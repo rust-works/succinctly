@@ -107534,6 +107534,50 @@ mod remaining_inputs {
         // What the CLI wants told when a read reaches a source, or the end of the stream
         // (#6475): see `set_read_hook`.
         static ON_READ: RefCell<Option<ReadHook>> = const { RefCell::new(None) };
+        // What the reads since the seed took from the stream, for where jq's reader leaves a
+        // standard input it did not read to the end (#7455): see `reads`.
+        static READS: Cell<Reads> = const { Cell::new(Reads::NONE) };
+    }
+
+    /// What the reads of the queue took from the stream since it was seeded (#7455).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Reads {
+        /// How many documents the reads handed out.
+        pub documents: u64,
+        /// Whether a read found the stream at its end.
+        pub past_end: bool,
+        /// Whether a read was of a parse error.
+        pub fault: bool,
+    }
+
+    impl Reads {
+        const NONE: Self = Self {
+            documents: 0,
+            past_end: false,
+            fault: false,
+        };
+    }
+
+    /// What the reads since the seed (or since [`clear_reads`]) took from the stream.
+    pub fn reads() -> Reads {
+        READS.with(Cell::get)
+    }
+
+    /// Forgets what earlier reads took, for a run that may not seed at all.
+    pub fn clear_reads() {
+        READS.with(|r| r.set(Reads::NONE));
+    }
+
+    fn note_read(pop: &Pop) {
+        READS.with(|r| {
+            let mut reads = r.get();
+            match pop {
+                Pop::Document(_) => reads.documents += 1,
+                Pop::ParseError(_) => reads.fault = true,
+                Pop::Exhausted => reads.past_end = true,
+            }
+            r.set(reads);
+        });
     }
 
     /// What is called when a read reaches a source, or the end of the stream, and whether the read
@@ -107614,6 +107658,7 @@ mod remaining_inputs {
         COUNT_PAST_END.with(|c| c.set(false));
         HOLD_END.with(|h| h.set(false));
         ON_READ.with(|slot| *slot.borrow_mut() = None);
+        clear_reads();
     }
 
     /// [`seed`] for a stream whose items `producer` hands over one at a time, when they are read
@@ -107633,6 +107678,7 @@ mod remaining_inputs {
         COUNT_PAST_END.with(|c| c.set(false));
         HOLD_END.with(|h| h.set(false));
         ON_READ.with(|slot| *slot.borrow_mut() = None);
+        clear_reads();
     }
 
     /// Counts the reads past the end from here on: see `COUNT_PAST_END`.
@@ -107685,6 +107731,13 @@ mod remaining_inputs {
     /// the stream as above: on `1\n2 }\n\n\n`, jq names line 2 for the
     /// error's read, line 4 for the next, and `<unknown>` after that.
     pub fn pop_input() -> Pop {
+        let pop = pop_input_unnoted();
+        note_read(&pop);
+        pop
+    }
+
+    /// [`pop_input`] without noting what it took in [`reads`].
+    fn pop_input_unnoted() -> Pop {
         let popped_so_far = POPPED.with(Cell::get);
         let error_due = ERRORS.with(|e| {
             let mut errors = e.borrow_mut();
@@ -108147,6 +108200,23 @@ pub use remaining_inputs::Pop as InputPop;
 #[cfg(feature = "std")]
 pub fn pop_input() -> InputPop {
     remaining_inputs::pop_input()
+}
+
+/// What the reads of the `input`/`inputs` queue took from the stream since it was seeded (#7455):
+/// how many documents they handed out, and whether one found the end or a parse error.
+#[cfg(feature = "std")]
+pub use remaining_inputs::Reads as InputReads;
+
+/// [`InputReads`] so far.
+#[cfg(feature = "std")]
+pub fn input_reads() -> InputReads {
+    remaining_inputs::reads()
+}
+
+/// Forgets what earlier reads of the queue took, for a run that may not seed it (#7455).
+#[cfg(feature = "std")]
+pub fn clear_input_reads() {
+    remaining_inputs::clear_reads();
 }
 
 /// Registers a hook that every read of the `input`/`inputs` queue calls (#6475).

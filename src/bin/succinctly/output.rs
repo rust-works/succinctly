@@ -304,6 +304,7 @@ impl ErrorSink {
             (true, false) => 0,
         };
         self.halt = self.halt.or(Some(exit_code));
+        super::stdin_offset::note_halt();
     }
 
     /// Make a negative `halt_error` code exit as its absolute value, which jq's `-e` does
