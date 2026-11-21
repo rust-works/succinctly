@@ -21964,6 +21964,8 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
     //   prove every read happens where one is in hand.
     let mentions = core::cell::OnceCell::new();
     let names_var = || *mentions.get_or_init(|| mentions_var(body, var));
+    // #7471: whether the body reads `$var` at all, answered for a whole chain of binds at once.
+    let reads_var = super::eval::as_body_reads_var(body, var);
     let reads = core::cell::OnceCell::new();
     let body_reads = || *reads.get_or_init(|| deferred_bind_reads(body, var));
     let defer = |bound: &V::Cursor, decode_failed: bool| {
@@ -22011,8 +22013,14 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
                         cursor.as_ref(),
                         body,
                     );
-                    let substituted_body =
-                        substitute_bound_var_from::<S>(expr, body, var, &bound_val, origin);
+                    // #7471: a body that does not read `$var` is evaluated as it is.
+                    let substituted_body = if reads_var.reads {
+                        alloc::borrow::Cow::Owned(substitute_bound_var_from::<S>(
+                            expr, body, var, &bound_val, origin,
+                        ))
+                    } else {
+                        alloc::borrow::Cow::Borrowed(body)
+                    };
                     eval_each_generic::<S, V>(
                         &substituted_body,
                         value.clone(),

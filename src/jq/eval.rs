@@ -8960,6 +8960,8 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut bound_any = false;
     let previous = yq_read_only_context::active();
     let source_scope = yq_as_source_scope::<S>();
+    // #7471: a body that does not read `$var` is evaluated as it is.
+    let reads_var = as_body_reads_var(body, var);
     let flow = fanout_arg_each_with_origin::<W, S, _>(
         expr,
         value.clone(),
@@ -8978,6 +8980,9 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `break` included.
             let _embed =
                 super::eval_generic::embed_table_push::<S>(origin.as_ref(), &mut bound_val);
+            if !reads_var.reads {
+                return eval_each::<W, S>(body, value.clone(), optional, sink);
+            }
             let substituted_body =
                 substitute_bound_var_from::<S>(expr, body, var, &bound_val, origin);
             eval_each::<W, S>(&substituted_body, value.clone(), optional, sink)
@@ -90809,6 +90814,8 @@ pub(crate) fn substitute_bound_var_from<S: EvalSemantics>(
     bound: &OwnedValue,
     node: Option<BindOrigin>,
 ) -> Expr {
+    #[cfg(test)]
+    BOUND_BODY_COPIES.with(|n| n.set(n.get() + 1));
     substitute_bound_var_at(
         bind_expr,
         body,
@@ -90820,6 +90827,174 @@ pub(crate) fn substitute_bound_var_from<S: EvalSemantics>(
         S::TAG == EvalTag::Jq,
         S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY,
     )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// How many bodies [`substitute_bound_var_from`] copied on this thread (#7471): what a test
+    /// reads to tell a chain whose unread links run as they are from one that copied the rest of
+    /// the chain at every link.
+    static BOUND_BODY_COPIES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Whether the body of an `as` that binds `$var` reads it: whether substituting a bound value
+/// changes the body at all (#7471). When it does not, a bind site evaluates `body` itself rather
+/// than the copy [`substitute_bound_var_from`] would make of it, the rule #3856's deferred bind
+/// already applies (`deferred_bind::mentions_var`): the only node a substitution rewrites is a
+/// `$var` ([`holds_var`]).
+///
+/// The answer is shadow-aware along a chain `E1 as $x1 | E2 as $x2 | ... | B`, as
+/// [`substitute_var_with`]'s `Expr::As` arm is (`$x` is read when a source names it, or when the
+/// last body does and no link binds `$x` again first), and conservative below it: a source or
+/// last body that names `$x` anywhere reads it.
+///
+/// A body that does not read the variable is evaluated as it is, so each link of the chain below
+/// is asked the same question of a node of the same tree. Those answers are worked out here in one
+/// walk and kept, keyed by each link's body, while the returned [`AsBodyReads`] is held, which is
+/// while the caller evaluates `body` (borrowed for that long, so the keys are live nodes of it).
+/// Asking each link afresh walked the rest of the chain at every link, and the copies made of it
+/// cost `n^2` memory (470 MB at 2,000 links). A body that does read the variable is copied by the
+/// substitution anyway, so nothing is kept for it, and the first link of the copy asks again.
+pub(crate) fn as_body_reads_var(body: &Expr, var: &str) -> AsBodyReads {
+    #[cfg(feature = "std")]
+    if let Some(reads) = as_chain_reads::lookup(body, var) {
+        return AsBodyReads {
+            reads,
+            #[cfg(feature = "std")]
+            _kept: None,
+        };
+    }
+    let reads = chain_reads_var(body, var);
+    AsBodyReads {
+        reads,
+        #[cfg(feature = "std")]
+        _kept: (!reads && matches!(body, Expr::As { .. }))
+            .then(|| as_chain_reads::keep(chain_link_reads(body))),
+    }
+}
+
+/// [`as_body_reads_var`]'s answer, walked: along the chain of links `body` starts, until one names
+/// `var` in its source (read) or binds it again (not read), then in the last body.
+fn chain_reads_var(body: &Expr, var: &str) -> bool {
+    let mut at = body;
+    while let Expr::As {
+        expr,
+        var: link,
+        body,
+    } = at
+    {
+        if super::deferred_bind::mentions_var(expr, var) {
+            return true;
+        }
+        if link == var {
+            return false;
+        }
+        at = body;
+    }
+    super::deferred_bind::mentions_var(at, var)
+}
+
+/// For each link of the chain `body` starts, its body, its variable and whether that body reads
+/// it, from one walk up the chain from its last body: the variables free in a link's body are
+/// those its source names, and those free in the next link's body but its variable.
+#[cfg(feature = "std")]
+fn chain_link_reads(body: &Expr) -> Vec<(&Expr, &str, bool)> {
+    let mut links = Vec::new();
+    let mut at = body;
+    while let Expr::As { expr, var, body } = at {
+        links.push((expr.as_ref(), var.as_str(), body.as_ref()));
+        at = body;
+    }
+    let mut free = alloc::collections::BTreeSet::new();
+    collect_var_names(at, &mut free);
+    let mut answers = vec_with_capacity(links.len());
+    for &(source, link_var, link_body) in links.iter().rev() {
+        answers.push((link_body, link_var, free.contains(link_var)));
+        free.remove(link_var);
+        collect_var_names(source, &mut free);
+    }
+    answers
+}
+
+/// Every variable `expr` names, bound inside it or not (a superset of the ones free in it).
+#[cfg(feature = "std")]
+fn collect_var_names(expr: &Expr, names: &mut alloc::collections::BTreeSet<String>) {
+    use crate::jq::walk::{search_subexpr, Visit};
+    search_subexpr(expr, &mut |e| {
+        if let Expr::Var(name) = e {
+            if !names.contains(name.as_str()) {
+                names.insert(name.clone());
+            }
+        }
+        Visit::Descend
+    });
+}
+
+/// [`as_body_reads_var`]'s answer, and the answers it keeps for the links of the chain below.
+pub(crate) struct AsBodyReads {
+    /// Whether the body reads the variable.
+    pub(crate) reads: bool,
+    #[cfg(feature = "std")]
+    _kept: Option<as_chain_reads::Kept>,
+}
+
+/// The answers [`as_body_reads_var`] keeps for the links of a chain it walked (#7471), by the
+/// address of each link's body, with the address of the link's variable name: a bind site asks of
+/// an `as` node's own body and variable, so an answer is only ever read back for the link it was
+/// worked out for. `std` only: a `no_std` embedding walks each link's body itself.
+#[cfg(feature = "std")]
+mod as_chain_reads {
+    use super::{expr_key as key, Expr};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static READS: RefCell<HashMap<usize, (usize, bool)>> = RefCell::new(HashMap::new());
+    }
+
+    /// The answer kept for the link whose body is `body` and whose variable is `var`, if one is.
+    pub(super) fn lookup(body: &Expr, var: &str) -> Option<bool> {
+        READS.with(|reads| match reads.borrow().get(&key(body)) {
+            Some(&(name, read)) if name == var.as_ptr() as usize => Some(read),
+            _ => None,
+        })
+    }
+
+    /// Keeps `answers` until the returned guard drops. A body already answered (the same chain
+    /// re-entered through a recursive `def`) keeps its answer and its owner.
+    pub(super) fn keep(answers: Vec<(&Expr, &str, bool)>) -> Kept {
+        READS.with(|reads| {
+            let mut reads = reads.borrow_mut();
+            let keys = answers
+                .into_iter()
+                .filter_map(|(body, var, read)| {
+                    let key = key(body);
+                    match reads.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert((var.as_ptr() as usize, read));
+                            Some(key)
+                        }
+                        std::collections::hash_map::Entry::Occupied(_) => None,
+                    }
+                })
+                .collect();
+            Kept(keys)
+        })
+    }
+
+    /// Drops the answers it kept.
+    pub(super) struct Kept(Vec<usize>);
+
+    impl Drop for Kept {
+        fn drop(&mut self) {
+            READS.with(|reads| {
+                let mut reads = reads.borrow_mut();
+                for key in &self.0 {
+                    reads.remove(key);
+                }
+            });
+        }
+    }
 }
 
 /// The [`Origin`] an identity-passthrough bind source freezes `.` with,
@@ -91560,12 +91735,20 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return eval_single::<W, S>(body, value, optional);
     }
 
+    // #7471: a body that does not read `$var` is evaluated as it is.
+    let reads_var = as_body_reads_var(body, var);
     for (i, mut bound_val) in bound_values.into_iter().enumerate() {
         let origin = bound_origins.get(i).cloned().flatten();
         // #2889 Stage B: same registration, same bind-scoped guard, as
         // `each_as`/`each_as_generic` -- see `eval_generic::embed_table`.
         let _embed = super::eval_generic::embed_table_push::<S>(origin.as_ref(), &mut bound_val);
-        let substituted_body = substitute_bound_var_from::<S>(expr, body, var, &bound_val, origin);
+        let substituted_body = if reads_var.reads {
+            Cow::Owned(substitute_bound_var_from::<S>(
+                expr, body, var, &bound_val, origin,
+            ))
+        } else {
+            Cow::Borrowed(body)
+        };
         let body_result = eval_single::<W, S>(&substituted_body, value.clone(), optional);
         // The outputs already produced no longer vanish (#400, #494).
         if let Some(control) = push_owned_values::<_, S>(body_result, &mut all_results) {
@@ -123132,6 +123315,121 @@ mod tests {
             }
             other => panic!("expected an Error, got {other:?}"),
         }
+    }
+
+    /// #7471: a chain copies a body only at a link whose variable is read. Before, every link
+    /// copied the rest of the chain: 200 copies for 200 links, `n^2` nodes in all.
+    #[test]
+    fn as_chain_copies_only_the_bodies_that_read_their_variable_7471() {
+        // Debug-build parser and evaluator frames overflow a test thread's default stack here.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let links = |tail: &str| {
+                    (0..200)
+                        .map(|i| alloc::format!("1 as $x{i} | "))
+                        .collect::<String>()
+                        + tail
+                };
+                let repeated = (0..200)
+                    .map(|i| alloc::format!("{i} as $x | "))
+                    .collect::<String>()
+                    + "$x";
+                for (filter, want, copies) in [
+                    (links("$x0"), "1", 1),
+                    (links("1"), "1", 0),
+                    (links("[$x0, $x199]"), "[1,1]", 2),
+                    (repeated, "199", 1),
+                ] {
+                    BOUND_BODY_COPIES.with(|n| n.set(0));
+                    let got = outputs(b"null", &filter);
+                    assert_eq!(
+                        got,
+                        alloc::vec![want.to_string()],
+                        "{}",
+                        &filter[filter.len() - 12..]
+                    );
+                    assert_eq!(
+                        BOUND_BODY_COPIES.with(core::cell::Cell::get),
+                        copies,
+                        "{}",
+                        &filter[filter.len() - 12..]
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// #7471: one walk answers every link of a chain, shadow-aware along it, and keeps the
+    /// answers for the links below exactly as long as the first answer is held.
+    #[test]
+    fn as_chain_answers_every_link_from_one_walk_7471() {
+        let var = |name: &str| Expr::Var(name.to_string());
+        let bind = |expr: Expr, name: &str, body: Expr| Expr::As {
+            expr: Box::new(expr),
+            var: name.to_string(),
+            body: Box::new(body),
+        };
+        let one = || Expr::Literal(Literal::Int(1));
+        // `$a` is read only below the link that binds it again, `$b` not at all, and the
+        // inner `$a` by the last body: `1 as $b | 1 as $a | [$a, $c]` is the body of an
+        // outer `as $a`.
+        let tail = Expr::Array(Box::new(Expr::Comma(vec![var("a"), var("c")])));
+        let body = bind(one(), "b", bind(one(), "a", tail));
+        let reads = as_body_reads_var(&body, "a");
+        assert!(!reads.reads, "the outer `$a` is shadowed before it is read");
+        let Expr::As {
+            body: b_body,
+            var: b_var,
+            ..
+        } = &body
+        else {
+            unreachable!("built above"); // patchcov: coverage tolerate-line reason="the chain is built just above"
+        };
+        let Expr::As {
+            body: a_body,
+            var: a_var,
+            ..
+        } = b_body.as_ref()
+        else {
+            unreachable!("built above"); // patchcov: coverage tolerate-line reason="the chain is built just above"
+        };
+        #[cfg(feature = "std")]
+        assert_eq!(
+            (
+                as_chain_reads::lookup(b_body, b_var),
+                as_chain_reads::lookup(a_body, a_var)
+            ),
+            (Some(false), Some(true)),
+            "kept: `$b` is not read, the inner `$a` is"
+        );
+        // Asked again of a link it kept, it answers from what was kept and keeps nothing; asked
+        // with a name that is not the link's own, it walks instead (`$b` is not read below).
+        assert!(!as_body_reads_var(b_body, b_var).reads);
+        assert!(as_body_reads_var(a_body, a_var).reads);
+        #[cfg(feature = "std")]
+        assert_eq!(as_chain_reads::lookup(b_body, "b"), None);
+        assert!(!as_body_reads_var(b_body, "b").reads);
+        drop(reads);
+        #[cfg(feature = "std")]
+        assert_eq!(
+            (
+                as_chain_reads::lookup(b_body, b_var),
+                as_chain_reads::lookup(a_body, a_var)
+            ),
+            (None, None),
+            "dropped with the answer"
+        );
+        // A source that names the variable reads it, and a free variable of the last body
+        // that no link binds (`$c`) is read wherever it is asked.
+        let reading_source = bind(var("a"), "b", bind(one(), "x", one()));
+        assert!(as_body_reads_var(&reading_source, "a").reads);
+        assert!(as_body_reads_var(&body, "c").reads);
+        // One bind, not a chain: the body is searched as it is.
+        assert!(as_body_reads_var(&var("a"), "a").reads);
+        assert!(!as_body_reads_var(&one(), "a").reads);
     }
 
     /// #2402 review finding: `wrap_shadowable_call` (`parser.rs`) isn't
