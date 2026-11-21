@@ -3469,16 +3469,19 @@ fn spans_repeat(prepared: &[PreparedField<'_>]) -> bool {
 /// Decoding every key into a list, mapping them all, and copying the fields
 /// into a second list made one repeat in a 100 MB object of 7.1 M keys hold
 /// all three at once, beside the field list itself.
+///
+/// `Err` is a malformed value under an earlier occurrence of a key (#7427):
+/// the printer writes every value it keeps, and jq parsed the one it drops.
 fn collapse_duplicate_fields<'a>(
     prepared: &mut [PreparedField<'a>],
     frame: &Frame<'a, impl Clone + AsRef<[u64]>>,
-) -> usize {
+) -> Result<usize, EvalError> {
     if prepared.len() < 2 {
-        return prepared.len();
+        return Ok(prepared.len());
     }
     let any_escaped = prepared.iter().any(|field| field.escaped);
     if !any_escaped && !spans_repeat(prepared) {
-        return prepared.len();
+        return Ok(prepared.len());
     }
     collapse_repeated_fields(prepared, frame)
 }
@@ -3495,7 +3498,7 @@ fn collapse_duplicate_fields<'a>(
 fn collapse_repeated_fields<'a>(
     prepared: &mut [PreparedField<'a>],
     frame: &Frame<'a, impl Clone + AsRef<[u64]>>,
-) -> usize {
+) -> Result<usize, EvalError> {
     let shared = shared_key_hashes(
         prepared
             .iter()
@@ -3503,7 +3506,7 @@ fn collapse_repeated_fields<'a>(
             .collect(),
     );
     if shared.is_empty() {
-        return prepared.len();
+        return Ok(prepared.len());
     }
 
     let mut slot_of: HashMap<PreparedCow<'a, str>, usize> = HashMap::new();
@@ -3520,9 +3523,12 @@ fn collapse_repeated_fields<'a>(
             .and_then(|_| collapse_key_name(&field, frame));
         if let Some(name) = name {
             match slot_of.entry(name) {
-                // A later occurrence: its key's first slot takes this field.
+                // A later occurrence: its key's first slot takes this field,
+                // once the value it shadows has been read (#7427).
                 Entry::Occupied(slot) => {
-                    prepared[*slot.get()] = field;
+                    let shadowed = &mut prepared[*slot.get()];
+                    validate_cursor::<JqSemantics, _>(&frame.cursor(shadowed.value_bp))?;
+                    *shadowed = field;
                     continue;
                 }
                 Entry::Vacant(slot) => {
@@ -3533,7 +3539,7 @@ fn collapse_repeated_fields<'a>(
         prepared[kept] = field;
         kept += 1;
     }
-    kept
+    Ok(kept)
 }
 
 /// A key's decoded spelling, or `None` when it will not decode.
@@ -20877,7 +20883,13 @@ where
                         // where they are until the truncate below, so a
                         // nested object still appends past the end.
                         let count = if !config.convention.preserves_source_values() {
-                            collapse_duplicate_fields(&mut scratch[base..], &frame)
+                            match collapse_duplicate_fields(&mut scratch[base..], &frame) {
+                                Ok(count) => count,
+                                Err(e) => {
+                                    scratch.truncate(base);
+                                    return Err(MalformedJsonError::new(e).into());
+                                }
+                            }
                         } else {
                             scratch.len() - base
                         };

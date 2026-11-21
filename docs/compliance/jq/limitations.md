@@ -6741,6 +6741,18 @@ $ echo '[1,0x1]'  | sjq -c 'length'      # (raises)         exit 5
 $ echo '[2x,1]'   | sjq -c 'length'      # (raises)         exit 5
 ```
 
+A value under a key that a later member repeats is read by the same rule ([#7427](https://github.com/rust-works/succinctly/issues/7427)).
+jq keeps a repeated key's last value, but only after parsing every value, so `{"a":tru,"a":1}` is its parse error whatever the filter.
+Every route that reads the values an object keeps (`.`, `-s .`, `.[]`, `to_entries`, `with_entries(f)`, `map_values(f)`, `tojson`) now reads the value the repeat shadows too, and raises jq's message with exit 5, where the collapse used to drop it unread and print `{"a":1}`.
+A filter that reads no value of the object, or only the value that wins, answers as it does for a malformed value no key shadows:
+
+```
+$ echo '{"a":tru,"b":2,"a":1}' | jq  -c '.'      # (parses nothing) exit 5
+$ echo '{"a":tru,"b":2,"a":1}' | sjq -c '.'      # (raises)         exit 5
+$ echo '{"a":tru,"b":2,"a":1}' | sjq -c 'length' # 2                exit 0
+$ echo '{"a":tru,"b":2,"a":1}' | sjq -c '.a'     # 1                exit 0
+```
+
 ### A string with an invalid escape or a lone high surrogate is echoed by a filter that only forwards it (#5308)
 
 jq 1.7.1 rejects the document at parse time, whatever the filter, with exit 2.

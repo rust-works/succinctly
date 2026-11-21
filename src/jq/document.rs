@@ -3886,7 +3886,8 @@ impl<C: Copy> RepeatPlan<C> {
 /// no repeated key (or `collapse` off), so the fields can be streamed straight off `uncons` in
 /// document order. `Err` is the same `malformed_member_error` the materializing
 /// [`effective_fields_checked`] raises; the checks are `census`'s, so a caller switching
-/// between the two sees the same diagnostic.
+/// between the two sees the same diagnostic. So is the one more `Err` both raise once a key
+/// repeats: a malformed value a later occurrence shadows ([`shadowed_value_ok`], #7427).
 ///
 /// It takes the census's key-only walk, then walks again decoding only the
 /// keys whose hash is shared: a handful on an ordinary object, so the
@@ -3912,13 +3913,16 @@ pub(crate) fn repeat_plan_checked<F: DocumentFields>(
     if !collapse || walked.shared.is_empty() {
         return Ok(None);
     }
-    Ok(plan_repeats(
+    // Every value the plan drops is read on its way out (#7427): the writers
+    // that take a plan write every value it keeps.
+    plan_repeats(
         fields,
         &walked.shared,
         walked.unkeyed > 0,
         |key| collapse_key_hash_of(key, collections_as_empty),
         None,
-    ))
+        shadowed_value_ok,
+    )
 }
 
 /// Where a cursor's node starts in its document's text:
@@ -3948,10 +3952,20 @@ pub(crate) fn repeat_plan_from_shared<F: DocumentFields>(
     hash_of: impl Fn(&F::Value) -> Option<u64>,
     position_of: Option<PositionOf<F::Cursor>>,
 ) -> Option<RepeatPlan<F::Cursor>> {
-    plan_repeats(fields, shared, false, hash_of, position_of)
+    // A certified object's values are well formed already, the ones a later
+    // occurrence shadows included, so there is nothing to read them for.
+    match plan_repeats(fields, shared, false, hash_of, position_of, |_| {
+        Ok::<(), core::convert::Infallible>(())
+    }) {
+        Ok(plan) => plan,
+        Err(never) => match never {},
+    }
 }
 
 /// [`repeat_plan_checked`]'s second walk, for an object whose hashes repeat.
+///
+/// `shadowed` is handed each value a later occurrence of its key replaces,
+/// before the plan drops it (#7427).
 ///
 /// Out of line and cold, so that the gate the writers call for every object
 /// stays as small as `collapsed_fields_checked`'s was. A build that kept this
@@ -3961,13 +3975,14 @@ pub(crate) fn repeat_plan_from_shared<F: DocumentFields>(
 /// with the three out of line it timed flat (#7311).
 #[cold]
 #[inline(never)]
-fn plan_repeats<F: DocumentFields>(
+fn plan_repeats<F: DocumentFields, E>(
     fields: &F,
     shared: &[u64],
     every_key: bool,
     hash_of: impl Fn(&F::Value) -> Option<u64>,
     mut position_of: Option<PositionOf<F::Cursor>>,
-) -> Option<RepeatPlan<F::Cursor>> {
+    mut shadowed: impl FnMut(&F::Cursor) -> Result<(), E>,
+) -> Result<Option<RepeatPlan<F::Cursor>>, E> {
     let mut plan = RepeatPlanBuilder::default();
     let mut spans: Vec<StepSpan> = Vec::new();
     // Whether the last step still waits for the position of the key after
@@ -4008,7 +4023,9 @@ fn plan_repeats<F: DocumentFields>(
                         spans = Vec::new();
                     }
                 }
-                plan.field(at, name, value);
+                if let Some(replaced) = plan.field(at, name, value) {
+                    shadowed(&replaced)?;
+                }
             }
         }
         at += 1;
@@ -4017,7 +4034,7 @@ fn plan_repeats<F: DocumentFields>(
     if position_of.is_none() || StepSpan::dense(spans.len(), at, true) {
         spans = Vec::new();
     }
-    plan.finish(spans)
+    Ok(plan.finish(spans))
 }
 
 /// A [`RepeatPlan`] being built by a walk that meets an object's fields in
@@ -4048,25 +4065,33 @@ impl<C> RepeatPlanBuilder<C> {
     /// The field at position `at` of the walk, whose key collapses under
     /// `name` and whose value is `value`. The first field under a name keeps
     /// its place and is written with the last one's value; every later one is
-    /// dropped.
-    pub(crate) fn field(&mut self, at: usize, name: Cow<'_, str>, value: C) {
+    /// dropped. Answers the value this one replaces, which the plan no longer
+    /// holds, when the name has occurred before (#7427).
+    pub(crate) fn field(&mut self, at: usize, name: Cow<'_, str>, value: C) -> Option<C> {
         let hash = key_hash(name.as_bytes());
-        self.field_hashed(at, hash, name, value);
+        self.field_hashed(at, hash, name, value)
     }
 
     /// [`RepeatPlanBuilder::field`] for a walk that has hashed `name` already:
     /// `hash` is its [`key_hash`] (the JSON text walk's, which hashes the raw
     /// spelling it hands over as `name`, #7350).
-    pub(crate) fn field_hashed(&mut self, at: usize, hash: u64, name: Cow<'_, str>, value: C) {
+    pub(crate) fn field_hashed(
+        &mut self,
+        at: usize,
+        hash: u64,
+        name: Cow<'_, str>,
+        value: C,
+    ) -> Option<C> {
         debug_assert_eq!(hash, key_hash(name.as_bytes()));
         match self.slots.slot(hash, name, self.values.len()) {
             Some(slot) => {
-                self.values[slot] = value;
+                let replaced = core::mem::replace(&mut self.values[slot], value);
                 self.steps.push(RepeatStep {
                     at,
                     slot: RepeatStep::DROPPED,
                 });
                 self.dropped = true;
+                Some(replaced)
             }
             None => {
                 self.steps.push(RepeatStep {
@@ -4074,6 +4099,7 @@ impl<C> RepeatPlanBuilder<C> {
                     slot: self.values.len(),
                 });
                 self.values.push(value);
+                None
             }
         }
     }
@@ -4250,11 +4276,16 @@ fn object_keys_repeat<F: DocumentFields>(seed: Vec<u64>, pending: &F::Value, res
 /// against a ~54 ns/field bare walk, because it allocated a `String` per
 /// key and stored a four-cursor `DocumentField` per entry whether or not
 /// the object had any duplicate at all.
+///
+/// `Err` only when a key repeats and a value it shadows is malformed
+/// (`shadowed_value_ok`, #7427): the caller reads the values, so it reads
+/// the one jq parsed before keeping the last.
+#[allow(clippy::type_complexity)] // STYLE-0004: effective_fields_checked's own Result<Vec<DocumentField<..>>, EvalError>; a named alias would add indirection for one wrapper.
 pub fn effective_fields<F: DocumentFields>(
     fields: &F,
     collapse: bool,
-) -> Vec<DocumentField<F::Value, F::Cursor>> {
-    effective_fields_with_raw_last(fields, collapse).0
+) -> Result<Vec<DocumentField<F::Value, F::Cursor>>, EvalError> {
+    effective_fields_with_raw_last(fields, collapse).map(|(fields, _)| fields)
 }
 
 /// [`effective_fields`], additionally handing back the raw last field's cursor (#2261).
@@ -4280,20 +4311,22 @@ pub fn effective_fields<F: DocumentFields>(
 /// Free: `all_fields()`'s own `Vec` already exists in raw document order
 /// before any collapsing runs, so reading its last element costs nothing
 /// beyond the call this function already makes.
+///
+/// `Err` as [`effective_fields`]'s: a shadowed value that is malformed (#7427).
 #[allow(clippy::type_complexity)] // STYLE-0004: mirrors effective_fields_checked's own Vec<DocumentField<..>>, plus the raw-last cursor; a named alias would add indirection for one extra wrapper.
 pub fn effective_fields_with_raw_last<F: DocumentFields>(
     fields: &F,
     collapse: bool,
-) -> (Vec<DocumentField<F::Value, F::Cursor>>, Option<F::Cursor>) {
+) -> Result<(Vec<DocumentField<F::Value, F::Cursor>>, Option<F::Cursor>), EvalError> {
     let all = fields.all_fields();
     let raw_last = all.last().map(|f| f.value_cursor);
     if !collapse {
-        return (all, raw_last);
+        return Ok((all, raw_last));
     }
     if keys_repeat(&all) {
-        (collapse_repeated(all), raw_last)
+        Ok((collapse_repeated(all)?, raw_last))
     } else {
-        (all, raw_last)
+        Ok((all, raw_last))
     }
 }
 
@@ -4353,7 +4386,7 @@ pub fn effective_fields_checked<F: DocumentFields>(
         }
     }
     if collapse && keys_repeat(&out) {
-        out = collapse_repeated(out);
+        out = collapse_repeated(out)?;
     }
     Ok(out)
 }
@@ -4567,13 +4600,13 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
             let mut shared = small.to_vec();
             shared.sort_unstable();
             let every_key = small.len() < out.len();
-            return Ok(collapse_repeated_cursors(
+            return collapse_repeated_cursors(
                 fields,
                 out,
                 &shared,
                 every_key,
                 collections_as_empty,
-            ));
+            );
         }
         return Ok(out);
     }
@@ -4588,13 +4621,7 @@ pub fn effective_value_cursors_checked<F: DocumentFields>(
     if shared.is_empty() {
         return Ok(out);
     }
-    Ok(collapse_repeated_cursors(
-        fields,
-        out,
-        &shared,
-        every_key,
-        collections_as_empty,
-    ))
+    collapse_repeated_cursors(fields, out, &shared, every_key, collections_as_empty)
 }
 
 /// The widest object whose key hashes [`effective_value_cursors_checked`] keeps on the stack.
@@ -4652,7 +4679,7 @@ fn collapse_repeated_cursors<F: DocumentFields>(
     shared: &[u64],
     every_key: bool,
     collections_as_empty: bool,
-) -> Vec<F::Cursor> {
+) -> Result<Vec<F::Cursor>, EvalError> {
     let mut slots = SharedKeySlots::default();
     let mut kept = 0usize;
     let mut walk = fields.clone();
@@ -4663,7 +4690,11 @@ fn collapse_repeated_cursors<F: DocumentFields>(
             collapse_key_hash_of(key, collections_as_empty)
         }) {
             Some(name) => match slots.slot(key_hash(name.as_bytes()), name, kept) {
-                Some(slot) => values[slot] = value,
+                // The value this one shadows is read on its way out (#7427).
+                Some(slot) => {
+                    shadowed_value_ok(&values[slot])?;
+                    values[slot] = value;
+                }
                 None => {
                     values[kept] = value;
                     kept += 1;
@@ -4678,7 +4709,7 @@ fn collapse_repeated_cursors<F: DocumentFields>(
         walk = rest;
     }
     values.truncate(kept);
-    values
+    Ok(values)
 }
 
 /// The collapsed field list, or `None` when no key repeats.
@@ -4694,7 +4725,7 @@ pub fn collapsed_fields<F: DocumentFields>(
     if !census(fields).repeated {
         return None;
     }
-    Some(collapse_repeated(fields.all_fields()))
+    Some(collapse_repeated_keys(fields.all_fields()))
 }
 
 /// [`collapsed_fields`], but skipped outright when the mode doesn't
@@ -5106,9 +5137,33 @@ struct ConfirmedRepeat<F: DocumentFields> {
 /// scan would be quadratic, and a single duplicate in a wide object is a
 /// perfectly ordinary input -- 100K keys took 8.5 s that way against
 /// 0.02 s for not collapsing at all.
+///
+/// Every value a later occurrence shadows is checked by [`shadowed_value_ok`]
+/// on its way out (#7427): the caller reads the values the list holds, and
+/// jq parses the ones it drops.
 fn collapse_repeated<V: DocumentValue, C: DocumentCursor>(
     all: Vec<DocumentField<V, C>>,
+) -> Result<Vec<DocumentField<V, C>>, EvalError> {
+    collapse_repeated_with(all, shadowed_value_ok)
+}
+
+/// [`collapse_repeated`] for a caller that reads only the keys the list holds
+/// (`keys_unsorted[n]`), which leaves every value unread, a shadowed one included.
+fn collapse_repeated_keys<V: DocumentValue, C: DocumentCursor>(
+    all: Vec<DocumentField<V, C>>,
 ) -> Vec<DocumentField<V, C>> {
+    match collapse_repeated_with(all, |_: &C| Ok::<(), core::convert::Infallible>(())) {
+        Ok(out) => out,
+        Err(never) => match never {},
+    }
+}
+
+/// [`collapse_repeated`]'s walk, handing each value a later occurrence of its
+/// key shadows to `shadowed` before it is dropped.
+fn collapse_repeated_with<V: DocumentValue, C: DocumentCursor, E>(
+    all: Vec<DocumentField<V, C>>,
+    mut shadowed: impl FnMut(&C) -> Result<(), E>,
+) -> Result<Vec<DocumentField<V, C>>, E> {
     // "First position, last value": the slot is claimed by the first
     // occurrence and overwritten by every later one.
     let mut slot_of: IndexMap<String, usize> = IndexMap::new();
@@ -5117,7 +5172,10 @@ fn collapse_repeated<V: DocumentValue, C: DocumentCursor>(
         let key = field.key_str().map(Cow::into_owned);
         match key {
             Some(key) => match slot_of.get(&key) {
-                Some(&slot) => out[slot] = field,
+                Some(&slot) => {
+                    shadowed(&out[slot].value_cursor)?;
+                    out[slot] = field;
+                }
                 None => {
                     slot_of.insert(key, out.len());
                     out.push(field);
@@ -5129,7 +5187,29 @@ fn collapse_repeated<V: DocumentValue, C: DocumentCursor>(
             None => out.push(field),
         }
     }
-    out
+    Ok(out)
+}
+
+/// Whether the value a later occurrence of its key shadows is well formed, for a
+/// collapse whose caller reads the values it keeps (#7427).
+///
+/// jq parses an object whole before it keeps the last value of a repeated key, so
+/// a malformed value under an earlier occurrence (`{"a":tru,"a":1}`) is its parse
+/// error whatever the filter. A walk that reads every value it keeps reads the
+/// one it drops through here, with [`validate_cursor`](super::eval_generic::validate_cursor)'s
+/// checks, so that `.`, `.[]` and `to_entries` refuse what `tojson` refuses. Only a
+/// format whose index accepts malformed text (JSON: [`DocumentCursor::HAS_DELIMITER_CHECKS`])
+/// has a value to check; a YAML parser has refused one already.
+///
+/// Called only once a key is known to repeat, so an object that repeats nothing
+/// never reaches it.
+#[cold]
+#[inline(never)]
+pub(crate) fn shadowed_value_ok<C: DocumentCursor>(value: &C) -> Result<(), EvalError> {
+    if !C::HAS_DELIMITER_CHECKS {
+        return Ok(());
+    }
+    super::eval_generic::validate_cursor::<super::JqSemantics, C>(value)
 }
 
 /// The field count an object presents under the mode's duplicate-key rule.
@@ -7341,5 +7421,91 @@ mod element_index_defaults_tests {
         assert!(!super::DocumentCursor::is_header_only_document(
             &index.root(json)
         ));
+    }
+}
+
+#[cfg(test)]
+mod shadowed_value_tests {
+    use super::{
+        collapsed_fields, effective_fields, effective_fields_checked,
+        effective_value_cursors_checked, repeat_plan_checked, DocumentValue,
+    };
+    use crate::json::JsonIndex;
+
+    /// A wide object: twelve members, past `SMALL_OBJECT_FIELDS`, with `body`
+    /// under the key `a` and then `a` again, holding 1.
+    fn wide(body: &str) -> String {
+        let pad: String = (0..10).map(|i| format!(r#""k{i}":{i},"#)).collect();
+        format!(r#"{{"a":{body},{pad}"a":1}}"#)
+    }
+
+    /// #7427: every collapse whose caller reads the values it keeps reads the
+    /// value a later occurrence of its key shadows, as jq's parser does, and
+    /// refuses it when it is malformed. The key-only collapse
+    /// (`keys_unsorted[n]`) reads no value, so it still answers, as it does
+    /// for a malformed value no key shadows; yq mode keeps every occurrence,
+    /// so nothing is shadowed.
+    #[test]
+    fn a_malformed_shadowed_value_is_read_by_every_value_collapse_7427() {
+        let mut docs: Vec<String> = [
+            r#"{"a":tru,"b":2,"a":1}"#,
+            r#"{"a":[1,,2],"a":1}"#,
+            r#"{"a":{x},"a":1}"#,
+            r#"{"a":1,"a":tru,"a":2}"#,
+            r#"{"a":"\q","a":1}"#,
+        ]
+        .map(String::from)
+        .to_vec();
+        docs.push(wide("tru"));
+        docs.push(wide("[1,,2]"));
+        for doc in &docs {
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let fields = root.value().as_object().expect(doc);
+            assert!(effective_fields(&fields, true).is_err(), "{doc}");
+            assert!(effective_fields_checked(&fields, true).is_err(), "{doc}");
+            assert!(
+                effective_value_cursors_checked(&fields, true, false).is_err(),
+                "{doc}"
+            );
+            assert!(repeat_plan_checked(&fields, true, false).is_err(), "{doc}");
+            assert!(collapsed_fields(&fields).is_some(), "{doc}");
+            assert!(effective_fields(&fields, false).is_ok(), "{doc}");
+        }
+    }
+
+    /// The other side of the check: a repeated key over well-formed values
+    /// still collapses to its first position and last value, a malformed value
+    /// that wins is the reader's to refuse, not the collapse's, and an object
+    /// that repeats nothing never reaches the check.
+    #[test]
+    fn a_well_formed_shadowed_value_still_collapses_7427() {
+        for (doc, want, first) in [
+            (
+                r#"{"a":[1,{"b":null}],"b":2,"a":3}"#.to_string(),
+                2,
+                Some(3),
+            ),
+            (r#"{"a":1,"a":tru}"#.to_string(), 1, None),
+            (r#"{"a":tru,"b":2}"#.to_string(), 2, None),
+            (wide("[1,{\"x\":2}]"), 11, Some(1)),
+        ] {
+            let index = JsonIndex::build(doc.as_bytes());
+            let root = index.root(doc.as_bytes());
+            let fields = root.value().as_object().expect(&doc);
+            let kept = effective_fields(&fields, true).expect(&doc);
+            assert_eq!(kept.len(), want, "{doc}");
+            assert_eq!(
+                effective_value_cursors_checked(&fields, true, false)
+                    .expect(&doc)
+                    .len(),
+                want,
+                "{doc}"
+            );
+            assert!(repeat_plan_checked(&fields, true, false).is_ok(), "{doc}");
+            if let Some(first) = first {
+                assert_eq!(kept[0].value.as_i64(), Some(first), "{doc}: the last value");
+            }
+        }
     }
 }

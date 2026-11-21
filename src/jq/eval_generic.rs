@@ -41822,10 +41822,11 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 } else {
                     match stream_len(&fields, true) {
                         Some(len) => (EffectiveFields::walk(&fields, len), None),
-                        None => {
-                            let (list, last) = effective_fields_with_raw_last(&fields, true);
-                            (EffectiveFields::listed(list), last)
-                        }
+                        None => match effective_fields_with_raw_last(&fields, true) {
+                            Ok((list, last)) => (EffectiveFields::listed(list), last),
+                            // A malformed value a repeated key shadows (#7427).
+                            Err(err) => return GenericResult::Error(err),
+                        },
                     }
                 };
                 // A format without delimiter checks (YAML) passes the trailing one whatever the
