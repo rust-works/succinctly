@@ -139,12 +139,14 @@ impl JqCommand {
     /// Under `-f` that first word is the program's *file* (#7439): it moves
     /// from `filter` to `program_file`, so `filter` is then always `None`.
     ///
-    /// Only words clap already captured are resequenced. By the time clap
-    /// sees argv, `hoist_options_before_positional_flags` (`main.rs`) has
-    /// moved every option after the first `--args`/`--jsonargs` in front of
-    /// it (#3447), so the words captured here are positional by jq's rule;
-    /// an option-shaped word can still arrive (clap parsing without that
-    /// hoist, as the unit tests below do), and is never taken as the program.
+    /// Only words clap already captured are resequenced. `succinctly jq` and
+    /// `sjq` never give clap a positional word: `walk_jq_argv` (`main.rs`)
+    /// reads them as jq does and `set_positional_words` sets them (#7494),
+    /// so there is nothing here to resequence. A `JqCommand` clap parsed by
+    /// itself (the `Cli` tree, the unit tests below) still arrives with
+    /// captures, and an option-shaped word among them is never taken as the
+    /// program before a `--`. After one it is: `jq -n --args -- -c .` runs
+    /// the program `-c`, as jq does.
     fn resolve_positional_args(&mut self) {
         // (starts in `--jsonargs` mode, the words clap captured under it)
         let captured = [
@@ -173,8 +175,9 @@ impl JqCommand {
                         _ => {}
                     }
                 }
-                let option_shaped =
-                    word.starts_with('-') && !super::looks_like_negative_filter(&word);
+                let option_shaped = !options_ended
+                    && word.starts_with('-')
+                    && !super::looks_like_negative_filter(&word);
                 if self.filter.is_none() && !option_shaped {
                     self.filter = Some(word.into());
                 } else if json {
@@ -25895,9 +25898,13 @@ mod tests {
                 ],
             ];
             for words in lines {
-                let hoisted = crate::cli::hoist_options_before_positional_flags(argv(words), 1);
-                let matches = JqCommand::command()
-                    .try_get_matches_from(&hoisted)
+                // Parsed as `parse_jq` parses: clap sees only the options the argv walk found.
+                let mut command = JqCommand::command();
+                command.build();
+                let walked = crate::cli::walk_jq_argv(&command, words)
+                    .unwrap_or_else(|e| panic!("{words:?}: {e:?}"));
+                let matches = command
+                    .try_get_matches_from_mut(walked.options)
                     .unwrap_or_else(|e| panic!("{words:?}: {e}"));
                 let scan = named_flag_order(&argv(words));
                 let want = if scan.len() < 2 { vec![] } else { scan };

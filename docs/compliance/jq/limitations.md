@@ -15220,7 +15220,8 @@ Under `-R` and `--input-dsv` the flag is ignored, as `--stream` is.
 It is pinned by `tests/jq_cli/i5474.rs` and was checked against `/usr/bin/jq` on random malformed inputs, with stdout, exit status and the `(at <file>:<line>)` marker compared.
 `--seq` combines with it since #6115, as with `--stream` above: `printf '[1,2' | jq --seq --stream-errors -c .` prints `["Unfinished abandoned text at EOF at line 1, column 4",[]]`, and a fault in a record is the event `[message, path]` and not a warning.
 
-`-b` is accepted and ignored, as jq does outside Windows; `--binary` is rejected there (`Unknown option --binary`, exit 2) and here.
+`-b` is accepted and ignored, as jq does outside Windows.
+`--binary` is too since #7438, as in jq 1.8: jq 1.7.1 refused it there (`Unknown option --binary`, exit 2) although its own `--help` lists it, and jq 1.8 fixed that (jqlang/jq#3131; see the #7438 section).
 
 ## ANSI color bytes: `-C` writes jq 1.7.1's bytes, redundant repeats included ([#5473](https://github.com/rust-works/succinctly/issues/5473))
 
@@ -15329,6 +15330,22 @@ jq 1.8 fixed that ([jqlang/jq@7a1fd72d](https://github.com/jqlang/jq/commit/7a1f
 `succinctly jq` follows jq 1.8.2 here (newer than the pinned 1.7.1), with its own version in the usage text's first line; the exit status is 2 in all three.
 A named argument is still read first, as in both jq releases: `jq -f --rawfile x nope` reports the missing `--rawfile` file.
 Pinned by `tests/jq_cli/i7439.rs`.
+
+## Short-option bundles are read as jq 1.8.2 reads them, not as jq 1.7.1 does ([#7438](https://github.com/rust-works/succinctly/issues/7438))
+
+`succinctly jq` reads its command line as jq's own option loop does (`walk_jq_argv`), and clap parses only the options it found (#7438, #7494).
+Outside short-option bundles jq 1.7.1 and jq 1.8.2 agree, and so does this: there is no `--name=value` (`--indent=3`, `--args=`, `--from-file=p` are `Unknown option`, exit 2), a long option is an exact name, and a word that is `-` and then neither a letter nor a `-` is positional wherever it sits, with options read after it.
+A succinctly-only option keeps clap's `--name=value` form (`--on-error=stop`), which its documentation uses.
+
+Bundles follow jq 1.8.2, which is newer than the pinned 1.7.1.
+jq 1.7.1 counted each distinct letter of a bundle once and checked the count against the word's length, so it refused a repeated letter (`-nn`, `-cc`, `-ee`) and `-L` inside a bundle (`-nL lib`, `-nLlib`), named the whole word (`Unknown option -fprog.jq`), and found `-h` and `-V` anywhere in a word in a fixed order (`-xV` printed the version, `-Vh` the help).
+jq 1.8 reads a bundle a letter at a time, in the order given ([jqlang/jq@ff4acba769](https://github.com/jqlang/jq/commit/ff4acba769ff907f8f35c9f75fc29cc82e9bf5df), "Parse short options in order given", jqlang/jq#3194), and lists the refused repeat, the refused `-L` and the fixed `-h`/`-V` order as the bugs it fixes.
+So `-nn 1` prints `1`, `-ee -n .` prints `null` and exits 1, `-nL lib .` adds `lib` to the search path, `-RsjL lib .` is `-R -s -j -L lib`, `-fprog.jq` is `Unknown option -p` (the first letter jq does not define), `-xV` is `Unknown option -x`, and of `-hV` and `-Vh` the first letter wins, as in jq 1.8.2.
+jq 1.8 also accepts `--binary` outside Windows, which jq 1.7.1's own `--help` lists and its parser refused: [jqlang/jq@5208a4425f](https://github.com/jqlang/jq/commit/5208a4425f24f5c366dfed2eae85f1935199d683) ("fix option parsing of `--binary` on non-Windows platforms", jqlang/jq#3131) is a fix, so it is accepted and ignored here too.
+The usage hint after `Unknown option` is 1.7.1's (`online docs  at https://jqlang.github.io/jq`), as in every other usage error here; jq 1.8 moved its documentation to `https://jqlang.org`.
+`--library-path`, the long spelling of `-L` that jq 1.8 added ([jqlang/jq@0558e77e8c](https://github.com/jqlang/jq/commit/0558e77e8c0cc4c6250ebddd1cddcb63bbf33615), "Add --library-path long option for -L"), is a new option, so it stays refused as in jq 1.7.1 (`Unknown option --library-path`).
+`succinctly dev compare jq` has no probe of these shapes, so the ledger has no entry for them.
+Pinned by `tests/jq_cli/i7438.rs`.
 
 ## `@urid`: jq 1.8.2's behaviour for the format, jq 1.7.1's for `format("urid")`
 

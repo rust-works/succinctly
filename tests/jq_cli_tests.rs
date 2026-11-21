@@ -2614,10 +2614,11 @@ fn test_negative_filter_program_accepted_without_dashdash_3389() -> Result<()> {
     // A genuine unknown flag must keep erroring, never silently become the
     // filter -- this is the reason `allow_hyphen_values` alone isn't the
     // fix (it can't tell `-x` apart from `-1`, both being "hyphen values").
+    // It is jq's own refusal since #7438.
     let (stdout, stderr, code) = run_jq_full(&["-c", "-x"], Some("[1]"))?;
-    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert_eq!((stdout.as_str(), code), ("", 2));
     assert!(
-        stderr.contains("unexpected argument") || stderr.contains("unrecognized"),
+        stderr.starts_with("jq: Unknown option -x\n"),
         "stderr: {stderr:?}"
     );
 
@@ -2697,14 +2698,14 @@ fn test_negative_filter_boundary_characters_3389() -> Result<()> {
         "stderr: {stderr:?}"
     );
 
-    // Still rejected: second character is a letter or another `-`, so
-    // clap's own short-flag-bundle parsing (or long-flag matching) is
-    // exactly right here and must be left alone.
-    for filter in ["-x", "-n1", "--bogus"] {
+    // Still rejected: second character is a letter or another `-`, so the
+    // word is an option, and jq names the first letter it does not define
+    // (jq 1.8.2's in-order bundle parser, #7438).
+    for (filter, named) in [("-x", "-x"), ("-n1", "-1"), ("--bogus", "--bogus")] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
-        assert_ne!(code, 0, "`{filter}`: stdout={stdout:?}");
+        assert_eq!((stdout.as_str(), code), ("", 2), "`{filter}`");
         assert!(
-            stderr.contains("unexpected argument"),
+            stderr.starts_with(&format!("jq: Unknown option {named}\n")),
             "`{filter}`: stderr={stderr:?}"
         );
     }
@@ -2726,10 +2727,9 @@ fn test_negative_filter_unary_minus_as_binding_matches_jq_3397() -> Result<()> {
 }
 
 /// #3389's fix has two call sites: `succinctly jq`'s own subcommand
-/// dispatch (`parse_cli_allowing_negative_filter`, exercised by every test
-/// above) and the `sjq`/`jq` multi-call alias dispatch
-/// (`parse_allowing_negative_filter`, reached only when argv[0]'s file name
-/// is `sjq` or `jq` -- `try_multicall`). A symlink named `sjq` pointing at
+/// dispatch (exercised by every test above) and the `sjq`/`jq` multi-call
+/// alias dispatch (reached only when argv[0]'s file name is `sjq` or `jq` --
+/// `try_multicall`); both read argv through `walk_jq_argv` since #7438. A symlink named `sjq` pointing at
 /// the built binary reproduces that argv[0] the same way
 /// `install-aliases` does for real users.
 #[test]
@@ -2775,8 +2775,11 @@ fn test_negative_filter_accepted_via_sjq_multicall_alias_3389() -> Result<()> {
         Some(b"[1]"),
     )?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert_ne!(code, 0);
-    assert!(stderr.contains("unexpected argument"), "stderr: {stderr:?}");
+    assert_eq!(code, 2);
+    assert!(
+        stderr.starts_with("jq: Unknown option -x\n"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
