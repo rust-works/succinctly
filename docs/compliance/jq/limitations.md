@@ -371,7 +371,7 @@ jq 1.8.2 reads once more before it closes the array (jqlang/jq#3279, commit 4e30
 `succinctly jq` follows 1.8.2 for `--stream -s` and `--stream-errors -s`, with and without `-n`, over standard input and files, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
 This replaces the rule #5548 added, which matched 1.7.1.
 `input_filename` and `input_line_number` read where the array was closed, as they did.
-What the same upstream change does not reach here: a fault at the end of the text (`printf '[1,' | jq -s --stream .`) is raised and the array is not printed in 1.8.2, where 1.7.1 printed the array and then raised, and `succinctly jq` still prints the array first.
+What the same upstream change does not reach here: a text that ends in a fault (`printf '[1,' | jq -s --stream .`) is raised without the array in 1.8.2, where 1.7.1 printed the array and then raised, and `succinctly jq` still prints the array first; with `--stream-errors -s` the fault event that follows the array reads `input_filename` as the last file in 1.8.2 and as `null` here, and in that case the closing event keeps the 1.7.1 place too.
 `--seq` keeps the 1.7.1 model of the slurp loop, and so do the cases that read a directory in the middle of the file list.
 `succinctly yq` is not changed.
 Pinned by `tests/jq_cli/i7523.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).

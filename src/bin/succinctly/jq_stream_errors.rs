@@ -1112,8 +1112,9 @@ pub(crate) fn read_for_deferred_slurp(
     // jq 1.8 reads once more after the last byte before it closes the array (jqlang/jq#3279,
     // #7523), so the closing event its parser still held at that point is in the array. jq 1.7.1
     // gave it out after the array, as an input of its own. A run with a file that did not open keeps
-    // the 1.7.1 reads (`closer_in_array` is false).
+    // the 1.7.1 reads (`closer_in_array` is false), and so does one whose text ends in a fault.
     if closer_in_array
+        && after.len() == 1
         && matches!(after.first(), Some((_, Afterwards::Value(value, _))) if is_closing_event(value))
     {
         if let (_, Afterwards::Value(value, _)) = after.remove(0) {

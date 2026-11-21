@@ -24,13 +24,22 @@ const SLURPED: &[(&str, &str)] = &[
     ("[]", "[[[],[]]]\n"),
     ("{}", "[[[],{}]]\n"),
     ("[1,2] ", "[[[0],1],[[1],2],[[1]]]\n"),
-    ("[1,2]\n[3,4]", "[[[0],1],[[1],2],[[1]],[[0],3],[[1],4],[[1]]]\n"),
+    (
+        "[1,2]\n[3,4]",
+        "[[[0],1],[[1],2],[[1]],[[0],3],[[1],4],[[1]]]\n",
+    ),
     ("[1,2][3]", "[[[0],1],[[1],2],[[1]],[[0],3],[[0]]]\n"),
     ("[[1]]", "[[[0,0],1],[[0,0]],[[0]]]\n"),
     ("[true]", "[[[0],true],[[0]]]\n"),
-    ("[1,{\"a\":2}]", "[[[0],1],[[1,\"a\"],2],[[1,\"a\"]],[[1]]]\n"),
+    (
+        "[1,{\"a\":2}]",
+        "[[[0],1],[[1,\"a\"],2],[[1,\"a\"]],[[1]]]\n",
+    ),
     ("\"x\"", "[[[],\"x\"]]\n"),
-    ("[1,2]\n[3,4]\n", "[[[0],1],[[1],2],[[1]],[[0],3],[[1],4],[[1]]]\n"),
+    (
+        "[1,2]\n[3,4]\n",
+        "[[[0],1],[[1],2],[[1]],[[0],3],[[1],4],[[1]]]\n",
+    ),
     ("{\"a\":\"x\"}", "[[[\"a\"],\"x\"],[[\"a\"]]]\n"),
 ];
 
@@ -38,7 +47,11 @@ const SLURPED: &[(&str, &str)] = &[
 fn the_last_closing_event_is_in_the_slurped_array_7523() -> Result<()> {
     for (input, expected) in SLURPED {
         let (stdout, stderr, code) = run_jq_full(&["-c", "-s", "--stream", "."], Some(input))?;
-        assert_eq!((stdout.as_str(), code), (*expected, 0), "{input:?}: {stderr}");
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "{input:?}: {stderr}"
+        );
     }
     Ok(())
 }
@@ -47,10 +60,30 @@ fn the_last_closing_event_is_in_the_slurped_array_7523() -> Result<()> {
 /// the array is the only thing `input` and `inputs` have.
 const PROGRAMS: &[(&[&str], &str, &str, &str)] = &[
     (&["-c", "-s", "--stream"], "length", "[1,2]", "3\n"),
-    (&["-c", "-s", "--stream"], "[., input_line_number]", "[1,\n2]", "[[[[0],1],[[1],2],[[1]]],1]\n"),
-    (&["-c", "-n", "-s", "--stream"], "[inputs]", "[1,2]", "[[[[0],1],[[1],2],[[1]]]]\n"),
-    (&["-c", "-n", "-s", "--stream"], "[inputs]", "[1][2]", "[[[[0],1],[[0]],[[0],2],[[0]]]]\n"),
-    (&["-c", "-n", "-s", "--stream"], "input", "[1,2]", "[[[0],1],[[1],2],[[1]]]\n"),
+    (
+        &["-c", "-s", "--stream"],
+        "[., input_line_number]",
+        "[1,\n2]",
+        "[[[[0],1],[[1],2],[[1]]],1]\n",
+    ),
+    (
+        &["-c", "-n", "-s", "--stream"],
+        "[inputs]",
+        "[1,2]",
+        "[[[[0],1],[[1],2],[[1]]]]\n",
+    ),
+    (
+        &["-c", "-n", "-s", "--stream"],
+        "[inputs]",
+        "[1][2]",
+        "[[[[0],1],[[0]],[[0],2],[[0]]]]\n",
+    ),
+    (
+        &["-c", "-n", "-s", "--stream"],
+        "input",
+        "[1,2]",
+        "[[[0],1],[[1],2],[[1]]]\n",
+    ),
 ];
 
 #[test]
@@ -59,7 +92,11 @@ fn the_program_reads_one_array_with_the_last_closing_event_7523() -> Result<()> 
         let mut args = flags.to_vec();
         args.push(program);
         let (stdout, stderr, code) = run_jq_full(&args, Some(input))?;
-        assert_eq!((stdout.as_str(), code), (*expected, 0), "{flags:?} {program} on {input:?}: {stderr}");
+        assert_eq!(
+            (stdout.as_str(), code),
+            (*expected, 0),
+            "{flags:?} {program} on {input:?}: {stderr}"
+        );
     }
     Ok(())
 }

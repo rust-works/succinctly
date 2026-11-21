@@ -8383,13 +8383,15 @@ fn read_inputs(
         // parser still held at that point and gave out after the array, is in the array: `printf
         // '[1,2]' | jq -c -s --stream .` is one array of all three events. That is `--stream -s`
         // and `--stream-errors -s`. `--seq` keeps the 1.7.1 model of the loop, and so does a run
-        // with a file that did not open, whose reads this change has not been checked against.
+        // with a file that did not open and one whose text ends in a fault, which jq 1.8.2 reads
+        // differently too (an uncaught fault, a closed input's name), unchecked here.
         let inside = if (args.stream || args.stream_errors) && !args.seq && !any_open_failure {
             read.inside
                 + usize::from(
-                    values
-                        .get(read.inside)
-                        .is_some_and(crate::cli::jq_stream_errors::is_closing_event),
+                    values.len() == read.inside + 1
+                        && values
+                            .get(read.inside)
+                            .is_some_and(crate::cli::jq_stream_errors::is_closing_event),
                 )
         } else {
             read.inside

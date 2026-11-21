@@ -2,6 +2,8 @@
 //! and keeps reading, and `-b` is accepted and ignored. Every row's expected text was captured
 //! from jq 1.7.1 (`/usr/bin/jq`); `scripts/jq-stream-errors-oracle-sweep.py` ran many more random
 //! malformed inputs through both binaries.
+//! Pin moved (#7523): a `--stream -s` row whose closing event jq 1.7.1 gave out after the array is jq
+//! 1.8.2's answer, with the event in the array.
 
 use anyhow::Result;
 
@@ -79,7 +81,7 @@ fn test_stream_errors_slurp_leaves_what_the_last_call_left_pending_outside_5474(
     // closing event the same byte leaves behind is handed out after the slurped array.
     assert_eq!(
         stream_errors("[1,2]", &["-s"])?,
-        ("[[[0],1],[[1],2]]\n[[1]]\n".to_string(), 0)
+        ("[[[0],1],[[1],2],[[1]]]\n".to_string(), 0)
     );
     assert_eq!(
         stream_errors("[1,2]\n", &["-s"])?,
