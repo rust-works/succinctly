@@ -11660,18 +11660,18 @@ thread_local! {
     static LAZY_RAW_MIN_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-/// The lone regular file `-R` reads a window at a time (#7023), opened, with its length; or `None` for
-/// a run that is not one. `-R` is a line reader, so it needs no more of the text before a line than
-/// the number of line breaks, which the producer keeps as it goes, and a stream of lines has no fault
-/// to word: every flag that has the route read the stream whole (`--slurp`, `--validate`, DSV), and
-/// every shape [`lone_regular_file`] turns down, keeps the route that reads it whole.
-fn lone_raw_windowed_file(args: &JqCommand, files: &[PathBuf]) -> Option<(std::fs::File, u64)> {
+/// The lone regular file `-R` reads a window at a time (#7023), opened; or `None` for a run that is not
+/// one. `-R` is a line reader, so it needs no more of the text before a line than the number of line
+/// breaks, which the producer keeps as it goes, and a stream of lines has no fault to word: every flag
+/// that has the route read the stream whole (`--slurp`, `--validate`, DSV), and every shape
+/// [`lone_regular_file`] turns down, keeps the route that reads it whole. The file is read to the end it
+/// has when the reads get there, not to the length `stat` gave here, as jq reads it (#7446).
+fn lone_raw_windowed_file(args: &JqCommand, files: &[PathBuf]) -> Option<std::fs::File> {
     if !raw_window_flags(args) {
         return None;
     }
-    let (path, meta) = lone_regular_file(files, raw_window_min_bytes())?;
-    let file = std::fs::File::open(path).ok()?;
-    Some((file, meta.len()))
+    let (path, _) = lone_regular_file(files, raw_window_min_bytes())?;
+    std::fs::File::open(path).ok()
 }
 
 /// Whether `-R` may read its source a window at a time: every flag that has the route read the stream
@@ -11752,8 +11752,9 @@ fn raw_windowed_source(args: &JqCommand, files: &[PathBuf]) -> Option<RawWindowe
             None
         };
     }
-    let (file, len) = lone_raw_windowed_file(args, files)?;
-    Some((Box::new(file), Some(len), Vec::new()))
+    // No length: the file is read to the end it has when the reads get there (#7446).
+    let file = lone_raw_windowed_file(args, files)?;
+    Some((Box::new(file), None, Vec::new()))
 }
 
 /// Standard input for `-R` (#7024) when it is a regular file with [`raw_window_min_bytes`] or more left
@@ -11972,7 +11973,9 @@ type WindowedSource = (
 /// The source [`windowed_plain_file`] and [`windowed_seq_file`] read a window at a time, once their own
 /// flags have let the run through: a regular file of `min` bytes or more named on the command line
 /// (4 MiB for the plain route, [`window::min_windowed_seq_file_bytes`] for `--seq`, #7260), several
-/// regular files (4 MiB or more between them), or standard input when it is one (#7024).
+/// regular files (4 MiB or more between them), or standard input when it is one (#7024). Each file is
+/// read on past the length `stat` gives here, to the end it has when the reads get there, as jq reads it
+/// (#7446); a `--seq` stream stops at that length, which its prepass vouched for.
 fn windowed_source(args: &JqCommand, min: u64) -> Option<WindowedSource> {
     let files = get_input_files(args);
     if files.is_empty() {
@@ -14439,7 +14442,6 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     #[cfg(test)]
     LONE_START_READ.with(|n| n.set(bytes.len()));
     if let Some((chunk, bom, valid_end)) = more {
-        // What the reader has read of the source, which is what is left of it to the windows.
         let read_len = bytes.len();
         let pending = bytes.split_off(valid_end);
         bytes.drain(..bom);
@@ -14452,8 +14454,9 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                         windows: {
                             let windows = window::LineWindows::new(
                                 reader,
-                                // A file's length is known; stdin ends at a short read.
-                                (!from_stdin).then(|| (capacity - read_len) as u64),
+                                // No length: a file is read to the end it has when the reads get
+                                // there, as jq reads it (#7446), and stdin ends at a short read.
+                                None,
                                 lazy_window_bytes(),
                                 pending,
                             );
