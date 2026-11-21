@@ -43,7 +43,7 @@ use super::array_index;
 use super::document::{
     effective_fields, effective_fields_checked, effective_fields_checked_iter, effective_keys,
     effective_len_checked, key_display_string, key_display_string_kind, tail_gap_ok,
-    DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields, EffectiveFields,
+    DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields,
 };
 use super::glob::yq_match_key;
 use super::key_index;
@@ -22080,16 +22080,10 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             //
             // #7260: jq mode walks the fields without `effective_fields_checked`'s list, which on a
             // wide object was half this builtin's peak (`effective_fields_checked_iter`); yq mode
-            // indexes the list below, so it keeps it.
-            let checked = if S::COLLAPSE_DUPLICATE_KEYS {
-                effective_fields_checked_iter(&fields, true)
-            } else {
-                effective_fields_checked(&fields, false).map(EffectiveFields::listed)
-            };
-            let checked = match checked {
-                Ok(f) => f,
-                Err(e) => return QueryResult::Error(e),
-            };
+            // indexes the list below, so it keeps it, as the `Vec` itself (#7406: wrapped in the
+            // walk's iterator and collected back, the list was copied, both copies live at once).
+            // Each mode's check runs below, before `f` runs on any field.
+            //
             // `f` on one value: the first output, none, or the control to surface (object construction
             // is atomic in jq -- see `eval_object_construction` -- so a `Partial` surfaces its control).
             let rewrite =
@@ -22139,6 +22133,10 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 };
             if S::COLLAPSE_DUPLICATE_KEYS {
+                let checked = match effective_fields_checked_iter(&fields, true) {
+                    Ok(walk) => walk,
+                    Err(e) => return QueryResult::Error(e),
+                };
                 // `checked` is already collapsed: one pass, each key checked as it is inserted.
                 let mut result_map = FieldMap::with_capacity(checked.len());
                 let mut guard = DisplayKeyGuard::default();
@@ -22163,7 +22161,10 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 return QueryResult::Owned(OwnedValue::Object(result_map.into()));
             }
 
-            let checked: Vec<_> = checked.collect();
+            let checked = match effective_fields_checked(&fields, false) {
+                Ok(list) => list,
+                Err(e) => return QueryResult::Error(e),
+            };
             // The display key of every field, then which occurrence of each key is its live (last)
             // one. yq's `map_values` rewrites that entry and leaves a repeated key's earlier entries
             // as they were (ADR-0027, #1344); jq mode's `checked` is already collapsed, so every
@@ -26582,11 +26583,20 @@ fn quote_csv_field<S: EvalSemantics>(s: &str) -> String {
 /// `@tsv` and `@html` (confirmed live against jq 1.7.1; `@uri`/`@base64`/
 /// `@text`/`@json` already agree). yq passes the NUL through raw (confirmed
 /// against yq v4.x), so the rewrite is jq-mode only.
+///
+/// The one definition of that rule (#7406): what a NUL is written as, or `None` where it is kept
+/// raw. [`escape_nul`] and the single-pass writers that escape other bytes as they go
+/// ([`push_tsv_escaped`], [`format_html`]) all read it here, so they cannot drift apart.
+#[inline]
+fn nul_escape<S: EvalSemantics>() -> Option<&'static str> {
+    (S::TAG != EvalTag::Yq).then_some("\\0")
+}
+
+/// `s` with every NUL written as [`nul_escape`] says.
 fn escape_nul<S: EvalSemantics>(s: &str) -> Cow<'_, str> {
-    if S::TAG != EvalTag::Yq && s.contains('\0') {
-        Cow::Owned(s.replace('\0', "\\0"))
-    } else {
-        Cow::Borrowed(s)
+    match nul_escape::<S>() {
+        Some(escape) if s.contains('\0') => Cow::Owned(s.replace('\0', escape)),
+        _ => Cow::Borrowed(s),
     }
 }
 
@@ -26812,7 +26822,10 @@ fn push_tsv_escaped<S: EvalSemantics>(out: &mut String, s: &str) {
             b'\t' => "\\t",
             b'\n' => "\\n",
             b'\r' => "\\r",
-            0 if S::TAG != EvalTag::Yq => "\\0",
+            0 => match nul_escape::<S>() {
+                Some(escape) => escape,
+                None => continue,
+            },
             _ => continue,
         };
         out.push_str(&s[from..at]);
@@ -27103,7 +27116,10 @@ fn format_html<S: EvalSemantics>(value: &OwnedValue, _optional: bool) -> Result<
             // jq 1.7.1 spells it `&apos;`, not `&#39;` (#5297).
             b'\'' => "&apos;",
             // #5302: jq mode renders U+0000 as `\0`; yq keeps it raw.
-            0 if S::TAG != EvalTag::Yq => "\\0",
+            0 => match nul_escape::<S>() {
+                Some(escape) => escape,
+                None => continue,
+            },
             _ => continue,
         };
         if start < i {
@@ -144011,6 +144027,13 @@ mod tests {
         query!(br"[1 2, 3]", "map_values(.+1)",
             QueryResult::Error(_) => {}
         );
+        // #7406: yq mode takes its own field list, and raises on the same members.
+        yq_query!(br#"{"a" 1, "b": 2}"#, "map_values(. + 1)",
+            QueryResult::Error(_) => {}
+        );
+        yq_query!(br#"{"a": 1, "b": 2,}"#, "map_values(. + 1)",
+            QueryResult::Error(_) => {}
+        );
         // Positive control: a well-formed array is unaffected.
         query!(br"[1, 2, 3]", "map_values(.+1)",
             QueryResult::Owned(OwnedValue::Array(arr)) => assert_eq!(arr.len(), 3)
@@ -145875,6 +145898,46 @@ mod tests {
                 assert_eq!(s, r"\t\n\r\\");
             }
         );
+    }
+
+    /// #7406: the single-pass writers that escape a NUL among other bytes (`@tsv`'s
+    /// `push_tsv_escaped`, `@html`) write it as `escape_nul` does, in both modes: `\0` in jq mode,
+    /// raw in yq mode. `@tsv`'s writer is pinned to the per-field definition it replaced (four
+    /// `replace`s, then `escape_nul`), and `@html` to `escape_nul` on text with no entity, so that
+    /// a change to the rule in one writer and not the others fails here.
+    #[test]
+    fn nul_rule_is_one_rule_across_the_writers_7406() {
+        fn per_field<S: EvalSemantics>(s: &str) -> String {
+            escape_nul::<S>(
+                &s.replace('\\', "\\\\")
+                    .replace('\t', "\\t")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r"),
+            )
+            .into_owned()
+        }
+        fn check<S: EvalSemantics>(nul: &str) {
+            for s in [
+                "",
+                "\0",
+                "\0\0",
+                "a\0b",
+                "\0\t\0\n\0\r\0\\\0",
+                "\\0",
+                "é\0ü\u{1}\u{1f}\u{7f}",
+                "plain",
+            ] {
+                let mut row = String::new();
+                push_tsv_escaped::<S>(&mut row, s);
+                assert_eq!(row, per_field::<S>(s), "{s:?}");
+                assert_eq!(escape_nul::<S>(s), s.replace('\0', nul), "{s:?}");
+                // None of these holds a byte `@html` writes as an entity.
+                let html = format_html::<S>(&OwnedValue::String(s.into()), false).unwrap();
+                assert_eq!(html, escape_nul::<S>(s), "{s:?}");
+            }
+        }
+        check::<JqSemantics>("\\0");
+        check::<YqSemantics>("\0");
     }
 
     #[test]

@@ -4400,6 +4400,22 @@ pub(crate) fn stream_len<F: DocumentFields>(fields: &F, collapse: bool) -> Optio
     }
 }
 
+/// How many fields `fields`' raw walk holds, counted by the key-only walk: no value is resolved, no
+/// key is hashed and nothing is checked (#7406).
+///
+/// For a caller that walks every field under no collapse (yq mode's `to_entries`), which needs the
+/// count only to size its result and runs the list's own checks as it walks, so that
+/// [`stream_len`]'s census would decide nothing for it.
+pub(crate) fn raw_walk_len<F: DocumentFields>(fields: &F) -> usize {
+    let mut count = 0usize;
+    let mut walk = fields.clone();
+    while let Some((_, _, rest)) = walk.uncons_key() {
+        count += 1;
+        walk = rest;
+    }
+    count
+}
+
 /// The fields of [`effective_fields_checked_iter`]: a walk of the object, or the list.
 pub struct EffectiveFields<F: DocumentFields> {
     inner: EffectiveFieldsInner<F>,
