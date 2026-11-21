@@ -3,11 +3,13 @@
 Run directly (`python3 scripts/test_jq_seq_oracle_sweep.py`) or via
 `python3 -m unittest scripts/test_jq_seq_oracle_sweep.py`.
 
-They pin #7256: jq 1.7.1's `check_literal` compares `tokenbuf[1]` with `u` for a bare `n`, and
-when no earlier token has written index 1 that is uninitialised heap, which differs between
-libc allocators (Linux aarch64 holds `u`; macOS and x86_64 glibc do not). The sweep has to skip
-exactly those streams: skipping fewer leaves a flake on one platform, skipping more stops
-checking the case it can check, a byte an earlier token left (#1723, #6513).
+They pin #7256 and #7525: jq 1.7.1's `check_literal` compares `tokenbuf[1]` with `u` for a bare
+`n`. When no earlier token has written index 1 that is uninitialised heap, which differs between
+libc allocators (Linux aarch64 holds `u`; macOS and x86_64 glibc do not), and when an earlier
+token left a `u` there 1.7.1 says "Invalid literal". jq 1.8.2 and `succinctly jq` never read the
+byte (`tokenpos > 1`, jqlang/jq#3324), so against the pinned 1.7.1 the sweep has to skip exactly
+those streams: skipping fewer leaves a flake, skipping more stops checking the case it can check,
+a bare `n` after a byte that is not `u` (#1723, #6513).
 
 Imported via `importlib` rather than `import`: the script's filename has hyphens.
 """
@@ -38,35 +40,44 @@ class UnwrittenTokenbufTests(unittest.TestCase):
         for data in (b"\x1et n", b"\x1ef n", b"\x1e[ ] n", b"\x1e\"\" n", b"\x1e\"a\" n"):
             self.assertTrue(sweep.reads_unwritten_tokenbuf(data), data)
 
-    def test_earlier_token_that_wrote_index_1_is_checked_not_skipped(self):
+    def test_earlier_token_that_wrote_a_byte_other_than_u_is_checked_not_skipped(self):
         for data in (
-            b"\x1enul n\n",  # a literal of two or more bytes
-            b"\x1e12 n\n",  # a number of two or more bytes
+            b"\x1enan n\n",  # a token of two or more bytes leaves its second byte
+            b"\x1e12 n\n",
             b"\x1e1 n\n",  # a one-byte number NUL-terminates in place, at index 1
             b"\x1ex n\n",  # so does any other one-byte token off the keyword path
-            b"\x1e\"ab\" n\n",  # a string of two or more bytes
-            b"\x1e\"iu\" n\n",
         ):
             self.assertFalse(sweep.reads_unwritten_tokenbuf(data), data)
+
+    def test_earlier_token_that_left_a_u_is_skipped_7525(self):
+        # 1.7.1 says "Invalid literal" for the `n`; 1.8.2 and succinctly say "Invalid numeric literal".
+        for data in (
+            b"\x1enul n\n",  # a literal whose second byte is `u`
+            b"\x1enull n\n",
+            b"\x1e\"iu\" n\n",  # the issue's repro: a string of two or more bytes may leave one
+            b"\x1e\"ab\" n\n",  # (what it leaves is its decoded text, not worked out here)
+        ):
+            self.assertTrue(sweep.reads_unwritten_tokenbuf(data), data)
 
     def test_only_the_first_bare_n_is_exposed(self):
         # The first reads the heap; it leaves its own NUL at index 1 for the second.
         self.assertTrue(sweep.reads_unwritten_tokenbuf(b"\x1en n\n"))
         self.assertFalse(sweep.reads_unwritten_tokenbuf(b"\x1e1 n n\n"))
+        self.assertFalse(sweep.reads_unwritten_tokenbuf(b"\x1e12 n n\n"))
 
     def test_string_writes_its_raw_bytes_and_an_rs_ends_it(self):
         # `"\\u0041"` decodes to one byte but leaves its raw `u` at index 1 (#6513).
-        self.assertFalse(sweep.reads_unwritten_tokenbuf(b'\x1e"\\u0041" n\n'))
-        self.assertFalse(sweep.reads_unwritten_tokenbuf(b'\x1e"a\\nbcd" n\n'))
+        self.assertTrue(sweep.reads_unwritten_tokenbuf(b'\x1e"\\u0041" n\n'))
+        self.assertTrue(sweep.reads_unwritten_tokenbuf(b'\x1e"a\\nbcd" n\n'))
         # An unclosed string was `tokenadd`ed all the same, up to the RS that ends it...
-        self.assertFalse(sweep.reads_unwritten_tokenbuf(b'\x1e"ab\x1en'))
+        self.assertTrue(sweep.reads_unwritten_tokenbuf(b'\x1e"ab\x1en'))
         # ...but a string of one byte before the RS wrote nothing, and the RS is not its content.
         self.assertTrue(sweep.reads_unwritten_tokenbuf(b'\x1e"a\x1en'))
         self.assertTrue(sweep.reads_unwritten_tokenbuf(b'\x1e"\\\x1en'))
 
     def test_a_parse_error_does_not_skip_what_follows(self):
-        # jq resets the parser at an error and reads on, so the `ab` after `]` is tokenised.
-        self.assertFalse(sweep.reads_unwritten_tokenbuf(b"\x1e]ab\x1en"))
+        # jq resets the parser at an error and reads on, so the `xy` after `]` is tokenised.
+        self.assertFalse(sweep.reads_unwritten_tokenbuf(b"\x1e]xy\x1en"))
 
     def test_streams_without_a_bare_n_are_not_artifacts(self):
         for data in (b"\x1e1\n", b"\x1enul\n", b"\x1enan\n", b"\x1enull\n", b"\x1e[1,2]\n", b"\x1ea n1\n"):
@@ -84,7 +95,7 @@ class UnwrittenTokenbufTests(unittest.TestCase):
     def test_artifact_is_what_expect_artifacts_turns_off(self):
         # `main()` calls `artifact()` only without `--expect-artifacts`; the stream still runs there.
         self.assertTrue(sweep.artifact(b"\x1en\n"))
-        self.assertFalse(sweep.artifact(b"\x1enul n\n"))
+        self.assertFalse(sweep.artifact(b"\x1enan n\n"))
 
 
 if __name__ == "__main__":

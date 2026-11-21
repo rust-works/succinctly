@@ -209,23 +209,20 @@ fn a_seq_file_with_a_cut_record_first_or_last_7262() -> Result<()> {
 }
 
 /// What the records before the turn leave in jq's reader decides how the turn reads: a bare `n` after a
-/// token whose second byte is `u` takes the keyword path ("Invalid literal"), and the number path after
-/// any other; a file that ends in an RS straight after its last record ends there (#2998). jq 1.7.1's
+/// token whose second byte is `u` took the keyword path ("Invalid literal") in jq 1.7.1, which read the
+/// stale byte; jq 1.8.2 does not (#7525), so a bare `n` is the number path after any token; a file that ends in an RS straight after its last record ends there (#2998). jq 1.8.2's
 /// output for each.
 #[test]
 fn a_seq_file_turns_with_what_its_records_left_7262() -> Result<()> {
     let head = records(0..RECORDS);
     // The line of the bare `n`: the records, the record before it, and its own.
     let line = RECORDS + 3;
-    let literal = format!(
-        "jq: ignoring parse error: Invalid literal at line {line}, column 0 (need RS to resync)\n"
-    );
     let numeric = format!(
         "jq: ignoring parse error: Invalid numeric literal at line {line}, column 0 (need RS to resync)\n"
     );
     let cases: [(&str, &str, &str); 4] = [
-        ("\x1e[\"x\\u0075\"]\n\x1en\n", "\x1e[\"xu\"]\n", &literal),
-        ("\x1enull\n\x1en\n", "\x1enull\n", &literal),
+        ("\x1e[\"x\\u0075\"]\n\x1en\n", "\x1e[\"xu\"]\n", &numeric),
+        ("\x1enull\n\x1en\n", "\x1enull\n", &numeric),
         ("\x1e7\n\x1en\n", "\x1e7\n", &numeric),
         ("\x1e12.5", "", ""),
     ];
