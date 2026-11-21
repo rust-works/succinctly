@@ -16664,6 +16664,11 @@ fn owned_state_expr_shape_in(expr: &Expr, calls: bool) -> bool {
             else_branch,
         } => shape(cond) && shape(then_branch) && shape(else_branch),
         Expr::Builtin(Builtin::ToString | Builtin::Type) => true,
+        // #7473: `"k\(.i)"`, each slot one value, so the string is one.
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => shape(inner),
+        }),
         // #6122: `map(.a)`, `map(.a.b)`, `map(.[0])` is one array and no effect: one output per
         // element from static steps, which [`eval_owned_map_projection`] reads off the tree, or
         // raises on, and a raise declines the write to the evaluator's own route and text.
@@ -16823,8 +16828,79 @@ fn owned_state_scalar_direct<S: EvalSemantics>(
     if let Some(length) = owned_state_length_direct::<S>(expr, state) {
         return Some(length);
     }
+    if is_state_text_shape(expr) {
+        return owned_state_text_direct::<S>(expr, state);
+    }
     let value = eval_owned_pure::<S>(expr, state, ResultPosition::Operand)?.ok()?;
     owned_scalar_spelled_the_same(&value).then_some(value)
+}
+
+/// A string built from scalars read off the state (#7473), for [`owned_state_scalar_direct`]: a
+/// string interpolation whose every slot is such a scalar (`"k\(.i)"`, `"\(.a)-\(.b + 1)"`), or
+/// `READ | tostring` of one (`.i | tostring`). Each slot is rendered by [`owned_to_string`] and
+/// `tostring` by [`tostring_text`], the texts the evaluator's own interpolation and `tostring` make
+/// of a scalar. A loop that keys its state by one (`until(..; .p["k\(.i)"] = 1 | .i += 1)`,
+/// `(.i | tostring) as $k | .p[$k] = ..`) read the key on a re-indexed copy of the whole state,
+/// or declined the round to the evaluator's route, every round: quadratic in the rounds where jq
+/// is linear. Asked only of an [`is_state_text_shape`] expression; `None` is a slot or a read that
+/// is not such a scalar (a container, a read that raises), which declines to the caller's route.
+fn owned_state_text_direct<S: EvalSemantics>(
+    expr: &Expr,
+    state: &OwnedValue,
+) -> Option<OwnedValue> {
+    match unwrap_paren(expr) {
+        Expr::StringInterpolation(parts) => owned_state_interpolation_direct::<S>(parts, state),
+        Expr::Pipe(stages) => match stages.split_last() {
+            Some((_, reads)) => {
+                // A read of static steps is borrowed off the tree, as `length`'s is
+                // ([`owned_state_length_direct`]); a lone computed read is a scalar of its own.
+                let borrowed = reads.iter().try_fold(state, |at, read| {
+                    owned_assign_step_child(&static_step(unwrap_paren(read))?, at)
+                });
+                let value = match (borrowed, reads) {
+                    (Some(value), _) => owned_scalar_spelled_the_same(value).then(|| value.clone()),
+                    (None, [read]) => owned_state_scalar_direct::<S>(read, state),
+                    (None, _) => None,
+                };
+                value.map(|value| match value {
+                    OwnedValue::String(_) => value,
+                    other => OwnedValue::String(tostring_text::<S>(&other, false).into()),
+                })
+            }
+            None => None,
+        },
+        _ => None,
+    }
+}
+
+/// The shapes [`owned_state_text_direct`] answers: a string interpolation, or a pipe of one or more
+/// reads ending in `tostring`.
+fn is_state_text_shape(expr: &Expr) -> bool {
+    match unwrap_paren(expr) {
+        Expr::StringInterpolation(_) => true,
+        Expr::Pipe(stages) => stages.split_last().is_some_and(|(last, reads)| {
+            !reads.is_empty() && matches!(unwrap_paren(last), Expr::Builtin(Builtin::ToString))
+        }),
+        _ => false,
+    }
+}
+
+/// [`owned_state_text_direct`]'s string interpolation: each slot a scalar read off the state, or
+/// `None`.
+fn owned_state_interpolation_direct<S: EvalSemantics>(
+    parts: &[StringPart],
+    state: &OwnedValue,
+) -> Option<OwnedValue> {
+    let mut text = String::new();
+    for part in parts {
+        match part {
+            StringPart::Literal(literal) => text.push_str(literal),
+            StringPart::Expr(inner) => text.push_str(&owned_to_string::<S>(
+                &owned_state_scalar_direct::<S>(inner, state)?,
+            )),
+        }
+    }
+    Some(OwnedValue::String(text.into()))
 }
 
 /// `length`, or `READ | length` with `READ` a pure read ([`eval_owned_pure`]), of a container, a
