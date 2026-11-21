@@ -1,4 +1,8 @@
 //! #5024: a collect INIT (`[.a]`, `[.[]?]`) of a `foreach` or `reduce` leaves jq's register where the fold entered.
+//!
+//! #7519: a row whose `foreach` has a multi-output INIT pins jq 1.8.2's answer, not 1.7.1's: jq 1.8 runs every
+//! INIT output's SOURCE on the real input (jqlang/jq#3266, a bug fix `succinctly jq` follows), where 1.7.1 ran the
+//! later ones on `null`. The other rows are 1.7.1's, which 1.8.2 answers alike.
 
 use anyhow::Result;
 
@@ -48,9 +52,9 @@ fn test_5024_collect_init_leaves_the_register_where_the_foreach_entered() -> Res
         (
             r"{}",
             r"path(. as $x | foreach (.,.a?) as $i (([.a], .); null; $i))",
-            "[]\n[\"a\"]\n",
-            r"Invalid path expression with result null",
-            5,
+            "[]\n[\"a\"]\n[]\n[\"a\"]\n",
+            "",
+            0,
         ),
         (
             r"true",
@@ -393,7 +397,8 @@ fn test_5024_collect_init_leaves_the_register_where_the_foreach_entered() -> Res
 
 /// #5024: a collect piped into a generator (`paths`, `tostream`) or a variable stage forks the INIT or reaches a node the
 /// register may be on, so it keeps the reading it had: each row answers as jq does or refuses. Each row is `(input,
-/// filter, jq 1.7.1's stdout, jq's exit code)`.
+/// filter, jq's stdout, jq's exit code)`: jq 1.7.1's, but jq 1.8.2's for the first three, whose `foreach` forks INIT
+/// (#7519; 1.7.1 answered `[]`, `[]` and refused the third).
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5024_collect_piped_into_a_generator_or_variable_never_answers_where_jq_differs(
@@ -402,20 +407,20 @@ fn test_5024_collect_piped_into_a_generator_or_variable_never_answers_where_jq_d
         (
             r#"{"a":[1]}"#,
             r"[del(. as $x | foreach (.,.a?) as $i ([.a] | paths; $i; .a?))?]",
-            "[]\n",
+            "[{}]\n",
             0,
         ),
         (
             r#"{"a":[1]}"#,
             r"[del(. as $x | foreach (.,.a?) as $i ([.a] | paths; $x; $i))?]",
-            "[]\n",
+            "[null]\n",
             0,
         ),
         (
             r#"{"a":1,"b":2}"#,
             r"(. as $x | foreach (.) as $i ([.a] | tostream; $i; .a?)) |= 5",
-            "",
-            5,
+            "{\"a\":5,\"b\":2}\n",
+            0,
         ),
         (
             r"null",

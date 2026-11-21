@@ -8194,7 +8194,7 @@ mod tests {
             b"[null",
             b"[nan",
             b"[-nan",
-            b"[Nan4000",
+            b"[Nan0",
             b"[Infinity",
             b"[-Infinity",
             b"[1 ",
@@ -14409,8 +14409,8 @@ mod tests {
             ("NaN", None, None),
             ("-nan", None, None),
             ("+nan", None, None),
-            ("nan1", None, None),
-            ("sNaN12", None, None),
+            ("nan0", None, None),
+            ("sNaN0", None, None),
             ("inf", Some(f64::INFINITY), None),
             ("Infinity", Some(f64::INFINITY), None),
             ("iNfInItY", Some(f64::INFINITY), None),
@@ -14547,7 +14547,7 @@ mod tests {
         // ... while a valid signed word is the whole word.
         assert_eq!(nested_number_span(b"[-inf]", 1), 5);
         assert_eq!(nested_number_span(b"[+nan]", 1), 5);
-        assert_eq!(nested_number_span(b"[sNaN12,1]", 1), 7);
+        assert_eq!(nested_number_span(b"[sNaN0,1]", 1), 6);
         // A `+digit` span is exactly what the greedy class already gave.
         assert_eq!(nested_number_span(b"[+1.2.3]", 1), 7);
         assert_eq!(nested_number_span(b"[+1e0e0]", 1), 7);
@@ -14570,8 +14570,8 @@ mod tests {
             (&b"nan"[..], 3),
             (b"nan 1", 3),
             (b"nan\n", 3),
-            (b"NaN5,", 4),
-            (b"sNaN12]", 6),
+            (b"NaN0,", 4),
+            (b"sNaN0]", 5),
             (b"-Infinity}", 9),
             (b"+inf\"", 4),
             (b"inf:", 3),

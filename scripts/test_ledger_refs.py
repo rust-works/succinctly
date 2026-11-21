@@ -129,12 +129,14 @@ class EntryPathTests(unittest.TestCase):
             ("features/strftime.1.toml", "features:strftime/1"),
             ("features/get_jq_origin.0.toml", "features:get_jq_origin/0"),
             ("since-secondary/add.1.toml", "since-secondary:add/1"),
+            ("upstream-jq.test/1942.toml", "upstream-jq.test:1942"),
         ]:
             self.assertEqual(ledger_refs.entry_id(rel), id_)
             self.assertEqual(rel_of(id_), rel)
 
     def test_a_path_no_id_maps_to_has_none(self):
-        for rel in ["README.md", "cli/a.txt", "a.toml", "cli/sub/a.toml", "cli/a b.toml", "cli/.toml"]:
+        for rel in ["README.md", "cli/a.txt", "a.toml", "cli/sub/a.toml", "cli/a b.toml", "cli/.toml",
+                    ".hidden/a.toml", "upstream-jq.test/a.b.toml"]:
             self.assertIsNone(ledger_refs.entry_id(rel), rel)
 
     def test_the_single_file_shape_is_still_read_for_a_base_before_the_split(self):

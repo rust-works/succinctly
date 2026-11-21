@@ -179,6 +179,9 @@ lexer has no such format (#5444).
 `\(E)` slot through the format before splicing it in — jq's own `gen_format` desugar,
 `@base64 "v=\(1)"` => `"v=MQ=="` — while the literal text passes through unchanged. A
 literal with no interpolation never runs the format at all (`@base64 "abc"` => `"abc"`).
+Such a string goes wherever jq takes a plain one: as a field step after `.` (`.@base64 "x"`
+is `.x`, `.a.@json "k\(1)"` is `.a["k1"]`), an object key or shorthand, an object-pattern key
+(`. as {@base64 "c": $c}`) and an `import`/`include` path (#7456).
 yq's lexer rejects a format followed by a string outright, and `succinctly yq` matches
 that unchanged (#3316).
 

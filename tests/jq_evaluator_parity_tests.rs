@@ -2061,8 +2061,9 @@ fn test_parity_positive_index_trailing_comma_2312() {
 }
 
 /// #2163, closed by #3895: `foreach`/`reduce`'s INIT-fork re-entry (real jq
-/// re-evaluates SOURCE against `null` for every INIT fork after the first,
-/// and so does succinctly — see `docs/compliance/jq/limitations.md`'s
+/// re-evaluates a `reduce`'s SOURCE against `null` for every INIT fork after the
+/// first, and so does succinctly; a `foreach`'s reads the real input, as jq 1.8.2's
+/// does, #7519 — see `docs/compliance/jq/limitations.md`'s
 /// "INIT-fork re-entry" entry and `eval.rs`'s
 /// `test_foreach_reduce_init_fork_source_reads_null_after_first_fork_2163`). Both
 /// front ends here (`full_outputs`/`generic_outputs`) ultimately dispatch to
@@ -3117,7 +3118,8 @@ fn test_float_literal_rounding_agrees_across_evaluators_2936() {
         (".a + 0", "2.7293109604053565"),
         (".a * 1", "2.7293109604053565"),
         (".a | sqrt", "1.6520626381603563"),
-        (".a | length", "2.7293109604053565"),
+        // jq 1.8.2 keeps the literal (jqlang/jq#3275, #7534); jq 1.7.1 printed the double.
+        (".a | length", "2.7293109604053567083"),
         (".a | fabs", "2.7293109604053565"),
         (".a == (2.729310960405357 + 0)", "false"),
         (".a < (2.729310960405357 + 0)", "true"),

@@ -691,6 +691,25 @@ fn yq_string_interpolations_are_closed(rest: &str) -> bool {
     true
 }
 
+/// Length in bytes of the exponent that starts `rest`, `[eE][+-]?[0-9]+`, or 0 when `rest` does
+/// not start one. jq's lexer matches the longest number token, so an `e` that no digit follows
+/// ends the number before it and starts the next token (`2else`, `3end`, #7496).
+fn number_exponent_len(rest: &[u8]) -> usize {
+    if !matches!(rest.first(), Some(b'e' | b'E')) {
+        return 0;
+    }
+    let sign = usize::from(matches!(rest.get(1), Some(b'+' | b'-')));
+    let digits = rest[1 + sign..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        0
+    } else {
+        1 + sign + digits
+    }
+}
+
 /// `text` with the redundant leading zeros of its integer part dropped (`007.50` is `7.50`,
 /// `-00e1` is `-0e1`, `00` is `0`), or `None` when it has none (#5615).
 fn strip_redundant_leading_zeros(text: &str) -> Option<String> {
@@ -737,8 +756,20 @@ fn begins_yq_name_outside_an_identifier(c: char) -> bool {
 /// decided to call it -- exactly the "duplicated predicates diverge
 /// silently" failure mode CLAUDE.md's #106 note warns about, now closed by
 /// having one definition instead of three hand-kept copies).
+///
+/// ASCII only (#7433): jq's identifier is `[a-zA-Z_][a-zA-Z_0-9]*` and a letter such as `é` or
+/// `中` is an `INVALID_CHARACTER` in a field name, a `def` name, a `$variable`, an object key
+/// or an import alias (exit 3); yq's lexer rejects them too, except in the unquoted path
+/// element after a `.`, which [`is_yq_path_element_char`] reads. A quoted name takes any text.
 fn is_ident_start_char(c: char) -> bool {
-    c.is_alphabetic() || c == '_'
+    c.is_ascii_alphabetic() || c == '_'
+}
+
+/// The one definition of "does this character continue a bare identifier": the characters of
+/// [`is_ident_start_char`] and the digits. Every identifier scan reads it, so none of them can
+/// take a letter the others refuse (#7433, #106).
+fn is_ident_continue_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 /// `with(PATH; UPDATE)` once its arguments are read: a metadata assignment in the update is a stage
@@ -1608,7 +1639,7 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
     // at all without succinctly's own extension -- a mode-blind superset
     // only ever widens the (already-imprecise) set, never narrows it.
     fn is_ident_continue(c: char) -> bool {
-        c.is_alphanumeric() || c == '_' || c == '-'
+        is_ident_continue_char(c) || c == '-'
     }
 
     // #2036 review round 2's comment-skip loop, factored out so the
@@ -1723,13 +1754,9 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
         // before the walk inspects what follows it, and the walk bails
         // (keeping whatever it already collected) the moment a token isn't
         // `IDENT` followed by `;`/`,`/`)`, so an unclosed list costs at
-        // most its own length, never a scan of everything after it. `,` is
-        // accepted alongside `;` to match `Parser::parse_func_params`'s own
-        // separator set -- this dialect's grammar, not real jq's (real jq
-        // rejects a comma-separated def parameter list outright, confirmed
-        // live) -- since a comma-separated parameter is otherwise silently
-        // dropped from the shadow set the exact same way (confirmed live:
-        // `def f(a, length): length; f(1;2)` answered `0`, not `2`).
+        // most its own length, never a scan of everything after it. Only `;`
+        // separates parameters, as in `Parser::parse_func_params` and real jq
+        // (a comma-separated parameter list is a syntax error, #7457).
         let after_name = skip_ws_and_comments(after_name_start);
         if let Some(mut rest_params) = after_name.strip_prefix('(') {
             loop {
@@ -1741,7 +1768,7 @@ fn collect_def_names(input: &str) -> BTreeSet<String> {
                 names.insert(pname.to_string());
                 rest_params = skip_ws_and_comments(after_pname);
                 match rest_params.chars().next() {
-                    Some(';' | ',') => rest_params = &rest_params[1..],
+                    Some(';') => rest_params = &rest_params[1..],
                     _ => break,
                 }
             }
@@ -3246,7 +3273,7 @@ impl<'a> Parser<'a> {
         // subtraction; `sin - approx` still is). Operators and structural
         // words never begin a name, so `-` after them stays a boundary:
         // `true and-1` is `true and (-1)` in yq too.
-        !matches!(next_char, Some(c) if c.is_alphanumeric() || c == '_')
+        !matches!(next_char, Some(c) if is_ident_continue_char(c))
             && (NON_NAME_KEYWORDS.contains(&keyword) || !self.yq_hyphen_continues_ident(after))
     }
 
@@ -3262,7 +3289,7 @@ impl<'a> Parser<'a> {
             && self.input[at + 1..]
                 .chars()
                 .next()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                .is_some_and(is_ident_continue_char)
     }
 
     /// Real yq's lexer has no token for jq-only surface like `paths`,
@@ -3430,7 +3457,7 @@ impl<'a> Parser<'a> {
         // Subsequent characters can be alphanumeric or underscore
         // In Yq mode, also allow hyphens (but not at the end)
         while let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' {
+            if is_ident_continue_char(c) {
                 self.next();
             } else if self.yq_hyphen_continues_ident(self.pos) {
                 // In Yq mode, allow hyphen if followed by valid ident char
@@ -3555,22 +3582,11 @@ impl<'a> Parser<'a> {
         }
 
         // Check for exponent
-        if matches!(self.peek(), Some('e' | 'E')) {
+        // #7496: jq's lexer takes `[eE][+-]?[0-9]+` or nothing (longest match), so `2else` is
+        // the number `2` and the keyword `else`; an `e` with no digit after it is not consumed.
+        let exponent_len = number_exponent_len(&self.input.as_bytes()[self.pos..]);
+        for _ in 0..exponent_len {
             self.next();
-
-            // Optional sign
-            if matches!(self.peek(), Some('+' | '-')) {
-                self.next();
-            }
-
-            // Exponent digits
-            while let Some(c) = self.peek() {
-                if c.is_ascii_digit() {
-                    self.next();
-                } else {
-                    break;
-                }
-            }
         }
 
         let spelled = &self.input[start..self.pos];
@@ -3850,6 +3866,26 @@ impl<'a> Parser<'a> {
             });
         }
         self.parse_path_step_name().map(PathStep::Field)
+    }
+
+    /// The quoted step after a `.`, if one is at the cursor: a string (see [`Self::parse_path_step`])
+    /// or, in jq mode, a format-prefixed one (#7456). jq's `String` production is `FORMAT
+    /// QQSTRING_START ...` as well as `QQSTRING_START ...`, so `.@base64 "x"` is `.["x"]` (a format
+    /// never runs on a string with no interpolation) and `.@base64 "\(1)"` is `.["MQ=="]`.
+    /// `None`, with the cursor where it was, for anything else, so the caller reads a field name or
+    /// reports the stray `@`. Out of line: both callers are on the recursive descent's spine.
+    #[inline(never)]
+    fn parse_quoted_path_step(&mut self) -> Result<Option<PathStep>, ParseError> {
+        match self.peek() {
+            Some('"') => self.parse_path_step().map(Some),
+            // `try_parse_interpolated_key` declines in yq mode, whose lexer rejects a format
+            // followed by a string (#3316), and leaves the cursor alone before anything else.
+            Some('@') => Ok(self.try_parse_interpolated_key()?.map(|key| match key {
+                Expr::Literal(Literal::String(name)) => PathStep::Field(name.into_string()),
+                computed => PathStep::Computed(computed),
+            })),
+            _ => Ok(None),
+        }
     }
 
     /// The quoted name of a dotted path step, `."key"`, in yq mode (#4916; jq mode goes through
@@ -5466,10 +5502,7 @@ impl<'a> Parser<'a> {
                     let lit = self.parse_number_literal()?;
                     // #3397: an `as` or a multiplicative operator after the
                     // literal means the negation covers it (jq's `'-' Exp`).
-                    if self.mode == ParserMode::Jq
-                        && !self.expd_operand
-                        && self.negation_scopes_over_what_follows()
-                    {
+                    if self.mode == ParserMode::Jq && self.negation_scopes_over_what_follows() {
                         self.pos = start;
                     } else {
                         folded = Some(lit);
@@ -5714,16 +5747,15 @@ impl<'a> Parser<'a> {
                     return Ok(Expr::Identity);
                 }
 
-                // Check for quoted field access `."key"`
-                let mut expr = if self.peek() == Some('"') {
-                    match self.parse_path_step()? {
-                        PathStep::Field(name) => self.field_or_wildcard(name),
-                        PathStep::Computed(key) => Expr::index_by(Expr::Identity, key),
+                // Check for quoted field access `."key"` (or `.@fmt "key"`, #7456)
+                let mut expr = match self.parse_quoted_path_step()? {
+                    Some(PathStep::Field(name)) => self.field_or_wildcard(name),
+                    Some(PathStep::Computed(key)) => Expr::index_by(Expr::Identity, key),
+                    None => {
+                        // Field access `.foo`
+                        let name = self.parse_field_ident()?;
+                        self.field_or_wildcard(name)
                     }
-                } else {
-                    // Field access `.foo`
-                    let name = self.parse_field_ident()?;
-                    self.field_or_wildcard(name)
                 };
 
                 // yq lexes a `?` after a space or newline as an error, not a
@@ -7101,6 +7133,29 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// An object pattern's string key, if one is at the cursor: jq's `String ':' Pattern`, a plain
+    /// or interpolated string, or in jq mode a format-prefixed one (`{@base64 "c": $c}`, #7456).
+    /// A string with no interpolation is a literal key (the format never runs on it); one with
+    /// `\(...)` is a computed key. `None`, with the cursor where it was, for anything else.
+    #[inline(never)]
+    fn parse_pattern_string_key(&mut self) -> Result<Option<ObjectKey>, ParseError> {
+        let key = match self.peek() {
+            Some('"') => self.parse_string_or_interpolation()?,
+            Some('@') => match self.try_parse_interpolated_key()? {
+                Some(key) => key,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        Ok(Some(match key {
+            Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s.into_string()),
+            interpolated => {
+                self.count_pattern_computed_key()?;
+                ObjectKey::Expr(Box::new(interpolated))
+            }
+        }))
+    }
+
     /// The real `parse_pattern` body, entered only through the depth-checked
     /// wrapper above -- every recursive call goes back through
     /// `self.parse_pattern()`, not this function, so the depth counter sees
@@ -7235,16 +7290,8 @@ impl<'a> Parser<'a> {
                                 }
                             }
                             ObjectKey::Expr(Box::new(key_expr))
-                        } else if self.peek() == Some('"') {
-                            match self.parse_string_or_interpolation()? {
-                                Expr::Literal(Literal::String(s)) => {
-                                    ObjectKey::Literal(s.into_string())
-                                }
-                                interpolated => {
-                                    self.count_pattern_computed_key()?;
-                                    ObjectKey::Expr(Box::new(interpolated))
-                                }
-                            }
+                        } else if let Some(key) = self.parse_pattern_string_key()? {
+                            key
                         } else {
                             ObjectKey::Literal(self.parse_qualified_ident()?)
                         };
@@ -7344,8 +7391,11 @@ impl<'a> Parser<'a> {
         if self.peek() != Some('$') {
             return Err(ParseError::new("expected '$' after 'label'", self.pos));
         }
+        let sigil_offset = self.pos;
         self.next();
         let name = self.parse_variable_name()?;
+        // #7458: `label $__loc__` is a syntax error, as the other binding sites are (#3029).
+        self.reject_loc_as_binding_name(&name, Some("BINDING"), sigil_offset)?;
         self.skip_ws();
 
         // Expect '|'
@@ -7408,8 +7458,11 @@ impl<'a> Parser<'a> {
         if self.peek() != Some('$') {
             return Err(ParseError::new("expected '$' after 'break'", self.pos));
         }
+        let sigil_offset = self.pos;
         self.next();
         let name = self.parse_variable_name()?;
+        // #7458: `break $__loc__` is a syntax error, as is `label $__loc__`.
+        self.reject_loc_as_binding_name(&name, Some("BINDING"), sigil_offset)?;
 
         // #2964: record the site unconditionally -- before the
         // `wrap_shadowable_call` wrapper below decides whether this `break`
@@ -7478,15 +7531,17 @@ impl<'a> Parser<'a> {
                 });
                 self.skip_ws();
 
+                // #7457: parameters are separated by `;` only; jq's grammar has no `,` there
+                // (`def f(a,b): a; f(5;6)` is `unexpected ','`), and yq has no `def` to follow.
                 match self.peek() {
-                    Some(';' | ',') => {
+                    Some(';') => {
                         self.next();
                         self.skip_ws();
                     }
                     Some(')') => break,
                     _ => {
                         return Err(ParseError::new(
-                            "expected ';', ',', or ')' in parameter list",
+                            "expected ';' or ')' in parameter list",
                             self.pos,
                         ));
                     }
@@ -8406,7 +8461,7 @@ impl<'a> Parser<'a> {
         let rest = &self.input[pos..];
         let end = rest
             .char_indices()
-            .find(|&(_, c)| !(c.is_alphanumeric() || c == '_'))
+            .find(|&(_, c)| !is_ident_continue_char(c))
             .map_or(rest.len(), |(i, _)| i);
         &rest[..end]
     }
@@ -10990,23 +11045,20 @@ impl<'a> Parser<'a> {
                         }
                         push_bracket(&mut chain, bracket);
                     } else {
-                        let name = if self.peek() == Some('"') {
-                            match self.parse_path_step()? {
-                                PathStep::Field(name) => name,
-                                PathStep::Computed(key) => {
-                                    // `.a."b\(0)"` is `.a | .["b\(0)"]` with the key read from the
-                                    // chain's input, as a bracket's is (#6053).
-                                    self.skip_ws();
-                                    let optional = self.at_postfix_question();
-                                    if optional {
-                                        self.next();
-                                    }
-                                    push_bracket(&mut chain, Bracket::Dynamic { key, optional });
-                                    continue;
+                        let name = match self.parse_quoted_path_step()? {
+                            Some(PathStep::Field(name)) => name,
+                            Some(PathStep::Computed(key)) => {
+                                // `.a."b\(0)"` is `.a | .["b\(0)"]` with the key read from the
+                                // chain's input, as a bracket's is (#6053).
+                                self.skip_ws();
+                                let optional = self.at_postfix_question();
+                                if optional {
+                                    self.next();
                                 }
+                                push_bracket(&mut chain, Bracket::Dynamic { key, optional });
+                                continue;
                             }
-                        } else {
-                            self.parse_field_ident()?
+                            None => self.parse_field_ident()?,
                         };
                         let mut field_expr = self.field_or_wildcard(name);
 
@@ -11145,7 +11197,11 @@ impl<'a> Parser<'a> {
     /// must not fold into the token. The unary-minus arm then binds the
     /// positive literal and absorbs the chain. A postfix `?` scopes too:
     /// `-2? * 3` is `-(2? * 3)`; so does a postfix `.name` or `.[...]` (`-1..e1`
-    /// and `-1 .e1` index the number 1, #5615). Consumes nothing.
+    /// and `-1 .e1` index the number 1, #5615) and a postfix `[...]` (`-1[0]`,
+    /// `-1.[]?` and `-1 [0]` are `-(1[0])`, #7497). Consumes nothing.
+    ///
+    /// An object value (`ExpD`, #3397) takes no `as`, no multiplicative chain and no `Exp '?'`,
+    /// but its `'-' ExpD` still negates a whole Term: only a `.` or `[` postfix scopes there.
     fn negation_scopes_over_what_follows(&mut self) -> bool {
         // The byte right after the literal settles nearly every case.
         if matches!(self.peek(), None | Some(',' | ']' | ')' | '}' | ';' | '|')) {
@@ -11154,13 +11210,13 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         self.skip_ws();
         let peek2 = self.peek_str(2);
-        let scopes = self.matches_keyword("as")
-            || self.at_postfix_question()
+        let scopes = (!self.expd_operand
+            && (self.matches_keyword("as") || self.at_postfix_question()))
             || match self.peek() {
-                Some('.') => true,
-                Some('*') => peek2 != "*=",
-                Some('%') => peek2 != "%=",
-                Some('/') => peek2 != "//" && peek2 != "/=",
+                Some('.' | '[') => true,
+                Some('*') => !self.expd_operand && peek2 != "*=",
+                Some('%') => !self.expd_operand && peek2 != "%=",
+                Some('/') => !self.expd_operand && peek2 != "//" && peek2 != "/=",
                 _ => false,
             };
         self.pos = start;
@@ -12632,7 +12688,7 @@ impl<'a> Parser<'a> {
         self.skip_ws();
 
         // Parse the path string
-        let path = self.parse_string_literal()?;
+        let path = self.parse_import_path()?;
 
         self.skip_ws();
 
@@ -12655,7 +12711,10 @@ impl<'a> Parser<'a> {
             self.next();
         }
         let alias = self.parse_ident()?;
-        if !data {
+        if data {
+            // #7458: `$__loc__` is its own token, not a `BINDING`, so it names no data import.
+            self.reject_loc_as_binding_name(&alias, Some("IDENT or BINDING"), alias_offset)?;
+        } else {
             self.reject_reserved_word_as_name(&alias, "IDENT or BINDING", alias_offset)?;
         }
 
@@ -12686,13 +12745,24 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// The path of an `import` or `include`: jq's `ImportFrom`, a constant `String`, which may carry
+    /// a format prefix (`import @text "m" as m;`, #7456). The format never runs on a string with
+    /// no interpolation, so the path is the literal; an interpolated one is refused either way.
+    fn parse_import_path(&mut self) -> Result<String, ParseError> {
+        if self.mode == ParserMode::Jq && self.peek() == Some('@') {
+            self.parse_format_string()?;
+            self.skip_ws();
+        }
+        self.parse_string_literal()
+    }
+
     /// Parse include directive: `include "path";`
     fn parse_include(&mut self, decl_index: usize) -> Result<Include, ParseError> {
         self.consume_keyword("include");
         self.skip_ws();
 
         // Parse the path string
-        let path = self.parse_string_literal()?;
+        let path = self.parse_import_path()?;
 
         self.skip_ws();
 
@@ -16819,7 +16889,7 @@ mod tests {
         let err = parse("def f(a b): a; f(1;2)").expect_err("missing separator must error");
         assert!(
             err.message
-                .contains("expected ';', ',', or ')' in parameter list"),
+                .contains("expected ';' or ')' in parameter list"),
             "unexpected error: {}",
             err.message
         );
@@ -17185,6 +17255,57 @@ mod tests {
     fn test_format_prefixed_string_still_rejected_in_yq_mode_3316() {
         assert!(parse_with_mode(r#"@base64 "v=\(1)""#, ParserMode::Yq).is_err());
         assert!(parse_with_mode(r#"@base64"x""#, ParserMode::Yq).is_err());
+    }
+
+    /// #7456: a format-prefixed string is a step after `.`, an object-pattern key and an import
+    /// path, desugaring to the same tree as the string with each interpolation formatted: a literal
+    /// is the field it names, an interpolation the computed key `."...\(E | @fmt)..."` reads.
+    #[test]
+    fn format_prefixed_string_is_a_path_step_pattern_key_and_import_path_7456() {
+        let jq = |source: &str| parse_with_mode(source, ParserMode::Jq).unwrap();
+        for (formatted, plain) in [
+            (r#".@base64 "x""#, ".x"),
+            (r#". @base64 "x""#, ".x"),
+            (r#".@foo "x"?"#, ".x?"),
+            (r#".a.@text "b".c"#, ".a.b.c"),
+            (r#".a . @json "b""#, ".a.b"),
+            (r#"$__loc__.@text "file""#, "$__loc__.file"),
+            (r#".@base64 "\(1)""#, r#"."\(1 | @base64)""#),
+            (r#".a.@json "k\(.n)"?"#, r#".a."k\(.n | @json)"?"#),
+            (r#". as {@base64 "c": $c} | $c"#, r#". as {"c": $c} | $c"#),
+            (
+                r#". as {@uri "\(.k)": $c} | $c"#,
+                r#". as {"\(.k | @uri)": $c} | $c"#,
+            ),
+        ] {
+            assert_eq!(jq(formatted), jq(plain), "{formatted}");
+        }
+        let program = |source: &str| parse_program_with_mode(source, ParserMode::Jq).unwrap();
+        assert_eq!(
+            program(r#"import @text "m" as m; m::f"#),
+            program(r#"import "m" as m; m::f"#)
+        );
+        assert_eq!(
+            program(r#"include @base64 "m"; f"#),
+            program(r#"include "m"; f"#)
+        );
+        // No string after the format: jq's `expecting QQSTRING_START`.
+        for source in [
+            ".@base64",
+            ".@base64 1",
+            "{@base64}",
+            ". as {@base64: $c} | $c",
+        ] {
+            assert!(parse_with_mode(source, ParserMode::Jq).is_err(), "{source}");
+        }
+        // yq's lexer has no format-prefixed string anywhere, and `.@base64` is the key `@base64`.
+        for source in [r#".@base64 "x""#, r#".a.@text "b""#] {
+            assert!(parse_with_mode(source, ParserMode::Yq).is_err(), "{source}");
+        }
+        assert_eq!(
+            parse_with_mode(".@base64", ParserMode::Yq).unwrap(),
+            Expr::Field("@base64".into())
+        );
     }
 
     /// #3357: jq's own grammar accepts any `@name` token at parse time and

@@ -11,14 +11,17 @@
 //! The routes read standard input in windows or whole, well past what the program takes, so the
 //! offset is put back once, when the run ends: the items the program took are counted again in
 //! the file, from where the run found it, and the descriptor is moved to the end of the chunk that
-//! completed the last of them. A run that never reads standard input, reads it to its end, or
+//! completed the last of them. Standard input read as a `-` among input files is counted after the
+//! files named before it, read again from their paths (#7568). A run that never reads standard
+//! input, reads it to its end, or
 //! reads a pipe makes no system call for it here; a pipe costs one `fstat` once it has stopped
 //! early.
 
 #![allow(unsafe_code)] // `read`, `fstat`, `lseek` and `pread` on descriptor 0
 #![cfg_attr(not(unix), allow(dead_code))] // only Unix descriptors have an offset to put back
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 
 /// What one item the program reads is, for counting the items again in the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,11 +54,15 @@ thread_local! {
     /// through the `input` queue.
     static TAKEN: Cell<u64> = const { Cell::new(0) };
     static HALTED: Cell<bool> = const { Cell::new(false) };
+    /// The input files named before the first `-`, when standard input is read as `-` among them
+    /// (#7568): jq's reader gets to standard input only once it has read these.
+    static BEFORE: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Forgets everything an earlier run on this thread recorded.
 pub(crate) fn start_run() {
     RUN.with(|r| r.set(None));
+    BEFORE.with(|b| b.borrow_mut().clear());
     ORIGIN.with(|o| o.set(None));
     READ.with(|r| r.set(0));
     TAKEN.with(|t| t.set(0));
@@ -64,8 +71,18 @@ pub(crate) fn start_run() {
 }
 
 /// Records how the run reads standard input: `None` when it reads none, or reads it in a way whose
-/// offset is left where the read left it (named files, `--slurp`, `--seq`, DSV, `--stream-errors`).
-pub(crate) fn set_run(items: Option<Items>, main_loop: bool) {
+/// offset is left where the read left it (named files with no `-`, `--slurp`, `--seq`, DSV,
+/// `--stream-errors`). `files` are the input files: standard input is the first `-` among them,
+/// or the only input when there are none.
+pub(crate) fn set_run(items: Option<Items>, main_loop: bool, files: &[PathBuf]) {
+    let items = match files.iter().position(|path| path.as_os_str() == "-") {
+        Some(dash) => {
+            BEFORE.with(|b| *b.borrow_mut() = files[..dash].to_vec());
+            items
+        }
+        None if files.is_empty() => items,
+        None => None,
+    };
     RUN.with(|r| r.set(items.map(|items| Run { items, main_loop })));
 }
 
@@ -130,13 +147,20 @@ pub(crate) fn restore() {
         return;
     }
     let reads = succinctly::jq::input_reads();
-    if reads.past_end || reads.fault || (run.main_loop && !HALTED.with(Cell::get)) {
+    if reads.past_end || reads.fault {
+        return;
+    }
+    // A main loop that does not halt reads to the end, unless a file before the `-` does not open:
+    // jq's main loop then stops once it has the first input read past that file (#7568).
+    let until_unopened = run.main_loop && !HALTED.with(Cell::get);
+    if until_unopened && BEFORE.with(|b| b.borrow().is_empty()) {
         return;
     }
     #[cfg(unix)]
     restore_unix(
         run.items,
         reads.documents + TAKEN.with(Cell::get),
+        until_unopened,
         origin,
         read,
     );
@@ -145,14 +169,15 @@ pub(crate) fn restore() {
 }
 
 #[cfg(unix)]
-fn restore_unix(items: Items, taken: u64, origin: Option<u64>, read: u64) {
+fn restore_unix(items: Items, taken: u64, until_unopened: bool, origin: Option<u64>, read: u64) {
     // SAFETY: `stat` is written by `fstat` before it is read, and only on success.
-    let regular = unsafe {
+    let Some(stat) = (unsafe {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) == 0
-            && stat.assume_init().st_mode & libc::S_IFMT == libc::S_IFREG
+        (libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) == 0).then(|| stat.assume_init())
+    }) else {
+        return;
     };
-    if !regular {
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return;
     }
     // SAFETY: `lseek` reads and moves only the descriptor's offset.
@@ -165,13 +190,47 @@ fn restore_unix(items: Items, taken: u64, origin: Option<u64>, read: u64) {
     };
     let mut block = vec![0u8; 64 << 10];
     let mut scan = Scan::new(items, taken);
+    // #7568: the files before a `-` are read first, by jq's reader and here.
+    let before = BEFORE.with(|b| b.borrow().clone());
+    let mut unopened = false;
+    for path in &before {
+        if scan.found().is_some() {
+            break;
+        }
+        match scan_named_file(&mut scan, path, &mut block) {
+            None => return,
+            Some(opened) => unopened |= !opened,
+        }
+    }
+    if until_unopened && !unopened {
+        return;
+    }
+    if scan.found().is_some() {
+        // The last item was handed out before jq's reader got to standard input.
+        if start != now {
+            if let Ok(start) = libc::off_t::try_from(start) {
+                // SAFETY: as above.
+                unsafe { libc::lseek(libc::STDIN_FILENO, start, libc::SEEK_SET) };
+            }
+        }
+        return;
+    }
+    let stdin_at = scan.pos;
+    let at_eof = u64::try_from(stat.st_size).is_ok_and(|size| size <= now);
     let mut at = start;
     let end = loop {
         if let Some(end) = scan.found() {
             break end;
         }
         if at >= now {
-            return;
+            if !at_eof {
+                return;
+            }
+            scan.end_of_file();
+            match scan.found() {
+                Some(end) => break end,
+                None => return,
+            }
         }
         let want = usize::try_from(now - at).map_or(block.len(), |left| left.min(block.len()));
         let Ok(offset) = libc::off_t::try_from(at) else {
@@ -188,13 +247,51 @@ fn restore_unix(items: Items, taken: u64, origin: Option<u64>, read: u64) {
         scan.feed(&block[..n]);
         at += n as u64;
     };
-    let end = start + end;
+    let end = start + (end - stdin_at);
     if end != now {
         if let Ok(end) = libc::off_t::try_from(end) {
             // SAFETY: as above.
             unsafe { libc::lseek(libc::STDIN_FILENO, end, libc::SEEK_SET) };
         }
     }
+}
+
+/// Feeds `scan` an input file named before standard input's `-`, read again from its path, and ends
+/// it there (#7568). A path that does not open, or a directory, is a source with no bytes, as jq's
+/// reader reads it. The file standard input holds, named by its path, is opened anew, by jq as here,
+/// so its reads do not move descriptor 0. `false` for anything whose bytes cannot be read again as
+/// jq read them: a pipe or device, or a path naming a descriptor (`/dev/stdin`, `/dev/fd/N`), which
+/// may share standard input's offset. `Some(false)` for a file jq's reader counts as an input error
+/// (it does not open, or is a directory), which ends jq's main loop one input later.
+#[cfg(unix)]
+fn scan_named_file(scan: &mut Scan, path: &PathBuf, block: &mut [u8]) -> Option<bool> {
+    use std::io::Read;
+    if path.starts_with("/dev/fd") || path.starts_with("/dev/stdin") {
+        return None;
+    }
+    let opened = match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {
+            let Ok(mut file) = std::fs::File::open(path) else {
+                scan.end_of_file();
+                return Some(false);
+            };
+            while scan.found().is_none() {
+                match file.read(block) {
+                    Ok(0) => break,
+                    Ok(n) => scan.feed(&block[..n]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return None,
+                }
+            }
+            true
+        }
+        Ok(meta) if !meta.is_dir() => return None,
+        _ => false,
+    };
+    if scan.found().is_none() {
+        scan.end_of_file();
+    }
+    Some(opened)
 }
 
 /// jq's `fgets` chunk: a line, or this many bytes of a longer one.
@@ -216,6 +313,11 @@ struct Scan {
     found: Option<u64>,
     /// Whether the last item has completed, and its chunk is being read to its end.
     completed: bool,
+    /// The items the byte being read has completed so far.
+    completed_here: u8,
+    /// Whether the last item was not the first one its byte completed (the close after a scalar's
+    /// `--stream` event), so that jq's parser handed it out with no byte left to read.
+    completed_second: bool,
     in_string: bool,
     escape: bool,
     in_literal: bool,
@@ -242,6 +344,8 @@ impl Scan {
             chunk_start: 0,
             found: (taken == 0).then_some(0),
             completed: false,
+            completed_here: 0,
+            completed_second: false,
             in_string: false,
             escape: false,
             in_literal: false,
@@ -263,11 +367,14 @@ impl Scan {
                 return;
             }
             if self.completed {
+                // The byte that completed the last item was not its chunk's last.
+                self.completed_second = false;
                 self.end_chunk_at(b);
                 self.pos += 1;
                 continue;
             }
             self.in_bom &= self.pos < 3 && b == b"\xef\xbb\xbf"[self.pos as usize];
+            self.completed_here = 0;
             if !self.in_bom {
                 match self.items {
                     Items::Lines => {
@@ -289,17 +396,41 @@ impl Scan {
 
     /// Ends the chunk once the last item has completed: at a newline, or after a chunk's worth of
     /// bytes (a `-R` line runs to its newline).
+    ///
+    /// jq's input loop reads the next chunk before it asks the parser for an item whenever the
+    /// parser has no byte left, so an item handed out with none left (the second one the chunk's
+    /// last byte completed: the close after a scalar's `--stream` event) stands at the end of the
+    /// chunk after it (#7570).
     fn end_chunk_at(&mut self, b: u8) {
         let full = self.items != Items::Lines && self.pos + 1 - self.chunk_start == CHUNK;
-        if b == b'\n' || full {
+        if full && std::mem::take(&mut self.completed_second) {
+            self.chunk_start = self.pos + 1;
+        } else if b == b'\n' || full {
             self.found = Some(self.pos + 1);
+        }
+    }
+
+    /// The end of an input file: jq's reader moves on to the next one, whose first chunk is a new
+    /// one (#7568). A last item completed in this file stands at its end, unless the file's last
+    /// byte completed it with nothing left to read (the close after a scalar, as above): jq's
+    /// reader then reads the next file's first chunk before it hands the item out.
+    fn end_of_file(&mut self) {
+        if self.found.is_some() {
+            return;
+        }
+        if self.completed && !std::mem::take(&mut self.completed_second) {
+            self.found = Some(self.pos);
+        } else {
+            self.chunk_start = self.pos;
         }
     }
 
     fn complete(&mut self) {
         self.left -= 1;
+        self.completed_here += 1;
         if self.left == 0 {
             self.completed = true;
+            self.completed_second = self.completed_here > 1;
         }
     }
 
@@ -464,6 +595,74 @@ mod tests {
         // An empty container's event is its own closer.
         assert_eq!(ends(Items::Events, b"[[]\n,2]\n[9]\n", 1), Some(4));
         assert_eq!(ends(Items::Events, b"\"top\"\n[9]\n", 1), Some(6));
+    }
+
+    #[test]
+    fn a_second_event_completed_by_a_chunks_last_byte_stands_after_the_next_chunk_7570() {
+        // Captured from jq 1.7.1 and 1.8.2: `[2]` ends at byte 4094, the last of the first chunk.
+        // Its scalar event is handed out at the `]`; its close is handed out once the next chunk
+        // (` 3\n`) has been read.
+        let f = format!("{}[2] 3\n4\n", "1 ".repeat(2046)).into_bytes();
+        assert_eq!(ends(Items::Events, &f, 2047), Some(4095));
+        assert_eq!(ends(Items::Events, &f, 2048), Some(4098));
+        assert_eq!(ends(Items::Events, &f, 2049), Some(4098));
+        // `2]` ends at byte 4094: the scalar and the innermost close, then the next two closes.
+        let g = format!("{}[[[2]]] 3\n4\n", "1 ".repeat(2045)).into_bytes();
+        assert_eq!(ends(Items::Events, &g, 2046), Some(4095));
+        for taken in 2047..=2050 {
+            assert_eq!(ends(Items::Events, &g, taken), Some(4100), "{taken}");
+        }
+        // The next chunk is itself a full one when the line runs on.
+        let long = format!("{}[2]{}\n", "1 ".repeat(2046), " 3".repeat(3000)).into_bytes();
+        assert_eq!(ends(Items::Events, &long, 2048), Some(8190));
+        // A close completed with its scalar anywhere else in a chunk ends with that chunk.
+        let early = format!("[2]{}\n", " 3".repeat(3000)).into_bytes();
+        assert_eq!(ends(Items::Events, &early, 2), Some(4095));
+        // One item per byte: an empty array's event at the chunk's last byte, and values.
+        let empty = format!("{}[[]] 3\n4\n", "1 ".repeat(2046)).into_bytes();
+        assert_eq!(ends(Items::Events, &empty, 2047), Some(4095));
+        assert_eq!(ends(Items::Values, &f, 2047), Some(4095));
+    }
+
+    /// Where the scan stops over `files` read one after the other, for `taken` items.
+    fn ends_over(items: Items, files: &[&[u8]], taken: u64) -> Option<u64> {
+        let mut scan = Scan::new(items, taken);
+        for file in files {
+            for piece in file.chunks(3) {
+                scan.feed(piece);
+            }
+            scan.end_of_file();
+        }
+        scan.found()
+    }
+
+    #[test]
+    fn the_files_are_read_as_one_text_with_a_chunk_ending_at_each_files_end_7568() {
+        let stdin = b"{\"id\":0}\n{\"id\":1}\n";
+        // A value that ends its file with no line break stands at the file's end.
+        assert_eq!(ends_over(Items::Values, &[b"{\"a\":1}", stdin], 1), Some(7));
+        assert_eq!(
+            ends_over(Items::Values, &[b"{\"a\":1}", stdin], 2),
+            Some(16)
+        );
+        // A literal a file leaves unfinished is completed by the next one.
+        assert_eq!(ends_over(Items::Values, &[b"1", b"2\n3\n"], 1), Some(3));
+        // A close completed by a file's last byte right after a scalar is handed out once the next
+        // file's first chunk is read, an empty file's included; with a line break after it, the
+        // chunk ends at that.
+        assert_eq!(ends_over(Items::Events, &[b"[2]", stdin], 1), Some(3));
+        assert_eq!(ends_over(Items::Events, &[b"[2]", stdin], 2), Some(12));
+        assert_eq!(ends_over(Items::Events, &[b"[2]", b"", stdin], 2), Some(3));
+        assert_eq!(ends_over(Items::Events, &[b"[2]\n", stdin], 2), Some(4));
+        // A file whose last chunk is a full one is read once more, to its end, first.
+        let full = format!("{}[2]", " ".repeat(4092)).into_bytes();
+        assert_eq!(ends_over(Items::Events, &[&full, stdin], 2), Some(4095));
+        // A raw line runs on into the next file.
+        assert_eq!(
+            ends_over(Items::Lines, &[b"abc", b"def\nghi\n"], 1),
+            Some(7)
+        );
+        assert_eq!(ends_over(Items::Lines, &[b"abc\n", b"def\n"], 1), Some(4));
     }
 
     #[test]
