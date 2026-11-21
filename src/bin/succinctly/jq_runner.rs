@@ -6831,6 +6831,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             let pending_failures = PENDING_OPEN_FAILURES
                 .with(|pending| !pending.borrow().is_empty())
                 || RAW_OPEN_FAILURES_POSSIBLE.with(std::cell::Cell::get);
+            // #7567: what the owned route asks of the run, once and not per document: a plain
+            // `--stream-errors` walk's events, and the array a stream slurps.
+            let stream_errors_events = plain_stream_errors(&args) && !args.slurp;
+            let slurped_stream =
+                stream_slurp_by_reader(&args) || (plain_stream_errors(&args) && args.slurp);
             'documents: for (document, location, source) in documents {
                 // #6531: a file that did not open is reported when the line read from past it is
                 // reached, before that line.
@@ -6868,12 +6873,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // #5764: the slurped array takes it only for a program the owned evaluator answers
                 // without the reindex bridge; any other reads the array's own index, as before #5744,
                 // which that bridge made 10-15% slower on `[limit(5;.[])]` and `select`.
+                // #7567: every input a `--stream-errors` read gives is a tree with no source text
+                // too, its events and the array `-s` slurps them into, and each took the reindex
+                // bridge, which cost an event its path's length: the closes of a document nested
+                // `n` deep cost `O(n^2)`. Its events are read where they are, and its array as
+                // `--stream -s`'s is.
                 let owned_route = owned_route_for(
-                    false,
+                    stream_errors_events,
                     args.raw_input
                         && args.input_dsv.is_none()
                         && matches!(*document, OwnedValue::String(_)),
-                    stream_slurp_by_reader(&args) && matches!(*document, OwnedValue::Array(_)),
+                    slurped_stream && matches!(*document, OwnedValue::Array(_)),
                 );
                 if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
                 {
@@ -18950,9 +18960,12 @@ fn owned_route_for(events: bool, raw_line: bool, where_answered: bool) -> OwnedR
 /// evaluator answers (while `door` has not seen enough declines to close, [`DoorMemory`]), and
 /// anything else reads its own index.
 fn queue_record_route(args: &JqCommand, door: &DoorMemory) -> OwnedRoute {
+    // #7567: a `--stream-errors` event is one too (it takes the slot a `-R` line takes in the
+    // document loop, which is `false` here). Written out and indexed, each event cost its path's
+    // length, so the closes of a document nested `n` deep cost `O(n^2)`.
     owned_route_for(
         args.stream,
-        false,
+        args.stream_errors,
         args.seq && !args.slurp && door.is_open(),
     )
 }
@@ -30568,6 +30581,9 @@ mod tests {
             // A `--stream` event is read where it is, closed door or not.
             (&["--stream", ".[1]"], OwnedRoute::Always),
             (&["--seq", "--stream", ".[1]"], OwnedRoute::Always),
+            // #7567: so is a `--stream-errors` event.
+            (&["--stream-errors", ".[1]"], OwnedRoute::Always),
+            (&["--seq", "--stream-errors", ".[1]"], OwnedRoute::Always),
         ];
         for (argv, want) in rows {
             assert!(route(argv, &open) == want, "{argv:?}, door open");
