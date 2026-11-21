@@ -110437,7 +110437,8 @@ fn test_large_int_literal_rounds_to_17_digits_in_comparisons_2906() -> Result<()
 fn test_large_int_literal_gaps_characterize_preexisting_bug_2906() -> Result<()> {
     for (filter, jq_says) in [
         ("869389897822472004 | floor", "869389897822472000"),
-        ("869389897822472004 | length", "869389897822472000"),
+        // jq 1.8.2 keeps the literal (jqlang/jq#3275, #7534); jq 1.7.1 printed the double.
+        ("869389897822472004 | length", "869389897822472004"),
     ] {
         let (output, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");
@@ -110558,7 +110559,8 @@ fn test_float_literal_rounding_reaches_every_reader_2936() -> Result<()> {
             "1",
         ),
         ("2.7293109604053567083 | sqrt", "1.6520626381603563"),
-        ("2.7293109604053567083 | length", "2.7293109604053565"),
+        // jq 1.8.2 keeps the literal (jqlang/jq#3275, #7534); jq 1.7.1 printed the double.
+        ("2.7293109604053567083 | length", "2.7293109604053567083"),
         ("2.7293109604053567083 | fabs", "2.7293109604053565"),
         // `-.` keeps a literal a literal since #7453, as in jq 1.8.2 (jq 1.7.1 rounded it).
         ("2.7293109604053567083 | -.", "-2.7293109604053567083"),
