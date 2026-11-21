@@ -695,7 +695,7 @@ Costs and gaps this change leaves:
   The CLI parses on a 256 MiB (release) / 2 GiB (debug) thread, and that was not enough either: about 48,000 bindings in a release build overflowed it and aborted the process (exit 134), and so did 500,000 chained definitions, in the walks after the parse ([#7475](https://github.com/rust-works/succinctly/issues/7475)).
   Since #7475 a binding's body checks ADR-0025's native-stack floor, and a chain past it is the compile error jq gives a program past its own parser's stack, `memory exhausted` (exit 3): from about 23,000 bindings in a release build, where jq refuses from about 2,500.
   A module-level chain of definitions, which the parser reads in a loop, is charged a fixed share of the floor's room per definition (`DEF_CHAIN_LINK_STACK`, 2 KiB in a release build, 48 KiB in a debug one, about three and two times what the deepest walk after the parse was measured to take on an Apple M5) and refused the same way from about 65,000 definitions in a release build (about 21,000 in a debug one); jq refuses from somewhere between 5,000 and 10,000.
-  A chain of definitions nested in an expression stops at `MAX_EXPR_DEPTH` already (256, where jq's message is `memory exhausted` from much further on).
+  A chain of definitions nested in an expression is a level of nesting each, held to the native stack with the rest of a program's nesting ([below](#a-programs-nesting-and-operator-chains-are-held-to-the-native-stack-not-to-256-levels-7435), #7435).
   A library caller that registers no stack budget (`with_stack_budget`) gets neither refusal, and its parser still overflows a small stack first.
 - **Stack per negated factor.** jq's `'-' Exp` puts the rest of a multiplicative chain
   under the negation, so `-1 * -1 * -1 ...` nests one negation per negated factor and the
@@ -710,6 +710,21 @@ Costs and gaps this change leaves:
   non-associative check covers bindings, not the other greedy-body prefixes.
 - **`try` bodies and `catch` handlers** take a binding as jq does (`try 1 as $x | $x == 1
   == 1` is a syntax error in both).
+
+## A program's nesting and operator chains are held to the native stack, not to 256 levels (#7435)
+
+`succinctly jq` refused a program nested more than 256 levels deep, or with more than 256 links in one chain of left-associative operators, with `expression nesting exceeds depth limit of 256` (exit 3): `select(.a == 0 or .a == 1 or ... or .a == 299)`, `1 + 1 + ...` with 258 operands, 256 nested brackets or parentheses, `.a` and 300 `?`, 255 local `def`s inside parentheses.
+jq 1.7.1 and 1.8.2 run all of them.
+The fixed limit (`MAX_EXPR_DEPTH`, #1156) was a guard against overflowing the native stack in the recursive-descent parser and in the walks after it, which recurse down a chain's left-deep tree once a link although the parser reads the chain in a loop.
+Since #7435 a jq program is held to the stack itself: when the parser starts it reads the room the native-stack floor leaves ([ADR-0025](../../adrs/adr-0025.md), half the thread's stack), and charges each level of nesting `EXPR_LEVEL_STACK` (14 KiB in a release build, 80 KiB in a debug one) and each chain link of the whole program `CHAIN_LINK_STACK` (6 KiB, 48 KiB) of it.
+The figures are about 1.3 to 1.5 times what the deepest walk was measured to take a level and a link on an Apple M5 (`src/jq/parser.rs` has the measurements), so a program the parser admits leaves the walks more than half the stack to spare.
+On the CLI's threads that is about 9,360 levels of nesting and 21,840 chain links in a release build, and 13,100 levels and 21,840 links in a debug one; a program past it is the compile error jq gives a program too deep for its own parser, `memory exhausted` (exit 3), where it used to be the 256-level refusal.
+
+jq's own limits differ by shape (captured from jq 1.7.1, and the same in 1.8.2): its parser refuses nesting at about 10,000 levels with `memory exhausted` (3,000 run, 30,000 are refused, and 3,000 nested `reduce`s are already refused), it runs a chain of `+`, `-` or `*` of any length (30,000 operands answer), and its compiler refuses an `or`, `//` or `label` chain of 3,000 links, and an `and` or postfix-`?` chain of 30,000, with `function compiled to N bytes which is too long` (3,000 `or` operands: `function compiled to 80985 bytes`).
+So `succinctly jq` answers a few shapes jq refuses (an `or` chain of 3,000 to 21,840 operands, 3,000 nested `reduce`s): those refusals protect jq's C implementation, which the owner's rule for jq's hard limits leaves unadopted, and the answers are the ones jq gives below its limits.
+It refuses a chain of `+`, `-` or `*` past about 21,840 operands that jq runs, where the stack is what bounds it: a bounded-stack walk of the tree is what would lift that.
+`succinctly yq` keeps the 256-level limit, and so does a library caller that registers no stack budget (`with_stack_budget`), or a small one, where each chain is held to it on its own as before.
+Pinned by `tests/jq_cli/i7435.rs`, whose answers were captured from jq 1.7.1 (or, where jq refuses for one of its own limits, are the ones it gives below that limit).
 
 ## `reduce`/`foreach` and a `?//` in their source or INIT (#3293)
 
@@ -11432,7 +11447,7 @@ jq 1.8.2 refuses a `def` with more than 4,095 parameters (4,096 is refused, 4,09
 Upstream: "Limit the number of function parameters and definitions to prevent SEGV" (jqlang/jq#3460, commit a2741ee; the overflow it fixes is jqlang/jq#3458).
 jq 1.7.1 and `succinctly jq` compile and run the same program (`null`, exit 0) at 4,096, 4,097 and 20,000 parameters; captured on this change, where 4,095 agrees in all three.
 What bounds it: the program's own size and available memory.
-Upstream's second test, 4,097 sibling local definitions, is refused by `succinctly jq` for another reason (`expression nesting exceeds depth limit of 256`, #7435), not by this divergence.
+Upstream's second test, 4,097 sibling local definitions, runs in `succinctly jq` too since #7435 (`7`, as in jq 1.7.1); before, it was refused for nesting past 256 levels.
 
 **String repetition: 2^31 bytes (#7500).**
 jq 1.8.2 refuses `s * n` with a result of 2,147,483,639 bytes or more (1.8.0 had the plain `INT_MAX` bound; 1.8.2 tightened it with the other string bounds above) with `Repeat string result too long`, in `jv_string_repeat`.
