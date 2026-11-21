@@ -2010,7 +2010,7 @@ fn negative_filter_retry_candidates<W: AsRef<std::ffi::OsStr>>(
         .iter()
         .enumerate()
         // clap names a word that is not UTF-8 by its lossy text (#7426).
-        .filter(|(_, a)| a.as_ref().to_string_lossy().starts_with(bad.as_str()))
+        .filter(|(_, a)| word_text(a).starts_with(bad.as_str()))
         .map(|(i, _)| i)
         .collect();
     positions.reverse();
@@ -2069,6 +2069,11 @@ fn jq_option_arity(cmd: &clap::Command, flag: &str) -> usize {
     0
 }
 
+/// An argv word's text, borrowed when it is UTF-8 (#7426).
+fn word_text<W: AsRef<std::ffi::OsStr>>(word: &W) -> std::borrow::Cow<'_, str> {
+    word.as_ref().to_string_lossy()
+}
+
 /// Move every option (and the values it takes) that follows the first
 /// `--args`/`--jsonargs` in `args` to just before it (#3447).
 ///
@@ -2095,13 +2100,12 @@ fn hoist_options_before_positional_flags<W: AsRef<std::ffi::OsStr> + Clone>(
 ) -> Vec<W> {
     let is_mode_flag = |w: &str| w == "--args" || w == "--jsonargs";
     let is_option = |w: &str| w.starts_with('-') && !looks_like_negative_filter(w);
-    let text = |w: &W| w.as_ref().to_string_lossy().into_owned();
 
     // The overwhelming majority of invocations have no such flag: answer
     // those from one scan of argv, before building clap's whole definition
     // for the arity table (process startup is the entire runtime of a small
     // query).
-    if !args.iter().skip(start).any(|w| is_mode_flag(&text(w))) {
+    if !args.iter().skip(start).any(|w| is_mode_flag(&word_text(w))) {
         return args;
     }
     let cmd = &built_jq_command();
@@ -2112,7 +2116,7 @@ fn hoist_options_before_positional_flags<W: AsRef<std::ffi::OsStr> + Clone>(
     let mut i = start;
     let mut first_mode = None;
     while i < args.len() {
-        let w = &text(&args[i]);
+        let w = &word_text(&args[i]);
         if w == "--" {
             break;
         }
@@ -2134,7 +2138,7 @@ fn hoist_options_before_positional_flags<W: AsRef<std::ffi::OsStr> + Clone>(
     let mut tail = Vec::new();
     let mut i = first_mode;
     while i < args.len() {
-        let w = &text(&args[i]);
+        let w = &word_text(&args[i]);
         if w == "--" {
             tail.extend_from_slice(&args[i..]);
             break;
