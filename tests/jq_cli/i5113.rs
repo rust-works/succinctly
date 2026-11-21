@@ -1,5 +1,9 @@
 //! #5113: a `foreach` UPDATE `if` whose literal `then` ran beside a fold in the `else`, on the last step of an INIT fork
 //! that is not the last.
+//!
+//! #7519: a row whose `foreach` has a multi-output INIT pins jq 1.8.2's answer, not 1.7.1's: jq 1.8 runs every
+//! INIT output's SOURCE on the real input (jqlang/jq#3266, a bug fix `succinctly jq` follows), where 1.7.1 ran the
+//! later ones on `null`. The other rows are 1.7.1's, which 1.8.2 answers alike.
 
 use anyhow::Result;
 
@@ -21,7 +25,7 @@ fn test_5113_literal_then_on_the_last_step_of_an_earlier_init_fork() -> Result<(
         (
             r#"{"a":{"a":null}}"#,
             r"[path(. as $x | foreach .a as $i ((.,.); try (if .a then 1 else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end) catch 1; $i))?]",
-            "[[\"a\"]]\n",
+            "[[\"a\"],[\"a\"]]\n",
             "",
             0,
         ),
@@ -36,8 +40,8 @@ fn test_5113_literal_then_on_the_last_step_of_an_earlier_init_fork() -> Result<(
             r#"{"a":null}"#,
             r"path(. as $x | foreach .a as $i ((., .a); try (if . then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; .a))",
             "[\"a\",\"a\"]\n",
-            "",
-            0,
+            "Invalid path expression near attempt to access element \"a\" of {\"a\":null}",
+            5,
         ),
         (
             r#"{"a":{"a":null}}"#,
@@ -49,9 +53,9 @@ fn test_5113_literal_then_on_the_last_step_of_an_earlier_init_fork() -> Result<(
         (
             r#"{"b":true}"#,
             r"(. as $x | foreach .a as $i ((., .a); try (if .b then null else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch .; $i)) |= 9",
-            "{\"b\":true,\"a\":9}\n",
             "",
-            0,
+            "Invalid path expression near attempt to access element \"a\" of {\"b\":true}",
+            5,
         ),
         (
             r#"{"a":{"a":null}}"#,
@@ -63,14 +67,14 @@ fn test_5113_literal_then_on_the_last_step_of_an_earlier_init_fork() -> Result<(
         (
             r#"{"a":{"a":null}}"#,
             r"[path(. as $x | foreach .a as $i ((.,.) | .; try (if .a then 1 else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end) catch 1; $i))?]",
-            "[[\"a\"]]\n",
+            "[[\"a\"],[\"a\"]]\n",
             "",
             0,
         ),
         (
             r#"{"a":{"a":null}}"#,
             r"[path(. as $x | foreach .a as $i (range(2) as $n | .; try (if .a then 1 else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end) catch 1; $i))?]",
-            "[[\"a\"]]\n",
+            "[[\"a\"],[\"a\"]]\n",
             "",
             0,
         ),
@@ -85,7 +89,8 @@ fn test_5113_literal_then_on_the_last_step_of_an_earlier_init_fork() -> Result<(
 #[test]
 #[allow(clippy::literal_string_with_formatting_args)] // jq object patterns read like format arguments
 fn test_5113_literal_then_stays_unread_under_a_retry_or_before_the_forks_last_step() -> Result<()> {
-    // (document, filter, jq's stdout)
+    // (document, filter, jq's stdout): jq 1.8.2's (#7519; 1.7.1 printed `[["a","a"],["a","a"]]` and `[]`, `["a"]` for the
+    // last two)
     let rows: &[(&str, &str, &str)] = &[
         (
             r#"{"b":true}"#,
@@ -95,12 +100,12 @@ fn test_5113_literal_then_stays_unread_under_a_retry_or_before_the_forks_last_st
         (
             r#"{"b":true}"#,
             r"[path(. as $x | foreach (.a,.) as $i ((.,.); try (if .b then null else (foreach (try ($x as {a:$a} | .)) as $y (.; .; .)) end) catch 1; .a))?]",
-            "[[\"a\",\"a\"],[\"a\",\"a\"]]\n",
+            "[[\"a\",\"a\"],[\"a\",\"a\"],[\"a\",\"a\"],[\"a\",\"a\"]]\n",
         ),
         (
             r#"{"a":null}"#,
             r"path(. as $x | foreach . as $i ((., null, .a); try (if . then 1 else foreach (try ($x as {a:$a} ?// [$a] | .)) as $y (.; .; .) end) catch 1; $i))",
-            "[]\n[\"a\"]\n",
+            "[]\n",
         ),
     ];
     for &(input, filter, jq_stdout) in rows {
@@ -814,7 +819,7 @@ fn test_superseded_rows_match_jq_through_the_path_mode_interpreter_5113() -> Res
         (
             r#"{"a":{"a":null}}"#,
             r"[path(. as $x | foreach .a as $i ((.,.); try (if .a then 1 else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end) catch 1; $i))?]",
-            "[[\"a\"]]\n",
+            "[[\"a\"],[\"a\"]]\n",
             "",
             0,
         ),

@@ -150606,7 +150606,10 @@ mod tests {
         // (jqlang/jq#3266 fixed `foreach` only).
         let (values, error) = outputs_and_error(b"[1,2,3]", "foreach .[] as $x (0,1; .+$x)");
         assert_eq!(values, ["1", "3", "6", "2", "4", "7"]);
-        assert!(error.is_none(), "every fork reads the real input: {error:?}");
+        assert!(
+            error.is_none(),
+            "every fork reads the real input: {error:?}"
+        );
         assert_eq!(
             outputs(b"[1,2,3]", "foreach range(1;4) as $x (0,1; .+$x)"),
             ["1", "3", "6", "2", "4", "7"]

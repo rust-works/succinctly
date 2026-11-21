@@ -4,6 +4,10 @@
 //! value's type or has a second entry (checked against the child the first moved the register onto). Either way the
 //! raise precedes the state, so the handler's output is placed at the `try`'s entry on that step too, and on every
 //! step of the run, not only its last.
+//!
+//! #7519: a row whose `foreach` has a multi-output INIT pins jq 1.8.2's answer, not 1.7.1's: jq 1.8 runs every
+//! INIT output's SOURCE on the real input (jqlang/jq#3266, a bug fix `succinctly jq` follows), where 1.7.1 ran the
+//! later ones on `null`. The other rows are 1.7.1's, which 1.8.2 answers alike.
 
 use anyhow::Result;
 
@@ -413,9 +417,9 @@ fn test_foreach_update_try_handler_before_the_run_last_step_is_placed_5012() -> 
         (
             r#"{"a":null}"#,
             r#"path(. as $x | foreach (.a,.) as $i ((.,null); try (foreach (try ($x as {a:$a} | .)) as $y (.; .; error("x"))) catch (.); $i))"#,
-            "[]\n",
-            "Invalid path expression near attempt to access element \"a\" of null",
-            5,
+            "[]\n[]\n",
+            "",
+            0,
         ),
         (
             r#"{"a":[1]}"#,

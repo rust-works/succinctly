@@ -58,7 +58,12 @@ fn interpreter(script: &str) -> Result<Vec<String>> {
 /// bug fix (#7519). A sweep that names it when that jq is not built is an error, not a pass.
 // The placeholders are the manifest's own syntax, not format arguments.
 #[allow(clippy::literal_string_with_formatting_args)]
-fn expand(text: &str, reference: &Tool, secondary: Option<&Tool>, subject: &Tool) -> Result<String> {
+fn expand(
+    text: &str,
+    reference: &Tool,
+    secondary: Option<&Tool>,
+    subject: &Tool,
+) -> Result<String> {
     const SECONDARY: &str = "{jq_secondary}";
     let text = text
         .replace("{subject}", &subject.program)
