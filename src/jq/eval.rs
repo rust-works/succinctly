@@ -107963,15 +107963,15 @@ mod remaining_inputs {
         pub documents: u64,
         /// Whether a read found the stream at its end.
         pub past_end: bool,
-        /// Whether a read was of a parse error.
-        pub fault: bool,
+        /// How many reads were of a parse error (#7575: a `try` can catch one and read on).
+        pub faults: u64,
     }
 
     impl Reads {
         const NONE: Self = Self {
             documents: 0,
             past_end: false,
-            fault: false,
+            faults: 0,
         };
     }
 
@@ -107990,7 +107990,7 @@ mod remaining_inputs {
             let mut reads = r.get();
             match pop {
                 Pop::Document(_) => reads.documents += 1,
-                Pop::ParseError(_) => reads.fault = true,
+                Pop::ParseError(_) => reads.faults += 1,
                 Pop::Exhausted => reads.past_end = true,
             }
             r.set(reads);
