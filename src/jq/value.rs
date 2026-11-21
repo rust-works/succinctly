@@ -3434,6 +3434,17 @@ impl SharableString {
         matches!(self.0, SharableStringInner::Shared(_))
     }
 
+    /// Whether another handle currently shares this storage, i.e. whether
+    /// the next write through this handle will copy the string. `false` for
+    /// an inline string and for the last handle on promoted storage.
+    #[inline]
+    pub fn is_aliased(&self) -> bool {
+        match &self.0 {
+            SharableStringInner::Owned(_) => false,
+            SharableStringInner::Shared(rc) => alloc::rc::Rc::strong_count(rc) > 1,
+        }
+    }
+
     /// Consume the wrapper, yielding the `String` it wraps -- by move when
     /// it is inline or this handle was the last one, by copy otherwise.
     #[inline]
