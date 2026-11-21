@@ -13390,7 +13390,8 @@ jq 1.8.0 fixed it with the negation fix above: "Preserve numerical precision on 
 `jv_number_abs` takes `decNumberAbs` of a literal's decimal, so the result is a literal: it keeps every digit and prints as written (`100000000000000000001`, `1E-400`, `1E+1000`, `1.50`, `1.0`, `0.00001` for `1e-5`), and a zero of either sign is a positive zero with its spelling kept (`-0 | length` is `0`, `-0.0 | length` is `0.0`).
 `succinctly jq` follows jq 1.8.2, because it is the same upstream fix as the negation above, so the difference from the pinned 1.7.1 stands as newer than primary.
 It holds for every number that carries its literal: an input document, `-s`, `inputs`, `--argjson`, `--slurpfile` and a program literal, on both evaluators (`jq_literal_length`, which negates a negative literal with `jq_negated_literal`).
-A computed number keeps the double's answer (`(1 + 0.5) | length` is `1.5`, `(100000000000000000001 * 1) | length` is `1e+20`), and so do NaN, the infinities and every non-number, in which both jq releases agree.
+A computed number keeps the double's answer (`(1 + 0.5) | length` is `1.5`, `(100000000000000000001 * 1) | length` is `1e+20`), and so do NaN, the computed infinities and every non-number, in which both jq releases agree.
+A parsed `Infinity` is a literal (#7469, below), so its `length` is one as well, as in jq 1.8.2.
 `abs` needs nothing of its own: jq defines it as `if . < 0 then -. else . end`, so it keeps a literal through the negation above, and `-0 | abs` stays `-0` where `-0 | length` is `0`, in both.
 `succinctly yq` is unchanged: yq's `length` of a number measures its text.
 Pinned by `tests/jq_cli/i7534.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
@@ -13651,6 +13652,17 @@ Still different:
 Ordering is unchanged in both: NaN sorts below NaN, itself included. A mixed-instance
 `sort`/`unique`/`group_by` (`[.a,.b,.a] | unique` over two NaN tokens) depends on the sort's
 comparison order in jq, and may group differently here.
+
+### A parsed infinity orders as decNumber's infinity (#7469)
+
+jq 1.7.1 keeps a parsed `Infinity` (`infinity`, `+Infinity`, `-Infinity`, from a document, `fromjson`, `tonumber`, `--argjson` or `--jsonargs`) as a decNumber literal, not as the `f64` infinity the section above describes.
+Two literals compare as exact decimals, so it orders past every finite literal, one past `DBL_MAX` included: `printf Infinity | jq '. > 1e1000'` is `true`, `[., 1e1000] | unique` keeps both and `max` picks it.
+Against a computed double it compares as the double infinity (`. == infinite`, `(. + 0) == 1e1000` are `true`), and it prints as `DBL_MAX` either way.
+succinctly read it as the computed infinity, so `. == 1e1000` was `true`; it is now a literal whose text is decNumber's word, printed as jq prints it (`OwnedValue::parsed_infinity`).
+Negating it keeps it a literal, as #7453 negates every literal after jqlang/jq#3242, so `-. | . == -1e1000` is `false`, jq 1.8.2's answer, where jq 1.7.1, whose `-` computes a double, says `true`.
+Its `length` keeps it a literal too, as #7534 keeps every literal's after jqlang/jq#3275, so `-Infinity | length > 1e1000` is `true` and `length == 1e1000` is `false`, jq 1.8.2's answers, where jq 1.7.1, whose `length` is `fabs` of the double, says `false` and `true`.
+Under `--preserve-input` (a succinctly extension that echoes a number's source spelling) it now prints as `Infinity` inside a constructed value too (`[., 1]`), as it already did at the top level.
+yq mode keeps the bare double.
 
 ### Two equally long slices of one array are `==` in jq, and are compared by content here (#7459)
 
