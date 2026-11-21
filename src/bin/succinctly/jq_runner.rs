@@ -708,11 +708,19 @@ fn read_arg_file(flag: &str, name: &str, file: &str) -> Result<String, BuildCont
 /// Why jq refuses `module_path` as a relative module path before searching for it (#5322): its
 /// `validate_relpath`, the same three checks in the same order, confirmed live against jq 1.7.1.
 ///
-/// A backslash first; then the components left to right, where the first of "equal to the one
+/// A NUL byte comes before all of them (#7450): jq 1.8.2 refuses it with `Module path contains a
+/// NUL byte` (CVE-2026-43895, commit 9d223f153c), where 1.7.1 looked the path up as a C string cut
+/// at the NUL, so `include "a\u0000b"` read `module not found: a`. The newer answer is taken: the
+/// 1.7.1 lookup could open a different file from the one the program names.
+///
+/// A backslash next; then the components left to right, where the first of "equal to the one
 /// before it" (`b/b`, and `a///b` for its empty ones) and `..` ends the scan -- so `../a/a` is a
 /// parent-directory error and `a/a/..` an equal-components one. `a//b`, `a/./b`, `/abs` and `b/`
 /// pass, and are simply not found when nothing is there.
 fn invalid_module_path(module_path: &str) -> Option<String> {
+    if module_path.contains('\0') {
+        return Some("Module path contains a NUL byte".to_string());
+    }
     if module_path.contains('\\') {
         return Some(format!(
             "Modules must be named by relative paths using '/', not '\\' ({module_path})"
