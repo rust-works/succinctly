@@ -147,13 +147,20 @@ pub(crate) fn restore() {
         return;
     }
     let reads = succinctly::jq::input_reads();
-    if reads.past_end || reads.fault || (run.main_loop && !HALTED.with(Cell::get)) {
+    if reads.past_end || reads.fault {
+        return;
+    }
+    // A main loop that does not halt reads to the end, unless a file before the `-` does not open:
+    // jq's main loop then stops once it has the first input read past that file (#7568).
+    let until_unopened = run.main_loop && !HALTED.with(Cell::get);
+    if until_unopened && BEFORE.with(|b| b.borrow().is_empty()) {
         return;
     }
     #[cfg(unix)]
     restore_unix(
         run.items,
         reads.documents + TAKEN.with(Cell::get),
+        until_unopened,
         origin,
         read,
     );
@@ -162,7 +169,7 @@ pub(crate) fn restore() {
 }
 
 #[cfg(unix)]
-fn restore_unix(items: Items, taken: u64, origin: Option<u64>, read: u64) {
+fn restore_unix(items: Items, taken: u64, until_unopened: bool, origin: Option<u64>, read: u64) {
     // SAFETY: `stat` is written by `fstat` before it is read, and only on success.
     let Some(stat) = (unsafe {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -185,10 +192,18 @@ fn restore_unix(items: Items, taken: u64, origin: Option<u64>, read: u64) {
     let mut scan = Scan::new(items, taken);
     // #7568: the files before a `-` are read first, by jq's reader and here.
     let before = BEFORE.with(|b| b.borrow().clone());
+    let mut unopened = false;
     for path in &before {
-        if scan.found().is_none() && !scan_named_file(&mut scan, path, &mut block) {
-            return;
+        if scan.found().is_some() {
+            break;
         }
+        match scan_named_file(&mut scan, path, &mut block) {
+            None => return,
+            Some(opened) => unopened |= !opened,
+        }
+    }
+    if until_unopened && !unopened {
+        return;
     }
     if scan.found().is_some() {
         // The last item was handed out before jq's reader got to standard input.
@@ -246,35 +261,37 @@ fn restore_unix(items: Items, taken: u64, origin: Option<u64>, read: u64) {
 /// reader reads it. The file standard input holds, named by its path, is opened anew, by jq as here,
 /// so its reads do not move descriptor 0. `false` for anything whose bytes cannot be read again as
 /// jq read them: a pipe or device, or a path naming a descriptor (`/dev/stdin`, `/dev/fd/N`), which
-/// may share standard input's offset.
+/// may share standard input's offset. `Some(false)` for a file jq's reader counts as an input error
+/// (it does not open, or is a directory), which ends jq's main loop one input later.
 #[cfg(unix)]
-fn scan_named_file(scan: &mut Scan, path: &PathBuf, block: &mut [u8]) -> bool {
+fn scan_named_file(scan: &mut Scan, path: &PathBuf, block: &mut [u8]) -> Option<bool> {
     use std::io::Read;
     if path.starts_with("/dev/fd") || path.starts_with("/dev/stdin") {
-        return false;
+        return None;
     }
-    match std::fs::metadata(path) {
+    let opened = match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() => {
             let Ok(mut file) = std::fs::File::open(path) else {
                 scan.end_of_file();
-                return true;
+                return Some(false);
             };
             while scan.found().is_none() {
                 match file.read(block) {
                     Ok(0) => break,
                     Ok(n) => scan.feed(&block[..n]),
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => return false,
+                    Err(_) => return None,
                 }
             }
+            true
         }
-        Ok(meta) if !meta.is_dir() => return false,
-        _ => {}
-    }
+        Ok(meta) if !meta.is_dir() => return None,
+        _ => false,
+    };
     if scan.found().is_none() {
         scan.end_of_file();
     }
-    true
+    Some(opened)
 }
 
 /// jq's `fgets` chunk: a line, or this many bytes of a longer one.

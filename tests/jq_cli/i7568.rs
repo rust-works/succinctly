@@ -857,3 +857,35 @@ fn a_dash_after_a_file_that_does_not_open_and_from_an_offset_7568() {
         (18, 0)
     );
 }
+
+#[test]
+fn a_main_loop_stops_one_input_past_a_file_that_does_not_open_7568() {
+    // jq's main loop ends once it has the input its reader read past a file that did not open (or
+    // a directory): `while (jq_util_input_errors(...) == 0 && ...)`. Captured from jq 1.7.1 (exit 2
+    // each), and the same in jq 1.8.2.
+    for (named, args, want) in [
+        (
+            &b"5\n"[..],
+            &["-c", "empty", "no-such-file", "-", "-"][..],
+            9,
+        ),
+        (b"", &["-c", "empty", "no-such-file", "-"], 9),
+        (b"5\n", &["-c", "empty", "F", "no-such-file", "-"], 9),
+        // The input after the failure is the named file's: standard input is never reached.
+        (b"5\n", &["-c", "empty", "no-such-file", "F", "-"], 0),
+        (
+            b"[2]",
+            &["-c", "--stream", "empty", "no-such-file", "F", "-"],
+            0,
+        ),
+        (b"", &["-c", "--stream", "empty", "no-such-file", "-"], 9),
+        (b"", &["-R", "empty", "no-such-file", "-"], 9),
+        (b"", &["-c", "[., input]", "no-such-file", "-"], 18),
+        (b"", &["-c", "empty", ".", "-"], 9),
+        // After standard input the failure is met at its end, and `[inputs]` reads it all.
+        (b"", &["-c", "empty", "-", "no-such-file"], 27),
+        (b"", &["-c", "-n", "[inputs]", "no-such-file", "-"], 27),
+    ] {
+        assert_eq!(offset_after(STDIN, 0, named, args), (want, 2), "{args:?}");
+    }
+}
