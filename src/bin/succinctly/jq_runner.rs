@@ -9864,7 +9864,14 @@ impl EofTail {
         let mut last_event = None;
         let mut offset = 0;
         loop {
-            let (values, malformed) = split_json_values_strict(&last[offset..]);
+            // #7470: past a fault, only through the first depth refusal.
+            let rest = &last[offset..];
+            let read = if offset > 0 {
+                &rest[..depth_refusal_cut(rest, stream)]
+            } else {
+                rest
+            };
+            let (values, malformed) = split_json_values_strict(read);
             if let Some(&(start, end)) = values.last() {
                 // At `last.len()` for a bare token that the end of input completes.
                 last_event = Some(offset + Self::completes_at(&last[offset..], start, end));
@@ -13617,6 +13624,24 @@ fn meet_fault(
     (detected, line, resume)
 }
 
+/// How many bytes of `text`, which jq's parser reads on into from a fault, a loop that resumes
+/// past faults has to split and parse (#7470): through the bracket jq refuses for its depth limit,
+/// when that is the first fault the parser meets in `text`, or all of it. `--stream` (`stream`)
+/// has no depth limit, so all of it there.
+///
+/// jq stops on that bracket and drops the rest of its read, so nothing after it changes the values
+/// before it or the fault. But a container that deep closes only near the end of the text, and the
+/// splitter, the index and the validators each walked it whole, once per read the loop resumed at:
+/// a deeply nested document's refusal was quadratic in its depth. The cut ends inside the refused
+/// container and leaves it unclosed, so the splitter stops at its start, where over the whole text
+/// the refused span starts, with the same values before it.
+fn depth_refusal_cut(text: &[u8], stream: bool) -> usize {
+    if stream {
+        return text.len();
+    }
+    jq::jq_stream_depth_fault_offset(text).map_or(text.len(), |at| at + 1)
+}
+
 /// The line jq's parser stands on when it meets the fault that ends `raw`'s clean prefix of
 /// `parsed` values, or `None` when the splitter finds no fault there (#5555).
 fn slurp_fault_at(raw: &str, seam: Seam, parsed: usize, stream: bool) -> Option<usize> {
@@ -13989,7 +14014,14 @@ fn open_tail_start(raw: &[u8], resumes: bool, seam: Seam, stream: bool) -> Optio
     let mut offset = 0;
     loop {
         let split = if resumes {
-            split_json_values_strict(&raw[offset..])
+            // #7470: past a fault, only through the first depth refusal.
+            let rest = &raw[offset..];
+            let read = if offset > 0 {
+                &rest[..depth_refusal_cut(rest, stream)]
+            } else {
+                rest
+            };
+            split_json_values_strict(read)
         } else {
             split_json_values(&raw[offset..])
         };
@@ -14189,7 +14221,13 @@ fn read_json_tail(
     // from one file to the next.
     let mut file_end: Option<(usize, usize)> = None;
     loop {
-        let segment = &raw[offset..];
+        let mut segment = &raw[offset..];
+        // #7470: past a fault, only through the first depth refusal. The parse below names the
+        // fault with jq's parser model over these same bytes, which a `lossy` text does not hold
+        // (the model reads the bytes jq read), so that one is read whole.
+        if parser_at.is_some() && cx.lossy.is_none() {
+            segment = &segment[..depth_refusal_cut(segment.as_bytes(), cx.stream)];
+        }
         let seg_pos = (!cx.stream).then(|| {
             parser_at.unwrap_or_else(|| {
                 advance_source(cx.file_start, raw.as_bytes(), cx.lossy, 0..offset)
