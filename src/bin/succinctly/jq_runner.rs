@@ -9832,10 +9832,10 @@ impl EofTail {
         let mut last_event = None;
         let mut offset = 0;
         loop {
-            // #7470: past a fault, only through the first depth refusal.
+            // #7470, #7611: past a fault, only through the next fault.
             let rest = &last[offset..];
             let read = if offset > 0 {
-                &rest[..depth_refusal_cut(rest, stream)]
+                &rest[..fault_cut(rest, stream)]
             } else {
                 rest
             };
@@ -13593,21 +13593,31 @@ fn meet_fault(
 }
 
 /// How many bytes of `text`, which jq's parser reads on into from a fault, a loop that resumes
-/// past faults has to split and parse (#7470): through the bracket jq refuses for its depth limit,
-/// when that is the first fault the parser meets in `text`, or all of it. `--stream` (`stream`)
-/// has no depth limit, so all of it there.
+/// past faults has to split and parse (#7470, #7611): through the byte at which jq's parser meets
+/// the first fault in `text` ([`jq::jq_stream_fault_offset`]), whatever the fault, and on to the end
+/// of the character it is in; all of it when the parser meets none before the end. `--stream`
+/// (`stream`) reads with jq's streaming parser, which that model is not, so all of it there.
 ///
-/// jq stops on that bracket and drops the rest of its read, so nothing after it changes the values
-/// before it or the fault. But a container that deep closes only near the end of the text, and the
-/// splitter, the index and the validators each walked it whole, once per read the loop resumed at:
-/// a deeply nested document's refusal was quadratic in its depth. The cut ends inside the refused
-/// container and leaves it unclosed, so the splitter stops at its start, where over the whole text
-/// the refused span starts, with the same values before it.
-fn depth_refusal_cut(text: &[u8], stream: bool) -> usize {
+/// jq stops on that byte and drops the rest of its read, so nothing after it changes the values
+/// before it or the fault. But the value holding a fault can run to the end of the text (a deeply
+/// nested document, or `[x[x[x...` with its closers at the end), and the splitter, the index and
+/// the validators each walked it whole, once per read the loop resumed at: quadratic in the text
+/// after the first fault. The cut ends inside the malformed value or just after it, so the
+/// splitter stops at the value's start, where over the whole text the malformed span starts, with
+/// the same values before it.
+fn fault_cut(text: &[u8], stream: bool) -> usize {
     if stream {
         return text.len();
     }
-    jq::jq_stream_depth_fault_offset(text).map_or(text.len(), |at| at + 1)
+    let Some(at) = jq::jq_stream_fault_offset(text) else {
+        return text.len();
+    };
+    // A `&str` caller slices at the cut, so it ends on a character boundary.
+    let mut cut = at + 1;
+    while text.get(cut).is_some_and(|&b| b & 0xC0 == 0x80) {
+        cut += 1;
+    }
+    cut
 }
 
 /// The line jq's parser stands on when it meets the fault that ends `raw`'s clean prefix of
@@ -13982,10 +13992,10 @@ fn open_tail_start(raw: &[u8], resumes: bool, seam: Seam, stream: bool) -> Optio
     let mut offset = 0;
     loop {
         let split = if resumes {
-            // #7470: past a fault, only through the first depth refusal.
+            // #7470, #7611: past a fault, only through the next fault.
             let rest = &raw[offset..];
             let read = if offset > 0 {
-                &rest[..depth_refusal_cut(rest, stream)]
+                &rest[..fault_cut(rest, stream)]
             } else {
                 rest
             };
@@ -14190,11 +14200,11 @@ fn read_json_tail(
     let mut file_end: Option<(usize, usize)> = None;
     loop {
         let mut segment = &raw[offset..];
-        // #7470: past a fault, only through the first depth refusal. The parse below names the
+        // #7470, #7611: past a fault, only through the next fault. The parse below names the
         // fault with jq's parser model over these same bytes, which a `lossy` text does not hold
         // (the model reads the bytes jq read), so that one is read whole.
         if parser_at.is_some() && cx.lossy.is_none() {
-            segment = &segment[..depth_refusal_cut(segment.as_bytes(), cx.stream)];
+            segment = &segment[..fault_cut(segment.as_bytes(), cx.stream)];
         }
         let seg_pos = (!cx.stream).then(|| {
             parser_at.unwrap_or_else(|| {
