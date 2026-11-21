@@ -29061,7 +29061,7 @@ fn failure_kinds_3573(stderr: &str) -> String {
             kinds.push(format!("D:{}", file_name(&rest[..end])));
         } else if let Some(module) = line.strip_prefix("jq: error: module not found: ") {
             kinds.push(format!("M:{module}"));
-        } else if line.starts_with("jq: error: module cycle detected: ") {
+        } else if line.starts_with("jq: error: circular import of ") {
             kinds.push("C".to_string());
         } else if let Some((_, rest)) = line
             .strip_prefix("jq: error: ")
@@ -29281,27 +29281,30 @@ fn test_directive_failures_are_reported_in_jqs_walk_order_3573() -> Result<()> {
     )
 }
 
-/// #3573: a module cycle is #2865's divergence -- real jq runs out of stack
-/// (exit 139) and prints only what its walk reached first -- so succinctly
-/// ends its walk at the cycle the way a missing module does: what jq printed
-/// before it died, in jq's order, then the cycle and `1 compile error`. The
-/// row `include "cyc1"; import "bad" as $d; $d` prints jq's `bad` first (jq's
-/// own output, before the crash), `include "cyc1"; include "synerr"; 1` jq's
-/// `synerr`, and a cycle with nothing before it prints the cycle alone, as it
-/// always did.
+/// #3573, #7530: a module cycle stops its level and returns `1` for it, as a
+/// missing module does, and the levels above go on (jq 1.8.2's
+/// `process_dependencies` answers `circular import of <path>` and `return 1`;
+/// jq 1.7.1 recursed until SIGSEGV, so there is no 1.7.1 output). Every row was
+/// captured from jq 1.8.2: the cycle counts once, and what the walk reaches
+/// after it is still reported (`include "cyc1"; import "bad" as $d; $d` prints
+/// `bad` first, the later-declared import, then the cycle, `2 compile errors`;
+/// `import "bad" as $d; include "cyc1"; $d` the other way round).
 #[test]
-fn test_a_module_cycle_ends_the_walk_after_what_jq_printed_first_3573() -> Result<()> {
+fn test_a_module_cycle_ends_its_level_and_the_walk_goes_on_3573() -> Result<()> {
     assert_directive_rows_3573(
         &[
             (r#"include "cyc1"; 1"#, "C T:1"),
-            (r#"import "bad" as $d; include "cyc1"; $d"#, "C T:1"),
+            (
+                r#"import "bad" as $d; include "cyc1"; $d"#,
+                "C D:bad.json T:2",
+            ),
             (
                 r#"include "cyc1"; import "bad" as $d; $d"#,
-                "D:bad.json C T:1",
+                "D:bad.json C T:2",
             ),
             (
                 r#"include "cyc1"; include "synerr"; 1"#,
-                "S:synerr.jq C T:1",
+                "S:synerr.jq C T:2",
             ),
         ],
         3,
@@ -29380,15 +29383,13 @@ fn test_an_unreadable_module_is_counted_and_the_walk_goes_on_3573() -> Result<()
     Ok(())
 }
 
-/// #3573: which cycle is named follows jq's walk order, last-declared first.
-/// `twoself.jq` includes two modules that each include themselves; jq would
-/// recurse into the *last-declared* one first, so that is the cycle reported
-/// (`self2 -> self2`). The loader's own first-declared order used to name
-/// `self1 -> self1`. jq crashes on a cycle, so this is the walk's order
-/// applied, not a captured answer; the chain text is pinned so the choice is
-/// deliberate.
+/// #3573, #7530: cycles are reported in jq's walk order, last-declared first.
+/// `twoself.jq` includes two modules that each include themselves; jq reaches
+/// the *last-declared* one first, so `self2.jq` is named before `self1.jq`, and
+/// both are reported (`2 compile errors`: each cycle returns `1` for its own
+/// level). Captured from jq 1.8.2.
 #[test]
-fn test_the_cycle_named_is_the_first_in_jqs_walk_order_3573() -> Result<()> {
+fn test_cycles_are_named_in_jqs_walk_order_3573() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     write_directive_fixtures_3573(temp_dir.path())?;
     let (output, code) = spawn_with_signal_retry(
@@ -29404,10 +29405,17 @@ fn test_the_cycle_named_is_the_first_in_jqs_walk_order_3573() -> Result<()> {
     )?;
     let stderr = String::from_utf8(output.stderr)?;
     assert_eq!(code, 3, "stderr {stderr:?}");
-    assert_eq!(
-        stderr,
-        "jq: error: module cycle detected: self2 -> self2\n\njq: 1 compile error\n"
-    );
+    let (first, rest) = stderr
+        .split_once("\n\n")
+        .expect("blank line after an entry");
+    let (second, tail) = rest.split_once("\n\n").expect("blank line after an entry");
+    let named = |line: &str, file: &str| {
+        line.strip_prefix("jq: error: circular import of /")
+            .is_some_and(|path| path.ends_with(&format!("/{file}")))
+    };
+    assert!(named(first, "self2.jq"), "stderr {stderr:?}");
+    assert!(named(second, "self1.jq"), "stderr {stderr:?}");
+    assert_eq!(tail, "jq: 2 compile errors\n", "stderr {stderr:?}");
     Ok(())
 }
 
@@ -30154,40 +30162,37 @@ fn test_transitive_include_chain_and_diamond_2865() -> Result<()> {
     Ok(())
 }
 
-/// #2865: a module cycle is reported and terminates.
+/// #2865, #7530: a module cycle is reported and terminates.
 ///
-/// **A deliberate ADR-0018 rule-4 divergence**, under the explicit "matching
-/// would take the host process down" carve-out: real jq 1.7.1 does not
-/// diagnose this at all, it recurses until it dies --
+/// jq 1.7.1 does not diagnose it, it recurses until it dies --
 /// `jq -L . -n 'include "ca"; a'` exits **139** (SIGSEGV) with nothing on
-/// either stream, and a self-including module does the same. So there is no
-/// reference output to match; what this test pins is that succinctly leaves
-/// through the same exit-3 `jq: 1 compile error` door as the other two
-/// compile-error kinds, and that it leaves at all.
+/// either stream -- so the output is jq 1.8.2's (CVE-2026-44777):
+/// `jq: error: circular import of <absolute path of the re-entered module>`,
+/// a blank line, `jq: 1 compile error`, exit 3.
 ///
 /// The third row is why detection keys on the *resolved* file rather than the
 /// module path as written: `alia.jq` including `"./alia"` is the same cycle
-/// under two spellings.
+/// under two spellings, and the message names the resolved file.
 #[test]
 fn test_module_cycle_is_a_compile_error_not_a_hang_2865() -> Result<()> {
-    for (modules, filter, want_chain) in [
+    for (modules, filter, want_file) in [
         (
             vec![
                 ("ca", "include \"cb\";\ndef a: 1;\n"),
                 ("cb", "include \"ca\";\ndef b: 2;\n"),
             ],
             r#"include "ca"; a"#,
-            "ca -> cb -> ca",
+            "ca.jq",
         ),
         (
             vec![("selfinc", "include \"selfinc\";\ndef s: 5;\n")],
             r#"include "selfinc"; s"#,
-            "selfinc -> selfinc",
+            "selfinc.jq",
         ),
         (
             vec![("alia", "include \"./alia\";\ndef q: 3;\n")],
             r#"include "alia"; q"#,
-            "alia -> ./alia",
+            "alia.jq",
         ),
         (
             vec![
@@ -30195,20 +30200,22 @@ fn test_module_cycle_is_a_compile_error_not_a_hang_2865() -> Result<()> {
                 ("ib", "import \"ia\" as a;\ndef y: 2;\n"),
             ],
             r#"include "ia"; x"#,
-            "ia -> ib -> ia",
+            "ia.jq",
         ),
     ] {
         let (stdout, stderr, code) = run_jq_with_modules(&modules, &["-nc", filter])?;
         assert_eq!(code, 3, "{filter}: stderr: {stderr:?}");
         assert_eq!(stdout, "", "{filter}");
+        let (first, tail) = stderr
+            .split_once("\n\n")
+            .unwrap_or_else(|| panic!("{filter}: stderr: {stderr:?}"));
         assert!(
-            stderr.contains(&format!("module cycle detected: {want_chain}")),
+            first
+                .strip_prefix("jq: error: circular import of /")
+                .is_some_and(|path| path.ends_with(&format!("/{want_file}"))),
             "{filter}: stderr: {stderr:?}"
         );
-        assert!(
-            stderr.contains("jq: 1 compile error"),
-            "{filter}: stderr: {stderr:?}"
-        );
+        assert_eq!(tail, "jq: 1 compile error\n", "{filter}");
     }
     Ok(())
 }
@@ -30364,10 +30371,8 @@ fn test_home_jq_def_does_not_seed_a_modules_own_shadow_candidates_2950() -> Resu
 /// `module_dep_defs`'s own `deps` result rather than a second, independent
 /// traversal (an earlier version of this fix took the second-traversal
 /// shape; see `test_module_cycle_chain_stays_linear_cost_2950` below for
-/// why that was reverted). `ca`/`cb` include each other; real jq hangs on
-/// this input (confirmed live, not asserted here), so this pins
-/// succinctly's own clean-refusal behavior instead of a byte-for-byte
-/// oracle match.
+/// why that was reverted). `ca`/`cb` include each other; jq 1.7.1 crashes on
+/// this input, so this pins the `circular import of` refusal of jq 1.8.2 (#7530).
 #[test]
 fn test_module_cycle_reached_through_discovery_pass_still_detected_2950() -> Result<()> {
     let (stdout, stderr, code) = run_jq_with_modules(
@@ -30380,7 +30385,7 @@ fn test_module_cycle_reached_through_discovery_pass_still_detected_2950() -> Res
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(stdout.is_empty(), "{stdout:?}");
     assert!(
-        stderr.contains("module cycle detected"),
+        stderr.contains("jq: error: circular import of "),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -30464,7 +30469,7 @@ fn test_module_cycle_chain_stays_linear_cost_2950() -> Result<()> {
     );
     assert_eq!(code, 3, "stderr: {stderr:?}");
     assert!(
-        stderr.contains("module cycle detected"),
+        stderr.contains("jq: error: circular import of "),
         "stderr: {stderr:?}"
     );
 
@@ -30567,16 +30572,15 @@ fn test_exported_module_def_carries_its_own_siblings_2865() -> Result<()> {
     Ok(())
 }
 
-/// #2865 (PR review): the reported cycle chain starts at the repeat, not at
-/// the bottom of the load stack.
+/// #2865 (PR review), #7530: the cycle names the module that is re-entered, not
+/// the one that led to it.
 ///
-/// A module that merely *leads* to a cycle is not part of it: loading `x`,
-/// which includes `ca`, which includes `cb`, which includes `ca`, reports
-/// `ca -> cb -> ca` and not `x -> ca -> cb -> ca`. The existing cycle test
-/// only covers cycles rooted at the first module loaded, where the two spell
-/// the same thing.
+/// Loading `x`, which includes `ca`, which includes `cb`, which includes `ca`,
+/// reports `circular import of .../ca.jq` and never names `x` (jq 1.8.2 does
+/// the same). The existing cycle test only covers cycles rooted at the first
+/// module loaded, where the two are the same module.
 #[test]
-fn test_cycle_chain_starts_at_the_repeat_not_the_stack_bottom_2865() -> Result<()> {
+fn test_cycle_names_the_reentered_module_not_the_stack_bottom_2865() -> Result<()> {
     let (_, stderr, code) = run_jq_with_modules(
         &[
             ("x", "include \"ca\";\ndef xx: 1;\n"),
@@ -30586,13 +30590,14 @@ fn test_cycle_chain_starts_at_the_repeat_not_the_stack_bottom_2865() -> Result<(
         &["-nc", r#"include "x"; xx"#],
     )?;
     assert_eq!(code, 3, "stderr: {stderr:?}");
+    let first = stderr.lines().next().unwrap_or_default();
     assert!(
-        stderr.contains("module cycle detected: ca -> cb -> ca"),
+        first.starts_with("jq: error: circular import of /") && first.ends_with("/ca.jq"),
         "stderr: {stderr:?}"
     );
     assert!(
-        !stderr.contains("x -> ca"),
-        "chain must not name modules outside the cycle: {stderr:?}"
+        !stderr.contains("/x.jq"),
+        "the cycle must not name a module outside it: {stderr:?}"
     );
     Ok(())
 }
