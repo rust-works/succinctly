@@ -2876,7 +2876,11 @@ pub(crate) fn unbound_value_args_call(expr: &Expr) -> Option<Expr> {
 /// call) is left as written, so it costs nothing at run time. yq mode keeps
 /// [`bind_retrying_value_arg`]: real yq takes the first value of most of these arguments, or
 /// refuses a second one, rather than fanning out.
-fn bind_value_args(mut builtin: Builtin) -> Expr {
+fn bind_value_args(builtin: Builtin) -> Expr {
+    let mut builtin = match retry_collected_arg(builtin) {
+        Ok(retried) => return retried,
+        Err(builtin) => builtin,
+    };
     let mut slots = builtin.value_args_mut();
     let Some(innermost) = slots
         .iter()
@@ -2898,6 +2902,199 @@ fn bind_value_args(mut builtin: Builtin) -> Expr {
             var: var.to_string(),
             body: Box::new(body),
         })
+}
+
+/// The variables [`retry_collected_arg`] binds. They are not [`VALUE_ARG_VARS`]: the argument it
+/// rewrites reads them, so the resolver checks these bindings as the ordinary `as` they are, not as
+/// the call they came from.
+const COLLECTED_RE_VAR: &str = "%re";
+const COLLECTED_ARG_VAR: &str = "%collected";
+const COLLECTED_VALUES_VAR: &str = "%collected_values";
+const IN_INPUT_VAR: &str = "%in";
+
+/// A `?//` bind in an argument jq reads *inside an array it collects* (#7558): `split`'s and
+/// `splits`' flags (`def splits($re; flags): . as $s | [match($re; "g" + flags) | ...] | ...`) and
+/// `combinations`' count (`def combinations(n): . as $dot | [range(n) | $dot] | combinations;`).
+///
+/// A failure the collected expression raises after one of the argument's values (`"g" + 1`, a
+/// regex refusal, `range("x")`) backtracks into the argument's next alternative. The argument
+/// cannot be bound ahead of the call the way [`bind_value_args`] binds the others, because every
+/// value it yields lands in the one array: `split("a"; ("", "i"))` is one split by both, not two.
+/// So its values are collected first, with the step that can fail run right after each one,
+/// where a failure retries the bind, and the call then reads the values that survived:
+/// `[F as $f | (match($re; "g" + $f) | empty), $f] as $fs | splits($re; $fs[])`, and
+/// `[N as $n | range($n; $n), $n] as $ns | combinations($ns[])` (`range(x; x)` yields nothing
+/// for a number and refuses anything else with `range(n)`'s own sentence). The builtin's own
+/// evaluation of the argument cannot retry a bind, which is why the values reach it settled.
+/// `split`'s and `splits`' `$re` is bound first, as jq binds it, so the check matches with the
+/// pattern the call uses.
+///
+/// `in(xs)` is the third shape: `def in(xs): . as $x | xs | has($x);` binds its input before
+/// `xs` runs, so binding `xs` first would put the argument's errors ahead of the input's own
+/// (#2202). An argument that holds a `?//` is spelled out as that definition instead, where a
+/// refusal of `has` retries the bind as any later pipe stage does. Any other argument keeps the
+/// call, which the resolver reports compile errors for as jq does (a closure operand).
+/// `Err` hands back a builtin with none of these arguments.
+fn retry_collected_arg(builtin: Builtin) -> Result<Expr, Builtin> {
+    let var = |name: &str| Expr::Var(name.to_string());
+    // `[source as $c | check, $c] as $cs`, then `body` reading `$cs[]` in the argument's slot.
+    let settled = |source: Box<Expr>, check: Expr, body: &dyn Fn(Box<Expr>) -> Expr| Expr::As {
+        expr: Box::new(Expr::Array(Box::new(Expr::As {
+            expr: source,
+            var: COLLECTED_ARG_VAR.to_string(),
+            body: Box::new(Expr::Comma(vec![check, var(COLLECTED_ARG_VAR)])),
+        }))),
+        var: COLLECTED_VALUES_VAR.to_string(),
+        body: Box::new(body(Box::new(Expr::pipe(vec![
+            var(COLLECTED_VALUES_VAR),
+            Expr::Iterate,
+        ])))),
+    };
+    let split_regex = matches!(builtin, Builtin::SplitRegex(..));
+    match builtin {
+        Builtin::SplitsFlags(re, flags) | Builtin::SplitRegex(re, flags)
+            if contains_retrying_pattern_bind(&flags) =>
+        {
+            let matched = Builtin::MatchFlags(
+                Box::new(var(COLLECTED_RE_VAR)),
+                Box::new(Expr::arithmetic(
+                    ArithOp::Add,
+                    Expr::Literal(Literal::String("g".into())),
+                    var(COLLECTED_ARG_VAR),
+                )),
+            );
+            let check = Expr::pipe(vec![Expr::Builtin(matched), Expr::Builtin(Builtin::Empty)]);
+            let call = settled(flags, check, &|flags| {
+                let re = Box::new(var(COLLECTED_RE_VAR));
+                Expr::Builtin(if split_regex {
+                    Builtin::SplitRegex(re, flags)
+                } else {
+                    Builtin::SplitsFlags(re, flags)
+                })
+            });
+            Ok(Expr::As {
+                expr: re,
+                var: COLLECTED_RE_VAR.to_string(),
+                body: Box::new(call),
+            })
+        }
+        Builtin::In(xs) if contains_retrying_pattern_bind(&xs) => Ok(Expr::As {
+            expr: Box::new(Expr::Identity),
+            var: IN_INPUT_VAR.to_string(),
+            body: Box::new(Expr::pipe(vec![
+                *xs,
+                Expr::Builtin(Builtin::Has(Box::new(var(IN_INPUT_VAR)))),
+            ])),
+        }),
+        Builtin::CombinationsN(count) if contains_retrying_pattern_bind(&count) => {
+            let check = Expr::Range {
+                from: Box::new(var(COLLECTED_ARG_VAR)),
+                to: Some(Box::new(var(COLLECTED_ARG_VAR))),
+                step: None,
+            };
+            Ok(settled(count, check, &|count| {
+                Expr::Builtin(Builtin::CombinationsN(count))
+            }))
+        }
+        other => Err(other),
+    }
+}
+
+/// Which call a [`retry_collected_arg`] shape was parsed from.
+#[derive(Clone, Copy)]
+enum CollectedCall {
+    In,
+    Split,
+    Splits,
+    Combinations,
+}
+
+/// Whether `var` is the outermost binding of a [`retry_collected_arg`] shape, which the resolver
+/// checks as the call it was parsed from (#7558).
+pub(crate) fn is_collected_arg_var(var: &str) -> bool {
+    var == COLLECTED_RE_VAR || var == COLLECTED_VALUES_VAR || var == IN_INPUT_VAR
+}
+
+/// The program's own operands in a [`retry_collected_arg`] shape, in the call's operand order,
+/// or `None` when `expr` is not one.
+fn collected_arg_operands_mut(expr: &mut Expr) -> Option<(CollectedCall, Vec<&mut Expr>)> {
+    // `[source as $c | check, $c] as $cs | body`: the source, and the body.
+    fn settled(expr: &mut Expr) -> Option<(&mut Expr, &mut Expr)> {
+        let Expr::As { expr, var, body } = expr else {
+            return None;
+        };
+        let Expr::Array(inner) = expr.as_mut() else {
+            return None;
+        };
+        let Expr::As { expr: source, .. } = inner.as_mut() else {
+            return None;
+        };
+        (var == COLLECTED_VALUES_VAR).then_some((source.as_mut(), body.as_mut()))
+    }
+    let Expr::As { expr, var, body } = expr else {
+        return None;
+    };
+    match var.as_str() {
+        IN_INPUT_VAR => match body.as_mut() {
+            Expr::Pipe(stages) => Some((CollectedCall::In, stages.iter_mut().take(1).collect())),
+            _ => None,
+        },
+        COLLECTED_RE_VAR => {
+            let (flags, call) = settled(body)?;
+            let kind = match call {
+                Expr::Builtin(Builtin::SplitRegex(..)) => CollectedCall::Split,
+                Expr::Builtin(Builtin::SplitsFlags(..)) => CollectedCall::Splits,
+                _ => return None,
+            };
+            Some((kind, alloc::vec![expr.as_mut(), flags]))
+        }
+        COLLECTED_VALUES_VAR => {
+            let Expr::Array(inner) = expr.as_mut() else {
+                return None;
+            };
+            let Expr::As { expr: count, .. } = inner.as_mut() else {
+                return None;
+            };
+            matches!(body.as_ref(), Expr::Builtin(Builtin::CombinationsN(_)))
+                .then(|| (CollectedCall::Combinations, alloc::vec![count.as_mut()]))
+        }
+        _ => None,
+    }
+}
+
+/// The call a [`retry_collected_arg`] shape was parsed from, with the program's operands moved
+/// out of the shape into it, or `None` when `expr` is not one. The resolver checks the call as
+/// written, as jq compiles it (its operands are closures), then hands it back to
+/// [`restore_collected_arg_call`]. Moving an operand moves none of the boxes inside it, so every
+/// `def` body keeps its address.
+pub(crate) fn take_collected_arg_call(expr: &mut Expr) -> Option<Expr> {
+    let (call, operands) = collected_arg_operands_mut(expr)?;
+    let mut taken = operands
+        .into_iter()
+        .map(|slot| Box::new(core::mem::replace(slot, Expr::Identity)));
+    let mut next = || taken.next().expect("each shape holds its call's operands");
+    Some(Expr::Builtin(match call {
+        CollectedCall::In => Builtin::In(next()),
+        CollectedCall::Split => Builtin::SplitRegex(next(), next()),
+        CollectedCall::Splits => Builtin::SplitsFlags(next(), next()),
+        CollectedCall::Combinations => Builtin::CombinationsN(next()),
+    }))
+}
+
+/// Puts the operands [`take_collected_arg_call`] moved out of `expr` back, from `call`.
+pub(crate) fn restore_collected_arg_call(expr: &mut Expr, call: Expr) {
+    let operands = match call {
+        Expr::Builtin(Builtin::In(xs) | Builtin::CombinationsN(xs)) => alloc::vec![*xs],
+        Expr::Builtin(Builtin::SplitRegex(re, flags) | Builtin::SplitsFlags(re, flags)) => {
+            alloc::vec![*re, *flags]
+        }
+        // patchcov: coverage tolerate-line reason="unreachable: the resolver hands back the call take_collected_arg_call built, and checking a builtin call leaves its variant (#7558)"
+        _ => unreachable!("a collected-argument call checks as the same builtin"),
+    };
+    let (_, slots) = collected_arg_operands_mut(expr).expect("the shape the call was taken from");
+    for (slot, operand) in slots.into_iter().zip(operands) {
+        *slot = operand;
+    }
 }
 
 /// Whether a builtin argument yields at most one value, for [`bind_value_args`]:
@@ -13410,6 +13607,60 @@ mod tests {
                 Literal::number_literal("1".to_string())
             )))))
         );
+    }
+
+    /// #7558: `split`/`splits`' flags and `combinations`' count are collected and checked
+    /// ahead of the call when they hold a `?//`, and left in their slot otherwise, where several
+    /// values still land in one array (`split(","; ("g", null))` is one split).
+    #[test]
+    fn test_collected_arg_with_an_alternative_bind_is_settled_first_7558() {
+        for (program, splits) in [
+            (r#"split(","; [1] as $q ?// $b | "g")"#, false),
+            (r#"splits(","; [1] as $q ?// $b | "g")"#, true),
+        ] {
+            let Expr::As { var, body, .. } = parse(program).unwrap() else {
+                panic!("{program}: expected `$re` bound first");
+            };
+            assert_eq!(var, COLLECTED_RE_VAR);
+            let Expr::As { expr, var, body } = *body else {
+                panic!("{program}: expected the flags collected");
+            };
+            assert_eq!(var, COLLECTED_VALUES_VAR);
+            assert!(matches!(*expr, Expr::Array(_)), "{program}: {expr:?}");
+            match (*body, splits) {
+                (Expr::Builtin(Builtin::SplitsFlags(re, _)), true)
+                | (Expr::Builtin(Builtin::SplitRegex(re, _)), false) => {
+                    assert!(matches!(*re, Expr::Var(name) if name == COLLECTED_RE_VAR));
+                }
+                (other, _) => panic!("{program}: {other:?}"),
+            }
+        }
+        let Expr::As { var, body, .. } = parse(r"combinations([1] as $q ?// $b | 2)").unwrap()
+        else {
+            panic!("expected the count collected");
+        };
+        assert_eq!(var, COLLECTED_VALUES_VAR);
+        assert!(matches!(*body, Expr::Builtin(Builtin::CombinationsN(_))));
+        // `in(xs)` is its definition, `. as $x | xs | has($x)`, so the input is bound first.
+        let Expr::As { expr, var, body } = parse(r"in([1] as $q ?// $b | {})").unwrap() else {
+            panic!("expected `in`'s input bound first");
+        };
+        assert_eq!(var, IN_INPUT_VAR);
+        assert!(matches!(*expr, Expr::Identity));
+        assert!(matches!(*body, Expr::Pipe(_)), "{body:?}");
+        assert!(matches!(
+            parse(r#"in({"a": 1})"#).unwrap(),
+            Expr::Builtin(Builtin::In(_))
+        ));
+        // No `?//`: untouched, several values and all.
+        assert!(matches!(
+            parse(r#"split(","; ("g", null))"#).unwrap(),
+            Expr::Builtin(Builtin::SplitRegex(..))
+        ));
+        assert!(matches!(
+            parse("combinations(1, 2)").unwrap(),
+            Expr::Builtin(Builtin::CombinationsN(_))
+        ));
     }
 
     /// #3487: a builtin whose argument holds a `?//` bind is parsed as `K as $v | B($v)`, so
