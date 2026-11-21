@@ -704,6 +704,8 @@ fn run_jq_interleaved(args: &[&str], input: Option<&str>) -> Result<(String, i32
         let spawned = Command::new(succinctly_bin())
             .arg("jq")
             .args(args)
+            // As `spawn_jq`: the expectations are the C locale's (#5754, #7612).
+            .env("LC_ALL", "C")
             .stdin(Stdio::piped())
             .stdout(Stdio::from(out_handle))
             .stderr(Stdio::from(err_handle))
