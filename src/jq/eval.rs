@@ -52297,6 +52297,35 @@ mod deferred_update_delete_path_tests {
         .unwrap_err();
         assert!(format!("{error:?}").contains("Cannot index array with string"));
     }
+
+    // #7562: an array key the filter deletes is queued, and `delpaths` refuses it at the end,
+    // so a later path's error can come first; with no queue it is refused at once.
+    #[test]
+    fn an_array_key_deletion_is_queued_and_refused_at_the_end_7562() {
+        let key = Expr::ArrayKey(Box::new(parse_complete_json("[1]", false).unwrap()));
+        let empty = parse("empty").unwrap();
+        let mut root = parse_complete_json("[1,2]", false).unwrap();
+        let mut deletes = DeferredUpdateDeletes::default();
+        let wrote = update_path_with_deletes::<JqSemantics>(
+            &mut root,
+            &key,
+            &empty,
+            false,
+            ScalarNoop::Off,
+            None,
+            Some(&mut deletes),
+        );
+        assert!(matches!(wrote, Ok(false)));
+        assert_eq!(root.to_json(), "[1,2]");
+        let error = finish_deferred_update_deletes::<JqSemantics>(root, deletes).unwrap_err();
+        assert!(format!("{error:?}").contains("Cannot delete array element of array"));
+
+        let mut root = parse_complete_json("[1,2]", false).unwrap();
+        let error =
+            update_path::<JqSemantics>(&mut root, &key, &empty, false, ScalarNoop::Off, None)
+                .unwrap_err();
+        assert!(format!("{error:?}").contains("Cannot delete array element of array"));
+    }
 }
 
 fn update_delete_component(expr: &Expr) -> Option<OwnedValue> {
@@ -52898,6 +52927,15 @@ fn update_path_with_deletes<S: EvalSemantics>(
             // jq's `delpaths` leaves a `null` or absent parent as it is (`{"c":null} | .c[nan] |=
             // empty`), and never returns on an array. The document stays as it is.
             if !wrote && is_nan_index_key(key) {
+                return Ok(false);
+            }
+            // #7562: with several paths, `_modify` queues the deletion and runs one `delpaths`
+            // once every path is collected, so a later path's error comes first and this key's
+            // refusal is `delpaths`' own, raised at the end.
+            if let (false, Some(deletes)) = (wrote, deletes) {
+                deletes.enter(OwnedValue::clone(key));
+                deletes.record();
+                deletes.leave();
                 return Ok(false);
             }
             Err(array_key_write_error(
