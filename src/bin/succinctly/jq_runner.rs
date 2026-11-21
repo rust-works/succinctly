@@ -22359,6 +22359,51 @@ mod tests {
         }
     }
 
+    /// #7447: the first of several files whose first document is longer than the front is read on
+    /// for by the gate ([`first_document_file_is_lazy`]), so the files are read a window at a time
+    /// and not all whole; they hand out what the files read whole do. A first document with a fault
+    /// inside it still turns the gate down. The pin fails with the gate's old give-up at the front.
+    #[test]
+    fn several_files_with_a_long_first_document_are_read_in_windows_7447() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rest: Vec<u8> = (0..4_000)
+            .flat_map(|n| {
+                format!("{{\"n\":{n},\"pad\":\"xxxxxxxxxxxxxxxxxxxxxx\"}}\n").into_bytes()
+            })
+            .collect();
+        let long = format!(
+            "[{}]\n",
+            (0..60_000)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(long.len() > LAZY_PREFIX_BYTES);
+        let first = [long.as_bytes(), &rest].concat();
+        let broken = [&long.as_bytes()[..long.len() - 2], b" x\n", &rest].concat();
+        for (files, windowed) in [([&first, &rest], true), ([&broken, &rest], false)] {
+            let files: [&[u8]; 2] = [files[0], files[1]];
+            let whole = observe_inputs(dir.path(), &files, true, None).0;
+            LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(Some(0)));
+            LAZY_WINDOW_OVERRIDE.with(|c| c.set(Some(64 << 10)));
+            let started = SEVERAL_WINDOWED_STARTS.with(std::cell::Cell::get);
+            LAZY_TEXT_PEAK.with(|n| n.set(0));
+            let seen = observe_inputs(dir.path(), &files, false, None).0;
+            LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(None));
+            LAZY_WINDOW_OVERRIDE.with(|c| c.set(None));
+            assert_eq!(seen, whole);
+            assert_eq!(
+                SEVERAL_WINDOWED_STARTS.with(std::cell::Cell::get) - started,
+                usize::from(windowed),
+                "windowed {windowed}"
+            );
+            if windowed {
+                let peak = LAZY_TEXT_PEAK.with(std::cell::Cell::get);
+                assert!(peak < long.len() * 2 + (256 << 10), "peak {peak}");
+            }
+        }
+    }
+
     /// #7024: several files read a window at a time, each a lazy source of its own, hand out what the
     /// files read whole do: every document and error `input` pops and the `(at ...)` marker after each,
     /// through and past the end. The streams are cut into two and three files at every other byte, with a
