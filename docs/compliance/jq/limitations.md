@@ -5837,6 +5837,16 @@ Only the first read of a malformed member asks, and a stream jq's parser reads c
 A `--slurp` stream is read again from its files, so one slurped from stdin keeps the evaluator's wording and its `(at <stdin>:N)` marker: the original bytes are gone once the values are joined, and keeping them would hold a second copy of the whole input for the run.
 `input`/`inputs` and `-n` are not on this route, and word their faults as [#5555](https://github.com/rust-works/succinctly/issues/5555) does.
 
+### A parse error past 2^31 lines or columns reports the true position ([#7461](https://github.com/rust-works/succinctly/issues/7461))
+
+jq's parser keeps its line and column in C `int`s (`int line, column;` in `src/jv_parse.c`, at jq-1.7.1 and at jq-1.8.2, printed with `%d`), so a parse error past 2^31-1 newlines in the stream, or 2^31-1 bytes on one line, reports a negative position.
+A 2 GiB stream of newlines followed by a stray `}` is `jq: parse error: Unmatched '}' at line -2147483641, column 1` in jq 1.7.1 and 1.8.2, and `... at line 2147483655, column 1` in `succinctly jq`.
+A line of 2^31+10 spaces and a `}` is `... at line 1, column -2147483636` in jq and `... at line 1, column 2147483660` in `succinctly jq`.
+`succinctly jq` prints the true number: a wrapped negative position is useless for finding the fault, and the difference shows only on an input of 2 GiB or more.
+Standard output and the exit status are jq's, and below 2^31 the messages agree.
+jq's `(at FILE:N)` marker and `input_line_number` are `size_t` in jq and do not wrap.
+No test reads 2 GiB; this record is the pin.
+
 jq builds a DOM before the program runs, so it rejects the document whatever the filter is.
 Reproducing that means validating every document up front, which costs roughly a second
 index-building pass over the input — the whole advantage this crate is built for. `--validate`
@@ -14988,6 +14998,13 @@ jq writes a container's color before its opening bracket with no reset after it,
 The `,` is bare and the `:` carries the object color (#3110).
 Until #5473 succinctly reset after every token and wrote each color once, which looked the same on a terminal and differed in every byte.
 `succinctly yq -C -o json` keeps that older per-token framing: real yq's JSON colors and framing are a third thing (`{` plain, keys `36`, numbers `95`), so neither framing matches it, and it is a separate difference from this one.
+
+**An empty eighth `JQ_COLORS` field followed by `:` keeps the default key color ([#7431](https://github.com/rust-works/succinctly/issues/7431)).**
+`JQ_COLORS=1:2:3:4:5:6:7::` (and `::::::::`, `::::::::8`) sets the object-key color to the empty color `ESC[m` in jq 1.7.1, whose `jq_set_colors` loop reads an eighth field while text remains after the seventh `:`.
+`succinctly jq` keeps the default key color `1;34`, as jq 1.8.2 does, whose rewritten `jq_set_colors` (jqlang/jq#3282, "dynamically allocate space for `JQ_COLORS`") ignores an empty last field.
+The owner chose to leave this as it is rather than follow 1.7.1: upstream changed it in a rewrite that adds larger escapes, not as a fix of this case.
+`printf '{"a":1}' | JQ_COLORS=1:2:3:4:5:6:7:: jq -C -c .` writes the key as `ESC[m"a"` in 1.7.1, and `ESC[1;34m"a"` in 1.8.2 and in `succinctly jq`.
+An empty eighth field that is the last one (`1:2:3:4:5:6:7:`), an empty field among the first seven and an invalid eighth field already agree with 1.7.1.
 
 **`null`'s default color, and NaN's own double wrap (#3413).** jq 1.7.1's default color for
 `null` is `0;90` (bright black), confirmed live on both the macOS system build and the Linux
