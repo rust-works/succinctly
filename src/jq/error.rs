@@ -1714,6 +1714,13 @@ impl EvalError {
         Self::subject(value, "cannot be parsed as a number")
     }
 
+    /// `<v> cannot be parsed as a boolean` — `toboolean` (jq 1.8) on anything but a boolean or the
+    /// strings `"true"` and `"false"` (#7529). The value is dumped as JSON, so a control character
+    /// is `\u0001` and not Rust's `\u{1}`, and every type is named with its value.
+    pub fn cannot_parse_as_boolean(value: &OwnedValue) -> Self {
+        Self::subject(value, "cannot be parsed as a boolean")
+    }
+
     /// `<v> only strings can be parsed` — `fromjson` on a non-string.
     pub fn only_strings_can_be_parsed(value: &OwnedValue) -> Self {
         Self::subject(value, "only strings can be parsed")
