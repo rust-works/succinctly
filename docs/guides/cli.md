@@ -625,7 +625,7 @@ while the evaluator still follows jq (`length` on `{"a":1,"a":2}` is `1` either 
 - `-n, --null-input`: Don't read any input; use null as the single input value
 - `-R, --raw-input`: Read each line as a string instead of JSON
 - `-s, --slurp`: Read all inputs into an array
-- `--input-dsv <DELIMITER>`: Read input as DSV (delimiter-separated values); each row becomes a JSON array of strings
+- `--input-dsv <DELIMITER>`: Read input as DSV (delimiter-separated values); each row becomes a JSON array of strings, and each row is its own input, so the program sees `["name","age"]` and `.[0]` is the first column (`.[]` would iterate the fields of one row). The delimiter is one character: pass a tab as `$'\t'` (or `"$(printf '\t')"`), since the two characters `\t` are refused
 - `--validate`: Validate JSON strictly according to RFC 8259 before processing; reports detailed validation errors with line:column positions
 
 ### Variables
