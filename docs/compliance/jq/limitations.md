@@ -714,8 +714,12 @@ Costs and gaps this change leaves:
   `parse_operand`, about 13 native frames per level where `parse_binding` used about 5.
   `MAX_EXPR_DEPTH` does not count it (a chain of bindings is not paren nesting, and jq and
   the previous build accept a thousand), so a caller driving the parser from a small stack
-  reaches its overflow point sooner; the CLI parses on a 256 MiB (release) / 2 GiB (debug)
-  thread and is not affected.
+  reaches its overflow point sooner.
+  The CLI parses on a 256 MiB (release) / 2 GiB (debug) thread, and that was not enough either: about 48,000 bindings in a release build overflowed it and aborted the process (exit 134), and so did 500,000 chained definitions, in the walks after the parse ([#7475](https://github.com/rust-works/succinctly/issues/7475)).
+  Since #7475 a binding's body checks ADR-0025's native-stack floor, and a chain past it is the compile error jq gives a program past its own parser's stack, `memory exhausted` (exit 3): from about 23,000 bindings in a release build, where jq refuses from about 2,500.
+  A module-level chain of definitions, which the parser reads in a loop, is charged a fixed share of the floor's room per definition (`DEF_CHAIN_LINK_STACK`, 2 KiB in a release build, 48 KiB in a debug one, about three and two times what the deepest walk after the parse was measured to take on an Apple M5) and refused the same way from about 65,000 definitions in a release build (about 21,000 in a debug one); jq refuses from somewhere between 5,000 and 10,000.
+  A chain of definitions nested in an expression stops at `MAX_EXPR_DEPTH` already (256, where jq's message is `memory exhausted` from much further on).
+  A library caller that registers no stack budget (`with_stack_budget`) gets neither refusal, and its parser still overflows a small stack first.
 - **Stack per negated factor.** jq's `'-' Exp` puts the rest of a multiplicative chain
   under the negation, so `-1 * -1 * -1 ...` nests one negation per negated factor and the
   parser recurses once per factor (about 19 KiB of debug stack each, where the old parse was

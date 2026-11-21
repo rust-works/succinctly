@@ -117860,6 +117860,15 @@ pub(crate) fn native_stack_exhausted() -> bool {
     origin != 0 && origin.abs_diff(stack_address()) > reach
 }
 
+/// How many bytes of stack this thread may still spend before [`native_stack_exhausted`] holds,
+/// or `None` when no budget is registered (#7475). For the parser, which builds a chain of
+/// definitions in a loop and so spends no stack on its length, while every walk of the program
+/// after it recurses once per link.
+pub(crate) fn native_stack_room() -> Option<usize> {
+    let (origin, reach) = native_stack::budget();
+    (origin != 0).then(|| reach.saturating_sub(origin.abs_diff(stack_address())))
+}
+
 /// Whether values on this thread are bounded by the native-stack floor instead of
 /// [`MAX_VALUE_TREE_DEPTH`](super::value::MAX_VALUE_TREE_DEPTH) -- see
 /// [`with_value_depth_on_stack_floor`] (#5554).
