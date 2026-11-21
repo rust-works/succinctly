@@ -3270,6 +3270,12 @@ impl OutputConfig {
         }
     }
 
+    /// `--indent 0` without a later `-c`: pretty output whose indent is empty, which jq 1.8 prints
+    /// with its newlines and no indentation (jqlang/jq#3232, #7605); jq 1.7.1 printed it as `-c`.
+    fn indents_by_zero(&self) -> bool {
+        !self.compact && self.indent_string.is_empty()
+    }
+
     fn from_args(args: &JqCommand) -> Self {
         let indent_string = if args.uses_tab_indent() {
             "\t".to_string()
@@ -3355,10 +3361,9 @@ impl OutputConfig {
         // binary ever constructs -- caught by review as a 2.7x-4.8x
         // slowdown on ordinary input with no DEL at all.
         //
-        // `--indent 0` counts as compact here for the same reason it does in
-        // both streaming printers (#3155): its output *is* `-c`'s, so it can
-        // take the same echo.
-        (self.compact || self.indent_string.is_empty())
+        // `--indent 0` is not compact (#7605): jq 1.8 prints its newlines
+        // with no indentation, so it cannot take `-c`'s echo.
+        self.compact
             && !self.color_output
             && !self.sort_keys
             && !self.ascii_output
@@ -5130,6 +5135,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         succinctly::jq::set_debug_line_renderer(move |line| {
             let opts = JsonFormatOpts {
                 indent: "",
+                compact: true,
                 sort_keys,
                 ascii,
                 convention,
@@ -5201,6 +5207,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // #5674: the streamer writes no RS before a record, which `--seq` input reaching this
         // route has to see.
         && !output_config.seq
+        // #7605: the streamer's width 0 is `-c`'s layout (`IndentSpec::is_compact`), and jq 1.8
+        // prints `--indent 0` with newlines and no indentation, which it has no spelling for.
+        && !output_config.indents_by_zero()
         && context.named.is_empty();
 
     // Indent width/unit for the fast path's streamer -- built directly from
@@ -19599,10 +19608,7 @@ fn echoable_span<'a, Wrd: Clone + AsRef<[u64]>>(
     let JqValue::Cursor(cursor) = value else {
         return None;
     };
-    if !writes_lazily(config)
-        || config.convention.preserves_source_values()
-        || !(config.compact || config.indent_string.is_empty())
-    {
+    if !writes_lazily(config) || config.convention.preserves_source_values() || !config.compact {
         return None;
     }
     cursor.canonical_compact_span(depth)
@@ -20680,21 +20686,11 @@ where
         let marker = output::SkippedKind::of_jq_value(value).marker(formatter.marks_nan());
         return Ok(out.write_all(marker.as_bytes())?);
     }
-    // `|| indent_string.is_empty()`: `--indent 0` sets an empty indent with
-    // `compact` false, and jq 1.7.1 prints that compactly -- confirmed live,
-    // `jq --indent 0 '{a:[1,2]}'` is `{"a":[1,2]}`. `format_json`
-    // (`output.rs`) has always keyed compactness off `indent.is_empty()` and
-    // so already agreed with the reference; these two streaming printers
-    // keyed it off `config.compact` alone and emitted newlines with
-    // zero-width indents instead (#3155).
-    //
-    // That split used to be invisible because the two routes never met: the
-    // eager `-n`/`--slurp`/DSV route formatted through `format_json` and the
-    // lazy route streamed through here. Merging the owned writers put the
-    // reference-correct route onto this code, so the divergence had to be
-    // settled rather than documented -- and it is settled in the reference's
-    // favour, per ADR-0018.
-    let compact = config.compact || config.indent_string.is_empty();
+    // `config.compact` alone: `--indent 0` sets an empty indent with `compact` false, and jq
+    // 1.8 prints that with its newlines and no indentation (jqlang/jq#3232, "Fix `--indent 0`
+    // implicitly enabling `--compact-output`"; #7605). jq 1.7.1 printed it compactly, which
+    // #3155 had pinned on every route. `format_json` (`output.rs`) reads the same flag.
+    let compact = config.compact;
     let indent = &config.indent_string;
     let current_indent = if compact {
         String::new()
@@ -21404,21 +21400,11 @@ where
         let marker = output::SkippedKind::of(value).marker(formatter.marks_nan());
         return Ok(out.write_all(marker.as_bytes())?);
     }
-    // `|| indent_string.is_empty()`: `--indent 0` sets an empty indent with
-    // `compact` false, and jq 1.7.1 prints that compactly -- confirmed live,
-    // `jq --indent 0 '{a:[1,2]}'` is `{"a":[1,2]}`. `format_json`
-    // (`output.rs`) has always keyed compactness off `indent.is_empty()` and
-    // so already agreed with the reference; these two streaming printers
-    // keyed it off `config.compact` alone and emitted newlines with
-    // zero-width indents instead (#3155).
-    //
-    // That split used to be invisible because the two routes never met: the
-    // eager `-n`/`--slurp`/DSV route formatted through `format_json` and the
-    // lazy route streamed through here. Merging the owned writers put the
-    // reference-correct route onto this code, so the divergence had to be
-    // settled rather than documented -- and it is settled in the reference's
-    // favour, per ADR-0018.
-    let compact = config.compact || config.indent_string.is_empty();
+    // `config.compact` alone: `--indent 0` sets an empty indent with `compact` false, and jq
+    // 1.8 prints that with its newlines and no indentation (jqlang/jq#3232, "Fix `--indent 0`
+    // implicitly enabling `--compact-output`"; #7605). jq 1.7.1 printed it compactly, which
+    // #3155 had pinned on every route. `format_json` (`output.rs`) reads the same flag.
+    let compact = config.compact;
     let indent = &config.indent_string;
     let current_indent = if compact {
         String::new()
@@ -21525,6 +21511,7 @@ fn format_json_text(value: &OwnedValue, config: &OutputConfig) -> String {
         } else {
             &config.indent_string
         },
+        compact: config.compact,
         sort_keys: config.sort_keys,
         ascii: config.ascii_output,
         // #2852: `-S`/`-a`/`-C`/`-s` used to reformat a `NumberLiteral`
@@ -28790,11 +28777,10 @@ mod tests {
         let mut configs = Vec::new();
         for (indent_string, compact) in [
             (String::new(), true),
-            // `--indent 0`: an empty indent with `compact` false. Previously
-            // excluded here because the two printers disagreed with
-            // `format_json` about it; both now key compactness off the indent
-            // string as well, matching jq 1.7.1, so this shape is covered
-            // like any other (#3155).
+            // `--indent 0`: an empty indent with `compact` false, which jq 1.8
+            // prints with newlines and no indentation (#7605; #3155 had it
+            // compact, as jq 1.7.1 did). Every printer reads `compact`, so this
+            // shape is covered like any other.
             (String::new(), false),
             ("  ".to_string(), false),
             ("    ".to_string(), false),
@@ -28907,15 +28893,11 @@ mod tests {
     /// the *body*: everything below the prologue, where the two routes
     /// genuinely differ.
     ///
-    /// **`--indent 0` is covered, and settling it was not optional.** Both
-    /// printers used to key compactness off `config.compact` alone, so with
-    /// an empty `indent_string` they emitted newlines with zero-width
-    /// indents, while `format_json` keyed it off `indent.is_empty()` and
-    /// printed compact. jq 1.7.1 agrees with `format_json` (confirmed live).
-    /// While the eager `-n`/`--slurp`/DSV route had its own writer this was
-    /// a dormant divergence on the lazy route only; merging the two owned
-    /// writers would have carried the *wrong* spelling onto the route that
-    /// was right, so both printers now key off the indent string too.
+    /// **`--indent 0` is covered.** The printers once disagreed about it:
+    /// two keyed compactness off `config.compact` and `format_json` off an
+    /// empty indent (#3155 settled it as compact, jq 1.7.1's output). jq 1.8
+    /// prints it with newlines and no indentation (jqlang/jq#3232), and all
+    /// three now read `compact` and follow it (#7605).
     #[test]
     fn write_output_owned_value_matches_rebuilt_route_3009() {
         let corpus = owned_print_corpus_3009();

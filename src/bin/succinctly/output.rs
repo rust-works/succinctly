@@ -765,8 +765,12 @@ pub fn escape_json_string_ascii_yq(s: &str) -> String {
 
 /// Options for [`format_json`].
 pub struct JsonFormatOpts<'a> {
-    /// Indent unit per nesting level; empty selects compact output.
+    /// Indent unit per nesting level (ignored when `compact`).
     pub indent: &'a str,
+    /// Compact output: no newlines and no space after a colon. When `false`, an empty `indent`
+    /// still prints the newlines and the colon's space, with no indentation: jq 1.8's
+    /// `--indent 0` (jqlang/jq#3232, #7605), which jq 1.7.1 printed compactly.
+    pub compact: bool,
     /// Sort object keys lexicographically.
     pub sort_keys: bool,
     /// Escape non-ASCII characters as \uXXXX.
@@ -1009,7 +1013,7 @@ fn write_json_impl(out: &mut String, value: &OwnedValue, opts: &JsonFormatOpts, 
     }
     assert_value_tree_depth(level);
     let indent = opts.indent;
-    let compact = indent.is_empty();
+    let compact = opts.compact;
     let push_indent = |out: &mut String, depth: usize| {
         for _ in 0..depth {
             out.push_str(indent);
@@ -2590,6 +2594,7 @@ mod tests {
         let opts = JsonFormatOpts {
             mark_nan_for_color: false,
             indent: "",
+            compact: true,
             sort_keys: true,
             ascii: false,
             convention: JsonConvention::JqCompat,
@@ -2629,6 +2634,7 @@ mod tests {
             let opts = JsonFormatOpts {
                 mark_nan_for_color: false,
                 indent,
+                compact: indent.is_empty(),
                 sort_keys: false,
                 ascii: false,
                 convention: JsonConvention::JqCompat,
@@ -2658,6 +2664,7 @@ mod tests {
         let opts = JsonFormatOpts {
             mark_nan_for_color: false,
             indent: "",
+            compact: true,
             sort_keys: false,
             ascii: false,
             convention: JsonConvention::JqCompat,
@@ -2696,6 +2703,7 @@ mod tests {
         let opts = JsonFormatOpts {
             mark_nan_for_color: false,
             indent: "",
+            compact: true,
             sort_keys: false,
             ascii: false,
             convention: JsonConvention::Preserve,
@@ -2792,6 +2800,7 @@ mod tests {
         let opts = JsonFormatOpts {
             mark_nan_for_color: false,
             indent: "",
+            compact: true,
             sort_keys: false,
             ascii: true,
             convention: JsonConvention::Preserve,
@@ -2813,6 +2822,7 @@ mod tests {
         let opts = JsonFormatOpts {
             mark_nan_for_color: false,
             indent: "",
+            compact: true,
             sort_keys: false,
             ascii: false,
             convention: JsonConvention::JqCompat,
@@ -2867,6 +2877,7 @@ mod tests {
             let opts = JsonFormatOpts {
                 mark_nan_for_color: false,
                 indent: "",
+                compact: true,
                 sort_keys: false,
                 ascii: false,
                 convention,
@@ -2897,6 +2908,7 @@ mod tests {
         let opts = |convention| JsonFormatOpts {
             mark_nan_for_color: false,
             indent: "",
+            compact: true,
             sort_keys: false,
             ascii: false,
             convention,
@@ -2928,6 +2940,7 @@ mod tests {
         let opts = JsonFormatOpts {
             mark_nan_for_color: false,
             indent: "",
+            compact: true,
             sort_keys: false,
             ascii: false,
             convention: JsonConvention::JqCompat,
@@ -2960,6 +2973,7 @@ mod tests {
         let pretty = JsonFormatOpts {
             mark_nan_for_color: false,
             indent: "  ",
+            compact: false,
             sort_keys: false,
             ascii: false,
             convention: JsonConvention::JqCompat,
@@ -2983,6 +2997,7 @@ mod tests {
         let opts = JsonFormatOpts {
             mark_nan_for_color: false,
             indent: "  ",
+            compact: false,
             sort_keys: false,
             ascii: true,
             convention: JsonConvention::JqCompat,
@@ -3070,6 +3085,7 @@ mod tests {
         let nan = OwnedValue::Float(f64::NAN);
         let mut opts = JsonFormatOpts {
             indent: "",
+            compact: true,
             sort_keys: false,
             ascii: false,
             convention: JsonConvention::JqCompat,
@@ -3205,6 +3221,7 @@ mod tests {
         let opts = JsonFormatOpts {
             mark_nan_for_color: false,
             indent: "",
+            compact: true,
             sort_keys: false,
             ascii: false,
             convention: JsonConvention::Preserve,
@@ -3315,6 +3332,7 @@ mod tests {
         let mut opts = JsonFormatOpts {
             mark_nan_for_color: false,
             indent: "",
+            compact: true,
             sort_keys: false,
             ascii: false,
             convention: JsonConvention::JqCompat,

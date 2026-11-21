@@ -15208,4 +15208,24 @@ $ jq-1.8.2 -nc --indent abc '[1]'   # jq: --indent takes a number between -1 and
 $ sjq      -nc --indent abc '[1]'   # error: invalid value 'abc' for '--indent <N>': --indent takes a number between -1 and 7, exit 2
 ```
 
-Not adopted with it: jq 1.8 also stopped printing `--indent 0` compactly (`--indent 0` prints the newlines with no indentation, jqlang/jq#3232), which is a separate change; `succinctly jq` keeps 1.7.1's compact output there (#3155).
+jq 1.8 also stopped printing `--indent 0` compactly (jqlang/jq#3232), which `succinctly jq` follows too: see the next section (#7605).
+
+### `--indent 0` prints newlines with no indentation, as jq 1.8 does — newer than the 1.7.1 pin (#7605)
+
+jq 1.7.1 printed `--indent 0` as `-c` does (its `JV_PRINT_INDENT_FLAGS(0)` dropped the pretty flag), and #3155 pinned that on every route.
+Upstream called it a bug and jq 1.8.0 fixed it: "Fix `--indent 0` implicitly enabling `--compact-output`" ([jqlang/jq#3232](https://github.com/jqlang/jq/pull/3232), NEWS.md of 1.8).
+jq 1.8.2 prints each element and key on its own line, with the space after each `:` and no indentation, and `succinctly jq` follows it since #7605, for every spelling of 0 (`0`, `-0`, `00`, `+0`) and on every print route.
+`-c`, `--tab` and `--indent` stay one setting whose last spelling wins, so `-c --indent 0` and `--tab --indent 0` print that layout too (jq 1.7.1 printed both compactly), and `--indent 0 -c` is compact in all three.
+With `-C` the colour bytes stay jq 1.7.1's (#5473), in the 1.8 layout.
+Pinned by `tests/jq_cli/i7605.rs` (a matrix captured from jq 1.8.2), `test_indent_zero_layout_on_every_route_3155`, and the `--indent 0` rows of `tests/jq_cli/i6017.rs` and `tests/jq_cli/i5473.rs`; the `cli:indent-0` and `cli:color-indent-0` compare probes are ledgered as `newer-than-primary`.
+
+```console
+$ printf '{"a":[1]}' | jq-1.7.1 --indent 0 .
+{"a":[1]}
+$ printf '{"a":[1]}' | jq-1.8.2 --indent 0 .   # sjq prints the same
+{
+"a": [
+1
+]
+}
+```

@@ -1090,32 +1090,26 @@ fn test_custom_indent() -> Result<()> {
     Ok(())
 }
 
-/// #3155: `--indent 0` is compact, on every route.
+/// #3155, #7605: `--indent 0` prints the same layout on every route.
 ///
-/// jq 1.7.1 prints `--indent 0` compactly -- confirmed live,
-/// `jq --indent 0 '{a:[1,2]}'` gives `{"a":[1,2]}`. succinctly had two
-/// answers to this. `output.rs`'s `format_json` keyed compactness off
-/// `indent.is_empty()` and was right; the streaming `print_json` keyed it off
-/// `config.compact` (i.e. `-c` alone) and emitted newlines with zero-width
-/// indents instead.
+/// #3155 found two answers here: `output.rs`'s `format_json` keyed compactness off an empty
+/// indent and the streaming `print_json` off `-c` alone, and #3009's merge of the owned writers
+/// would have carried one onto the other's route. It settled them on jq 1.7.1's compact output.
+/// jq 1.8 calls that compact output a bug ("Fix `--indent 0` implicitly enabling
+/// `--compact-output`", jqlang/jq#3232) and prints the newlines and the space after each `:` with
+/// no indentation; every printer now reads `-c` alone and follows 1.8 (#7605, pin moved from
+/// 1.7.1's `{"a":[1,2]}`). Expected output captured from jq 1.8.2.
 ///
-/// The split stayed invisible while the routes never met -- the eager
-/// `-n`/`--slurp`/DSV route used `format_json`, the lazy route used
-/// `print_json`. #3009 merged the two owned writers, which would have carried
-/// the *wrong* spelling onto the route that was right; both printers now key
-/// off the indent string too.
-///
-/// Covers both routes deliberately: `-n` is the eager one (the regression
-/// this would have been), a plain filter over stdin is the lazy one (the
-/// pre-existing divergence this closes), and `to_entries` forces the owned
-/// print path specifically.
+/// Covers both routes deliberately: `-n` is the eager one, a plain filter over stdin is the lazy
+/// one, and `to_entries` forces the owned print path specifically.
 #[test]
-fn test_indent_zero_is_compact_on_every_route_3155() -> Result<()> {
+fn test_indent_zero_layout_on_every_route_3155() -> Result<()> {
+    let zero = "{\n\"a\": [\n1,\n2\n]\n}\n";
     // Eager route: `-n` never reads a document, so it takes the materializing
     // writer.
     let (stdout, stderr, code) = run_jq_full(&["-n", "--indent", "0", "{a:[1,2]}"], None)?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout, "{\"a\":[1,2]}\n");
+    assert_eq!(stdout, zero);
 
     // Eager route via `--slurp`.
     let (stdout, stderr, code) = run_jq_full(
@@ -1123,21 +1117,23 @@ fn test_indent_zero_is_compact_on_every_route_3155() -> Result<()> {
         Some(r#"{"a":[1,2]}"#),
     )?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout, "{\"a\":[1,2]}\n");
+    assert_eq!(stdout, zero);
 
     // Lazy route, cursor-backed identity.
     let (stdout, stderr, code) = run_jq_full(&["--indent", "0", "."], Some(r#"{"a":[1,2]}"#))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout, "{\"a\":[1,2]}\n");
+    assert_eq!(stdout, zero);
 
     // Lazy route, owned result -- the #3009 print path itself.
     let (stdout, stderr, code) =
         run_jq_full(&["--indent", "0", "to_entries"], Some(r#"{"a":[1,2]}"#))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout, "[{\"key\":\"a\",\"value\":[1,2]}]\n");
+    assert_eq!(
+        stdout,
+        "[\n{\n\"key\": \"a\",\n\"value\": [\n1,\n2\n]\n}\n]\n"
+    );
 
-    // `--indent 1` is *not* compact, so the fix keys off emptiness rather
-    // than off "the indent is small".
+    // `--indent 1` indents by one space.
     let (stdout, stderr, code) = run_jq_full(&["--indent", "1", "."], Some(r#"{"a":1}"#))?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout, "{\n \"a\": 1\n}\n");
