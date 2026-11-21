@@ -17,7 +17,17 @@ use crate::spawn_jq;
 
 /// (bytes of the first line after the mark, how the mark is cut across files, flags, jq's stdout as
 /// `<count>x<line>` runs, stderr, exit status).
-const ROWS: &[(usize, &str, &[&str], &str, &str, i32)] = &[
+/// One row: the length, the split, the flags, stdout's runs, stderr and the exit status.
+type Row = (
+    usize,
+    &'static str,
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+    i32,
+);
+
+const ROWS: &[Row] = &[
     (
         4091,
         "whole",
