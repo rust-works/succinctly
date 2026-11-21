@@ -4879,7 +4879,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     super::stdin_offset::start_run();
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
-    super::stdin_offset::set_run(stdin_items(&args), !args.null_input);
+    super::stdin_offset::set_run(stdin_items(&args), !args.null_input, &get_input_files(&args));
     // The order only matters between two or more named flags: a command line with fewer builds no clap definition for it.
     // `parse_jq` has already read it off clap's matches (#7260); a `JqCommand` matched inside the whole `Cli` tree
     // (a global flag before `jq`) has not, and scans argv here.
@@ -7164,13 +7164,12 @@ fn get_input_files(args: &JqCommand) -> Vec<std::path::PathBuf> {
 }
 
 /// What the program reads from standard input, one item at a time, for where a run that stops early
-/// leaves a regular file there (#7455): `None` when it reads named files, or reads standard input
-/// in a way whose offset stays where the read left it (`--slurp`, `--seq`, DSV, `--stream-errors`,
-/// `--validate`).
+/// leaves a regular file there (#7455): `None` when it reads standard input in a way whose offset
+/// stays where the read left it (`--slurp`, `--seq`, DSV, `--stream-errors`, `--validate`). Named
+/// input files are left to [`super::stdin_offset::set_run`], which follows a `-` among them (#7568).
 fn stdin_items(args: &JqCommand) -> Option<super::stdin_offset::Items> {
     use super::stdin_offset::Items;
-    if !get_input_files(args).is_empty()
-        || args.slurp
+    if args.slurp
         || args.input_dsv.is_some()
         || args.validate
         || (!args.raw_input && (args.seq || args.stream_errors))
