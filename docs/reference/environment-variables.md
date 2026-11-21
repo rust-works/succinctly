@@ -13,7 +13,7 @@ Every environment variable succinctly reads, what it accepts, and what it change
 | [`SUCCINCTLY_PRESERVE_INPUT`](#succinctly_preserve_input) | `succinctly jq`                       | `1` or `true`                   | jq-compatible formatting      |
 | [`NO_COLOR`](#no_color)                                   | `succinctly jq`, `succinctly yq`      | Any non-empty value             | Color if stdout is a terminal |
 | [`JQ_COLORS`](#jq_colors)                                 | `succinctly jq`                       | Eight `:`-separated SGR fields  | Built-in color scheme         |
-| [`JQ_LIBRARY_PATH`](#jq_library_path)                     | `succinctly jq`                       | `:`-separated directories       | Only `-L` paths and `~/.jq`   |
+| [`JQ_LIBRARY_PATH`](#jq_library_path)                     | `succinctly jq`                       | `:`-separated directories       | `-L` paths, else defaults     |
 | [`HOME`](#home)                                           | `succinctly jq`                       | A directory path                | No `~/.jq` auto-loading       |
 | [`TZ`](#tz)                                               | Library (jq date builtins)            | IANA name or POSIX string       | System zone                   |
 | [`SUCCINCTLY_EXPECT_SIMD`](#succinctly_expect_simd)       | Test suite (`cargo test`)             | Comma-separated CPU features    | Expectation check skipped     |
@@ -296,15 +296,16 @@ A `:`-separated list of directories to search for jq modules, used by `import` a
 
 Entries that are not existing directories — including files and typo'd paths — are **dropped without
 a warning**, so a module that fails to resolve may be a bad path rather than a bad import. Succinctly
-does not expand `~` itself, so a tilde only works when the shell expands it first; prefer `$HOME`.
+does not expand `~` in these entries, so a tilde only works when the shell expands it first; prefer `$HOME`. (`-L` entries are expanded, as jq does, #7430.)
+By itself it is a succinctly extension: jq 1.7.1 and 1.8.2 do not read `JQ_LIBRARY_PATH`.
 `;` is not accepted as a separator.
 
 Search order, highest first:
 
 1. The current directory, for an `import`/`include` of the main program and of a module alike (#5327)
-2. `-L` / `--library-path` command-line paths
+2. `-L` / `--library-path` command-line paths, with `~/` expanded to `$HOME` and `$ORIGIN/` to the directory jq was run from (#7430)
 3. `JQ_LIBRARY_PATH` entries, in the order listed
-4. `~/.jq`, when it is a directory
+4. Only when no `-L` was given, jq's default list (#7428): `~/.jq` when it is a directory, then `$ORIGIN/../lib/jq` and `$ORIGIN/../lib`
 
 ```bash
 JQ_LIBRARY_PATH="$HOME/lib/jq:/usr/share/jq" succinctly jq 'import "utils" as u; u::helper' input.json
@@ -321,7 +322,7 @@ Locates `~/.jq`, which succinctly loads automatically. `HOME` is not read for an
 | `~/.jq` is      | Effect                                                                         |
 |-----------------|--------------------------------------------------------------------------------|
 | A **file**      | Parsed, and its function definitions are added to **every** query              |
-| A **directory** | Appended to the module search path (see [`JQ_LIBRARY_PATH`](#jq_library_path)) |
+| A **directory** | Searched unless `-L` is given (see [`JQ_LIBRARY_PATH`](#jq_library_path))      |
 
 Worth being aware of: when `~/.jq` is a file, its definitions are in scope for every invocation
 without being imported, so a definition there can shadow one you expect from elsewhere. Failures are

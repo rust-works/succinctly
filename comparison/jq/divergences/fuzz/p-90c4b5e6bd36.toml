@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+reason = "`foreach (try (.[:2])) as $x0 ((. , .); (.[-1:]))` on an object: its INIT is a generator, and jq 1.7.1 runs the SOURCE of the second INIT output on `null` (`null | .[:2]` is `null`), so the update `.[-1:]` slices the object and fails with `Cannot index object with object` (exit 5). jq 1.8 runs the SOURCE on the real input for every INIT output (jqlang/jq#3266, a bug fix), where `.[:2]` on an object fails inside `try`, so jq 1.8.2 and succinctly print nothing (exit 0). The syntax:foreach-gen-init entry is the same difference (#7519)."
+issue = "7519"

@@ -204,8 +204,9 @@ fn constructors_after_recurse_keep_jq_cardinality_and_spelling_6608() -> Result<
             0,
         ),
         (
+            // A program's `-0` is `0` since #7453, as in jq 1.8.2 (jq 1.7.1: `[[-0],[-0]]`).
             "[.[] | recurse(.children[]?) | [-0]]",
-            "[[-0],[-0]]\n",
+            "[[0],[0]]\n",
             "",
             0,
         ),

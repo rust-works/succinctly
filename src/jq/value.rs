@@ -311,6 +311,55 @@ pub(crate) fn parse_i64_exact(s: &str) -> Option<i64> {
     Some(value)
 }
 
+/// A number literal's spelling without its sign.
+pub(crate) fn literal_magnitude(text: &str) -> &str {
+    text.strip_prefix('-')
+        .or_else(|| text.strip_prefix('+'))
+        .unwrap_or(text)
+}
+
+/// Whether a number literal's decimal is zero, whatever its double: every
+/// mantissa digit is `0` (`0.00e5`, not `1e-400`).
+pub(crate) fn literal_is_zero(magnitude: &str) -> bool {
+    magnitude
+        .split(['e', 'E'])
+        .next()
+        .is_some_and(|mantissa| mantissa.bytes().all(|b| b == b'0' || b == b'.'))
+}
+
+/// jq 1.8's `_negate` of a number literal (#7453): the negated decimal, still
+/// a literal, so it keeps every digit and compares exactly (jqlang/jq#3242,
+/// which fixed jq 1.7.1 turning the operand into a double, jqlang/jq#2704).
+/// `decNumberMinus` computes `0 - x`, so a zero of either sign negates to
+/// positive zero with its spelling otherwise kept (`-0` is `0`, `-0.0` is
+/// `0.0`). Zero is the decimal's, not the double's: `1e-400` negates to
+/// `-1E-400`. `None` for a NaN, which has no decimal to negate.
+pub(crate) fn jq_negated_literal(repr: NumberRepr, text: &str) -> Option<(NumberRepr, String)> {
+    if matches!(repr, NumberRepr::Float(f) if f.is_nan()) {
+        return None;
+    }
+    let magnitude = literal_magnitude(text);
+    let zero = literal_is_zero(magnitude);
+    let spelled = if zero || text.starts_with('-') {
+        magnitude.to_string()
+    } else {
+        format!("-{magnitude}")
+    };
+    // The negated text parses to the negated repr (`jq_literal_text_to_f64` is
+    // sign-symmetric), so only `i64::MIN`, whose magnitude no `i64` holds,
+    // needs the parse.
+    let repr = match repr {
+        NumberRepr::Int(_) if zero => NumberRepr::Int(0),
+        NumberRepr::Float(_) if zero => NumberRepr::Float(0.0),
+        NumberRepr::Int(n) => match n.checked_neg() {
+            Some(n) => NumberRepr::Int(n),
+            None => parse_i64_or_f64_in::<JqSemantics>(&spelled)?,
+        },
+        NumberRepr::Float(f) => NumberRepr::Float(-f),
+    };
+    Some((repr, spelled))
+}
+
 /// [`parse_i64_or_f64`] under `S`'s number model (#2936): the `Int` arm is
 /// the exact `i64` in both modes (jq widens it through
 /// [`jq_literal_int_to_f64`] only when arithmetic reads it, #2906), and the
@@ -7244,6 +7293,54 @@ mod tests {
 
     use super::*;
 
+    /// #7453: a negated literal's repr is the parse of its negated spelling,
+    /// and a decimal zero negates to positive zero whatever its sign.
+    #[test]
+    fn negated_literal_repr_matches_its_spelling_7453() {
+        for text in [
+            "1",
+            "-1",
+            "0",
+            "-0",
+            "00",
+            "1.500",
+            "-1.500",
+            "1e-400",
+            "-1e-400",
+            "0.0",
+            "-0.0",
+            "0e5",
+            "007",
+            "9007199254740993",
+            "-9223372036854775808",
+            "9223372036854775807",
+            "1e1000",
+            "-1E1000",
+        ] {
+            let repr = parse_i64_or_f64_in::<JqSemantics>(text).unwrap();
+            let (negated, spelled) = jq_negated_literal(repr, text).unwrap();
+            assert_eq!(
+                Some(negated),
+                parse_i64_or_f64_in::<JqSemantics>(&spelled),
+                "{text}"
+            );
+            let zero = literal_is_zero(literal_magnitude(text));
+            if zero {
+                assert!(!spelled.starts_with('-'), "{text} -> {spelled}");
+            } else {
+                assert_ne!(
+                    spelled.starts_with('-'),
+                    text.starts_with('-'),
+                    "{text} -> {spelled}"
+                );
+            }
+        }
+        assert_eq!(
+            jq_negated_literal(NumberRepr::Float(f64::NAN), "null"),
+            None
+        );
+    }
+
     /// #2429/#3506: the subarray search counts overlapping matches, answers
     /// `[]` (never `null`) for an empty needle, a miss, or a needle longer
     /// than the haystack, and compares elements the way `==` does.
@@ -9499,7 +9596,7 @@ mod tests {
         // Real jq number spellings read identically on both routes, except
         // that a cursor read of a NaN spelling is a parse instance (#3309),
         // the same NaN once collapsed.
-        for text in ["nan", "sNaN12"] {
+        for text in ["nan", "sNaN0"] {
             let read = read_as_bridge_text::<JqSemantics>(text);
             assert!(
                 matches!(&read, OwnedValue::NumberLiteral(NumberRepr::Float(f), t) if f.is_nan() && &**t == "null"),
@@ -9779,7 +9876,7 @@ mod tests {
     #[test]
     fn test_from_number_bytes_reads_decnumber_specials_and_leading_plus_2877() {
         for word in [
-            "nan", "NaN", "-nan", "+nan", "nan1", "sNaN", "SNAN12", "-sNaN",
+            "nan", "NaN", "-nan", "+nan", "nan0", "sNaN", "SNAN0", "-sNaN",
         ] {
             assert!(
                 matches!(OwnedValue::from_number_bytes::<JqSemantics>(word.as_bytes()), OwnedValue::Float(f) if f.is_nan()),
@@ -9900,7 +9997,7 @@ mod tests {
             "NaN",
             "-nan",
             "+nan",
-            "sNaN12",
+            "sNaN0",
             "inf",
             "-Infinity",
             "+inf",

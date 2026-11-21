@@ -1164,11 +1164,14 @@ fn test_length_of_negative_int_is_absolute_value() {
 
 #[test]
 fn test_length_of_i64_min_falls_back_to_float() {
-    // jq: -9223372036854775808 | length => 9223372036854775808; -2^63 has no
-    // i64 absolute value, so the result is the exact f64 2^63 (#161)
+    // -2^63 has no i64 absolute value, so the result's value is the exact f64
+    // 2^63 (#161). Since #7534 it is the literal `9223372036854775808`, as in
+    // jq 1.8.2 (jqlang/jq#3275), where jq 1.7.1 printed the double's
+    // `9223372036854776000`.
     query!(b"-9223372036854775808", "length",
-        QueryResult::Owned(OwnedValue::Float(f)) => {
+        QueryResult::Owned(OwnedValue::NumberLiteral(NumberRepr::Float(f), text)) => {
             assert_eq!(f, 9_223_372_036_854_775_808.0);
+            assert_eq!(&*text, "9223372036854775808");
         }
     );
 }
