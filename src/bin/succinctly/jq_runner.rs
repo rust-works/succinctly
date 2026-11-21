@@ -676,13 +676,7 @@ fn read_library(path: &Path) -> std::io::Result<String> {
 
 /// Strip Rust's `std::io::Error` Display's own `" (os error N)"` suffix,
 /// which has no jq equivalent -- jq's C `strerror()` call never appends an
-/// errno number. Leaves any other message untouched: the one `std::io::Error`
-/// shape with no such suffix to strip is `ErrorKind::InvalidData` (invalid
-/// UTF-8 in a `--slurpfile`/`--rawfile` argument, constructed from a plain
-/// string rather than an OS errno) -- an unverified-against-jq wording for a
-/// failure class real jq's own byte-oriented reader never hits at all (it
-/// accepts arbitrary bytes in `--rawfile`; confirmed live), so there is
-/// nothing to match there, only to not silently corrupt.
+/// errno number. Leaves any other message untouched.
 fn strerror_only(e: &std::io::Error) -> String {
     let full = e.to_string();
     match full.rsplit_once(" (os error ") {
@@ -712,13 +706,14 @@ fn load_file_detail(e: &std::io::Error) -> String {
 ///
 /// The file is opened by the bytes of its argv word (#7426), and the prefix names the variable and
 /// the file by theirs, as jq's `fprintf` does; the detail after it is jq's own text, so the file
-/// there reads as [`crate::cli::jq_word_text`] makes it.
+/// there reads as [`crate::cli::jq_word_text`] makes it. The file's bytes are handed back as read:
+/// jq reads them whatever they hold, a byte that is not UTF-8 included (#7436).
 fn read_arg_file(
     flag: &str,
     name: &std::ffi::OsStr,
     file: &std::ffi::OsStr,
-) -> Result<String, BuildContextError> {
-    std::fs::read_to_string(file).map_err(|e| {
+) -> Result<Vec<u8>, BuildContextError> {
+    std::fs::read(file).map_err(|e| {
         // #7576: a file there is no room for is jq's `cannot allocate memory`, not one that would not open.
         abort_if_out_of_memory(&e);
         bad_arg_file(
@@ -732,6 +727,68 @@ fn read_arg_file(
             ),
         )
     })
+}
+
+/// The text jq 1.7.1's `jv_load_file` makes of a file it reads raw (#7436): the program of `-f` and the
+/// string of `--rawfile`. It reads the file 4,096 bytes at a time, reads on to the end of a character
+/// the last byte of a full read starts (`jvp_utf8_backtrack`), and appends each read to the string on
+/// its own (`jv_string_append_buf`), so a byte that is not UTF-8 is U+FFFD by jq's rule
+/// ([`succinctly::text::utf8::substitute_invalid_utf8_jq_style`]) over the read that holds it: a
+/// sequence a read ends inside is one U+FFFD to the read's end, the bytes the next read starts with
+/// a text of their own.
+fn jq_raw_file_text(bytes: &[u8]) -> String {
+    const READ: usize = 4096;
+    let mut text = String::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let mut len = (bytes.len() - at).min(READ);
+        // A short read met the end of the file, so only a full one reads on.
+        if len == READ {
+            len += utf8_bytes_missing_at_end(&bytes[at..at + len]).min(bytes.len() - at - len);
+        }
+        let read = &bytes[at..at + len];
+        match std::str::from_utf8(read) {
+            Ok(valid) => text.push_str(valid),
+            Err(_) => text.push_str(&succinctly::text::utf8::substitute_invalid_utf8_jq_style(
+                read,
+            )),
+        }
+        at += len;
+    }
+    text
+}
+
+/// How many bytes the character `read` ends inside is short of, as jq's `jvp_utf8_backtrack` counts
+/// them from the last byte back to the lead (#7436): 0 for a read that ends on a whole character,
+/// on a byte that leads nothing, on continuation bytes with no lead before them, or on one byte.
+fn utf8_bytes_missing_at_end(read: &[u8]) -> usize {
+    // jq's `utf8_coding_length`: 0xFF for a continuation byte, 0 for a byte that is never a lead.
+    const CONTINUATION: usize = 0xFF;
+    let coding_length = |byte: u8| match byte {
+        0x00..=0x7F => 1,
+        0x80..=0xBF => CONTINUATION,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => 0,
+    };
+    if read.len() < 2 {
+        return 0;
+    }
+    let mut seen = 1;
+    let mut length = CONTINUATION;
+    for &byte in read.iter().rev() {
+        length = coding_length(byte);
+        if length != CONTINUATION {
+            break;
+        }
+        seen += 1;
+    }
+    if length == 0 || length == CONTINUATION {
+        0
+    } else {
+        length.saturating_sub(seen)
+    }
 }
 
 /// jq's `Bad JSON in --<flag> <name> <file>: <detail>` (#3051), `name` and `file` as the bytes of
@@ -6985,7 +7042,17 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                     .map(|pair| (pair, crate::cli::jq_word_text(&pair[0])))
                     .filter(|(_, name)| !context.named.contains_key(name))
                 {
-                    let contents = read_arg_file("slurpfile", raw_name, file)?;
+                    // jq's parser reads the bytes, and a string's that are not UTF-8 are U+FFFD by
+                    // the rule the main input's are (#7436).
+                    let bytes = read_arg_file("slurpfile", raw_name, file)?;
+                    let contents = match String::from_utf8(bytes) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(
+                                e.as_bytes(),
+                            )
+                        }
+                    };
                     let values = parse_json_stream(&contents).map_err(|e| {
                         bad_arg_file("slurpfile", raw_name, file, &format!("{e:#}"))
                     })?;
@@ -7002,7 +7069,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                     .map(|pair| (pair, crate::cli::jq_word_text(&pair[0])))
                     .filter(|(_, name)| !context.named.contains_key(name))
                 {
-                    let contents = read_arg_file("rawfile", raw_name, file)?;
+                    let contents = jq_raw_file_text(&read_arg_file("rawfile", raw_name, file)?);
                     context
                         .named
                         .insert(name, OwnedValue::String(contents.into()));
@@ -7178,12 +7245,9 @@ fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
                 "program file contains NUL bytes".into(),
             ));
         }
-        let text = String::from_utf8(bytes).map_err(|_| {
-            open_error(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8",
-            ))
-        })?;
+        // A byte that is not UTF-8 reads as jq reads it, U+FFFD (#7436): harmless in a string or a
+        // comment, and a compile error anywhere else.
+        let text = jq_raw_file_text(&bytes);
         let skipped = text.len() - skip_shebang(&text).len();
         Ok(if skipped == 0 {
             text
