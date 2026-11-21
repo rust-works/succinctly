@@ -20,7 +20,10 @@ use std::process::{Command, Stdio};
 /// 4095), where `--stream -n '[limit(k; inputs)] | length'` leaves the file for k = 1, 2, ...
 /// every event of the text, and where `--stream 'if length == 1 then halt else empty end'` (a halt
 /// on the first close) leaves it.
-const ROWS: &[(&str, [(&[u64], u64); 3])] = &[
+/// For one place of the closer: the offsets after `limit(k; ...)` for each k, and after the halt.
+type Place = (&'static [u64], u64);
+
+const ROWS: &[(&str, [Place; 3])] = &[
     (
         "[2]",
         [
