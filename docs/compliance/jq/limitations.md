@@ -7276,6 +7276,27 @@ against the pinned jq 1.7.1 binary), so refusing with a catchable error is the s
 "would take the host process down" exception as the rest of this entry, not a new kind of
 divergence.
 
+## A document of 4 GiB or more is read without an index (#7425)
+
+`succinctly jq` indexes a document before it runs the program on it, and the index holds a text of at most `u32::MAX` bytes ([Input Size Limits](../../reference/limits.md)).
+A document longer than that, a `-s` slurp of a stream that long included, is read into a tree instead, by the one-pass reader of plain JSON (`jq::parse_plain`), and the program runs on the tree with the owned evaluator.
+Before #7425 such a document panicked with exit 101 where jq 1.7.1 answers.
+The answer is jq's for a plain document, which nearly every large document is: `length` over a 4,296,011,781-byte array prints `4098`, as jq does.
+
+Three cases are refused with an error at exit 5 where jq answers, a known limitation rather than one of ADR-0018's permitted divergences:
+
+- A document that is not plain RFC 8259 JSON: a repeated key, a `\u` surrogate escape, a jq leniency such as `nan` or `007`, or nesting past 128 levels.
+  The one-pass reader declines these, and the route that reads them needs the index.
+  The message is `Cannot index a value of N bytes: the index holds at most 4294967295 bytes (4 GiB), and the document is not plain JSON, which is all that is read without an index`.
+- A program whose stage the owned evaluator answers only by indexing a value of 4 GiB or more (its reindex bridge): `Cannot index a value of N bytes: the index holds at most 4294967295 bytes (4 GiB)`.
+  A program that first steps into the document (`.[]`, `.key`, `length`, `map(...)`) reaches the bridge only with the smaller values it steps to.
+- `--preserve-input`, which writes such a document out and indexes the text, with the same message.
+
+A malformed document of that length is reported as jq's parser reports it (`jq: parse error: ...`, exit 2), as on the indexed route.
+The peak memory is the text and the tree: about 8.6 GB for the 4 GiB array above, where jq 1.7.1 holds 4.2 GB.
+
+`jq-locate` and `succinctly yq -p json` refuse an input that long with an error at exit 1 (`yq`'s is the `InputTooLarge` wording its YAML input already gives), rather than panicking.
+
 ## Standard input is read to EOF before the program runs (#6499)
 
 `succinctly jq` reads standard input to its end before it evaluates anything, on every route but `--stream`.

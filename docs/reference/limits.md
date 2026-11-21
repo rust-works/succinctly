@@ -34,9 +34,14 @@ Nesting depth is therefore no longer bounded by the index (previously
 
 ## Practical Notes
 
-- The CLI tools (`sjq`, `syq`, DSV input) inherit these limits: a > 4 GiB
+- The CLI tools (`syq`, `sjq-locate`, DSV input) inherit these limits: a > 4 GiB
   input file fails with the corresponding error or panic message rather than
   producing wrong results.
+- `sjq` asks `JsonIndex::can_index` first, and reads a document of 4 GiB or
+  more without an index, as a tree, instead of panicking
+  ([#7425](https://github.com/rust-works/succinctly/issues/7425)); what it
+  cannot read that way is listed in
+  [jq limitations](../compliance/jq/limitations.md#a-document-of-4-gib-or-more-is-read-without-an-index-7425).
 - All ceilings are per-document. Multi-document YAML streams are bounded by
   the total input passed to a single `YamlIndex::build` call.
 - The design decision (widen cheap counters, validate ceilings on hot

@@ -2770,6 +2770,17 @@ fn parse_json_values(
     bytes: &[u8],
     parse_value: impl Fn(&[u8]) -> Result<Vec<OwnedValue>>,
 ) -> Result<Vec<OwnedValue>> {
+    // #7425: a JSON document no index can hold is refused as `YamlIndex` refuses a YAML input that
+    // long (`InputTooLarge`), where building the index would panic.
+    let parse_value = |value: &[u8]| {
+        if !JsonIndex::can_index(value.len()) {
+            anyhow::bail!(
+                "{}",
+                succinctly::yaml::YamlError::InputTooLarge { len: value.len() }
+            );
+        }
+        parse_value(value)
+    };
     let split = split_json_values(bytes);
     if let (Some(at), false) = (split.stopped_at, split.pieces.is_empty()) {
         anyhow::bail!("YAML parse error: unexpected content at byte offset {at}");
