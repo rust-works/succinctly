@@ -3013,6 +3013,25 @@ fn retry_collected_arg(builtin: Builtin) -> Result<Expr, Builtin> {
                 Expr::Builtin(Builtin::Has(Box::new(var(IN_INPUT_VAR)))),
             ])),
         }),
+        // #7602: `map(f)`, `with_entries(f)` and `walk(f)` are spelled out as jq defines them when
+        // `f` holds a `?//` ([`jq_defined_call`]). Each element's `f` then runs as a stage of a
+        // pipe, where a failure raised after the bind's value (`map(startswith([1, "x"] as [$a]
+        // ?// [$b, $a] | $a))`, a builtin refusing the first alternative) retries the bind, as in
+        // jq; the builtins' own element walks run `f` where it cannot.
+        Builtin::Map(f) if contains_retrying_pattern_bind(&f) => {
+            Ok(jq_defined_call(MAP_DEF, collected_map(closure_call()), *f))
+        }
+        Builtin::WithEntries(f) if contains_retrying_pattern_bind(&f) => {
+            let body = Expr::pipe(vec![
+                Expr::Builtin(Builtin::ToEntries),
+                collected_map(closure_call()),
+                Expr::Builtin(Builtin::FromEntries),
+            ]);
+            Ok(jq_defined_call(WITH_ENTRIES_DEF, body, *f))
+        }
+        Builtin::Walk(f) if contains_retrying_pattern_bind(&f) => {
+            Ok(jq_defined_call(WALK_DEF, walk_body(), *f))
+        }
         Builtin::CombinationsN(count) if contains_retrying_pattern_bind(&count) => {
             let check = Expr::Range {
                 from: Box::new(var(COLLECTED_ARG_VAR)),
@@ -3024,6 +3043,79 @@ fn retry_collected_arg(builtin: Builtin) -> Result<Expr, Builtin> {
             }))
         }
         other => Err(other),
+    }
+}
+
+/// The names of the `def`s [`jq_defined_call`] spells `map`, `with_entries` and `walk` with, and
+/// of their closure parameter and `walk`'s inner `w`: none is spellable in source.
+const MAP_DEF: &str = "%map";
+const WITH_ENTRIES_DEF: &str = "%with_entries";
+const WALK_DEF: &str = "%walk";
+const WALK_INNER_DEF: &str = "%w";
+const CLOSURE_PARAM: &str = "%f";
+
+/// A call of the parameterless `def` or closure parameter `name`.
+fn bare_call(name: &str) -> Expr {
+    Expr::FuncCall {
+        name: name.to_string(),
+        args: Vec::new(),
+        builtin_fallback: None,
+    }
+}
+
+/// A call of [`CLOSURE_PARAM`].
+fn closure_call() -> Expr {
+    bare_call(CLOSURE_PARAM)
+}
+
+/// `def <name>(f): <body>; <name>(<arg>)`: a builtin spelled out as jq's own `def` of it
+/// ([`retry_collected_arg`], #7602), `f` a closure parameter as in jq, so `arg` is a closure of the
+/// block the call is in (#3391): its compile errors hide under that block's, as jq's do.
+fn jq_defined_call(name: &str, body: Expr, arg: Expr) -> Expr {
+    Expr::FuncDef {
+        name: name.to_string(),
+        params: vec![Param::Bare(CLOSURE_PARAM.to_string())],
+        body: Box::new(body),
+        then: Box::new(Expr::FuncCall {
+            name: name.to_string(),
+            args: vec![arg],
+            builtin_fallback: None,
+        }),
+        bound: FuncDefBound::default(),
+    }
+}
+
+/// `map(f)` as jq defines it, `[.[] | f]` ([`retry_collected_arg`], #7602).
+fn collected_map(f: Expr) -> Expr {
+    Expr::Array(Box::new(Expr::pipe(vec![Expr::Iterate, f])))
+}
+
+/// The body of jq 1.7.1's `def walk(f)` ([`retry_collected_arg`], #7602): `def w: if type ==
+/// "object" then map_values(w) elif type == "array" then map(w) else . end | f; w`, with `map(w)` as
+/// `[.[] | w]`.
+fn walk_body() -> Expr {
+    let is_type = |name: &str| Expr::Compare {
+        op: CompareOp::Eq,
+        left: Box::new(Expr::Builtin(Builtin::Type)),
+        right: Box::new(Expr::Literal(Literal::String(name.into()))),
+    };
+    let children = Expr::If {
+        cond: Box::new(is_type("object")),
+        then_branch: Box::new(Expr::Builtin(Builtin::MapValues(Box::new(bare_call(
+            WALK_INNER_DEF,
+        ))))),
+        else_branch: Box::new(Expr::If {
+            cond: Box::new(is_type("array")),
+            then_branch: Box::new(collected_map(bare_call(WALK_INNER_DEF))),
+            else_branch: Box::new(Expr::Identity),
+        }),
+    };
+    Expr::FuncDef {
+        name: WALK_INNER_DEF.to_string(),
+        params: Vec::new(),
+        body: Box::new(Expr::pipe(vec![children, closure_call()])),
+        then: Box::new(bare_call(WALK_INNER_DEF)),
+        bound: FuncDefBound::default(),
     }
 }
 
@@ -13853,9 +13945,17 @@ mod tests {
             parse(r#"startswith("a")"#).unwrap(),
             Expr::Builtin(Builtin::Startswith(_))
         ));
-        // A closure parameter is not bound once per value.
+        // A closure parameter is not bound once per value: `map(f)` with a `?//` in `f` is jq's
+        // own `def map(f): [.[] | f];`, `f` passed as the closure (#7602).
         assert!(matches!(
             parse("map([1] as $q ?// $b | $b)").unwrap(),
+            Expr::FuncDef { name, then, .. } if name == MAP_DEF && matches!(
+                then.as_ref(),
+                Expr::FuncCall { args, .. } if matches!(args.as_slice(), [Expr::AsPattern { .. }])
+            )
+        ));
+        assert!(matches!(
+            parse("map([1] as $q | $q)").unwrap(),
             Expr::Builtin(Builtin::Map(_))
         ));
         // `error(msg)` is jq's `msg|error`.
