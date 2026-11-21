@@ -109079,8 +109079,8 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// jq tests the input before it reads the format: a number is converted first and a failed
 /// conversion is the error, a non-array is not a datetime, and only an array gets to `requires a
-/// string format`. A number that converts then meets a format `jv_string_value` aborts on (#3046),
-/// which raises here. Out of line and cold so the builtin's hot path keeps its shape.
+/// string format`. A number that converts then meets a format that jq 1.7.1 aborts on (#3046) and
+/// jq 1.8.2 refuses with the same `requires a string format` (#7533). Out of line and cold so the builtin's hot path keeps its shape.
 #[cold]
 #[inline(never)]
 fn strftime_format_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -109098,9 +109098,8 @@ fn strftime_format_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `optional` is false here: the caller took that arm first.
             match broken_down_time_fields::<W, S>(value, false, local, false, name) {
                 Err(r) => r,
-                Ok(_) => {
-                    QueryResult::Error(EvalError::type_error("string", &format!("{name} format")))
-                }
+                // jq 1.8.2 words it as the array case (#7533); 1.7.1 aborted on an assertion (#3046).
+                Ok(_) => QueryResult::Error(EvalError::requires_string_format(name)),
             }
         }
         StandardJson::Array(_) => QueryResult::Error(EvalError::requires_string_format(name)),

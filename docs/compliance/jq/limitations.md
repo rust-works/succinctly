@@ -11378,13 +11378,15 @@ The date itself agrees: a week number in a negative year is placed with the libc
 starts the slice at 0. Every other depth (a negative or fractional number, `null`, a boolean) is checked against
 `/usr/bin/jq` 1.7.1 in `tests/jq_cli/i4971.rs`.
 
-### A non-string `strflocaltime`/`strftime` format raises where jq aborts (#3046)
+### A non-string `strflocaltime`/`strftime` format raises where jq 1.7.1 aborts (#3046)
 
 `0 | strflocaltime(1)` and `0 | strftime(1)` kill jq 1.7.1 on an assertion
 (`Assertion failed: (JVP_HAS_KIND(j, JV_KIND_STRING)), function jv_string_value`, exit 134).
 succinctly raises a catchable error at exit 5 instead — the "would take the host process
-down" condition. The wording is succinctly's own (`expected string, got strflocaltime
-format`), since jq has none to match.
+down" condition.
+jq 1.8.2 fixed that crash (jqlang/jq commit 1411ce6, "strftime/1: fix validation of non-string argument with number input", oss-fuzz #67403) and raises `strftime/1 requires a string format` (`strflocaltime/1 requires a string format`), the words it already had for an array input.
+`succinctly jq` uses those words (#7533); until then its own wording was `expected string, got strflocaltime format`, since 1.7.1 had none to match.
+`strptime(1)` already agrees (`strptime/1 requires string inputs and arguments`).
 That holds only for a number that converts (#6111).
 jq tests the input before it reads the format.
 `null | strftime(1)` is `strftime/1 requires parsed datetime inputs` in both.
