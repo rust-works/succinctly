@@ -151,7 +151,7 @@ fn a_seq_file_under_four_mib_carries_on_after_stretches_in_its_middle_7260() -> 
         "jq: ignoring parse error: Truncated value at line 702, column 1\n",
         "jq: ignoring parse error: Unmatched '}' at line 1402, column 2 (need RS to resync)\n",
         "jq: ignoring parse error: Expected another array element at line 1404, column 5 (need RS to resync)\n",
-        "jq: ignoring parse error: Invalid literal at line 1407, column 0 (need RS to resync)\n",
+        "jq: ignoring parse error: Invalid numeric literal at line 1407, column 0 (need RS to resync)\n",
         "jq: ignoring parse error: Potentially truncated top-level numeric value at line 1407, column 3\n",
         "jq: ignoring parse error: Invalid numeric literal at line 1709, column 0 (need RS to resync)\n",
     ];

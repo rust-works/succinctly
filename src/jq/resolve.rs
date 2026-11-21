@@ -64,7 +64,10 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::eval::pattern_alternatives_var_names;
-use super::parser::{is_value_arg_var, join_expr_operands_mut, JOIN_IDX_VAR};
+use super::parser::{
+    is_collected_arg_var, is_value_arg_var, join_expr_operands_mut, restore_collected_arg_call,
+    take_collected_arg_call, JOIN_IDX_VAR,
+};
 use super::walk::{any_subexpr, builtin_kids, map_builtin_subexprs, BuiltinKids};
 use super::{Builtin, Expr, ObjectKey, Pattern, StringPart};
 
@@ -1429,19 +1432,26 @@ fn build_call_graph(
                 None => {
                     if let Some(fallback) = builtin_fallback.as_deref() {
                         build_call_graph(fallback, scope, enclosing, graph, roots);
-                    } else if is_jq_builtin(name, arity) {
+                    } else {
+                        // A jq builtin's arguments, and a genuinely
+                        // unresolvable callee's too (#7443). jq never
+                        // compiles an unresolved call's arguments (#2037),
+                        // and `check` does not check them, but a call in
+                        // one still *references* its def: jq keeps every
+                        // def a binding reaches, arguments of unbound calls
+                        // included (`block_bind_referenced`), and compiles
+                        // each kept def as a closure of the block it is
+                        // written in. So `def rs: foo; def run: count(rs);
+                        // run` reports `foo/0` as well as `count/1` -- `rs`
+                        // is a sibling of `run`, not a closure beneath the
+                        // erroring call -- while `def h: nosuchfn2;
+                        // nosuchfn(h)` reports only `nosuchfn/1`: `h` is
+                        // reached, but its block (the main one) has an
+                        // error of its own, which hides it (#3391).
                         for a in args {
                             build_call_graph(a, scope, enclosing, graph, roots);
                         }
                     }
-                    // A genuinely unresolvable callee: `check`'s own matching
-                    // branch doesn't check its arguments either (#2037 --
-                    // real jq's compiler never compiles an unresolved call's
-                    // arguments, having nothing to bind them to), so nothing
-                    // in `args` can mark another `def` reachable through
-                    // this call site. Confirmed live: `def h: nosuchfn2;
-                    // nosuchfn(h)` reports only `nosuchfn/1 is not defined`
-                    // in jq 1.7.1, not `nosuchfn2/0` too.
                 }
             }
         }
@@ -2562,14 +2572,19 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         // #7474: a builtin call whose arguments the parser bound first.
         Expr::As { var, .. } if is_value_arg_var(var) => check_bound_value_args(expr, cx, reachable),
 
+        // #7558: a builtin call whose collected argument the parser settled first, checked as
+        // the call it was written as.
+        Expr::As { var, .. } if is_collected_arg_var(var) => match take_collected_arg_call(expr) {
+            Some(mut call) => {
+                check(&mut call, cx, reachable);
+                restore_collected_arg_call(expr, call);
+            }
+            None => check_as_binding(expr, cx, reachable),
+        },
+
         // #2734: binds `var` in `body` only, not `expr` -- `.foo as $x | ...`
         // evaluates `.foo` before `$x` exists.
-        Expr::As { expr, var, body } => {
-            check(expr, cx, reachable);
-            cx.var_scope.push(var.clone());
-            check(body, cx, reachable);
-            cx.var_scope.pop();
-        }
+        Expr::As { .. } => check_as_binding(expr, cx, reachable),
 
         // #2734: `patterns` is every `?//`-alternative (usually just one);
         // jq requires each alternative bind the same variable set, so the
@@ -3085,6 +3100,17 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
     }
 }
 
+/// [`check`] for `.foo as $x | body`: `var` is bound in `body` only (#2734).
+fn check_as_binding(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
+    let Expr::As { expr, var, body } = expr else {
+        unreachable!("called on an `as` binding"); // patchcov: coverage tolerate-line reason="unreachable: both callers match Expr::As first"
+    };
+    check(expr, cx, reachable);
+    cx.var_scope.push(var.clone());
+    check(body, cx, reachable);
+    cx.var_scope.pop();
+}
+
 /// [`check`] for `B(a; b)` that `parser::bind_value_args` parsed as `b as $v | a as $u | B($u;
 /// $v)` (#7474), checked as the call it was written as.
 ///
@@ -3485,19 +3511,18 @@ mod tests {
         );
     }
 
-    /// #2740 review: `build_call_graph`'s own arguments-of-an-unresolved-call
-    /// handling must mirror `check`'s (#2037's rule: real jq's compiler
-    /// never compiles an unresolved call's arguments, having no resolved
-    /// callee to bind them to). An early version of this pass didn't
-    /// distinguish that case from the `is_jq_builtin` one and walked `args`
-    /// unconditionally, marking `h` -- and transitively its own
-    /// `nosuchfn2` -- reachable through a call site jq itself never
-    /// compiles. Oracle-verified: jq 1.7.1 reports only `nosuchfn/1`.
+    /// #7443: an unresolvable callee's arguments are never compiled (#2037),
+    /// but a call in one still references its def, so `h` is reachable and
+    /// its body is checked like any def's: this view, which keeps every
+    /// error in the tree, sees its `nosuchfn2` first. What jq reports is
+    /// `nosuchfn/1` alone (oracle-verified, jq 1.7.1), because `h` is a
+    /// closure of the main block, which has an error of its own (#3391):
+    /// `jq_reported::a_def_referenced_only_in_an_unresolved_calls_argument_*`.
     #[test]
-    fn an_unresolvable_callees_arguments_do_not_mark_anything_reachable() {
+    fn an_unresolvable_callees_arguments_still_reference_their_defs() {
         assert_eq!(
             resolve("def h: nosuchfn2; nosuchfn(h)"),
-            Err("nosuchfn/1 is not defined".into())
+            Err("nosuchfn2/0 is not defined".into())
         );
     }
 
@@ -4874,6 +4899,34 @@ mod tests {
             let filter = "def t: topmissing; t, bodymissing";
             assert_eq!(reported(filter), ["bodymissing/0"]);
             assert_eq!(all(filter), ["topmissing/0", "bodymissing/0"]);
+        }
+
+        #[test]
+        fn a_def_referenced_only_in_an_unresolved_calls_argument_is_its_blocks_closure() {
+            // #7443: `rs` is reached only through `count`'s argument, which
+            // jq never compiles, but the reference keeps `rs`, a closure of
+            // the main block -- which has no error, so `rs` is compiled.
+            assert_eq!(
+                reported("def rs: foo; def run: count(rs); run"),
+                ["foo/0", "count/1"]
+            );
+            assert_eq!(
+                reported("def a: x; def b: count(a); def c: bar(b); c"),
+                ["x/0", "count/1", "bar/1"]
+            );
+        }
+
+        #[test]
+        fn a_def_referenced_only_in_an_unresolved_calls_argument_hides_under_its_block() {
+            // #7443: the same reference from the main block, whose own error
+            // hides every closure it owns, `h` included (#3391).
+            assert_eq!(reported("def h: nosuchfn2; nosuchfn(h)"), ["nosuchfn/1"]);
+            assert_eq!(reported("def rs: foo; count(rs)"), ["count/1"]);
+            // Nothing references `run`, so nothing references `rs`.
+            assert_eq!(
+                reported("def rs: foo; def run: count(rs); 1"),
+                Vec::<String>::new()
+            );
         }
 
         #[test]

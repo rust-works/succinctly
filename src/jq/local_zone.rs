@@ -163,10 +163,11 @@ mod backend_utc {
     }
 }
 
-/// The system's local zone through `jiff`: `TZ` as an IANA name, a `:name`, a
-/// path or a POSIX string, otherwise the system zone. `TZ` is read once per
-/// process, on the first conversion (a later `set_var` is not seen). A `TZ` it
-/// cannot read is UTC, as in jq.
+/// The system's local zone through `jiff`: `TZ` read as libc reads it (a tz
+/// file under the zoneinfo directory or at a path, then a POSIX string, #7486),
+/// otherwise the system zone. `TZ` is read once per process, on the first
+/// conversion (a later `set_var` is not seen). A `TZ` it cannot read is UTC, as
+/// in jq.
 ///
 /// One case jiff declines and this module covers: a POSIX string with a
 /// daylight-time name but no rule (`EST5EDT`) whose name is not a tz file (newer
@@ -189,13 +190,71 @@ mod backend_jiff {
 
     fn system() -> &'static TimeZone {
         static ZONE: OnceLock<TimeZone> = OnceLock::new();
-        ZONE.get_or_init(|| {
-            std::env::var("TZ")
-                .ok()
-                .as_deref()
-                .and_then(with_default_rule)
-                .unwrap_or_else(TimeZone::system)
+        ZONE.get_or_init(|| match std::env::var_os("TZ") {
+            None => TimeZone::system(),
+            Some(tz) => from_tz(&tz, zoneinfo_dir().as_os_str()),
         })
+    }
+
+    /// The directory a `TZ` that is not a path is a file of: `$TZDIR` where glibc reads it (Linux;
+    /// an empty one is unset), else `/usr/share/zoneinfo`, the directory both glibc and Apple's libc
+    /// are built with. Apple's libc does not read `TZDIR` (#7486, captured from jq 1.7.1 on both).
+    fn zoneinfo_dir() -> std::ffi::OsString {
+        #[cfg(target_os = "linux")]
+        if let Some(dir) = std::env::var_os("TZDIR").filter(|dir| !dir.is_empty()) {
+            return dir;
+        }
+        "/usr/share/zoneinfo".into()
+    }
+
+    /// The zone libc's `tzset` makes of a `TZ` that is set (#7486): one leading `:` is dropped, and
+    /// what is left is a TZif file if one opens at it (`dir/<TZ>`, or the path itself when it starts
+    /// with `/`: so `posix/Asia/Tokyo`, `Asia//Tokyo` and `/usr/share/zoneinfo/Asia/Tokyo` load, and
+    /// a name matches a file only as the file system matches it), else a POSIX string (`JST-9`,
+    /// `EST5EDT`), else UTC. jiff's own reading of `TZ` looks names up in its database instead,
+    /// which matches them without regard to case, skips the `posix/` and `right/` trees and does not
+    /// take `Asia//Tokyo`. Apple's libc never reads a `:`-prefixed `TZ` as a POSIX string
+    /// (`TZ=:JST-9` is UTC there; glibc reads it as `JST-9`).
+    fn from_tz(tz: &std::ffi::OsStr, dir: &std::ffi::OsStr) -> TimeZone {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = tz.as_bytes();
+        let colon = bytes.first() == Some(&b':');
+        let name = std::ffi::OsStr::from_bytes(if colon { &bytes[1..] } else { bytes });
+        if name.is_empty() {
+            return TimeZone::UTC;
+        }
+        if let Some(zone) = zone_file(name, dir) {
+            return zone;
+        }
+        if colon && cfg!(target_vendor = "apple") {
+            return TimeZone::UTC;
+        }
+        name.to_str()
+            .and_then(|text| with_default_rule(text).or_else(|| TimeZone::posix(text).ok()))
+            .unwrap_or(TimeZone::UTC)
+    }
+
+    /// The zone of the TZif file `name` names (a path when it starts with `/`, else under `dir`),
+    /// `None` when it does not open or is not TZif. At most 1 MiB is read: a zone file is a few KiB,
+    /// and `TZ=/dev/zero` must not read forever.
+    fn zone_file(name: &std::ffi::OsStr, dir: &std::ffi::OsStr) -> Option<TimeZone> {
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        let path = if name.as_bytes().first() == Some(&b'/') {
+            name.to_os_string()
+        } else {
+            let mut path = dir.to_os_string();
+            path.push("/");
+            path.push(name);
+            path
+        };
+        let mut data = alloc::vec::Vec::new();
+        std::fs::File::open(&path)
+            .ok()?
+            .take(1 << 20)
+            .read_to_end(&mut data)
+            .ok()?;
+        TimeZone::tzif(&name.to_string_lossy(), &data).ok()
     }
 
     pub(super) fn offset_at(utc_secs: i64) -> i64 {
@@ -360,11 +419,11 @@ mod backend_jiff {
         zone_in(tz, ts)
     }
 
-    /// The zone `tz` names when it is a rule-less POSIX string with no tz file
-    /// of that name: the string plus [`DEFAULT_RULE`]. `None` otherwise, which
-    /// leaves `tz` to jiff.
+    /// The zone `tz` names when it is a rule-less POSIX string: the string plus
+    /// [`DEFAULT_RULE`]. `None` otherwise, which leaves `tz` to jiff. Asked only
+    /// once no tz file of that name opened ([`from_tz`]).
     fn with_default_rule(tz: &str) -> Option<TimeZone> {
-        if !is_rule_less_posix(tz) || jiff::tz::db().get(tz).is_ok() {
+        if !is_rule_less_posix(tz) {
             return None;
         }
         TimeZone::posix(&format!("{tz},{DEFAULT_RULE}")).ok()
@@ -408,8 +467,8 @@ mod backend_jiff {
     #[cfg(test)]
     mod tests {
         use super::{
-            is_rule_less_posix, offset_in, tzname_in, wall_clock_in, with_default_rule, zone_in,
-            TimeZone,
+            from_tz, is_rule_less_posix, offset_in, tzname_in, wall_clock_in, with_default_rule,
+            zone_in, TimeZone,
         };
 
         /// New York's rule as a POSIX string: needs no tz database on the
@@ -549,6 +608,80 @@ mod backend_jiff {
             ] {
                 assert!(!is_rule_less_posix(tz), "{tz}");
             }
+        }
+
+        /// #7486: `TZ` is a tz file under the zoneinfo directory (or at a path) before it is a POSIX
+        /// string, as libc's `tzset` reads it, with the path the file system resolves: a doubled
+        /// slash or a `.` step opens the same file, one leading `:` is dropped, and a name no file
+        /// has, or a file that is not TZif, is read as a POSIX string or else is UTC. The zones are
+        /// copies of the machine's own, so the case is skipped where it has none.
+        #[test]
+        fn a_tz_is_a_tz_file_before_it_is_a_posix_string_7486() {
+            use std::ffi::OsStr;
+            let system = std::path::Path::new("/usr/share/zoneinfo");
+            let (Ok(tokyo), Ok(new_york)) = (
+                std::fs::read(system.join("Asia/Tokyo")),
+                std::fs::read(system.join("America/New_York")),
+            ) else {
+                return;
+            };
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(dir.path().join("Asia")).expect("created");
+            std::fs::write(dir.path().join("Asia/Tokyo"), &tokyo).expect("written");
+            // A file of a POSIX string's name is the file, not the string.
+            std::fs::write(dir.path().join("JST-9"), &new_york).expect("written");
+            std::fs::write(
+                dir.path().join("zone.tab"),
+                "JP\t+353916+1394441\tAsia/Tokyo\n",
+            )
+            .expect("written");
+            let root = dir.path().as_os_str();
+            let at = |tz: &str| {
+                let zone = zone_in(&from_tz(OsStr::new(tz), root), 1_700_000_000);
+                (zone.offset_secs, zone.name)
+            };
+            let jst = (9 * 3600, "JST".to_string());
+            for tz in [
+                "Asia/Tokyo",
+                ":Asia/Tokyo",
+                "Asia//Tokyo",
+                "Asia/./Tokyo",
+                "./Asia/Tokyo",
+            ] {
+                assert_eq!(at(tz), jst, "{tz}");
+            }
+            let path = dir.path().join("Asia/Tokyo");
+            let elsewhere = tempfile::tempdir().expect("tempdir");
+            let tz = path.to_str().expect("a UTF-8 path");
+            assert_eq!(
+                zone_in(
+                    &from_tz(OsStr::new(tz), elsewhere.path().as_os_str()),
+                    1_700_000_000
+                )
+                .offset_secs,
+                jst.0
+            );
+            assert_eq!(at("JST-9"), (-5 * 3600, "EST".to_string()));
+            // No file: the POSIX string, with the US rule when it has none.
+            assert_eq!(at("KST-9"), (9 * 3600, "KST".to_string()));
+            assert_eq!(
+                zone_in(&from_tz(OsStr::new("XYZ5XYD"), root), 1_720_000_000).name,
+                "XYD"
+            );
+            // Neither: UTC.
+            for tz in ["", ":", "Asia/Osaka", "zone.tab", "Asia", "::Asia/Tokyo"] {
+                assert_eq!(at(tz).0, 0, "{tz}");
+            }
+            // Apple's libc never reads a `:`-prefixed `TZ` as a POSIX string; glibc does.
+            let colon = at(":KST-9").0;
+            assert_eq!(
+                colon,
+                if cfg!(target_vendor = "apple") {
+                    0
+                } else {
+                    9 * 3600
+                }
+            );
         }
 
         #[test]
