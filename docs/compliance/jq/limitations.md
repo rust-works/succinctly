@@ -9262,6 +9262,42 @@ a compile failure from a runtime one gets a consistent answer on every one of th
 Neither remaining gap corrupts output or crashes — the two conditions that would otherwise
 make this an accepted ADR-0018 divergence rather than an open gap.
 
+### A module that fails to load and is imported twice is reported once, where jq 1.8.2 reports it at each import (#7535)
+
+jq 1.8.2 reports a module that fails to load at every `import` or `include` that reaches it.
+`succinctly jq` reports it once, as jq 1.7.1 does for a syntax error, and this is deliberately left that way.
+The 1.8.2 behaviour comes from a crash fix (jqlang/jq#3497, "Fix crash when importing a module with errors twice", for jqlang/jq#3126): `load_library` used to cache the block of a module that failed to parse as a library, and a second import found the cached invalid block and passed it to `block_bind_library`, which aborted on an assertion.
+The fix skips caching a block when there are parse errors, so the failed module is loaded again by the next directive and fails again.
+The repeat is a consequence of not caching, not a designed report, and `succinctly jq` does not crash, so there is no reason to copy it.
+The count is the one place the two differ, so a script that counts `compile error` lines sees fewer here for a repeated bad module.
+The three outputs, captured on macOS (jq 1.7.1 is Apple's `/usr/bin/jq`, jq 1.8.2 is Homebrew's), with `data.json` = `{"a":1}`, `mod.jq` = `import "data" as $data; .`, `main.jq` = `import "mod" as mod; include "mod"; .`, and `bad.jq` = `def f: (;`:
+
+```console
+$ jq -L . -n -f main.jq                                  # jq 1.7.1
+jq: error: jq: error: library should only have function definitions, not a main expression
+<unknown location>
+Assertion failed: (block_has_only_binders(binder, bindflags)), function block_bind_library, file compile.c, line 383.
+                                                           # exit 134
+
+$ jq -L . -n -f main.jq                                  # jq 1.8.2
+jq: error: jq: error: library should only have function definitions, not a main expression
+jq: error: jq: error: library should only have function definitions, not a main expression
+jq: 2 compile errors
+                                                           # exit 3
+
+$ succinctly jq -L . -n -f main.jq
+jq: error: jq: error: library should only have function definitions, not a main expression
+<unknown location>
+jq: 1 compile error
+                                                           # exit 3
+```
+
+The same module reached twice and failing to parse is reported once by jq 1.7.1 and `succinctly jq` (`jq -L . -nc 'import "bad" as x; import "bad" as y; 1'`: one syntax error, `jq: 1 compile error`, exit 3), and twice by jq 1.8.2 (the syntax error twice, `jq: 2 compile errors`, exit 3).
+The syntax error's own wording is succinctly's, as recorded in the section above on the other compile-error paths.
+jq 1.7.1 has no output to match for the crash case (a library with a main expression, imported and included), where 1.8.2's two reports are the only reference and `succinctly jq` prints one, followed by the `<unknown location>` line 1.7.1 printed just before it aborted.
+A module that loads fine and is imported twice agrees in all three.
+This is the repo owner's default for the question the issue raised (report once, or at each import): behaviour stays as it is until a reason to change it turns up.
+
 ## Recursive `def`s: what a native call stack costs that jq's own does not — #1371
 
 > The `MAX_EVAL_FRAMES` raise is uncatchable by `?`/`try`/`catch` since #2132 -- see "Every resource cap is uncatchable" below.
