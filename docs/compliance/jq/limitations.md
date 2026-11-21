@@ -13260,7 +13260,10 @@ The scan for a NaN before a sort costs one pass over the keys; a sort of keys wi
 jq's parser reports a text that opens with part of the UTF-8 BOM (`EF`, or `EF BB`) and then departs from it as `Malformed BOM`.
 `fromjson` and `tonumber` word it that way here (`"\ufffd" | try fromjson catch .` is `"Malformed BOM (while parsing ...)"`).
 The primary input stream does not: `printf '\xef\xbf\xbd1' | jq .` is `jq: parse error: Malformed BOM` in jq and `jq: parse error: Invalid numeric literal at EOF at line 1, column 4` here.
-Both exit 5 with no output, so only the message differs.
+Both exit 5 with no output, so only the message differs, when the mark breaks off at a byte that is not the next one of it.
+A mark that breaks off because the input ends (`printf '\xef' | jq .`, or `EF BB`) is no fault in jq: its parser keeps its place in the mark across a refill, so the input is empty, `.` prints nothing and `-s .` prints `[]`, both with exit 0 (#7454).
+`succinctly jq` does the same, on standard input and in files, when the stream's only bytes are the start of the mark, with files without bytes before or after it.
+A mark split across two files (`EF BB` in one and `BF` in the next) is not joined here, where jq skips it, and still ends in a numeric-literal fault.
 The stream routes word their first fault through `jq_stream_fault`, which does not look for a partial BOM; closing that is a separate change.
 
 ### A malformed nested number raises when read; jq rejects the document (#966, #3034, #3222) — accepted uniform divergence

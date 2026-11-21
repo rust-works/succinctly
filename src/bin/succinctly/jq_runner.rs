@@ -11069,6 +11069,8 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let mut openers: Vec<crate::cli::jq_stream_errors::Opener> =
         Vec::with_capacity(files.len().max(1));
     let mut look_for_bom = true;
+    // #7454: set while the first source with bytes is the start of the BOM and no later one has any.
+    let mut truncated_bom: Option<std::rc::Rc<std::cell::Cell<bool>>> = None;
     if files.is_empty() {
         let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
         let mut stdin =
@@ -11083,7 +11085,11 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                 Vec::new()
             })
         };
-        let skip = bom_to_skip(&head, &mut look_for_bom);
+        let mut skip = bom_to_skip(&head, &mut look_for_bom);
+        // #7454: all there is of the stream is the start of the mark.
+        if skip == 0 && crate::cli::front_matter::truncated_bom_len(&head) > 0 {
+            skip = head.len();
+        }
         openers.push(Box::new(move || {
             let rest = std::io::Cursor::new(head[skip..].to_vec()).chain(stdin);
             Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, rest)))
@@ -11103,8 +11109,10 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
             } else {
                 (Vec::new(), false)
             };
+            let first = look_for_bom && !bytes.is_empty();
             let skip = bom_to_skip(&bytes[..bytes.len().min(3)], &mut look_for_bom);
             bytes.drain(..skip);
+            let only_the_mark = truncated_bom_head(&bytes, first, skip, &mut truncated_bom);
             opened.push(path.clone());
             openers.push(report_unopened_before(
                 std::mem::take(&mut unopened),
@@ -11112,6 +11120,9 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                 Box::new(move || {
                     if failed {
                         note_stdin_read_failed();
+                    }
+                    if only_the_mark.is_some_and(|flag| flag.get()) {
+                        bytes.clear();
                     }
                     Ok(Box::new(std::io::Cursor::new(bytes)))
                 }),
@@ -11133,13 +11144,20 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
             .map_err(|e| InputFileOpenError::from_io(path, &e, at + 1 == files.len()));
         match probed {
             Ok((head, kept)) => {
+                let first = look_for_bom && !head.is_empty();
                 let skip = bom_to_skip(&head, &mut look_for_bom);
+                let only_the_mark = truncated_bom_head(&head, first, skip, &mut truncated_bom);
                 let path = path.clone();
                 opened.push(path.clone());
                 openers.push(report_unopened_before(
                     std::mem::take(&mut unopened),
                     Box::new(move || {
                         use std::io::Seek;
+                        let skip = if only_the_mark.is_some_and(|flag| flag.get()) {
+                            head.len()
+                        } else {
+                            skip
+                        };
                         if let Some(file) = kept {
                             let front = std::io::Cursor::new(head[skip..].to_vec());
                             let rest: Box<dyn std::io::Read> = match file {
@@ -11268,6 +11286,33 @@ fn bom_to_skip(head: &[u8], look_for_bom: &mut bool) -> usize {
     crate::cli::front_matter::leading_bom_len(head)
 }
 
+/// Whether the first source with bytes holds nothing but the start of the BOM (`EF` or `EF BB`),
+/// and so is empty input unless a later source goes on from it (#7454): jq's parser keeps its place
+/// in the mark across a refill and accepts the end of the stream inside it.
+///
+/// `first` says `head` is the head of the first source that has bytes; the answer is a flag the
+/// source's opener reads once every source is probed, and a later source with bytes clears it
+/// (`note_later_bytes`), as that source makes the mark `Malformed BOM` instead.
+fn truncated_bom_head(
+    head: &[u8],
+    first: bool,
+    skip: usize,
+    pending: &mut Option<std::rc::Rc<std::cell::Cell<bool>>>,
+) -> Option<std::rc::Rc<std::cell::Cell<bool>>> {
+    if first {
+        if skip == 0 && crate::cli::front_matter::truncated_bom_len(head) > 0 {
+            let flag = std::rc::Rc::new(std::cell::Cell::new(true));
+            *pending = Some(flag.clone());
+            return Some(flag);
+        }
+    } else if !head.is_empty() {
+        if let Some(flag) = pending {
+            flag.set(false);
+        }
+    }
+    None
+}
+
 /// A read of standard input failed, or it cannot be read at all (`jq . 0>>file`, `jq . 0<&-`,
 /// `jq . < /`): jq reads what it got (nothing, for a descriptor it cannot read), says nothing, and
 /// exits 2 once the run is over, whatever the program left (#7126).
@@ -11377,8 +11422,17 @@ fn read_file_bytes(path: &Path, last: bool) -> std::result::Result<Vec<u8>, Inpu
 /// the `--seq` reader accounts for the BOM itself (`bom_prefix`), including
 /// the malformed forms.
 fn strip_leading_json_bom<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
-    if let Some(first) = raws.into_iter().find(|raw| !raw.is_empty()) {
+    let mut raws = raws.into_iter().filter(|raw| !raw.is_empty());
+    if let Some(first) = raws.next() {
         let bom_len = crate::cli::front_matter::leading_bom_len(first);
+        // A stream that ends inside the mark is empty input, not a fault (#7454): the mark's
+        // first bytes are all there is, and no later file goes on from them.
+        if bom_len == 0
+            && crate::cli::front_matter::truncated_bom_len(first) > 0
+            && raws.next().is_none()
+        {
+            first.clear();
+        }
         first.drain(..bom_len);
     }
 }
@@ -26792,6 +26846,33 @@ mod tests {
         assert_eq!(stripped(&[b"\xEF\xBB1"]), vec![b"\xEF\xBB1".to_vec()]);
         assert_eq!(stripped(&[b"\xEF\xBB\xBF"]), vec![b"".to_vec()]);
         assert_eq!(stripped(&[]), Vec::<Vec<u8>>::new());
+    }
+
+    /// #7454: a stream that ends inside the mark is empty; one that goes on, or whose mark is
+    /// already whole, keeps its bytes.
+    #[test]
+    fn strip_leading_json_bom_empties_a_stream_that_ends_inside_the_mark_7454() {
+        let stripped = |files: &[&[u8]]| -> Vec<Vec<u8>> {
+            let mut raws: Vec<Vec<u8>> = files.iter().map(|f| f.to_vec()).collect();
+            strip_leading_json_bom(raws.iter_mut());
+            raws
+        };
+        assert_eq!(stripped(&[b"\xEF"]), vec![b"".to_vec()]);
+        assert_eq!(stripped(&[b"\xEF\xBB"]), vec![b"".to_vec()]);
+        assert_eq!(
+            stripped(&[b"", b"\xEF", b""]),
+            vec![b"".to_vec(), b"".to_vec(), b"".to_vec()]
+        );
+        // Another file with bytes goes on from the mark: a fault, left for the parser to say.
+        assert_eq!(
+            stripped(&[b"\xEF", b"1"]),
+            vec![b"\xEF".to_vec(), b"1".to_vec()]
+        );
+        // A stray byte of the mark after a whole one is no mark.
+        assert_eq!(stripped(&[b"\xEF\xBB\xBF\xEF"]), vec![b"\xEF".to_vec()]);
+        // A mark that breaks off, and a first byte that is not one, are left alone.
+        assert_eq!(stripped(&[b"\xEF\n"]), vec![b"\xEF\n".to_vec()]);
+        assert_eq!(stripped(&[b"\xBB"]), vec![b"\xBB".to_vec()]);
     }
 
     /// #4305: the tail moves onto the next file, through an empty one, and the last file
