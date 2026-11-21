@@ -481,3 +481,5 @@ files-dash-null-input	files	["-n", "-c", "[inputs]", "-"]	"1 2\n"
 files-dash-slurpfile-is-an-error	files	["-n", "-c", "--slurpfile", "x", "-", "$x"]	"1"
 strftime-negative-year-y	time	["-n", "-c", "[-5,0,1,0,0,0,0,0] | strftime(\"%y|%C|%D\")"]	-
 strftime-negative-year-century	time	["-n", "-c", "[-101,0,1,0,0,0,0,0] | strftime(\"%y|%C\")"]	-
+seq-bare-n-after-u	input	["--seq", "-c", "."]	"\u001e\"iu\"\n\u001en\n"
+stream-bare-n-after-u	input	["--stream", "-c", "."]	"\"iu\" n"
