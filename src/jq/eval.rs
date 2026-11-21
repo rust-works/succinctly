@@ -149568,8 +149568,11 @@ mod tests {
     }
 
     /// #6106: a loop rewritten for Oniguruma's empty-iteration exit is what the `regex` crate
-    /// compiles, and a rewrite the crate refuses (here, nested past its limit) falls back to the
-    /// pattern as written instead of becoming an error.
+    /// compiles. A rewrite nests deeper than the pattern it was made from, and the crate's default
+    /// limit (250) refused one that jq reads (#6106 then fell back to the pattern as written); since
+    /// #7528 the builder takes jq's own depth (`ONIG_NEST_LIMIT`), so the rewrite compiles at a depth
+    /// the default limit refuses. The fall-back remains for a rewrite past the raised limit, which a
+    /// pattern within jq's 511 groups cannot make.
     #[cfg(feature = "regex")]
     #[test]
     fn build_regex_falls_back_to_the_pattern_as_written_6106() {
@@ -149591,9 +149594,12 @@ mod tests {
                 super::super::onig_loop::rewrite(&nested(d))
                     .is_some_and(|rewritten| regex::Regex::new(&rewritten).is_err())
             })
-            .expect("some depth nests the rewrite past the crate's limit");
+            .expect("some depth nests the rewrite past the crate's default limit");
         assert!(regex::Regex::new(&nested(depth)).is_ok());
-        assert_eq!(compiled(&nested(depth)), nested(depth));
+        assert_eq!(
+            compiled(&nested(depth)),
+            super::super::onig_loop::rewrite(&nested(depth)).unwrap()
+        );
     }
 
     /// #6332: a loop with a capture group the plain rewrite would copy or drop is written with the
