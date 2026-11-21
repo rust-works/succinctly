@@ -114654,8 +114654,25 @@ fn environment_object() -> OwnedValue {
 fn environment_object_in(snapshot: bool) -> OwnedValue {
     fn build() -> OwnedValue {
         let mut env_obj = FieldMap::new();
+        // jq splits every `environ` string at its first `=`; `std` skips a name that is empty and
+        // reads `=X=1` as `X`, so Unix reads the strings themselves (#7487). An entry with no `=`
+        // is no variable, as in jq.
+        #[cfg(unix)]
+        for entry in super::environ::entries() {
+            use std::os::unix::ffi::OsStrExt;
+            let Some(eq) = entry.iter().position(|&b| b == b'=') else {
+                continue;
+            };
+            env_obj.insert(
+                environment_text(std::ffi::OsStr::from_bytes(&entry[..eq])),
+                OwnedValue::String(
+                    environment_text(std::ffi::OsStr::from_bytes(&entry[eq + 1..])).into(),
+                ),
+            );
+        }
         // `vars_os`, not `vars`: `vars` panics on the first name or value that is not UTF-8
         // (#6564); jq substitutes it instead.
+        #[cfg(not(unix))]
         for (key, value) in std::env::vars_os() {
             env_obj.insert(
                 environment_text(&key),

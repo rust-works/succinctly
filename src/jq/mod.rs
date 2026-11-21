@@ -78,6 +78,8 @@ pub mod document;
 mod element_run;
 // Only the `std` build reads the environment; a `no_std` build parses the builtin and refuses it.
 mod encoder_comments;
+#[cfg(all(unix, feature = "std"))]
+mod environ;
 #[cfg_attr(not(feature = "std"), allow(dead_code))]
 mod envsubst;
 mod error;
