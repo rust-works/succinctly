@@ -7048,6 +7048,57 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
     OwnedValue::Object(args_obj.into())
 }
 
+/// jq 1.7.1's `skip_shebang` (`src/main.c`, #7481), which it applies to the text of a `-f` program
+/// file and to nothing else: the first three lines are dropped when the file is a shell/jq
+/// polyglot,
+///
+/// ```text
+/// #!/bin/sh
+/// # \
+/// exec jq -n -f "$0" "$@"
+/// ```
+///
+/// that is, when line 1 starts with `#!`, line 2 starts with `#` and ends in exactly one `\`
+/// (a second backslash before it, or a CR after it, is no match), line 2 is followed by a line
+/// that does not start with `#` and is not the end of the text, and that line ends in a newline.
+/// Every other file is the program as it stands; in particular a comment that ends in a backslash
+/// still ends at its newline, anywhere else (jq 1.8.2 gets the same answer for the polyglot
+/// through a language change, Tcl-style comment continuation everywhere, jqlang/jq#2989, which
+/// this does not adopt). Returns the program text to run.
+fn skip_shebang(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    let line_end = |from: usize| {
+        bytes[from..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| from + i)
+    };
+    if !bytes.starts_with(b"#!") {
+        return text;
+    }
+    let Some(first_end) = line_end(0) else {
+        return text;
+    };
+    if bytes.get(first_end + 1) != Some(&b'#') {
+        return text;
+    }
+    let Some(second_end) = line_end(first_end + 1) else {
+        return text;
+    };
+    // The second line is at least `#`, so `second_end - 1` is inside it; the byte before that
+    // is the newline ending line 1 at the least.
+    if matches!(bytes.get(second_end + 1), None | Some(b'#'))
+        || bytes[second_end - 1] != b'\\'
+        || bytes[second_end - 2] == b'\\'
+    {
+        return text;
+    }
+    match line_end(second_end + 1) {
+        Some(third_end) => &text[third_end + 1..],
+        None => text,
+    }
+}
+
 /// Get the filter expression from arguments.
 ///
 /// An unreadable `-f`/`--from-file` filter file is jq's *own* usage error
@@ -7081,11 +7132,17 @@ fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
                 "program file contains NUL bytes".into(),
             ));
         }
-        String::from_utf8(bytes).map_err(|_| {
+        let text = String::from_utf8(bytes).map_err(|_| {
             open_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "stream did not contain valid UTF-8",
             ))
+        })?;
+        let skipped = text.len() - skip_shebang(&text).len();
+        Ok(if skipped == 0 {
+            text
+        } else {
+            text[skipped..].to_string()
         })
     } else if let Some(ref filter) = args.filter {
         Ok(crate::cli::jq_word_text(filter))
