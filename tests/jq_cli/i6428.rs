@@ -1,6 +1,8 @@
 //! #6428: Oniguruma counts a lazy bounded repeat of two or more, and an iteration that matches nothing
 //! leaves the count, so a group the empty way set is unset again when what follows fails there. Every row
 //! was captured from jq 1.7.1 (`jq -nc`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -24,7 +26,7 @@ fn a_lazy_bounded_repeat_unsets_the_group_of_an_empty_iteration_that_failed_6428
         (
             r"(?:(b*)|a){0,2}?",
             "ab",
-            r#"[[0,"",[""]],[1,"",[""]],[2,"",[""]]]"#,
+            r#"[[0,"",[null]],[1,"",[null]],[2,"",[null]]]"#,
         ),
         (r"(?:(?:b*|(a))+){0,2}?b", "ab", r#"[[0,"ab",["a"]]]"#),
         (r"(?:(b*)|a){0,1}?b", "ab", r#"[[0,"ab",[null]]]"#),
@@ -38,17 +40,17 @@ fn a_lazy_bounded_repeat_leaves_the_rest_of_the_pattern_rewritten_and_any_count_
         (
             r"(?:^b*|(?:(a*)|b)+(?:(a)|b?){0,2}){1,2}?$",
             "abba",
-            r#"[[0,"abba",["",null]],[4,"",["",""]]]"#,
+            r#"[[0,"abba",["",null]],[4,"",["",null]]]"#,
         ),
         (
             r"(?:(a)|b*|c)+(?:(d*)|x){0,20}?",
             "bcab",
-            r#"[[0,"b",[null,null]],[1,"",["",""]],[2,"ab",["a",null]],[4,"",["",""]]]"#,
+            r#"[[0,"b",[null,null]],[1,"",[null,null]],[2,"ab",["a",null]],[4,"",[null,null]]]"#,
         ),
         (
             r"(?:(a)|b*|c)+(?:()|d){0,2}?",
             "bcab",
-            r#"[[0,"b",[null,null]],[1,"",["",""]],[2,"ab",["a",null]],[4,"",["",""]]]"#,
+            r#"[[0,"b",[null,null]],[1,"",[null,null]],[2,"ab",["a",null]],[4,"",[null,null]]]"#,
         ),
         (r"(?:()|b){0,2}?a", "ba", r#"[[0,"ba",[null]]]"#),
         (r"(?:(b*)|a){0,11}?c", "aac", r#"[[0,"aac",[null]]]"#),
@@ -57,24 +59,24 @@ fn a_lazy_bounded_repeat_leaves_the_rest_of_the_pattern_rewritten_and_any_count_
         (
             r"((a)*|c)+(((b*())(()|a){0,2}?(())){4}){3}",
             "aac",
-            r#"[[0,"aa",["","a","","","","",null,null,"",""]],[2,"",["","","","","","","","","",""]],[3,"",["","","","","","","","","",""]]]"#,
+            r#"[[0,"aa",["","a","","","","",null,null,"",""]],[2,"",["",null,"","","","",null,null,"",""]],[3,"",["",null,"","","","",null,null,"",""]]]"#,
         ),
         (
             r"(?:(a)|b*|c)+(?:(?:(x)|y*|z){200}|d){0,2}?",
             "bcab",
-            r#"[[0,"b",[null,null]],[1,"",["",""]],[2,"ab",["a",null]],[4,"",["",""]]]"#,
+            r#"[[0,"b",[null,null]],[1,"",[null,null]],[2,"ab",["a",null]],[4,"",[null,null]]]"#,
         ),
         (
             r"(?:(a)?|(b|)*(\b)){0,12}?$",
             "bb",
-            r#"[[0,"bb",[null,"",""]],[2,"",["","",""]]]"#,
+            r#"[[0,"bb",[null,"",""]],[2,"",[null,null,null]]]"#,
         ),
         (r"(?:b*(\b)){1,3}?$", "bb", r#"[[0,"bb",[""]],[2,"",[""]]]"#),
         (r"(\b|(b*)|a){1,2}?b", "ab", r#"[[0,"ab",["a",null]]]"#),
         (
             r"(?:(a)|b*|c)+(?:(d*)|x){1,20000}?",
             "bcab",
-            r#"[[0,"b",[null,""]],[1,"",["",""]],[2,"ab",["a",""]],[4,"",["",""]]]"#,
+            r#"[[0,"b",[null,""]],[1,"",[null,""]],[2,"ab",["a",""]],[4,"",[null,""]]]"#,
         ),
     ])
 }

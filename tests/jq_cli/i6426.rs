@@ -2,6 +2,8 @@
 //! Oniguruma does: the loop rewrite and the capture rewrite read the pattern through the copy that writes
 //! that syntax plainly, and the text they write runs on `fancy-regex`. Every row was captured from jq 1.7.1
 //! (`jq -nc`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -30,20 +32,20 @@ fn a_loop_with_capture_groups_beside_a_lookaround_or_atomic_group_answers_as_jq_
             "(?!c)((a|b)|){2,}",
             "ba",
             "g",
-            r#"[[0,"ba",["","a"]],[2,"",["",""]]]"#,
+            r#"[[0,"ba",["","a"]],[2,"",["",null]]]"#,
         ),
         (
             "(?!c)((a|b)|){2,}",
             "aab",
             "g",
-            r#"[[0,"aab",["","b"]],[3,"",["",""]]]"#,
+            r#"[[0,"aab",["","b"]],[3,"",["",null]]]"#,
         ),
         ("(?<=b)((a|b)|){2,}", "ba", "g", r#"[[1,"a",["","a"]]]"#),
         (
             "(?<=b)((a|b)|){2,}",
             "bab",
             "g",
-            r#"[[1,"ab",["","b"]],[3,"",["",""]]]"#,
+            r#"[[1,"ab",["","b"]],[3,"",["",null]]]"#,
         ),
         ("(?>b)((a|b)|){2,}", "ba", "g", r#"[[0,"ba",["","a"]]]"#),
         ("(?>b)((a|b)|){2,}", "bab", "g", r#"[[0,"bab",["","b"]]]"#),
@@ -51,44 +53,44 @@ fn a_loop_with_capture_groups_beside_a_lookaround_or_atomic_group_answers_as_jq_
             "(?#c)((?:b*|a(\\w*))*b*|a){2,}",
             "ba",
             "g",
-            r#"[[0,"b",["",null]],[1,"",["",""]],[2,"",["",""]]]"#,
+            r#"[[0,"b",["",null]],[1,"",["",null]],[2,"",["",null]]]"#,
         ),
         (
             "(?#c)((?:b*|a(\\w*))*b*|a){2,}",
             "bab",
             "g",
-            r#"[[0,"b",["",null]],[1,"",["",""]],[2,"b",["",null]],[3,"",["",""]]]"#,
+            r#"[[0,"b",["",null]],[1,"",["",null]],[2,"b",["",null]],[3,"",["",null]]]"#,
         ),
         (
             "((a|b)|){2,}(?=b)",
             "bab",
             "g",
-            r#"[[0,"ba",["","a"]],[2,"",["",""]]]"#,
+            r#"[[0,"ba",["","a"]],[2,"",["",null]]]"#,
         ),
-        ("((a|b)|){2,}(?=b)", "ba", "g", r#"[[0,"",["",""]]]"#),
+        ("((a|b)|){2,}(?=b)", "ba", "g", r#"[[0,"",["",null]]]"#),
         (
             "((a|b)|){2,}(?!a)",
             "bab",
             "g",
-            r#"[[0,"bab",["","b"]],[3,"",["",""]]]"#,
+            r#"[[0,"bab",["","b"]],[3,"",["",null]]]"#,
         ),
         (
             "((a|b)|){2,}(?!a)",
             "ba",
             "g",
-            r#"[[0,"ba",["","a"]],[2,"",["",""]]]"#,
+            r#"[[0,"ba",["","a"]],[2,"",["",null]]]"#,
         ),
         (
             "(?:(a)?(a*)|(?:(a)|b)){2,}(?!c)",
             "bab",
             "g",
-            r#"[[0,"",["","",""]],[1,"a",["a","",null]],[2,"",["","",""]],[3,"",["","",""]]]"#,
+            r#"[[0,"",[null,"",null]],[1,"a",["a","",null]],[2,"",[null,"",null]],[3,"",[null,"",null]]]"#,
         ),
         (
             "(?!c)(?:(a)?(a*)|(?:(a)|b)){2,}",
             "bab",
             "gx",
-            r#"[[0,"",["","",""]],[1,"a",["a","",null]],[2,"",["","",""]],[3,"",["","",""]]]"#,
+            r#"[[0,"",[null,"",null]],[1,"a",["a","",null]],[2,"",[null,"",null]],[3,"",[null,"",null]]]"#,
         ),
         (
             "(?=[ab])(?:(b*)|a)*",
@@ -110,7 +112,7 @@ fn a_loop_with_capture_groups_beside_a_lookaround_or_atomic_group_answers_as_jq_
             "(?!c)(?:(a)|b*|c)+(?<=b)",
             "abab",
             "g",
-            r#"[[0,"abab",["a"]],[4,"",[""]]]"#,
+            r#"[[0,"abab",["a"]],[4,"",[null]]]"#,
         ),
         ("(?=b)(b*|a)*", "ba", "g", r#"[[0,"b",[""]]]"#),
         ("(?=b)(b*|a)*", "bab", "g", r#"[[0,"b",[""]],[2,"b",[""]]]"#),
