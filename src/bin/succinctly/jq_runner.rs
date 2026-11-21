@@ -5680,6 +5680,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 })
                 .unzip()
         };
+        // Given back before the documents are read: an allocation the run holds through them moves
+        // where glibc's allocator puts theirs (+0.7% instructions on NDJSON `-c .id` at 1 MB, in
+        // `_int_malloc` and `_int_free`).
+        drop(scans);
 
         // #2847: `--slurp` replaces the per-file documents with the single
         // synthesized array, evaluated once below. Everything the per-file
