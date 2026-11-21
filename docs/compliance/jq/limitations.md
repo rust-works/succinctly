@@ -14605,6 +14605,9 @@ loader does not always splice the whole module: a dependency's link run keeps on
 defs something references, and each `import` of a module is a separate copy that can reach
 different defs. Per-def counting keeps every copy pointing at the same physical site, which
 is also what lets the CLI report a site once however many copies reach it, as jq does.
+The arguments of a call `check` cannot resolve were the same kind of gap: jq never compiles them (#2037), so `check` did not walk them, and a site in one was not counted.
+`def d0: ua(ub(1));` then `ub(2)` on the next line cited the `ub(1)` of line 1, where jq cites the `ub(2)` of line 2, and so did the main program's `ua(ub(1)),` then `ub(2)`.
+Since [#7609](https://github.com/rust-works/succinctly/issues/7609) `check` walks those arguments too, counts their sites (calls, variables, breaks) and drops the errors the walk would raise.
 **Closed by #3107: an unbound variable in the *main filter* used the older failures-only
 counter.** `UnboundVar` (`resolve.rs`) already carried the same scope-aware `occurrence`
 count `#3085` gave calls and breaks, but `jq_runner.rs`'s `report_unbound_var` call site for
