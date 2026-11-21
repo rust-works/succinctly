@@ -13438,6 +13438,16 @@ Ordering is unchanged in both: NaN sorts below NaN, itself included. A mixed-ins
 `sort`/`unique`/`group_by` (`[.a,.b,.a] | unique` over two NaN tokens) depends on the sort's
 comparison order in jq, and may group differently here.
 
+### A parsed infinity orders as decNumber's infinity (#7469)
+
+jq 1.7.1 keeps a parsed `Infinity` (`infinity`, `+Infinity`, `-Infinity`, from a document, `fromjson`, `tonumber`, `--argjson` or `--jsonargs`) as a decNumber literal, not as the `f64` infinity the section above describes.
+Two literals compare as exact decimals, so it orders past every finite literal, one past `DBL_MAX` included: `printf Infinity | jq '. > 1e1000'` is `true`, `[., 1e1000] | unique` keeps both and `max` picks it.
+Against a computed double it compares as the double infinity (`. == infinite`, `(. + 0) == 1e1000` are `true`), and it prints as `DBL_MAX` either way.
+succinctly read it as the computed infinity, so `. == 1e1000` was `true`; it is now a literal whose text is decNumber's word, printed as jq prints it (`OwnedValue::parsed_infinity`).
+Negating it keeps it a literal, as #7453 negates every literal after jqlang/jq#3242, so `-. | . == -1e1000` is `false`, jq 1.8.2's answer, where jq 1.7.1, whose `-` computes a double, says `true`.
+Under `--preserve-input` (a succinctly extension that echoes a number's source spelling) it now prints as `Infinity` inside a constructed value too (`[., 1]`), as it already did at the top level.
+yq mode keeps the bare double.
+
 ### Two equally long slices of one array are `==` in jq, and are compared by content here (#7459)
 
 jq's `jv_equal` answers `true` for two arrays with the same length and the same storage pointer before it compares any element, and it does not compare the slice offset.

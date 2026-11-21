@@ -29382,11 +29382,12 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // returned above with its own grammar (#2960).
     // A NaN is a new parse instance (#3309): `"NaN" | tonumber as $x |
     // $x == $x` is `true` in jq, while two `tonumber` runs never agree.
+    // An infinity is a literal too (#7469): `"Infinity" | tonumber > 1e1000` is `true` in jq.
     if let Some(f) = crate::json::validate::jq_special_number(trimmed.as_bytes()) {
         return Ok(if f.is_nan() {
             OwnedValue::fresh_nan_instance(f.is_sign_negative())
         } else {
-            OwnedValue::Float(f)
+            OwnedValue::parsed_infinity(f.is_sign_negative())
         });
     }
     // What reaches here is a spelling jq's decNumber reader accepts but whose text is not
