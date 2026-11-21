@@ -1,4 +1,5 @@
-//! Diagnostics that a standard error which cannot be written does not turn into a panic (#7476).
+//! Diagnostics that a standard error which cannot be written does not turn into a panic (#7476), and
+//! output that a standard output which cannot be written does not turn into one either (#7538).
 //!
 //! `std::eprintln!` panics with `failed printing to stderr` when the write fails: a standard error
 //! on a full disk or `/dev/full` (`ENOSPC`), on a file past `ulimit -f` (`EFBIG`), or on a pipe whose
@@ -13,6 +14,18 @@
 //! (which prints through `std::eprintln!`), and on this module losing its place at the top of
 //! `main.rs`. A write to standard error elsewhere in the CLI ignores its result the same way
 //! (`let _ = writeln!(std::io::stderr(), ...)`).
+//!
+//! The standard output side is the same shape, with a different outcome (#7538). `std::println!` and
+//! `std::print!` panic with `failed printing to stdout` when the write fails (`ENOSPC` on a full disk
+//! or `/dev/full`, `EFBIG` past `ulimit -f`, `EPIPE` on a pipe whose reader has gone), so `json
+//! generate`, `dsv generate`, `yaml generate`, `jq-locate`, `yq-locate`, the build-configuration
+//! reports and the `bench` tables ended in exit 101 and a Rust panic message. The `println!`/`print!`
+//! below shadow them the same way, and a failed write is what `succinctly jq` reports for one
+//! (#7214): `succinctly: error: writing output failed: <strerror>` on standard error, exit 2, as
+//! jq's `jq: error: writing output failed: <strerror>`, exit 2. A closed descriptor is a failed
+//! write too (std would treat `EBADF` as success). A closed pipe (`| head`) is not an error report:
+//! where there is a SIGPIPE the run dies of it, as `succinctly jq` and jq do (#5547); elsewhere it
+//! exits quietly.
 //!
 //! The panic hook is not changed: the standard library's own hook already ignores a failed write
 //! of the panic message, so a panic on a dead standard error is still exit 101, not an abort. Nor is
@@ -38,6 +51,23 @@ macro_rules! eprintln {
     };
 }
 
+/// `print!` that reports a failed write on standard error and exits 2 instead of panicking (#7538).
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::cli::diag::write_stdout(format_args!($($arg)*))
+    };
+}
+
+/// `println!` that reports a failed write on standard error and exits 2 instead of panicking (#7538).
+macro_rules! println {
+    () => {
+        $crate::cli::diag::write_stdout(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::cli::diag::write_stdout(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
 /// Write `args` to standard error, ignoring a failed write (#7476).
 ///
 /// Under `cfg(test)` it prints through the standard macro instead, which the test harness captures
@@ -53,6 +83,73 @@ pub(crate) fn write_stderr(args: std::fmt::Arguments<'_>) {
         // One `write_fmt` under the lock, as `std::eprint!` does, so a line is not split by
         // another thread's.
         let _ = std::io::stderr().lock().write_fmt(args);
+    }
+}
+
+/// Write `args` to standard output. A failed write ends the process (#7538): a closed pipe by
+/// SIGPIPE (quietly, status 1 where there is none), anything else as `succinctly: error: writing
+/// output failed: <strerror>` on standard error and status 2, which is how `succinctly jq` ends one.
+///
+/// Under `cfg(test)` it prints through the standard macro instead, which the test harness captures
+/// per test; a panic there costs nothing, and the binary is what the CLI tests run.
+pub(crate) fn write_stdout(args: std::fmt::Arguments<'_>) {
+    #[cfg(test)]
+    {
+        std::print!("{args}");
+    }
+    #[cfg(not(test))]
+    {
+        if let Err(failure) = try_write_stdout(args) {
+            stdout_write_failed(failure);
+        }
+    }
+}
+
+/// Why a write to standard output failed.
+#[cfg(not(test))]
+enum StdoutFailure {
+    /// The reader of a pipe has gone.
+    BrokenPipe,
+    /// Any other failure; the `strerror` text.
+    Other(String),
+}
+
+#[cfg(not(test))]
+fn try_write_stdout(args: std::fmt::Arguments<'_>) -> Result<(), StdoutFailure> {
+    use std::io::Write;
+    // Whatever another part of the CLI left in the standard library's buffer goes first, so the two
+    // writers cannot reorder. A failure here is the same condition the write below reports.
+    let _ = std::io::stdout().flush();
+    // The `jq` subcommand's writer: unbuffered on a duplicate of descriptor 1, and a closed
+    // descriptor is an error (`std::io::Stdout` treats `EBADF` as success, #7214).
+    let mut out = super::output::JqStdout::new();
+    out.write_fmt(args).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            return StdoutFailure::BrokenPipe;
+        }
+        match e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<super::output::OutputWriteFailed>())
+        {
+            Some(failed) => StdoutFailure::Other(failed.0.clone()),
+            None => StdoutFailure::Other(e.to_string()),
+        }
+    })
+}
+
+#[cfg(not(test))]
+fn stdout_write_failed(failure: StdoutFailure) -> ! {
+    match failure {
+        StdoutFailure::BrokenPipe => {
+            // Die of SIGPIPE as jq does (#5547): restore the default action, then write again.
+            super::sigpipe::restore_default();
+            let _ = try_write_stdout(format_args!("\n"));
+            std::process::exit(1)
+        }
+        StdoutFailure::Other(strerror) => {
+            eprintln!("succinctly: error: writing output failed: {strerror}");
+            std::process::exit(2)
+        }
     }
 }
 
@@ -77,14 +174,15 @@ mod tests {
         line.find("//").map_or(line, |at| &line[..at])
     }
 
-    /// #7476: no path in the CLI prints to standard error through a write that panics on failure.
+    /// #7476, #7538: no path in the CLI prints to standard error or standard output through a write
+    /// that panics on failure.
     #[test]
     fn cli_source_has_no_panicking_stderr_write_7476() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let cli = root.join("src/bin/succinctly");
         let mut files = Vec::new();
         rust_files(&cli, &mut files);
-        // The binary's own crate: the shadow does not reach it, so any `eprint` there is std's.
+        // The binary's own crate: the shadow does not reach it, so any `print` or `eprint` there is std's.
         let binary_root = root.join("src/main.rs");
         files.push(binary_root.clone());
         let this_file = cli.join("diag.rs");
@@ -95,9 +193,9 @@ mod tests {
                 continue;
             }
             let needles: &[&str] = if *file == binary_root {
-                &["eprint", "dbg!("]
+                &["print", "dbg!("]
             } else {
-                &["std::eprint", "dbg!("]
+                &["std::eprint", "std::print", "dbg!("]
             };
             let text = std::fs::read_to_string(file).expect("readable source file");
             for (number, line) in text.lines().enumerate() {
@@ -115,8 +213,9 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "a write to standard error that panics when it fails (#7476): use `eprintln!`/`eprint!` \
-             unqualified (diag.rs shadows them) or `let _ = writeln!(std::io::stderr(), ...)`:\n{}",
+            "a write to standard error or output that panics when it fails (#7476, #7538): use \
+             `eprintln!`/`eprint!`/`println!`/`print!` unqualified (diag.rs shadows them), \
+             `let _ = writeln!(std::io::stderr(), ...)`, or a `Write` whose error is returned:\n{}",
             offenders.join("\n")
         );
 
@@ -153,5 +252,11 @@ mod tests {
         eprintln!("positional {} {}", value, "x",);
         eprint!("no newline {value}");
         eprint!("\n");
+        println!();
+        println!("plain");
+        println!("inline {value}");
+        println!("positional {} {}", value, "x",);
+        print!("no newline {value}");
+        print!("\n");
     }
 }
