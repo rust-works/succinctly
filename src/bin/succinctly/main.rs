@@ -1133,8 +1133,9 @@ struct JqCommand {
     #[arg(long, overrides_with = "stream_errors")]
     stream_errors: bool,
 
-    /// Accepted and ignored, as jq does outside Windows (only the short form: `--binary` is rejected there)
-    #[arg(short = 'b', hide = true, overrides_with = "binary")]
+    /// Accepted and ignored, as jq does outside Windows. jq 1.7.1 refused the `--binary` its own
+    /// help lists; jq 1.8 fixed that (jqlang/jq#3131), and this follows it (#7438).
+    #[arg(short = 'b', long, hide = true, overrides_with = "binary")]
     binary: bool,
 
     // === Exit Status ===
@@ -1921,65 +1922,6 @@ fn looks_like_negative_filter(token: &str) -> bool {
     !matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '-')
 }
 
-/// If `err` is clap's refusal of an unrecognized `-`-leading argument that
-/// [`looks_like_negative_filter`], returns the positions in `args` `--`
-/// might need inserting before so a retried parse accepts the token as the
-/// positional FILTER instead of an unknown flag -- most-plausible position
-/// first (see below).
-///
-/// Matches by *prefix*, not equality: when clap fails to bundle-parse a
-/// short-flag argument (`Parser::parse_short_arg`'s `NoMatchingArg` arm), it
-/// reports only `-` plus the first character it couldn't resolve as a short
-/// flag, not the argument's full text -- `-.[0]` surfaces as `InvalidArg`
-/// `"-."`, `-(1)` as `"-("`, `-$__loc__.line` as `"-$"`. That truncated form
-/// is always exactly two bytes (the leading `-` and one more character), so
-/// [`looks_like_negative_filter`] on it already answers the same question a
-/// check on the full token would (both read the same second character) --
-/// but more than one token can share that same two-byte prefix, and the
-/// prefix alone can't tell them apart.
-///
-/// Candidates come back **last-occurrence first**, never just the first
-/// match (code review on #3389): an option like `--arg`/`-L` that already
-/// takes `allow_hyphen_values` can have *already been given* a value
-/// sharing the bad token's prefix (`--arg x -1x`'s `-1x`), which sits
-/// earlier in `args` than the real, still-unclaimed FILTER token clap
-/// actually choked on. `parse_allowing_negative_filter` below tries each
-/// candidate in the order returned and keeps the first one that makes the
-/// whole thing parse -- correctness comes from that verification, not from
-/// this function guessing right, but trying later positions first means
-/// the common shape (FILTER after every flag) succeeds on the first retry
-/// rather than the last.
-fn negative_filter_retry_candidates(args: &[String], err: &clap::error::Error) -> Vec<usize> {
-    if err.kind() != clap::error::ErrorKind::UnknownArgument {
-        return Vec::new();
-    }
-    let Some(clap::error::ContextValue::String(bad)) =
-        err.get(clap::error::ContextKind::InvalidArg)
-    else {
-        return Vec::new(); // patchcov: coverage tolerate-line reason="unreachable given clap 4.6's own unknown_argument() error constructor: every ErrorKind::UnknownArgument it builds sets ContextKind::InvalidArg to ContextValue::String(arg) in the same call, so this arm only guards a future clap release changing that invariant"
-    };
-    if !looks_like_negative_filter(bad) {
-        return Vec::new();
-    }
-    let mut positions: Vec<usize> = args
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| a.starts_with(bad.as_str()))
-        .map(|(i, _)| i)
-        .collect();
-    positions.reverse();
-    positions
-}
-
-/// `jq`'s clap definition with its argument settings resolved: until clap
-/// builds a command, an argument's `num_args` is unset, which
-/// [`jq_option_arity`] would read as "takes no value".
-fn built_jq_command() -> clap::Command {
-    let mut cmd = <JqCommand as clap::CommandFactory>::command();
-    cmd.build();
-    cmd
-}
-
 /// How many words after `flag` the jq option `flag` consumes as its values
 /// (`--arg NAME VALUE` is 2, `-L DIR` is 1, `-c` and `-f` are 0), read off clap's own
 /// definition so a new option cannot drift from this table. `flag` is one
@@ -2023,115 +1965,245 @@ fn jq_option_arity(cmd: &clap::Command, flag: &str) -> usize {
     0
 }
 
-/// Move every option (and the values it takes) that follows the first
-/// `--args`/`--jsonargs` in `args` to just before it (#3447).
-///
-/// Those two flags are greedy in clap: they take every following word, so an
-/// option among them (`--args '$ARGS.positional' -c a`) arrived as a
-/// positional value, where jq reads it as the option it is. jq's own rule is
-/// that a word is an option when it is `-` followed by a letter or another
-/// `-` ([`looks_like_negative_filter`] is the complement), anywhere before a
-/// `--`; `-7` and a lone `-` stay positional. Options do not depend on where
-/// they sit, so hoisting them leaves their effect unchanged and leaves the
-/// greedy flags only words that really are positional. Values are kept with
-/// their option by arity ([`jq_option_arity`]), so `--args '$P' --arg x y a`
-/// does not leave `x` and `y` behind as positional words.
-///
-/// `start` is the index of the first jq argument (after the program name, or
-/// after the `jq` subcommand token). Nothing moves when no such flag appears
-/// before a `--`, so every other invocation passes through byte-for-byte.
-fn hoist_options_before_positional_flags(args: Vec<String>, start: usize) -> Vec<String> {
-    let is_mode_flag = |w: &str| w == "--args" || w == "--jsonargs";
-    let is_option = |w: &str| w.starts_with('-') && !looks_like_negative_filter(w);
-
-    // The overwhelming majority of invocations have no such flag: answer
-    // those from one scan of argv, before building clap's whole definition
-    // for the arity table (process startup is the entire runtime of a small
-    // query).
-    if !args.iter().skip(start).any(|w| is_mode_flag(w)) {
-        return args;
+/// An argv word's bytes as the operating system passed them (#7426). Unix argv is bytes; anywhere
+/// else a word is whatever text the platform made of it.
+pub(crate) fn os_word_bytes(word: &std::ffi::OsStr) -> std::borrow::Cow<'_, [u8]> {
+    #[cfg(unix)]
+    {
+        std::borrow::Cow::Borrowed(std::os::unix::ffi::OsStrExt::as_bytes(word))
     }
-    let cmd = &built_jq_command();
-
-    // The first mode flag, found by walking in option-arity steps so a flag
-    // spelled like one but given as an option's value (`--arg x --args`) is
-    // not mistaken for it.
-    let mut i = start;
-    let mut first_mode = None;
-    while i < args.len() {
-        let w = args[i].as_str();
-        if w == "--" {
-            break;
+    #[cfg(not(unix))]
+    {
+        match word.to_string_lossy() {
+            std::borrow::Cow::Borrowed(text) => std::borrow::Cow::Borrowed(text.as_bytes()),
+            std::borrow::Cow::Owned(text) => std::borrow::Cow::Owned(text.into_bytes()),
         }
-        if is_mode_flag(w) {
-            first_mode = Some(i);
-            break;
-        }
-        i += 1 + if is_option(w) {
-            jq_option_arity(cmd, w)
-        } else {
-            0
-        };
     }
-    let Some(first_mode) = first_mode else {
-        return args;
-    };
-
-    let mut head = args[..first_mode].to_vec();
-    let mut tail = Vec::new();
-    let mut i = first_mode;
-    while i < args.len() {
-        let w = args[i].as_str();
-        if w == "--" {
-            tail.extend_from_slice(&args[i..]);
-            break;
-        }
-        if is_mode_flag(w) || !is_option(w) {
-            tail.push(args[i].clone());
-            i += 1;
-            continue;
-        }
-        let end = (i + 1 + jq_option_arity(cmd, w)).min(args.len());
-        head.extend_from_slice(&args[i..end]);
-        i = end;
-    }
-    head.extend(tail);
-    head
 }
 
-/// Parses `args` as `P` (a jq-only [`clap::Parser`], see
-/// [`looks_like_negative_filter`]'s own doc comment for why `yq` needs no
-/// equivalent), retrying with `--` spliced in before each candidate
-/// [`negative_filter_retry_candidates`] returns, in order, until one
-/// actually parses (#3389). Clap has no per-positional way to express jq's
-/// letter-vs-non-letter split -- `allow_hyphen_values` is all-or-nothing on
-/// the FILTER positional, and would also swallow a genuine unknown-flag
-/// typo as the filter instead of erroring on it -- so this recovers from
-/// clap's own rejection after the fact instead of trying to configure it
-/// away. Every retry is itself verified by `try_parse_from`, never assumed
-/// correct from the candidate order alone.
-fn parse_allowing_negative_filter<P, I, T>(
-    args: I,
-    parse: impl Fn(Vec<String>) -> Result<P, clap::Error>,
-) -> P
-where
-    I: IntoIterator<Item = T>,
-    T: Into<String>,
-{
-    let args: Vec<String> = args.into_iter().map(Into::into).collect();
-    match parse(args.clone()) {
-        Ok(cmd) => cmd,
-        Err(e) => {
-            for idx in negative_filter_retry_candidates(&args, &e) {
-                let mut fixed = args.clone();
-                fixed.insert(idx, "--".to_string());
-                if let Ok(cmd) = parse(fixed) {
-                    return cmd;
-                } // patchcov: coverage tolerate-line reason="llvm-cov line-attribution artifact, not unreachable: test_negative_filter_accepted_via_sjq_multicall_alias_3389's '-x' row demonstrably reaches the e.exit() two lines below (exit code 2, confirmed by that test passing), which this if-let's own closing brace sits directly above -- the brace itself is never credited a hit, the same class of artifact eval.rs's own tolerate list documents for other closing braces (#3389)"
+/// The inverse of [`os_word_bytes`], for the part of a word after a letter (`-Llib`'s `lib`).
+fn os_word_from_bytes(bytes: &[u8]) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(bytes).to_owned()
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8_lossy(bytes).into_owned().into()
+    }
+}
+
+/// The long options of jq 1.7.1's `main.c`. jq has no `--name=value` syntax, so a word of that
+/// shape whose name is one of these is jq's `Unknown option` (#7438); a succinctly-only option
+/// (`--on-error=stop`) keeps clap's `=` form, which its documentation uses.
+const JQ_LONG_OPTIONS: &[&str] = &[
+    "slurp",
+    "raw-output",
+    "raw-output0",
+    "join-output",
+    "compact-output",
+    "color-output",
+    "monochrome-output",
+    "ascii-output",
+    "unbuffered",
+    "sort-keys",
+    "raw-input",
+    "null-input",
+    "from-file",
+    "binary",
+    "tab",
+    "indent",
+    "seq",
+    "stream",
+    "stream-errors",
+    "exit-status",
+    "args",
+    "jsonargs",
+    "arg",
+    "argjson",
+    "rawfile",
+    "slurpfile",
+    "debug-dump-disasm",
+    "debug-trace",
+    "help",
+    "version",
+    "build-configuration",
+    "run-tests",
+];
+
+/// The mode a positional word was read in: jq's `further_args_are_strings` and
+/// `further_args_are_json`, set by the latest `--args` or `--jsonargs` before the word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WordMode {
+    File,
+    Str,
+    Json,
+}
+
+/// `succinctly jq`'s argv as jq's own option loop reads it (#7438, #7494).
+#[derive(Debug, PartialEq, Eq)]
+struct JqArgv {
+    /// The program name, then every option with the words it takes, one option per word and in
+    /// argv order (`-nL lib` is `-n`, `-L`, `lib`): what clap parses. `--args`, `--jsonargs` and
+    /// `--` are not here; their effect is in `positional`.
+    options: Vec<std::ffi::OsString>,
+    /// Every positional word with the mode it was read in. The first is the program, or the
+    /// program file under `-f`, whatever its mode.
+    positional: Vec<(WordMode, std::ffi::OsString)>,
+}
+
+/// The word jq names in `jq: Unknown option <word>`.
+#[derive(Debug, PartialEq, Eq)]
+struct UnknownJqOption(Vec<u8>);
+
+/// Read `argv` (program name first) as jq 1.8.2's `main.c` does, against `cmd`, the built jq
+/// definition (#7438, #7494).
+///
+/// A word is an option when it is `-` followed by a letter or another `-` (jq's `isoptish`;
+/// [`looks_like_negative_filter`] is the complement), until a `--`. Any other word is positional
+/// wherever it sits: `jq -1 -n` runs the program `-1` with `-n`, and `jq . a.json -1 -c` reads the
+/// file `-1` and still applies `-c`. The first positional word is the program; each later one is a
+/// file, or an `--args`/`--jsonargs` word when one of those came before it.
+///
+/// A long option must be a name clap defines, exactly: `--indent=3`, `--args=` and `--from-file=p`
+/// are jq's `Unknown option`. A bundle is read a letter at a time, in order (jq 1.8's in-order
+/// parser, jqlang/jq#3194): a letter may repeat (`-nn`), `-L` may end a bundle and takes the rest of
+/// the word or the next word (`-nLlib`, `-nL lib`), and the first letter jq does not define is the
+/// one named (`-fprog.jq` is `Unknown option -p`). A help, version or build-configuration option
+/// ends the walk, as jq exits there: `-V1` and `-Vx` print the version.
+///
+/// Values are kept with their option by arity ([`jq_option_arity`]'s rule), whatever they look like:
+/// `--arg x -c` binds `-c`, `-L --` adds the directory `--`.
+fn walk_jq_argv<W: AsRef<std::ffi::OsStr>>(
+    cmd: &clap::Command,
+    argv: &[W],
+) -> Result<JqArgv, UnknownJqOption> {
+    let takes = |arg: &clap::Arg| arg.get_num_args().map_or(0, |range| range.min_values());
+    let ends_the_walk = |arg: &clap::Arg| {
+        matches!(
+            arg.get_id().as_str(),
+            "help" | "version" | "build_configuration"
+        )
+    };
+    let long_arg = |name: &str| {
+        cmd.get_arguments().find(|arg| {
+            arg.get_long() == Some(name)
+                || arg
+                    .get_all_aliases()
+                    .is_some_and(|aliases| aliases.contains(&name))
+        })
+    };
+    let short_arg = |letter: u8| {
+        let letter = char::from(letter);
+        cmd.get_arguments().find(|arg| {
+            letter.is_ascii_alphabetic()
+                && (arg.get_short() == Some(letter)
+                    || arg
+                        .get_all_short_aliases()
+                        .is_some_and(|aliases| aliases.contains(&letter)))
+        })
+    };
+
+    let mut walked = JqArgv {
+        options: argv
+            .first()
+            .map(|name| name.as_ref().to_owned())
+            .into_iter()
+            .collect(),
+        positional: Vec::new(),
+    };
+    // The values an option takes follow it, whatever they look like.
+    let take_values = |walked: &mut JqArgv, n: usize, i: &mut usize| {
+        let end = (*i + n).min(argv.len());
+        walked
+            .options
+            .extend(argv[*i..end].iter().map(|w| w.as_ref().to_owned()));
+        *i = end;
+    };
+    let mut mode = WordMode::File;
+    let mut options_ended = false;
+    let mut i = 1;
+    while i < argv.len() {
+        let word = argv[i].as_ref();
+        let bytes = os_word_bytes(word);
+        i += 1;
+        let is_option = bytes.len() > 1
+            && bytes[0] == b'-'
+            && (bytes[1] == b'-' || bytes[1].is_ascii_alphabetic());
+        if options_ended || !is_option {
+            walked.positional.push((mode, word.to_owned()));
+            continue;
+        }
+        if *bytes == *b"--" {
+            options_ended = true;
+            continue;
+        }
+        if bytes[1] == b'-' {
+            let name = std::str::from_utf8(&bytes[2..]).ok();
+            let Some(arg) = name.and_then(long_arg) else {
+                // `--on-error=stop`: a succinctly-only option keeps clap's `=` form.
+                let extension =
+                    name.and_then(|name| name.split_once('='))
+                        .is_some_and(|(name, _)| {
+                            !JQ_LONG_OPTIONS.contains(&name) && long_arg(name).is_some()
+                        });
+                if extension {
+                    walked.options.push(word.to_owned());
+                    continue;
+                }
+                return Err(UnknownJqOption(bytes.into_owned()));
+            };
+            match arg.get_id().as_str() {
+                "args" => mode = WordMode::Str,
+                "jsonargs" => mode = WordMode::Json,
+                _ => {
+                    walked.options.push(word.to_owned());
+                    if ends_the_walk(arg) {
+                        return Ok(walked);
+                    }
+                    take_values(&mut walked, takes(arg), &mut i);
+                }
             }
-            e.exit()
+            continue;
+        }
+        for (at, &letter) in bytes.iter().enumerate().skip(1) {
+            let Some(arg) = short_arg(letter) else {
+                return Err(UnknownJqOption(vec![b'-', letter]));
+            };
+            walked
+                .options
+                .push(format!("-{}", char::from(letter)).into());
+            if ends_the_walk(arg) {
+                return Ok(walked);
+            }
+            let n = takes(arg);
+            if n > 0 {
+                // `-Llib`: the rest of the word is the value; `-nL lib`: the next word is.
+                if at + 1 < bytes.len() {
+                    walked.options.push(os_word_from_bytes(&bytes[at + 1..]));
+                } else {
+                    take_values(&mut walked, n, &mut i);
+                }
+                break;
+            }
         }
     }
+    Ok(walked)
+}
+
+/// jq's refusal of an option it does not define (#7438): `jq: Unknown option <word>` and its usage
+/// hint on standard error, exit 2. The word is printed as given, as jq's `fprintf` prints it.
+fn exit_unknown_jq_option(UnknownJqOption(word): UnknownJqOption) -> ! {
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(b"jq: Unknown option ");
+    let _ = stderr.write_all(&word);
+    let _ = stderr.write_all(
+        b"\nUse jq --help for help with command-line options,\n\
+          or see the jq manpage, or online docs  at https://jqlang.github.io/jq\n",
+    );
+    let _ = stderr.flush();
+    std::process::exit(output::exit_codes::USAGE_ERROR)
 }
 
 /// Returns `Some(exit_code)` if a multi-call alias was detected,
@@ -2359,21 +2431,55 @@ fn exit_after_run(exit_code: i32) -> ! {
 const JQ_SUBCOMMAND_ABOUT: &str = "Command-line JSON processor (jq-compatible)";
 const YQ_SUBCOMMAND_ABOUT: &str = "Command-line YAML processor (jq-compatible syntax)";
 
-/// `argv` (program name first) parsed as `jq`, with the negative-filter retry and the option hoist
-/// (#3389, #3447), for the `sjq` multi-call path (`about` is `None`: its own text) and for
-/// `succinctly jq` (`about` is the one the tree shows, #7149).
+/// `argv` (program name first) parsed as `jq`, for the `sjq` multi-call path (`about` is `None`: its
+/// own text) and for `succinctly jq` (`about` is the one the tree shows, #7149).
+///
+/// jq's grammar is not clap's (#7438, #7494): [`walk_jq_argv`] reads argv as jq does, refusing what
+/// jq refuses, and clap then parses only the options it found, so no positional word (`-1`, `-.a`)
+/// ever reaches clap. One definition serves both, built once.
 fn parse_jq(argv: Vec<String>, about: Option<&'static str>) -> JqCommand {
     use clap::{CommandFactory, FromArgMatches};
-    parse_allowing_negative_filter(hoist_options_before_positional_flags(argv, 1), |args| {
-        let mut command = JqCommand::command();
-        if let Some(about) = about {
-            command = command.about(about);
+    let mut command = JqCommand::command();
+    if let Some(about) = about {
+        command = command.about(about);
+    }
+    // `walk_jq_argv` reads each option's arity, which is only filled in once the command is built.
+    command.build();
+    let walked = walk_jq_argv(&command, &argv).unwrap_or_else(|e| exit_unknown_jq_option(e));
+    let matches = command
+        .try_get_matches_from_mut(walked.options)
+        .unwrap_or_else(|e| e.exit());
+    let mut cmd = JqCommand::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    cmd.named_order = jq_runner::named_flag_order_of(&matches);
+    cmd.set_positional_words(walked.positional);
+    cmd
+}
+
+impl JqCommand {
+    /// Take the positional words [`walk_jq_argv`] read (#7494): the first is the program (under
+    /// `-f`, `resolve_positional_args` moves it to `program_file`), and each later one goes where
+    /// the mode it was read in sends it: an input file, or an `--args`/`--jsonargs` word.
+    fn set_positional_words(&mut self, words: Vec<(WordMode, std::ffi::OsString)>) {
+        // Not UTF-8 only once argv is read as OS words (#7426); until then `std::env::args` has
+        // already refused such a word.
+        let text = |word: std::ffi::OsString| {
+            word.into_string()
+                .unwrap_or_else(|word| word.to_string_lossy().into_owned())
+        };
+        let mut words = words.into_iter();
+        self.filter = words.next().map(|(_, word)| text(word));
+        for (mode, word) in words {
+            match mode {
+                WordMode::File => self.files.push(text(word)),
+                WordMode::Str => self
+                    .positional_words
+                    .push(jq_runner::PositionalWord::Str(text(word))),
+                WordMode::Json => self
+                    .positional_words
+                    .push(jq_runner::PositionalWord::Json(text(word))),
+            }
         }
-        let matches = command.try_get_matches_from(args)?;
-        let mut cmd = JqCommand::from_arg_matches(&matches)?;
-        cmd.named_order = jq_runner::named_flag_order_of(&matches);
-        Ok(cmd)
-    })
+    }
 }
 
 /// `argv` (program name first) parsed as `yq`; see [`parse_jq`] for `about`.
@@ -3789,53 +3895,6 @@ mod tests {
         }
     }
 
-    /// #3389: `negative_filter_retry_candidates` against real `clap::Error`
-    /// values from `JqCommand::try_parse_from`, rather than only through a
-    /// spawned subprocess (`tests/jq_cli_tests.rs`) -- this reaches the
-    /// function's own defensive branches directly: a non-`UnknownArgument`
-    /// error kind (here, `--help`'s `DisplayHelp`) must never trigger a
-    /// retry, matching the same "only this one error shape" discipline
-    /// `stop_with_escape`'s callers elsewhere in this codebase apply to
-    /// their own out-of-band signals.
-    #[test]
-    fn test_negative_filter_retry_candidates_3389() {
-        let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-
-        let err = JqCommand::try_parse_from(["jq", "-x"]).unwrap_err();
-        assert_eq!(
-            negative_filter_retry_candidates(&args(&["jq", "-x"]), &err),
-            Vec::<usize>::new(),
-            "a genuine unknown flag must not retry"
-        );
-
-        let err = JqCommand::try_parse_from(["jq", "-1"]).unwrap_err();
-        assert_eq!(
-            negative_filter_retry_candidates(&args(&["jq", "-1"]), &err),
-            vec![1],
-            "a filter-shaped rejection must retry at the token's own index"
-        );
-
-        let err = JqCommand::try_parse_from(["jq", "--help"]).unwrap_err();
-        assert_eq!(
-            negative_filter_retry_candidates(&args(&["jq", "--help"]), &err),
-            Vec::<usize>::new(),
-            "a non-UnknownArgument error kind must never retry"
-        );
-
-        // Code review on #3389: an earlier `allow_hyphen_values` option's
-        // own already-consumed value (`--arg x -1x`'s `-1x`) can share the
-        // bad token's two-byte prefix with the real, still-unclaimed
-        // FILTER (`-1`) that follows it. Candidates must be tried
-        // last-occurrence first, so the real FILTER position (index 3)
-        // comes before the decoy (index 2).
-        let err = JqCommand::try_parse_from(["jq", "--arg", "x", "-1x", "-1"]).unwrap_err();
-        assert_eq!(
-            negative_filter_retry_candidates(&args(&["jq", "--arg", "x", "-1x", "-1"]), &err),
-            vec![4, 3],
-            "the real FILTER position must be tried before the decoy"
-        );
-    }
-
     /// The flag spelling a user would actually type, for a test-failure
     /// message -- `arg.get_id()` is the Rust field name (e.g. `library_path`
     /// for `-L`, which has no `long` at all), not necessarily anything
@@ -4144,135 +4203,262 @@ mod tests {
     }
 }
 
-/// #3447: [`hoist_options_before_positional_flags`] on argv alone, without
-/// running a command.
+/// #7438, #7494: [`walk_jq_argv`] on argv alone, without running a command.
 #[cfg(test)]
-mod hoist_options_3447 {
+mod jq_argv_7438 {
     use super::*;
+    use std::ffi::OsString;
 
-    fn hoist(words: &[&str]) -> Vec<String> {
-        let argv = words.iter().map(|w| (*w).to_string()).collect();
-        hoist_options_before_positional_flags(argv, 1)
+    fn walk(words: &[&str]) -> Result<JqArgv, UnknownJqOption> {
+        use clap::CommandFactory;
+        let mut cmd = JqCommand::command();
+        cmd.build();
+        walk_jq_argv(&cmd, words)
     }
 
-    fn strs(words: &[&str]) -> Vec<String> {
-        words.iter().map(|w| (*w).to_string()).collect()
+    fn os(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
     }
 
-    #[test]
-    fn options_after_the_flag_move_in_front_of_it() {
-        assert_eq!(
-            hoist(&["jq", "-n", "--args", "$P", "-c", "a"]),
-            strs(&["jq", "-n", "-c", "--args", "$P", "a"])
-        );
-        assert_eq!(
-            hoist(&["jq", "--jsonargs", "$P", "1", "--tab", "2"]),
-            strs(&["jq", "--tab", "--jsonargs", "$P", "1", "2"])
-        );
-        // The flag's own position, and the order of what moved, are kept.
-        assert_eq!(
-            hoist(&["jq", "--args", "-n", "-c", "$P"]),
-            strs(&["jq", "-n", "-c", "--args", "$P"])
-        );
+    /// The options clap is given and the positional words, each with its mode.
+    fn read(words: &[&str]) -> (Vec<OsString>, Vec<(WordMode, OsString)>) {
+        let walked = walk(words).unwrap_or_else(|e| panic!("{words:?}: {e:?}"));
+        (walked.options, walked.positional)
     }
 
-    #[test]
-    fn an_option_keeps_its_values_by_arity() {
-        assert_eq!(
-            hoist(&["jq", "--args", "$P", "--arg", "x", "y", "a"]),
-            strs(&["jq", "--arg", "x", "y", "--args", "$P", "a"])
-        );
-        assert_eq!(
-            hoist(&["jq", "--args", "$P", "--indent", "1", "a"]),
-            strs(&["jq", "--indent", "1", "--args", "$P", "a"])
-        );
-        // `-f` is a flag (#7439): the program file is a positional word and stays put.
-        assert_eq!(
-            hoist(&["jq", "-n", "--args", "-f", "prog.jq", "a", "b"]),
-            strs(&["jq", "-n", "-f", "--args", "prog.jq", "a", "b"])
-        );
-        // A bundle ending in a value-taking short takes the next word; one
-        // with the value attached, or a `--long=value`, takes nothing more.
-        assert_eq!(
-            hoist(&["jq", "--args", "$P", "-nL", "lib", "a"]),
-            strs(&["jq", "-nL", "lib", "--args", "$P", "a"])
-        );
-        assert_eq!(
-            hoist(&["jq", "--args", "$P", "-nf", "prog.jq", "a"]),
-            strs(&["jq", "-nf", "--args", "$P", "prog.jq", "a"])
-        );
-        assert_eq!(
-            hoist(&["jq", "--args", "$P", "--indent=1", "a"]),
-            strs(&["jq", "--indent=1", "--args", "$P", "a"])
-        );
+    fn positional(words: &[(WordMode, &str)]) -> Vec<(WordMode, OsString)> {
+        words.iter().map(|(m, w)| (*m, OsString::from(w))).collect()
     }
 
-    #[test]
-    fn short_only_and_two_value_options_keep_their_operands() {
-        // `-L DIR` has no long spelling; `--slurpfile`/`--rawfile` take two.
-        assert_eq!(
-            hoist(&["jq", "--args", "$P", "-L", "lib", "a"]),
-            strs(&["jq", "-L", "lib", "--args", "$P", "a"])
-        );
-        assert_eq!(
-            hoist(&["jq", "--args", "$P", "--slurpfile", "x", "f.json", "a"]),
-            strs(&["jq", "--slurpfile", "x", "f.json", "--args", "$P", "a"])
-        );
-        assert_eq!(
-            hoist(&["jq", "--args", "$P", "--rawfile", "x", "f.txt", "a"]),
-            strs(&["jq", "--rawfile", "x", "f.txt", "--args", "$P", "a"])
-        );
-        // An option-shaped operand belongs to its option, not to the hoist.
-        assert_eq!(
-            hoist(&["jq", "--args", "$P", "--arg", "x", "-c", "a"]),
-            strs(&["jq", "--arg", "x", "-c", "--args", "$P", "a"])
-        );
-    }
-
-    #[test]
-    fn positional_words_and_a_double_dash_stay_put() {
-        // `-7`, a lone `-`, and a bare word are positional, not options.
-        assert_eq!(
-            hoist(&["jq", "-n", "--args", "$P", "-7", "-", "a"]),
-            strs(&["jq", "-n", "--args", "$P", "-7", "-", "a"])
-        );
-        // `--` ends option reading, so what follows is not hoisted.
-        assert_eq!(
-            hoist(&["jq", "-n", "--args", "$P", "--", "-c", "a"]),
-            strs(&["jq", "-n", "--args", "$P", "--", "-c", "a"])
-        );
-        // An unknown option still moves, so clap reports it in its own words.
-        assert_eq!(
-            hoist(&["jq", "--args", "$P", "-x"]),
-            strs(&["jq", "-x", "--args", "$P"])
-        );
-    }
-
-    #[test]
-    fn a_flag_spelled_like_a_mode_flag_as_an_options_value_is_not_one() {
-        // `--arg a --args` hands `--args` to `--arg` as its value, so there is
-        // no mode flag here and nothing moves.
-        let argv = ["jq", "-n", "--arg", "a", "--args", "$P", "b"];
-        assert_eq!(hoist(&argv[..5]), strs(&argv[..5]));
-    }
-
-    #[test]
-    fn argv_without_a_mode_flag_is_untouched() {
-        for argv in [
-            &["jq", ".", "data.json", "-c"][..],
-            &["jq", "-nc", "$ARGS", "--arg", "x", "y"][..],
-            &["jq"][..],
-        ] {
-            assert_eq!(hoist(argv), strs(argv));
+    fn unknown(words: &[&str]) -> String {
+        match walk(words) {
+            Err(UnknownJqOption(word)) => String::from_utf8(word).unwrap(),
+            Ok(walked) => panic!("{words:?} was accepted: {walked:?}"),
         }
     }
 
+    use WordMode::{File, Json, Str};
+
     #[test]
-    fn the_start_index_skips_the_subcommand_token() {
-        let argv = strs(&["succinctly", "jq", "-n", "--args", "$P", "-c", "a"]);
+    fn a_bundle_is_read_a_letter_at_a_time_and_a_letter_may_repeat() {
+        assert_eq!(read(&["jq", "-cc", "."]).0, os(&["jq", "-c", "-c"]));
+        assert_eq!(read(&["jq", "-nre", "."]).0, os(&["jq", "-n", "-r", "-e"]));
+    }
+
+    #[test]
+    fn l_ends_a_bundle_and_takes_the_rest_of_the_word_or_the_next_word() {
         assert_eq!(
-            hoist_options_before_positional_flags(argv, 2),
-            strs(&["succinctly", "jq", "-n", "-c", "--args", "$P", "a"])
+            read(&["jq", "-nL", "lib", "."]),
+            (os(&["jq", "-n", "-L", "lib"]), positional(&[(File, ".")]))
+        );
+        assert_eq!(
+            read(&["jq", "-RsjLlib", "."]).0,
+            os(&["jq", "-R", "-s", "-j", "-L", "lib"])
+        );
+        // The rest of the word is the value as it stands: no `=` is taken off it, unlike clap's.
+        assert_eq!(read(&["jq", "-L=x", "."]).0, os(&["jq", "-L", "=x"]));
+        // Nothing left to take: clap reports the missing value.
+        assert_eq!(read(&["jq", "-nL"]).0, os(&["jq", "-n", "-L"]));
+    }
+
+    #[test]
+    fn values_stay_with_their_option_whatever_they_look_like() {
+        assert_eq!(
+            read(&["jq", "--arg", "x", "-c", "--args", "-L", "--", "."]),
+            (
+                os(&["jq", "--arg", "x", "-c", "-L", "--"]),
+                positional(&[(Str, ".")])
+            )
+        );
+        assert_eq!(
+            read(&["jq", "--indent", "-1", "--slurpfile", "a", "-1", "."]).0,
+            os(&["jq", "--indent", "-1", "--slurpfile", "a", "-1"])
+        );
+        // `--arg a --args` hands `--args` to `--arg` as its value: there is no mode flag here.
+        assert_eq!(
+            read(&["jq", "-n", "--arg", "a", "--args", "$P", "b"]),
+            (
+                os(&["jq", "-n", "--arg", "a", "--args"]),
+                positional(&[(File, "$P"), (File, "b")])
+            )
+        );
+    }
+
+    /// #7494: a word that is `-` and then neither a letter nor a `-` is positional, and options
+    /// are still read after it.
+    #[test]
+    fn options_are_read_after_a_hyphen_led_positional_word() {
+        assert_eq!(
+            read(&["jq", "-1", "-n"]),
+            (os(&["jq", "-n"]), positional(&[(File, "-1")]))
+        );
+        assert_eq!(
+            read(&["jq", ".", "a.json", "-1", "-c", "-.a", "-", "-(1)"]),
+            (
+                os(&["jq", "-c"]),
+                positional(&[
+                    (File, "."),
+                    (File, "a.json"),
+                    (File, "-1"),
+                    (File, "-.a"),
+                    (File, "-"),
+                    (File, "-(1)"),
+                ])
+            )
+        );
+        assert_eq!(
+            read(&["jq", "$x", "-1", "--arg", "x", "2", "-n"]).0,
+            os(&["jq", "--arg", "x", "2", "-n"])
+        );
+    }
+
+    #[test]
+    fn a_double_dash_ends_the_options_and_is_consumed() {
+        assert_eq!(
+            read(&["jq", ".", "a.json", "-1", "--", "-c", "--"]),
+            (
+                os(&["jq"]),
+                positional(&[
+                    (File, "."),
+                    (File, "a.json"),
+                    (File, "-1"),
+                    (File, "-c"),
+                    (File, "--"),
+                ])
+            )
+        );
+        // After `--args --`, an option-shaped word is the program, as in jq (#7494).
+        assert_eq!(
+            read(&["jq", "-n", "--args", "--", "-c", "."]),
+            (os(&["jq", "-n"]), positional(&[(Str, "-c"), (Str, ".")]))
+        );
+    }
+
+    #[test]
+    fn args_and_jsonargs_set_the_mode_of_the_words_after_them() {
+        assert_eq!(
+            read(&[
+                "jq",
+                ".",
+                "a.json",
+                "--args",
+                "s",
+                "-c",
+                "--jsonargs",
+                "1",
+                "--args",
+                "t"
+            ]),
+            (
+                os(&["jq", "-c"]),
+                positional(&[
+                    (File, "."),
+                    (File, "a.json"),
+                    (Str, "s"),
+                    (Json, "1"),
+                    (Str, "t"),
+                ])
+            )
+        );
+    }
+
+    #[test]
+    fn a_long_option_is_an_exact_name() {
+        for word in [
+            "--indent=3",
+            "--args=",
+            "--jsonargs=1",
+            "--from-file=p",
+            "--compac",
+            "--Null-input",
+            "--library-path",
+            "--debug-trace",
+            "--",
+        ] {
+            let argv = ["jq", "-n", word, "."];
+            if word == "--" {
+                assert_eq!(read(&argv).0, os(&["jq", "-n"]));
+            } else {
+                assert_eq!(unknown(&argv), word, "{word}");
+            }
+        }
+        // `--binary` is accepted as in jq 1.8 (jqlang/jq#3131).
+        assert_eq!(read(&["jq", "--binary", "."]).0, os(&["jq", "--binary"]));
+    }
+
+    /// A succinctly-only option keeps clap's `--name=value`, which its documentation uses; a jq
+    /// option's name never does.
+    #[test]
+    fn an_extension_option_keeps_its_equals_form() {
+        assert_eq!(
+            read(&["jq", "--on-error=stop", "--input-dsv=,", "."]).0,
+            os(&["jq", "--on-error=stop", "--input-dsv=,"])
+        );
+        assert_eq!(unknown(&["jq", "--tab=1", "."]), "--tab=1");
+        assert_eq!(unknown(&["jq", "--bogus=1", "."]), "--bogus=1");
+        for name in JQ_LONG_OPTIONS {
+            assert!(
+                !matches!(
+                    *name,
+                    "on-error" | "input-dsv" | "validate" | "preserve-input"
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    /// jq 1.8.2 names the first letter it does not define, where 1.7.1 named the whole word
+    /// (jqlang/jq#3194, the same change that lets a letter repeat).
+    #[test]
+    fn an_unknown_letter_is_named_alone() {
+        assert_eq!(unknown(&["jq", "-fprog.jq", "a.json"]), "-p");
+        assert_eq!(unknown(&["jq", "-n", "-library-path"]), "-l");
+        assert_eq!(unknown(&["jq", "-xV"]), "-x");
+        assert_eq!(unknown(&["jq", "-n-"]), "--");
+        assert_eq!(unknown(&["jq", "-c1"]), "-1");
+    }
+
+    /// jq exits at a help, version or build-configuration option, so nothing after it is read.
+    #[test]
+    fn help_and_version_end_the_walk() {
+        assert_eq!(read(&["jq", "-V1"]).0, os(&["jq", "-V"]));
+        assert_eq!(read(&["jq", "-nVx", "--bogus"]).0, os(&["jq", "-n", "-V"]));
+        assert_eq!(read(&["jq", "-hV"]).0, os(&["jq", "-h"]));
+        assert_eq!(read(&["jq", "-Vh"]).0, os(&["jq", "-V"]));
+        assert_eq!(
+            read(&["jq", "--build-configuration", "-x"]).0,
+            os(&["jq", "--build-configuration"])
+        );
+        assert_eq!(read(&["jq", "--help", "--bogus"]).0, os(&["jq", "--help"]));
+    }
+
+    /// Every word is read by its bytes: one that is not UTF-8 is positional, or the value of an
+    /// option, as its bytes say (#7426).
+    #[cfg(unix)]
+    #[test]
+    fn a_word_that_is_not_utf8_is_read_by_its_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = |bytes: &[u8]| std::ffi::OsStr::from_bytes(bytes).to_owned();
+        let mut cmd = <JqCommand as clap::CommandFactory>::command();
+        cmd.build();
+        let argv = [
+            OsString::from("jq"),
+            OsString::from("-L"),
+            bad(b"l\xff"),
+            bad(b"-\xff"),
+            bad(b"x\xff"),
+        ];
+        let walked = walk_jq_argv(&cmd, &argv).unwrap();
+        assert_eq!(walked.options[1..3], argv[1..3]);
+        assert_eq!(walked.positional.len(), 2);
+        assert_eq!(walked.positional[0].1, argv[3]);
+        assert_eq!(
+            walk_jq_argv(&cmd, &[OsString::from("jq"), bad(b"-n\xff")]),
+            Err(UnknownJqOption(b"-\xff".to_vec()))
+        );
+        assert_eq!(
+            walk_jq_argv(&cmd, &[OsString::from("jq"), bad(b"--a\xff")]),
+            Err(UnknownJqOption(b"--a\xff".to_vec()))
         );
     }
 }
