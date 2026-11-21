@@ -7002,14 +7002,28 @@ fn build_args_var(context: &EvalContext) -> OwnedValue {
 fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
     if let Some(ref path) = args.program_file {
         // Filter comes from file.
-        let contents = std::fs::read_to_string(path).map_err(|e| {
+        let open_error = |e: std::io::Error| {
             BuildContextError::Usage(format!(
                 "Could not open {}: {}",
                 path.display(),
                 load_file_detail(&e)
             ))
-        })?;
-        Ok(contents)
+        };
+        let bytes = std::fs::read(path).map_err(open_error)?;
+        // jq 1.8.2 refuses a program file holding a NUL byte (CVE-2026-41256, #7434); 1.7.1
+        // read it as a C string and ended the program at the NUL. The check runs before the
+        // UTF-8 one, as jq's runs on the loaded text.
+        if bytes.contains(&0) {
+            return Err(BuildContextError::Usage(
+                "program file contains NUL bytes".to_string(),
+            ));
+        }
+        String::from_utf8(bytes).map_err(|_| {
+            open_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            ))
+        })
     } else if let Some(ref filter) = args.filter {
         Ok(filter.clone())
     } else {
