@@ -259,6 +259,9 @@ pub struct ModuleLoader {
     search_path: Vec<PathBuf>,
     /// The library directories alone, which `modulemeta` searches (#5321)
     lib_dirs: Vec<PathBuf>,
+    /// The note a `module not found` on [`Self::search_path`] or [`Self::lib_dirs`] carries: jq
+    /// cannot expand the `~/` of `~/.jq` or of a `-L` entry with `HOME` unset, and says so (#7608).
+    default_note: Option<String>,
     /// The `-L` entries as given, kept so the directories can be worked out again once the
     /// program and jq origins are known (#7430): a `~/` and a `$ORIGIN/` entry names no
     /// directory until then.
@@ -400,7 +403,13 @@ pub(crate) enum ReportEntry {
     /// show for this case: `module not found: {module_path}`, a blank line
     /// standing in for the missing echo, then the usual trailer. Confirmed
     /// live against jq 1.7.1, byte-for-byte.
-    NotFound { module_path: String },
+    NotFound {
+        module_path: String,
+        /// jq's parenthesised note after the message: the last search entry it could not
+        /// expand (`Could not expand ~/.jq. (Could not find home directory.)` with `HOME`
+        /// unset, #7608), or `None`.
+        note: Option<String>,
+    },
     /// A module's own `include`/`import` chain leads back to a module already
     /// being loaded (`ca` includes `cb` includes `ca`, or a module including
     /// itself).
@@ -574,11 +583,14 @@ fn print_report_entry(entry: &ReportEntry) {
     match entry {
         // jq's own shape for a module it cannot find: the message, then a blank
         // line standing in for the missing source echo.
-        ReportEntry::NotFound { module_path } => {
+        ReportEntry::NotFound { module_path, note } => {
             // jq rejects a malformed path before it searches, in the same report (#5322).
             match invalid_module_path(module_path) {
                 Some(message) => eprintln!("jq: error: {message}"),
-                None => eprintln!("jq: error: module not found: {module_path}"),
+                None => eprintln!(
+                    "jq: error: {}",
+                    module_not_found(module_path, note.as_deref())
+                ),
             }
             eprintln!();
         }
@@ -802,13 +814,59 @@ fn invalid_module_path(module_path: &str) -> Option<String> {
 struct Target<'a> {
     path: &'a str,
     search: Option<Vec<PathBuf>>,
+    /// The note a `module not found` for `search` carries ([`unexpanded_home_note`]).
+    search_note: Option<String>,
 }
 
 #[cfg(test)]
 impl<'a> Target<'a> {
     /// A directive without `search` metadata, resolved on the default list.
     const fn plain(path: &'a str) -> Self {
-        Self { path, search: None }
+        Self {
+            path,
+            search: None,
+            search_note: None,
+        }
+    }
+}
+
+/// jq's `module not found: <path>`, with the note of the search list it was looked for in, in
+/// parentheses, when there is one (#7608).
+fn module_not_found(module_path: &str, note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!("module not found: {module_path} ({note})"),
+        None => format!("module not found: {module_path}"),
+    }
+}
+
+/// The note jq's `find_lib` puts after a `module not found` (#7608): `build_lib_search_chain`
+/// expands each search entry in turn and keeps the error of the last one that does not expand.
+/// Only a `~/` entry can fail, and only with `HOME` unset (`get_home`); an empty `HOME` expands
+/// (to `/...`). `entries` are the search list as written, in order.
+fn unexpanded_home_note<'e>(entries: impl IntoIterator<Item = &'e str>) -> Option<String> {
+    if std::env::var_os("HOME").is_some() {
+        return None;
+    }
+    entries
+        .into_iter()
+        .filter(|entry| entry.starts_with("~/"))
+        .last()
+        .map(|entry| format!("Could not expand {entry}. (Could not find home directory.)"))
+}
+
+/// [`unexpanded_home_note`] for the library list ([`library_dirs`]): the `-L` entries, or jq's
+/// default list when there are none. A `-L` entry that names a directory as written is no `~/`
+/// to jq, which takes its real path first.
+fn library_note(cli_dirs: &[PathBuf]) -> Option<String> {
+    if cli_dirs.is_empty() {
+        unexpanded_home_note(DEFAULT_LIBRARY_ENTRIES)
+    } else {
+        unexpanded_home_note(
+            cli_dirs
+                .iter()
+                .filter(|entry| !entry.is_dir())
+                .filter_map(|entry| entry.to_str()),
+        )
     }
 }
 
@@ -832,8 +890,19 @@ fn directive_search(
     origin: &Path,
     jq_origin: &Path,
 ) -> Option<Vec<PathBuf>> {
+    Some(
+        directive_search_entries(metadata)?
+            .into_iter()
+            .filter_map(|entry| expand_search_entry(entry, origin, jq_origin))
+            .collect(),
+    )
+}
+
+/// The `search` entries of a directive's metadata as written, or `None` without one; see
+/// [`directive_search`].
+fn directive_search_entries(metadata: Option<&MetaObject>) -> Option<Vec<&str>> {
     let (_, value) = metadata?.iter().find(|(key, _)| key == "search")?;
-    let entries: Vec<&str> = match value {
+    Some(match value {
         MetaValue::String(entry) => vec![entry.as_str()],
         MetaValue::Array(items) => items
             .iter()
@@ -843,13 +912,12 @@ fn directive_search(
             })
             .collect(),
         _ => Vec::new(),
-    };
-    Some(
-        entries
-            .into_iter()
-            .filter_map(|entry| expand_search_entry(entry, origin, jq_origin))
-            .collect(),
-    )
+    })
+}
+
+/// The note a `module not found` for a directive with `search` metadata carries (#7608).
+fn directive_search_note(metadata: Option<&MetaObject>) -> Option<String> {
+    unexpanded_home_note(directive_search_entries(metadata)?)
 }
 
 /// One `search` entry as a directory; see [`directive_search`].
@@ -1011,11 +1079,13 @@ fn resolve_data_file_in(search_path: &[PathBuf], module_path: &str) -> Option<Pa
 /// data file <path>: <detail>` for the latter.
 fn load_data_import(
     search_path: &[PathBuf],
+    note: Option<String>,
     module_path: &str,
 ) -> Result<OwnedValue, ModuleLoadError> {
     let Some(path) = resolve_data_file_in(search_path, module_path) else {
         return Err(ModuleLoadError::single(ReportEntry::NotFound {
             module_path: module_path.to_string(),
+            note,
         }));
     };
     read_data_file(&path).map_err(|failure| ModuleLoadError::single(ReportEntry::Data(failure)))
@@ -1044,14 +1114,18 @@ fn read_data_file(path: &Path) -> Result<OwnedValue, DataFileFailure> {
 /// import, `is_data` and `relpath`) and `defs` (`name/arity` of each top-level `def`). A
 /// module that fails to load is not an error of the filter: jq prints the diagnostic and
 /// answers `null`, with exit 0, so it comes back as stderr text.
-fn module_meta_outcome(lib_dirs: &[PathBuf], name: &str) -> jq::cli_context::ModuleMetaOutcome {
+fn module_meta_outcome(
+    lib_dirs: &[PathBuf],
+    note: Option<&str>,
+    name: &str,
+) -> jq::cli_context::ModuleMetaOutcome {
     use jq::cli_context::ModuleMetaOutcome::{Error, LoadFailure, Meta};
 
     if let Some(message) = invalid_module_path(name) {
         return Error(message);
     }
     let Some(file) = resolve_module_in(lib_dirs, name) else {
-        return Error(format!("module not found: {name}"));
+        return Error(module_not_found(name, note));
     };
     let canonical = canonical_or_self(&file);
     // Lossily, as `import` reads a module (#5351, #7429): jq parses the raw bytes.
@@ -1507,6 +1581,8 @@ struct Directive<'a> {
     data: bool,
     /// The directories its `search` metadata names in place of the default list (#5338).
     search: Option<Vec<PathBuf>>,
+    /// The note a `module not found` for `search` carries (#7608).
+    search_note: Option<String>,
 }
 
 /// `program`'s directives in jq's walk order: last-declared first. `origin` is the directory
@@ -1521,12 +1597,14 @@ fn directives_of<'p>(program: &'p Program, origin: &Path, jq_origin: &Path) -> V
             path: &include.path,
             data: false,
             search: directive_search(include.metadata.as_ref(), origin, jq_origin),
+            search_note: directive_search_note(include.metadata.as_ref()),
         })
         .chain(program.imports.iter().map(|import| Directive {
             decl_index: import.decl_index,
             path: &import.path,
             data: import.data,
             search: directive_search(import.metadata.as_ref(), origin, jq_origin),
+            search_note: directive_search_note(import.metadata.as_ref()),
         }))
         .collect();
     directives.sort_by_key(|directive| core::cmp::Reverse(directive.decl_index));
@@ -1537,6 +1615,8 @@ fn directives_of<'p>(program: &'p Program, origin: &Path, jq_origin: &Path) -> V
 /// (#3573). [`ModuleLoader::failure_report`] documents the rules this follows.
 struct FailureWalk<'a> {
     search_path: &'a [PathBuf],
+    /// The note a `module not found` on `search_path` carries (#7608).
+    default_note: Option<&'a str>,
     /// jq's own directory, which a `search` entry's `$ORIGIN/` stands for (#5338).
     jq_origin: &'a Path,
     /// The modules already reached, by canonical file, whether or not they
@@ -1571,8 +1651,13 @@ impl FailureWalk<'_> {
             let Some(resolved) = resolved else {
                 // A missing module stops this level and returns `1` for it,
                 // whatever the level had counted.
+                let note = match &directive.search {
+                    Some(_) => directive.search_note.clone(),
+                    None => self.default_note.map(str::to_string),
+                };
                 self.entries.push(ReportEntry::NotFound {
                     module_path: directive.path.to_string(),
+                    note,
                 });
                 return 1;
             };
@@ -1773,6 +1858,7 @@ impl ModuleLoader {
         Self {
             search_path,
             lib_dirs,
+            default_note: library_note(&cli_dirs),
             cli_dirs,
             env_dirs,
             prog_origin: PathBuf::from("."),
@@ -1830,6 +1916,7 @@ impl ModuleLoader {
         Target {
             path,
             search: directive_search(metadata, &origin, &self.jq_origin),
+            search_note: directive_search_note(metadata),
         }
     }
 
@@ -1871,6 +1958,15 @@ impl ModuleLoader {
     /// The directories `target` is looked for in: its own `search` list, else the default.
     fn search_for<'t>(&'t self, target: &'t Target<'_>) -> &'t [PathBuf] {
         target.search.as_deref().unwrap_or(&self.search_path)
+    }
+
+    /// The note a `module not found` for `target` carries: its own `search` list's, else the
+    /// default list's (#7608).
+    fn note_for(&self, target: &Target<'_>) -> Option<String> {
+        match &target.search {
+            Some(_) => target.search_note.clone(),
+            None => self.default_note.clone(),
+        }
     }
 
     /// The canonical file a run id names, for compile-error attribution.
@@ -1982,6 +2078,7 @@ impl ModuleLoader {
             resolve_module_in(self.search_for(target), module_path).ok_or_else(|| {
                 ModuleLoadError::single(ReportEntry::NotFound {
                     module_path: module_path.to_string(),
+                    note: self.note_for(target),
                 })
             })?;
 
@@ -2256,7 +2353,11 @@ impl ModuleLoader {
             if import.data {
                 data_bindings.push((
                     import.alias.clone(),
-                    load_data_import(self.search_for(&target), import.path.as_str())?,
+                    load_data_import(
+                        self.search_for(&target),
+                        self.note_for(&target),
+                        import.path.as_str(),
+                    )?,
                 ));
                 continue;
             }
@@ -2453,6 +2554,7 @@ impl ModuleLoader {
                 if resolve_data_file_in(self.search_for(&target), &import.path).is_none() {
                     let missing = ModuleLoadError::single(ReportEntry::NotFound {
                         module_path: import.path.clone(),
+                        note: self.note_for(&target),
                     });
                     return Err(self.failure_report(program, missing));
                 }
@@ -2501,6 +2603,7 @@ impl ModuleLoader {
     fn failure_report(&self, program: &Program, first: ModuleLoadError) -> ModuleLoadError {
         let mut walk = FailureWalk {
             search_path: &self.search_path,
+            default_note: self.default_note.as_deref(),
             jq_origin: &self.jq_origin,
             visited: BTreeSet::new(),
             chain: Vec::new(),
@@ -2597,7 +2700,11 @@ impl ModuleLoader {
             // (#2956). A load failure (missing file, unreadable, bad JSON)
             // ends the pass like any other directive's.
             if import.data {
-                match load_data_import(self.search_for(&target), &import.path) {
+                match load_data_import(
+                    self.search_for(&target),
+                    self.note_for(&target),
+                    &import.path,
+                ) {
                     Ok(value) => data_bindings.push((import.alias.clone(), value)),
                     Err(e) => return Err(self.failure_report(program, e)),
                 }
@@ -5081,7 +5188,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         program_ctx.jq_origin.as_deref(),
     );
     let module_lib_dirs = module_loader.lib_dirs().to_vec();
-    jq::cli_context::set_module_resolver(move |name| module_meta_outcome(&module_lib_dirs, name));
+    let module_lib_note = module_loader.default_note.clone();
+    jq::cli_context::set_module_resolver(move |name| {
+        module_meta_outcome(&module_lib_dirs, module_lib_note.as_deref(), name)
+    });
 
     // #2395: re-parse the filter once the module-sourced def names are known,
     // so a `def` arriving through `include` or `~/.jq` can shadow a builtin

@@ -9144,6 +9144,7 @@ nothing blocks matching jq byte for byte: `jq: error: module not found: {name}`,
 line (jq's own stand-in for the missing source echo), then the trailer.
 `ModuleLoader::ensure_module_loaded`'s not-found case now reports this exactly; verified
 against jq 1.7.1 for both `include` and `import`.
+With `HOME` unset jq cannot expand a `~/` search entry (`~/.jq` in its default list, a `-L ~/x`, a `search` metadata entry) and appends the last such error, `module not found: zz (Could not expand ~/.jq. (Could not find home directory.))`, as `modulemeta` does too; `succinctly jq` writes the same since [#7608](https://github.com/rust-works/succinctly/issues/7608) (`unexpanded_home_note`).
 
 **Closed for *which* module is named when *more than one* unresolvable declaration is spread
 across the top-level `include`s and `import`s (#2857).** jq reports the last failing declaration
