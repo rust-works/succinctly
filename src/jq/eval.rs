@@ -159401,14 +159401,14 @@ mod tests {
 
     #[test]
     fn test_datetime_nan_and_subsecond_negative_already_match_jq() {
-        // #869 suspected these were also bugs, but checking the pinned jq
-        // oracle (jq-1.7.1) directly showed both already match real jq
-        // exactly — do not "fix" either into diverging from jq:
-        //  - NaN silently maps to the Unix epoch (not an error) in jq too.
+        // #869 suspected these were also bugs:
+        //  - NaN mapped to the Unix epoch in jq 1.7.1, whose `jv2tm` read the
+        //    NaN seconds slot `gmtime` gives it as 0; jq 1.8.2 refuses that
+        //    slot (jqlang/jq#3070), and succinctly follows it (#7532).
         //  - A sub-second-negative timestamp truncates toward zero in jq
         //    (not floor semantics — `-0.5` maps to `secs=0`, not `-1`).
         query!(b"null", r#"(nan) | strftime("%Y-%m-%d")"#,
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970-01-01")
+            QueryResult::Error(e) => assert_eq!(e.message, "strftime/1 requires parsed datetime inputs")
         );
         query!(b"null", r#"(-0.5) | strftime("%Y-%m-%dT%H:%M:%SZ")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970-01-01T00:00:00Z")
@@ -159428,9 +159428,10 @@ mod tests {
 
         // Each pair is the exact direct-field output observed in jq 1.7.1
         // after an input below/above the signed 32-bit range. The four
-        // values exercise both immediate boundaries and i64 extremes.
+        // values exercise both immediate boundaries and i64 extremes. The
+        // year saturates after its 1900 offset (#7532):
+        // `test_broken_down_year_saturates_after_its_offset_7532`.
         let fields = [
-            (0, "%Y", "2147483648", "2147483647"),
             (1, "%m", "-2147483647", "-2147483648"),
             (2, "%d", "-2147483648", "2147483647"),
             (3, "%H", "-2147483648", "2147483647"),
@@ -159473,37 +159474,70 @@ mod tests {
     }
 
     #[test]
-    fn test_broken_down_year_offset_wraps_across_full_boundary_3083() {
-        // jq 1.7.1 stores year - 1900 in a signed 32-bit tm_year. The wrap
-        // applies to 1900 consecutive input years, not only i32::MIN.
+    fn test_broken_down_year_saturates_after_its_offset_7532() {
+        // jq 1.8.2's `jv2tm` takes 1900 off the year as a double, then
+        // saturates it to a C `int` (jqlang/jq#3070), so the year never
+        // wraps: it runs from i32::MIN + 1900, before 1900 and so an
+        // `invalid gmtime representation` for `mktime`, to i32::MAX + 1900.
+        // jq 1.7.1 saturated first and wrapped the subtraction (#3083), so
+        // i32::MIN was year 2147483648 there. Captured from jq 1.8.2.
         for (year, displayed, timestamp) in [
-            (i32::MIN, "2147483648", 67_767_976_233_532_800.0),
-            (i32::MIN + 1, "2147483649", 67_767_976_265_155_200.0),
-            (i32::MIN + 1899, "2147485547", 67_768_036_160_140_800.0),
+            (i64::MIN, "-2147481748", None),
+            (i64::from(i32::MIN), "-2147481748", None),
+            (i64::from(i32::MIN) + 1, "-2147481748", None),
+            (i64::from(i32::MIN) + 1899, "-2147481748", None),
+            (i64::from(i32::MIN) + 1900, "-2147481748", None),
+            (i64::from(i32::MIN) + 1901, "-2147481747", None),
+            (
+                i64::from(i32::MAX),
+                "2147483647",
+                Some(67_767_976_201_996_800.0),
+            ),
+            (
+                i64::from(i32::MAX) + 1,
+                "2147483648",
+                Some(67_767_976_233_532_800.0),
+            ),
+            (
+                i64::from(i32::MAX) + 1900,
+                "2147485547",
+                Some(67_768_036_160_140_800.0),
+            ),
+            (
+                i64::from(i32::MAX) + 1901,
+                "2147485547",
+                Some(67_768_036_160_140_800.0),
+            ),
+            (i64::MAX, "2147485547", Some(67_768_036_160_140_800.0)),
         ] {
             let array = format!("[{year},0,1,0,0,0,4,0]");
             let format_filter = format!("{array} | strftime(\"%Y\")");
             query!(b"null", &format_filter,
                 QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, displayed, "{format_filter}"));
             let mktime_filter = format!("{array} | mktime");
-            query!(b"null", &mktime_filter,
-                QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, timestamp, "{mktime_filter}"));
+            if let Some(timestamp) = timestamp {
+                query!(b"null", &mktime_filter,
+                    QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, timestamp, "{mktime_filter}"));
+            } else {
+                query!(b"null", &mktime_filter,
+                    QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation", "{mktime_filter}"));
+            }
         }
-        query!(b"null", r#"[-2147481748,0,1,0,0,0,4,0] | strftime("%Y")"#,
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-2147481748"));
-        query!(b"null", r"[-2147481748,0,1,0,0,0,4,0] | mktime",
-            QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation"));
+        // A fractional year is truncated after the offset too: 1899.5 is
+        // tm_year -0.5, so 0, the year 1900 (jq 1.7.1: 1899).
+        query!(b"null", r#"[1899.5,0,1,0,0,0,4,0] | strftime("%Y")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1900"));
     }
 
     #[test]
     fn test_mktime_and_strftime_extreme_fields_3083() {
-        // jq 1.7.1 saturates each input field to `int`, then converts the
+        // jq saturates each input field to `int`, then converts the
         // broken-down time. A failed timegm is an error for mktime but the
-        // string "-1" for strftime's %s.
+        // string "-1" for strftime's %s. The year rows are jq 1.8.2's (#7532).
         query!(b"null", r"[9223372036854775807,0,1,0,0,0,0,0] | mktime",
-            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 67_767_976_201_996_800.0));
+            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 67_768_036_160_140_800.0));
         query!(b"null", r"[-9223372036854775808,0,1,0,0,0,0,0] | mktime",
-            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 67_767_976_233_532_800.0));
+            QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation"));
         query!(b"null", r"[1970,9223372036854775807,1,0,0,0,4,0] | mktime",
             QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 5_647_336_530_739_200.0));
         query!(b"null", r"[1970,-9223372036854775808,1,0,0,0,4,0] | mktime",
@@ -159518,7 +159552,7 @@ mod tests {
             QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 1_718_447_400.0));
 
         let positive = [
-            67_767_976_201_996_800.0,
+            67_768_036_160_140_800.0,
             5_647_336_530_739_200.0,
             185_542_587_014_400.0,
             7_730_941_129_200.0,
@@ -159741,15 +159775,11 @@ mod tests {
             }
         );
 
-        // Real jq requires the full 8-element array (weekday and yearday
-        // included), not just the 6 fields mktime needs — verified against
-        // the pinned oracle for every length 1-7. Before this fix, a
-        // 6-element array silently defaulted weekday/yearday to 0 instead
-        // of erroring, which %U/%V/%W/%G/%g would then silently compute a
-        // wrong answer from.
+        // A shorter array has its missing fields 0, as in jq 1.8.2 (#7532;
+        // jq 1.7.1 required all 8).
         query!(b"[2024,0,15,0,0,0]", r#"strftime("%Y")"#,
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024");
             }
         );
 
@@ -159930,14 +159960,14 @@ mod tests {
             QueryResult::None => {}
         );
 
-        // A too-short array gets the same wording real jq uses — it has no
-        // distinct "at least 6 elements" message.
-        query!(b"[2024,0,15]", r#"strftime("%Y")"#,
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+        // A shorter array has its missing fields 0, as in jq 1.8.2 (#7532;
+        // jq 1.7.1 refused it).
+        query!(b"[2024,0,15]", r#"strftime("%Y-%m-%d %H")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15 00");
             }
         );
-        query!(b"[2024,0,15]", r#"strftime("%Y")?"#,
+        query!(b"[2024,0,15,nan]", r#"strftime("%Y")?"#,
             QueryResult::None => {}
         );
 
@@ -160073,10 +160103,10 @@ mod tests {
                 assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
             }
         );
-        // Too-short array: same error as strftime's own (#760).
+        // A shorter array has its missing fields 0, as in jq 1.8.2 (#7532).
         query!(b"[2024,0,15,0,0,0]", r"todate",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T00:00:00Z");
             }
         );
         // Full 8-element broken-down-time array: succeeds, matching jq.
@@ -160088,13 +160118,13 @@ mod tests {
 
         // NaN and (either-signed) infinity share `broken_down_time_fields`'s
         // number arm with `strftime`/`gmtime`/`localtime` -- exercised here
-        // via `todate` specifically since, unlike `gmtime` (#3071), both
-        // already match jq exactly: `nan | todate` treats NaN as `0.0`
-        // (confirmed live against jq 1.7.1), and either infinity raises the
-        // same out-of-range error `mktime`'s own overflow path uses.
+        // via `todate` specifically: `nan | todate` converts, but its
+        // seconds slot is NaN, which jq 1.8.2 refuses (#7532; jq 1.7.1 read
+        // it as 0), and either infinity raises the same out-of-range error
+        // `mktime`'s own overflow path uses.
         query!(b"null", r"nan | todate",
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "1970-01-01T00:00:00Z");
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
             }
         );
         for filter in ["infinite | todate", "(-infinite) | todate"] {
@@ -160109,8 +160139,8 @@ mod tests {
             );
         }
 
-        // End-to-end `?` behavior over early-exit `todate` cases (a
-        // too-short array and a non-array/non-number value) -- confirmed via
+        // End-to-end `?` behavior over early-exit `todate` cases (an array
+        // with a non-number and a non-array/non-number value) -- confirmed via
         // `eprintln!` probing that `broken_down_time_fields`'s own `optional`
         // parameter is never `true` on these (suppression happens entirely
         // outside builtin dispatch here, not
@@ -160118,7 +160148,7 @@ mod tests {
         // observable behavior without claiming to cover those arms; see
         // their own `tolerate-line` markers above for why they're dead code
         // through every path that currently calls this function.
-        for filter in ["[1,2,3] | todate?", "null | todate?"] {
+        for filter in ["[1,\"x\",3] | todate?", "null | todate?", "nan | todate?"] {
             query!(b"null", filter, QueryResult::None => {});
         }
 
