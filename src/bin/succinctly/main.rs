@@ -3520,6 +3520,7 @@ mod relocation_pages;
 mod select_stats_report;
 mod sigpipe;
 mod stdin_access;
+mod stdin_offset;
 mod text_generators;
 mod text_validate;
 mod utf8_bench;

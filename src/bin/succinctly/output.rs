@@ -292,6 +292,7 @@ impl ErrorSink {
     /// call should never happen in practice.
     pub fn request_halt(&mut self, exit_code: i32) {
         self.halt = self.halt.or(Some(exit_code));
+        super::stdin_offset::note_halt();
     }
 
     /// The exit code requested by `halt`/`halt_error` during this run, if

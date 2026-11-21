@@ -186,10 +186,10 @@ pub use eval::snapshot_environment;
 // stream" to seed under a `no_std` embedding with no CLI driver anyway).
 #[cfg(feature = "std")]
 pub use eval::{
-    count_reads_past_end, current_input_location, hold_reads_past_end, pop_input,
-    pop_remaining_input, seed_remaining_inputs, seed_remaining_inputs_from,
+    clear_input_reads, count_reads_past_end, current_input_location, hold_reads_past_end,
+    input_reads, pop_input, pop_remaining_input, seed_remaining_inputs, seed_remaining_inputs_from,
     seed_remaining_inputs_with_error, seed_remaining_inputs_with_errors, set_input_read_hook,
-    InputPop, InputProducer, ProducedInput, UNKNOWN_INPUT_LINE,
+    InputPop, InputProducer, InputReads, ProducedInput, UNKNOWN_INPUT_LINE,
 };
 // `input_queue_is_active` exists under both gates (a `const fn` returning
 // `false` without `std`), so `eval_generic` can consult it unconditionally.

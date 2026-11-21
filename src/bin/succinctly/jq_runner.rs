@@ -4747,7 +4747,11 @@ impl Drop for RunIndex<'_> {
 /// A value the program builds is bounded by the native-stack floor `main` registered, not by
 /// `MAX_VALUE_TREE_DEPTH`, as jq bounds it by its C stack alone (#5554).
 pub fn run_jq(args: JqCommand) -> Result<i32> {
-    match jq::with_value_depth_on_stack_floor(|| run_jq_on_stack_floor(args)) {
+    let run = jq::with_value_depth_on_stack_floor(|| run_jq_on_stack_floor(args));
+    // #7455: a regular file on standard input the run did not read to the end is left where jq's
+    // reader would have left it.
+    super::stdin_offset::restore();
+    match run {
         // jq's own report and status for a write to standard output that failed, a closed descriptor included (#7214).
         Err(e) => match super::output::output_write_failure(&e) {
             Some(strerror) => {
@@ -4770,8 +4774,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     FIRST_OPEN_FAILURE_AT.with(|first| first.set(None));
     // Nor may one carry a standard input that failed (#7126).
     INPUT_READ_FAILED.with(|failed| failed.set(false));
+    super::stdin_offset::start_run();
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
+    super::stdin_offset::set_run(stdin_items(&args), !args.null_input);
     // The order only matters between two or more named flags: a command line with fewer builds no clap definition for it.
     // `parse_jq` has already read it off clap's matches (#7260); a `JqCommand` matched inside the whole `Cli` tree
     // (a global flag before `jq`) has not, and scans argv here.
@@ -5776,6 +5782,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     run_stopped = true;
                     break 'files;
                 }
+                // #7455: what the program took, for where a halt leaves standard input.
+                super::stdin_offset::note_taken();
                 while let Some((_, warning)) = notes.next_if(|&(at, _)| at < start) {
                     eprintln!("{warning}");
                 }
@@ -6618,6 +6626,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     ended_early = true;
                     break 'documents;
                 }
+                // #7455: what the program took, for where a halt leaves standard input (`-n`'s one
+                // `null` is not read from it).
+                if !args.null_input {
+                    super::stdin_offset::note_taken();
+                }
                 evaluate_input_streaming_via(
                     &document,
                     &expr,
@@ -6936,6 +6949,29 @@ fn get_input_files(args: &JqCommand) -> Vec<std::path::PathBuf> {
     files.extend(args.files.iter().map(std::path::PathBuf::from));
 
     files
+}
+
+/// What the program reads from standard input, one item at a time, for where a run that stops early
+/// leaves a regular file there (#7455): `None` when it reads named files, or reads standard input
+/// in a way whose offset stays where the read left it (`--slurp`, `--seq`, DSV, `--stream-errors`,
+/// `--validate`).
+fn stdin_items(args: &JqCommand) -> Option<super::stdin_offset::Items> {
+    use super::stdin_offset::Items;
+    if !get_input_files(args).is_empty()
+        || args.slurp
+        || args.input_dsv.is_some()
+        || args.validate
+        || (!args.raw_input && (args.seq || args.stream_errors))
+    {
+        return None;
+    }
+    Some(if args.raw_input {
+        Items::Lines
+    } else if args.stream {
+        Items::Events
+    } else {
+        Items::Values
+    })
 }
 
 /// Whether to force a real read under `-n` for `input`/`inputs`/
@@ -11072,7 +11108,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     if files.is_empty() {
         let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
         let mut stdin =
-            std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
+            std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(super::stdin_offset::Stdin);
         // #7126: standard input that cannot be read is an empty one and ends the run with exit 2.
         let head = if crate::cli::stdin_access::unreadable() {
             note_stdin_read_failed();
@@ -11303,7 +11339,8 @@ fn read_stdin_bytes_unreported() -> (Vec<u8>, bool) {
     }
     let mut buf = Vec::new();
     // What `read_to_end` appended before a failure stays in `buf`.
-    let failed = std::io::stdin().read_to_end(&mut buf).is_err();
+    // #7455: read by a reader that counts what it took, for where the run leaves the descriptor.
+    let failed = super::stdin_offset::Stdin.read_to_end(&mut buf).is_err();
     (buf, failed)
 }
 
@@ -12174,6 +12211,7 @@ fn regular_stdin_left(
         return None;
     }
     let start = file.stream_position().ok()?;
+    super::stdin_offset::note_origin(start);
     let len = meta.len().checked_sub(start)?;
     let unreadable = file
         .read_at(&mut [0u8], start)
@@ -14355,8 +14393,8 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                 note_stdin_read_failed();
                 return Ok(LoneStart::Read(Vec::new()));
             }
-            let stdin =
-                std::io::Cursor::new(pushed_back.unwrap_or_default()).chain(std::io::stdin());
+            let stdin = std::io::Cursor::new(pushed_back.unwrap_or_default())
+                .chain(super::stdin_offset::Stdin);
             // #7260: room for the windows read onto the text after the front, as a file's length is,
             // so the text is not grown by doubling as they are (a 2.5 MiB buffer copied out of a
             // 1.25 MiB one at the peak); room not written to is not memory the run holds.
