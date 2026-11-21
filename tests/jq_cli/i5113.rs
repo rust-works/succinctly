@@ -33,7 +33,7 @@ fn test_5113_literal_then_on_the_last_step_of_an_earlier_init_fork() -> Result<(
             r#"{"a":{"a":null}}"#,
             r"path(. as $x | foreach . as $i ((., .a); (7, if .a then 1 elif . then 2 else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end); $i))",
             "[]\n[]\n",
-            "Invalid path expression with result null",
+            "Invalid path expression with result {\"a\":{\"a\":null}}",
             5,
         ),
         (
@@ -47,7 +47,7 @@ fn test_5113_literal_then_on_the_last_step_of_an_earlier_init_fork() -> Result<(
             r#"{"a":{"a":null}}"#,
             r"path(. as $x | foreach . as $i ((., .a); (7, if .a then true else foreach (try ($x as {a:$a} | .)) as $y (.; .; .) end); $i))",
             "[]\n[]\n",
-            "Invalid path expression with result null",
+            "Invalid path expression with result {\"a\":{\"a\":null}}",
             5,
         ),
         (
