@@ -10,7 +10,7 @@ Add succinctly to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-succinctly = "0.7"
+succinctly = "0.8"
 ```
 
 Or with cargo:
@@ -464,20 +464,20 @@ succinctly jq -r '.users[] | [.name, .email] | @dsv("|")' users.json
 
 ```toml
 # Default: uses Rust's count_ones()
-succinctly = "0.7"
+succinctly = "0.8"
 
 # Explicit SIMD intrinsics
-succinctly = { version = "0.7", features = ["simd"] }
+succinctly = { version = "0.8", features = ["simd"] }
 
 # Portable bitwise algorithm
-succinctly = { version = "0.7", features = ["portable-popcount"] }
+succinctly = { version = "0.8", features = ["portable-popcount"] }
 ```
 
 ### Serialization
 
 ```toml
 # Enable serde support
-succinctly = { version = "0.7", features = ["serde"] }
+succinctly = { version = "0.8", features = ["serde"] }
 ```
 
 ```rust
@@ -495,7 +495,7 @@ Succinctly is `no_std` compatible (requires `alloc`):
 
 ```toml
 [dependencies]
-succinctly = { version = "0.7", default-features = false }
+succinctly = { version = "0.8", default-features = false }
 ```
 
 ```rust
