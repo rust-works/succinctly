@@ -1056,24 +1056,44 @@ fn resolve_data_file_in(search_path: &[PathBuf], module_path: &str) -> Option<Pa
 fn load_data_import(
     search_path: &[PathBuf],
     module_path: &str,
+    raw: bool,
 ) -> Result<OwnedValue, ModuleLoadError> {
     let Some(path) = resolve_data_file_in(search_path, module_path) else {
         return Err(ModuleLoadError::single(ReportEntry::NotFound {
             module_path: module_path.to_string(),
         }));
     };
-    read_data_file(&path).map_err(|failure| ModuleLoadError::single(ReportEntry::Data(failure)))
+    read_data_file(&path, raw)
+        .map_err(|failure| ModuleLoadError::single(ReportEntry::Data(failure)))
+}
+
+/// Whether a data import's metadata asks for its file's text (#7645): `import "f" as $d {raw:
+/// true};` binds `$d` to one string, the file read as `--rawfile` reads its file, where any other
+/// import parses it as a stream of JSON values. jq's `process_dependencies` reads `raw` as raw only
+/// when it is `true` itself, so `raw: 1`, `raw: "true"` and `raw: null` parse the file (captured
+/// against jq 1.7.1 and 1.8.2). A library import reads its file as text either way, so `raw` means
+/// nothing to one.
+fn data_import_is_raw(metadata: Option<&MetaObject>) -> bool {
+    metadata.is_some_and(|metadata| {
+        metadata
+            .iter()
+            .any(|(key, value)| key == "raw" && *value == MetaValue::Bool(true))
+    })
 }
 
 /// Read and parse one resolved data file ([`load_data_import`]'s second half),
 /// so the failure report's walk reads a data import exactly as the loader does
-/// (#3573).
-fn read_data_file(path: &Path) -> Result<OwnedValue, DataFileFailure> {
+/// (#3573). A `raw` import's file is its text instead, one string ([`data_import_is_raw`]).
+fn read_data_file(path: &Path, raw: bool) -> Result<OwnedValue, DataFileFailure> {
     let unreadable = |detail: String| DataFileFailure {
         path: canonical_or_self(path),
         detail,
     };
     let bytes = std::fs::read(path).map_err(|e| unreadable(strerror_only(&e)))?;
+    if raw {
+        // `jv_load_file(path, 1)`, as for `--rawfile` (#7645).
+        return Ok(OwnedValue::String(jq_raw_file_text(&bytes).into()));
+    }
     // jq's parser reads the bytes (`jv_load_file`, as for `--slurpfile`), and a string's that are
     // not UTF-8 are U+FFFD by the rule the main input's are (#7604).
     let contents = match String::from_utf8(bytes) {
@@ -1557,6 +1577,8 @@ struct Directive<'a> {
     data: bool,
     /// The directories its `search` metadata names in place of the default list (#5338).
     search: Option<Vec<PathBuf>>,
+    /// A data import whose metadata says `raw: true`, read as text (#7645).
+    raw: bool,
 }
 
 /// `program`'s directives in jq's walk order: last-declared first. `origin` is the directory
@@ -1571,12 +1593,14 @@ fn directives_of<'p>(program: &'p Program, origin: &Path, jq_origin: &Path) -> V
             path: &include.path,
             data: false,
             search: directive_search(include.metadata.as_ref(), origin, jq_origin),
+            raw: false,
         })
         .chain(program.imports.iter().map(|import| Directive {
             decl_index: import.decl_index,
             path: &import.path,
             data: import.data,
             search: directive_search(import.metadata.as_ref(), origin, jq_origin),
+            raw: import.data && data_import_is_raw(import.metadata.as_ref()),
         }))
         .collect();
     directives.sort_by_key(|directive| core::cmp::Reverse(directive.decl_index));
@@ -1629,7 +1653,7 @@ impl FailureWalk<'_> {
             if directive.data {
                 // Counted, and never deduplicated: the same file imported
                 // twice is reported twice.
-                if let Err(failure) = read_data_file(&resolved) {
+                if let Err(failure) = read_data_file(&resolved, directive.raw) {
                     self.entries.push(ReportEntry::Data(failure));
                     errors += 1;
                 }
@@ -2306,7 +2330,11 @@ impl ModuleLoader {
             if import.data {
                 data_bindings.push((
                     import.alias.clone(),
-                    load_data_import(self.search_for(&target), import.path.as_str())?,
+                    load_data_import(
+                        self.search_for(&target),
+                        import.path.as_str(),
+                        data_import_is_raw(import.metadata.as_ref()),
+                    )?,
                 ));
                 continue;
             }
@@ -2647,7 +2675,11 @@ impl ModuleLoader {
             // (#2956). A load failure (missing file, unreadable, bad JSON)
             // ends the pass like any other directive's.
             if import.data {
-                match load_data_import(self.search_for(&target), &import.path) {
+                match load_data_import(
+                    self.search_for(&target),
+                    &import.path,
+                    data_import_is_raw(import.metadata.as_ref()),
+                ) {
                     Ok(value) => data_bindings.push((import.alias.clone(), value)),
                     Err(e) => return Err(self.failure_report(program, e)),
                 }
