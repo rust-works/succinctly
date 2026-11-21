@@ -6206,6 +6206,7 @@ ones). Two different checks are in play, and their coverage differs:
   and `contains` is reachable through the library API only — the CLI's `eval_generic.rs` bridge
   materializes the input a layer earlier and raises the decode failure uniformly for all three
   builtins, `contains` included.
+  Since #7474 `contains(error("boom"), 1)` is the exception there: its generator argument is bound first, `(error("boom"), 1) as $v | contains($v)`, so the CLI raises `boom` as that spelling always did.
 - **The #1677 malformed-`,`/`:`-delimiter check is the narrower gap.**
   `to_owned_at_depth` itself never calls `key_delimiter_ok`/`value_delimiter_ok`, so
   every builtin routed through it still misses this one check. `Builtin::Keys` (`keys`/

@@ -34627,6 +34627,11 @@ fn path_context_is_navigational_at(expr: &Expr, unfolded: u8) -> bool {
                 && end.as_deref().map_or(true, path_context_component_walkable)
         }
         Expr::Builtin(Builtin::GetPath(path_expr)) => path_context_component_walkable(path_expr),
+        // #7474: a call whose generator argument the parser bound first walks as written
+        // (`getpath(G)`, `nth(G)`), so the walk keeps pulling `G` one path at a time (#2259).
+        bound @ Expr::As { var, .. } if crate::jq::parser::is_value_arg_var(var) => {
+            crate::jq::parser::unbound_value_args_call(bound).is_some_and(|call| nav(&call))
+        }
         // spine 2416 (walk residue): the transparent wrappers step their
         // body; what they evaluate besides it (`if`'s condition, `limit`'s
         // count, a `catch` handler, an `error` message) is evaluated at the
@@ -35135,6 +35140,12 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             Ok(())
         }
         Expr::Paren(inner) => path_context_step_generic::<S, V>(inner, pos, out),
+        // #7474: see `path_context_is_navigational_at`'s arm.
+        bound @ Expr::As { var, .. } if crate::jq::parser::is_value_arg_var(var) => {
+            let call = crate::jq::parser::unbound_value_args_call(bound)
+                .expect("path_context_is_navigational_at admitted only a bound call");
+            path_context_step_generic::<S, V>(&call, pos, out)
+        }
         Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => {
             // `path_step_generic` is the same navigation `Builtin::Path`'s
             // cursor walk (#2058) uses, absent nodes included, so the two

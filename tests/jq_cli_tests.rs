@@ -48306,17 +48306,23 @@ fn test_decode_failure_not_caught_by_try_catch_1620() {
 /// `eval_generic.rs` bridge (`bridge_to_full_evaluator`/
 /// `bridge_to_each_owned_flow`) materializes the input one layer before any
 /// of `in`/`IN`/`contains`'s own `eval.rs` argument-vs-input ordering can
-/// run, so all three raise the identical decode failure from `succinctly
-/// jq` -- including `contains`, whose #1800 deferral only wins on the
-/// library route (see `test_contains_defers_past_decode_failure_unlike_in_2202`
-/// in `src/jq/eval.rs`).
+/// run, so these raise the identical decode failure from `succinctly
+/// jq`. `contains(error("boom"), 1)` is no longer one of them since #7474: its
+/// generator argument is bound first (`(error("boom"), 1) as $v | contains($v)`),
+/// so it raises `boom` as that spelling always did and as the library route's
+/// #1800 deferral does (`test_contains_defers_past_decode_failure_unlike_in_2202`
+/// in `src/jq/eval.rs`). jq has no answer for either: it rejects the document.
 #[test]
 fn test_in_upper_in_contains_all_raise_decode_failure_from_cli_2202() {
     let doc = r#""\ud800""#;
+    let (_, stderr, code) = run_jq_full(&["-c", r#"contains(error("boom"), 1)"#], Some(doc))
+        .unwrap_or_else(|e| panic!("contains failed to run: {e}"));
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
     for filter in [
         r#"in(error("boom"), {"a":1})"#,
         r#"IN(error("boom"), {"a":1})"#,
-        r#"contains(error("boom"), 1)"#,
+        r#"contains(1)"#,
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
             .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
