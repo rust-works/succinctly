@@ -120591,7 +120591,8 @@ mod tests {
             ".[$k] |= 7",
             ".[$k] += 1",
             ".[$k] //= 1",
-            ".a | .[$k] = 1",
+            ".a[$k] = 1",
+            ".a[$k] += 1",
         ] {
             let wrap = src.starts_with(".a");
             let start = OwnedValue::array_from(vec![OwnedValue::string(&literal)]);
