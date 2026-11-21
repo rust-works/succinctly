@@ -1308,19 +1308,15 @@ fn test_bad_argjson_slurpfile_rawfile_exit_2_not_1_3051() -> Result<()> {
         "stderr: {stderr:?}"
     );
 
-    // --rawfile: a file that exists and reads, but isn't valid UTF-8 --
-    // `strerror_only`'s `None` arm, the one `std::io::Error` shape with no
-    // `" (os error N)"` suffix for it to strip (`ErrorKind::InvalidData` is
-    // constructed from a plain string, not an OS errno).
+    // --rawfile: a file that exists and reads, but isn't valid UTF-8, is read with U+FFFD, as
+    // jq 1.7.1 reads it (#7436; it was refused here, exit 2).
     let mut file = NamedTempFile::new()?;
     file.write_all(&[0xff, 0xfe, b' ', b'x'])?;
     let path = file.path().to_str().unwrap().to_string();
-    let (stdout, stderr, code) = run_jq_full(&["-nc", "1", "--rawfile", "x", &path], None)?;
-    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "1, $x", "--rawfile", "x", &path], None)?;
     assert_eq!(
-        stderr,
-        format!("jq: Bad JSON in --rawfile x {path}: Could not open {path}: stream did not contain valid UTF-8\n")
+        (stdout.as_str(), stderr.as_str(), code),
+        ("1\n\"\u{fffd}\u{fffd} x\"\n", "", 0)
     );
 
     Ok(())
