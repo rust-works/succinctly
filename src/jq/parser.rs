@@ -5365,10 +5365,7 @@ impl<'a> Parser<'a> {
                     let lit = self.parse_number_literal()?;
                     // #3397: an `as` or a multiplicative operator after the
                     // literal means the negation covers it (jq's `'-' Exp`).
-                    if self.mode == ParserMode::Jq
-                        && !self.expd_operand
-                        && self.negation_scopes_over_what_follows()
-                    {
+                    if self.mode == ParserMode::Jq && self.negation_scopes_over_what_follows() {
                         self.pos = start;
                     } else {
                         folded = Some(lit);
@@ -11102,7 +11099,11 @@ impl<'a> Parser<'a> {
     /// must not fold into the token. The unary-minus arm then binds the
     /// positive literal and absorbs the chain. A postfix `?` scopes too:
     /// `-2? * 3` is `-(2? * 3)`; so does a postfix `.name` or `.[...]` (`-1..e1`
-    /// and `-1 .e1` index the number 1, #5615). Consumes nothing.
+    /// and `-1 .e1` index the number 1, #5615) and a postfix `[...]` (`-1[0]`,
+    /// `-1.[]?` and `-1 [0]` are `-(1[0])`, #7497). Consumes nothing.
+    ///
+    /// An object value (`ExpD`, #3397) takes no `as`, no multiplicative chain and no `Exp '?'`,
+    /// but its `'-' ExpD` still negates a whole Term: only a `.` or `[` postfix scopes there.
     fn negation_scopes_over_what_follows(&mut self) -> bool {
         // The byte right after the literal settles nearly every case.
         if matches!(self.peek(), None | Some(',' | ']' | ')' | '}' | ';' | '|')) {
@@ -11111,13 +11112,13 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         self.skip_ws();
         let peek2 = self.peek_str(2);
-        let scopes = self.matches_keyword("as")
-            || self.at_postfix_question()
+        let scopes = (!self.expd_operand
+            && (self.matches_keyword("as") || self.at_postfix_question()))
             || match self.peek() {
-                Some('.') => true,
-                Some('*') => peek2 != "*=",
-                Some('%') => peek2 != "%=",
-                Some('/') => peek2 != "//" && peek2 != "/=",
+                Some('.' | '[') => true,
+                Some('*') => !self.expd_operand && peek2 != "*=",
+                Some('%') => !self.expd_operand && peek2 != "%=",
+                Some('/') => !self.expd_operand && peek2 != "//" && peek2 != "/=",
                 _ => false,
             };
         self.pos = start;
