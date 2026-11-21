@@ -652,6 +652,24 @@ pub fn jq_depth_fault_offset(text: &[u8]) -> Option<usize> {
         .map(|fault| fault.offset)
 }
 
+/// [`jq_depth_fault_offset`] for jq's input stream, read as [`jq_stream_fault_end`] reads it: the
+/// byte of `text` holding the bracket jq refuses for its depth limit, when that is the first fault
+/// its parser meets in the stream of top-level values `text` holds, or `None` (#7470).
+///
+/// It reads only as far as the first fault, so a caller can learn where jq stops in a long text
+/// for the cost of the bytes before that point.
+#[doc(hidden)]
+pub fn jq_stream_depth_fault_offset(text: &[u8]) -> Option<usize> {
+    let mut parser = Parser::new(1, 0, JQ_MAX_PARSING_DEPTH);
+    parser.multi = true;
+    for (at, &byte) in text.iter().enumerate() {
+        if let Err(Stop::Fault(fault)) = parser.feed(byte) {
+            return (fault == DEPTH_FAULT).then_some(at);
+        }
+    }
+    None
+}
+
 /// Where a document checked against jq's parse-depth limit came from (#5497).
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1111,6 +1129,32 @@ mod tests {
         let objects = format!("\u{feff}{}", nest("{\"a\":", "1", "}", 129));
         assert_eq!(jq_depth_fault_offset(objects.as_bytes()), Some(3 + 640));
         assert_eq!(jq_depth_fault_offset(b"[1,,2]"), None);
+    }
+
+    /// The stream form reads every top-level value, places the fault where the single-text form
+    /// does, and stops there: what follows the refused bracket is never read (#7470).
+    #[test]
+    fn stream_depth_fault_offset_is_the_first_fault_of_the_stream_7470() {
+        let deep = nest("[", "", "]", 300);
+        assert_eq!(jq_stream_depth_fault_offset(deep.as_bytes()), Some(256));
+        let after = format!("1 2 {{\"a\":3}} {deep} 4");
+        assert_eq!(
+            jq_stream_depth_fault_offset(after.as_bytes()),
+            Some(12 + 256)
+        );
+        // Only a depth refusal: a fault of any other kind first is `None`.
+        let syntax_first = format!("1 ] {deep}");
+        assert_eq!(jq_stream_depth_fault_offset(syntax_first.as_bytes()), None);
+        assert_eq!(jq_stream_depth_fault_offset(b"[1,,2]"), None);
+        assert_eq!(jq_stream_depth_fault_offset(b"1 2 [3]"), None);
+        // What follows the refused bracket is never read, malformed or not.
+        let open = format!("{}\u{1}]]", "{\"a\":".repeat(129));
+        assert_eq!(jq_stream_depth_fault_offset(open.as_bytes()), Some(128 * 5));
+        // It agrees with the message `jq_stream_fault_end` gives for the same text.
+        for text in [deep.as_str(), after.as_str(), open.as_str()] {
+            let (message, _) = jq_stream_fault_end([text], 1, 0).unwrap();
+            assert!(is_jq_depth_fault(&message), "{message}");
+        }
     }
 
     /// The bracket walk refuses exactly where the parser does: on every boundary shape above and
