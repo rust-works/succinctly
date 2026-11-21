@@ -3309,6 +3309,37 @@ mod tests {
         resolve_func_calls(&mut expr).map_err(|e| format!("{e}"))
     }
 
+    /// #7474: a call the parser bound first is checked as written: `setpath(foo; bar)` is
+    /// parsed `bar as $a | foo as $b | setpath($b; $a)`, and jq 1.7.1 reports `foo` first
+    /// (its errors are checked in the builtin's own order), then the bound sources go back into
+    /// the bindings resolved. A binding of that name over anything but a call is checked as an
+    /// ordinary binding.
+    #[test]
+    fn a_bound_builtin_call_is_checked_as_written_7474() {
+        let mut expr = parse("setpath(foo; bar)").expect("filter must parse");
+        assert!(matches!(&expr, Expr::As { .. }), "{expr:?}");
+        let names: Vec<String> = resolve_all_jq(&mut expr)
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names[0].contains("foo") && names[1].contains("bar"), "{names:?}");
+
+        // The sources go back into the bindings, and the call is left holding its variables.
+        let mut expr = parse("def p: [\"a\"]; {} | setpath(p, p; 1, 2)").expect("filter must parse");
+        let before = expr.clone();
+        assert!(resolve_all_jq(&mut expr).is_empty());
+        assert_eq!(expr, before);
+
+        let mut odd = Expr::As {
+            expr: Box::new(parse("nosuch").expect("filter must parse")),
+            var: "%arg".to_string(),
+            body: Box::new(Expr::Identity),
+        };
+        let errors = resolve_all_jq(&mut odd);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
     /// The compiled-in roster must match what `./scripts/sync-jq-builtin-names.sh`
     /// captured from the pinned jq (1.7.1), entry for entry and in order.
     ///

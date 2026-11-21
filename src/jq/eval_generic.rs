@@ -49822,8 +49822,12 @@ mod tests {
         ] {
             assert_eq!(answers(fast), answers(evaluator), "{fast}");
         }
-        // A generator operand, a computed operand and a non-number keep the evaluator.
-        assert!(run("map([pow(.; (1, 2))] | .[0])").1 > 0);
+        // A computed operand and a non-number keep the evaluator. A generator operand is bound
+        // first since #7474 (`(1, 2) as $v | pow(.; $v)`), so each call is a variable operand.
+        assert_eq!(
+            run("map([pow(.; (1, 2))] | .[0])").0,
+            join(numbers.map(|n| math::pow(n, 1.0)).to_vec())
+        );
         assert!(run("map(pow(. + 1; 2))").1 > 0);
         assert!(run("map(tostring | try pow(.; 2) catch 0)").1 > 0);
     }

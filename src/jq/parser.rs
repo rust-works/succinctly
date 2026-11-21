@@ -2825,6 +2825,35 @@ pub(crate) fn is_value_arg_var(var: &str) -> bool {
     VALUE_ARG_VARS.contains(&var)
 }
 
+/// The call [`bind_value_args`] parsed `expr` from, with every bound source back in its slot, or
+/// `None` when `expr` is not such a binding. For a static judgment made on the call's shape as
+/// written (`eval::transparent_outputs`), which the bindings would otherwise move it off.
+pub(crate) fn unbound_value_args_call(expr: &Expr) -> Option<Expr> {
+    let mut sources: Vec<(&str, &Expr)> = Vec::new();
+    let mut node = expr;
+    while let Expr::As { expr: source, var, body } = node {
+        if !is_value_arg_var(var) {
+            break;
+        }
+        sources.push((var.as_str(), source.as_ref()));
+        node = body;
+    }
+    let (false, Expr::Builtin(builtin)) = (sources.is_empty(), node) else {
+        return None;
+    };
+    let mut builtin = builtin.clone();
+    for slot in builtin.value_args_mut() {
+        let bound = match &*slot {
+            Expr::Var(name) => sources.iter().find(|(var, _)| var == name),
+            _ => None,
+        };
+        if let Some(&(_, source)) = bound {
+            *slot = source.clone();
+        }
+    }
+    Some(Expr::Builtin(builtin))
+}
+
 /// `B(G)` as jq runs it, `G as $v | B($v)`, in jq mode, when an argument jq binds per value
 /// can yield more than one value or holds a `?//` bind (#7474, #3487).
 ///
@@ -14369,12 +14398,19 @@ mod tests {
                 "{kw}"
             );
         }
+        // #7474: a generator argument of `nth/1` is bound first, one value at a time.
         assert_eq!(
             parse("nth(1,2)").unwrap(),
-            Expr::Builtin(Builtin::Nth(Box::new(Expr::Comma(vec![
-                Expr::Literal(Literal::number_literal("1".to_string())),
-                Expr::Literal(Literal::number_literal("2".to_string())),
-            ]))))
+            Expr::As {
+                expr: Box::new(Expr::Comma(vec![
+                    Expr::Literal(Literal::number_literal("1".to_string())),
+                    Expr::Literal(Literal::number_literal("2".to_string())),
+                ])),
+                var: VALUE_ARG_VAR.to_string(),
+                body: Box::new(Expr::Builtin(Builtin::Nth(Box::new(Expr::Var(
+                    VALUE_ARG_VAR.to_string()
+                ))))),
+            }
         );
 
         // User-defined single-parameter function called with a comma
