@@ -38,7 +38,7 @@ fn test_index_write_past_the_bound_says_array_index_too_large_7536() -> Result<(
 #[test]
 fn test_array_index_too_large_is_caught_by_try_7536() -> Result<()> {
     let (stdout, code) = run_jq_null(
-        r#"try ([] | .[536870912] = 1 | length) catch ., try setpath([536870912]; 1) catch ., (try ([] | .[1e12] = 1) catch .)"#,
+        r"try ([] | .[536870912] = 1 | length) catch ., try setpath([536870912]; 1) catch ., (try ([] | .[1e12] = 1) catch .)",
         &["-c"],
     )?;
     assert_eq!(
