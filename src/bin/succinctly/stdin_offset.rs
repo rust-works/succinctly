@@ -182,17 +182,24 @@ pub(crate) fn restore() {
         return;
     }
     // A main loop stops at the first parse error its reads meet, the stream's first unless the
-    // program's own `input` met one before (a route whose main loop does not read through the
-    // queue counts its inputs, so its queue's errors are the program's). It is placed without the
-    // count of what came before it: some routes count a document they hand over before its
-    // decoding meets the error, and some count the error both as the queue's and the loop's.
+    // program's own `input` met one before. It is placed without the count of what came before
+    // it: some routes count a document they hand over before its decoding meets the error.
     let taken_by_loop = TAKEN.with(Cell::get);
-    if run.main_loop && main_fault && taken_by_loop > 0 && reads.faults > 0 {
-        return;
-    }
-    let first_fault = run.main_loop && main_fault;
+    // A main loop that reads through the queue (it counts no inputs of its own) has its own error
+    // among the queue's.
+    let loop_reads_queue = taken_by_loop == 0;
+    let program_faults = if loop_reads_queue {
+        reads.faults.saturating_sub(1)
+    } else {
+        reads.faults
+    };
+    let first_fault = run.main_loop && main_fault && program_faults == 0;
     let taken = if first_fault {
         u64::MAX
+    } else if run.main_loop && main_fault {
+        // The program's own `input` met an error first: every input and error is counted, the
+        // loop's last.
+        reads.documents + taken_by_loop + reads.faults + u64::from(!loop_reads_queue) - counted
     } else {
         reads.documents + taken_by_loop + faults - counted
     };
