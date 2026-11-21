@@ -111,8 +111,14 @@ pub(crate) fn fgets_chunk_lens(raw: &[u8]) -> impl Iterator<Item = usize> + '_ {
 /// The length of the `fgets` chunk that starts at `pos` in `raw`, or `None` at its end: one step
 /// of [`fgets_chunk_lens`], for a reader that finds the chunks as it goes (#5498).
 pub(crate) fn fgets_chunk_len_at(raw: &[u8], pos: usize) -> Option<usize> {
+    fgets_chunk_len_in(raw, pos, JQ_FGETS_CHUNK)
+}
+
+/// [`fgets_chunk_len_at`] for a chunk with room for `room` bytes of `raw`: the first chunk of a
+/// source whose BOM it also holds, which `raw` no longer has (#7569).
+pub(crate) fn fgets_chunk_len_in(raw: &[u8], pos: usize, room: usize) -> Option<usize> {
     let rest = raw.get(pos..).filter(|rest| !rest.is_empty())?;
-    let chunk = &rest[..rest.len().min(JQ_FGETS_CHUNK)];
+    let chunk = &rest[..rest.len().min(room)];
     // #7263: searched a block at a time; a byte at a time this was most of a long line's walk.
     Some(find_byte(b'\n', chunk).map_or(chunk.len(), |index| index + 1))
 }

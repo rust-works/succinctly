@@ -33,8 +33,7 @@
 //! this module decides only where each one begins and ends and which error fires.
 
 use crate::cli::jq_seq_reader::{
-    c_string, decode_string_in_place, fgets_chunk_len_at, fgets_visible_len, number_is_valid,
-    JQ_FGETS_CHUNK,
+    c_string, decode_string_in_place, fgets_visible_len, number_is_valid, JQ_FGETS_CHUNK,
 };
 use succinctly::jq::{ArrayVec, OwnedValue};
 
@@ -170,9 +169,13 @@ pub(crate) struct MemorySources<S: AsRef<[(Option<usize>, Vec<u8>)]>> {
 
 impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> MemorySources<S> {
     pub(crate) fn new(sources: S) -> Self {
+        let leads = STREAM_BOM_LEADS.with(|leads| leads.borrow().clone());
         Self {
             sources,
-            cursor: RefillCursor::default(),
+            cursor: RefillCursor {
+                leads,
+                ..RefillCursor::default()
+            },
         }
     }
 }
@@ -225,11 +228,16 @@ pub(crate) struct ChunkedSources {
     /// The tail's last failure is a source of its own in jq's reader, so the last source that
     /// opened does not end the stream.
     tail_is_source: bool,
+    /// How many of each source's first bytes are the BOM jq's parser skips (#7569): they are read in
+    /// the source's first chunk, which so holds that many fewer bytes of text, and dropped from it.
+    bom_cuts: Vec<usize>,
+    /// The source open in `current` has had no chunk read yet.
+    at_source_front: bool,
 }
 
 impl ChunkedSources {
-    /// `openers` in input order, each giving the reader of one source, already past a leading BOM
-    /// that is to be skipped.
+    /// `openers` in input order, each giving the reader of one source from its first byte; a BOM to
+    /// skip is [`with_bom_cuts`](Self::with_bom_cuts)'s.
     pub(crate) fn new(openers: Vec<Opener>) -> Self {
         Self {
             openers: openers.into_iter().map(Some).collect(),
@@ -242,7 +250,16 @@ impl ChunkedSources {
             error: None,
             tail: Vec::new(),
             tail_is_source: false,
+            bom_cuts: Vec::new(),
+            at_source_front: false,
         }
+    }
+
+    /// Skips `cuts[n]` bytes, the BOM jq's parser skips, at the front of source `n`, once its first
+    /// chunk is read with them (#7569).
+    pub(crate) fn with_bom_cuts(mut self, cuts: Vec<usize>) -> Self {
+        self.bom_cuts = cuts;
+        self
     }
 
     /// Has `tail` run when the reader asks past the last source (#6485).
@@ -316,6 +333,7 @@ impl RefillSource for ChunkedSources {
                     },
                     |open| open(),
                 );
+                self.at_source_front = true;
                 self.current = Some(match opened {
                     Ok(reader) => reader,
                     Err(e) => {
@@ -368,6 +386,11 @@ impl RefillSource for ChunkedSources {
             let (end, error) = read_chunk(reader.as_mut(), buf);
             if let Some(e) = error {
                 self.fail(e);
+            }
+            // jq's `fgets` reads the mark with the text after it, and its parser skips it.
+            if std::mem::take(&mut self.at_source_front) {
+                let cut = self.bom_cuts.get(source).copied().unwrap_or(0);
+                buf.drain(..cut.min(buf.len()));
             }
             if buf.is_empty() {
                 // A source with no bytes is a refill of its own.
@@ -447,6 +470,17 @@ struct RefillCursor {
     /// The source whose last chunk filled the buffer with no newline, so that jq's next `fgets` of
     /// it returns nothing, a refill of its own that is not the last (#6760).
     empty_after: Option<usize>,
+    /// How many bytes of each source's first chunk were a BOM, which the sources no longer hold
+    /// ([`STREAM_BOM_LEADS`], #7569): that chunk has room for that many fewer of their bytes.
+    leads: Vec<usize>,
+}
+
+thread_local! {
+    /// The BOM bytes `strip_leading_json_bom` cut off the front of each of the run's sources (#7569),
+    /// which jq's `fgets` read in each one's first chunk: [`MemorySources`] over those sources reads
+    /// their first chunks that much shorter. Empty when nothing was cut.
+    pub(crate) static STREAM_BOM_LEADS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A refill of the in-memory sources, with its bytes borrowed from them.
@@ -482,7 +516,15 @@ impl RefillCursor {
                     is_last,
                 });
             }
-            let Some(len) = fgets_chunk_len_at(raw, self.pos) else {
+            // The first chunk of a source held its BOM too.
+            let lead = if self.pos == 0 {
+                self.leads.get(source).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            let room = JQ_FGETS_CHUNK - lead;
+            let Some(len) = crate::cli::jq_seq_reader::fgets_chunk_len_in(raw, self.pos, room)
+            else {
                 self.source += 1;
                 self.pos = 0;
                 continue;
@@ -495,11 +537,11 @@ impl RefillCursor {
                 self.pos = 0;
             }
             let newline = chunk.ends_with(b"\n");
-            let hit_eof = !newline && len < JQ_FGETS_CHUNK;
+            let hit_eof = !newline && len < room;
             let bytes = &chunk[..fgets_visible_len(chunk)];
             let is_last = last_source && at_end && hit_eof;
             self.last = Some((source, is_last));
-            if at_end && !last_source && !newline && len == JQ_FGETS_CHUNK {
+            if at_end && !last_source && !newline && len == room {
                 self.empty_after = Some(source);
             }
             return Some(CursorRefill {

@@ -5601,13 +5601,14 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         };
         jq::cli_context::set_input_names(names);
         // #5291: jq skips a BOM at the start of its input, `--validate` included.
-        strip_leading_json_bom(raw_inputs.iter_mut());
+        let bom_cuts = strip_leading_json_bom(raw_inputs.iter_mut());
         // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
         let mut seams = if args.validate {
             Vec::new()
         } else {
             stitch_json_file_seams(raw_inputs.iter_mut(), false, false)
         };
+        note_bom_leads(&mut seams, &bom_cuts, raw_inputs.len());
         // Substitution is skipped under `--validate` so the strict validator
         // in the loop below still sees the *original* bytes (#1247).
         // Substituting first silently repaired a non-UTF-8 document, leaving
@@ -7468,10 +7469,11 @@ fn read_inputs(
     // #5498: a program that asks for the `--stream` events as it goes reads them from the files a
     // chunk at a time, as jq does, and not from their bytes read whole first.
     if stream_read_in_chunks(args, track_eof) {
-        let (files, readers, unopened_tail, tail_is_source) = match open_chunked_inputs(&files) {
-            Ok(opened_inputs) => opened_inputs,
-            Err(e) => return Ok(Err(e)),
-        };
+        let (files, readers, unopened_tail, tail_is_source, bom_cuts) =
+            match open_chunked_inputs(&files) {
+                Ok(opened_inputs) => opened_inputs,
+                Err(e) => return Ok(Err(e)),
+            };
         opened.clone_from(&files);
         let locations =
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
@@ -7495,7 +7497,8 @@ fn read_inputs(
                 files: tags,
                 reader: crate::cli::jq_stream_errors::Reader::from_source(Box::new(
                     crate::cli::jq_stream_errors::ChunkedSources::new(readers)
-                        .with_tail(unopened_tail, tail_is_source),
+                        .with_tail(unopened_tail, tail_is_source)
+                        .with_bom_cuts(bom_cuts),
                 )),
                 raise_errors: !args.stream_errors,
             });
@@ -7552,7 +7555,7 @@ fn read_inputs(
         SEVERAL_WINDOWED_STARTS.with(|n| n.set(n.get() + 1));
         let sources = windows
             .into_iter()
-            .map(|windows| (String::new(), Vec::new(), LazyRest { windows }))
+            .map(|(windows, lead)| (String::new(), Vec::new(), LazyRest { windows }, lead))
             .collect();
         return Ok(Ok(defer_windowed_lazy_sources(&files, opened, sources)));
     }
@@ -7563,10 +7566,15 @@ fn read_inputs(
     let mut read_whole: Option<Vec<u8>> = None;
     if lone_lazy_read(args, track_eof, &files) {
         match lone_lazy_start(&files) {
-            Ok(LoneStart::Lazy { text, spans, rest }) => {
+            Ok(LoneStart::Lazy {
+                text,
+                spans,
+                rest,
+                lead,
+            }) => {
                 #[cfg(test)]
                 LONE_FRONT_STARTS.with(|n| n.set(n.get() + 1));
-                let sources = vec![(text, spans, rest)];
+                let sources = vec![(text, spans, rest, lead)];
                 return Ok(Ok(defer_windowed_lazy_sources(&files, opened, sources)));
             }
             Ok(LoneStart::Read(bytes)) => read_whole = Some(bytes),
@@ -7939,10 +7947,15 @@ fn read_inputs(
     // record-sequence mode: the program reads the events a record produces, not its document.
     let seq_by_stream_reader = seq_by_stream_reader(args);
     // `--seq` keeps the mark: its reader removes it as jq's does, and reacts to one that breaks off.
-    if json_input_mode {
+    let bom_cuts = if json_input_mode {
         // #5291: jq skips a BOM at the start of its input.
-        strip_leading_json_bom(raw_bytes.iter_mut().map(|(_, raw)| raw));
-    }
+        strip_leading_json_bom(raw_bytes.iter_mut().map(|(_, raw)| raw))
+    } else {
+        Vec::new()
+    };
+    // #7569: the stream reader's chunks of these sources held the cut bytes.
+    crate::cli::jq_stream_errors::STREAM_BOM_LEADS
+        .with(|leads| leads.borrow_mut().clone_from(&bom_cuts));
     // #4305: jq reads every input file as one byte stream, so a token still open at the end of
     // a file continues in the next one.
     // `--validate` is strict per file (an empty file is rejected too), so it reads the files as
@@ -7974,6 +7987,7 @@ fn read_inputs(
     } else {
         Vec::new()
     };
+    note_bom_leads(&mut seams, &bom_cuts, raw_bytes.len());
 
     // #1525: real jq warns on stderr when it drops a malformed --seq
     // record; succinctly silently ignored malformed records entirely
@@ -8911,7 +8925,11 @@ fn read_inputs(
                     let seam = if stitched {
                         seams.get(pos).cloned().unwrap_or_default()
                     } else {
-                        Seam::NONE
+                        // The BOM's lead is no stitch (#7569).
+                        Seam {
+                            lead: seams.get(pos).map_or(0, |seam| seam.lead),
+                            ..Seam::NONE
+                        }
                     };
                     let more = more_from.map(|(scanned_to, chunks)| LazyMore {
                         scanned_to,
@@ -9055,7 +9073,15 @@ fn read_inputs(
                                 rest: None,
                             });
                             if recorded_tail.is_none() {
-                                debug_assert_eq!(seam, Seam::NONE, "a lone source is unstitched");
+                                // A BOM's lead is no stitch (#7569).
+                                debug_assert_eq!(
+                                    Seam {
+                                        lead: 0,
+                                        ..seam.clone()
+                                    },
+                                    Seam::NONE,
+                                    "a lone source is unstitched"
+                                );
                                 locations.eof_tail = Some(if more.is_some() {
                                     EofTail {
                                         newlines: 0,
@@ -11253,6 +11279,7 @@ type ChunkedInputs = (
     Vec<crate::cli::jq_stream_errors::Opener>,
     crate::cli::jq_stream_errors::Tail,
     bool,
+    Vec<usize>,
 );
 
 /// Wraps `open` so that the reader, on reaching the source, first says what jq says of the files
@@ -11291,14 +11318,17 @@ fn report_lazy_open_failures(failures: &[InputFileOpenError]) {
 /// A pipe or socket named by path is the exception (#7295): it cannot be opened again or seeked, so
 /// the probe's handle is kept (until the reader gets to it) and read on from the probe.
 /// Stdin is read for its first bytes and kept.
+///
+/// Each opener reads its source from its first byte, a BOM included: the last element is how many
+/// of each opener's first bytes are the mark, which the reader skips once it has read them in its
+/// first `fgets` chunk of the source, as jq's parser skips them (#7569). The mark may be cut across
+/// the first sources with bytes (#7566), and a stream that ends inside it is empty input (#7454).
 fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let mut opened = Vec::with_capacity(files.len());
     let mut openers: Vec<crate::cli::jq_stream_errors::Opener> =
         Vec::with_capacity(files.len().max(1));
-    // Each source's head and the cell its opener reads its cut of the BOM from, set once every
-    // source is probed: the mark may be cut across the first sources with bytes (#7566), and a
-    // stream that ends inside it is empty input (#7454).
-    let mut fronts: Vec<(Vec<u8>, std::rc::Rc<std::cell::Cell<usize>>)> = Vec::new();
+    // Each opener's first bytes, for the cuts.
+    let mut fronts: Vec<Vec<u8>> = Vec::new();
     if files.is_empty() {
         let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
         let mut stdin =
@@ -11313,15 +11343,12 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                 Vec::new()
             })
         };
-        let skip = crate::cli::front_matter::bom_cut_at(
-            &crate::cli::front_matter::stream_bom_cuts([head.as_slice()]),
-            0,
-        );
+        let cuts = crate::cli::front_matter::stream_bom_cuts([head.as_slice()]);
         openers.push(Box::new(move || {
-            let rest = std::io::Cursor::new(head[skip..].to_vec()).chain(stdin);
+            let rest = std::io::Cursor::new(head).chain(stdin);
             Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, rest)))
         }));
-        return Ok((opened, openers, Vec::new(), false));
+        return Ok((opened, openers, Vec::new(), false, cuts));
     }
     // The files that would not open since the last one that did: said when the reader reaches
     // the next source, or its end (#6485).
@@ -11336,8 +11363,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
             } else {
                 (Vec::new(), false)
             };
-            let skip = std::rc::Rc::new(std::cell::Cell::new(0));
-            fronts.push((bytes[..bytes.len().min(3)].to_vec(), skip.clone()));
+            fronts.push(bytes[..bytes.len().min(3)].to_vec());
             opened.push(path.clone());
             openers.push(report_unopened_before(
                 std::mem::take(&mut unopened),
@@ -11346,8 +11372,6 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                     if failed {
                         note_stdin_read_failed();
                     }
-                    let mut bytes = bytes;
-                    bytes.drain(..skip.get());
                     Ok(Box::new(std::io::Cursor::new(bytes)))
                 }),
             ));
@@ -11368,17 +11392,14 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
             .map_err(|e| InputFileOpenError::from_io(path, &e, at + 1 == files.len()));
         match probed {
             Ok((head, kept)) => {
-                let cut = std::rc::Rc::new(std::cell::Cell::new(0));
-                fronts.push((head.clone(), cut.clone()));
+                fronts.push(head.clone());
                 let path = path.clone();
                 opened.push(path.clone());
                 openers.push(report_unopened_before(
                     std::mem::take(&mut unopened),
                     Box::new(move || {
-                        use std::io::Seek;
-                        let skip = cut.get();
                         if let Some(file) = kept {
-                            let front = std::io::Cursor::new(head[skip..].to_vec());
+                            let front = std::io::Cursor::new(head);
                             let rest: Box<dyn std::io::Read> = match file {
                                 Some(file) => Box::new(front.chain(file)),
                                 None => Box::new(front),
@@ -11388,8 +11409,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                                     as Box<dyn std::io::BufRead>,
                             );
                         }
-                        let mut file = std::fs::File::open(&path)?;
-                        file.seek(std::io::SeekFrom::Start(skip as u64))?;
+                        let file = std::fs::File::open(&path)?;
                         Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, file)))
                     }),
                 ));
@@ -11439,10 +11459,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let tail_is_source = unopened
         .last()
         .is_some_and(|failure| !failure.is_directory());
-    let cuts = crate::cli::front_matter::stream_bom_cuts(fronts.iter().map(|(head, _)| &head[..]));
-    for (at, (_, cut)) in fronts.iter().enumerate() {
-        cut.set(crate::cli::front_matter::bom_cut_at(&cuts, at));
-    }
+    let cuts = crate::cli::front_matter::stream_bom_cuts(fronts.iter().map(Vec::as_slice));
     // #6531: and `input_filename` names it from there on, once `get_inputs` hands it to the
     // locations.
     if let Some(failure) = unopened.last().filter(|_| tail_is_source) {
@@ -11466,7 +11483,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
         });
         Vec::new()
     };
-    Ok((opened, openers, tail, tail_is_source))
+    Ok((opened, openers, tail, tail_is_source, cuts))
 }
 
 /// Whether the probe's handle on a source is the one the reader reads on: a pipe or a socket
@@ -11613,11 +11630,30 @@ fn read_file_bytes(path: &Path, last: bool) -> std::result::Result<Vec<u8>, Inpu
 /// `-R` and `--seq` never come through here: raw input is never parsed, and
 /// the `--seq` reader accounts for the BOM itself (`bom_prefix`), including
 /// the malformed forms.
-fn strip_leading_json_bom<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
+///
+/// The cuts are handed back, one per file (empty when there is no mark): jq's `fgets` still reads
+/// the mark, so the reads of a file's first line start that many bytes before its text (#7569).
+fn strip_leading_json_bom<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) -> Vec<usize> {
     let raws: Vec<&mut Vec<u8>> = raws.collect();
     let cuts = crate::cli::front_matter::stream_bom_cuts(raws.iter().map(|raw| raw.as_slice()));
-    for (raw, cut) in raws.into_iter().zip(cuts) {
+    for (raw, &cut) in raws.into_iter().zip(&cuts) {
         raw.drain(..cut);
+    }
+    cuts
+}
+
+/// Puts the BOM cuts [`strip_leading_json_bom`] made on the seams of the `files` files, as each
+/// file's [`Seam::lead`] (#7569), filling an empty list of seams with [`Seam::NONE`] when there is a
+/// mark to record.
+fn note_bom_leads(seams: &mut Vec<Seam>, cuts: &[usize], files: usize) {
+    if cuts.iter().all(|&cut| cut == 0) {
+        return;
+    }
+    if seams.is_empty() {
+        seams.resize(files, Seam::NONE);
+    }
+    for (seam, &cut) in seams.iter_mut().zip(cuts) {
+        seam.lead = cut;
     }
 }
 
@@ -12813,6 +12849,12 @@ struct Seam {
     /// and a share can end inside a replacement, where jq's next read starts on a byte the text
     /// no longer has. `None` until the substitution has run on the file.
     raw_ends: Option<std::rc::Rc<[usize]>>,
+    /// How many bytes of the file come before its text that jq's first read of it holds: the BOM
+    /// jq's parser skips, which its `fgets` still reads (#7569). The text's first line therefore
+    /// starts that many bytes into the first 4095-byte read, and its later reads start that many
+    /// bytes early. 0 for every file but the stream's first with bytes (and those the mark is cut
+    /// across, #7566).
+    lead: usize,
 }
 
 /// One file's share of the bytes moved onto the front of a later file (#5936).
@@ -12862,6 +12904,7 @@ impl Seam {
         prev_source: 0,
         earlier: None,
         raw_ends: None,
+        lead: 0,
     };
 
     /// The file's own bytes: `raw` without the ones moved onto its front.
@@ -13004,6 +13047,9 @@ struct LineCounter<'a> {
     /// What [`stitch_json_file_seams`] did to `bytes`, whose lines are jq's lines of the file
     /// as it was on disk (#4316).
     seam: Seam,
+    /// The bytes jq's first read held before `bytes` while the counter is on the text's first line
+    /// ([`Seam::lead`], #7569), and 0 once it is past a line break.
+    lead: usize,
 }
 
 /// A [`LineCounter`]'s position without its text (#5661): only [`LineCounter::resume`] over
@@ -13015,6 +13061,7 @@ struct LinePlace {
     line_start: usize,
     next_newline: Option<usize>,
     seam: Seam,
+    lead: usize,
 }
 
 impl LinePlace {
@@ -13059,6 +13106,7 @@ impl<'a> LineCounter<'a> {
             newlines_before_pos: 0,
             line_start: base,
             next_newline: None,
+            lead: seam.lead,
             seam,
         }
     }
@@ -13080,6 +13128,7 @@ impl<'a> LineCounter<'a> {
             line_start: self.line_start,
             next_newline: self.next_newline,
             seam: self.seam.clone(),
+            lead: self.lead,
         }
     }
 
@@ -13092,6 +13141,7 @@ impl<'a> LineCounter<'a> {
             line_start: place.line_start,
             next_newline: place.next_newline,
             seam: place.seam.clone(),
+            lead: place.lead,
         }
     }
 
@@ -13164,8 +13214,7 @@ impl<'a> LineCounter<'a> {
     /// it costs nothing more.
     fn read_end(&self, at: usize) -> usize {
         let at = at.max(self.line_start);
-        let chunk_end =
-            self.line_start + ((at - self.line_start) / JQ_READ_CHUNK + 1) * JQ_READ_CHUNK;
+        let chunk_end = self.line_start + (self.read_of(at) + 1) * JQ_READ_CHUNK - self.lead;
         match self.next_newline {
             Some(newline) if newline < chunk_end && newline < self.read_len() => newline + 1,
             _ => chunk_end.min(self.read_len()),
@@ -13180,6 +13229,8 @@ impl<'a> LineCounter<'a> {
         let counted = &self.bytes[self.pos..completes_at];
         if let Some(last) = counted.iter().rposition(|&b| b == b'\n') {
             self.line_start = self.pos + last + 1;
+            // A read starts after the line break: the mark jq's first read held is behind it.
+            self.lead = 0;
         }
         self.newlines_before_pos += count_newlines(counted);
         self.pos = completes_at;
@@ -13197,10 +13248,14 @@ impl<'a> LineCounter<'a> {
                 ),
         };
         self.next_newline = Some(next);
-        let same_read = next < self.read_len()
-            && (next - self.line_start) / JQ_READ_CHUNK
-                == (completes_at - self.line_start) / JQ_READ_CHUNK;
+        let same_read = next < self.read_len() && self.read_of(next) == self.read_of(completes_at);
         self.newlines_before_pos + usize::from(same_read)
+    }
+
+    /// Which of the reads of the line holding `at` (from `line_start`) holds it, counted from 0: the
+    /// first read of the text's first line holds the [`lead`](Self::lead) bytes too (#7569).
+    fn read_of(&self, at: usize) -> usize {
+        (at - self.line_start + self.lead) / JQ_READ_CHUNK
     }
 
     /// Same result [`line_at`] would return for this `end`, given every
@@ -14379,7 +14434,7 @@ fn several_lazy_windowed_files(
     args: &JqCommand,
     track_eof: bool,
     files: &[PathBuf],
-) -> Option<Vec<window::LineWindows>> {
+) -> Option<Vec<(window::LineWindows, usize)>> {
     if files.len() < 2 || !lazy_read_flags(args, track_eof) {
         return None;
     }
@@ -14406,9 +14461,12 @@ fn several_lazy_windowed_files(
     Some(
         sources
             .into_iter()
-            .map(|(file, ..)| {
+            .map(|(file, start, _)| {
                 // No length: the file is read to the end it has when the reads get there.
-                window::LineWindows::new(Box::new(file), None, lazy_window_bytes(), Vec::new())
+                let windows =
+                    window::LineWindows::new(Box::new(file), None, lazy_window_bytes(), Vec::new());
+                // The start past a BOM is the mark jq's first read held (#7569).
+                (windows, usize::try_from(start).unwrap_or(0))
             })
             .collect(),
     )
@@ -14442,7 +14500,9 @@ fn windowed_file_start(
 /// the list holds one descriptor, and each file's windows read through [`window::OpenWhenRead`], which
 /// opens the path when the run first reads it, as jq does. A file that will not open then reads as no
 /// bytes and is noted for the read hook ([`note_raw_open_failure`]), as for `-R`.
-fn several_lazy_windowed_files_by_path(files: &[PathBuf]) -> Option<Vec<window::LineWindows>> {
+fn several_lazy_windowed_files_by_path(
+    files: &[PathBuf],
+) -> Option<Vec<(window::LineWindows, usize)>> {
     judge_regular_paths(files, raw_window_min_bytes())?;
     let count = files.len();
     let mut sources = Vec::with_capacity(count);
@@ -14475,7 +14535,15 @@ fn several_lazy_windowed_files_by_path(files: &[PathBuf]) -> Option<Vec<window::
                 // reader reads it, where the length a `stat` gave now may be another file's.
                 let reader =
                     window::OpenWhenRead::new(path.clone(), at, at + 1 == count).starting_at(start);
-                window::LineWindows::new(Box::new(reader), None, lazy_window_bytes(), Vec::new())
+                // The start past a BOM is the mark jq's first read held (#7569).
+                let lead = usize::try_from(start).unwrap_or(0);
+                let windows = window::LineWindows::new(
+                    Box::new(reader),
+                    None,
+                    lazy_window_bytes(),
+                    Vec::new(),
+                );
+                (windows, lead)
             })
             .collect(),
     )
@@ -14592,8 +14660,9 @@ fn check_file_text(file: &mut std::fs::File, start: u64) -> Option<FileText> {
 }
 
 /// One source [`defer_windowed_lazy_sources`] defers: the text read of it so far, the documents of its
-/// first chunk in that text, and the rest of it to read.
-type WindowedLazySource = (String, Vec<(usize, usize)>, LazyRest);
+/// first chunk in that text, the rest of it to read, and the bytes of a BOM before the text that jq's
+/// first read of it held ([`Seam::lead`], #7569).
+type WindowedLazySource = (String, Vec<(usize, usize)>, LazyRest, usize);
 
 /// The read of a stream the lazy route reads a window at a time, for [`get_inputs`] to hand over:
 /// `sources` deferred in order, each with the text read of it so far, the documents of its first chunk
@@ -14613,18 +14682,19 @@ fn defer_windowed_lazy_sources(
         unknown: true,
     });
     let last_source = locations.last_src();
-    for (src, (text, spans, rest)) in sources.into_iter().enumerate() {
+    for (src, (text, spans, rest, lead)) in sources.into_iter().enumerate() {
+        let seam = Seam { lead, ..Seam::NONE };
         let more = LazyMore {
             scanned_to: spans.last().map_or(0, |&(_, end)| end),
             chunks: usize::from(!spans.is_empty()),
-            seams: vec![Seam::NONE],
+            seams: vec![seam.clone()],
             last_source,
             lossy: None,
             last_span: None,
             recorded_tail: None,
             rest: Some(rest),
         };
-        defer_lazy_start(std::rc::Rc::new(text), spans, src, Seam::NONE, Some(more));
+        defer_lazy_start(std::rc::Rc::new(text), spans, src, seam, Some(more));
     }
     mark_lazy_stream_end(true);
     (Vec::new(), locations, None, Vec::new())
@@ -14638,6 +14708,8 @@ enum LoneStart {
         text: String,
         spans: Vec<(usize, usize)>,
         rest: LazyRest,
+        /// The BOM before `text`, which jq's first read held (#7569).
+        lead: usize,
     },
     /// Every byte of the source, read for the route that reads it whole.
     Read(Vec<u8>),
@@ -14752,6 +14824,7 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             Ok(text) => {
                 return Ok(LoneStart::Lazy {
                     text,
+                    lead: bom,
                     spans: chunk.spans,
                     rest: LazyRest {
                         windows: {

@@ -881,6 +881,8 @@ impl WindowedFile {
                 self.seam_raw = Seam::NONE;
                 self.carry_raw = Vec::new();
             }
+            // The text starts on a later line now, whose reads start at its front (#7569).
+            self.seam.lead = 0;
             self.raw_map.drop_before(self.offset);
         }
     }
@@ -1038,6 +1040,9 @@ impl WindowedFile {
             if bom > 0 {
                 self.buf.drain(..bom);
                 self.offset += bom;
+                // jq's first read holds the mark, so the reads of the first line start before the
+                // text (#7569).
+                self.seam.lead = bom;
                 self.no_break_from = self.no_break_from.saturating_sub(bom);
                 self.front_end = self.front_end.saturating_sub(bom);
             }
