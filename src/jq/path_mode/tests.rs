@@ -2554,3 +2554,87 @@ fn owned_value_truthiness_agrees_across_routes_7244() {
         assert_eq!(v.is_falsy(), !expected, "is_falsy of {v:?}");
     }
 }
+
+/// `keys`, `keys_unsorted` and `.[]` hand out the object's own key `jv`
+/// (`jv_object_iter_key`), so a key read twice is identical; another object's
+/// key, a fresh string and a constructor's literal key (one per site) are
+/// not (#7401). Writes keep a key the object has and store the key they are
+/// given (`jv_object_set`).
+#[test]
+fn an_object_key_is_one_value_per_object_7401() {
+    on_big_stack(|| {
+        let refused = r#"Invalid path expression with result "a""#;
+        check(&[
+            (
+                r#"{"a":1}"#,
+                "keys[0] as $k | keys[0] | path($k)",
+                ok(&["[]"]),
+            ),
+            (
+                r#"{"b":1,"a":2}"#,
+                "keys_unsorted[1] as $k | keys[0] | path($k)",
+                ok(&["[]"]),
+            ),
+            (
+                r#"{"a":1}"#,
+                "[paths][0][0] as $k | to_entries[0].key | path($k)",
+                ok(&["[]"]),
+            ),
+            (
+                r#"{"a":1}"#,
+                r#""a" as $k | keys[0] | path($k)"#,
+                err(&[], refused),
+            ),
+            (
+                r#"{"a":1,"b":{"a":2}}"#,
+                "keys[0] as $k | .b | keys[0] | path($k)",
+                err(&[], refused),
+            ),
+            (
+                "null",
+                "[range(2) | {a: .}] | (.[0] | keys[0]) as $k | .[1] | keys[0] | path($k)",
+                ok(&["[]"]),
+            ),
+            (
+                "null",
+                "[{a: 1}, {a: 2}] | (.[0] | keys[0]) as $k | .[1] | keys[0] | path($k)",
+                err(&[], refused),
+            ),
+            (
+                r#"{"a":1}"#,
+                "keys[0] as $k | {($k): 2} | keys[0] | path($k)",
+                ok(&["[]"]),
+            ),
+            (
+                r#"{"a":1}"#,
+                "keys[0] as $k | . + {b: 2} | keys[0] | path($k)",
+                ok(&["[]"]),
+            ),
+            (
+                r#"{"a":1}"#,
+                "keys[0] as $k | {a: 3} + . | keys[0] | path($k)",
+                err(&[], refused),
+            ),
+            (
+                r#"{"b":{"a":1},"a":"b"}"#,
+                "keys[0] as $k | {z: 1} * . | keys_unsorted[-1] | path($k)",
+                ok(&["[]"]),
+            ),
+            (
+                r#"{"a":{"b":1}}"#,
+                ".a as $x | . * {a: {}} | .a | path($x)",
+                ok(&["[]"]),
+            ),
+            (
+                r#"{"a":1}"#,
+                "keys[0] as $k | null | setpath([$k]; 1) | keys[0] | path($k)",
+                ok(&["[]"]),
+            ),
+            (
+                "null",
+                r#""[{\"a\":1},{\"a\":2}]" | fromjson | (.[0] | keys[0]) as $k | .[1] | keys[0] | path($k)"#,
+                err(&[], refused),
+            ),
+        ]);
+    });
+}

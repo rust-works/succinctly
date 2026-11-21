@@ -18,6 +18,9 @@
 //!   and number literal the interpreter holds has storage of its own: the
 //!   input document is promoted on entry, a constant once per site, and a C
 //!   builtin's result as it is answered (`fresh`), as jq allocates every `jv`.
+//!   So does every object key (#7401): one per object, which `.[]`, `keys`
+//!   and `keys_unsorted` hand out, and which a write keeps or takes from the
+//!   key it is given, as jq's `jv_object_set` does.
 //! - Each `Expr` arm follows the bytecode `compile.c` emits for it, cited at
 //!   the arm. The jq-defined builtins run their `builtin.jq` bodies
 //!   ([`PRELUDE`]); the C-coded ones are delegated to the existing evaluator
@@ -60,7 +63,8 @@ use super::tail_call::{
 };
 use super::value::FieldMap;
 use super::value::{
-    jv_identical, ArrayVec, NumberRepr, OwnedValue, SharableLiteral, SharableString,
+    assert_value_tree_depth, jv_identical, ArrayVec, NumberRepr, ObjectMap, OwnedValue,
+    SharableLiteral, SharableString,
 };
 use super::walk::{
     any_subexpr, builtin_kids, map_builtin_subexprs, search_subexpr, BuiltinKids, Visit,
@@ -78,6 +82,19 @@ fn literal(repr: NumberRepr, spelling: &str) -> OwnedValue {
     let mut spelling = SharableLiteral::from(spelling);
     spelling.promote();
     OwnedValue::NumberLiteral(repr, spelling)
+}
+
+/// An object's key as jq hands it out (`jv_object_iter_key`, which `.[]`,
+/// `keys` and `keys_unsorted` read): the object's own key `jv`, so two reads
+/// of one key are identical (#7401). Every object the interpreter holds has
+/// its keys promoted (`promote_identities`, `promote_built`, the constructor);
+/// a key that is still inline gets fresh storage instead, as it did before.
+fn object_key(key: &SharableString) -> OwnedValue {
+    if key.is_shared() {
+        OwnedValue::String(key.clone())
+    } else {
+        string(key)
+    }
 }
 
 /// A C builtin's result as jq's fresh `jv`.
@@ -100,16 +117,66 @@ fn fresh(value: OwnedValue, inputs: &[&OwnedValue]) -> OwnedValue {
     value
 }
 
+/// `l op r` as jq's C operator answers it: an operand itself when the
+/// operator hands it back ([`binop_keeps`]), a fresh value otherwise.
+///
+/// Two objects' `+` and `*` are `jv_object_merge` and
+/// `jv_object_merge_recursive`, written here so the result keeps both
+/// operands' key `jv`s (#7401): each sets `r`'s fields on `l`, and
+/// `jv_object_set` keeps a key `l` already has and stores `r`'s for a new
+/// one, so `{b: 1} + .` holds `.`'s own key.
+fn combine(op: ArithOp, l: &OwnedValue, r: &OwnedValue) -> Result<OwnedValue, EvalError> {
+    if let Some(kept) = binop_keeps(op, l, r) {
+        return Ok(kept.clone());
+    }
+    match (op, l, r) {
+        (ArithOp::Add, OwnedValue::Object(a), OwnedValue::Object(b)) => {
+            let mut merged = a.clone();
+            for (k, v) in b.iter_stored() {
+                merged.insert_shared(k.clone(), v.clone());
+            }
+            Ok(fresh(OwnedValue::Object(merged), &[l, r]))
+        }
+        (ArithOp::Mul(flags), OwnedValue::Object(a), OwnedValue::Object(b))
+            if flags == MergeFlags::default() =>
+        {
+            let merged = OwnedValue::Object(merge_recursive(a, b, 0));
+            Ok(fresh(merged, &[l, r]))
+        }
+        _ => arith_combine::<JqSemantics>(op, l.clone(), r.clone()).map(|v| fresh(v, &[l, r])),
+    }
+}
+
+/// `jv_object_merge_recursive`: `b`'s fields set on `a`, a field that is an
+/// object on both sides merged in turn. A merge that sets nothing is `a`
+/// itself, as jq's returns its `a`. Bounded as the shipped `*` is (#1017).
+fn merge_recursive(a: &ObjectMap, b: &ObjectMap, depth: usize) -> ObjectMap {
+    assert_value_tree_depth(depth);
+    let mut merged = a.clone();
+    for (k, v) in b.iter_stored() {
+        let value = match (merged.get(k.as_str()), v) {
+            (Some(OwnedValue::Object(x)), OwnedValue::Object(y)) => {
+                OwnedValue::Object(merge_recursive(x, y, depth + 1))
+            }
+            _ => v.clone(),
+        };
+        merged.insert_shared(k.clone(), value);
+    }
+    merged
+}
+
 /// `value` with new storage at the top, its contents shared.
 fn unshare_top(value: OwnedValue) -> OwnedValue {
     match value {
         OwnedValue::Array(items) => OwnedValue::Array(items.iter().cloned().collect()),
-        OwnedValue::Object(map) => OwnedValue::Object(
-            map.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<FieldMap<_>>()
-                .into(),
-        ),
+        // The keys stay the object's own (`jv_object_set` keeps them, #7401).
+        OwnedValue::Object(map) => {
+            let mut copy = FieldMap::with_capacity(map.len());
+            for (k, v) in map.iter_stored() {
+                copy.insert_shared(k.clone(), v.clone());
+            }
+            OwnedValue::Object(copy.into())
+        }
         OwnedValue::String(s) => string(&s),
         OwnedValue::NumberLiteral(repr, spelling) => literal(repr, &spelling),
         other => other,
@@ -127,7 +194,12 @@ fn promote_built(value: &mut OwnedValue) {
         OwnedValue::Array(items) if !items.is_shared() => {
             items.iter_mut().for_each(promote_built);
         }
-        OwnedValue::Object(map) if !map.is_shared() => map.values_mut().for_each(promote_built),
+        // A key the builtin carried over from one of the interpreter's own
+        // objects keeps its storage (#7401); a key it built gets some.
+        OwnedValue::Object(map) if !map.is_shared() => {
+            map.promote_keys();
+            map.values_mut().for_each(promote_built);
+        }
         _ => {}
     }
 }
@@ -919,7 +991,9 @@ pub struct Interp<'e> {
     /// One `jv` per constant site, as `LOADK` hands out (keyed by the `Expr`'s
     /// address, which is stable: the interpreter never rewrites the program).
     /// A substituted variable (`Expr::TrackedVar`) is one `jv` too, keyed by
-    /// its marker.
+    /// its marker, and so is an object constructor's literal key, keyed by its
+    /// `ObjectKey`'s address (#7401), which holds no `Expr` inline and so is no
+    /// `Expr`'s address.
     consts: RefCell<BTreeMap<usize, OwnedValue>>,
     next_label: Cell<u64>,
     /// How many jq-function calls are live: the structural backstop under
@@ -1457,11 +1531,7 @@ impl<'e> Interp<'e> {
                 }
                 let op = *op;
                 self.binop(left, right, env, &input, &reg, sink, &mut |l, r| {
-                    if let Some(kept) = binop_keeps(op, l, r) {
-                        return Ok(kept.clone());
-                    }
-                    arith_combine::<JqSemantics>(op, l.clone(), r.clone())
-                        .map(|v| fresh(v, &[l, r]))
+                    combine(op, l, r)
                 })
             }
             Expr::Compare { op, left, right } => {
@@ -1824,8 +1894,11 @@ impl<'e> Interp<'e> {
                 Ok(())
             }
             OwnedValue::Object(map) => {
-                for (k, item) in &**map {
-                    sink(item.clone(), reg.clone().append(string(k), item.clone()))?;
+                for (k, item) in map.iter_stored() {
+                    sink(
+                        item.clone(),
+                        reg.clone().append(object_key(k), item.clone()),
+                    )?;
                 }
                 Ok(())
             }
@@ -1974,13 +2047,27 @@ impl<'e> Interp<'e> {
                 return Err(raise_msg(EvalError::cannot_use_as_object_key(&k)));
             };
             self.eval(value, env, input.clone(), reg.sub(), &mut |v, _| {
+                // `INSERT` stores the key `jv` itself (#7401): `{($k): 1} | keys[0]` is `$k`.
+                let mut name = name.clone();
+                name.promote();
                 let mut next = built.clone();
-                next.insert(name.as_str().to_string(), v);
+                next.insert_shared(name, v);
                 self.object(rest, next, env, input, reg, sink)
             })
         };
         match key {
-            ObjectKey::Literal(s) => with_key(string(s)),
+            // `{a: f}` is `gen_dictpair(gen_const("a"), f)`: one key `jv` per site, so every
+            // object the site builds holds the same key (#7401).
+            ObjectKey::Literal(s) => {
+                let site = *key as *const ObjectKey as usize;
+                let cached = self.consts.borrow().get(&site).cloned();
+                let k = cached.unwrap_or_else(|| {
+                    let k = string(s);
+                    self.consts.borrow_mut().insert(site, k.clone());
+                    k
+                });
+                with_key(k)
+            }
             ObjectKey::Expr(k) => {
                 self.eval(k, env, input.clone(), reg.sub(), &mut |kv, _| with_key(kv))
             }
@@ -3814,12 +3901,7 @@ fn compound_step(name: &str, v: &OwnedValue, t: &OwnedValue) -> Result<OwnedValu
         "_sp_upd_div" => ArithOp::Div,
         _ => ArithOp::Mod,
     };
-    if let Some(kept) = binop_keeps(op, v, t) {
-        return Ok(kept.clone());
-    }
-    arith_combine::<JqSemantics>(op, v.clone(), t.clone())
-        .map(|r| fresh(r, &[v, t]))
-        .map_err(raise_eval)
+    combine(op, v, t).map_err(raise_eval)
 }
 
 /// What [`Interp::collect_outputs`] gathered: every output with its register,
@@ -4274,6 +4356,7 @@ fn constant_value(expr: &Expr) -> Option<OwnedValue> {
                 String::from("line"),
                 literal(NumberRepr::Int(*line as i64), &line.to_string()),
             );
+            map.promote_keys();
             Some(OwnedValue::Object(map.into()))
         }
         Expr::Array(inner) => {
@@ -4293,18 +4376,14 @@ fn constant_value(expr: &Expr) -> Option<OwnedValue> {
                 };
                 built.insert(key.clone(), constant_value(&entry.value)?);
             }
+            built.promote_keys();
             Some(OwnedValue::Object(built.into()))
         }
         Expr::Arithmetic {
             op, left, right, ..
         } => {
             let (l, r) = (constant_value(left)?, constant_value(right)?);
-            if let Some(kept) = binop_keeps(*op, &l, &r) {
-                return Some(kept.clone());
-            }
-            arith_combine::<JqSemantics>(*op, l.clone(), r.clone())
-                .ok()
-                .map(|v| fresh(v, &[&l, &r]))
+            combine(*op, &l, &r).ok()
         }
         Expr::Compare { op, left, right } => {
             let (l, r) = (constant_value(left)?, constant_value(right)?);
@@ -4443,6 +4522,17 @@ fn emit_c_builtin(
         (Builtin::Type, [], _) => {
             return sink(string(super::eval::owned_type_name(input)), reg.clone());
         }
+        // `jv_keys`/`jv_keys_unsorted` collect the object's own key `jv`s
+        // (`jv_object_foreach`), so a key read twice is identical (#7401);
+        // `keys` then sorts them by their bytes (`string_cmp`).
+        (Builtin::Keys | Builtin::KeysUnsorted, [], OwnedValue::Object(map)) => {
+            let mut keys: Vec<&SharableString> = map.iter_stored().map(|(k, _)| k).collect();
+            if matches!(builtin, Builtin::Keys) {
+                keys.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            }
+            let keys: Vec<OwnedValue> = keys.into_iter().map(object_key).collect();
+            return sink(OwnedValue::Array(keys.into()), reg.clone());
+        }
         _ => {}
     }
     // `setpath`/`delpaths` write natively, with copy-on-write: the input is
@@ -4472,6 +4562,13 @@ fn emit_c_builtin(
         // their input.
         let value = if keep.is_some() {
             input.clone()
+        } else if matches!(builtin, Builtin::FromJson | Builtin::Input) {
+            // A parsed document, as the run's input is: the reader shares one
+            // key among sibling records (#7260), where jq's parser allocates
+            // each, so each object's keys get storage of their own (#7401).
+            let mut v = v;
+            v.promote_identities();
+            v
         } else {
             fresh(v, &inputs)
         };

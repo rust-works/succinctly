@@ -688,6 +688,20 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
         map_mut(&mut self.map).values_mut()
     }
 
+    /// [`FieldMap::promote_keys`] on the collapsed view.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn promote_keys(&mut self) {
+        map_mut(&mut self.map).promote_keys();
+    }
+
+    /// [`FieldMap::own_keys`] on the collapsed view.
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn own_keys(&mut self) {
+        map_mut(&mut self.map).own_keys();
+    }
+
     /// The slot, key and a mutable reference to the value for `key` -- the
     /// live (last) entry when the key repeats.
     #[inline]
@@ -731,11 +745,20 @@ impl<V: Teardown + Clone> ObjectMapOf<V> {
     #[inline]
     #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
     pub fn insert(&mut self, key: String, value: V) -> Option<V> {
+        self.insert_shared(SharableString::from(key), value)
+    }
+
+    /// [`insert`](Self::insert) with a key that may share its storage
+    /// ([`FieldMap::insert_shared`]): a new key is stored as the handle given,
+    /// as jq's `jv_object_set` stores the key `jv` it is given (#7401).
+    #[inline]
+    #[cfg_attr(any(test, feature = "share-stats"), track_caller)]
+    pub fn insert_shared(&mut self, key: SharableString, value: V) -> Option<V> {
         let map = map_mut(&mut self.map);
         if self.shadows.is_none() {
-            return map.insert(key, value);
+            return map.insert_shared(key, value);
         }
-        let (slot, old) = map.insert_full(key, value);
+        let (slot, old) = map.insert_shared_full(key, value);
         if old.is_none() {
             // Only a new key changes the side list; replacing a live value
             // must not copy a side list another handle shares.
