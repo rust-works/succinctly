@@ -16916,8 +16916,40 @@ fn is_canonical_int_text(n: i64, text: &str) -> bool {
 fn owned_key_step<S: EvalSemantics>(key: &Expr, at: &OwnedValue) -> Option<StepKey<'static>> {
     match owned_assign_operand::<S>(key, at)? {
         OwnedValue::String(name) => Some(StepKey::Field(Cow::Owned(name.into_string()))),
-        key => Some(StepKey::Index(integral_key(&key)?)),
+        key => {
+            let whole_float = || match S::TAG {
+                EvalTag::Jq => whole_float_key(&key),
+                _ => None,
+            };
+            Some(StepKey::Index(integral_key(&key).or_else(whole_float)?))
+        }
     }
+}
+
+/// A float-represented key whose value is a whole number no larger than 2^53 (`1e4`, `3.0`,
+/// `$i * 1.0`, `-0.0`, an element of `[range(1e4)]`), as the index it names (#7495). jq keeps
+/// every number as a double and a write truncates a key to an `int`, so a whole one names exactly
+/// the slot its integer spelling does (`[1,2,3] | .[1.0] = 9` is `[1,9,3]`, `.[-0.0]` is `.[0]`).
+/// [`owned_assign_step`] only writes, so the spelling `path()` keeps (#1088) is never seen. Without
+/// this a fold such as `reduce range(1e4) as $i ([]; .[$i] = 1)` declined to the evaluator's
+/// route, which rebuilt the whole accumulator every step and went quadratic.
+///
+/// A fractional key, a NaN, an infinity and anything past 2^53 stay the evaluator's, with its
+/// rules and its errors; so does every float key in yq mode, whose array index rejects one
+/// (`cannot index array with '1.0'`). Written with comparisons and casts only, which `core` has.
+fn whole_float_key(key: &OwnedValue) -> Option<i64> {
+    const LIMIT: f64 = 9_007_199_254_740_992.0;
+    let (OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) = key else {
+        return None;
+    };
+    let f = *f;
+    // A NaN fails both comparisons; within the limit the cast is exact, so the round trip holds
+    // exactly when `f` has no fraction.
+    if !(-LIMIT..=LIMIT).contains(&f) {
+        return None;
+    }
+    let n = f as i64;
+    (n as f64 == f).then_some(n)
 }
 
 /// Where `step` lands inside `container`: `Some(child)` when
@@ -120687,6 +120719,111 @@ mod tests {
             unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this arm only fires if `state` stopped being an Object, which every write in the loop above preserves (#3138)"
         };
         assert_eq!(fields.len(), 65);
+    }
+
+    /// #7495: a whole float key (`1e4`, `$i * 1.0`, an element of `[range(1e4)]`) is the index
+    /// its integer spelling names, so a fold's array write by one is answered in place, as an
+    /// integer key's is. It used to decline, and the evaluator's route rebuilt the accumulator
+    /// every step: `reduce range(1e4) as $i ([]; .[$i] = 1)` went quadratic. The unchanged
+    /// sibling's text being the same allocation after every step is the in-place proof. A
+    /// fractional, non-finite or huge key, a float key on an object, and every float key in yq
+    /// mode still decline to the evaluator, whose rules and errors they need.
+    #[test]
+    fn owned_assign_step_takes_a_whole_float_index_in_place_7495() {
+        let literal = "x".repeat(100_000);
+        let text_ptr = |state: &OwnedValue| match state {
+            OwnedValue::Array(items) => match items.first() {
+                Some(OwnedValue::String(text)) => text.as_ptr(),
+                other => panic!("missing sibling: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- slot 0 holds the tracked string, which no write below touches (#7495)"
+            },
+            other => panic!("expected array: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every write below keeps the state an array (#7495)"
+        };
+        for src in [
+            ".[$k] = $k",
+            ".[$k] |= 7",
+            ".[$k] += 1",
+            ".[$k] //= 1",
+            ".a[$k] = 1",
+            ".a[$k] += 1",
+        ] {
+            let wrap = src.starts_with(".a");
+            let start = OwnedValue::array_from(vec![OwnedValue::string(&literal)]);
+            let mut state = if wrap {
+                OwnedValue::object_from([("a".to_string(), start)])
+            } else {
+                start
+            };
+            let array = |state: &OwnedValue| -> OwnedValue {
+                match state {
+                    OwnedValue::Object(fields) => fields.get("a").cloned().unwrap(),
+                    other => other.clone(),
+                }
+            };
+            let before = text_ptr(&array(&state));
+            for i in 1..64 {
+                let key = if i % 2 == 0 {
+                    OwnedValue::Float(i as f64)
+                } else {
+                    OwnedValue::from_number_literal::<JqSemantics>(&alloc::format!("{i}.0"))
+                };
+                let expr = substitute_vars(&parse(src).unwrap(), [("k", &key)]);
+                state = match try_eval_owned_step::<JqSemantics>(&expr, state) {
+                    OwnedStep::Handled(Ok(next)) => next,
+                    _ => panic!("{src}: step {i} was not handled"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if a whole float key declined, which is the regression this test pins (#7495)"
+                };
+            }
+            let items = array(&state);
+            assert_eq!(text_ptr(&items), before, "{src}: the sibling was copied");
+            let OwnedValue::Array(items) = items else {
+                unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every write above keeps the target an array (#7495)"
+            };
+            assert_eq!(items.len(), 64, "{src}");
+        }
+        // `-0.0` is index 0; `5.0` into a three-element array pads, which is the evaluator's.
+        let three = || OwnedValue::array_from(vec![OwnedValue::Int(1); 3]);
+        let step = |src: &str, key: OwnedValue, state: OwnedValue, yq: bool| {
+            let expr = substitute_vars(&parse(src).unwrap(), [("k", &key)]);
+            if yq {
+                try_eval_owned_step::<YqSemantics>(&expr, state)
+            } else {
+                try_eval_owned_step::<JqSemantics>(&expr, state)
+            }
+        };
+        let OwnedStep::Handled(Ok(zero)) =
+            step(".[$k] = 9", OwnedValue::Float(-0.0), three(), false)
+        else {
+            panic!("-0.0 is a whole key"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if -0.0 stopped naming index 0 (#7495)"
+        };
+        assert_eq!(
+            zero,
+            OwnedValue::array_from(vec![
+                OwnedValue::Int(9),
+                OwnedValue::Int(1),
+                OwnedValue::Int(1)
+            ])
+        );
+        let object = || OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
+        for (key, state, yq) in [
+            (OwnedValue::Float(1.5), three(), false),
+            (OwnedValue::Float(-1.7), three(), false),
+            (OwnedValue::Float(f64::NAN), three(), false),
+            (OwnedValue::Float(f64::INFINITY), three(), false),
+            (OwnedValue::Float(f64::NEG_INFINITY), three(), false),
+            (OwnedValue::Float(1e300), three(), false),
+            (OwnedValue::Float(9_007_199_254_740_994.0), three(), false),
+            (OwnedValue::Float(-1.0), three(), false),
+            (OwnedValue::Float(5.0), three(), false),
+            (OwnedValue::Float(0.0), object(), false),
+            (OwnedValue::Float(1.0), three(), true),
+        ] {
+            assert!(
+                matches!(
+                    step(".[$k] = 9", key.clone(), state, yq),
+                    OwnedStep::Declined(_)
+                ),
+                "{key:?} (yq: {yq}) must stay the evaluator's"
+            );
+        }
     }
 
     /// #3944: a right side built from the loop variable with a comparison, an
