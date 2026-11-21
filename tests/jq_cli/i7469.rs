@@ -9,7 +9,8 @@
 //! Every row is jq 1.7.1's own output (`/usr/bin/jq -c`, stdin ending in a newline), except
 //! the rows marked `jq 1.8.2 (#7453)`: a negated literal stays a literal since #7453 adopted
 //! jqlang/jq#3242's fix, so `-.` of a parsed infinity is decNumber's `-Infinity` there, as in
-//! jq 1.8.2. jq 1.8.2 differs from 1.7.1 on 132 rows, all but those for reasons outside this
+//! jq 1.8.2. The row marked `jq 1.8.2 (#7534)` is `length` of a literal, which keeps
+//! the literal since #7534 adopted jqlang/jq#3275's fix (`1e1000 | length` is `1E+1000`). jq 1.8.2 differs from 1.7.1 on 132 rows, all but those for reasons outside this
 //! issue: the reworded value previews in errors (jqlang/jq#3478), `length` and `bsearch` of a
 //! literal past `DBL_MAX`, and `unique`'s refusal of a non-array.
 
@@ -404,7 +405,7 @@ const ROWS: &[(&str, &str, &str, &str, i32)] = &[
     (". + 0 | . == 1e1000", "1e1000", "true\n", "", 0),
     ("-. | . == -1e1000", "1e1000", "true\n", "", 0),
     (". * 1 > 1e1000", "1e1000", "false\n", "", 0),
-    ("length", "1e1000", "1.7976931348623157e+308\n", "", 0),
+    ("length", "1e1000", "1E+1000\n", "", 0), // jq 1.8.2 (#7534)
     ("[.] | contains([1e1000])", "1e1000", "true\n", "", 0),
     ("[.] | inside([1e1000])", "1e1000", "true\n", "", 0),
     ("[1e1000] | bsearch(1e1000)", "1e1000", "0\n", "", 0),
@@ -693,6 +694,51 @@ fn every_parse_of_infinity_is_a_literal_7469() -> Result<()> {
             run_jq_full(args, None)?,
             (expected.to_string(), String::new(), 0),
             "{args:?}"
+        );
+    }
+    Ok(())
+}
+
+/// #7469 with #7534: `length` of a parsed infinity is decNumber's `decNumberAbs` of the literal in
+/// jq 1.8.2 (jqlang/jq#3275, adopted by #7534), so it still orders past `1e1000`, on every route
+/// that reads one: a document (top level and nested), `-s`, `inputs`, `--argjson` and `tonumber`.
+/// jq 1.7.1 took `fabs` of the double (`[false,true,true,[1.7976931348623157e+308,1E+1000]]`); the
+/// document route answered that after #7534 while the owned routes answered 1.8.2's. Every row
+/// was captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+#[test]
+fn length_of_a_parsed_infinity_stays_a_literal_7469() -> Result<()> {
+    const P: &str =
+        "[length > 1e1000, length == 1e1000, length == infinite, ([length, 1e1000] | sort)]";
+    const ONE: &str = "[true,false,true,[1E+1000,1.7976931348623157e+308]]";
+    let map_p = format!("map({P})");
+    let inputs_p = format!("[inputs | {P}]");
+    let argjson_p = format!("$x | {P}");
+    let tonumber_p = format!("\"-Infinity\" | tonumber | {P}");
+    let one = format!("{ONE}\n");
+    let two = format!("[{ONE},{ONE}]\n");
+    let rows: [(&[&str], &str, &str); 8] = [
+        (&["-c", P], "Infinity\n", &one),
+        (&["-c", P], "-Infinity\n", &one),
+        (&["-c", &map_p], "{\"a\":-Infinity,\"b\":Infinity}\n", &two),
+        (&["-sc", &map_p], "Infinity\n-Infinity\n", &two),
+        (&["-nc", &inputs_p], "Infinity\n-Infinity\n", &two),
+        (
+            &["-nc", "--argjson", "x", "-Infinity", &argjson_p],
+            "",
+            &one,
+        ),
+        (&["-nc", &tonumber_p], "", &one),
+        (
+            &["-c", P],
+            "1e1000\n-1e1000\n",
+            "[false,true,true,[1E+1000,1E+1000]]\n[false,true,true,[1E+1000,1E+1000]]\n",
+        ),
+    ];
+    for (args, input, want) in rows {
+        assert_eq!(
+            run_jq_full(args, Some(input))?,
+            (want.to_string(), String::new(), 0),
+            "{args:?} on {input:?}"
         );
     }
     Ok(())
