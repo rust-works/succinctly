@@ -922,12 +922,18 @@ fn module_meta_outcome(lib_dirs: &[PathBuf], name: &str) -> jq::cli_context::Mod
     };
 
     let mut defs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut tail = &program.expr;
     while let Expr::FuncDef {
         name, params, then, ..
     } = tail
     {
-        defs.push(OwnedValue::string(format!("{name}/{}", params.len())));
+        // jq lists the block's bindings, one per name and arity, at the position of the
+        // first `def` of it: `def f: 1; def g: 1; def f: 3;` is `["f/0","g/0"]` (#7432).
+        let entry = format!("{name}/{}", params.len());
+        if seen.insert(entry.clone()) {
+            defs.push(OwnedValue::string(entry));
+        }
         tail = then;
     }
     if !matches!(tail, Expr::Identity) {
