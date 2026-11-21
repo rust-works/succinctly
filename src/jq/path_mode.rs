@@ -20,7 +20,9 @@
 //!   builtin's result as it is answered (`fresh`), as jq allocates every `jv`.
 //!   So does every object key (#7401): one per object, which `.[]`, `keys`
 //!   and `keys_unsorted` hand out, and which a write keeps or takes from the
-//!   key it is given, as jq's `jv_object_set` does.
+//!   key it is given, as jq's `jv_object_set` does. A run whose program
+//!   cannot reach either hand-out leaves the document's keys as they were
+//!   read (`hands_out_keys`, #7489): no key's identity is ever asked there.
 //! - Each `Expr` arm follows the bytecode `compile.c` emits for it, cited at
 //!   the arm. The jq-defined builtins run their `builtin.jq` bodies
 //!   ([`PRELUDE`]); the C-coded ones are delegated to the existing evaluator
@@ -87,14 +89,96 @@ fn literal(repr: NumberRepr, spelling: &str) -> OwnedValue {
 /// An object's key as jq hands it out (`jv_object_iter_key`, which `.[]`,
 /// `keys` and `keys_unsorted` read): the object's own key `jv`, so two reads
 /// of one key are identical (#7401). Every object the interpreter holds has
-/// its keys promoted (`promote_identities`, `promote_built`, the constructor);
-/// a key that is still inline gets fresh storage instead, as it did before.
+/// its keys promoted (`promote_identities`, `promote_built`, the constructor)
+/// in a run that can reach this ([`hands_out_keys`], #7489); a key that is
+/// still inline gets fresh storage instead, as it did before.
 fn object_key(key: &SharableString) -> OwnedValue {
     if key.is_shared() {
         OwnedValue::String(key.clone())
     } else {
         string(key)
     }
+}
+
+/// Whether a run of `program` can hand an object's key out as a value, the
+/// only way a key's identity is ever asked (#7489).
+///
+/// The interpreter hands a key out at two sites, `EACH` on an object (the key
+/// it appends to the register, which `path(f)` then answers) and `keys`/
+/// `keys_unsorted`; [`object_key`] serves both. So a program reaches one only
+/// through `.[]`, `..`, `recurse`, `keys`, `keys_unsorted` or a jq-defined
+/// builtin whose [`PRELUDE`] body does (`to_entries`, `paths`, `map`, ...),
+/// which is looked inside, as is every definition it calls. A run of any
+/// other program never needs a key's identity, so its objects keep the keys
+/// they were read with, which saves an allocation per key; jq's answer is
+/// the same either way. Both hand-out sites assert the decision in debug
+/// builds.
+///
+/// A `def` of the program is walked where it is defined, and a call of a
+/// name the prelude also defines is taken to reach the prelude's definition,
+/// which can only answer `true` more often.
+fn hands_out_keys(program: &Expr, prelude: &Prelude) -> bool {
+    expr_hands_out_keys(program, prelude, &mut Vec::new())
+}
+
+/// [`hands_out_keys`] of `expr`, `seen` the prelude definitions already
+/// looked inside (a recursive one is looked inside once, and a definition
+/// met again adds nothing to the answer already being found).
+fn expr_hands_out_keys(
+    expr: &Expr,
+    prelude: &Prelude,
+    seen: &mut Vec<(&'static str, usize)>,
+) -> bool {
+    any_subexpr(expr, &mut |e| {
+        let (name, arity) = match e {
+            Expr::Iterate | Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys => {
+                return true;
+            }
+            Expr::Builtin(Builtin::Keys | Builtin::KeysUnsorted | Builtin::Recurse) => {
+                return true;
+            }
+            Expr::Builtin(builtin) => match prelude_call(builtin) {
+                Some((name, args)) => (name, args.len()),
+                None => return false,
+            },
+            // The arms that run a prelude definition by name ([`Interp::call_prelude`]).
+            Expr::Limit { .. } => ("_sp_limit", 2),
+            Expr::FirstExpr(_) => ("_sp_first", 1),
+            Expr::LastExpr(_) => ("_sp_last", 1),
+            Expr::NthExpr { .. } => ("_sp_nth", 2),
+            Expr::Until { .. } => ("_sp_until", 2),
+            Expr::While { .. } => ("_sp_while", 2),
+            Expr::Assign { .. } => ("_sp_assign", 2),
+            // Every update-assignment runs `_sp_modify` (`_sp_upd_*` wraps it).
+            Expr::Update { .. } | Expr::CompoundAssign { .. } | Expr::AlternativeAssign { .. } => {
+                ("_sp_modify", 2)
+            }
+            Expr::FuncCall {
+                name,
+                args,
+                builtin_fallback,
+            } => {
+                // The walk leaves out a call's unsettled builtin, which the call runs when no
+                // `def` answers it.
+                if builtin_fallback
+                    .as_deref()
+                    .is_some_and(|fallback| expr_hands_out_keys(fallback, prelude, seen))
+                {
+                    return true;
+                }
+                (name.as_str(), args.len())
+            }
+            _ => return false,
+        };
+        let Some(def) = prelude.find(name, arity) else {
+            return false;
+        };
+        if seen.contains(&(def.name, def.arity)) {
+            return false;
+        }
+        seen.push((def.name, def.arity));
+        expr_hands_out_keys(def.expr(), prelude, seen)
+    })
 }
 
 /// A C builtin's result as jq's fresh `jv`.
@@ -1060,6 +1144,12 @@ pub struct Interp<'e> {
     /// The `def` bodies [`Self::pure`] and [`Self::single`] are looking inside right
     /// now, by address, so a definition that reaches itself is seen as it is (#5263).
     def_walk: RefCell<Vec<usize>>,
+    /// Whether the objects of this run carry one identity per key (#7401):
+    /// only when the program can hand a key out as a value
+    /// ([`hands_out_keys`]), since nothing else could ever ask a key's
+    /// identity, and the storage costs one allocation per key (#7489). On
+    /// until a run decides, so an interpreter nobody configured stays exact.
+    key_ids: Cell<bool>,
 }
 
 /// How a run ended.
@@ -1410,7 +1500,7 @@ pub(crate) fn run_program(
     with_prelude(|prelude| {
         let interp = Interp::new(prelude);
         let mut input = input;
-        input.promote_identities();
+        interp.prepare(program, &mut input);
         let result = interp.eval(program, &Env::default(), input, Reg::top(), &mut |v, _| {
             if on_value(v) {
                 Ok(())
@@ -1471,13 +1561,22 @@ impl<'e> Interp<'e> {
             next_label: Cell::new(0),
             depth: Cell::new(0),
             def_walk: RefCell::new(Vec::new()),
+            key_ids: Cell::new(true),
         }
+    }
+
+    /// Decide [`Self::key_ids`] for a run of `program`, and give `input`
+    /// (a document, materialized for this run) its identities to match.
+    fn prepare(&self, program: &Expr, input: &mut OwnedValue) {
+        let keys = hands_out_keys(program, self.prelude);
+        self.key_ids.set(keys);
+        input.promote_identities(keys);
     }
 
     /// Run `program` on `input`, a document: its strings and numbers are
     /// promoted first, so each node has one identity, as `jv_parse` gives it.
     pub fn run(&self, program: &'e Expr, mut input: OwnedValue) -> Run {
-        input.promote_identities();
+        self.prepare(program, &mut input);
         let mut outputs = Vec::new();
         let result = self.eval(program, &Env::default(), input, Reg::top(), &mut |v, _| {
             outputs.push(v);
@@ -1661,7 +1760,7 @@ impl<'e> Interp<'e> {
                 let cached = self.consts.borrow().get(&key).cloned();
                 let value = cached.unwrap_or_else(|| {
                     let mut value = tracked.value.clone();
-                    value.promote_identities();
+                    value.promote_identities(self.key_ids.get());
                     self.consts.borrow_mut().insert(key, value.clone());
                     value
                 });
@@ -1943,6 +2042,8 @@ impl<'e> Interp<'e> {
                 Ok(())
             }
             OwnedValue::Object(map) => {
+                // A key handed out unpromoted would be identical to nothing it should be (#7489).
+                debug_assert!(self.key_ids.get(), "hands_out_keys missed an iteration");
                 for (k, item) in map.iter_stored() {
                     sink(
                         item.clone(),
@@ -3227,16 +3328,30 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
+        // A key handed out unpromoted would be identical to nothing it should be (#7489).
+        debug_assert!(
+            self.key_ids.get() || !matches!(builtin, Builtin::Keys | Builtin::KeysUnsorted),
+            "hands_out_keys missed {builtin:?}"
+        );
+        let key_ids = self.key_ids.get();
         let kids = builtin_args(builtin);
         if kids.is_empty() {
-            return emit_c_builtin(node, builtin, &input, &[], &reg, sink);
+            return emit_c_builtin(node, builtin, &input, &[], &reg, key_ids, sink);
         }
         self.c_args(&kids, env, &input, &reg, &mut |values| {
             let mut next = values.iter();
             let call = map_builtin_subexprs(builtin, &mut |_| {
                 Expr::tracked_value(next.next().cloned().unwrap_or(OwnedValue::Null))
             });
-            emit_c_builtin(&Expr::Builtin(call), builtin, &input, values, &reg, sink)
+            emit_c_builtin(
+                &Expr::Builtin(call),
+                builtin,
+                &input,
+                values,
+                &reg,
+                key_ids,
+                sink,
+            )
         })
     }
 
@@ -4638,12 +4753,16 @@ fn number_owned(value: f64) -> OwnedValue {
 /// argument itself when the builtin hands it back unchanged ([`kept`]), a
 /// fresh value otherwise. The call runs either way, for its side effects
 /// (`debug`) and its errors.
+///
+/// `key_ids` is the run's [`Interp::key_ids`]: whether a parsed document's
+/// keys get an identity each.
 fn emit_c_builtin(
     expr: &Expr,
     builtin: &Builtin,
     input: &OwnedValue,
     args: &[OwnedValue],
     reg: &Reg,
+    key_ids: bool,
     sink: &mut Sink<'_>,
 ) -> R {
     let keep = kept(builtin, input, args);
@@ -4718,9 +4837,10 @@ fn emit_c_builtin(
         } else if matches!(builtin, Builtin::FromJson | Builtin::Input) {
             // A parsed document, as the run's input is: the reader shares one
             // key among sibling records (#7260), where jq's parser allocates
-            // each, so each object's keys get storage of their own (#7401).
+            // each, so each object's keys get storage of their own (#7401),
+            // in a run that can hand one out (#7489).
             let mut v = v;
-            v.promote_identities();
+            v.promote_identities(key_ids);
             v
         } else {
             fresh(v, &inputs)
