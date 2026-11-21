@@ -101,6 +101,11 @@ fn an_early_stop_leaves_the_file_after_the_line_of_its_last_read_7455() {
         offset_after(&three, 9, &["-c", "-n", "limit(0; inputs)"]),
         9
     );
+    // A last value with no line break after it completes at the end, where the read stands.
+    assert_eq!(
+        offset_after(b"1\n2", 0, &["-c", "if . == 2 then halt else . end"]),
+        3
+    );
     // A line of several values is read whole, and blank lines after a value's line are not.
     assert_eq!(
         offset_after(b"1 2 3\n4 5\n", 0, &["-c", "-n", "limit(2; inputs)"]),
