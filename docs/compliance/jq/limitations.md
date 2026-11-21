@@ -5864,6 +5864,7 @@ That fault is the first in the stream, as jq's is, so when the member the filter
 jq stops there, so the run does too: the values before the fault are answered and no later value or file is read.
 Only the first read of a malformed member asks, and a stream jq's parser reads clean (a decode failure jq has no counterpart for) keeps the evaluator's `Invalid JSON text: ...` line and reads on.
 A `--slurp` stream is read again from its files, so one slurped from stdin keeps the evaluator's wording and its `(at <stdin>:N)` marker: the original bytes are gone once the values are joined, and keeping them would hold a second copy of the whole input for the run.
+Since [#7444](https://github.com/rust-works/succinctly/issues/7444) `/dev/null` in the file list reads again as the nothing it gave, and a regular file named through a descriptor (`/dev/fd/3 3<t.json`, `/dev/stdin < t.json`) is read again from its start by position, so both get jq's wording too; a pipe behind such a path still cannot be read again.
 `input`/`inputs` and `-n` are not on this route, and word their faults as [#5555](https://github.com/rust-works/succinctly/issues/5555) does.
 
 ### A parse error past 2^31 lines or columns reports the true position ([#7461](https://github.com/rust-works/succinctly/issues/7461))
