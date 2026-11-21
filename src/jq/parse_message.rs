@@ -148,6 +148,68 @@ pub fn find_nul(hay: &[u8]) -> Option<usize> {
     crate::util::simd::nul::find_nul(hay)
 }
 
+/// What [`scan_utf8_and_nul`] finds of a text: whether it is UTF-8 (as
+/// [`validate_utf8`](crate::text::utf8::validate_utf8) answers) and whether it holds a NUL byte (as
+/// [`find_nul`] answers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextScan {
+    /// The text is UTF-8.
+    pub utf8: bool,
+    /// The text holds a NUL byte.
+    pub nul: bool,
+}
+
+/// The bytes [`scan_utf8_and_nul`] validates before it looks for a NUL in them: few enough to still
+/// be in the core's own cache when the search reads them again.
+const SCAN_PIECE: usize = 128 * 1024;
+
+/// Validates `text` as UTF-8 and looks for a NUL byte in it, in one read of it from memory (#7437).
+///
+/// Every route that reads JSON input validates each text before anything else reads it, and the
+/// search for the NUL a number token may hold is a second pass over the same bytes: on a text bigger
+/// than the cache, the cost of that pass is the bytes read from memory again (2 to 3.5 ms on 100 MB),
+/// not its instructions. So the text is validated a piece at a time and each piece searched while
+/// the validation has left it in the cache.
+///
+/// The pieces are cut before a byte that is not a continuation byte, so no character is cut: a
+/// UTF-8 text cut there is pieces that are each UTF-8, and a text that is not leaves a piece that is
+/// not (a sequence cut short ends the piece before it, and a stray continuation byte stays in one).
+/// So [`TextScan::utf8`] is the whole text's verdict.
+#[must_use]
+pub fn scan_utf8_and_nul(text: &[u8]) -> TextScan {
+    scan_utf8_and_nul_in(text, SCAN_PIECE)
+}
+
+/// [`scan_utf8_and_nul`] with pieces of about `piece` bytes.
+fn scan_utf8_and_nul_in(text: &[u8], piece: usize) -> TextScan {
+    let mut scan = TextScan {
+        utf8: true,
+        nul: false,
+    };
+    let mut at = 0;
+    while at < text.len() {
+        let mut end = (at + piece).min(text.len());
+        // On to the end of the character `end` is inside of, three bytes at most: a fourth
+        // continuation byte in a row is no character's, and the piece after it is not UTF-8.
+        let ceiling = (end + 3).min(text.len());
+        while end < ceiling && text[end] & 0xC0 == 0x80 {
+            end += 1;
+        }
+        let bytes = &text[at..end];
+        if scan.utf8 {
+            scan.utf8 = crate::text::utf8::validate_utf8(bytes).is_ok();
+        }
+        if !scan.nul {
+            scan.nul = find_nul(bytes).is_some();
+        }
+        if !scan.utf8 && scan.nul {
+            break;
+        }
+        at = end;
+    }
+    scan
+}
+
 /// Whether `byte` ends a bare token for jq's tokenizer (`classify` in `jv_parse.c`): whitespace,
 /// structure or a quote. Every other byte, a NUL included, is part of the token.
 fn ends_token(byte: u8) -> bool {
@@ -1345,6 +1407,105 @@ mod tests {
     fn blanked(text: &[u8], chunk: Option<usize>, lead: usize, head: &[u8]) -> Option<Vec<u8>> {
         let mut text = text.to_vec();
         blank_nul_number_tails(&mut text, chunk, lead, head).then_some(text)
+    }
+
+    /// What the scan must answer: the whole text's UTF-8 verdict and whether [`find_nul`] finds one.
+    fn scan_reference(text: &[u8]) -> TextScan {
+        TextScan {
+            utf8: core::str::from_utf8(text).is_ok(),
+            nul: find_nul(text).is_some(),
+        }
+    }
+
+    #[test]
+    fn the_scan_answers_as_a_validation_and_a_nul_search_of_the_whole_text_do_7437() {
+        // Characters of one to four bytes, so that pieces end inside each.
+        let chars: [&[u8]; 6] = [
+            b"a",
+            b"{\"k\":1}",
+            "\u{e9}".as_bytes(),
+            "\u{20ac}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            b" \n",
+        ];
+        let mut seed: u32 = 7437;
+        let mut next = move |n: usize| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 8) as usize % n
+        };
+        for round in 0..400 {
+            let mut text = Vec::new();
+            while text.len() < 40 + round % 60 {
+                text.extend_from_slice(chars[next(chars.len())]);
+            }
+            for piece in [1, 2, 3, 4, 5, 7, 16, 32, 64] {
+                assert_eq!(
+                    scan_utf8_and_nul_in(&text, piece),
+                    scan_reference(&text),
+                    "{text:?} piece {piece}"
+                );
+                // A NUL, and a byte that breaks the UTF-8, at every offset.
+                for at in 0..text.len() {
+                    for bad in [0x00, 0x80, 0xC3, 0xF0, 0xFF] {
+                        let mut one = text.clone();
+                        one[at] = bad;
+                        assert_eq!(
+                            scan_utf8_and_nul_in(&one, piece),
+                            scan_reference(&one),
+                            "{one:?} piece {piece}"
+                        );
+                    }
+                }
+            }
+        }
+        // The real piece size: a NUL either side of each boundary, and a four-byte character across
+        // it, both alone and with a fault after it.
+        let len = 3 * SCAN_PIECE + 64;
+        let plain: Vec<u8> = (0..len).map(|i| b"0123456789,[]{} \n"[i % 17]).collect();
+        assert_eq!(
+            scan_utf8_and_nul(&plain),
+            TextScan {
+                utf8: true,
+                nul: false
+            }
+        );
+        for boundary in [SCAN_PIECE, 2 * SCAN_PIECE, 3 * SCAN_PIECE] {
+            for at in boundary - 4..boundary + 4 {
+                let mut nul = plain.clone();
+                nul[at] = 0;
+                assert_eq!(
+                    scan_utf8_and_nul(&nul),
+                    TextScan {
+                        utf8: true,
+                        nul: true
+                    },
+                    "NUL at {at}"
+                );
+                let mut wide = plain.clone();
+                wide[at..at + 4].copy_from_slice("\u{1f600}".as_bytes());
+                assert_eq!(
+                    scan_utf8_and_nul(&wide),
+                    scan_reference(&wide),
+                    "character at {at}"
+                );
+                wide[len - 1] = 0xFF;
+                assert_eq!(
+                    scan_utf8_and_nul(&wide),
+                    TextScan {
+                        utf8: false,
+                        nul: false
+                    },
+                    "fault after {at}"
+                );
+            }
+        }
+        assert_eq!(
+            scan_utf8_and_nul(b""),
+            TextScan {
+                utf8: true,
+                nul: false
+            }
+        );
     }
 
     #[test]

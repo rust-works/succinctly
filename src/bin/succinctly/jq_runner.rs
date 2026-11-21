@@ -5643,8 +5643,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             None => input_names(&files),
         };
         jq::cli_context::set_input_names(names);
-        if reads_plain_json(&args) {
-            blank_nul_number_tails_in(raw_inputs.iter_mut());
+        // #7437: each source validated and searched for a NUL in the one read of it, which the
+        // substitution below takes the verdict of.
+        let scans = reads_plain_json(&args).then(|| scan_sources(&raw_inputs));
+        if let Some(scans) = &scans {
+            blank_nul_number_tails_in(raw_inputs.iter_mut(), Some(scans));
         }
         // #5291: jq skips a BOM at the start of its input, `--validate` included.
         strip_leading_json_bom(raw_inputs.iter_mut());
@@ -5667,10 +5670,14 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         let (raw_inputs, originals): (Vec<Vec<u8>>, Vec<Option<Vec<u8>>>) = if args.validate {
             (raw_inputs, Vec::new())
         } else {
+            let unmoved = seams_moved_nothing(&seams);
             raw_inputs
                 .into_iter()
                 .enumerate()
-                .map(|(index, raw)| utf8_lossy_document(raw, seams.get_mut(index)))
+                .map(|(index, raw)| {
+                    let scan = scans.as_ref().map(|scans| scans[index]);
+                    utf8_lossy_scanned(raw, seams.get_mut(index), scan, unmoved)
+                })
                 .unzip()
         };
 
@@ -7988,7 +7995,7 @@ fn read_inputs(
     // `--seq` keeps the mark: its reader removes it as jq's does, and reacts to one that breaks off.
     if json_input_mode {
         if reads_plain_json(args) {
-            blank_nul_number_tails_in(raw_bytes.iter_mut().map(|(_, raw)| raw));
+            blank_nul_number_tails_in(raw_bytes.iter_mut().map(|(_, raw)| raw), None);
         }
         // #5291: jq skips a BOM at the start of its input.
         strip_leading_json_bom(raw_bytes.iter_mut().map(|(_, raw)| raw));
@@ -11781,10 +11788,19 @@ pub(super) fn abort_if_out_of_memory(error: &std::io::Error) {
 /// jq reads the files as one stream, so a line a file ends in without a newline goes on in the
 /// next: a string or token open there is handed on, and only for a file whose first line holds a
 /// NUL is that line's start looked for in the files before it.
-fn blank_nul_number_tails_in<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
+///
+/// `scans` are the sources' [`scan_sources`], when they were made: a source they say holds no NUL
+/// is not searched again.
+fn blank_nul_number_tails_in<'a>(
+    raws: impl Iterator<Item = &'a mut Vec<u8>>,
+    scans: Option<&[succinctly::jq::TextScan]>,
+) {
     let mut raws: Vec<&mut Vec<u8>> = raws.collect();
     let front = raws.iter().position(|raw| !raw.is_empty());
     for at in 0..raws.len() {
+        if scans.is_some_and(|scans| !scans[at].nul) {
+            continue;
+        }
         let (before, rest) = raws.split_at_mut(at);
         let raw = &mut *rest[0];
         let Some(nul) = succinctly::jq::find_nul(raw) else {
@@ -11819,6 +11835,36 @@ fn blank_nul_number_tails_in<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
             &head,
         );
     }
+}
+
+/// Each source validated as UTF-8 and searched for a NUL in one read of it (#7437,
+/// [`succinctly::jq::scan_utf8_and_nul`]), for [`blank_nul_number_tails_in`] and then
+/// [`utf8_lossy_scanned`], which would otherwise each read every byte from memory again.
+fn scan_sources(raws: &[Vec<u8>]) -> Vec<succinctly::jq::TextScan> {
+    raws.iter()
+        .map(|raw| succinctly::jq::scan_utf8_and_nul(raw))
+        .collect()
+}
+
+/// [`utf8_lossy_document`], taking the verdict of `scan` for a source it holds when nothing has
+/// changed the source since but the BOM taken off its front, which is UTF-8 itself: no NUL tail was
+/// blanked (the source holds no NUL) and no seam moved bytes off or onto any source (`unmoved`).
+fn utf8_lossy_scanned(
+    raw: Vec<u8>,
+    seam: Option<&mut Seam>,
+    scan: Option<succinctly::jq::TextScan>,
+    unmoved: bool,
+) -> (Vec<u8>, Option<Vec<u8>>) {
+    match scan {
+        Some(scan) if unmoved && scan.utf8 && !scan.nul => (raw, None),
+        _ => utf8_lossy_document(raw, seam),
+    }
+}
+
+/// Whether [`stitch_json_file_seams`] moved no bytes between the sources: every move puts the bytes
+/// on the front of a later source, whose seam counts them.
+fn seams_moved_nothing(seams: &[Seam]) -> bool {
+    seams.iter().all(|seam| seam.base == 0)
 }
 
 /// Whether the plain JSON reader reads the input, the one [`blank_nul_number_tails_in`] is for.
