@@ -114351,29 +114351,31 @@ fn builtin_halt_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 Err(control) => Err(control.into()),
             };
             match n_result {
-                // Clamped into `0..=i32::MAX`, not wrapped, to match real jq:
-                // verified live against jq 1.7.1 that an out-of-range
-                // positive exit code clamps to `i32::MAX` (e.g.
-                // `halt_error(4294967296)` exits 255, `i32::MAX`'s low byte —
-                // not 0, which a wrapping `as i32` cast would give), and that
-                // every negative `halt_error(n)`, from `-1` through `-1e300`,
-                // exits 0 rather than the OS's usual two's-complement
-                // byte-truncation of a negative process-exit status (#791).
-                // The `i64`-typed arm needs an explicit `clamp` for this,
-                // since `as i32` on an integer wraps instead; the `f64` arm's
-                // `.max(0.0)` (floors before the saturating `as i32` cast,
-                // which already handles the upper bound, NaN, and +/-infinity
-                // by Rust's cast semantics since 1.45) is the float twin.
+                // Saturated into `i32`, not wrapped, to match real jq (which assigns the
+                // number to an `int`): verified live against jq 1.7.1 that an out-of-range
+                // positive exit code clamps to `i32::MAX` (e.g. `halt_error(4294967296)`
+                // exits 255, `i32::MAX`'s low byte -- not 0, which a wrapping `as i32` cast
+                // would give). A negative code is handed over as it is (#7440): jq's `-e`
+                // exits with its absolute value (`halt_error(-300)` exits 44) and without
+                // `-e` it exits 0 for every negative from `-1` through `-1e300` (#791), a
+                // choice the CLI makes in `ErrorSink::request_halt`, which knows the flag.
+                // The `i64`-typed arm needs an explicit `clamp` for this, since `as i32` on an
+                // integer wraps instead; the `f64` arm's `as i32` already saturates, sends NaN
+                // to 0 and truncates a fraction toward zero (Rust's cast semantics since 1.45).
                 Ok(OwnedValue::Int(i) | OwnedValue::NumberLiteral(NumberRepr::Int(i), _)) => {
-                    i.clamp(0, i64::from(i32::MAX)) as i32
+                    i.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
                 }
                 Ok(OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _)) => {
-                    f.max(0.0) as i32
+                    f as i32
                 }
+                // #7441: jq's `f_halt_error` raises a `type_error` on the INPUT value
+                // (`<type> (<input>) halt_error/1: number required`), not on the argument.
                 Ok(_) => {
-                    return QueryResult::Error(EvalError::new(
-                        "halt_error/1 requires a number exit code",
-                    ));
+                    let message = match to_owned::<S, _>(&value) {
+                        Ok(owned) => EvalError::halt_error_number_required(&owned),
+                        Err(e) => e,
+                    };
+                    return suppress_or_raise(message, optional);
                 }
                 Err(e) => return e.into(),
             }

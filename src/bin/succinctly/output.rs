@@ -202,6 +202,9 @@ pub struct ErrorSink {
     /// run (see [`Self::ends_run_since`], #5507).
     continue_past_program_errors: bool,
     halt: Option<i32>,
+    /// `-e` on `succinctly jq`: a negative halt code exits as its absolute value (see
+    /// [`Self::request_halt`], #7440).
+    halt_negative_as_abs: bool,
 }
 
 /// jq's own parse error for the input stream, asked for only when a document turns out to be
@@ -290,8 +293,23 @@ impl ErrorSink {
     /// bookkeeping. First halt seen wins; callers are expected to stop
     /// evaluating further input immediately after this is set, so a second
     /// call should never happen in practice.
+    ///
+    /// A negative code is what `halt_error(-3)` asked for (the evaluator hands it over
+    /// unclamped): jq's `-e` exits with its absolute value, and without `-e` it exits 0
+    /// (#7440). `i32::MIN` has no positive twin and stays itself, as in jq, so it exits 0.
     pub fn request_halt(&mut self, exit_code: i32) {
+        let exit_code = match (exit_code < 0, self.halt_negative_as_abs) {
+            (false, _) => exit_code,
+            (true, true) => exit_code.wrapping_abs(),
+            (true, false) => 0,
+        };
         self.halt = self.halt.or(Some(exit_code));
+    }
+
+    /// Make a negative `halt_error` code exit as its absolute value, which jq's `-e` does
+    /// (`jq_exit_with_status`; plain `jq_exit` clamps a negative status to 0, #7440).
+    pub fn set_halt_negative_as_abs(&mut self, on: bool) {
+        self.halt_negative_as_abs = on;
     }
 
     /// The exit code requested by `halt`/`halt_error` during this run, if
