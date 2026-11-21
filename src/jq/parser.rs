@@ -5386,11 +5386,18 @@ impl<'a> Parser<'a> {
                         // split into `-1 * <literal>` (#1035), an integer past
                         // `2^53` folded to the rounded `Literal::Float`
                         // (#3044/#3075) and `-0` kept its sign.
-                        Literal::NumberLiteral(repr, text) if self.mode == ParserMode::Jq => {
-                            let (repr, text) =
-                                crate::jq::value::jq_negated_literal(repr, &text[1..])
-                                    .unwrap_or((repr, text));
-                            Ok(Expr::Literal(Literal::NumberLiteral(repr, text)))
+                        Literal::NumberLiteral(repr, text)
+                            if self.mode == ParserMode::Jq
+                                && crate::jq::value::literal_is_zero(&text[1..]) =>
+                        {
+                            let repr = match repr {
+                                NumberRepr::Int(_) => NumberRepr::Int(0),
+                                NumberRepr::Float(_) => NumberRepr::Float(0.0),
+                            };
+                            Ok(Expr::Literal(Literal::NumberLiteral(
+                                repr,
+                                text[1..].to_string(),
+                            )))
                         }
                         lit => Ok(Expr::Literal(lit)),
                     }

@@ -311,6 +311,22 @@ pub(crate) fn parse_i64_exact(s: &str) -> Option<i64> {
     Some(value)
 }
 
+/// A number literal's spelling without its sign.
+pub(crate) fn literal_magnitude(text: &str) -> &str {
+    text.strip_prefix('-')
+        .or_else(|| text.strip_prefix('+'))
+        .unwrap_or(text)
+}
+
+/// Whether a number literal's decimal is zero, whatever its double: every
+/// mantissa digit is `0` (`0.00e5`, not `1e-400`).
+pub(crate) fn literal_is_zero(magnitude: &str) -> bool {
+    magnitude
+        .split(['e', 'E'])
+        .next()
+        .is_some_and(|mantissa| mantissa.bytes().all(|b| b == b'0' || b == b'.'))
+}
+
 /// jq 1.8's `_negate` of a number literal (#7453): the negated decimal, still
 /// a literal, so it keeps every digit and compares exactly (jqlang/jq#3242,
 /// which fixed jq 1.7.1 turning the operand into a double, jqlang/jq#2704).
@@ -322,14 +338,8 @@ pub(crate) fn jq_negated_literal(repr: NumberRepr, text: &str) -> Option<(Number
     if matches!(repr, NumberRepr::Float(f) if f.is_nan()) {
         return None;
     }
-    let magnitude = text
-        .strip_prefix('-')
-        .or_else(|| text.strip_prefix('+'))
-        .unwrap_or(text);
-    let zero = magnitude
-        .split(['e', 'E'])
-        .next()
-        .is_some_and(|mantissa| mantissa.bytes().all(|b| b == b'0' || b == b'.'));
+    let magnitude = literal_magnitude(text);
+    let zero = literal_is_zero(magnitude);
     let spelled = if zero || text.starts_with('-') {
         magnitude.to_string()
     } else {
@@ -7247,6 +7257,54 @@ mod tests {
     }
 
     use super::*;
+
+    /// #7453: a negated literal's repr is the parse of its negated spelling,
+    /// and a decimal zero negates to positive zero whatever its sign.
+    #[test]
+    fn negated_literal_repr_matches_its_spelling_7453() {
+        for text in [
+            "1",
+            "-1",
+            "0",
+            "-0",
+            "00",
+            "1.500",
+            "-1.500",
+            "1e-400",
+            "-1e-400",
+            "0.0",
+            "-0.0",
+            "0e5",
+            "007",
+            "9007199254740993",
+            "-9223372036854775808",
+            "9223372036854775807",
+            "1e1000",
+            "-1E1000",
+        ] {
+            let repr = parse_i64_or_f64_in::<JqSemantics>(text).unwrap();
+            let (negated, spelled) = jq_negated_literal(repr, text).unwrap();
+            assert_eq!(
+                Some(negated),
+                parse_i64_or_f64_in::<JqSemantics>(&spelled),
+                "{text}"
+            );
+            let zero = literal_is_zero(literal_magnitude(text));
+            if zero {
+                assert!(!spelled.starts_with('-'), "{text} -> {spelled}");
+            } else {
+                assert_ne!(
+                    spelled.starts_with('-'),
+                    text.starts_with('-'),
+                    "{text} -> {spelled}"
+                );
+            }
+        }
+        assert_eq!(
+            jq_negated_literal(NumberRepr::Float(f64::NAN), "null"),
+            None
+        );
+    }
 
     /// #2429/#3506: the subarray search counts overlapping matches, answers
     /// `[]` (never `null`) for an empty needle, a miss, or a needle longer
