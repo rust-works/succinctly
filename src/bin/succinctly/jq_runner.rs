@@ -5651,7 +5651,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     if files.is_empty() {
                         (files, vec![read_stdin_bytes()?], Vec::new())
                     } else {
-                        read_input_files(&files, false)
+                        // #7478: a named pipe the windowed gate read and found short hands its
+                        // bytes on here, since it gives them once.
+                        take_named_pushback(&files)
+                            .unwrap_or_else(|| read_input_files(&files, false))
                     }
                 }
             },
@@ -12184,8 +12187,36 @@ fn raw_windowed_source(args: &JqCommand, files: &[PathBuf]) -> Option<RawWindowe
         };
     }
     // No length: the file is read to the end it has when the reads get there (#7446).
-    let file = lone_raw_windowed_file(args, files)?;
-    Some((Box::new(file), None, Vec::new()))
+    if let Some(file) = lone_raw_windowed_file(args, files) {
+        return Some((Box::new(file), None, Vec::new()));
+    }
+    raw_windowed_named_pipe(args, files)
+}
+
+/// `-R`'s read of a lone input named on the command line that gives its bytes once (#7478): `-` as
+/// standard input ([`raw_windowed_stdin`]), and a FIFO or socket by its path ([`named_pipe`]) as a pipe on
+/// standard input is read, a window at a time once it holds one, so `-R -n input` over a producer that
+/// never ends its stream answers at once, as jq does. A pipe that ends sooner hands its bytes to the
+/// route that reads it whole ([`hand_back_short_pipe`]).
+#[cfg(unix)]
+fn raw_windowed_named_pipe(args: &JqCommand, files: &[PathBuf]) -> Option<RawWindowed> {
+    if !raw_window_flags(args) {
+        return None;
+    }
+    if let [path] = files {
+        if is_stdin_dash(path) {
+            return raw_windowed_stdin();
+        }
+    }
+    let path = named_pipe(files)?;
+    let file = std::fs::File::open(path).ok()?;
+    let front = probe_pipe(&file, raw_window_min_pipe_bytes(), Some(path))?;
+    Some((Box::new(file), None, front))
+}
+
+#[cfg(not(unix))]
+fn raw_windowed_named_pipe(_args: &JqCommand, _files: &[PathBuf]) -> Option<RawWindowed> {
+    None
 }
 
 /// Standard input for `-R` (#7024) when it is a regular file with [`raw_window_min_bytes`] or more left
@@ -12386,10 +12417,13 @@ fn windowed_plain_file(args: &JqCommand) -> Option<WindowedSource> {
     windowed_source(args, window::min_windowed_file_bytes()).or_else(|| {
         // #7024: a pipe on standard input, read a window at a time with its first fault kept as it is
         // read (`--seq` over a pipe is [`windowed_seq_pipe`]'s, #7164).
-        get_input_files(args)
-            .is_empty()
-            .then(windowed_stdin_pipe)
-            .flatten()
+        let files = get_input_files(args);
+        if files.is_empty() {
+            windowed_stdin_pipe()
+        } else {
+            // #7478: a lone pipe named on the command line, or `-`, is read as standard input is.
+            windowed_named_pipe(&files)
+        }
     })
 }
 
@@ -12662,6 +12696,13 @@ fn regular_stdin_left(
 /// standard input reads it ([`not_open_for_reading`]).
 #[cfg(unix)]
 fn probe_stdin_pipe(file: &std::fs::File, min: u64) -> Option<Vec<u8>> {
+    probe_pipe(file, min, None)
+}
+
+/// [`probe_stdin_pipe`] over standard input (`named` is `None`) or over a pipe named on the command line
+/// (#7478), whose short front goes to [`hand_back_short_pipe`].
+#[cfg(unix)]
+fn probe_pipe(file: &std::fs::File, min: u64, named: Option<&PathBuf>) -> Option<Vec<u8>> {
     // The probe's whole size at once, so that its bytes are not grown and copied on the way.
     let mut front = Vec::with_capacity(usize::try_from(min).unwrap_or(0));
     let error = Read::take(file, min)
@@ -12669,11 +12710,46 @@ fn probe_stdin_pipe(file: &std::fs::File, min: u64) -> Option<Vec<u8>> {
         .err()
         .filter(|error| !not_open_for_reading(error));
     if (front.len() as u64) < min {
-        STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
-        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(front));
+        hand_back_short_pipe(named, front, error);
         return None;
     }
     Some(front)
+}
+
+/// What a probe read of a pipe that ended before a windowed route would take it, handed to the route that
+/// reads it whole as if that route had read it itself: standard input's through [`STDIN_PUSHBACK`] (and
+/// the failure of a read through [`STDIN_PUSHBACK_ERROR`]), a pipe named on the command line's (#7478)
+/// through [`NAMED_PUSHBACK`], which that route takes for the same list of files: such a pipe gives its
+/// bytes once, and opening it again waits for a writer that has gone.
+#[cfg(unix)]
+fn hand_back_short_pipe(named: Option<&PathBuf>, bytes: Vec<u8>, error: Option<std::io::Error>) {
+    match named {
+        None => {
+            STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
+            STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(bytes));
+        }
+        // A read of a named pipe that fails after it opened leaves what it read as the pipe's bytes.
+        Some(path) => NAMED_PUSHBACK.with(|slot| {
+            let files = vec![path.clone()];
+            *slot.borrow_mut() = Some((files.clone(), (files, vec![bytes], Vec::new())));
+        }),
+    }
+}
+
+/// A lone input named on the command line that gives its bytes once (#7478): a FIFO or a socket by its
+/// path (`mkfifo`, `<(cmd)`), or `/dev/stdin` or `/dev/fd/N` naming one; judged by `stat`, which opens
+/// nothing. `-` is standard input, which each route reads as it reads an unnamed one.
+#[cfg(unix)]
+fn named_pipe(files: &[PathBuf]) -> Option<&PathBuf> {
+    use std::os::unix::fs::FileTypeExt;
+    let [path] = files else {
+        return None;
+    };
+    if is_stdin_dash(path) {
+        return None;
+    }
+    let kind = std::fs::metadata(path).ok()?.file_type();
+    (kind.is_fifo() || kind.is_socket()).then_some(path)
 }
 
 /// [`probe_stdin_pipe`] a block at a time (#7260): the probe's bytes as blocks of `block` bytes each,
@@ -12687,6 +12763,18 @@ fn probe_stdin_pipe_blocks(
     file: &std::fs::File,
     min: u64,
     block: usize,
+) -> Option<std::collections::VecDeque<Vec<u8>>> {
+    probe_pipe_blocks(file, min, block, None)
+}
+
+/// [`probe_stdin_pipe_blocks`] over standard input (`named` is `None`) or a pipe named on the command
+/// line (#7478), whose short front goes to [`hand_back_short_pipe`].
+#[cfg(unix)]
+fn probe_pipe_blocks(
+    file: &std::fs::File,
+    min: u64,
+    block: usize,
+    named: Option<&PathBuf>,
 ) -> Option<std::collections::VecDeque<Vec<u8>>> {
     const ROOM: usize = 64 << 10;
     let block = block.max(1);
@@ -12712,8 +12800,7 @@ fn probe_stdin_pipe_blocks(
         for bytes in blocks {
             whole.extend_from_slice(&bytes);
         }
-        STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
-        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(whole));
+        hand_back_short_pipe(named, whole, error);
         return None;
     }
     Some(blocks)
@@ -12769,7 +12856,18 @@ fn windowed_stdin_pipe() -> Option<WindowedSource> {
 /// documents before it as on a regular file.
 #[cfg(unix)]
 fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
-    let blocks = probe_stdin_pipe_blocks(&file, min, window::window_bytes())?;
+    windowed_pipe_named(file, min, None)
+}
+
+/// [`windowed_pipe`] over standard input (`named` is `None`) or a pipe named on the command line
+/// (#7478), which is the run's file list then, so its documents and faults name it.
+#[cfg(unix)]
+fn windowed_pipe_named(
+    file: std::fs::File,
+    min: u64,
+    named: Option<&PathBuf>,
+) -> Option<WindowedSource> {
+    let blocks = probe_pipe_blocks(&file, min, window::window_bytes(), named)?;
     let seen = window::SeenFault::default();
     let reader = window::WindowedFiles::pipe(
         std::rc::Rc::new(file),
@@ -12778,14 +12876,38 @@ fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
         seen.clone(),
     );
     Some((
-        Vec::new(),
+        named.cloned().into_iter().collect(),
         reader,
         std::rc::Rc::new(window::Reread::seen(seen)),
     ))
 }
 
+/// The plain route's read of a lone input named on the command line that gives its bytes once (#7478):
+/// `-` is read as standard input is ([`windowed_stdin_pipe`]), named `<stdin>`; a FIFO or socket by its
+/// path ([`named_pipe`]) is opened (which waits for its writer, as jq's open does) and read as a pipe on
+/// standard input is, a window at a time once it holds two, so `halt` or `first(.), halt` over a producer
+/// that never ends its stream ends at once, as jq does; the route that reads it whole read it to its end
+/// first. A pipe that ends sooner hands its bytes to that route ([`hand_back_short_pipe`]).
+#[cfg(unix)]
+fn windowed_named_pipe(files: &[PathBuf]) -> Option<WindowedSource> {
+    if let [path] = files {
+        if is_stdin_dash(path) {
+            let (_, reader, reread) = windowed_stdin_pipe()?;
+            return Some((files.to_vec(), reader, reread));
+        }
+    }
+    let path = named_pipe(files)?;
+    let file = std::fs::File::open(path).ok()?;
+    windowed_pipe_named(file, window::min_windowed_pipe_bytes(), Some(path))
+}
+
 #[cfg(not(unix))]
 fn windowed_stdin_pipe() -> Option<WindowedSource> {
+    None
+}
+
+#[cfg(not(unix))]
+fn windowed_named_pipe(_files: &[PathBuf]) -> Option<WindowedSource> {
     None
 }
 
@@ -14593,13 +14715,9 @@ fn lazy_prefix_bytes() -> usize {
 /// `input`/`inputs` (`track_eof`), over plain JSON documents, one file or stdin, nothing that
 /// needs the whole text first. Every condition is one the lone source's branch of [`get_inputs`]
 /// takes the stream on; `lone_lazy_read_is_the_lone_source_route_6451` checks the two agree.
+/// A lone `-`, and a lone pipe named by its path, are read as standard input is (#7478).
 fn lone_lazy_read(args: &JqCommand, track_eof: bool, files: &[PathBuf]) -> bool {
-    lazy_read_flags(args, track_eof)
-        && match files {
-            [] => true,
-            [file] => !is_stdin_dash(file),
-            _ => false,
-        }
+    lazy_read_flags(args, track_eof) && files.len() <= 1
 }
 
 /// The flags of a run whose documents the lazy route reads as the program asks for them: a program
@@ -14937,9 +15055,34 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     // doubling as they are (a 2.5 MiB buffer copied out of a 1.25 MiB one at the peak); room not
     // written to is not memory the run holds.
     let room = front + 2 * lazy_window_bytes();
-    // A regular file's length, which a read whole of it is sized for; `None` for standard input.
+    // A regular file's length, which a read whole of it is sized for; `None` for standard input and for
+    // a pipe named on the command line (#7478), which are read as a stream.
+    let dash = files.first().is_some_and(|path| is_stdin_dash(path));
     let (mut reader, len): (Box<dyn std::io::Read>, Option<usize>) = match files.first() {
-        None => {
+        // #7478: `-` is standard input, read below as an unnamed one is (named `<stdin>`), unless a
+        // route before has read it whole already.
+        Some(_) if dash && DASH_STDIN.with(|cache| cache.borrow().is_some()) => {
+            return Ok(LoneStart::Read(dash_stdin_bytes()?)); // patchcov: coverage tolerate-line reason="unreachable today: no route before this one reads a lone `-`; kept so a cached read is never read again"
+        }
+        Some(path) if !dash => {
+            let Ok(file) = std::fs::File::open(path) else {
+                return Ok(LoneStart::Declined);
+            };
+            // A file the front holds whole gains nothing, and a directory keeps its route, which
+            // reports it. #7478: a FIFO, a socket or a device (`<(cmd)`, `/dev/stdin` on a pipe) gives
+            // its bytes once, so it is read here as standard input is, from the open just made, and
+            // never turned back once read: the route that reads it whole read it to its end before the
+            // program started, which never ends over an endless producer.
+            match file
+                .metadata()
+                .map(|meta| (meta.is_file(), meta.is_dir(), usize::try_from(meta.len())))
+            {
+                Ok((true, _, Ok(len))) if len > front => (Box::new(file), Some(len)),
+                Ok((false, false, _)) => (Box::new(file), None),
+                _ => return Ok(LoneStart::Declined),
+            }
+        }
+        _ => {
             let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
             // #7126: standard input that cannot be read is empty, and ends the run with exit 2.
             if crate::cli::stdin_access::unreadable() {
@@ -14950,28 +15093,18 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                 .chain(super::stdin_offset::Stdin);
             (Box::new(stdin), None)
         }
-        Some(path) => {
-            let Ok(file) = std::fs::File::open(path) else {
-                return Ok(LoneStart::Declined);
-            };
-            // A file the front holds whole gains nothing; a FIFO or a directory keeps its route.
-            match file
-                .metadata()
-                .map(|meta| (meta.is_file(), usize::try_from(meta.len())))
-            {
-                Ok((true, Ok(len))) if len > front => (Box::new(file), Some(len)),
-                _ => return Ok(LoneStart::Declined),
-            }
-        }
     };
-    let from_stdin = files.is_empty();
+    let from_stdin = files.is_empty() || dash;
+    // Standard input or a named stream: its length is not known, and what is read of it is not read
+    // again, so a read past the front is never turned down.
+    let streamed = len.is_none();
     let mut bytes = Vec::with_capacity(len.map_or(room, |len| len.min(room)));
     // A file longer than the front is known to be, so its first chunk is looked for in the first
     // [`LAZY_START_BYTES`] of it and the front is read only when that holds no whole chunk (#7264):
     // reading 256 KiB first was a tenth of `-n 'first(inputs)|.id'`'s time. Standard input may end
     // anywhere, and that it holds a front's worth is how it is told from a short source, so it reads
     // the front at once.
-    let mut want = if from_stdin {
+    let mut want = if streamed {
         front
     } else {
         front.min(LAZY_START_BYTES)
@@ -14987,6 +15120,11 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             return if from_stdin {
                 note_stdin_read_failed();
                 Ok(LoneStart::Read(bytes))
+            } else if streamed {
+                // patchcov: coverage tolerate reason="untestable: a read that fails after the pipe opened"
+                // A named stream cannot be read again: what it gave is the stream.
+                Ok(LoneStart::Read(bytes))
+                // patchcov: coverage end
             } else {
                 // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
                 Ok(LoneStart::Declined)
@@ -15102,6 +15240,8 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             note_stdin_read_failed();
             Ok(LoneStart::Read(bytes))
         }
+        // A named stream cannot be read again (#7478).
+        Err(_) if streamed => Ok(LoneStart::Read(bytes)),
         Err(_) => Ok(LoneStart::Declined),
         // patchcov: coverage end
     }
@@ -23531,14 +23671,16 @@ mod tests {
         assert!(check(b"\xef\xbb\xbf \n", 3).blank);
     }
 
-    /// #6920: the gate judges a path by `stat` and opens nothing it declines. A named pipe (what
-    /// `<(cmd)` is on some systems) pairs a reader with its writer when it is opened, and a handle opened
-    /// and dropped on the way to the route that reads it would take the writer's bytes with it.
+    /// #6920, #7478: a named pipe (what `<(cmd)` is on some systems) pairs a reader with its writer when it
+    /// is opened, so a handle opened and dropped on the way to the route that reads it would take the
+    /// writer's bytes with it. Since #7478 the gate reads such a pipe as it reads one on standard input: a
+    /// pipe that ends before it holds two windows hands what it read to the route that reads it whole
+    /// ([`NAMED_PUSHBACK`]), which takes it for the same file list, and nothing is lost. A regular file
+    /// too small for the route is judged by `stat` and not opened.
     #[cfg(unix)]
     #[test]
-    fn the_gate_does_not_open_a_named_pipe_6920() {
+    fn the_gate_hands_a_short_named_pipe_on_whole_7478() {
         use clap::Parser;
-        use std::sync::mpsc;
         let dir = tempfile::tempdir().expect("tempdir");
         let fifo = dir.path().join("pipe");
         let made = std::process::Command::new("mkfifo")
@@ -23548,23 +23690,17 @@ mod tests {
         assert!(made.success());
         let writer_path = fifo.clone();
         let writer = std::thread::spawn(move || std::fs::write(&writer_path, b"{\"a\":1}\n"));
-        // Let the writer reach its open, which blocks until a reader opens the pipe.
-        std::thread::sleep(std::time::Duration::from_millis(200));
         let cmd =
             JqCommand::try_parse_from(["jq", ".", fifo.to_str().expect("utf-8 path")]).unwrap();
         assert!(windowed_plain_file(&cmd).is_none());
-        // The writer is still waiting for its reader: the first open after the gate gets its bytes.
-        let (sender, receiver) = mpsc::channel();
-        let reader_path = fifo.clone();
-        std::thread::spawn(move || {
-            let _ = sender.send(std::fs::read(&reader_path));
-        });
-        let got = receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the writer's bytes were not taken by the gate")
-            .expect("reads");
-        assert_eq!(got, b"{\"a\":1}\n");
         writer.join().expect("writer").expect("written");
+        let (files, raws, failures) =
+            take_named_pushback(&get_input_files(&cmd)).expect("the pipe's bytes are handed on");
+        assert_eq!(files, get_input_files(&cmd));
+        assert_eq!(raws, vec![b"{\"a\":1}\n".to_vec()]);
+        assert!(failures.is_empty());
+        // Taken once.
+        assert!(take_named_pushback(&files).is_none());
     }
 
     /// #6920: the plain route reads a window at a time only for one regular file big enough to be
