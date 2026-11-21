@@ -334,11 +334,16 @@ Pinned by `tests/jq_cli/i5476.rs`, which asserts succinctly's side; jq's side wa
 
 jq 1.7.1 reads JSON input through `fgets` into a 4096-byte buffer, and `jq_util_input_read_more` then measures a chunk that holds no newline with `strlen`.
 A NUL byte in such a chunk ends the chunk there, and the rest of it is dropped without a word.
-A chunk that does hold a newline is handed to the parser whole, so the same NUL is an `Invalid numeric literal` error.
 The input's last chunk, the only one of a short file without a trailing newline, is the case that loses data.
-`succinctly jq` reads the text as it is and reports the NUL as a parse error in both cases.
+`succinctly jq` reads the text as it is and reports such a NUL as a parse error.
 This is jq discarding the input after the NUL with exit status 0, so the divergence stands under [ADR-0018](../../adrs/adr-0018.md) rather than being matched.
 The `--seq` reader matches jq instead (#7340), as it matches jq's other silent drops there (#2998): a `--seq` stream is one jq reads past its faults by design, with no exit status to report them.
+jq 1.8.2 no longer truncates a chunk at a NUL (CVE-2026-33948, upstream commit 6374ae0bcd), so it reads `[1\0,2]` with no newline as `[1,2]`; `succinctly jq` does not follow that change yet.
+
+A chunk that does hold a newline is handed to the parser whole, NULs included, and jq's tokenizer reads a NUL into the token it is in like any other byte.
+A NUL that starts a token, follows `true`, `false` or `null`, or sits in a string is then an error (`Invalid numeric literal`, `Invalid literal`, or the control-character one).
+One glued to a number is not: `check_literal` hands the number's token to its parser as a C string, which stops at the NUL, so `[1`, a NUL, `x,2]` and a newline is `[1,2]` and the rest of the token is dropped with the NUL (#7437).
+`succinctly jq` reads both the same way, on every route that reads JSON input, and in `fromjson`, which reads its string by its length and so needs no newline (`"[1\u0000,2]" | fromjson` is `[1,2]` in jq 1.7.1 and 1.8.2).
 
 Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinctly jq`:
 
@@ -352,7 +357,7 @@ Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinc
 | `[1]\0[2]\n` | `Invalid numeric literal at line 1, column 5`, exit 5     | the same                                                     |
 
 The last row is the agreement: with a newline in the chunk jq does not truncate either.
-`tests/jq_cli/i5654_nul.rs` pins both sides.
+`tests/jq_cli/i5654_nul.rs` pins both sides, and `tests/jq_cli/i7437.rs` the number tokens with a newline in their chunk.
 
 ## A `-f` program file with a NUL byte is refused, as jq 1.8.2 refuses it; jq 1.7.1 ends the program at the NUL (#7434)
 
