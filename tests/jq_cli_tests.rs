@@ -9156,8 +9156,14 @@ fn test_range_int_from_keeps_negative_zero_literal_spelling_3103() -> Result<()>
     // `-0` is the one integer spelling that diverges from its own canonical
     // `i64` print (no leading zeros/`+`/underscores are legal JSON/jq number
     // syntax otherwise, so this is the sole int-side case #3103 also covers).
-    // jq 1.7.1: `[range(-0;3)]` => `[-0,1,2]`, not `[0,1,2]`.
+    // jq 1.7.1: `[range(-0;3)]` => `[-0,1,2]`, not `[0,1,2]`. Since #7453 a
+    // program's `-0` is jq 1.8's negation of the literal `0`, which is `0`
+    // (jqlang/jq#3242), so the spelling that still carries the sign is a
+    // document `-0`.
     let (output, code) = run_jq_null("[range(-0; 3)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0,1,2]");
+    let (output, code) = run_jq_stdin("[range(.; 3)]", "-0", &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "[-0,1,2]");
     Ok(())
@@ -42261,12 +42267,11 @@ fn test_jq_raw_input_line_number_unterminated_single_file_1809() -> Result<()> {
 /// `numeric_key_to_index` and emit a bare integer. Every expectation here is
 /// pinned jq 1.7.1's own output.
 ///
-/// The `path(.[-1.0])` → `[-1]` case is not an index-specific asymmetry, and
-/// is here to keep anyone from "fixing" it into `[-1.0]`: jq's unary minus
-/// destroys number-literal preservation (`jq -n '-1.0'` is already `-1`), so
-/// the negated key is a plain double before indexing happens at all. The
-/// `from-data` case is the control that proves it — a negative float that
-/// never passes through unary minus *does* keep its spelling.
+/// The negated keys follow jq 1.8.2 since #7453: jq 1.8's unary minus keeps a
+/// literal a literal (jqlang/jq#3242), so `path(.[-1.0])` is `[-1.0]`, where
+/// jq 1.7.1 turned the key into a double first (`[-1]`). The `from-data` case
+/// is the control: a negative float that never passes through unary minus
+/// keeps its spelling in both versions.
 #[test]
 fn test_1088_path_reports_float_index_as_written() {
     let arr = Some("[1,2,3,4,5]");
@@ -42280,11 +42285,11 @@ fn test_1088_path_reports_float_index_as_written() {
         // An integer-spelled key is unchanged — nothing to preserve.
         ("path(.[2])", "[2]\n"),
         ("path(.[-1])", "[-1]\n"),
-        // Negated literals: jq's own unary minus already collapsed them.
-        ("path(.[-1.0])", "[-1]\n"),
+        // Negated literals keep their spelling, as in jq 1.8.2 (#7453).
+        ("path(.[-1.0])", "[-1.0]\n"),
         ("path(.[-2.5])", "[-2.5]\n"),
-        ("path(.[-1e10])", "[-10000000000]\n"),
-        ("path(.[-0.0])", "[-0]\n"),
+        ("path(.[-1e10])", "[-1E+10]\n"),
+        ("path(.[-0.0])", "[0.0]\n"),
         // A dynamic key resolves through `key_to_path_component`, not the
         // parser's constant fold — both had to be fixed.
         ("(2.0) as $x | path(.[$x])", "[2.0]\n"),
@@ -52057,7 +52062,10 @@ fn test_todate_non_number_matches_strftime_wording_3068() -> Result<()> {
 /// keeps its own literal spelling instead of being recomputed through
 /// `f64`, and `null`/`false`/`true` (which sort *below* every number) raise
 /// through `-.`'s own "cannot be negated" error. Every row confirmed live
-/// against jq 1.7.1.
+/// against jq 1.7.1, except a negative literal's `abs`: since #7453 `-.`
+/// keeps a literal a literal, as jq 1.8 does (jqlang/jq#3242), so
+/// `(-1.50) | abs` is `1.50` and `(-0.0) | abs` is `0.0` (jq 1.7.1: `1.5`,
+/// `-0`), as in jq 1.8.2.
 #[test]
 fn test_abs_matches_jq_total_ordering_semantics_3041() -> Result<()> {
     for (filter, want) in [
@@ -52065,10 +52073,10 @@ fn test_abs_matches_jq_total_ordering_semantics_3041() -> Result<()> {
         ("[1,2] | abs", "[1,2]"),
         ("{} | abs", "{}"),
         ("1.50 | abs", "1.50"),
-        ("(-1.50) | abs", "1.5"),
+        ("(-1.50) | abs", "1.50"),
         ("(-1) | abs", "1"),
         ("0 | abs", "0"),
-        ("(-0.0) | abs", "-0"),
+        ("(-0.0) | abs", "0.0"),
         ("nan | abs", "null"),
         ("infinite | abs", "1.7976931348623157e+308"),
     ] {
@@ -68494,19 +68502,26 @@ fn test_range_i64_overflow_keeps_exact_prefix_2219() -> Result<()> {
 /// consistent exception. Fixed by routing a literal-adjacent `-` through
 /// the same `-1 * <literal>` split the float/exponent case already used
 /// (`parser.rs`) and closing the same gap in `arith_negate` for the
-/// parenthesized/piped spellings (`eval.rs`). `-1.10` is the
-/// magnitude-specific control: below `2^53`, `double` holds the value
-/// exactly either way, so this was never observable there.
+/// parenthesized/piped spellings (`eval.rs`).
+///
+/// #7453 superseded that with jq 1.8's rule, which upstream fixed as a bug
+/// (jqlang/jq#3242, jqlang/jq#2704): unary minus negates a literal to a
+/// literal, so every literal row below keeps its digits, and only a
+/// computed operand rounds.
 #[test]
 fn test_unary_minus_matches_jq_past_2_53_3044() -> Result<()> {
     for (filter, want) in [
-        ("-9223372036854775758", "-9223372036854776000"),
-        ("-9007199254740993", "-9007199254740992"),
-        ("-(9223372036854775758)", "-9223372036854776000"),
-        ("9223372036854775758 | -.", "-9223372036854776000"),
-        ("-9223372036854775808", "-9223372036854776000"), // i64::MIN
-        ("-1.10", "-1.1"),
-        ("-123", "-123"), // below 2^53: unaffected, still exact
+        // #7453: a negated literal keeps every digit, as in jq 1.8.2; jq
+        // 1.7.1 answers `-9223372036854776000`, `-9007199254740992` and `-1.1`.
+        ("-9223372036854775758", "-9223372036854775758"),
+        ("-9007199254740993", "-9007199254740993"),
+        ("-(9223372036854775758)", "-9223372036854775758"),
+        ("9223372036854775758 | -.", "-9223372036854775758"),
+        ("-9223372036854775808", "-9223372036854775808"), // i64::MIN
+        ("-1.10", "-1.10"),
+        ("-123", "-123"),
+        // A computed operand still negates as a double.
+        ("-(9223372036854775758 + 0)", "-9223372036854776000"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", "--", filter], None)?;
         assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
@@ -68530,19 +68545,22 @@ fn test_unary_minus_matches_jq_past_2_53_3044() -> Result<()> {
 /// or slice bound kept the divergence
 /// `test_unary_minus_matches_jq_past_2_53_3044` just closed for every other
 /// spelling -- `path(.[-869389897822472004])` stayed `[-869389897822472004]`
-/// where jq gives `[-869389897822472000]`. A magnitude within range
-/// (`.[-1]`) must keep folding exactly, unaffected.
+/// where jq 1.7.1 gives `[-869389897822472000]`. A magnitude within range
+/// (`.[-1]`) must keep folding exactly, unaffected. Since #7453 the jq 1.8.2
+/// answer is the pin: a negated literal keeps its digits (jqlang/jq#3242).
 #[test]
 fn test_unary_minus_matches_jq_in_index_and_slice_bounds_3044() -> Result<()> {
     for (filter, want) in [
-        ("path(.[-869389897822472004])", "[-869389897822472000]"),
+        // #7453: the negated literal keeps its digits, as in jq 1.8.2 (jq
+        // 1.7.1: `-869389897822472000`).
+        ("path(.[-869389897822472004])", "[-869389897822472004]"),
         (
             "path(.[-869389897822472004:])",
-            r#"[{"start":-869389897822472000,"end":null}]"#,
+            r#"[{"start":-869389897822472004,"end":null}]"#,
         ),
         (
             "path(.[:-869389897822472004])",
-            r#"[{"start":null,"end":-869389897822472000}]"#,
+            r#"[{"start":null,"end":-869389897822472004}]"#,
         ),
         ("[1,2,3] | .[-1]", "3"),
         ("path(.[-123])", "[-123]"),
@@ -110542,7 +110560,8 @@ fn test_float_literal_rounding_reaches_every_reader_2936() -> Result<()> {
         ("2.7293109604053567083 | sqrt", "1.6520626381603563"),
         ("2.7293109604053567083 | length", "2.7293109604053565"),
         ("2.7293109604053567083 | fabs", "2.7293109604053565"),
-        ("2.7293109604053567083 | -.", "-2.7293109604053565"),
+        // `-.` keeps a literal a literal since #7453, as in jq 1.8.2 (jq 1.7.1 rounded it).
+        ("2.7293109604053567083 | -.", "-2.7293109604053567083"),
         ("2.7293109604053567083 * 1", "2.7293109604053565"),
         // the overflow boundary: 17 digits round *down* to DBL_MAX
         ("1.797693134862315808e308 | isinfinite", "false"),
@@ -110740,10 +110759,11 @@ fn test_large_int_literal_rounds_to_17_digits_from_input_sources_2906() -> Resul
 /// #2906 must-not-regress companion: a literal that is only *displayed*
 /// keeps its exact spelling, 17-or-fewer-digit literals are unchanged (the
 /// rounding is the identity below 10^17), genuine `i64` overflow still goes
-/// through the pre-existing float path, and (#3044, superseding the former
-/// #2357 divergence this row used to pin the opposite way) a negative
-/// literal past `2^53` now rounds the same as every other operator. jq's
-/// answers captured live against `/usr/bin/jq` 1.7.1 except where noted.
+/// through the pre-existing float path, and a negative literal past `2^53`
+/// keeps its digits: jq 1.8 negates a literal to a literal (jqlang/jq#3242),
+/// which `succinctly jq` follows since #7453 (#3044 had rounded it as jq
+/// 1.7.1 does). jq's answers captured live against `/usr/bin/jq` 1.7.1,
+/// except that row, which is jq 1.8.2's.
 #[test]
 fn test_large_int_literal_rounding_leaves_display_and_small_ints_alone_2906() -> Result<()> {
     for (filter, want) in [
@@ -110758,7 +110778,7 @@ fn test_large_int_literal_rounding_leaves_display_and_small_ints_alone_2906() ->
             "9223372036854775807 + 9223372036854775807",
             "18446744073709552000",
         ),
-        ("0 | -869389897822472004", "-869389897822472000"),
+        ("0 | -869389897822472004", "-869389897822472004"),
     ] {
         let (output, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");
@@ -125744,7 +125764,9 @@ const AS_BINDING_GUARD_ROWS_3397: &[(&str, &str, &str, i32)] = &[
     (r"[4]", r"[1 and 2 as $x | $x]", "[true]\n", 0),
     (r"[4]", r"1 == 1 as $x | $x", "true\n", 0),
     (r"[4]", r"-reduce (1,2) as $i (0; .+$i) as $z | $z", "", 3),
-    (r"[4]", r"[-1e2 as $x | $x]", "[-100]\n", 0),
+    // `-(1e2 as $x | $x)`: the negated literal keeps its spelling since #7453, as in jq 1.8.2
+    // (jq 1.7.1: `[-100]`).
+    (r"[4]", r"[-1e2 as $x | $x]", "[-1E+2]\n", 0),
     (r"[4]", r"[.[-1] as $x | $x]", "[4]\n", 0),
     (r"[4]", r"[.[] as $x | $x * 2]", "[8]\n", 0),
     (r"[4]", r"[reduce .[] as $x (0; . + $x)]", "[4]\n", 0),
