@@ -12,6 +12,11 @@
 //! of bytes (on AVX2 one instruction per 32 bytes, its load folded in) and test the minimum once
 //! per block; the block that holds a NUL is then searched a vector at a time, and the last vector
 //! a byte at a time.
+//!
+//! The fold keeps [`LANES`] minimums apart, one for each vector of a [`STEP`], and joins them once a
+//! block: a single one is a chain of `min`s each waiting on the last, which ran at one vector per
+//! `min` latency (two cycles on an Apple M4 Pro, 8 bytes a cycle: 2 ms of a 100 MB run, +1.5-2.6%
+//! wall clock on whole-file rows there, #7437), where the core can start several a cycle.
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
@@ -22,6 +27,14 @@ use core::arch::x86_64::*;
 /// vector and one test, so the test's cost is spread over this many bytes.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const BLOCK: usize = 4096;
+
+/// The bytes of one step of the fold: a vector for each of the [`LANES`] minimums.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const STEP: usize = 128;
+
+/// How many minimums the fold keeps apart (16-byte vectors; AVX2 keeps half as many of 32).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const LANES: usize = 8;
 
 /// The offset of the first NUL byte in `bytes`, or `None` when it holds none.
 #[inline]
@@ -73,15 +86,7 @@ fn avx2_available() -> bool {
     }
 }
 
-/// Folds `$count` vectors from `$p` on into `$acc` with `$min`, one statement each, so that a block
-/// is straight-line code with no loop counter of its own.
-macro_rules! fold_min {
-    ($acc:ident, $p:ident, $min:ident, $load:expr, $width:expr, [$($k:literal)*]) => {
-        $( $acc = $min($acc, $load($p.add($k * $width))); )*
-    };
-}
-
-/// AVX2: 4096 bytes a test, one `vpminub` (with its load) per 32 bytes.
+/// AVX2: 4096 bytes a test, one `vpminub` (with its load) per 32 bytes, into four minimums.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn nul_free_prefix_avx2(bytes: &[u8]) -> usize {
@@ -90,15 +95,20 @@ unsafe fn nul_free_prefix_avx2(bytes: &[u8]) -> usize {
     let n = bytes.len();
     let mut at = 0;
     while at + BLOCK <= n {
-        let p = bytes.as_ptr().add(at);
-        let mut m = load(p);
-        fold_min!(m, p, _mm256_min_epu8, load, 32, [
-            1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
-            32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60
-            61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89
-            90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113
-            114 115 116 117 118 119 120 121 122 123 124 125 126 127
-        ]);
+        let base = bytes.as_ptr().add(at);
+        let mut m = [
+            load(base),
+            load(base.add(32)),
+            load(base.add(64)),
+            load(base.add(96)),
+        ];
+        for step in 1..BLOCK / STEP {
+            let p = base.add(step * STEP);
+            for (lane, min) in m.iter_mut().enumerate() {
+                *min = _mm256_min_epu8(*min, load(p.add(lane * 32)));
+            }
+        }
+        let m = _mm256_min_epu8(_mm256_min_epu8(m[0], m[1]), _mm256_min_epu8(m[2], m[3]));
         if _mm256_movemask_epi8(_mm256_cmpeq_epi8(m, zero)) != 0 {
             break;
         }
@@ -114,7 +124,7 @@ unsafe fn nul_free_prefix_avx2(bytes: &[u8]) -> usize {
     at
 }
 
-/// SSE2, the x86_64 baseline: 4096 bytes a test, one `pminub` per 16 bytes.
+/// SSE2, the x86_64 baseline: 4096 bytes a test, one `pminub` per 16 bytes, into eight minimums.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn nul_free_prefix_sse2(bytes: &[u8]) -> usize {
@@ -124,16 +134,20 @@ unsafe fn nul_free_prefix_sse2(bytes: &[u8]) -> usize {
     let mut at = 0;
     while at + BLOCK <= n {
         let base = bytes.as_ptr().add(at);
-        let mut m = load(base);
-        // Four runs of 64 vectors: the macro's offsets are per run.
-        for run in 0..4 {
-            let p = base.add(run * 1024);
-            fold_min!(m, p, _mm_min_epu8, load, 16, [
-                0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30
-                31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58
-                59 60 61 62 63
-            ]);
+        let mut m = [zero; LANES];
+        for (lane, min) in m.iter_mut().enumerate() {
+            *min = load(base.add(lane * 16));
         }
+        for step in 1..BLOCK / STEP {
+            let p = base.add(step * STEP);
+            for (lane, min) in m.iter_mut().enumerate() {
+                *min = _mm_min_epu8(*min, load(p.add(lane * 16)));
+            }
+        }
+        let m = _mm_min_epu8(
+            _mm_min_epu8(_mm_min_epu8(m[0], m[1]), _mm_min_epu8(m[2], m[3])),
+            _mm_min_epu8(_mm_min_epu8(m[4], m[5]), _mm_min_epu8(m[6], m[7])),
+        );
         if _mm_movemask_epi8(_mm_cmpeq_epi8(m, zero)) != 0 {
             break;
         }
@@ -149,7 +163,7 @@ unsafe fn nul_free_prefix_sse2(bytes: &[u8]) -> usize {
     at
 }
 
-/// NEON: 4096 bytes a test, one `umin` per 16 bytes and one `uminv` per block.
+/// NEON: 4096 bytes a test, one `umin` per 16 bytes into eight minimums, and one `uminv` per block.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn nul_free_prefix_neon(bytes: &[u8]) -> usize {
@@ -158,15 +172,20 @@ unsafe fn nul_free_prefix_neon(bytes: &[u8]) -> usize {
     let mut at = 0;
     while at + BLOCK <= n {
         let base = bytes.as_ptr().add(at);
-        let mut m = load(base);
-        for run in 0..4 {
-            let p = base.add(run * 1024);
-            fold_min!(m, p, vminq_u8, load, 16, [
-                0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30
-                31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58
-                59 60 61 62 63
-            ]);
+        let mut m = [vdupq_n_u8(0); LANES];
+        for (lane, min) in m.iter_mut().enumerate() {
+            *min = load(base.add(lane * 16));
         }
+        for step in 1..BLOCK / STEP {
+            let p = base.add(step * STEP);
+            for (lane, min) in m.iter_mut().enumerate() {
+                *min = vminq_u8(*min, load(p.add(lane * 16)));
+            }
+        }
+        let m = vminq_u8(
+            vminq_u8(vminq_u8(m[0], m[1]), vminq_u8(m[2], m[3])),
+            vminq_u8(vminq_u8(m[4], m[5]), vminq_u8(m[6], m[7])),
+        );
         if vminvq_u8(m) == 0 {
             break;
         }
