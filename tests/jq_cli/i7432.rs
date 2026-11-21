@@ -59,7 +59,7 @@ fn test_modulemeta_repeated_def_keeps_the_header_and_deps_7432() -> Result<()> {
     std::fs::create_dir_all(dir.path().join("lib"))?;
     for (source, want) in [
         (
-            "module {a:1}; import \"x\" as x; def f: 1; def f: 2;",
+            "module {\"a\":1}; import \"x\" as x; def f: 1; def f: 2;",
             r#"{"a":1,"deps":[{"as":"x","is_data":false,"relpath":"x"}],"defs":["f/0"]}"#,
         ),
         (
