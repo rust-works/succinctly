@@ -346,6 +346,31 @@ const MAX_PATTERN_COMPUTED_KEYS: usize = 4096;
 /// brackets or parentheses stay guarded through the bracket's own depth unit.
 const MAX_EXPR_DEPTH: usize = 256;
 
+/// The native stack a later walk of the program spends on each definition of a module-level
+/// chain (`def f0: ...; def f1: ...; ...`), charged against the stack's room when the parser reads
+/// the chain (#7475). The parser reads such a chain in a loop and spends nothing on its length,
+/// but the walks after it (the resolver, the def binder, the analyses, a clone of the tree)
+/// recurse once per definition, and a long enough chain overflowed the stack in one of them:
+/// measured on an Apple M5, the deepest walk took up to 670 bytes a definition in a release build
+/// (400,000 ran, 500,000 aborted, on the CLI's 256 MiB thread) and up to 21 KiB in a debug build
+/// (100,000 ran, 150,000 aborted, on 2 GiB). This is about three times the first and twice the
+/// second, against the room left to the floor, half the thread's stack, so a chain the parser
+/// admits leaves the walks at least that much to spare.
+const DEF_CHAIN_LINK_STACK: usize = if cfg!(debug_assertions) {
+    48 * 1024
+} else {
+    2 * 1024
+};
+
+/// jq's own words when its parser runs out of room, `memory exhausted` (a compile error, exit 3):
+/// what a program too long for the native-stack floor is refused with (#7475). Out of line, so the
+/// recursive parse functions that raise it keep their frames.
+#[cold]
+#[inline(never)]
+fn stack_exhausted_error(position: usize) -> ParseError {
+    ParseError::new("memory exhausted", position)
+}
+
 /// yq's `--string-interpolation` (#7025): whether a string literal reads `\(expr)` as an
 /// interpolation. Process-wide, as yq's own setting is, so an `eval(..)` text and every other
 /// parse in the run read the same one. Only `ParserMode::Yq` consults it.
@@ -12817,6 +12842,11 @@ impl<'a> Parser<'a> {
         }
         self.expect('|')?;
         self.skip_ws();
+        // #7475: a binding's body re-enters the whole operator ladder, which the expression depth
+        // limit does not count, so a long chain of bindings is held to the native-stack floor.
+        if super::eval::native_stack_exhausted() {
+            return Err(stack_exhausted_error(self.pos));
+        }
         let body = match self.mode {
             ParserMode::Jq => self.parse_expr()?,
             // The body is a pipe chain, and a pipe binds tighter than `,` and `and`/`or` in yq:
@@ -12976,11 +13006,16 @@ impl<'a> Parser<'a> {
 
         // Collect function definitions at module level
         let mut defs: Vec<(String, Vec<Param>, Expr)> = Vec::new();
+        // #7475: how many this thread's native stack has room for.
+        let room_for = super::eval::native_stack_room().map(|room| room / DEF_CHAIN_LINK_STACK);
 
         // Parse function definitions until we hit something that isn't one
         while self.matches_keyword("def") {
             self.reject_unless_jq_extensions("def")?;
             let offset = self.pos;
+            if room_for.is_some_and(|room_for| defs.len() >= room_for) {
+                return Err(stack_exhausted_error(offset));
+            }
             let (name, params, body) = self.parse_func_def_parts()?;
             self.def_sites.push(DefSite {
                 name: name.clone(),
