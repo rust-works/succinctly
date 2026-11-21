@@ -36871,8 +36871,9 @@ fn interval_quantifier_at(chars: &[char], at: usize) -> Option<(usize, bool)> {
 /// bare `?` there as lazy, so it is written `{0,1}`). A lazy quantifier followed by `+` (`a*?+`)
 /// and `{n}?+` are a repeat of a repeat in jq as well and are left alone, as is a `+` that
 /// whitespace separates from its quantifier under the `x` flag (`a* +`).
-/// Escapes, character classes, `\Q..\E`, `(?#..)` and, under `x`, `#` comments are stepped over;
-/// an inline `(?x)` is not modelled, so a `#` comment under it is read as pattern.
+/// Escapes, character classes, `\Q..\E`, `(?#..)` and, under `x`, `#` comments are stepped over.
+/// The `x` flag is the argument's as inline flags change it (`(?x)`, `(?-x)`, `(?x:...)`, #7464),
+/// so a blank and a `#` comment under an inline `(?x)` are stepped over as under the argument.
 #[cfg(all(feature = "regex", test))]
 fn refuse_possessive_quantifier(
     pattern: &str,
@@ -36924,11 +36925,19 @@ fn refuse_possessive_quantifier_for(
     // last saw one begin (a group's `(`, a class's `[`, an escape, a character), and the group
     // opens there and closes after the `+`.
     let mut atom: Option<usize> = None;
-    // The `(` of each group still open, and whether it only sets flags (`(?i)`), which is no atom.
-    let mut open_groups: Vec<(usize, bool)> = Vec::new();
+    // The `(` of each group still open, whether it only sets flags (`(?i)`), which is no atom, and
+    // whether the `x` flag was on where it opened.
+    let mut open_groups: Vec<(usize, bool, bool)> = Vec::new();
+    // Whether the `x` flag is on here (#7464): the argument's, then as inline flags set it. A flag
+    // group of its own (`(?x:...)`) sets it for its body; a switch (`(?x)`, `(?-x)`) sets it to the
+    // end of the group it stands in, alternatives included, as Oniguruma parses the rest of that
+    // group as the switch's body.
+    let mut x_on = extended;
     // An escape the scan does not size (`\x41`, `\1`, `\k<n>`) leaves the atoms after it unknown.
     let mut unsure = false;
-    // An inline `(?x)` is not modelled: the blank before a quantifier would be taken for the atom.
+    // Whether an inline flag group names `x`. The `n`-flag rewrites below (#6218) stay off under one,
+    // as they were before the flag was modelled (#7464): turning them on there reaches the refusal
+    // of a lazy quantifier followed by `++`, which the old reach answered.
     let inline_x = inline_extended(pattern);
     // A lazy quantifier directly followed by `+` is a repeat of a repeat in jq, and the second
     // engine reads it otherwise, so a pattern with one stays on the first engine.
@@ -37034,6 +37043,7 @@ fn refuse_possessive_quantifier_for(
                 let start = i;
                 i += 1;
                 let mut flags_only = false;
+                let outer_x = x_on;
                 if chars.get(i) == Some(&'?') {
                     i += 1;
                     match chars.get(i) {
@@ -37049,10 +37059,16 @@ fn refuse_possessive_quantifier_for(
                         }
                         _ => {
                             // Flags, then `:` for a group of its own or `)` for a switch.
-                            while chars
+                            let mut off = false;
+                            while let Some(&c) = chars
                                 .get(i)
-                                .is_some_and(|c| c.is_ascii_alphabetic() || *c == '-')
+                                .filter(|c| c.is_ascii_alphabetic() || **c == '-')
                             {
+                                match c {
+                                    '-' => off = true,
+                                    'x' => x_on = !off,
+                                    _ => {}
+                                }
                                 i += 1;
                             }
                             if chars.get(i) == Some(&':') {
@@ -37063,12 +37079,16 @@ fn refuse_possessive_quantifier_for(
                         }
                     }
                 }
-                open_groups.push((start, flags_only));
+                open_groups.push((start, flags_only, outer_x));
                 atom = None;
             }
             ')' => {
                 atom = match open_groups.pop() {
-                    Some((start, false)) => Some(start),
+                    Some((start, false, outer_x)) => {
+                        x_on = outer_x;
+                        Some(start)
+                    }
+                    // A switch's `)` keeps the flag it set.
                     _ => None,
                 };
                 i += 1;
@@ -37077,7 +37097,7 @@ fn refuse_possessive_quantifier_for(
                 atom = None;
                 i += 1;
             }
-            '#' if extended => {
+            '#' if x_on => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
@@ -37134,7 +37154,7 @@ fn refuse_possessive_quantifier_for(
                 match atom {
                     // The group makes the repeat atomic, so the `+` goes, which also spares the
                     // second engine an interval it would read as a repeat of a repeat.
-                    Some(start) if !unsure && !inline_x => {
+                    Some(start) if !unsure => {
                         opens.push(start);
                         closes.push(i + 1);
                         drops.push(i);
@@ -37186,7 +37206,7 @@ fn refuse_possessive_quantifier_for(
                 }
             },
             // Under `x` a blank between an atom and its quantifier is ignored.
-            c if extended && c.is_whitespace() => i += 1,
+            c if x_on && c.is_whitespace() => i += 1,
             _ => {
                 atom = Some(i);
                 i += 1;
@@ -159608,8 +159628,6 @@ mod tests {
             r"\Qab\E*+c",
             r"\C-a*+c",
             "(?i)*+c",
-            // An inline `(?x)` is not modelled.
-            "(?x)a *+ c",
             "*+c",
             "c?+a+?+",
             "c?+a??+",
@@ -159618,6 +159636,33 @@ mod tests {
                 refuse_possessive_quantifier(pattern, false).is_err(),
                 "{pattern}"
             );
+        }
+    }
+
+    /// #7464: the `x` flag an inline flag group sets is read as the argument's is, for the extent
+    /// Oniguruma gives it: a group of its own (`(?x:...)`) for its body, a switch (`(?x)`, `(?-x)`) to
+    /// the end of the group it stands in, alternatives included.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn an_inline_x_flag_is_read_where_it_is_on_7464() {
+        for (pattern, extended, want) in [
+            ("(?x) a*+a", false, "(?x) (?>a*)a"),
+            ("(?x) a*+ b", false, "(?x) (?>a*) b"),
+            ("(?x)a *+ c", false, "(?x)(?>a *) c"),
+            ("(?x)a #c\n*+b", false, "(?x)(?>a #c\n*)b"),
+            ("(?x:a *+)b", false, "(?x:(?>a *))b"),
+            ("(?x:a *)b *+c", false, "(?x:a *)b(?> *)c"),
+            ("((?x) a *+b)", false, "((?x) (?>a *)b)"),
+            ("((?x)a)b *+c", false, "((?x)a)b(?> *)c"),
+            ("b|(?x) a *+b", false, "b|(?x) (?>a *)b"),
+            ("(?x)b| a *+b", false, "(?x)b| (?>a *)b"),
+            ("(?ix-s) a*+b", false, "(?ix-s) (?>a*)b"),
+            ("(?-x)a *+c", true, "(?-x)a(?> *)c"),
+            ("(?-x: a) b*+c", true, "(?-x: a) (?>b*)c"),
+            ("a(?-x) *+c", true, "a(?-x)(?> *)c"),
+        ] {
+            let got = refuse_possessive_quantifier(pattern, extended);
+            assert_eq!(got.ok().as_deref(), Some(want), "{pattern} x={extended}");
         }
     }
 
