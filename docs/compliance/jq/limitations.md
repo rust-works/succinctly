@@ -9154,6 +9154,17 @@ blank line between them (#2703 recorded one; the pinned macOS `/usr/bin/jq` and 
 1.7.1 release binary both print none, #3624). The pre-#2703 `jq: module error: parse error in module
 '{path-as-given}': …` is gone.
 
+**Closed for a bad escape in a string literal (#7445).**
+The first bullet below (jq's phrasing of a *syntax error* is a function of its bison parse state) does not cover this family.
+A bad escape in a program's string literal (`"\q"`, `"\u12"`, `"\ud800"`) is not a bison message: jq's lexer hands each run of consecutive escapes of the literal to its JSON decoder as the string `"<run>"`, so the message is the decoder's, deterministic, and `succinctly jq` prints it.
+`"ab\q"` is `jq: error: Invalid escape at line 1, column 4 (while parsing '"\q"') at <top-level>, line 1:` in jq 1.7.1, jq 1.8.2 and here, and a `\u12` is `Invalid \uXXXX escape`, a lone high surrogate `Invalid \uXXXX\uXXXX surrogate pair escape`.
+A run is the maximal stretch of escapes (`\n\q` is one, `"\n\q"` quotes both in the message), so literal text and a `\(` interpolation start a new one, and each bad run is an error of its own, counted in the trailer (`"\q\(1)\q"` is `2 compile errors`).
+This holds for every place a string literal is read in jq mode: a plain string, one after an interpolation, a format string (`@base64 "\ud800"`), an object key, a field access (`."\q"`), and the path of an `include` or `import`.
+jq 1.8.2 differs from 1.7.1 here only in the error-position suffix (`at <top-level>, line 1, column 2:` and a caret line, jqlang/jq#3257), which is jq 1.8's presentation of every compile error and is not matched.
+A lone low surrogate (`"\udc00"`) is accepted by both versions and becomes U+FFFD, as here.
+`succinctly yq` keeps yq's own reading of a string literal, in which an unknown escape is kept as text.
+Pinned by `tests/jq_cli/i7445.rs`, whose rows are jq 1.7.1's messages (jq 1.8.2 agrees on all of them).
+
 **What remains open, all three narrower than the shape gap:**
 
 - **Message wording is succinctly's own.** A syntax error reads `jq: error: unexpected end of
