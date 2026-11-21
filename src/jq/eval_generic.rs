@@ -63940,6 +63940,66 @@ mod tests {
         }
     }
 
+    /// #7473: an `until`/`while` round that adds an entry to an object in its state under a key
+    /// read off the state -- a string interpolation of it (`.p["k\(.i)"] = 1`) or an `as` binding of
+    /// `.i | tostring` -- is the owned step's, so no round re-indexes the state. Each round used to:
+    /// the key was not an operand the step reads off the tree, so the round fell to the evaluator's
+    /// route, which serialised and re-indexed the whole state (3 reindexes per round), and the loop
+    /// was quadratic in its rounds. The outputs are jq 1.7.1's (captured live; 1.8.2 agrees).
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // STYLE-0004: jq object literals, not format strings
+    fn test_until_while_state_read_key_needs_no_reindex_per_round_7473() {
+        for (query, want) in [
+            (
+                r#"{i:0,p:{}} | until(.i>=50; .p["k\(.i)"]=1 | .i += 1) | [.i, (.p|length), .p.k49]"#,
+                "[50,50,1]",
+            ),
+            (
+                r#"{i:0,p:{}} | until(.i>=50; (.i|tostring) as $cs | .p[$cs]=.i | .i += 1) | [.i, (.p|length), .p["49"]]"#,
+                "[50,50,49]",
+            ),
+            (
+                r#"[{i:0,p:{}} | while(.i<50; .p["k\(.i)"]=1 | .i += 1)] | [length, (.[-1].p|length)]"#,
+                "[50,49]",
+            ),
+            // `last(while ...)` re-indexes no round either, but it still copies the state every round
+            // and stays quadratic (#7473); this row pins the reindex count and jq's output only.
+            (
+                r#"{i:0,p:{}} | last(while(.i<50; .p["k\(.i)"]=1 | .i += 1)) | [.i, (.p|length)]"#,
+                "[49,49]",
+            ),
+            (
+                r#"{i:0,a:{b:2},p:{}} | until(.i>=50; .p["\(.a.b)-\(.i + 1)"] = (.i|tostring) | .i += 1) | [(.p|length), .p["2-50"]]"#,
+                r#"[50,"49"]"#,
+            ),
+            (
+                r#"{i:0,p:{},n:null,t:true} | until(.i>=50; .p["\(.n)\(.t)\(.i)"] = 1 | .i += 1) | [(.p|length), .p.nulltrue49]"#,
+                "[50,1]",
+            ),
+        ] {
+            let (got, reindexes) = outputs_and_reindexes("null", query);
+            assert_eq!(got, [want], "{query}");
+            assert!(
+                reindexes <= 3,
+                "{query}: {reindexes} reindexes over 50 rounds"
+            );
+        }
+        // A slot that is not a scalar read off the state keeps the evaluator's route and answer.
+        for (query, want) in [
+            (
+                r#"{i:0,p:{}} | until(.i>=3; .p["\(.p)"] = 1 | .i += 1) | .p"#,
+                r#"{"{}":1,"{\"{}\":1}":1,"{\"{}\":1,\"{\\\"{}\\\":1}\":1}":1}"#,
+            ),
+            (
+                r#"{i:0,p:{},f:1.50} | until(.i>=2; .p["\(.f)"] = (.f|tostring) | .i += 1) | .p"#,
+                r#"{"1.50":"1.50"}"#,
+            ),
+        ] {
+            let (got, _) = outputs_and_reindexes("null", query);
+            assert_eq!(got, [want], "{query}");
+        }
+    }
+
     /// #3707: an `until`/`while`/`select` condition built from `has`, `keys`,
     /// `startswith`/`endswith`, `tostring` or an array construction reads the
     /// owned state's tree instead of serializing and re-indexing it every
