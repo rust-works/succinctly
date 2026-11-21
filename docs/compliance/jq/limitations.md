@@ -11613,7 +11613,15 @@ and the `jq-linux-arm64` release binaries):
 - **`TZ` is read once per process**, on the first conversion. An embedder that changes `TZ`
   afterwards (`std::env::set_var`) keeps the first zone; the POSIX-only reading above re-reads it
   on every call. jq cannot change its own environment, so the CLI is unaffected.
-- **A `TZ` jiff cannot read is UTC**, as in jq (`Foo/Bar`, `garbage`, an empty `TZ`). The offset
+- **`TZ` is read as libc reads it** (#7486): one leading `:` is dropped, then the value is a tz file if one opens at `<zoneinfo>/<TZ>` (or at the path itself when it starts with `/`), else a POSIX string.
+  So `TZ=posix/Asia/Tokyo`, `TZ=Asia//Tokyo`, `TZ=Asia/../Asia/Tokyo`, `TZ=posixrules` and `TZ=/usr/share/zoneinfo/Asia/Tokyo` load the zone, and a name matches a file only as the file system matches it: `TZ=asia/tokyo` is UTC on Linux and Tokyo on macOS, as in jq.
+  The zoneinfo directory is `$TZDIR` on Linux, as glibc reads it (an empty `TZDIR` is unset), and `/usr/share/zoneinfo` on macOS, whose libc ignores `TZDIR`.
+  On macOS a `TZ` that starts with `:` and names no file is UTC (`TZ=:JST-9`), as Apple's libc never reads it as a POSIX string; glibc reads it as `JST-9`.
+  Captured from jq 1.7.1 on x86_64 Linux (glibc) over 49 spellings of `TZ` under six `TZDIR` settings, and on macOS for the rows that differ there; jq 1.8.2 agrees on macOS (it was not run on Linux, where there is no 1.8.2 build).
+  Before #7486, `TZ` went through jiff's zone database, which matches names whatever their case, has no `posix/` or `right/` trees and does not open `Asia//Tokyo`, and which read `TZDIR` on macOS too.
+- **A `right/` zone carries no leap seconds here.** glibc counts the leap seconds of a `right/` tz file in every conversion while `TZ` names one, `gmtime` and `mktime` included: under `TZ=right/UTC`, jq 1.7.1's `1700000000 | todate` is `2023-11-14T22:12:53Z` and `1483228826 | todate` is `2016-12-31T23:59:60Z`.
+  `succinctly jq` reads the zone's offsets and abbreviations from the file and counts no leap seconds, so a `right/` zone answers as the same zone outside `right/` does (`2023-11-14T22:13:20Z`), 27 seconds from jq's answer since 2017.
+- **A `TZ` that is neither a tz file nor a POSIX string is UTC**, as in jq (`Foo/Bar`, `garbage`, an empty `TZ`). The offset
   forms libc accepts that jiff does not read as UTC: `TZ=5`, and an offset beyond ±24h
   (`XXX99`, `XXX-25`; jq applies them as written on macOS and clamped to ±24h on glibc).
 - **`TZ=5` with `%Z`** raises `strflocaltime/1: unknown system failure` in jq (libc's `%Z` is empty
