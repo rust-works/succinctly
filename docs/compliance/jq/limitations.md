@@ -7490,7 +7490,15 @@ A file that is one document, or has one bigger than eight windows, is therefore 
 Invalid UTF-8 is substituted a window at a time, which equals substituting the file because a window is whole lines and a JSON string holds no line break.
 A text where a string does hold one (a backslash before a line break) is not JSON jq reads, and its substitution can differ at a window's edge.
 The stream's first fault is worded by reading the file again (`Reread`): a chunk at a time, by position, through a duplicate of the handle the run read by, on the error path only.
-A file renamed, replaced or appended to meanwhile is worded from the bytes the run read, and the wording's memory is a chunk, not the file.
+A file renamed or replaced meanwhile is worded from the bytes the run read, one appended to from the file read again to the end it then has (#7446), and the wording's memory is a chunk, not the file.
+A file is read on past the length `stat` gave when the run opened it, to the end it has when the reads get there, as jq reads it to the read that returns nothing (#7446): the lone file named or redirected on standard input, the files of a list under the plain filter, the lone file `-R` reads and the lone source the lazy `input`/`inputs` route reads past its front.
+So a line a writer appends while the run goes is read, and so is a last document cut short when the run opened the file and completed after, where each was dropped or reported as cut short at that length before #7446.
+A file read to its length reads once more there, which returns nothing, as jq's reader does; one that grows while it is read (a log a writer appends to, or `jq -c . f | tee -a f`) is read on a window at a time for as long as it grows, in the memory of a window, as jq goes on reading it.
+A file cut short while the run goes ends where the reads find its end, with what was read before it run and no fault for the rest, as in jq.
+A file renamed over the path is not read: the run holds the file it opened, as jq does.
+Two routes still read a file to the length it had, so a line appended during the run is dropped where jq reads it.
+The route that reads a file whole (a file under 1 MiB under the plain filter or `-R`, a path such as `/dev/fd/N`, and every flag that reads the stream whole) reads it before the run starts, so what is appended after that is not read; `--slurp` reads all of its input before the program runs in jq too, and matches.
+A `--seq` file read a window at a time stops at the length its records were vouched for up to before the run (`Reread::is_plain_seq_records`), since a record read past it would be one no prepass judged; a file a gate of its own reads (one the prepass turned down) reads on as a pipe does.
 A depth refusal names the position from the window's line count; where a window was substituted it is worded from the file read again, as the whole-file route words it from the originals.
 Standard input that is a regular file (`jq … < file`, a here-file, a descriptor a parent opened) takes the same route from its current offset: what a shell or parent has read already is not part of the stream, as on a pipe, and a fault is worded from a duplicate of descriptor 0 read by position.
 A terminal, a standard input under 4 MiB and one the run also writes to (`jq . <> f >&0`: its output would land where the next window is read from) read whole as before, and so does a path that names the stdin descriptor a second time.
@@ -7586,7 +7594,8 @@ The second read that words a fault reads each file as the run read it (the same 
 A read that fails part-way through one of the files (an I/O error) runs the documents before the failure, reports `jq: error: <strerror>` and ends the run there with exit 2, as the lone file's does, where the whole-file route reports that file as one that could not be opened and runs the others; jq's own main loop stops fetching input once a read has failed, but the failure needs a read that fails, which no test here can make.
 A list with a path that is not a regular file (a pipe, `-`, a directory, `/dev/stdin`, `/dev/fd/N`), one that does not open, or one that is also the run's standard output or error (`jq . a b 1<>b`: output landing in a file the next window is read from) takes the route that reads the files whole and reports what it finds.
 A file whose `stat` size is 0 (an empty file, or one of the `/proc` kind that reports 0 and has content) is read to its end, as `std::fs::read` reads it.
-A file is read as it was when opened, so a run whose output is appended to its input ends, and a read that fails runs the documents before the failure and then reports it.
+Each file is read on past the length it had when it was opened, to the end it has when the reads get there (#7446), so a line a writer appends to the file the run is in is read before the next file, and a run whose output is appended to its input through a pipe reads what it wrote, as jq does; before #7446 each was read to the length it had when it was opened, which this page had as a run whose output is appended to its input ending.
+A read that fails runs the documents before the failure and then reports it.
 
 Peak resident set size at 100 MiB (993,416 records), in MiB:
 
