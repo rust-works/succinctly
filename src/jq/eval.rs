@@ -16683,6 +16683,11 @@ fn owned_state_expr_shape_in(expr: &Expr, calls: bool) -> bool {
             else_branch,
         } => shape(cond) && shape(then_branch) && shape(else_branch),
         Expr::Builtin(Builtin::ToString | Builtin::Type) => true,
+        // #7473: `"k\(.i)"`, each slot one value, so the string is one.
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => shape(inner),
+        }),
         // #6122: `map(.a)`, `map(.a.b)`, `map(.[0])` is one array and no effect: one output per
         // element from static steps, which [`eval_owned_map_projection`] reads off the tree, or
         // raises on, and a raise declines the write to the evaluator's own route and text.
@@ -16842,8 +16847,79 @@ fn owned_state_scalar_direct<S: EvalSemantics>(
     if let Some(length) = owned_state_length_direct::<S>(expr, state) {
         return Some(length);
     }
+    if is_state_text_shape(expr) {
+        return owned_state_text_direct::<S>(expr, state);
+    }
     let value = eval_owned_pure::<S>(expr, state, ResultPosition::Operand)?.ok()?;
     owned_scalar_spelled_the_same(&value).then_some(value)
+}
+
+/// A string built from scalars read off the state (#7473), for [`owned_state_scalar_direct`]: a
+/// string interpolation whose every slot is such a scalar (`"k\(.i)"`, `"\(.a)-\(.b + 1)"`), or
+/// `READ | tostring` of one (`.i | tostring`). Each slot is rendered by [`owned_to_string`] and
+/// `tostring` by [`tostring_text`], the texts the evaluator's own interpolation and `tostring` make
+/// of a scalar. A loop that keys its state by one (`until(..; .p["k\(.i)"] = 1 | .i += 1)`,
+/// `(.i | tostring) as $k | .p[$k] = ..`) read the key on a re-indexed copy of the whole state,
+/// or declined the round to the evaluator's route, every round: quadratic in the rounds where jq
+/// is linear. Asked only of an [`is_state_text_shape`] expression; `None` is a slot or a read that
+/// is not such a scalar (a container, a read that raises), which declines to the caller's route.
+fn owned_state_text_direct<S: EvalSemantics>(
+    expr: &Expr,
+    state: &OwnedValue,
+) -> Option<OwnedValue> {
+    match unwrap_paren(expr) {
+        Expr::StringInterpolation(parts) => owned_state_interpolation_direct::<S>(parts, state),
+        Expr::Pipe(stages) => match stages.split_last() {
+            Some((_, reads)) => {
+                // A read of static steps is borrowed off the tree, as `length`'s is
+                // ([`owned_state_length_direct`]); a lone computed read is a scalar of its own.
+                let borrowed = reads.iter().try_fold(state, |at, read| {
+                    owned_assign_step_child(&static_step(unwrap_paren(read))?, at)
+                });
+                let value = match (borrowed, reads) {
+                    (Some(value), _) => owned_scalar_spelled_the_same(value).then(|| value.clone()),
+                    (None, [read]) => owned_state_scalar_direct::<S>(read, state),
+                    (None, _) => None,
+                };
+                value.map(|value| match value {
+                    OwnedValue::String(_) => value,
+                    other => OwnedValue::String(tostring_text::<S>(&other, false).into()),
+                })
+            }
+            None => None,
+        },
+        _ => None,
+    }
+}
+
+/// The shapes [`owned_state_text_direct`] answers: a string interpolation, or a pipe of one or more
+/// reads ending in `tostring`.
+fn is_state_text_shape(expr: &Expr) -> bool {
+    match unwrap_paren(expr) {
+        Expr::StringInterpolation(_) => true,
+        Expr::Pipe(stages) => stages.split_last().is_some_and(|(last, reads)| {
+            !reads.is_empty() && matches!(unwrap_paren(last), Expr::Builtin(Builtin::ToString))
+        }),
+        _ => false,
+    }
+}
+
+/// [`owned_state_text_direct`]'s string interpolation: each slot a scalar read off the state, or
+/// `None`.
+fn owned_state_interpolation_direct<S: EvalSemantics>(
+    parts: &[StringPart],
+    state: &OwnedValue,
+) -> Option<OwnedValue> {
+    let mut text = String::new();
+    for part in parts {
+        match part {
+            StringPart::Literal(literal) => text.push_str(literal),
+            StringPart::Expr(inner) => text.push_str(&owned_to_string::<S>(
+                &owned_state_scalar_direct::<S>(inner, state)?,
+            )),
+        }
+    }
+    Some(OwnedValue::String(text.into()))
 }
 
 /// `length`, or `READ | length` with `READ` a pure read ([`eval_owned_pure`]), of a container, a
@@ -29279,8 +29355,9 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // a doubled one, or one behind whitespace, is refused. The errors below still name `s`, BOM
     // and all, as jq does.
     //
-    // `tonumber` passes jq's parser a C string, so a NUL ends the text it sees (`"1\u00002" |
-    // tonumber` is 1); `fromjson`, which passes a length, does not (#5309).
+    // jq 1.7.1 passes its parser a C string, so a NUL ended the text it saw (`"1\u00002" |
+    // tonumber` was 1); jq 1.8.2 refuses a string with a NUL in it (jqlang/jq#3496, #7521).
+    // `fromjson`, which passes a length, never stopped there (#5309).
     // yq reads the text with `parseInt64` and keeps it as the node's value: `"0x10" | tonumber`
     // prints `0x10` and `"007"` `007`, while the JSON writers print the number (#1356).
     if yq_mode {
@@ -29295,19 +29372,18 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
             return Ok(OwnedValue::NumberLiteral(NumberRepr::Float(f), s.into()));
         }
     }
-    let c_text = if yq_mode {
-        s
-    } else {
-        s.split('\0').next().unwrap_or(s)
-    };
+    if !yq_mode && s.contains('\0') {
+        return Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
+            s.to_string().into(),
+        )));
+    }
     let trimmed = if yq_mode {
         s
     } else {
         // jq's parser skips only space, tab, CR and LF, not the Unicode whitespace `trim`
         // knows (`"\u000b1" | tonumber` is refused).
-        c_text
-            .strip_prefix('\u{feff}')
-            .unwrap_or(c_text)
+        s.strip_prefix('\u{feff}')
+            .unwrap_or(s)
             .trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
     };
     // jq reads a bare trailing dot as the integer (`"99999999999999999." | tonumber` is
@@ -29487,7 +29563,7 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
             s.to_string().into(),
         )))
     } else {
-        Err(EvalError::json_parse_failure(c_text))
+        Err(EvalError::json_parse_failure(s))
     }
 }
 
@@ -107887,15 +107963,15 @@ mod remaining_inputs {
         pub documents: u64,
         /// Whether a read found the stream at its end.
         pub past_end: bool,
-        /// Whether a read was of a parse error.
-        pub fault: bool,
+        /// How many reads were of a parse error (#7575: a `try` can catch one and read on).
+        pub faults: u64,
     }
 
     impl Reads {
         const NONE: Self = Self {
             documents: 0,
             past_end: false,
-            fault: false,
+            faults: 0,
         };
     }
 
@@ -107914,7 +107990,7 @@ mod remaining_inputs {
             let mut reads = r.get();
             match pop {
                 Pop::Document(_) => reads.documents += 1,
-                Pop::ParseError(_) => reads.fault = true,
+                Pop::ParseError(_) => reads.faults += 1,
                 Pop::Exhausted => reads.past_end = true,
             }
             r.set(reads);
@@ -109492,8 +109568,8 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// jq tests the input before it reads the format: a number is converted first and a failed
 /// conversion is the error, a non-array is not a datetime, and only an array gets to `requires a
-/// string format`. A number that converts then meets a format `jv_string_value` aborts on (#3046),
-/// which raises here. Out of line and cold so the builtin's hot path keeps its shape.
+/// string format`. A number that converts then meets a format that jq 1.7.1 aborts on (#3046) and
+/// jq 1.8.2 refuses with the same `requires a string format` (#7533). Out of line and cold so the builtin's hot path keeps its shape.
 #[cold]
 #[inline(never)]
 fn strftime_format_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -109511,9 +109587,8 @@ fn strftime_format_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `optional` is false here: the caller took that arm first.
             match broken_down_time_fields::<W, S>(value, false, local, false, name) {
                 Err(r) => r,
-                Ok(_) => {
-                    QueryResult::Error(EvalError::type_error("string", &format!("{name} format")))
-                }
+                // jq 1.8.2 words it as the array case (#7533); 1.7.1 aborted on an assertion (#3046).
+                Ok(_) => QueryResult::Error(EvalError::requires_string_format(name)),
             }
         }
         StandardJson::Array(_) => QueryResult::Error(EvalError::requires_string_format(name)),

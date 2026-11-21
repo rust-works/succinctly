@@ -5,17 +5,16 @@
 //! one), and stdio puts a seekable descriptor back at the end of what it handed out when the
 //! process exits. So a run that stops early leaves the file just past the chunk that completed the
 //! last item it read: `{ jq -n input; jq -n input; } < f` reads the first document, then the
-//! second. A run that read to the end leaves it there, and so does one that met a parse error
-//! (where jq's offset is the error's chunk, which this does not model).
+//! second. A run that read to the end leaves it there. A parse error is an item too: jq's reader
+//! hands it out at the byte its parser refuses, and drops the rest of that chunk (#7575).
 //!
 //! The routes read standard input in windows or whole, well past what the program takes, so the
 //! offset is put back once, when the run ends: the items the program took are counted again in
 //! the file, from where the run found it, and the descriptor is moved to the end of the chunk that
 //! completed the last of them. Standard input read as a `-` among input files is counted after the
 //! files named before it, read again from their paths (#7568). A run that never reads standard
-//! input, reads it to its end, or
-//! reads a pipe makes no system call for it here; a pipe costs one `fstat` once it has stopped
-//! early.
+//! input, reads it to its end, or reads a pipe makes no system call for it here; a pipe costs one
+//! `fstat` once it has stopped early.
 
 #![allow(unsafe_code)] // `read`, `fstat`, `lseek` and `pread` on descriptor 0
 #![cfg_attr(not(unix), allow(dead_code))] // only Unix descriptors have an offset to put back
@@ -54,6 +53,11 @@ thread_local! {
     /// through the `input` queue.
     static TAKEN: Cell<u64> = const { Cell::new(0) };
     static HALTED: Cell<bool> = const { Cell::new(false) };
+    /// Whether the main loop stopped at a parse error (#7575).
+    static MAIN_FAULT: Cell<bool> = const { Cell::new(false) };
+    /// Whether that error is in a document already counted as handed to the program: a document
+    /// decoded as the program reads it, which jq's parser refuses part of the way through.
+    static FAULT_TAKEN: Cell<bool> = const { Cell::new(false) };
     /// The input files named before the first `-`, when standard input is read as `-` among them
     /// (#7568): jq's reader gets to standard input only once it has read these.
     static BEFORE: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
@@ -67,6 +71,8 @@ pub(crate) fn start_run() {
     READ.with(|r| r.set(0));
     TAKEN.with(|t| t.set(0));
     HALTED.with(|h| h.set(false));
+    MAIN_FAULT.with(|f| f.set(false));
+    FAULT_TAKEN.with(|f| f.set(false));
     succinctly::jq::clear_input_reads();
 }
 
@@ -103,6 +109,18 @@ pub(crate) fn note_taken() {
 /// Records that the program halted (`halt`, `halt_error`).
 pub(crate) fn note_halt() {
     HALTED.with(|h| h.set(true));
+}
+
+/// Records that the main loop stopped at a parse error, the last thing jq's reader handed it
+/// (#7575).
+pub(crate) fn note_main_fault() {
+    MAIN_FAULT.with(|f| f.set(true));
+}
+
+/// Records that the parse error the main loop stops at is in a document already counted, as a
+/// main-loop input or an `input` read: jq's reader handed out the error in its place.
+pub(crate) fn note_fault_was_taken() {
+    FAULT_TAKEN.with(|f| f.set(true));
 }
 
 /// Standard input, read straight from descriptor 0 with no buffer of its own, so that the bytes it
@@ -147,29 +165,74 @@ pub(crate) fn restore() {
         return;
     }
     let reads = succinctly::jq::input_reads();
-    if reads.past_end || reads.fault {
+    let main_fault = MAIN_FAULT.with(Cell::get);
+    // A parse error is an item like a value: jq's reader hands it out, and drops the rest of the
+    // chunk that held it (#7575). Only the plain parser's errors are placed: `--stream`'s parser
+    // refuses a text at bytes of its own.
+    let faults = reads.faults + u64::from(main_fault);
+    let counted = u64::from(main_fault && FAULT_TAKEN.with(Cell::get));
+    if reads.past_end || (faults > 0 && run.items != Items::Values) {
         return;
     }
-    // A main loop that does not halt reads to the end, unless a file before the `-` does not open:
-    // jq's main loop then stops once it has the first input read past that file (#7568).
-    let until_unopened = run.main_loop && !HALTED.with(Cell::get);
+    // A main loop that does not halt reads to the end, unless it stops at a parse error or a file
+    // before the `-` does not open: jq's main loop then stops once it has the first input read
+    // past that file (#7568).
+    let until_unopened = run.main_loop && !HALTED.with(Cell::get) && !main_fault;
     if until_unopened && BEFORE.with(|b| b.borrow().is_empty()) {
         return;
     }
+    // A main loop stops at the first parse error its reads meet, the stream's first unless the
+    // program's own `input` met one before. It is placed without the count of what came before
+    // it: some routes count a document they hand over before its decoding meets the error.
+    let taken_by_loop = TAKEN.with(Cell::get);
+    // A main loop that reads through the queue (it counts no inputs of its own) has its own error
+    // among the queue's.
+    let loop_reads_queue = taken_by_loop == 0;
+    let program_faults = if loop_reads_queue {
+        reads.faults.saturating_sub(1)
+    } else {
+        reads.faults
+    };
+    let first_fault = run.main_loop && main_fault && program_faults == 0;
+    let taken = if first_fault {
+        u64::MAX
+    } else if run.main_loop && main_fault {
+        // The program's own `input` met an error first: every input and error is counted, the
+        // loop's last.
+        reads.documents + taken_by_loop + reads.faults + u64::from(!loop_reads_queue) - counted
+    } else {
+        reads.documents + taken_by_loop + faults - counted
+    };
     #[cfg(unix)]
     restore_unix(
         run.items,
-        reads.documents + TAKEN.with(Cell::get),
-        until_unopened,
+        taken,
+        Stop {
+            faults: faults > 0,
+            first_fault,
+            until_unopened,
+        },
         origin,
         read,
     );
     #[cfg(not(unix))]
-    let _ = (run.items, origin, read);
+    let _ = (run.items, taken, first_fault, until_unopened, origin, read);
+}
+
+/// What ended a run that did not read standard input to its end, beyond the items it took.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct Stop {
+    /// It met a parse error, which is an item (#7575).
+    faults: bool,
+    /// Its main loop stopped at the first parse error in the stream.
+    first_fault: bool,
+    /// Its main loop stopped one input past a file before the `-` that did not open (#7568).
+    until_unopened: bool,
 }
 
 #[cfg(unix)]
-fn restore_unix(items: Items, taken: u64, until_unopened: bool, origin: Option<u64>, read: u64) {
+fn restore_unix(items: Items, taken: u64, stop: Stop, origin: Option<u64>, read: u64) {
     // SAFETY: `stat` is written by `fstat` before it is read, and only on success.
     let Some(stat) = (unsafe {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -177,7 +240,7 @@ fn restore_unix(items: Items, taken: u64, until_unopened: bool, origin: Option<u
     }) else {
         return;
     };
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG || writes_to(&stat) {
         return;
     }
     // SAFETY: `lseek` reads and moves only the descriptor's offset.
@@ -190,6 +253,10 @@ fn restore_unix(items: Items, taken: u64, until_unopened: bool, origin: Option<u
     };
     let mut block = vec![0u8; 64 << 10];
     let mut scan = Scan::new(items, taken);
+    if stop.faults {
+        scan.faults = Some(succinctly::jq::JqStreamFaults::new());
+        scan.stop_at_fault = stop.first_fault;
+    }
     // #7568: the files before a `-` are read first, by jq's reader and here.
     let before = BEFORE.with(|b| b.borrow().clone());
     let mut unopened = false;
@@ -199,10 +266,17 @@ fn restore_unix(items: Items, taken: u64, until_unopened: bool, origin: Option<u
         }
         match scan_named_file(&mut scan, path, &mut block) {
             None => return,
-            Some(opened) => unopened |= !opened,
+            Some(opened) => {
+                // A main loop that stops at the first parse error stops sooner at the first input
+                // read past a file that did not open, if that comes first.
+                if stop.first_fault && !opened && !unopened {
+                    scan.left = 1;
+                }
+                unopened |= !opened;
+            }
         }
     }
-    if until_unopened && !unopened {
+    if stop.until_unopened && !unopened {
         return;
     }
     if scan.found().is_some() {
@@ -254,6 +328,31 @@ fn restore_unix(items: Items, taken: u64, until_unopened: bool, origin: Option<u
             unsafe { libc::lseek(libc::STDIN_FILENO, end, libc::SEEK_SET) };
         }
     }
+}
+
+/// Whether the run writes its output or errors to the file standard input holds at the offset it
+/// stands at (`jq ... <> f >&0`, #7575): most likely one open file shared with standard input, whose
+/// offset the output has moved too. Where jq leaves such a file depends on when stdio flushed the
+/// output against the reads (on macOS, jq 1.7.1 writes it at the end of its reads and then moves
+/// back over what it read and did not hand out), which this does not model, so it is left where the
+/// run's reads and writes left it.
+#[cfg(unix)]
+fn writes_to(stdin: &libc::stat) -> bool {
+    // SAFETY: `lseek` with `SEEK_CUR` and a zero offset reads the offset and moves nothing.
+    let at = |fd| unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+    [libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        .into_iter()
+        .any(|fd| {
+            // SAFETY: as in `restore_unix`.
+            let stat = unsafe {
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                (libc::fstat(fd, stat.as_mut_ptr()) == 0).then(|| stat.assume_init())
+            };
+            stat.is_some_and(|stat| {
+                (stat.st_dev, stat.st_ino) == (stdin.st_dev, stdin.st_ino)
+                    && at(fd) == at(libc::STDIN_FILENO)
+            })
+        })
 }
 
 /// Feeds `scan` an input file named before standard input's `-`, read again from its path, and ends
@@ -333,6 +432,13 @@ struct Scan {
     /// Whether the bytes read so far are the front of a BOM, which jq's parser skips (and its
     /// chunk counts).
     in_bom: bool,
+    /// jq's parser, when the run met a parse error: a byte it refuses the text at is an item, and
+    /// the rest of that byte's chunk is dropped (#7575).
+    faults: Option<succinctly::jq::JqStreamFaults>,
+    /// Whether the rest of a refused byte's chunk is being dropped.
+    dropping: bool,
+    /// Whether the first parse error is the last item, whatever the count.
+    stop_at_fault: bool,
 }
 
 impl Scan {
@@ -354,6 +460,9 @@ impl Scan {
             open: Vec::new(),
             pending: false,
             in_bom: items != Items::Lines,
+            faults: None,
+            dropping: false,
+            stop_at_fault: false,
         }
     }
 
@@ -373,9 +482,27 @@ impl Scan {
                 self.pos += 1;
                 continue;
             }
+            let full = self.pos + 1 - self.chunk_start == CHUNK;
+            if self.dropping {
+                if b == b'\n' || full {
+                    self.dropping = false;
+                    self.chunk_start = self.pos + 1;
+                }
+                self.pos += 1;
+                continue;
+            }
             self.in_bom &= self.pos < 3 && b == b"\xef\xbb\xbf"[self.pos as usize];
             self.completed_here = 0;
-            if !self.in_bom {
+            if !self.in_bom && self.faults.as_mut().is_some_and(|faults| faults.feed(b)) {
+                // jq's parser hands out the error and is reset; its reader drops the rest of the
+                // chunk.
+                if self.stop_at_fault {
+                    self.left = 1;
+                }
+                self.complete();
+                self.reset();
+                self.dropping = !self.completed && b != b'\n' && !full;
+            } else if !self.in_bom {
                 match self.items {
                     Items::Lines => {
                         if b == b'\n' {
@@ -387,7 +514,7 @@ impl Scan {
             }
             if self.completed {
                 self.end_chunk_at(b);
-            } else if b == b'\n' || self.pos + 1 - self.chunk_start == CHUNK {
+            } else if b == b'\n' || full {
                 self.chunk_start = self.pos + 1;
             }
             self.pos += 1;
@@ -422,7 +549,19 @@ impl Scan {
             self.found = Some(self.pos);
         } else {
             self.chunk_start = self.pos;
+            self.dropping = false;
         }
+    }
+
+    /// jq's parser after an error: no value, container or token pending.
+    fn reset(&mut self) {
+        self.in_string = false;
+        self.escape = false;
+        self.in_literal = false;
+        self.string_is_key = false;
+        self.expect_key = false;
+        self.open.clear();
+        self.pending = false;
     }
 
     fn complete(&mut self) {
@@ -663,6 +802,35 @@ mod tests {
             Some(7)
         );
         assert_eq!(ends_over(Items::Lines, &[b"abc\n", b"def\n"], 1), Some(4));
+    }
+
+    /// [`ends`] with jq's parse errors counted as items.
+    fn ends_with_faults(text: &[u8], taken: u64) -> Option<u64> {
+        let mut scan = Scan::new(Items::Values, taken);
+        scan.faults = Some(succinctly::jq::JqStreamFaults::new());
+        for piece in text.chunks(2) {
+            scan.feed(piece);
+        }
+        scan.found()
+    }
+
+    #[test]
+    fn a_parse_error_is_an_item_and_the_rest_of_its_chunk_is_dropped_7575() {
+        // Captured from jq 1.7.1 (`-n '[range(k) as $_ | try input catch "E"]'`).
+        let text = b"{\"id\":0}\n{\"id\":1}\n}\n{\"id\":3}\n{\"id\":4}\n";
+        let offsets: Vec<_> = (1..=5).map(|k| ends_with_faults(text, k)).collect();
+        assert_eq!(offsets, [9, 18, 20, 29, 38].map(Some));
+        // A sixth read finds the end, where nothing is put back.
+        assert_eq!(ends_with_faults(text, 6), None);
+        // The value before a stray closer on its line is handed out; the closer is the error, and
+        // what follows it on the line is dropped.
+        let text = b"1 2 } 3 4\n5\n6\n";
+        let offsets: Vec<_> = (1..=5).map(|k| ends_with_faults(text, k)).collect();
+        assert_eq!(offsets, [10, 10, 10, 12, 14].map(Some));
+        // A document left open by an error is not resumed: `2]` is a second error.
+        let text = b"1\n[1,\n}\n2]\n3\n4\n";
+        let offsets: Vec<_> = (1..=5).map(|k| ends_with_faults(text, k)).collect();
+        assert_eq!(offsets, [2, 8, 11, 13, 15].map(Some));
     }
 
     #[test]

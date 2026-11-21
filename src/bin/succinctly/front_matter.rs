@@ -51,6 +51,43 @@ pub(crate) fn truncated_bom_len(bytes: &[u8]) -> usize {
     }
 }
 
+/// How many bytes of each of `sources` (a stream's sources in order, each whole or at least its
+/// first three bytes) are the UTF-8 byte-order mark jq's parser skips at the front of the stream
+/// (#5291), when the mark may be cut across sources (#7566).
+///
+/// jq reads its files as one stream and its parser matches the mark a byte at a time
+/// (`bom_strip_position`), whichever buffer each byte comes in, so `EF BB` in one file and
+/// `BF [2]` in the next is a mark and `[2]`, and so is a byte of it in each of three files. A
+/// stream that ends inside the mark is empty input (#7454): the bytes it has are all cut. A mark
+/// that departs from itself (`EF` then `1`) cuts nothing, so the parser meets its bytes and faults.
+pub(crate) fn stream_bom_cuts<'a>(sources: impl IntoIterator<Item = &'a [u8]>) -> Vec<usize> {
+    let mut cuts = Vec::new();
+    let mut matched = 0;
+    for source in sources {
+        let mut cut = 0;
+        if matched < UTF8_BOM.len() {
+            for &byte in source {
+                if byte != UTF8_BOM[matched] {
+                    // No mark, or one that breaks off: the parser reads every byte.
+                    return Vec::new();
+                }
+                matched += 1;
+                cut += 1;
+                if matched == UTF8_BOM.len() {
+                    break;
+                }
+            }
+        }
+        cuts.push(cut);
+    }
+    cuts
+}
+
+/// The cut [`stream_bom_cuts`] gives source `at`, 0 past the sources it covers.
+pub(crate) fn bom_cut_at(cuts: &[usize], at: usize) -> usize {
+    cuts.get(at).copied().unwrap_or(0)
+}
+
 /// Split `input` into its YAML front matter and trailing body, as yq v4.53.3 does (#6910).
 ///
 /// A first line that is `---` (blanks and a `\r` around it ignored, and a leading UTF-8 BOM
@@ -160,6 +197,41 @@ mod tests {
         ] {
             assert_eq!(truncated_bom_len(other), 0, "{other:?}");
         }
+    }
+
+    /// #7566: the mark is cut wherever its bytes fall, across sources with no bytes too; a stream
+    /// that ends inside it is all cut, and one that departs from it is not cut at all.
+    #[test]
+    fn stream_bom_cuts_follows_the_mark_across_sources_7566() {
+        let cuts = |sources: &[&[u8]]| stream_bom_cuts(sources.iter().copied());
+        assert_eq!(cuts(&[b"\xEF\xBB\xBF[2]"]), vec![3]);
+        assert_eq!(cuts(&[b"\xEF\xBB", b"\xBF[2]"]), vec![2, 1]);
+        assert_eq!(cuts(&[b"\xEF", b"\xBB\xBF[2]"]), vec![1, 2]);
+        assert_eq!(cuts(&[b"\xEF", b"\xBB", b"\xBF[2]"]), vec![1, 1, 1]);
+        assert_eq!(
+            cuts(&[b"", b"\xEF", b"", b"\xBB\xBF", b"\xEF\xBB\xBF"]),
+            vec![0, 1, 0, 2, 0]
+        );
+        // The stream ends inside the mark: empty input (#7454).
+        assert_eq!(cuts(&[b"\xEF", b"\xBB"]), vec![1, 1]);
+        assert_eq!(cuts(&[b"\xEF", b""]), vec![1, 0]);
+        // No mark, or one that departs from itself, in the first source or a later one.
+        for sources in [
+            &[&b"[2]"[..]][..],
+            &[b"\xEF", b"1"],
+            &[b"\xEF\xBB", b"\xEF"],
+            &[b"\xEF\xBB", b"\xBB\xBF"],
+            &[b"\xBB\xBF"],
+            &[b"", b""],
+        ] {
+            assert!(
+                cuts(sources).iter().all(|&cut| cut == 0),
+                "{sources:?}: {:?}",
+                cuts(sources)
+            );
+        }
+        assert_eq!(bom_cut_at(&[], 4), 0);
+        assert_eq!(bom_cut_at(&[1, 2], 1), 2);
     }
 
     /// (input, front matter text, body) as yq v4.53.3 splits them (#6910): the front matter is the text

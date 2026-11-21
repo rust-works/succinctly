@@ -570,6 +570,38 @@ pub fn jq_stream_fault_end<B: AsRef<[u8]>>(
     }
 }
 
+/// jq's parser over its input stream, fed a byte at a time, for a reader that only needs to know at
+/// which bytes it refuses the stream (#7575). After a refusal it starts afresh, as jq's parser is
+/// reset after one; the caller drops what jq's reader drops with it.
+#[doc(hidden)]
+pub struct JqStreamFaults(Parser);
+
+impl JqStreamFaults {
+    /// A parser at the front of the stream.
+    pub fn new() -> Self {
+        let mut parser = Parser::new(1, 0, JQ_MAX_PARSING_DEPTH);
+        parser.multi = true;
+        Self(parser)
+    }
+
+    /// Whether jq's parser refuses the stream at `byte`. A BOM jq skips is never fed.
+    pub fn feed(&mut self, byte: u8) -> bool {
+        match self.0.feed(byte) {
+            Err(Stop::Fault(_)) => {
+                *self = Self::new();
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Default for JqStreamFaults {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// jq's parser reading `chunks` from `(line, column)` without reaching the end of the text (#7024): the
 /// first fault it meets in them (worded as [`jq_stream_fault`] words it), or whether it stands at a
 /// boundary between top-level values once they are read (no container, string, token or value

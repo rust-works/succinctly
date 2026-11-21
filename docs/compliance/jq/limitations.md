@@ -395,6 +395,18 @@ jq 1.8.2 rewords every `Cannot index` message on purpose (jqlang/jq#3478): `Cann
 That is a change of wording, not a fix, so `succinctly jq` stays with the pinned 1.7.1 for all of them.
 Pinned by `tests/jq_cli/i7450.rs`, whose rows were captured from `/usr/bin/jq`.
 
+## `tonumber` refuses a string with a NUL byte in it, as jq 1.8.2 does; jq 1.7.1 reads up to the NUL (#7521)
+
+jq 1.7.1 hands the string to its number parser as a C string, so the text ends at the first NUL byte and the rest is dropped without a word: `"1\u00002" | tonumber` is `1`, `"12\u0000abc" | tonumber` is `12`.
+jq 1.8.2 refuses every such string (jqlang/jq#3496, listed in the 1.8 NEWS under changes to existing functions: "Fix `tonumber` and `toboolean` to reject strings with embedded null bytes"): `string ("1\u00002") cannot be parsed as a number`.
+A long string is cut with `...` as in any such message; when a NUL falls inside the quoted, cut-off text, `succinctly jq` quotes the string only up to the NUL (`string ("1234567890...)`) where 1.8.2 quotes all of it, which this change does not touch.
+`succinctly jq` follows 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+The refusal covers a NUL anywhere in the string, including a string that 1.7.1 also refuses (`"a\u0000b"`, which it words as a parse fault in `a`), and `tonumber?` is then empty.
+Only the NUL changes: the rest of 1.8.2's reworded `tonumber` failures and its refusal of surrounding whitespace (`" 1 " | tonumber`) come from a separate upstream change (jqlang/jq#3055) and stay as the 1.7.1 behaviour recorded in the conversion-diagnostics section above.
+`fromjson` is not affected: it hands its parser a length in both versions.
+`succinctly yq` is not changed.
+Pinned by `tests/jq_cli/i7521.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.
@@ -466,6 +478,7 @@ Only space, tab, CR and LF are whitespace to jq's parser, so `"\u000b1" | tonumb
 What is still not matched is on the *accepting* side, not the wording.
 The validator refuses a text jq reads, so the message here falls back to the older `Invalid numeric literal` form.
 The two cases are a bare trailing decimal point (`"5." | fromjson`, see the accepted divergence below) and a number token with a NUL after it (`"1\u00002" | fromjson`, which jq reads as `1` because it hands its number reader a C string).
+`tonumber` no longer reads up to a NUL: jq 1.8.2 refuses the string, and so does `succinctly jq` (#7521).
 
 ## The math builtins print the platform libm's last bit, as jq does (#3045)
 
@@ -1600,6 +1613,15 @@ What it leaves:
 - **yq mode** is not rebound: real yq takes the first value of most of these arguments or refuses a second one, so `succinctly yq` keeps evaluating the argument before the call.
 - **A shadowed builtin name** (`def ltrimstr(x): ...` anywhere in the program) leaves every call to it as written, as above.
 - **Where jq never answers** (`sub("a"; repeat("X"))`, `split("a"; repeat(""))`, `sort_by(repeat(.))`), succinctly still raises its `repeat: maximum iterations exceeded` cap.
+
+## `in`, `halt_error` and a collected argument with a `?//` (#7558)
+
+The C-coded `halt_error/1` is bound the same way.
+`in(xs)` whose argument holds a `?//` is parsed as its definition, `. as $x | xs | has($x)`, which binds the input before the argument runs (so #2202's order of an argument's error against an undecodable input stays as it was), and `"a" | in([[1], {"a":1}] as [$a] ?// [$b, $a] | $a)` retries `has`'s refusal of `[1]` and answers `true`, as jq does.
+`split`'s and `splits`' flags and `combinations`' count cannot be bound ahead of the call: jq reads them inside the array it collects (`[match($re; "g" + flags) | ...]`, `[range(n) | $dot]`), so every value lands in one array and `split(","; ("g", null))` is one split, not two.
+When such an argument holds a `?//`, its values are collected first, each followed by the step that can fail (`match($re; "g" + $f)`, `range($n; $n)`), where a failure still retries the bind, and the builtin then reads the values that survived.
+jq 1.8.2 retries the same way; its `splits` binds the flags as a `$flags` parameter since jqlang/jq#3260's refactor, which splits once per flags value, and 1.7.1 stays the reference for that.
+A `?//` inside the body of `with_entries(f)` or of `to_entries | map(f)` still does not retry a failure raised in `f` (`with_entries(select(has([1, "key"] as [$a] ?// [$b, $a] | $a)))` on `{"a":1}`): that route evaluates `f` its own way.
 
 ## `while`/`until` and a `?//` retry in `update` or `cond` (#3503, #3617)
 
@@ -7586,7 +7608,10 @@ Standard input named as `-` among input files is put back the same way (#7568): 
 A close that a file's last byte completes right after a scalar is handed out once jq's reader has read the next file's first chunk, as at a chunk's last byte (#7570).
 A main loop that does not halt reads to the end, except when a file before the `-` does not open (or is a directory): jq's main loop then stops once it has the input its reader read past that file (`while (jq_util_input_errors(...) == 0 && ...)`), and standard input is left where that input's chunk ends.
 A missing file or a directory before the `-` is a source with no bytes, as jq's reader reads it, but one that names a descriptor (`/dev/stdin`, `/dev/fd/N`), or a pipe or device, leaves standard input where the reads left it: its bytes cannot be read again as jq read them.
-Three shapes still leave a regular file where the reads left it: a run that ends at a parse error (jq leaves the offset at the end of the chunk where its parser met the error), `--seq`, and `--stream-errors`, whose items this count does not model.
+A parse error is an item like a value (#7575): jq's reader hands it out at the byte where its parser refuses the text, then resets the parser and drops the rest of that byte's chunk, so a run that stops at it (the main loop, an uncaught `input` error) leaves the offset at the end of that chunk, and one that catches it and reads on (`try input catch ...`) takes its next input from the chunk after it.
+The count places the error with jq's own parser (`parse_message.rs`, the one that words jq's parse errors), fed the bytes jq's parser reads.
+Three shapes still leave a regular file where the reads left it, as their items are not counted: a parse error under `--stream` (jq's streaming parser refuses a text at bytes of its own), `--seq`, and `--stream-errors`.
+A standard input the run also writes its output or errors to, at the same offset (`jq ... <> f >&0`, most likely one open file shared by both), is left where the run's reads and writes left it too: where jq leaves it depends on when stdio flushed the output against the reads (on macOS jq 1.7.1 and 1.8.2 write the output at the end of their reads and then move the shared offset back over what they read and did not hand out), which the count does not model.
 `-R` over standard input (#7024) is read by the `LineWindows` the `-R` file route reads its file with (#7023, above), and the plain route's machinery is not involved.
 A regular file is read by a duplicate of descriptor 0 from the offset it stands at; a pipe or socket has its first 4 MiB read to learn whether it is long enough, and one that ends sooner hands what it held to the route that reads it whole, as the plain route's pipe does.
 A stream of lines has no fault to word, so neither is read again and no window is certified: the time #7106 tracks for the plain route's pipe is not spent here.
@@ -7616,8 +7641,14 @@ On terminus `-R .`, `-R length` and `-R 'select(endswith("9}"))'` read −4.3% t
 The lone file, which this change does not move, read +4.2% to +8.0% on three of its terminus rows at 10 and 100 MiB with fewer instructions than before (cachegrind: 330.2 million against 330.9 for `-R length` at 10 MiB), so that is where the code landed in the binary, and −3.0% to +2.3% on the mini.
 A program that calls `input`/`inputs` over several regular files (#7024: 4 MiB or more between them, judged as the plain route judges them) reads each file as a lazy source of its own, a window at a time and in turn, as the lone source past its front is read (#7023, above).
 Every file is opened and checked before the run starts (below), and the producer reads a file's windows when it reaches it.
-A fault, a number or literal a file ends in (the next file's first byte may go on with it, #4305), a document a file ends inside, or a document nested deeper than the lazy route converts (64 levels) hands the rest of the stream to the eager reader there, which reads what is left of the files whole and holds it, as the route that read every file whole did from the same point (`hand_off_later_sources`): such a stream is flat only up to that point.
-A first file with a document that the route reading the files whole stitches onto the next before it starts (its first chunk ends in a fault, a document it does not finish, or a number or literal) is left to that route, which then reads lazily, where the windowed route would hand everything after it to the eager reader.
+A fault, or a document nested deeper than the lazy route converts (64 levels), hands the rest of the stream to the eager reader there, which reads what is left of the files whole and holds it, as the route that read every file whole did from the same point (`hand_off_later_sources`): such a stream is flat only up to that point.
+A document a file ends inside, or a number or literal a file ends in (the next file's first byte may go on with it, #4305), is no fault: since #7480 the producer moves it onto the front of the next file as the stitch of the files read whole moves it (`carry_cut_document`, through the same `SeamStitcher`), and reads on lazily from there, so a stream cut inside its records is read a window at a time to its end.
+The same holds for several files read whole (under 4 MiB between them, or named as `/dev/fd/N`), whose producer carries the cut document on in the same way.
+Until #7480 such a cut was handed over as a fault, and the eager reader turned every later document into a value before the first was read: about ten times the text after the cut (peak RSS 993 MiB at 100 MB in three files cut inside a record, for `-n 'reduce inputs as $x (0;.+1)'` and for `-c input_line_number`, and 1,072 MiB over the same files as `/dev/fd/N`, on an Apple M4 Pro; jq 1.7.1 holds 2.5 MiB).
+Since #7480 the same runs peak at 5.3 to 5.6 MiB at 10, 30 and 100 MB, and the `/dev/fd/N` files, which are read whole, at 21, 55 and 171 MiB (the text, and the next file's buffer grown for the carried bytes).
+A fault in the carried document is met in the next file, which hands the stream over from there, and the line and file it names are those the stitch gives.
+A number or literal a file's end cuts into pieces the lazy scan refuses on their own (`tr` then `ue`, `1.` then `5`) is still handed over.
+A first file with a document that the route reading the files whole stitches onto the next before it starts (its first chunk ends in a fault, a document it does not finish, or a number or literal) is left to that route, which then reads lazily (it reads the files whole, so such a run holds the text).
 That reader blanks the text a window has already read before its stitch and its end-of-stream scan, starts the windowed file's lines and its position in jq's input past the text dropped, and adds the line breaks dropped to the seams the stitch moves off it, so a fault in bytes a file's end handed on is named on the line jq names.
 Where the next file starts in jq's input, which a depth refusal's message names, is counted from the window's start past the text dropped (`DroppedText`).
 Every file is checked to be UTF-8 before the run starts, a 1 MiB block at a time, as the route that reads them whole checks each before it takes them lazily: a file that is not, or a character a cut between two files splits, keeps that route, which substitutes the bytes, and the first file with a byte is read past its BOM.
@@ -7644,6 +7675,7 @@ The tail is handed on as the bytes that were read, so a character or a run of in
 Only the front of the stream may start with a BOM; the BOM at the front of a later file is a byte of the stream.
 A window never drops part of the tail that opens a file, so a document that spans files is held from its start, as a document bigger than a window is.
 The first fault is worded by reading every file again as one stream, by position, and a depth refusal names its position in the stream of all the files.
+The line its `(at FILE:N)` marker names counts jq's reads, which end at a line break or 4095 bytes after the start of the line, even for a fault met in the bytes of an earlier file that were moved onto the next: a depth refusal in the first 4095 bytes of a first line that is longer is `(at a.json:0)`, as in jq 1.7.1, where it used to be `:1` (#7573).
 A list of up to 32 files is read again through the handles the run reads by, which are held open from the start.
 A process's descriptor table starts at 64 slots, and doubling it waits for an RCU grace period when the process has a second thread, 35 ms for each doubling on the 7950X's Linux, which more than doubled a 10 MiB run over 64 files: 32 files and the standard descriptors stay under it.
 A longer list is opened a file at a time since #7024 (`NamedFile`): each file is opened to be judged before the run starts (a regular file, not the run's standard input or output) and closed again, and opened again when the run reaches it, so the run reads what the path names then, as jq does, which opens each file as it reaches it.
@@ -9193,6 +9225,17 @@ blank line between them (#2703 recorded one; the pinned macOS `/usr/bin/jq` and 
 1.7.1 release binary both print none, #3624). The pre-#2703 `jq: module error: parse error in module
 '{path-as-given}': …` is gone.
 
+**Closed for a bad escape in a string literal (#7445).**
+The first bullet below (jq's phrasing of a *syntax error* is a function of its bison parse state) does not cover this family.
+A bad escape in a program's string literal (`"\q"`, `"\u12"`, `"\ud800"`) is not a bison message: jq's lexer hands each run of consecutive escapes of the literal to its JSON decoder as the string `"<run>"`, so the message is the decoder's, deterministic, and `succinctly jq` prints it.
+`"ab\q"` is `jq: error: Invalid escape at line 1, column 4 (while parsing '"\q"') at <top-level>, line 1:` in jq 1.7.1, jq 1.8.2 and here, and a `\u12` is `Invalid \uXXXX escape`, a lone high surrogate `Invalid \uXXXX\uXXXX surrogate pair escape`.
+A run is the maximal stretch of escapes (`\n\q` is one, `"\n\q"` quotes both in the message), so literal text and a `\(` interpolation start a new one, and each bad run is an error of its own, counted in the trailer (`"\q\(1)\q"` is `2 compile errors`).
+This holds for every place a string literal is read in jq mode: a plain string, one after an interpolation, a format string (`@base64 "\ud800"`), an object key, a field access (`."\q"`), and the path of an `include` or `import`.
+jq 1.8.2 differs from 1.7.1 here only in the error-position suffix (`at <top-level>, line 1, column 2:` and a caret line, jqlang/jq#3257), which is jq 1.8's presentation of every compile error and is not matched.
+A lone low surrogate (`"\udc00"`) is accepted by both versions and becomes U+FFFD, as here.
+`succinctly yq` keeps yq's own reading of a string literal, in which an unknown escape is kept as text.
+Pinned by `tests/jq_cli/i7445.rs`, whose rows are jq 1.7.1's messages (jq 1.8.2 agrees on all of them).
+
 **What remains open, all three narrower than the shape gap:**
 
 - **Message wording is succinctly's own.** A syntax error reads `jq: error: unexpected end of
@@ -9224,6 +9267,42 @@ trailer discriminator, and exit 3, so a script that greps or counts `compile err
 a compile failure from a runtime one gets a consistent answer on every one of them.
 Neither remaining gap corrupts output or crashes — the two conditions that would otherwise
 make this an accepted ADR-0018 divergence rather than an open gap.
+
+### A module that fails to load and is imported twice is reported once, where jq 1.8.2 reports it at each import (#7535)
+
+jq 1.8.2 reports a module that fails to load at every `import` or `include` that reaches it.
+`succinctly jq` reports it once, as jq 1.7.1 does for a syntax error, and this is deliberately left that way.
+The 1.8.2 behaviour comes from a crash fix (jqlang/jq#3497, "Fix crash when importing a module with errors twice", for jqlang/jq#3126): `load_library` used to cache the block of a module that failed to parse as a library, and a second import found the cached invalid block and passed it to `block_bind_library`, which aborted on an assertion.
+The fix skips caching a block when there are parse errors, so the failed module is loaded again by the next directive and fails again.
+The repeat is a consequence of not caching, not a designed report, and `succinctly jq` does not crash, so there is no reason to copy it.
+The count is the one place the two differ, so a script that counts `compile error` lines sees fewer here for a repeated bad module.
+The three outputs, captured on macOS (jq 1.7.1 is Apple's `/usr/bin/jq`, jq 1.8.2 is Homebrew's), with `data.json` = `{"a":1}`, `mod.jq` = `import "data" as $data; .`, `main.jq` = `import "mod" as mod; include "mod"; .`, and `bad.jq` = `def f: (;`:
+
+```console
+$ jq -L . -n -f main.jq                                  # jq 1.7.1
+jq: error: jq: error: library should only have function definitions, not a main expression
+<unknown location>
+Assertion failed: (block_has_only_binders(binder, bindflags)), function block_bind_library, file compile.c, line 383.
+                                                           # exit 134
+
+$ jq -L . -n -f main.jq                                  # jq 1.8.2
+jq: error: jq: error: library should only have function definitions, not a main expression
+jq: error: jq: error: library should only have function definitions, not a main expression
+jq: 2 compile errors
+                                                           # exit 3
+
+$ succinctly jq -L . -n -f main.jq
+jq: error: jq: error: library should only have function definitions, not a main expression
+<unknown location>
+jq: 1 compile error
+                                                           # exit 3
+```
+
+The same module reached twice and failing to parse is reported once by jq 1.7.1 and `succinctly jq` (`jq -L . -nc 'import "bad" as x; import "bad" as y; 1'`: one syntax error, `jq: 1 compile error`, exit 3), and twice by jq 1.8.2 (the syntax error twice, `jq: 2 compile errors`, exit 3).
+The syntax error's own wording is succinctly's, as recorded in the section above on the other compile-error paths.
+jq 1.7.1 has no output to match for the crash case (a library with a main expression, imported and included), where 1.8.2's two reports are the only reference and `succinctly jq` prints one, followed by the `<unknown location>` line 1.7.1 printed just before it aborted.
+A module that loads fine and is imported twice agrees in all three.
+This is the repo owner's default for the question the issue raised (report once, or at each import): behaviour stays as it is until a reason to change it turns up.
 
 ## Recursive `def`s: what a native call stack costs that jq's own does not — #1371
 
@@ -10344,17 +10423,17 @@ Two pieces of jq's own wording are misleading, and are reproduced rather than co
 - **jq's numbers are decNumber's, not RFC 8259's.** `1.`, `.5`, `+1`, `nan`, `NaN5`, `snan`
   and `-Infinity` are all numbers to `--seq`'s parser, while `1e` and `1.2.3` are not.
 
-There is also a genuine quirk in jq's classifier that succinctly matches: `check_literal`
-reads `tokenbuf[1]` without consulting `tokenpos`, so a bare `n` is measured against
-whatever byte an earlier token left behind.
-`printf '\x1e"iu" n'` reports `Invalid literal`, because the string left `u` at index 1, and the same `n`
-after a token that left another byte reports `Invalid numeric literal`.
+A bare `n` token is `Invalid numeric literal` whatever an earlier token left in the token buffer (#7525), as in jq 1.8.2.
+jq 1.7.1's `check_literal` reads `tokenbuf[1]` without consulting `tokenpos`, so a bare `n` was measured against whatever byte an earlier token left behind.
+`printf '\x1e"iu" n'` reports `Invalid literal` in 1.7.1, because the string left `u` at index 1, and the same `n` after a token that left another byte reports `Invalid numeric literal`.
 When no earlier token in the stream has written index 1, the byte is uninitialised heap in jq itself (`parser_init` leaves `tokenbuf` null and `token()` grows it with `jv_mem_realloc`), so the answer belongs to the libc allocator, not to jq (#7256).
 `printf '\x1en'` reports `Invalid numeric literal` on macOS and on x86_64 glibc, and `Invalid literal` on Amazon Linux 2023 aarch64, from the same 1.7.1 source.
-`succinctly jq` answers as if that byte were not `u`, which is the first of those, and `scripts/jq-seq-oracle-sweep.py` skips a stream whose first bare `n` is classified before any token has written the byte (`--expect-artifacts` includes it).
-jq 1.8.2 fixed the read: its `check_literal` tests `p->tokenpos > 1 && p->tokenbuf[1] == 'u'`, so a bare `n` never reads `tokenbuf[1]`.
-On 1.8.2 `printf '\x1en'` and `printf '\x1e"iu"\n\x1en\n'` both report `Invalid numeric literal` (checked on macOS arm64; the source says the same on every platform), where 1.7.1 reports `Invalid literal` for the second.
-The quirk and the skip above therefore exist only because the pinned reference is 1.7.1, and both can go if the pin moves to 1.8.x.
+jq 1.8.2 fixed the read as a memory-safety bug (jqlang/jq#3324, "Fix use of uninitialized value in `check_literal`"): its `check_literal` tests `p->tokenpos > 1 && p->tokenbuf[1] == 'u'`, so a bare `n` never reads `tokenbuf[1]`.
+On 1.8.2 `printf '\x1en'` and `printf '\x1e"iu"\n\x1en\n'` both report `Invalid numeric literal` (the source says the same on every platform), where 1.7.1 reports `Invalid literal` for the second.
+`succinctly jq` follows 1.8.2 on every route that reads a stream of JSON texts: `--seq`, `--stream`, `--stream-errors`, and the plain, `-n` and `-s` routes (which never modelled the quirk).
+A token that really starts `nu` (`nu`, `nul`, `nulx`) is still `Invalid literal`, as in both versions.
+The difference from the pinned 1.7.1 is the ledger entries `cli:stream-bare-n-after-u`, `cli:stream-errors-bare-n-after-u` and `cli:inputs-bare-n-after-u` (`newer-than-primary`; the compare harness reads stdout and the exit status, so `--seq`'s warning on standard error has none), and `scripts/jq-seq-oracle-sweep.py`, which compares against 1.7.1, skips the streams that read the byte (`--expect-artifacts` includes them).
+Pinned by `tests/jq_cli/i7525.rs`, whose rows are jq 1.8.2's output.
 
 The value path uses the same reader: values jq hands off before a malformed suffix are
 materialized, while values invalidated by the scan call that discovers the error are not.
@@ -11554,13 +11633,15 @@ The date itself agrees: a week number in a negative year is placed with the libc
 starts the slice at 0. Every other depth (a negative or fractional number, `null`, a boolean) is checked against
 `/usr/bin/jq` 1.7.1 in `tests/jq_cli/i4971.rs`.
 
-### A non-string `strflocaltime`/`strftime` format raises where jq aborts (#3046)
+### A non-string `strflocaltime`/`strftime` format raises where jq 1.7.1 aborts (#3046)
 
 `0 | strflocaltime(1)` and `0 | strftime(1)` kill jq 1.7.1 on an assertion
 (`Assertion failed: (JVP_HAS_KIND(j, JV_KIND_STRING)), function jv_string_value`, exit 134).
 succinctly raises a catchable error at exit 5 instead — the "would take the host process
-down" condition. The wording is succinctly's own (`expected string, got strflocaltime
-format`), since jq has none to match.
+down" condition.
+jq 1.8.2 fixed that crash (jqlang/jq commit 1411ce6, "strftime/1: fix validation of non-string argument with number input", oss-fuzz #67403) and raises `strftime/1 requires a string format` (`strflocaltime/1 requires a string format`), the words it already had for an array input.
+`succinctly jq` uses those words (#7533); until then its own wording was `expected string, got strflocaltime format`, since 1.7.1 had none to match.
+`strptime(1)` already agrees (`strptime/1 requires string inputs and arguments`).
 That holds only for a number that converts (#6111).
 jq tests the input before it reads the format.
 `null | strftime(1)` is `strftime/1 requires parsed datetime inputs` in both.
@@ -13604,8 +13685,9 @@ jq's parser reports a text that opens with part of the UTF-8 BOM (`EF`, or `EF B
 The primary input stream does not: `printf '\xef\xbf\xbd1' | jq .` is `jq: parse error: Malformed BOM` in jq and `jq: parse error: Invalid numeric literal at EOF at line 1, column 4` here.
 Both exit 5 with no output, so only the message differs, when the mark breaks off at a byte that is not the next one of it.
 A mark that breaks off because the input ends (`printf '\xef' | jq .`, or `EF BB`) is no fault in jq: its parser keeps its place in the mark across a refill, so the input is empty, `.` prints nothing and `-s .` prints `[]`, both with exit 0 (#7454).
-`succinctly jq` does the same, on standard input and in files, when the stream's only bytes are the start of the mark, with files without bytes before or after it.
-A mark split across two files (`EF BB` in one and `BF` in the next) is not joined here, where jq skips it, and still ends in a numeric-literal fault.
+`succinctly jq` does the same, on standard input and in files, when the stream's only bytes are the start of the mark, with files without bytes before or after it, and when that start is cut across files (`EF` in one and `BB` in the next).
+A mark cut across the first files (`EF BB` in one and `BF [2]` in the next, or a byte in each of three) is skipped as jq skips it, since jq's parser matches the mark a byte at a time whichever file each byte comes from (#7566).
+The routes that read several files a window at a time skip a mark at the front of the first file with bytes only, so a list whose first file with bytes is only the start of the mark is read whole, which joins it.
 The stream routes word their first fault through `jq_stream_fault`, which does not look for a partial BOM; closing that is a separate change.
 
 ### A malformed nested number raises when read; jq rejects the document (#966, #3034, #3222) — accepted uniform divergence
@@ -15014,13 +15096,10 @@ parser's own error-position/message rules for this one CLI-arg error path — ou
 to this issue's own "Low severity" scope, which was the exit code and the reporting channel,
 not this detail text.
 
-`--rawfile`'s "Could not open" wrapper also covers invalid-UTF-8 file content (`std::io::Error`'s
-`ErrorKind::InvalidData`, since this crate reads the argument as a Rust `String`) — unverifiable
-against jq, which reads raw bytes and never rejects invalid UTF-8 there at all (confirmed live:
-`jq -nc 1 --rawfile x <file with invalid UTF-8>` exits 0, the content silently unused by a filter
-that never reads `$x`). Not the scope of this issue either: it is a pre-existing limitation of
-this crate's whole `--rawfile`/`--slurpfile` pipeline being built on `String`, not something
-#3051 introduces or narrows.
+A `--rawfile`, `--slurpfile` or `-f` file with a byte that is not valid UTF-8 was refused with that wrapper (`Could not open <file>: stream did not contain valid UTF-8`, exit 2) until [#7436](https://github.com/rust-works/succinctly/issues/7436); jq reads it with U+FFFD, and so does `succinctly jq` now.
+jq's `jv_load_file` reads `-f` and `--rawfile` 4,096 bytes at a time, reads on to the end of a character the last byte of a full read starts, and decodes each read on its own, so a sequence cut short by the end of a read is one U+FFFD to that end, and that is matched (`jq_raw_file_text`).
+`--slurpfile` is parsed, and the bytes of its strings are decoded as the main input's are.
+A program whose U+FFFD is outside a string or a comment is a compile error, exit 3, as in jq.
 
 `--jsonargs`, `-f`/`--from-file`, and the main input file had the same exit-1 bug (confirmed
 live: jq exits 2 for a bad `--jsonargs` value, an unreadable filter file, and an unreadable
