@@ -200,22 +200,26 @@ jq: error (at <unknown>): Invalid path expression near attempt to access element
                                                                              # key: still 11 bytes
 ```
 
-## Truncation that splits a multi-byte character: matched (#6434)
+## Truncation that splits a multi-byte character: follows jq 1.8, not the pinned 1.7.1 (#7524)
 
-jq cuts the dump at a byte offset and will split a UTF-8 sequence. The message is then built as a `jv` string, which replaces the partial sequence with one U+FFFD (`ef bf bd`), whether one, two or three bytes of the character were kept:
+jq 1.7.1 cuts the dump of a value in an error message at a byte offset and will split a UTF-8 sequence.
+The message is then built as a `jv` string, which replaces the partial sequence with one U+FFFD (`ef bf bd`), whether one, two or three bytes of the character were kept:
 
 ```bash
-$ echo '"あああああ"' | jq '.[]' | cat -v
+$ echo '"あああああ"' | /usr/bin/jq '.[]' | cat -v
 jq: error (at <stdin>:1): Cannot iterate over string ("M-cM-^AM-^BM-cM-^AM-^BM-cM-^AM-^BM-oM-?M-=...)
                                                      # "あああ, then U+FFFD (M-oM-?M-=)
 ```
 
-`dump_truncated` cuts back to the character boundary and writes that U+FFFD before the `...`, so `try (.[]) catch .` on `"abc😀😀😀"` is `"Cannot iterate over string (\"abc😀�...)"` in both.
+jq 1.8.0 fixed that as a bug ("Fix error messages including long string literal not to break Unicode characters", jqlang/jq#3249): `jv_dump_string_trunc` moves the cut back to the start of the character and writes nothing in its place.
+Its own test, at the 1.7.1 budget, is `"x" * range(0; 12; 2) + "☆" * 5 | try -. catch .`, which prints `"string (\"☆☆☆...) cannot be negated"`, `"string (\"xx☆☆...)`, `"string (\"xxxx☆☆...)`, `"string (\"xxxxxx☆...)`, `"string (\"xxxxxxxx...)` and `"string (\"xxxxxxxxxx...)`.
+ADR-0018's fork order applies: an upstream bug fix is adopted, so `dump_truncated` cuts back to the character boundary and writes no U+FFFD before the `...`, so `try (.[]) catch .` on `"abc😀😀😀"` is `"Cannot iterate over string (\"abc😀...)"`.
 It applies at the wide `path()` budget too.
-The `succinctly yq` messages that embed a cut value (`keys` of a string, `tonumber` of an object) are jq's wording, not yq's, and get the same U+FFFD.
-A cut that lands on a boundary writes none (`"ααααα...`, exactly 11 bytes).
-Before #6434 this page said jq emitted the lone invalid byte, and `succinctly jq` dropped the partial character without a replacement.
-Pinned in `src/jq/error.rs` (`dump_truncation_that_splits_a_character_writes_one_replacement_6434`) and `tests/jq_cli/i6434.rs`.
+The `succinctly yq` messages that embed a cut value (`keys` of a string, `tonumber` of an object) are jq's wording, not yq's, and get the same cut.
+A cut that lands on a boundary is unchanged (`"ααααα...`, exactly 11 bytes).
+The budgets stay 1.7.1's: jq 1.8.2 also widened the preview and closes it with the delimiter (jqlang/jq#3478), which the owner ruled an improvement, not a bug fix, so it is not adopted and `succinctly jq` still prints a long value cut at 11 bytes where jq 1.8.2 prints it whole.
+#6434 had matched 1.7.1's U+FFFD; before that this page said jq emitted the lone invalid byte, and `succinctly jq` dropped the partial character without a replacement, which is what it does again.
+Pinned in `src/jq/error.rs` (`dump_truncation_that_splits_a_character_backs_up_to_its_start_7524`), `tests/jq_cli/i7524.rs` and `tests/jq_cli/i6434.rs` (its rows are the 1.7.1 messages without the U+FFFD).
 
 ## jq's own UTF-8 replacement-character substitution: matched, at each caller's own granularity
 
