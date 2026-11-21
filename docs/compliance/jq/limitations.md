@@ -14600,6 +14600,10 @@ inline. Pinned in the `jq_reported` tests of `resolve.rs` (including the whole-r
 `succinctly yq` is unchanged: it keeps the first error from the full list
 (`resolve_func_calls_all`), and yq has no such rule to match.
 
+A `def` that nothing references is never compiled, and a reference counts wherever it is written, an argument of an unresolved call included, although jq compiles no such argument ([#7443](https://github.com/rust-works/succinctly/issues/7443)).
+The def is a unit of the block it is written in, not of the call: `def rs: foo; def run: count(rs); run` reports `foo/0` and `count/1`, and `def h: nosuchfn2; nosuchfn(h)` only `nosuchfn/1`, because there the block that owns `h` has the error.
+Pinned in `tests/jq_cli/i7443.rs`, jq 1.8.2 agreeing.
+
 **The order of errors among closures — closed ([#3583](https://github.com/rust-works/succinctly/issues/3583)).**
 jq reports a block's own errors, or, when it has none, the errors of the closures it owns, in
 the order of its compiled instructions, which is not source order for every construct. The
