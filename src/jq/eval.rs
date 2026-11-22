@@ -33213,6 +33213,11 @@ fn refuse_unknown_group_option(rest: &[char]) -> Result<(), EvalError> {
         Some('-') if !rest.get(1).is_some_and(char::is_ascii_digit) => {}
         // `(?)`: no option at all.
         Some(')') => return Err(EvalError::new("Regex failure: undefined group option")),
+        // #7689: a sign Oniguruma's Perl syntax opens no group with (`(?}`, `(??`, `(?|`, `(?[`,
+        // `(? `), which the `regex` crate refuses in its own words or reads as something else.
+        Some(c) if " \"$%*+,./;?@[\\]^_`|}".contains(*c) => {
+            return Err(EvalError::new("Regex failure: undefined group option"))
+        }
         _ => return Ok(()),
     }
     if rest.starts_with(&['R', ')']) {
@@ -34456,6 +34461,8 @@ fn translate_posix_brackets_scan(
     // item to jq: a repeat operator after it has nothing to repeat.
     let mut prev_option_group = false;
     let mut group_facts: Option<GroupFacts> = None;
+    // A refusal Oniguruma makes only after reading the whole pattern (#7689).
+    let mut late_refusal: Option<EvalError> = None;
     // The extended mode's ignored blanks are invisible to this scan (`^ *` is a repeated
     // assertion there), so a pattern in that mode is not judged as written: `translate_posix_brackets`
     // runs the scan again over the pattern without the blanks and comments (#6215, #6249) and keeps
@@ -34577,14 +34584,23 @@ fn translate_posix_brackets_scan(
                 ));
             }
             // #6070: the escapes Oniguruma reads that the `regex` crate refuses or reads another way.
-            if let Some((text, used)) = rewrite_onig_escape(
+            // #7689: a backreference to a group the pattern does not have is refused once the
+            // pattern has been read, so an error after it comes first (`\2\` ends at an escape).
+            let escape = match rewrite_onig_escape(
                 &chars,
                 i,
                 depth > 0,
                 class_from,
                 groups_opened,
                 &mut group_facts,
-            )? {
+            ) {
+                Err(refusal) if refusal.to_string().ends_with("invalid backref number/name") => {
+                    late_refusal.get_or_insert(refusal);
+                    None
+                }
+                other => other?,
+            };
+            if let Some((text, used)) = escape {
                 // #6240: a byte run no character has is a member of its own after a `-` that is
                 // itself a member (`[a-c-\xED\xA0\x80]`), which the `regex` crate would read as the
                 // start of a range up to a nested class.
@@ -34666,6 +34682,12 @@ fn translate_posix_brackets_scan(
                         let name = &chars[i + 3..i + 3 + close];
                         let caret = name.first() == Some(&'^');
                         let raw: String = name[usize::from(caret)..].iter().collect();
+                        // #7689: an empty name is refused where it stands, before a later error.
+                        if raw.is_empty() {
+                            return Err(EvalError::new(
+                                "Regex failure: invalid character property name {}",
+                            ));
+                        }
                         match property_name_kind(&raw) {
                             PropertyName::Refused => {
                                 return Err(EvalError::new(format!(
@@ -34963,6 +34985,54 @@ fn translate_posix_brackets_scan(
                 if wrapped.pop() == Some(true) {
                     out.push(')');
                 }
+            } else if c == ')' {
+                // #7689: Oniguruma refuses a `)` that closes no group where it reads it, before an
+                // error later in the pattern (`)\` ends at an escape, `\2)` names a group the
+                // pattern does not have, which Oniguruma checks once it has read it all). An error
+                // before it that a later pass words (`\k<x>)`, `(*a))`) still comes first.
+                let mut before: String = if extended {
+                    "(?x)".into()
+                } else {
+                    String::new()
+                };
+                before.extend(&chars[..i]);
+                const LATE: [&str; 5] = [
+                    "end pattern with unmatched parenthesis",
+                    "end pattern in group",
+                    "invalid backref number/name",
+                    "undefined group",
+                    "never ending recursion",
+                ];
+                // The text before it is read whole, with the checks that follow this scan (a
+                // repeated assertion, `(?=a)*)`; under `x`, a repeat with no target, `*+)`), then in
+                // the words of the pass after it. A call `\g<x>` is resolved once the pattern has been
+                // read, so its refusal is a late one.
+                let prefix: String = chars[..i].iter().collect();
+                let calls_only = |message: &String| {
+                    message
+                        .strip_prefix("undefined name <")
+                        .is_some_and(|rest| {
+                            let name = rest.split('>').next().unwrap_or_default();
+                            !prefix.contains(&format!("\\k<{name}>"))
+                                && !prefix.contains(&format!("\\k'{name}'"))
+                        })
+                };
+                let earlier = translate_posix_brackets(&prefix, extended, ignore_case)
+                    .err()
+                    .and_then(|refusal| {
+                        refusal
+                            .to_string()
+                            .strip_prefix("Regex failure: ")
+                            .map(String::from)
+                    })
+                    .or_else(|| oniguruma_refusal(&before))
+                    .filter(|message| {
+                        !LATE.iter().any(|late| message.contains(late)) && !calls_only(message)
+                    });
+                return Err(EvalError::new(format!(
+                    "Regex failure: {}",
+                    earlier.as_deref().unwrap_or("unmatched close parenthesis")
+                )));
             }
             // #6068: a `{` that does not open `{n}`, `{n,}` or `{n,m}` is the literal brace in
             // Oniguruma (`a{ 1}`, `a{1 }`, `a{1, 2}`, `a{,2}`); the `regex` crate allows blanks
@@ -35068,6 +35138,9 @@ fn translate_posix_brackets_scan(
     // #6229: a class still open at the end of the pattern.
     if depth > 0 {
         return Err(EvalError::new("Regex failure: premature end of char-class"));
+    }
+    if let Some(refusal) = late_refusal {
+        return Err(refusal);
     }
     Ok(if changed {
         std::borrow::Cow::Owned(out)
@@ -37676,9 +37749,12 @@ fn build_regex_uncached<S: EvalSemantics>(
         // (`a??++` is `(?>a*?)`), one quantifier per item, before the possessive scan reads it.
         let stacked = super::onig_quantifier::rewrite(pattern, extended);
         let pattern = stacked.as_deref().unwrap_or(pattern);
+        // #7689: the possessive scan's refusal is succinctly's own, of a pattern jq reads, so an error
+        // jq reports (`*+a` is `target of repeat operator is not specified`) comes before it.
+        let mut possessive_refusal = None;
         let scanned =
             refuse_possessive_quantifier_for(pattern, extended, n_flag).unwrap_or_else(|refusal| {
-                deferred_refusal.get_or_insert(refusal);
+                possessive_refusal = Some(refusal);
                 std::borrow::Cow::Borrowed(pattern)
             });
         let scanned = match escape_class_range_dashes(&scanned, extended) {
@@ -37702,7 +37778,11 @@ fn build_regex_uncached<S: EvalSemantics>(
                 None => scanned,
             }
         };
-        match translate_posix_brackets(&scanned, extended, flags.is_some_and(|f| f.contains('i'))) {
+        let translated = match translate_posix_brackets(
+            &scanned,
+            extended,
+            flags.is_some_and(|f| f.contains('i')),
+        ) {
             // #6108: a group repeated `{0}` keeps its capture slot.
             Ok(translated) => {
                 // #6196: each backreference carries the case mode in force where it stands.
@@ -37723,7 +37803,11 @@ fn build_regex_uncached<S: EvalSemantics>(
                 deferred_refusal.get_or_insert(refusal);
                 String::new()
             }
+        };
+        if let Some(refusal) = possessive_refusal {
+            deferred_refusal.get_or_insert(refusal);
         }
+        translated
     };
 
     // Apply flags
@@ -38210,6 +38294,38 @@ fn oniguruma_refusal(pattern: &str) -> Option<String> {
     oniguruma_refusal_within(pattern, 8)
 }
 
+/// Oniguruma's refusal of the callout whose name starts `rest` (the text after `(*`, #7689): a
+/// name is a letter or `_` and then letters, digits and `_`, closed by `)` or followed by its `[tag]`
+/// or `{args}`. `None` for a name jq knows, whose callout it runs.
+#[cfg(feature = "regex")]
+fn callout_refusal(rest: &str) -> Option<String> {
+    let Some(first) = rest.chars().next() else {
+        return Some("invalid callout pattern".into());
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Some("invalid callout name".into());
+    }
+    let len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    match rest[len..].chars().next() {
+        None => Some("end pattern in group".into()),
+        Some(')' | '[' | '{') => {
+            const BUILTIN: [&str; 7] = [
+                "FAIL",
+                "MISMATCH",
+                "ERROR",
+                "MAX",
+                "COUNT",
+                "TOTAL_COUNT",
+                "CMP",
+            ];
+            (!BUILTIN.contains(&&rest[..len])).then(|| "undefined callout name".into())
+        }
+        Some(_) => Some("invalid callout name".into()),
+    }
+}
+
 /// [`oniguruma_refusal`], which may read past a construct the crate cannot parse but jq accepts
 /// (a reference to a group the pattern has, a `(?'name'...)` group) by writing it as one the crate
 /// reads and looking again, up to `retries` times, for an error Oniguruma would meet later.
@@ -38242,6 +38358,13 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 }
                 ErrorKind::GroupUnclosed => Some(UNMATCHED_OPEN.into()),
                 ErrorKind::GroupUnopened => Some("unmatched close parenthesis".into()),
+                // #7689: `(*` opens a callout by name in Oniguruma, which the crate reads as a repeat
+                // of nothing. One of jq's builtin callouts (`(*MAX{2})`) has no refusal to word.
+                ErrorKind::RepetitionMissing
+                    if at(start).starts_with('*') && pattern.get(..start)?.ends_with('(') =>
+                {
+                    callout_refusal(at(start + 1))
+                }
                 // jq 1.8.2's parse depth limit, which `ONIG_NEST_LIMIT` is the crate's name for (#7528).
                 ErrorKind::NestLimitExceeded(_) => Some("parse depth limit over".into()),
                 ErrorKind::RepetitionCountInvalid => {
@@ -38284,9 +38407,17 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                         '\''
                     };
                     let Some((name, _)) = at(start + 3).split_once(close) else {
+                        // #7689: `\k<` and `\g<` with nothing after them.
+                        if at(start + 3).is_empty() {
+                            return Some("group name is empty".into());
+                        }
                         // `\k<x`: the name runs to the end of the pattern.
                         return Some(format!("invalid group name <{}>", at(start + 3)));
                     };
+                    // #7689: `\k<>`, `\g<>`, `\k''`.
+                    if name.is_empty() {
+                        return Some("group name is empty".into());
+                    }
                     let end = start + 3 + name.len() + 1;
                     let rewritten = || format!("{}(?:){}", &pattern[..start], at(end));
                     let numbered = name.strip_prefix(['-', '+']).unwrap_or(name);
@@ -38360,6 +38491,8 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 {
                     match at(start + 1).split_once('\'') {
                         Some((name, rest)) => retry(format!("{}<{name}>{rest}", &pattern[..start])),
+                        // #7689: `(?'` with nothing after it.
+                        None if at(start + 1).is_empty() => Some("group name is empty".into()),
                         // The name stops at the group's `)` when it has one (`(?'na)`).
                         None => Some(format!(
                             "invalid group name <{}>",
