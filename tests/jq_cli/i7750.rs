@@ -98,3 +98,71 @@ fn a_cut_after_a_fault_a_lookup_steps_over_is_recorded_7750() -> Result<()> {
         ),
     ])
 }
+
+/// One array spread over files past 1 MiB, which the plain route reads a window at a time (#7024):
+/// jq's parser that read the carried part goes on with each file's own bytes (#7750, #7792). A fault in
+/// the second file (`x` before a stray quote) is raised there, before the file that does not open;
+/// a clean array is read whole across the failure, which is reported when the reader reaches it.
+#[test]
+fn an_array_spread_over_windowed_files_is_read_once_7750() -> Result<()> {
+    let dir = files()?;
+    let pad = "{\"pad\":1},\n";
+    let write = |name: &str, text: String| std::fs::write(dir.path().join(name), text);
+    write("f0.json", format!("[{}", pad.repeat(120_000)))?;
+    write(
+        "f1.json",
+        format!("{}{{\"a\":x\"}},\n{}", pad.repeat(120_000), pad.repeat(3)),
+    )?;
+    write("f2.json", format!("{}{{\"z\":2}}]\n", pad.repeat(3)))?;
+    write("g1.json", pad.repeat(120_000))?;
+    write("g2.json", format!("{}{{\"z\":2}}]\n", pad.repeat(120_000)))?;
+    // jq 1.7.1 and 1.8.2.
+    let fault = "jq: parse error: Invalid numeric literal at line 240001, column 7\n";
+    let missing = "jq: error: Could not open file missing.json: No such file or directory\n";
+    for (args, stdout, stderr, code) in [
+        (
+            &[
+                "-c",
+                "length",
+                "f0.json",
+                "f1.json",
+                "missing.json",
+                "f2.json",
+            ][..],
+            "",
+            fault,
+            5,
+        ),
+        (
+            &["-c", "length", "f0.json", "f1.json", "f2.json"][..],
+            "",
+            fault,
+            5,
+        ),
+        (
+            &[
+                "-c",
+                "length",
+                "f0.json",
+                "g1.json",
+                "missing.json",
+                "g2.json",
+            ][..],
+            "360001\n",
+            missing,
+            2,
+        ),
+        (
+            &["-c", ".[-1]", "f0.json", "g1.json", "g2.json"][..],
+            "{\"z\":2}\n",
+            "",
+            0,
+        ),
+    ] {
+        let (out, err, status) = run_jq_in_dir(dir.path(), args, None)?;
+        assert_eq!(out, stdout, "{args:?} stdout");
+        assert_eq!(err, stderr, "{args:?} stderr");
+        assert_eq!(status, code, "{args:?} status");
+    }
+    Ok(())
+}
