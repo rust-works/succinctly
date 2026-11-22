@@ -251,9 +251,8 @@ fn a_fault_in_a_stream_is_reported_at_once_7738() {
     }
 }
 
-/// A FIFO named on the command line, and `/dev/urandom` named or on standard input, answer at once too.
-/// Random bytes give random answers, so those rows pin that the run ends, in little memory, with jq's
-/// kind of answer: a parse error (exit 5), or, when the bytes happen to start with a value, that value.
+/// A FIFO named on the command line, and a character device (a terminal the test streams into) named or
+/// on standard input, answer at once too.
 #[test]
 fn a_fifo_and_a_device_answer_at_once_7738() {
     assert_eq!(
@@ -264,24 +263,42 @@ fn a_fifo_and_a_device_answer_at_once_7738() {
         over_endless_fifo(&["-n", "-c", "input"], b"\xff\n"),
         fault("FIFO:1", "Invalid numeric literal at line 2, column 0")
     );
-    for program in ["input", "first(inputs)", "[limit(3; inputs)]"] {
+    // The device is a terminal the test streams a fixed line into, not `/dev/urandom`: random bytes open
+    // a container about 2 times in 256, and a fault inside one that never closes is still read on (#7812).
+    let fffd = "\u{fffd}";
+    for (program, line, want) in [
+        (
+            "input",
+            &b"tru 1\n"[..],
+            fault("TTY:1", "Invalid literal at line 1, column 4"),
+        ),
+        (
+            "first(inputs)",
+            &b"\"\xff\"\n"[..],
+            ok(&format!("\"{fffd}\"\n")),
+        ),
+        (
+            "[limit(3; inputs)]",
+            &b"\"\xff\"\n"[..],
+            ok(&format!("[\"{fffd}\",\"{fffd}\",\"{fffd}\"]\n")),
+        ),
+    ] {
         for named in [true, false] {
+            let terminal = pty::Pty::open();
+            let _streaming = terminal.stream(line);
             let mut command = jq(&["-n", "-c", program]);
             if named {
-                command.arg("/dev/urandom").stdin(Stdio::null());
+                command.arg(terminal.path()).stdin(Stdio::null());
             } else {
-                command.stdin(std::fs::File::open("/dev/urandom").expect("open /dev/urandom"));
+                command.stdin(terminal.stdin());
             }
-            let what = format!("jq -n -c {program} over /dev/urandom (named: {named})");
+            let what = format!("jq -n -c {program} over a streaming terminal (named: {named})");
             let (stdout, stderr, code) = pty::spawn(&mut command)
                 .wait_within(&what, pty::DEADLINE, Some(MAX_KIB))
                 .triple();
-            let at = if named { "/dev/urandom" } else { "<stdin>" };
-            assert!(
-                (code == 5 && stderr.starts_with(&format!("jq: error (at {at}:")))
-                    || (code == 0 && stderr.is_empty() && !stdout.is_empty()),
-                "{what}: {code} {stdout:?} {stderr:?}"
-            );
+            let name = terminal.path().display().to_string();
+            let stderr = stderr.replace(&name, "TTY").replace("<stdin>", "TTY");
+            assert_eq!((stdout, stderr, code), want, "{what}");
         }
     }
 }
