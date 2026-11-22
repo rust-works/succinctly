@@ -62,6 +62,8 @@ fn test_a_possessive_quantifier_followed_by_more_pattern_is_atomic_6172() -> Res
         (r#""a{xxb""#, r#"test("a{x*+b")"#, "true\n"),
         (r#""{{b""#, r#"test("{*+b")"#, "true\n"),
         (r#""a{b""#, r#"test("a{*+b")"#, "true\n"),
+        // #7464: under an inline `(?x)` the blank before `*+` is not the atom (jq 1.7.1 and 1.8.2).
+        (r#""aab""#, r#"test("(?x)a *+ b")"#, "true\n"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(input))?;
         assert_eq!(
@@ -74,14 +76,15 @@ fn test_a_possessive_quantifier_followed_by_more_pattern_is_atomic_6172() -> Res
 }
 
 /// What the scan cannot place an atom for keeps the refusal: a quantifier on a quoted run, on a
-/// group of flags, after a control-character escape, under an inline `(?x)`, and a pattern the second engine would read otherwise
+/// group of flags, after a control-character escape, and a pattern the second engine would read otherwise
 /// (a lazy quantifier followed by `+`, which jq reads as a repeat of a repeat).
+/// An inline `(?x)` was refused here too until #7464 modelled the flag; its row is now among the
+/// atomic rewrites above.
 #[test]
 fn test_a_possessive_quantifier_without_a_known_atom_is_refused_5524() -> Result<()> {
     for program in [
         r#"test("\\Qab\\E*+b")"#,
         r#"test("\\C-a*+b")"#,
-        r#"test("(?x)a *+ b")"#,
         r#"test("(?i)*+a")"#,
         r#"test("c?+a+?+")"#,
     ] {
