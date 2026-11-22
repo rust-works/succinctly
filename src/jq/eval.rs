@@ -110850,7 +110850,7 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Only these specifiers read the zone's labels; `E`/`O` modifiers
             // precede one of them, so the letters alone decide. A locale's own
             // `%c`/`%x`/`%X`/`%r` layout may also print the zone (#5754).
-            let labelled = fmt.bytes().any(|b| matches!(b, b'z' | b'Z' | b's'))
+            let labelled = fmt.bytes().any(|b| matches!(b, b'z' | b'Z' | b's' | b'+'))
                 || locale_time::layouts_may_name_the_zone(&fmt);
             let (t, zone) =
                 match broken_down_time_fields::<W, S>(&value, optional, local, labelled, name) {
@@ -111104,13 +111104,17 @@ fn format_strftime(
             }
             if let (
                 true,
-                Some(letter @ ('a' | 'A' | 'b' | 'B' | 'h' | 'p' | 'c' | 'x' | 'X' | 'r')),
+                Some(letter @ ('a' | 'A' | 'b' | 'B' | 'h' | 'p' | 'c' | 'x' | 'X' | 'r' | '+')),
             ) = (localized, spec)
             {
+                // `%+` is the locale's `date_fmt` in macOS's libc (#7784). glibc has no `%+` (its
+                // `strftime` prints it as written), and there the pinned libc's C layout stands.
                 // A time the C library cannot hold (a year past `int`) gets the C rendering.
-                if let Some(text) = locale_time::render(&format!("%{letter}"), &tm) {
-                    result.push_str(&text);
-                    continue;
+                if letter != '+' || cfg!(target_vendor = "apple") {
+                    if let Some(text) = locale_time::render(&format!("%{letter}"), &tm) {
+                        result.push_str(&text);
+                        continue;
+                    }
                 }
             }
             match spec {
@@ -111442,7 +111446,9 @@ fn strptime_name_len(
 /// - one `E` or `O`, before or after the width, which makes the specifier read as it does without
 ///   it; a second one is no match;
 /// - a `+` flag, which reads like no flag, only at the start or straight after that modifier
-///   (`%+Y`, `%E+Y`, `%+E+Y`; not `%++Y`, `%4+Y` or `%0+Y`);
+///   (`%+Y`, `%E+Y`, `%+E+Y`) and only before a specifier; any other `+` is the `%+`
+///   conversion, the locale's `date_fmt` (`%++Y`, `%4+Y` and `%0+Y` read it and then a `Y`,
+///   and so do `%+`, `%+%` and `%+ `, #7784);
 /// - a decimal width, the most digits a numeric field takes. A `0` before the digits is part of
 ///   them (`%04Y` is a width of 4, `%40Y` of 40), and a run of digits that is 0 changes nothing
 ///   (`%0d` is `%d`). A modifier ends a run, so a second run after it replaces the first
@@ -111461,7 +111467,7 @@ struct StrptimeSpecPrefix {
 }
 
 fn read_strptime_spec_prefix(
-    chars: &mut impl Iterator<Item = char>,
+    chars: &mut (impl Iterator<Item = char> + Clone),
     keep_consumed: bool,
 ) -> StrptimeSpecPrefix {
     let mut prefix = StrptimeSpecPrefix {
@@ -111473,7 +111479,8 @@ fn read_strptime_spec_prefix(
     };
     let mut flag_allowed = true;
     // The prefix so far ends in a modifier or a `+` flag, with no width after it. The libc refuses
-    // a `%` specifier then (`%+%`, `%E%`) and reads it after a width (`%5%`, `%E4%`, #5754).
+    // a `%` specifier then (`%E%`) and reads it after a width (`%5%`, `%E4%`, #5754); a `+` before
+    // a `%` is the `%+` conversion (#7784).
     let mut ends_in_marker = false;
     let mut run: Option<usize> = None;
     loop {
@@ -111491,11 +111498,16 @@ fn read_strptime_spec_prefix(
                 ends_in_marker = true;
                 run = None;
             }
-            Some('+') => {
-                if !flag_allowed {
-                    prefix.error = Some("a '+' flag after a width or another flag".to_string());
-                    return prefix;
-                }
+            // A `+` is a flag only where one may stand and when a specifier follows it; anywhere
+            // else it is `%+`, the locale's `date_fmt` layout (#7784). Apple's `strptime` reads it
+            // that way: a `+` followed by the end, a `%` or white space is the conversion.
+            Some('+')
+                if flag_allowed
+                    && chars
+                        .clone()
+                        .next()
+                        .is_some_and(|next| next != '%' && !is_c_space(next)) =>
+            {
                 flag_allowed = false;
                 ends_in_marker = true;
                 run = None;
@@ -111524,9 +111536,9 @@ fn read_strptime_spec_prefix(
     }
 }
 
-/// `fmt` with `%c`, `%x`, `%X` and `%r` replaced by the layout each stands for: the process
-/// locale's, else C's (`%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S`, `%I:%M:%S %p`), which is
-/// what the libc reads. A layout can name another (`en_US`'s `%c` holds `%X`), so this repeats
+/// `fmt` with `%c`, `%x`, `%X`, `%r` and `%+` replaced by the layout each stands for: the process
+/// locale's, else C's (`%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S`, `%I:%M:%S %p`, and
+/// `%a %b %e %H:%M:%S %Z %Y` for `%+`, #7784), which is what the libc reads. A layout can name another (`en_US`'s `%c` holds `%X`), so this repeats
 /// until none is left, to a bound that no locale's layouts reach.
 fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
     let names_a_layout = |text: &str| {
@@ -111534,7 +111546,9 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
         while let Some(c) = chars.next() {
             if c == '%' {
                 let prefix = read_strptime_spec_prefix(&mut chars, false);
-                if prefix.error.is_none() && matches!(prefix.spec, Some('c' | 'x' | 'X' | 'r')) {
+                if prefix.error.is_none()
+                    && matches!(prefix.spec, Some('c' | 'x' | 'X' | 'r' | '+'))
+                {
                     return true;
                 }
             }
@@ -111547,6 +111561,13 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
     let layouts = locale_time::layouts();
     let layout = |spec: char| -> &str {
         match (spec, layouts) {
+            (
+                '+',
+                Some(locale_time::Layouts {
+                    date_fmt: Some(f), ..
+                }),
+            ) => f.as_str(),
+            ('+', _) => "%a %b %e %H:%M:%S %Z %Y",
             ('c', Some(l)) => l.date_time.as_str(),
             ('x', Some(l)) => l.date.as_str(),
             ('X', Some(l)) => l.time.as_str(),
@@ -111570,7 +111591,7 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
             // modifier change nothing (#5754, #5989).
             let prefix = read_strptime_spec_prefix(&mut chars, true);
             match prefix.spec {
-                Some(spec @ ('c' | 'x' | 'X' | 'r')) if prefix.error.is_none() => {
+                Some(spec @ ('c' | 'x' | 'X' | 'r' | '+')) if prefix.error.is_none() => {
                     out.push_str(layout(spec));
                 }
                 _ => {
