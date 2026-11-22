@@ -9446,6 +9446,7 @@ The same module reached twice and failing to parse is reported once by jq 1.7.1 
 The syntax error's own wording is succinctly's, as recorded in the section above on the other compile-error paths.
 jq 1.7.1 has no output to match for the crash case (a library with a main expression, imported and included), where 1.8.2's two reports are the only reference and `succinctly jq` prints one, followed by the `<unknown location>` line 1.7.1 printed just before it aborted.
 A module that loads fine and is imported twice agrees in all three.
+So does one that cannot be opened at all, a directory or an unreadable file: jq 1.7.1, jq 1.8.2 and `succinctly jq` report it at every directive that reaches it, since neither jq caches a file it could not open (#7709).
 This is the repo owner's default for the question the issue raised (report once, or at each import): behaviour stays as it is until a reason to change it turns up.
 
 ## Recursive `def`s: what a native call stack costs that jq's own does not — #1371
@@ -15187,8 +15188,8 @@ A data file that cannot be read or parsed and a module that does not parse are p
 **counted** while the walk goes on, and a module that does not parse skips its own directives
 (`include "synerr"; import "bad" as $d; $d` is `bad`, then `synerr`, `2 compile errors`;
 `import "bad" as $d; include "synerr"; $d` the reverse). A data file is never deduplicated
-(imported three times it is reported three times), but a module is reached once, failed or
-not, so a second path to it prints and counts nothing. A **missing module** stops its level
+(imported three times it is reported three times), but a module that opens is reached once,
+parsed or not, so a second path to it prints and counts nothing. A **missing module** stops its level
 and returns `1` for it, discarding what that level had counted, and the level above adds that
 `1` to its own count and goes on: `include "missing"; import "bad" as $d; $d` is `bad`,
 `missing`, `1 compile error` (the stop is the program's own), and `import "bad" as $d;
@@ -15212,6 +15213,7 @@ first-declared order named `c1 -> c1`), which is the one jq would reach first. A
 exists but cannot be read is printed as `error loading data file` and counted, and the walk goes
 on, as jq does (`include "m1"; include "perm"` with `perm.jq` unreadable prints `perm`, then
 `m1`, `1 compile error`); the detail after the path is succinctly's own.
+Like a data file, a module that cannot be opened (a directory named `m.jq`, a file this user cannot read) is reported at every directive that reaches it, each counted, because neither jq 1.7.1 nor 1.8.2 records a file it could not open among its loaded modules (#7709): `import "dm" as a; import "dm" as b; 1` prints the `Could not open` report twice and `jq: 2 compile errors` in all three.
 jq parses a library's raw bytes, and so does succinctly since #5351, decoding them lossily: a byte that is not UTF-8 is harmless in a comment, reads as U+FFFD in a string, and is a syntax error anywhere else, as in jq.
 A library is a module or the `~/.jq` file, and both are refused with a compile error when they do not parse (#5351).
 The wording after `jq: error:` is succinctly's own, as for a module's syntax error above; the location, the source echo, the count and exit 3 are jq's.
