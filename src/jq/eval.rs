@@ -93337,9 +93337,77 @@ fn fold_step_each<S: EvalSemantics>(
         }
         OwnedStep::Handled(Err(error)) => Flow::Escaped(Control::Error(error)),
         OwnedStep::Declined(state) => {
+            // #7702: an UPDATE that is a call (or a pipe a call leads) runs on the state handed
+            // down, through the owned-call door, rather than on a re-indexed copy of the state.
+            let state = match owned_door_step::<S>(expr, state, optional, reentry, on_update) {
+                Ok(flow) => return flow,
+                Err(state) => state,
+            };
             eval_each_owned::<S>(expr, &state, optional, reentry, on_update)
         }
     }
+}
+
+/// [`eval_owned_input_bridge`]'s door (#7702): every output of the owned-call door over `input`,
+/// as the eager result the bridge would have answered, or `None`, nothing evaluated, when the door
+/// declines. Out of line and cold, so the bridge's frame, on the path of the eager evaluator's
+/// recursion, holds one result slot more and nothing else.
+#[cold]
+#[inline(never)]
+fn owned_door_collect<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Option<QueryResult<'a, W>> {
+    let mut outputs = Vec::new();
+    let flow = owned_call::door_borrowed::<S>(expr, input, optional, Reentry::REBUILT, &mut |v| {
+        outputs.push(v);
+        Demand::Continue
+    })?;
+    Some(match flow {
+        Flow::Escaped(control) => partial(outputs, control),
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
+    })
+}
+
+/// A fold or loop step over the state the loop owns, through #7483's owned-call door with the
+/// state handed down (#7702): `Err(state)`, untouched, when the door declines, which is all a
+/// shape the door cannot take costs (a compare on the node's discriminant).
+#[inline(always)]
+pub(crate) fn owned_door_step<S: EvalSemantics>(
+    expr: &Expr,
+    state: OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Result<Flow, OwnedValue> {
+    if !owned_call::door_candidate(expr) {
+        return Err(state);
+    }
+    owned_call::door_moved::<S>(expr, state, optional, reentry, sink)
+}
+
+/// [`owned_door_step`] shaped as [`eval_owned_expr_fork`]'s answer, for the loops that fork on
+/// their update's outputs (`until`, `while`, and `eval_generic`'s loop): every output, then the
+/// control that ended the step.
+pub(crate) fn owned_door_fork<S: EvalSemantics>(
+    expr: &Expr,
+    state: OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+) -> Result<(Vec<OwnedValue>, Option<Control>), OwnedValue> {
+    let mut outputs = Vec::new();
+    let flow = owned_door_step::<S>(expr, state, optional, reentry, &mut |value| {
+        outputs.push(value);
+        Demand::Continue
+    })?;
+    Ok((
+        outputs,
+        match flow {
+            Flow::Escaped(control) => Some(control),
+            Flow::Exhausted | Flow::Stopped { .. } => None,
+        },
+    ))
 }
 
 /// The by-value step a `reduce`/`foreach` UPDATE or an `until`/`while` `update`
@@ -95920,6 +95988,14 @@ fn eval_owned_input_bridge<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #7702: #7483's owned-call door first, as the lazy twin's bridge (`owned_bridge`) tries it, so
+    // a call reached by an eager caller (a `recurse` level collected into `[...]`, a fold's fork)
+    // does not write its input out at each call.
+    if owned_call::door_candidate(expr) {
+        if let Some(answer) = owned_door_collect::<W, S>(expr, input, optional) {
+            return answer;
+        }
+    }
     // Serialize and reparse to obtain a document the evaluator can index into.
     //
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
@@ -100384,6 +100460,22 @@ impl<'e> LoopOperand<'e> {
         eval_owned_expr_fork::<S>(expr, input, optional, Reentry::Proven)
     }
 
+    /// [`Self::fork`] for the update of a round whose state the loop hands on (#7702): the state
+    /// goes to #7483's owned-call door by value ([`owned_door_fork`]), so a call's write lands in
+    /// place; a shape the door declines forks as before.
+    fn fork_moved<S: EvalSemantics>(
+        &self,
+        state: OwnedValue,
+        optional: bool,
+        ambient: bool,
+    ) -> (Vec<OwnedValue>, Option<Control>) {
+        let expr = if ambient { self.expr } else { self.demoted };
+        match owned_door_fork::<S>(expr, state, optional, Reentry::Proven) {
+            Ok(answer) => answer,
+            Err(state) => eval_owned_expr_fork::<S>(expr, &state, optional, Reentry::Proven),
+        }
+    }
+
     /// [`Self::fork`] for the loop's `cond`, which is read only for its
     /// truthiness: a shape [`owned_cond_verdict`] answers is settled from the
     /// state's tree, and anything else is [`Self::fork`]'s (#3697).
@@ -100540,7 +100632,7 @@ fn until_step<S: EvalSemantics>(
                 OwnedRound::Done => return Ok(Demand::Continue),
                 OwnedRound::Declined(declined) => state = declined,
             }
-            let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
+            let (update_vals, update_control) = update.fork_moved::<S>(state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {
                 state = update_vals.into_iter().next().unwrap();
                 ambient = false;
@@ -100732,7 +100824,7 @@ fn while_step<S: EvalSemantics>(
                 OwnedRound::Done => return Ok(Demand::Continue),
                 OwnedRound::Declined(declined) => state = declined,
             }
-            let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
+            let (update_vals, update_control) = update.fork_moved::<S>(state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {
                 state = update_vals.into_iter().next().unwrap();
                 ambient = false;

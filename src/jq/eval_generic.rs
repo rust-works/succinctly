@@ -23532,7 +23532,23 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
                 }
                 document => document,
             };
-            let (mut next, update_control) = state.fork::<S>(update, optional);
+            // #7702: a computed state goes to #7483's owned-call door by value.
+            let (mut next, update_control) = match state {
+                LoopState::Owned(owned) => {
+                    match crate::jq::eval::owned_door_fork::<S>(
+                        update,
+                        owned,
+                        optional,
+                        Reentry::REBUILT,
+                    ) {
+                        Ok((values, control)) => {
+                            (values.into_iter().map(LoopState::Owned).collect(), control)
+                        }
+                        Err(owned) => LoopState::Owned(owned).fork::<S>(update, optional),
+                    }
+                }
+                document => document.fork::<S>(update, optional),
+            };
             if update_control.is_none() && next.len() == 1 {
                 state = next.pop().expect("one update output");
                 continue;
