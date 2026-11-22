@@ -3166,3 +3166,48 @@ fn the_grow_step_answers_as_jq_7610() {
         ),
     ]);
 }
+
+/// #7697: a run asked to keep its document leaves a handle on the whole tree it ran on,
+/// whatever the program let go of, for the CLI to forget at the end of the process; the
+/// answers do not move, a write copies what the handle shares, and a request is used up by
+/// the one run that took it.
+#[cfg(feature = "std")]
+#[test]
+fn a_run_asked_to_keep_its_document_leaves_the_whole_tree_7697() {
+    on_big_stack(|| {
+        let doc = r#"{"meta":{"n":[1,2]},"data":[{"name":"a"},{"x":1},{"name":"b"}]}"#;
+        let materialize = || {
+            let index = JsonIndex::build(doc.as_bytes());
+            to_owned::<JqSemantics, _>(&index.root(doc.as_bytes()).value()).expect("doc")
+        };
+        let run_on_doc = |filter: &str, keep: bool| {
+            let program = compile(filter).expect("compiles");
+            if keep {
+                kept_document::keep_next();
+            }
+            let mut outputs = Vec::new();
+            let control = run_program(&program, materialize(), &mut |v| {
+                outputs.push(v.to_json_jq_preserve());
+                true
+            });
+            assert!(control.is_none(), "{filter}");
+            (outputs, kept_document::take())
+        };
+        // `.data` lets go of `meta` as it reads `data`; the handle keeps both.
+        let (outputs, kept) = run_on_doc("[path(.data[] | .name // empty)]", true);
+        assert_eq!(outputs, [r#"[["data",0,"name"],["data",2,"name"]]"#]);
+        assert_eq!(kept, Some(materialize()));
+        // A write through what the handle shares copies it: the kept tree is the document.
+        let (outputs, kept) = run_on_doc("(.data[] | .name // empty) |= 1 | .data", true);
+        assert_eq!(outputs, [r#"[{"name":1},{"x":1},{"name":1}]"#]);
+        assert_eq!(kept, Some(materialize()));
+        // Nothing is kept unasked, and a request is not left for a later run.
+        let (_, kept) = run_on_doc("[path(.data[] | .name // empty)]", false);
+        assert_eq!(kept, None);
+        kept_document::keep_next();
+        let (_, kept) = run_on_doc("[path(.data[] | .name // empty)]", false);
+        assert_eq!(kept, Some(materialize()));
+        let (_, kept) = run_on_doc("[path(.data[] | .name // empty)]", false);
+        assert_eq!(kept, None);
+    });
+}

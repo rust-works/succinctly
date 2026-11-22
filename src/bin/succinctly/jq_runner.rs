@@ -5092,6 +5092,16 @@ pub(crate) fn silence_depth_guard_panic_line() {
     });
 }
 
+/// The smallest value whose document a program the path-mode interpreter runs keeps to the end of
+/// the run, when it is the last of the run or of a window (#7697, `jq::path_mode::kept_document`).
+///
+/// Keeping only pays where the tree is large. A document kept as a window's last value that is not
+/// the run's is given back once the next window has been read instead of at the end of its own
+/// run, which moves its frees after that window's allocations: on a stream of 100,000 one-line
+/// records, keeping every such document cost 0.8% of the run's instructions in the allocator
+/// (cachegrind, AMD Ryzen 9 7950X), for documents of a hundred bytes whose teardown it only moved.
+const KEEP_DOCUMENT_MIN_BYTES: usize = 64 << 10;
+
 /// The index of one input value, which the last value of the run (of a window, for a windowed file)
 /// leaves in `held` at its end, for the next window to give back or for the run to forget (#7332).
 ///
@@ -6120,6 +6130,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // #7332: where the last value of the run or of a window leaves its index (see `RunIndex`); the
         // one left when the loop ends is forgotten below, unless the run goes on.
         let mut held_index: Option<JsonIndex> = None;
+        // #7697: likewise the document a program the path-mode interpreter runs had as its tree,
+        // which that run would otherwise take apart (see `jq::path_mode::kept_document`).
+        let keeps_document = matches!(
+            jq::path_mode::route(&expr),
+            jq::path_mode::Route::Interpreter
+        );
+        let mut held_document: Option<OwnedValue> = None;
         'files: loop {
             // The next file's text, or for a windowed file its next window with the documents the
             // window holds (#6920): the splitter already ran over it, and `lines_before` line
@@ -6150,8 +6167,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         None => break,
                     },
                 };
-            // #7332: the next window is here, so the last index of the one before it is given back.
+            // #7332: the next window is here, so the last index of the one before it is given back,
+            // and its last document (#7697).
             held_index = None;
+            held_document = None;
             // #7024: a file of a long list that did not open when the windowed reader reached it is
             // one jq's reader meets once the run is past it, as a file the whole-file route could not
             // open is: up to this window's file, and, for a window that ends in a fault, only before
@@ -6508,6 +6527,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // The general path reads the location in several places below,
                 // all of them diagnostics; it is counted on the first read (#4178).
                 let at = LazyLocation::new(locator, end);
+                // #7697: the last value's document is held as its index is (`RunIndex`), when it is
+                // large enough for its tree to matter (`KEEP_DOCUMENT_MIN_BYTES`).
+                let keep_this_document =
+                    keeps_document && is_last_value && json_bytes.len() >= KEEP_DOCUMENT_MIN_BYTES;
+                if keep_this_document {
+                    jq::path_mode::kept_document::keep_next();
+                }
 
                 // A builtin with no native lazy fast path (`sort`, `join`,
                 // ...) falls back to a full `to_owned_cursor` materialization
@@ -6663,6 +6689,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         // reaches it on the same iteration; this one didn't).
                     }
                 }
+                if keep_this_document {
+                    held_document = jq::path_mode::kept_document::take();
+                }
                 // halt/halt_error (#791) outranks everything else, including
                 // remaining values/files still to process. The panic arm above
                 // used to `continue` past this check and repeat it itself;
@@ -6743,9 +6772,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         seq_tail_handed_on = !run_stopped
             && (hand_on_seq_pipe_tail(&args) || hand_on_seq_files_tail(&args, past_open_failure));
         // #7332: the last value's index is not given back when the run ends here, see `RunIndex`; a
-        // run that goes on frees it.
+        // run that goes on frees it. So is its document (#7697).
         if !seq_tail_handed_on {
             std::mem::forget(held_index);
+            std::mem::forget(held_document);
         }
     }
     if !lazy_path_taken || seq_tail_handed_on {

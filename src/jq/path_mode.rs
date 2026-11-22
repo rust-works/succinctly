@@ -1625,6 +1625,9 @@ pub(crate) fn run_program(
         let interp = Interp::new(prelude);
         let mut input = input;
         interp.prepare(program, &mut input);
+        // #7697: taken after `prepare`, whose promotions write the tree in place.
+        #[cfg(feature = "std")]
+        let kept = kept_document::requested().then(|| input.clone());
         let result = interp.eval(program, &Env::default(), input, Reg::top(), &mut |v, _| {
             if on_value(v) {
                 Ok(())
@@ -1632,6 +1635,8 @@ pub(crate) fn run_program(
                 Err(Raise::Stop)
             }
         });
+        #[cfg(feature = "std")]
+        kept_document::leave(kept);
         match result {
             Ok(()) | Err(Raise::Stop) => None,
             Err(raise) => match Interp::outcome(raise) {
@@ -1646,6 +1651,62 @@ pub(crate) fn run_program(
             },
         }
     })
+}
+
+/// A handle on the document of a [`run_program`] run, for a caller whose process ends with
+/// the run to forget instead of freeing (#7697).
+///
+/// The interpreter's document is a tree materialized for the run, millions of small blocks for
+/// a large file (each string and number of it has its own, see
+/// [`OwnedValue::promote_identities`]), and the run frees them wherever the program lets go of
+/// them: `.data` frees every other member of the document as it reads that one, at the start
+/// of `[path(.data[] | .name // empty)]`. Taking that tree apart was more than a fifth of such
+/// a run's instructions (cachegrind, AMD Ryzen 9 7950X, a 10 MB and a 100 MB document), and on
+/// glibc the frees put the small blocks in its fast bins, which the first free that joins
+/// larger blocks past 64 KiB (or the first large `malloc`) then sweeps whole
+/// (`malloc_consolidate`), a pointer chase through every one of them. A run that keeps a
+/// handle frees none of it, and a caller that forgets the handle at the end of the process
+/// never takes the tree apart.
+///
+/// The handle does not change what the program sees: a write through a container it shares
+/// copies the container where a write to one the run owned alone would have written it in
+/// place, and in either case the result is a value no other handle of the run holds, as jq's
+/// would be. What it costs is memory the program no longer reads, held to the end: on a run
+/// that writes every node of its document, the old one stays beside the new one.
+#[cfg(feature = "std")]
+pub(crate) mod kept_document {
+    use super::OwnedValue;
+    use core::cell::{Cell, RefCell};
+
+    std::thread_local! {
+        static REQUESTED: Cell<bool> = const { Cell::new(false) };
+        static LEFT: RefCell<Option<OwnedValue>> = const { RefCell::new(None) };
+    }
+
+    /// Ask the next [`run_program`](super::run_program) on this thread to keep a handle on
+    /// its document, for [`take`].
+    pub(crate) fn keep_next() {
+        REQUESTED.with(|requested| requested.set(true));
+    }
+
+    /// The handle the last run asked to keep left, if it ran; the request is withdrawn
+    /// either way.
+    pub(crate) fn take() -> Option<OwnedValue> {
+        REQUESTED.with(|requested| requested.set(false));
+        LEFT.with(|left| left.borrow_mut().take())
+    }
+
+    /// Whether this run keeps a handle (the request is used up).
+    pub(super) fn requested() -> bool {
+        REQUESTED.with(|requested| requested.replace(false))
+    }
+
+    /// Leave the run's handle, if it kept one, for [`take`].
+    pub(super) fn leave(kept: Option<OwnedValue>) {
+        if kept.is_some() {
+            LEFT.with(|left| *left.borrow_mut() = kept);
+        }
+    }
 }
 
 /// Run `f` with this thread's parsed [`PRELUDE`]: parsed once per thread
