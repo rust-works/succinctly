@@ -64,7 +64,10 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::eval::pattern_alternatives_var_names;
-use super::parser::{is_value_arg_var, join_expr_operands_mut, JOIN_IDX_VAR};
+use super::parser::{
+    is_collected_arg_var, is_value_arg_var, join_expr_operands_mut, restore_collected_arg_call,
+    take_collected_arg_call, JOIN_IDX_VAR,
+};
 use super::walk::{any_subexpr, builtin_kids, map_builtin_subexprs, BuiltinKids};
 use super::{Builtin, Expr, ObjectKey, Pattern, StringPart};
 
@@ -2569,14 +2572,19 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         // #7474: a builtin call whose arguments the parser bound first.
         Expr::As { var, .. } if is_value_arg_var(var) => check_bound_value_args(expr, cx, reachable),
 
+        // #7558: a builtin call whose collected argument the parser settled first, checked as
+        // the call it was written as.
+        Expr::As { var, .. } if is_collected_arg_var(var) => match take_collected_arg_call(expr) {
+            Some(mut call) => {
+                check(&mut call, cx, reachable);
+                restore_collected_arg_call(expr, call);
+            }
+            None => check_as_binding(expr, cx, reachable),
+        },
+
         // #2734: binds `var` in `body` only, not `expr` -- `.foo as $x | ...`
         // evaluates `.foo` before `$x` exists.
-        Expr::As { expr, var, body } => {
-            check(expr, cx, reachable);
-            cx.var_scope.push(var.clone());
-            check(body, cx, reachable);
-            cx.var_scope.pop();
-        }
+        Expr::As { .. } => check_as_binding(expr, cx, reachable),
 
         // #2734: `patterns` is every `?//`-alternative (usually just one);
         // jq requires each alternative bind the same variable set, so the
@@ -3002,6 +3010,16 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
                     occurrence_index,
                     module_def: cx.occurrences.module_def(),
                 }));
+                // #7609: jq never compiles the arguments (#2037), so nothing in them is
+                // diagnosed, but their sites are in the source tables the occurrence indexes
+                // point into, as an unreferenced body's are (#3085): they are counted, and the
+                // errors the walk would raise are dropped. Without the count, `ua(ub(1)),
+                // ub(2)` cited the `ub(1)` for the `ub(2)` that fails.
+                let kept = cx.errors.len();
+                for a in args.iter_mut() {
+                    check_in_block(a, cx, reachable);
+                }
+                cx.truncate_errors(kept);
             }
         }
 
@@ -3090,6 +3108,17 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
             cx.reorder_reversed(&marks);
         }
     }
+}
+
+/// [`check`] for `.foo as $x | body`: `var` is bound in `body` only (#2734).
+fn check_as_binding(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
+    let Expr::As { expr, var, body } = expr else {
+        unreachable!("called on an `as` binding"); // patchcov: coverage tolerate-line reason="unreachable: both callers match Expr::As first"
+    };
+    check(expr, cx, reachable);
+    cx.var_scope.push(var.clone());
+    check(body, cx, reachable);
+    cx.var_scope.pop();
 }
 
 /// [`check`] for `B(a; b)` that `parser::bind_value_args` parsed as `b as $v | a as $u | B($u;
@@ -4732,6 +4761,30 @@ mod tests {
                     occurrence_index: 1,
                     module_def: None,
                 }]
+            );
+        }
+
+        /// #7609: a call in the arguments of an unresolved call is counted too,
+        /// in an unreferenced body and in the main program alike, and is still
+        /// not reported (#2037).
+        #[test]
+        fn occurrence_index_counts_calls_in_an_unresolved_calls_arguments_7609() {
+            let call = |name: &str, occurrence_index| UnresolvedCall {
+                name: name.into(),
+                arity: 1,
+                origin: None,
+                occurrence_index,
+                module_def: None,
+            };
+            let mut expr = parse("def d0: ua(ub(1)); ub(2)").expect("filter must parse");
+            assert_eq!(resolve_func_calls_all(&mut expr), [call("ub", 1)]);
+            let mut expr = parse("ua(ub(1); ub(3)), ub(2)").expect("filter must parse");
+            assert_eq!(
+                resolve_func_calls_all(&mut expr)
+                    .iter()
+                    .map(|c| (c.name.as_str(), c.occurrence_index))
+                    .collect::<Vec<_>>(),
+                [("ua", 0), ("ub", 2)]
             );
         }
     }

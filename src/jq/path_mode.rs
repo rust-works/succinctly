@@ -171,16 +171,32 @@ fn is_append_update(update: &Expr) -> bool {
     }
 }
 
+/// Whether a `reduce` state is an object or a string that no other value
+/// shares, which [`Interp::grow_step`] adds to in place (#7610).
+fn grows_in_place(state: &OwnedValue) -> bool {
+    match state {
+        OwnedValue::Object(map) => !map.is_shared(),
+        OwnedValue::String(s) => !s.is_aliased(),
+        _ => false,
+    }
+}
+
 /// Whether `expr` never reads its input, so that running it on `null` gives
 /// what running it on any input gives: constants and variables, and
-/// constructors and operators over them; a pipe reads its input only in its
-/// first stage. Anything else (a call, a builtin, a path) may read it.
+/// constructors (string interpolation among them) and operators over them;
+/// a pipe reads its input only in its first stage. Anything else (a call, a
+/// builtin, a path) may read it.
 fn is_input_free(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) | Expr::Loc { .. } | Expr::Var(_) | Expr::TrackedVar(_) => true,
         Expr::Paren(inner) | Expr::Negate(inner) | Expr::Array(inner) => is_input_free(inner),
         Expr::Pipe(stages) => stages.first().is_some_and(is_input_free),
         Expr::Comma(items) => items.iter().all(is_input_free),
+        // `"k\($i)"` reads the input only through its slots (#7610).
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Expr(slot) => is_input_free(slot),
+            StringPart::Literal(_) => true,
+        }),
         Expr::Object(entries) => entries.iter().all(|entry| {
             let key_free = match &entry.key {
                 ObjectKey::Literal(_) => true,
@@ -2383,6 +2399,7 @@ impl<'e> Interp<'e> {
         let appends = is_append_update(update);
         self.eval(init, env, input, reg, &mut |initial, reg_init| {
             let state = RefCell::new(initial);
+            let promoted = Cell::new(false);
             self.eval(
                 source,
                 env,
@@ -2394,10 +2411,15 @@ impl<'e> Interp<'e> {
                             OwnedValue::Array(items) if appends => {
                                 return self.append_step(update, &env_p, items, reg_p, &state);
                             }
+                            base if appends && grows_in_place(&base) => {
+                                return self
+                                    .grow_step(update, &env_p, base, &reg_p, &state, &promoted);
+                            }
                             current => current,
                         };
                         self.eval(update, &env_p, current, reg_p, &mut |u, _| {
                             *state.borrow_mut() = u;
+                            promoted.set(false);
                             Ok(())
                         })
                     })
@@ -2470,6 +2492,77 @@ impl<'e> Interp<'e> {
         if produced {
             *state.borrow_mut() = OwnedValue::Array(acc.into_inner());
         }
+        Ok(())
+    }
+
+    /// One `reduce` step whose update [`is_append_update`] and whose state
+    /// `base` is an object or a string no other value shares, run in place
+    /// as jq runs it (#7610): object `+` is `jv_object_merge`, string `+` is
+    /// `jv_string_concat`, and `f_plus` frees its input first, so the state of
+    /// `add` or `reduce ... (. + {(k): v})` is unique and grows in place.
+    /// The generic arms hold the state as [`Interp::append_step`] says and
+    /// so copied the whole object or string on every step.
+    ///
+    /// The operands run on `null`, as there. Each output of the update is
+    /// `base` plus that output's operand, and only the last one is the next
+    /// state, so each operand is checked against `base` as it comes (a type
+    /// error names `base`, as `combine`'s does) and only the last is added.
+    /// `null` and `{}` add nothing ([`binop_keeps`]). A shared state takes
+    /// the generic arms, which copy it once; the copy is unique. A state
+    /// that did not come from this step is promoted when something is first
+    /// added to it, as `combine`'s [`fresh`] result would have been, so the
+    /// values it holds are what the copying step left (`promoted`, which the
+    /// generic arms clear).
+    fn grow_step(
+        &self,
+        update: &'e Expr,
+        env: &Env<'e>,
+        mut base: OwnedValue,
+        reg: &Reg,
+        state: &RefCell<OwnedValue>,
+        promoted: &Cell<bool>,
+    ) -> R {
+        let mut last: Option<OwnedValue> = None;
+        self.append_operands(update, env, reg, &mut |operand| {
+            let adds = match (&base, &operand) {
+                (_, OwnedValue::Null) => false,
+                (OwnedValue::Object(_), OwnedValue::Object(more)) => !more.is_empty(),
+                (OwnedValue::String(_), OwnedValue::String(_)) => true,
+                _ => {
+                    return match combine(ArithOp::Add, &base, &operand) {
+                        Err(e) => Err(raise_eval(e)),
+                        Ok(_) => Err(unsupported("a `+` of two kinds that is no error")), // patchcov: coverage tolerate-line reason="unreachable: jq's `+` of an object or string and a value of another kind always raises"
+                    };
+                }
+            };
+            last = Some(if adds { operand } else { OwnedValue::Null });
+            Ok(())
+        })?;
+        let Some(operand) = last else {
+            // No output: the state is `null`, as `LOADVN` leaves it.
+            return Ok(());
+        };
+        let adds = !matches!(operand, OwnedValue::Null);
+        if adds && !promoted.replace(true) {
+            promote_built(&mut base);
+        }
+        match (&mut base, operand) {
+            (OwnedValue::Object(map), OwnedValue::Object(more)) => {
+                for (k, v) in more.iter_stored() {
+                    let mut key = k.clone();
+                    key.promote();
+                    let mut value = v.clone();
+                    promote_built(&mut value);
+                    map.insert_shared(key, value);
+                }
+            }
+            (OwnedValue::String(s), OwnedValue::String(more)) => {
+                s.push_str(&more);
+                s.promote();
+            }
+            _ => {}
+        }
+        *state.borrow_mut() = base;
         Ok(())
     }
 
