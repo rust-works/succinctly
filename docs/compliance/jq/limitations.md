@@ -8129,25 +8129,42 @@ Since #6172 the quantifier is written as the atomic group of its atom and quanti
 That includes a repeat after the possessive quantifier (`a?+*`, `a*+*`, `a?+{2}`, `(?:a*+b)*+`), which `fancy-regex` cannot read written out, and an interval (`a{1,2}+*`), which it would read as a repeat of a repeat.
 The scan finds where the atom starts: a group's `(`, a class's `[`, an escape, a character.
 Where it cannot place one, the pattern is refused as before, with `Regex failure: regex parse error: possessive quantifier is not supported` (exit 5): a quantifier on a quoted run (`\Qab\E*+c`), after an escape the scan does not size (`\C-a`), or on a group of flags (`(?i)*+c`), and any pattern with an inline `(?x)`, whose blanks the scan does not model.
-So is a pattern that also holds a lazy quantifier followed by `+` (`c?+a+?+`): jq reads that as a repeat of a repeat, and the second engine reads it otherwise.
+A pattern that also holds a lazy quantifier followed by `+` (`c?+a+?+`) was refused too until [#7682](https://github.com/rust-works/succinctly/issues/7682) wrote such a run as Oniguruma reads it (the section after this one); one on an atom that rewrite cannot place still is.
 A repeat of a repeat that the second engine refuses (`a**+b`, `a{2}+++a`) is an error from it, not a wrong answer.
 As the last character of the pattern, or followed only by closing parentheses (`(?:a++)`), nothing after it can fail, so it is rewritten to the plain quantifier instead (`sub("a*+";"X")`, `gsub("a++";"X")`), and stays on the first engine.
 The flags are checked first, as in jq, so a bad flag string is the error whatever the pattern.
 The scan steps over escapes, classes, `\Q..\E`, `(?#..)` and, under the `x` flag, `#` comments and blanks; an inline `(?x)` is not modelled, and a `*+` in its comments is read as a quantifier.
-What jq itself reads as a repeat of a repeat stays as it was: a lazy quantifier followed by `+` (`a*?+`) and `{n}?+`.
+What jq itself reads as a new quantifier on the quantified atom, a lazy quantifier followed by `+` (`a*?+`) and `{n}?+`, is written out before this scan since #7682.
 Under the `n` flag the end of the pattern is where an empty match fails, so the dropped `+` matters there (#6218).
 A trailing possessive quantifier over an atom that can match nothing on its first try (a lazy quantifier or an alternation inside it: `(?:a??)*+`, `(?:|a)++`) keeps its atomic group, which takes the empty way and fails: `"cabb" | [match("(?:a??)*+"; "gn")]` is `[]` in jq, and was `[{"offset":1,...}]` here.
 An ungrouped lazy quantifier followed by `+` (`a??+`) is written as the group it stands for, `(?:a??)+`, under `n`.
-Over a matrix of 14,280 pattern x text x flag cases (empty-matching atoms, seven possessive forms, six endings, flags `g`, `n`, `gn`, `gln`), the `n` and `gn` answers match jq except `X?++` (`a*?++`, `a+?++`, `a??++`), which stays refused; with `l` (`ln`) the lazy shapes differ whether or not they are possessive (`"cabb" | [match("(?:a??)+"; "ln")]` is `["a"]` in jq and `[]` here), a limit of the longest-match mode.
-A fixed count then `+` over such an atom (`(?:a??){2}+`) is `{2}` here (#6079) and is `[]` under `n` in jq; the rest of 160 edge cases (an escaped `|`, a class holding `|`, a greedy empty-first atom, nested groups) agree.
+Over a matrix of 14,280 pattern x text x flag cases (empty-matching atoms, seven possessive forms, six endings, flags `g`, `n`, `gn`, `gln`), the `n` and `gn` answers match jq except `X?++` (`a*?++`, `a+?++`, `a??++`), which stayed refused until #7682; with `l` (`ln`) the lazy shapes differ whether or not they are possessive (`"cabb" | [match("(?:a??)+"; "ln")]` is `["a"]` in jq and `[]` here), a limit of the longest-match mode.
+A fixed count then `+` over such an atom (`(?:a??){2}+`) was `{2}` here (#6079), where it is `[]` under `n` in jq, until #7682 made it atomic; the rest of 160 edge cases (an escaped `|`, a class holding `|`, a greedy empty-first atom, nested groups) agree.
 Pinned by `tests/jq_cli/i6218.rs`.
 The interval forms follow jq 1.7.1: `{n,}+`, `{n,m}+` and `{,m}+` are possessive.
-A fixed `{n}+` is neither possessive nor a repeat: it is `{n}` (#6079).
+A fixed `{n}+` on an item that matches in one way (a character, a class, `.`) is neither possessive nor a repeat: it is `{n}` (#6079).
+On an item that can match in more than one way it is possessive like the other interval forms, and is written as its atomic group since #7682: `"aaab" | test("^(?:a|aa){2}+b")` is `false` in jq 1.7.1 and 1.8.2, and was `true` here.
 `"aaaa" | match("a{2}+")` is `aa` in jq, since a fixed count has nothing to give back, and this was `aaaa`, the `regex` crate's `(?:a{2})+`.
 The `+` is dropped, and a quantifier after it applies to the `{n}`: `{n}++` repeats it, and `{n}+?` makes it optional (written `{0,1}`, since the crate would read a bare `?` there as lazy).
 A braced escape is not a count: `\x{41}+` and `\p{Lu}+` repeat as before.
 Pinned against jq 1.7.1 on 180 pattern x text x flag rows in `tests/jq_cli/i6079.rs`, and the possessive rewrite on the rows of `tests/jq_cli/i5524.rs`.
 A sweep of generated patterns (atoms, groups, classes, escapes, lookaround, every quantifier with every suffix, three flag sets, 30,000 patterns over 15 texts) went from 2,900 differences per 8,000 patterns, nearly all refusals, to 640, none of which `main` did not already have.
+
+## A quantifier after a quantifier (#7682)
+
+jq compiles its patterns with Oniguruma's `ONIG_SYNTAX_PERL_NG`, whose tokenizer takes only the character right after a quantifier as part of it: a `?` makes it lazy, otherwise a `+` makes it possessive, intervals included.
+Any further `?`, `*`, `+` or interval is a new quantifier on the quantified atom, and so is a quantifier after a blank or a `#` comment under `x`, or after a `(?#..)` comment.
+The parser then reduces the two where it can (`assign_quantifier_body` and `onig_reduce_nested_quantifier` in `regparse.c`): two of `?`, `*`, `+`, `??`, `*?` and `+?` become one by its `ReduceTypeTable` (`a??+` is `a*?`, `a+?*` is `a*`, `a*??` is `a*?`), two fixed counts multiply (`a{2}?{3}` is `a{6}`), a bounded greedy interval over `*` or `+` keeps only its least count, and `{1}` is no quantifier at all, its `+` included.
+A possessive quantifier is the atomic group of the repeat it ends, which a later quantifier repeats without reducing.
+So `(a)??++` is `(?>(a)*?)`, and `"aaa" | [match("(a)??++"; "gn")] | length` is `0` in jq 1.7.1 and 1.8.2: the atomic lazy repeat takes its empty way, which `n` refuses.
+The possessive scan above took the last `+` of `(a)??++` for a possessive marker it could not write, and refused the pattern; `a{2}?++`, `(?:a|){2}?++` and the other lazy and possessive runs were refused or read as another tree.
+Since [#7682](https://github.com/rust-works/succinctly/issues/7682) a run in which a quantifier follows a lazy or a possessive one, one that ends in a possessive fixed count of an item that can match in more than one way, and one that ends in a count of zero is written as the tree Oniguruma builds, before the possessive scan reads it (`src/jq/onig_quantifier.rs`): one quantifier per item, a plain group around a repeat that another repeats, and an atomic group for a possessive quantifier, except a greedy one that ends the run, which the scan reads as it reads any other.
+A run of greedy quantifiers is left as written, since the engines read a repeat of a repeat as the same tree; a run on an atom the rewrite cannot place (after an escape it does not size, on a quoted run, a lookaround or a group it does not know) keeps the pattern as written.
+A count of zero writes only the atom under it, whose groups keep their numbers: `"ab" | [match("(a)+{0}b") | .captures | length]` is `[1]`, as in jq.
+`succinctly yq` is not changed: Go's `regexp` refuses a quantifier after a quantifier (`invalid nested repetition operator`), as yq v4.53.3 does.
+Over 37,067 generated rows (the 24,956 of #7654, #7669 and #7670, and 12,111 of every pair and 4,000 triples of 26 quantifier forms over ten atoms, eight heads, eight tails and the flags none, `g`, `n`, `x`, `l` and `gn`), the rows that differ from jq 1.7.1 went from 2,567 to 1,401, most of the rest being 1.7.1's empty captures (#7520) and the `l` flag's limits.
+Seven rows that matched only by accident now show older faults of the `n` and `l` routes, each of which a pattern without a quantifier run shows too: `"ab" | [match("(a){0}|b"; "n")]` is `[]` here, `"ba" | match("(a?)++$"; "n").captures[0].offset` is `1` (jq `2`), and `"aaa" | match("(a?)+"; "l").captures[0].length` is `3` (jq `0`).
+Pinned by `tests/jq_cli/i7682.rs` and the unit test in `src/jq/onig_quantifier.rs`.
 yq mode is unchanged: Go's `regexp` rejects the form (`invalid nested repetition operator: `*+``), as yq does.
 
 ## Lookaround and backreferences: a second regex engine (#5502)
@@ -8466,6 +8483,7 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
 - **`l` stays a no-op on a pattern with a lazy quantifier.**
   `fancy-regex`'s longest mode returns the lazy match where Oniguruma returns the longest of all the ways to match: `"aa" | match("a*?";"l")` is `"aa"` in jq and `""` here.
   Such a pattern keeps its old route whole, `n` included, because the two flags are not independent (`ln` is the longest non-empty match anywhere).
+  A quantifier after a lazy one keeps the run lazy where Oniguruma does: `"aaaaaa" | [match("b|a{2,}?{2}"; "l") | .length]` is `[6]` in jq 1.7.1 and 1.8.2 and `[4]` here, since `a{2,}?{2}` is the lazy `(?:a{2,}?){2}` in both ([#7682](https://github.com/rust-works/succinctly/issues/7682)), pinned by `tests/jq_cli/i7682.rs`.
   Pinned by `test_regex_l_and_n_keep_their_old_search_where_fancy_regex_disagrees_5530` and `test_l_flag_on_a_lazy_quantifier_is_still_a_no_op_5530`.
 - **`n` backtracks to a non-empty match at the same position.**
   `ONIG_OPTION_FIND_NOT_EMPTY` refuses an empty match and tries another way to match where it stands, which the skip-forward search could not: `"xaab" | gsub("a*?";"X";"gn")` is `"xXXb"` in jq and now here, where it was a no-op.
