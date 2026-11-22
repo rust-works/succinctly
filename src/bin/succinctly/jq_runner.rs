@@ -445,12 +445,10 @@ pub(crate) enum ReportEntry {
     /// invalid UTF-8 is not unreadable: jq parses the raw bytes, and so does
     /// [`read_library`] (#5351).
     ///
-    /// **Wording is succinctly's own** past the `error loading data file
-    /// {path}:` prefix, the same fidelity limit [`Self::Syntax`] already
-    /// documents: jq's own message text comes from its C JSON parser
-    /// (confirmed live: `Invalid numeric literal at line 1, column 4` for
-    /// `not json`), which this crate's own reader cannot reproduce
-    /// byte-for-byte. `path` is the resolved file, matching
+    /// Past the `error loading data file {path}:` prefix, a file that is not
+    /// JSON is worded as jq's parser words it (`Invalid numeric literal at
+    /// line 1, column 4` for `not json`), from the crate's model of that parser
+    /// (#7769, [`parse_json_file`]). `path` is the resolved file, matching
     /// [`Self::Syntax`]'s own by-path naming.
     Data(DataFileFailure),
     /// A library -- a module, or `~/.jq` -- holds an expression of its own after its
@@ -1195,11 +1193,7 @@ fn read_data_file(path: &Path, raw: bool) -> Result<OwnedValue, DataFileFailure>
     }
     // jq's parser reads the bytes (`jv_load_file`, as for `--slurpfile`), and a string's that are
     // not UTF-8 are U+FFFD by the rule the main input's are (#7604).
-    let contents = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(e) => succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(e.as_bytes()),
-    };
-    let values = parse_json_stream(&contents).map_err(|e| unreadable(format!("{e:#}")))?;
+    let values = parse_json_file(&bytes).map_err(|e| unreadable(format!("{e:#}")))?;
     Ok(OwnedValue::array_from(values))
 }
 
@@ -7372,15 +7366,11 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
             }
             // Process --slurpfile name file pairs. jq wraps both an unreadable file
             // and malformed JSON in it under the identical "Bad JSON in --slurpfile
-            // ..." wording (#3051, confirmed live) -- succinctly's own detail text
-            // after the colon is not jq's (see `docs/compliance/jq/limitations.md`),
-            // but the flag, exit code (2) and single-line shape now match. `{e:#}`,
-            // not `{e}`: `parse_json_stream`'s own `.context("Invalid JSON in
-            // stream")` call replaces (not chains onto) the wrapped `serde_json`
-            // error's own Display, so a bare `{e}` here would silently drop its
-            // line/column detail entirely rather than merely wording it differently
-            // from jq's own diagnostic -- `anyhow::Error`'s alternate Display joins
-            // the whole context chain instead.
+            // ..." wording (#3051, confirmed live), and the detail after the colon is
+            // jq's parser's message and position (#7769, `parse_json_file`). `{e:#}`,
+            // not `{e}`: a refusal the model does not word keeps `parse_json_stream`'s
+            // `.context("Invalid JSON in stream")` chain, which a bare `{e}` would cut
+            // to its outermost line.
             NamedFlag::SlurpFile => {
                 if let Some(([raw_name, file], name)) = slurpfile_pairs
                     .next()
@@ -7390,15 +7380,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                     // jq's parser reads the bytes, and a string's that are not UTF-8 are U+FFFD by
                     // the rule the main input's are (#7436).
                     let bytes = read_arg_file("slurpfile", raw_name, file)?;
-                    let contents = match String::from_utf8(bytes) {
-                        Ok(text) => text,
-                        Err(e) => {
-                            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(
-                                e.as_bytes(),
-                            )
-                        }
-                    };
-                    let values = parse_json_stream(&contents).map_err(|e| {
+                    let values = parse_json_file(&bytes).map_err(|e| {
                         bad_arg_file("slurpfile", raw_name, file, &format!("{e:#}"))
                     })?;
                     context.named.insert(name, OwnedValue::array_from(values));
@@ -18778,6 +18760,48 @@ fn trim_json_whitespace(s: &str) -> &str {
 /// match `find_json_values`'s own (never shrinks below `serde_json`'s), so
 /// the main input path's cross-check invariant above still holds -- it
 /// still never diverges, just via equality now instead of strict subset.
+/// A `--slurpfile` file or a data import's file (`import "d" as $d;`) read as jq reads it: its
+/// bytes parsed as one stream of JSON values ([`parse_json_stream`]), the bytes of a string that
+/// are not UTF-8 decoded as the main input's are (#7436, #7604).
+///
+/// A file it refuses is refused in the words of jq's parser for the first fault it meets, with
+/// jq's line and column (#7769): `Unfinished JSON term at EOF at line 2, column 0`, where
+/// `serde_json` and the splitter word the same faults their own way. jq's parser reads the bytes
+/// as they are, so the model reads them too, past the byte-order mark jq skips: a byte that is not
+/// UTF-8 is one column to it, where the decoded text holds three for its U+FFFD. Where the model
+/// reads every value (a fault of succinctly's own, such as a nesting depth the materializer
+/// refuses past jq's), the refusal keeps its own words.
+///
+/// jq's number parser reads a token as a C string, so a NUL glued to a number ends it (`1.5`, a
+/// NUL, `x` is `[1.5]`), as for `fromjson` (#7437): `jv_load_file` hands its parser each read by
+/// its length, so there is no `fgets` read for the NUL to end. Only a file that is refused pays for
+/// the search, and the rewrite keeps every offset, so a fault after it is placed as jq places it.
+fn parse_json_file(bytes: &[u8]) -> Result<Vec<OwnedValue>> {
+    let parse = |bytes: &[u8]| match core::str::from_utf8(bytes) {
+        Ok(text) => parse_json_stream(text),
+        Err(_) => parse_json_stream(
+            &succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(bytes),
+        ),
+    };
+    let error = match parse(bytes) {
+        Ok(values) => return Ok(values),
+        Err(error) => error,
+    };
+    let read = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    if let Some(message) = jq::jq_stream_fault([read], 1, 0) {
+        return Err(anyhow::anyhow!(message));
+    }
+    if succinctly::jq::find_nul(read).is_some() {
+        let mut blanked = read.to_vec();
+        if succinctly::jq::blank_nul_number_tails(&mut blanked, None, 0, &mut []) {
+            if let Ok(values) = parse(&blanked) {
+                return Ok(values);
+            }
+        }
+    }
+    Err(error)
+}
+
 fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
     // #5291: jq's parser skips a leading BOM before anything else, so whitespace ahead of one
     // leaves it standing, to be refused.
