@@ -1,17 +1,17 @@
 //! #7606: jq 1.8.2's `jv2tm` passes a broken-down time through `timegm` (`mktime` for
 //! `strflocaltime`) before `strftime`, `strflocaltime`, `todate` and `todateiso8601` format it
 //! (jqlang/jq#3203, which fills in the zone), and that call normalises the fields: out-of-range ones
-//! carry over and the weekday and yearday are recomputed. Upstream never calls jq 1.7.1's
-//! formatting of the fields as given a bug, so for a full 8-field array `succinctly jq` keeps it.
-//! An array of fewer than 8 fields, which jq 1.7.1 refuses and #7532 reads as jq 1.8.2 does, is
-//! now normalised as jq 1.8.2 normalises it (`[2024,5] | todate` was `"2024-06-00T00:00:00Z"`, a
-//! date neither release prints).
+//! carry over and the weekday and yearday are recomputed. jq 1.7.1 formats the fields as given.
+//! `succinctly jq` follows jq 1.8.2 (ADR-0018: 1.7.1's `todate` of out-of-range fields is text its
+//! own `fromdate` refuses, and its `%a` names the wrong weekday for a real date), for a full array,
+//! a short one (#7532; `[2024,5] | todate` was `"2024-06-00T00:00:00Z"`, a date neither release
+//! prints) and a number whose `gmtime` seconds slot rounded up to 60.
 //!
 //! Also: `strflocaltime`'s `%s` of a wall-clock reading that is `-1` as UTC (`1969-12-31
 //! 23:59:59`) is that reading's instant in the zone, where it printed `-1` (both releases agree).
 //!
-//! Rows were captured on macOS from jq 1.8.2 (`/opt/homebrew/bin/jq`, the short arrays, which jq
-//! 1.7.1 refuses) and jq 1.7.1 (`/usr/bin/jq`, the full arrays).
+//! Every row was captured on macOS from jq 1.8.2 (`/opt/homebrew/bin/jq`); jq 1.7.1's
+//! (`/usr/bin/jq`) answer is in the comment where it differs.
 
 use std::process::Command;
 
@@ -21,7 +21,8 @@ use crate::{spawn_with_signal_retry, succinctly_bin};
 
 const F: &str = "%Y-%m-%dT%H:%M:%S %a %j %U %W %u %w";
 
-/// (TZ, value, filter, stdout of `try (value | filter) catch .`), from jq 1.8.2.
+/// (TZ, value, filter, stdout of `try (value | filter) catch .`), from jq 1.8.2; jq 1.7.1 refuses
+/// every one (`requires parsed datetime inputs`).
 const SHORT_ARRAYS: &[(&str, &str, &str, &str)] = &[
     ("UTC", "[2024,5]", "todate", "\"2024-05-31T00:00:00Z\"\n"),
     (
@@ -124,52 +125,116 @@ const SHORT_ARRAYS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// (TZ, value, filter, stdout), from jq 1.7.1: a full array is formatted as given, where jq 1.8.2
-/// normalises it (its answer in the comment), and `mktime` agrees in both.
+/// (TZ, value, filter, stdout), from jq 1.8.2: a full array, normalised; jq 1.7.1 formats the
+/// fields as given (its answer in the comment). `mktime` agrees in both.
 const FULL_ARRAYS: &[(&str, &str, &str, &str)] = &[
-    // 1.8.2: "Mon 001"
+    // 1.7.1: "Sun 001"
     (
         "UTC",
         "[2024,0,1,0,0,0,0,0]",
         "strftime(\"%a %j\")",
-        "\"Sun 001\"\n",
+        "\"Mon 001\"\n",
     ),
-    // 1.8.2: "2025-03-08 02:02:01"
+    // 1.7.1: "2024-14-35 25:61:61"
     (
         "UTC",
         "[2024,13,35,25,61,61,0,0]",
         "strftime(\"%Y-%m-%d %H:%M:%S\")",
-        "\"2024-14-35 25:61:61\"\n",
+        "\"2025-03-08 02:02:01\"\n",
     ),
-    // 1.8.2: "2024-03-01T00:00:00Z"
+    // 1.7.1: "2024-02-30T00:00:00Z"
     (
         "UTC",
         "[2024,1,30,0,0,0,0,0]",
         "todate",
-        "\"2024-02-30T00:00:00Z\"\n",
+        "\"2024-03-01T00:00:00Z\"\n",
     ),
-    // 1.8.2: "Mon 001"
+    // 1.7.1: "Wed 101"
     (
         "UTC",
         "[2024,0,1,0,0,0,3,100]",
         "strflocaltime(\"%a %j\")",
-        "\"Wed 101\"\n",
+        "\"Mon 001\"\n",
     ),
-    // 1.8.2: "2023-12-31T23:59:59Z"
+    // 1.7.1: "2024-01-01T00:00:-1Z", which its own `fromdate` refuses
     (
         "UTC",
         "[2024,0,1,0,0,-1,0,0]",
         "todate",
-        "\"2024-01-01T00:00:-1Z\"\n",
+        "\"2023-12-31T23:59:59Z\"\n",
     ),
     ("UTC", "[2024,13,35,25,61,61,0,0]", "mktime", "1741399321\n"),
-    // jq 1.7.1 labels this July reading CET +0100 (jqlang/jq#1912, fixed by #3203, #3054 here);
-    // jq 1.8.2 prints "Mon 183 12 CEST +0200".
+    // 1.7.1: "Sun 001 12 CET +0100"
     (
         "Europe/Paris",
         "[2024,6,1,12,0,0,0,0]",
         "strflocaltime(\"%a %j %H %Z %z\")",
-        "\"Sun 001 12 CEST +0200\"\n",
+        "\"Mon 183 12 CEST +0200\"\n",
+    ),
+    // 1.7.1: "2147483647 Sun 001" (its year saturates before 1900 is taken off, #7532)
+    (
+        "UTC",
+        "[1e20,0,1,0,0,0,0,0]",
+        "strftime(\"%Y %a %j\")",
+        "\"2147485547 Wed 001\"\n",
+    ),
+    // A consistent array is the same in both releases.
+    (
+        "UTC",
+        "[2015,2,5,23,51,47,4,63]",
+        "strftime(\"%Y-%m-%dT%H:%M:%S %a %j\")",
+        "\"2015-03-05T23:51:47 Thu 064\"\n",
+    ),
+];
+
+/// (TZ, value, filter, stdout), from jq 1.8.2: a number goes through `gmtime`'s (`localtime`'s)
+/// array, which only moves when its seconds slot rounded up to 60.
+const NUMBERS: &[(&str, &str, &str, &str)] = &[
+    // 1.7.1: "1969-12-31T23:59:60Z"
+    (
+        "UTC",
+        "-1.0000000000000002",
+        "todate",
+        "\"1970-01-01T00:00:00Z\"\n",
+    ),
+    // 1.7.1: "1969-12-31T23:59:60 Wed 365"
+    (
+        "UTC",
+        "-1.0000000000000002",
+        "strftime(\"%Y-%m-%dT%H:%M:%S %a %j\")",
+        "\"1970-01-01T00:00:00 Thu 001\"\n",
+    ),
+    // 1.7.1: "23:59:60"
+    (
+        "UTC",
+        "-1.0000000000000002",
+        "gmtime | strftime(\"%H:%M:%S\")",
+        "\"00:00:00\"\n",
+    ),
+    // 1.7.1: "00:59:60 CET"
+    (
+        "Europe/Paris",
+        "-1.0000000000000002",
+        "strflocaltime(\"%H:%M:%S %Z\")",
+        "\"01:00:00 CET\"\n",
+    ),
+    (
+        "UTC",
+        "-1.0000000000000002",
+        "gmtime",
+        "[1969,11,31,23,59,60,3,364]\n",
+    ),
+    (
+        "UTC",
+        "1425599507.9",
+        "strftime(\"%Y-%m-%dT%H:%M:%S %a %j\")",
+        "\"2015-03-05T23:51:47 Thu 064\"\n",
+    ),
+    (
+        "UTC",
+        "-2300000000",
+        "strftime(\"%Y-%m-%dT%H:%M:%S %a %j\")",
+        "\"1897-02-11T15:06:40 Thu 042\"\n",
     ),
 ];
 
@@ -232,8 +297,13 @@ fn short_broken_down_time_is_normalised_as_jq_1_8_2_does_7606() -> Result<()> {
 }
 
 #[test]
-fn full_broken_down_time_is_formatted_as_given_as_jq_1_7_1_does_7606() -> Result<()> {
+fn full_broken_down_time_is_normalised_as_jq_1_8_2_does_7606() -> Result<()> {
     check(FULL_ARRAYS)
+}
+
+#[test]
+fn a_number_whose_seconds_slot_rounds_to_60_is_normalised_7606() -> Result<()> {
+    check(NUMBERS)
 }
 
 #[test]
