@@ -572,12 +572,19 @@ impl JqStdout {
 
     /// What a failed write becomes. `Interrupted` is retried by the caller of `write`, and a closed pipe keeps its own
     /// handling (SIGPIPE on Unix, #5547; the `BrokenPipe` report elsewhere); anything else is jq's failed write.
+    ///
+    /// A closed pipe is jq's failed write too when the process was started with SIGPIPE ignored (#7732): jq keeps
+    /// that disposition, so its write fails `EPIPE` and it reports `writing output failed: Broken pipe`, exit 2.
     fn tag(e: std::io::Error) -> std::io::Error {
-        if matches!(
-            e.kind(),
-            std::io::ErrorKind::Interrupted | std::io::ErrorKind::BrokenPipe
-        ) {
-            return e;
+        Self::tag_with(e, super::sigpipe::inherited_ignored())
+    }
+
+    /// [`Self::tag`] with the inherited disposition passed in, so a test can read both.
+    fn tag_with(e: std::io::Error, sigpipe_inherited_ignored: bool) -> std::io::Error {
+        match e.kind() {
+            std::io::ErrorKind::Interrupted => return e,
+            std::io::ErrorKind::BrokenPipe if !sigpipe_inherited_ignored => return e,
+            _ => {}
         }
         let text = e.to_string();
         // strerror only: drop std's " (os error N)" suffix.
@@ -1805,6 +1812,8 @@ pub struct JsonColorWriter<'a, W: Write> {
     /// Uncolored text not yet colored; ends mid-character only between writes.
     raw: Vec<u8>,
     colored: String,
+    /// The error of the last write through `core::fmt::Write`, which `core::fmt::Error` cannot carry.
+    failed: Option<std::io::Error>,
 }
 
 impl<'a, W: Write> JsonColorWriter<'a, W> {
@@ -1816,7 +1825,13 @@ impl<'a, W: Write> JsonColorWriter<'a, W> {
             // Grown as written: a result is often a few bytes, and this is made per result.
             raw: Vec::new(),
             colored: String::new(),
+            failed: None,
         }
+    }
+
+    /// The error a write through `core::fmt::Write` failed with, if one did (#7732).
+    pub fn take_failure(&mut self) -> Option<std::io::Error> {
+        self.failed.take()
     }
 
     /// Colors and writes what is left, closing the token the text ended in.
@@ -1879,7 +1894,10 @@ impl<W: Write> Write for JsonColorWriter<'_, W> {
 
 impl<W: Write> core::fmt::Write for JsonColorWriter<'_, W> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        Write::write_all(self, s.as_bytes()).map_err(|_| core::fmt::Error)
+        Write::write_all(self, s.as_bytes()).map_err(|e| {
+            self.failed = Some(e);
+            core::fmt::Error
+        })
     }
 }
 
@@ -1956,10 +1974,24 @@ mod tests {
         );
         for kind in [ErrorKind::BrokenPipe, ErrorKind::Interrupted] {
             assert!(
-                !is_output_write_failed(&JqStdout::tag(kind.into())),
+                !is_output_write_failed(&JqStdout::tag_with(kind.into(), false)),
                 "{kind:?}"
             );
         }
+        // #7732: started with SIGPIPE ignored, a closed pipe is jq's failed write, with jq's strerror.
+        #[cfg(unix)]
+        {
+            let closed = JqStdout::tag_with(std::io::Error::from_raw_os_error(libc::EPIPE), true);
+            assert_eq!(closed.kind(), ErrorKind::BrokenPipe);
+            assert_eq!(
+                output_write_failure(&anyhow::Error::new(closed)),
+                Some("Broken pipe")
+            );
+        }
+        assert!(!is_output_write_failed(&JqStdout::tag_with(
+            ErrorKind::Interrupted.into(),
+            true
+        )));
         assert_eq!(OutputWriteFailed("x".into()).to_string(), "x");
         assert!(output_write_failure(&anyhow::anyhow!("other")).is_none());
     }

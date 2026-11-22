@@ -5,6 +5,10 @@
 //! `jq: ignoring parse error: Unfinished JSON term at EOF` where jq prints nothing. A program that
 //! pulls `input`, alone, beside `input_line_number` or behind a `def`, is handed it and keeps its behaviour, and `.` and `input_filename` already agreed.
 //! Every row was captured from jq 1.7.1.
+//!
+//! Since #7718 `succinctly jq` reads `--seq` past the last bytes as jq 1.8.2 does (jqlang/jq#3279), so
+//! the rows that read differently there are jq 1.8.2's (`/opt/homebrew/bin/jq`), with jq 1.7.1's
+//! position after the last input (#7607) and its reads past a last directory.
 
 use anyhow::Result;
 
@@ -35,7 +39,7 @@ fn input_line_number_is_not_handed_an_unfinished_term_it_cannot_read_6774() -> R
         (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "pa", "dir"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "", 2),
         (&["-c", "--seq", "-s", "--stream", "input_filename"][..], &["trunc", "pa", "dir"][..], "\u{1e}\"@DIR@/dir\"\n", "", 2),
         (&["-c", "--seq", "-s", "--stream", "[., input]"][..], &["trunc", "pa", "dir"][..], "", "jq: error: Is a directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 7\n", 2),
-        (&["-c", "--seq", "-s", "--stream", "input_line_number"][..], &["trunc", "pa"][..], "\u{1e}0\n\u{1e}0\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 0),
+        (&["-c", "--seq", "-s", "--stream", "input_line_number"][..], &["trunc", "pa"][..], "\u{1e}0\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 0),
         (&["-c", "--seq", "-s", "--stream", "input_line_number"][..], &["trunc", "dir"][..], "", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 4\n", 2),
         (&["-c", "-s", "--stream", "input_line_number"][..], &["trunc", "pa", "dir"][..], "", "jq: parse error: Invalid numeric literal at line 1, column 2\n", 5),
         (&["-c", "--seq", "-s", "--stream", "[input_line_number, input]"][..], &["trunc", "pa", "dir"][..], "", "jq: error: Is a directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 7\n", 2),

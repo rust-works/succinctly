@@ -8383,12 +8383,15 @@ fn test_seq_warning_columns_count_raw_bytes_1723() -> Result<()> {
 /// printed too (#3199): this test used to pin empty stdout.
 #[test]
 fn test_seq_malformed_bom_with_no_rs_byte_warns_1723() -> Result<()> {
+    // jq 1.7.1 also warned `Potentially truncated top-level numeric value at EOF
+    // at line 1, column 3` for the `2`; jq 1.8.2's empty last call resets first,
+    // wiping both (#7718), and these rows are 1.8.2's.
     for input in [&b"\xef\xbb1 2"[..], b"\xef1 2"] {
         let (output, code) = spawn_jq(&["--seq", "-c", "."], Some(input))?;
         assert_eq!(code, 0);
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
-            "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 1, column 3\n",
+            "",
             "input {input:?}"
         );
         assert_eq!(output.stdout, b"\x1e1\n", "input {input:?}");
@@ -8439,45 +8442,52 @@ fn test_seq_bom_verdict_comes_from_raw_bytes_3195_3199() -> Result<()> {
     Ok(())
 }
 
-/// #3201: under `--seq -s`, when jq's terminal read yields a value on the
-/// final buffer's last byte, the `at EOF` report for what that byte opened
-/// comes from the *next* `next_input` call, after the slurped array has been
-/// handed to the filter. So a runtime error prints before it, `halt` never
-/// lets it print, and an `input`/`inputs` in the filter receives it as an
-/// error at `(at <unknown>)`. Every row captured from `/usr/bin/jq` 1.7.1:
-/// stdout, the full stderr in order, and the exit code.
+/// #3201: under `--seq -s`, when jq 1.7.1's terminal read yielded a value on the
+/// final buffer's last byte, the `at EOF` report for what that byte opened came
+/// from the *next* `next_input` call, after the slurped array had been handed to
+/// the filter: a runtime error printed before it, `halt` never let it print, and
+/// `input` received it as an error at `(at <unknown>)`. jq 1.8.2 reads the empty
+/// buffer after the last bytes before it hands the array on, so the report is the
+/// reading call's, printed before the filter runs, and `input` finds the end of
+/// the stream (`break`); `succinctly jq` follows it since #7718. Every row is jq
+/// 1.8.2's (`/opt/homebrew/bin/jq`), except the position after the last input,
+/// which is jq 1.7.1's (#7607: 1.8.2 names `<stdin>:0` and `"<stdin>"`).
 #[test]
-fn test_seq_slurp_deferred_eof_warning_follows_the_filter_3201() -> Result<()> {
+fn test_seq_slurp_eof_warning_comes_before_the_filter_3201() -> Result<()> {
     const WARNING: &str =
         "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 3\n";
-    const AS_ERROR: &str =
-        "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 3\n";
     for (filter, stdout, stderr, exit) in [
         (".", "\x1e[1]\n".to_string(), WARNING.to_string(), 0),
-        ("halt", String::new(), String::new(), 0),
+        ("halt", String::new(), WARNING.to_string(), 0),
         (
             "error(\"x\")",
             String::new(),
-            format!("jq: error (at <stdin>:0): x\n{WARNING}"),
+            format!("{WARNING}jq: error (at <stdin>:0): x\n"),
             5,
         ),
         (
             ".,  input",
             "\x1e[1]\n".to_string(),
-            AS_ERROR.to_string(),
+            format!("{WARNING}jq: error (at <unknown>): break\n"),
             5,
         ),
         (
             "., (try input catch .)",
-            "\x1e[1]\n\x1e\"Unfinished JSON term at EOF at line 1, column 3\"\n".to_string(),
-            String::new(),
+            "\x1e[1]\n\x1e\"break\"\n".to_string(),
+            WARNING.to_string(),
             0,
         ),
         (
             "., ([inputs] | length)",
-            "\x1e[1]\n".to_string(),
-            AS_ERROR.to_string(),
-            5,
+            "\x1e[1]\n\x1e0\n".to_string(),
+            WARNING.to_string(),
+            0,
+        ),
+        (
+            "(try input catch .), input_filename",
+            "\x1e\"break\"\n\x1enull\n".to_string(),
+            WARNING.to_string(),
+            0,
         ),
     ] {
         let (output, code) = spawn_jq(&["--seq", "-s", "-c", filter], Some(b"\x1e1{"))?;
@@ -8485,34 +8495,20 @@ fn test_seq_slurp_deferred_eof_warning_follows_the_filter_3201() -> Result<()> {
         assert_eq!(String::from_utf8_lossy(&output.stderr), stderr, "{filter}");
         assert_eq!(code, exit, "{filter}");
     }
-    // Once `input` has read it, jq's stream is closed: `input_filename` is
-    // null. And `-n`'s forced read queues it the same way (review).
-    for (args, filter, stdout) in [
-        (
-            &["--seq", "-s", "-c"][..],
-            "(try input catch .), input_filename",
-            "\x1e\"Unfinished JSON term at EOF at line 1, column 3\"\n\x1enull\n",
-        ),
-        (
-            &["--seq", "-s", "-n", "-c"][..],
-            "input, (try input catch .), input_filename",
-            "\x1e[1]\n\x1e\"Unfinished JSON term at EOF at line 1, column 3\"\n\x1enull\n",
-        ),
-    ] {
-        let mut argv = args.to_vec();
-        argv.push(filter);
-        let (output, code) = spawn_jq(&argv, Some(b"\x1e1{"))?;
-        assert_eq!(String::from_utf8_lossy(&output.stdout), stdout, "{filter}");
-        assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{filter}");
-        assert_eq!(code, 0, "{filter}");
+    // `-n`'s forced read raises it where it reads it: before the array.
+    for filter in ["input, (try input catch .), input_filename", "[inputs]"] {
+        let (output, code) = spawn_jq(&["--seq", "-s", "-n", "-c", filter], Some(b"\x1e1{"))?;
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{filter}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "jq: error (at <stdin>:0): Unfinished JSON term at EOF at line 1, column 3\n",
+            "{filter}"
+        );
+        assert_eq!(code, 5, "{filter}");
     }
-    let (output, code) = spawn_jq(&["--seq", "-s", "-n", "-c", "[inputs]"], Some(b"\x1e1{"))?;
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_eq!(String::from_utf8_lossy(&output.stderr), AS_ERROR);
-    assert_eq!(code, 5);
 
-    // Control: a warning jq reports in the reading call still comes first,
-    // and `halt` does not suppress it.
+    // Control: a warning jq 1.7.1 reported in the reading call too, which `halt`
+    // does not suppress.
     let (output, code) = spawn_jq(&["--seq", "-s", "-c", "halt"], Some(b"\x1e1 {"))?;
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
@@ -8572,7 +8568,7 @@ fn test_seq_value_location_is_where_the_value_was_yielded_3250() -> Result<()> {
 /// #3200: under a malformed BOM jq resets at every `fgets` refill, including
 /// the one after a full 4095-byte chunk with no newline, and at an empty final
 /// buffer. The issue's three rows, with their stderr and `(at ...)` location,
-/// captured from `/usr/bin/jq` 1.7.1 (stdin).
+/// captured from `/usr/bin/jq` 1.7.1 (stdin), the third from jq 1.8.2 (#7718).
 #[test]
 fn test_seq_malformed_bom_resets_at_fgets_size_limit_refill_3200() -> Result<()> {
     let padded = |head: &[u8], pad: usize, tail: &[u8]| -> Vec<u8> {
@@ -8593,11 +8589,12 @@ fn test_seq_malformed_bom_resets_at_fgets_size_limit_refill_3200() -> Result<()>
             "jq: error (at <stdin>:0): x\n",
         ),
         // The refill drops the open string; the trailing `"` opens another,
-        // which the EOF branch reports, and the location is lost.
+        // which jq 1.7.1's EOF branch reported (`Unfinished string at EOF at
+        // line 1, column 4094`, location lost). jq 1.8.2 reads one more, empty,
+        // buffer, whose reset wipes it (#7718): this row is 1.8.2's.
         (
             padded(b"\xef\xbb\"a", 4091, b"\""),
-            "jq: ignoring parse error: Unfinished string at EOF at line 1, column 4094\n\
-             jq: error (at <unknown>): x\n",
+            "jq: error (at <stdin>:0): x\n",
         ),
     ] {
         let (output, code) = spawn_jq(&["--seq", "-s", "-c", "error(\"x\")"], Some(&input))?;
@@ -41357,11 +41354,11 @@ fn test_jq_input_filename_after_input_builtin_loses_seq_slurp_position_3202() ->
         Some("\x1e1{"),
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
-    // `--seq` RS-prefixes output too (RFC 7464), not just input.
-    assert_eq!(
-        stdout, "\x1e\"Unfinished JSON term at EOF at line 1, column 3\"\n\x1enull\n",
-        "stderr: {stderr:?}"
-    );
+    // `--seq` RS-prefixes output too (RFC 7464), not just input. jq 1.7.1's
+    // `input` read the deferred EOF warning here; jq 1.8.2 reports it while it
+    // reads the slurp (#7718), so `input` meets the end (`break`), and the
+    // `null` is jq 1.7.1's position after the last input (#7607).
+    assert_eq!(stdout, "\x1e\"break\"\n\x1enull\n", "stderr: {stderr:?}");
 
     Ok(())
 }
@@ -49351,10 +49348,14 @@ fn test_jq_combinations_n_huge_count_does_not_abort_1669() -> Result<()> {
 /// size `base_array.len().pow(n)` can overflow independently of `n` alone
 /// being perfectly reasonable (`n=10` is trivial by itself; `1000^10` is
 /// not), a completely different quantity from the row-width guard on `n`.
+///
+/// The rows are collected (`[...]`): since #7726 they stream as jq's do, so
+/// `combinations | length` prints for as long as jq would; collecting a
+/// product that cannot be held is what is refused.
 #[test]
 fn test_jq_combinations_n_small_n_huge_base_power_does_not_abort_1669() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
-        &["-n", "-c", "[range(1000)] | combinations(10) | length"],
+        &["-n", "-c", "[range(1000)] | [combinations(10)] | length"],
         None,
     )?;
     assert_eq!(stdout, "");
@@ -49418,11 +49419,15 @@ fn test_jq_combinations_n_row_width_guard_independent_of_output_count_1669() -> 
 /// overflows `usize`. Deterministic and fast: the allocator's capacity
 /// check rejects this on arithmetic grounds alone, without attempting any
 /// real allocation.
+///
+/// The rows are collected (`[...]`): since #7726 they stream as jq's do, so
+/// `combinations | length` prints for as long as jq would; collecting a
+/// product that cannot be held is what is refused.
 #[test]
 fn test_jq_combinations_n_reserve_exact_failure_after_pow_succeeds_does_not_abort_1669(
 ) -> Result<()> {
     let (stdout, stderr, code) =
-        run_jq_full(&["-n", "-c", "[1,2] | combinations(63) | length"], None)?;
+        run_jq_full(&["-n", "-c", "[1,2] | [combinations(63)] | length"], None)?;
     assert_eq!(stdout, "");
     assert!(
         !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
@@ -49447,13 +49452,17 @@ fn test_jq_combinations_n_reserve_exact_failure_after_pow_succeeds_does_not_abor
 /// its own) combined with a 100,000-element `base_array` must still be
 /// refused up front, without ever touching the per-element cost that used
 /// to slip through here.
+///
+/// The rows are collected (`[...]`): since #7726 they stream as jq's do, so
+/// `combinations | length` prints for as long as jq would; collecting a
+/// product that cannot be held is what is refused.
 #[test]
 fn test_jq_combinations_n_moderate_n_large_base_array_does_not_abort_1669() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-n",
             "-c",
-            "[range(100000)] | combinations(1000000) | length",
+            "[range(100000)] | [combinations(1000000)] | length",
         ],
         None,
     )?;
@@ -49555,12 +49564,16 @@ fn test_jq_combinations_bare_multi_output_matches_real_jq() -> Result<()> {
 /// identical missed guard. Five 100000-element arrays make the product
 /// overflow `usize` by the fourth factor, so this must fail fast rather
 /// than attempt to enumerate any of the 10^25 combinations.
+///
+/// The rows are collected (`[...]`): since #7726 they stream as jq's do, so
+/// `combinations | length` prints for as long as jq would; collecting a
+/// product that cannot be held is what is refused.
 #[test]
 fn test_jq_combinations_cartesian_product_length_overflow_does_not_abort_1669() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
-            "[range(100000)] as $a | [$a,$a,$a,$a,$a] | combinations | length",
+            "[range(100000)] as $a | [$a,$a,$a,$a,$a] | [combinations] | length",
         ],
         Some("{}"),
     )?;
@@ -50704,35 +50717,41 @@ fn test_seq_record_with_multiple_values_emits_all_1723() -> Result<()> {
     Ok(())
 }
 
-/// #2998: real jq's non-slurp `--seq` driver (`jq_util_input_next_input`,
-/// `src/util.c`) can end the *entire* stream silently at the first empty
-/// record of jq's own final `fgets` buffer -- no value, no diagnostic,
-/// exit 0. Every row confirmed live against `/usr/bin/jq` 1.7.1.
+/// #2998: jq 1.7.1's non-slurp `--seq` driver (`jq_util_input_next_input`,
+/// `src/util.c`) ended the *entire* stream silently at the first empty
+/// record of its own final `fgets` buffer, exit 0: `\x1e\x1etrue` printed
+/// nothing. jq 1.8.2 reads every record (jqlang/jq#3279), and since #7718
+/// so does `succinctly jq`: every row is `/opt/homebrew/bin/jq` 1.8.2's.
 #[test]
 fn test_seq_non_slurp_end_of_stream_rule_2998() -> Result<()> {
     for (input, expected_stdout, expected_stderr, why) in [
-        ("\x1e\x1etrue", "", "", "issue's own headline repro"),
-        ("\x1e\x1e\"s\"", "", "", "string, not just a scalar keyword"),
-        ("\x1e\x1e5", "", "", "number"),
-        ("\x1e \x1e{}", "", "", "whitespace-only leading record"),
-        ("\x1e\n\x1etrue", "", "", "newline-only leading record"),
+        ("\x1e\x1etrue", "true\n", "", "issue's own headline repro"),
+        ("\x1e\x1e\"s\"", "\"s\"\n", "", "string, not just a scalar keyword"),
+        (
+            "\x1e\x1e5",
+            "",
+            "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 1, column 3\n",
+            "number, which the EOF branch reports",
+        ),
+        ("\x1e \x1e{}", "{}\n", "", "whitespace-only leading record"),
+        ("\x1e\n\x1etrue", "true\n", "", "newline-only leading record"),
         (
             "\x1e\x1etru",
             "",
-            "",
-            "drop also suppresses the would-be `at EOF` warning",
+            "jq: ignoring parse error: Invalid literal at EOF at line 1, column 5\n",
+            "the `at EOF` warning 1.7.1's drop suppressed",
         ),
         (
             "\x1e1\n\x1etrue",
-            "1\n",
+            "1\ntrue\n",
             "",
-            "an earlier record's own value leaves the same state an empty one would",
+            "a record after the last newline",
         ),
         (
             "\x1e1\n\x1e\x1e\"abc",
             "1\n",
-            "",
-            "suppresses a later warning in the same buffer too",
+            "jq: ignoring parse error: Unfinished string at EOF at line 2, column 6\n",
+            "a later warning in the same buffer",
         ),
         (
             "\x1e1 \x1etrue",
@@ -50746,8 +50765,7 @@ fn test_seq_non_slurp_end_of_stream_rule_2998() -> Result<()> {
             "jq: ignoring parse error: Potentially truncated top-level numeric value at line 1, column 3\n",
             "first event is an error, not empty -- rest of the buffer parses normally",
         ),
-        // Controls: a trailing newline empties the final buffer entirely,
-        // so nothing can be dropped regardless of what came before.
+        // Controls: a trailing newline, which both releases read alike.
         ("\x1e\x1etrue\n", "true\n", "", "trailing newline (control)"),
         (
             "\x1e\x1etrue\n\x1e5\n",
@@ -50765,9 +50783,9 @@ fn test_seq_non_slurp_end_of_stream_rule_2998() -> Result<()> {
     Ok(())
 }
 
-/// #2998's rule is non-slurp only: real jq's `-s` keeps `has_more` looping
-/// past the same empty record, so the value survives and the warning the
-/// non-slurp rule would have suppressed fires normally.
+/// #2998's rule was non-slurp only: jq 1.7.1's `-s` kept `has_more` looping
+/// past the same empty record, so the value survived and the warning fired;
+/// jq 1.8.2 answers the same.
 #[test]
 fn test_seq_slurp_unaffected_by_non_slurp_end_of_stream_rule_2998() -> Result<()> {
     // The headline repro itself has nothing left to warn about once kept
@@ -50786,17 +50804,14 @@ fn test_seq_slurp_unaffected_by_non_slurp_end_of_stream_rule_2998() -> Result<()
     Ok(())
 }
 
-/// #2998 also applies under `-n` forcing a real read via `inputs` -- the
-/// value side (`build_seq_values`) runs regardless of `-n`, even though
-/// `seq_no_rs_byte_warning`'s own warnings are separately suppressed there
-/// (#1525's unrelated gap, documented in
-/// `docs/compliance/jq/limitations.md`).
+/// #2998 also applied under `-n` forcing a real read via `inputs`, where jq
+/// 1.7.1 answered `[]`; jq 1.8.2 reads the record (#7718).
 #[test]
 fn test_seq_null_input_forced_read_hits_end_of_stream_rule_2998() -> Result<()> {
     let (stdout, stderr, code) =
         run_jq_full(&["--seq", "-n", "-c", "[inputs]"], Some("\x1e\x1etrue"))?;
     let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
-    assert_eq!(stripped, "[]\n");
+    assert_eq!(stripped, "[true]\n");
     assert_eq!(stderr, "");
     assert_eq!(code, 0);
     Ok(())
@@ -50827,27 +50842,19 @@ fn test_seq_end_of_stream_rule_only_applies_to_the_last_file_2998() -> Result<()
     Ok(())
 }
 
-/// Real jq's own `fgets` chunks at a newline *or* after 4095 bytes,
-/// whichever comes first -- so the drop is observable by padding alone.
-/// `\x1e1\n\x1e` + N spaces + `\x1etrue`'s tail (from the second RS) is
-/// `N + 6` bytes; N=4093 keeps `true`, N=4094 drops it, and the same
-/// one-byte flip recurs at the next chunk (8188/8189).
+/// jq 1.7.1's own `fgets` chunks at a newline *or* after 4095 bytes,
+/// whichever comes first, so its drop (#2998) moved with the padding: N=4093
+/// kept `true`, N=4094 dropped it, and the flip recurred at 8188/8189. jq
+/// 1.8.2 keeps `true` at every padding, and so does `succinctly jq` (#7718).
 #[test]
 fn test_seq_end_of_stream_rule_4095_byte_fgets_boundary_2998() -> Result<()> {
-    for (spaces, keeps_true) in [
-        (4093, true),
-        (4094, false),
-        (4095, false),
-        (8188, true),
-        (8189, false),
-    ] {
+    for spaces in [4093, 4094, 4095, 8188, 8189] {
         let mut input = String::from("\x1e1\n\x1e");
         input.push_str(&" ".repeat(spaces));
         input.push_str("\x1etrue");
         let (stdout, stderr, code) = run_jq_full(&["--seq", "-c", "."], Some(&input))?;
         let stripped: String = stdout.chars().filter(|&c| c != '\u{1e}').collect();
-        let expected = if keeps_true { "1\ntrue\n" } else { "1\n" };
-        assert_eq!(stripped, expected, "spaces={spaces}: {stderr}");
+        assert_eq!(stripped, "1\ntrue\n", "spaces={spaces}: {stderr}");
         assert_eq!(code, 0, "spaces={spaces}");
     }
     Ok(())
@@ -52663,8 +52670,9 @@ fn test_syntax_error_exits_with_the_compile_error_code_1473() -> Result<()> {
         stderr.contains("unexpected end of input at <top-level>, line 1:"),
         "the jq line-header is missing: {stderr:?}"
     );
+    // jq 1.7.1's padding: the error is at the start of the last match, the `+` (#7711).
     assert!(
-        stderr.contains("\n1 +   \njq: 1 compile error"),
+        stderr.contains("\n1 +  \njq: 1 compile error"),
         "the echoed line + trailer are missing: {stderr:?}"
     );
     assert!(
@@ -68664,99 +68672,51 @@ fn test_range_beyond_boundary_stays_on_exact_i64_path_2219() -> Result<()> {
     Ok(())
 }
 
-/// The confirmed-hangs-in-real-jq shape from the issue's own investigation:
-/// once `i` reaches `2^53` with `step == 1`, `i + 1` rounds back to exactly
-/// `i` in `f64` arithmetic (the next representable double after `2^53` is
-/// `2^53 + 2`, not `2^53 + 1`), so real jq's `while` loop never advances and
-/// never terminates -- reproduced live and killed by hand while
-/// investigating this issue; NOT re-run here against the real oracle (would
-/// hang the test suite). Per ADR-0018's host-process-endangering exception,
-/// succinctly is not obligated to reproduce that hang.
-///
-/// Under the earlier, now-replaced `±2^53`-gated fix, this range (`to`
-/// exceeds the gate) was routed to `f64` same as any out-of-bound range, and
-/// the pre-existing `MAX_RANGE` cap (#2089) raised instead of looping
-/// forever. The revised, `checked_add`-based fix changes this: `i64` has no
-/// precision-loss problem at `2^53`'s magnitude the way `f64` does (every
-/// integer here is exactly representable and `i += 1` always advances by
-/// exactly 1), and this walk is nowhere near `i64::MIN`/`i64::MAX`, so
-/// `checked_add` never trips -- the range now stays on the exact `i64` path
-/// and completes correctly, well under `MAX_RANGE`, instead of needing the
-/// cap to save it. A nice side effect of narrowing the gate, not a
-/// regression: this asserts succinctly's own behavior completes (not a
-/// hang) with the exact correct answer.
+/// The confirmed-hangs-in-real-jq shape from #2131's investigation: once the walk reaches
+/// `2^53` with `step == 1`, `+ 1` rounds back to `2^53` (the next double is `2^53 + 2`), so
+/// jq 1.7.1 and 1.8.2 repeat `9007199254740992` forever. #2131/#2219 kept this range on an
+/// exact `i64` walk, an answer jq never gives; since #7731 it walks jq's doubles, so a
+/// consumer that stops gets jq's values, and one that does not is refused at the cap
+/// (ADR-0018 rule 4(c), as `range(nan)` is).
 #[test]
-fn test_range_2_53_magnitude_completes_via_i64_not_hang_or_cap_2131() -> Result<()> {
-    let (stdout, code) = run_jq_null("[range(9007199254740990; 9007199254740994; 1)]", &["-c"])?;
-    assert_eq!(code, 0, "stdout: {stdout:?}");
-    assert_eq!(
-        stdout.trim(),
-        "[9007199254740990,9007199254740991,9007199254740992,9007199254740993]"
-    );
-    Ok(())
-}
-
-/// #2131's own regression that this refinement fixes: a nanosecond-epoch-
-/// scale integer range with no `i64` overflow risk at all -- its magnitude
-/// (`~1.7e18`) sits well past the earlier, now-replaced `±2^53` gate, but
-/// its 10-step walk never comes remotely close to `i64::MAX`
-/// (`~9.2e18`). The earlier gate routed this to `f64` purely on magnitude,
-/// where every one of these 10 integers rounds to the *same* double and the
-/// range silently degenerates to empty -- worse than the original overflow
-/// bug for a realistic input (nanosecond timestamps, large database IDs),
-/// since it fails silently at exit 0 rather than producing wrong data loudly.
-/// The revised fix keeps this on the exact `i64` path, matching what an
-/// unpatched, pre-#2131 build already produced for this specific range (this
-/// magnitude has no overflow risk, so the original bug never affected it) --
-/// not a claim about matching real jq here, which has its own separate
-/// `decNumber`-vs-`double` quirk at this magnitude (out of this issue's
-/// scope; see `docs/compliance/jq/limitations.md`).
-#[test]
-fn test_range_nanosecond_epoch_scale_stays_exact_i64_2131() -> Result<()> {
+fn test_range_2_53_magnitude_steps_in_doubles_7731() -> Result<()> {
     let (stdout, code) = run_jq_null(
-        "[range(1700000000000000000;1700000000000000010;1)]",
+        "[limit(5; range(9007199254740990; 9007199254740994; 1))]",
         &["-c"],
     )?;
     assert_eq!(code, 0, "stdout: {stdout:?}");
     assert_eq!(
         stdout.trim(),
-        "[1700000000000000000,1700000000000000001,1700000000000000002,\
-1700000000000000003,1700000000000000004,1700000000000000005,\
-1700000000000000006,1700000000000000007,1700000000000000008,\
-1700000000000000009]"
+        "[9007199254740990,9007199254740991,9007199254740992,9007199254740992,9007199254740992]"
     );
     Ok(())
 }
 
-/// #2131 round 3: pins the exact live repro a review found in round 2's
-/// `checked_add`-based fix. `eval_range_values`'s loop hit `MAX_RANGE`
-/// (100000 pushed values) on the same push whose lookahead candidate --
-/// the 100,001st value, needed only to answer "does one more value exist",
-/// never pushed itself -- overflows `i64` (`100000 * 92234642714974`
-/// exceeds `i64::MAX`). Round 2's structure computed that lookahead the
-/// same way it computed every other iteration's advance and bailed the
-/// *entire* function on its overflow, discarding all 100000 already-correct
-/// pushed values for an `f64` recomputation none of them needed:
-///
-/// ```console
-/// $ succinctly jq -nc 'nth(250; range(0;9223372036854775807;92234642714974))'
-/// 23058660678743610     # wrong, f64-derived (before this fix)
-/// ```
-///
-/// The round-3 fix still computes that one lookahead at the cap boundary,
-/// but interprets its overflow *locally* (as proof no further value could
-/// exist -- `to` is always representable in `i64`, so an out-of-range
-/// candidate could never be less than it anyway) instead of bailing the
-/// whole function on it: `nth(250; ...)` must come back with the exact
-/// `i64` value `250 * 92234642714974`, matching the same step used with a
-/// `to` small enough that the cap is never engaged
-/// (`range(0;92234642714974000;92234642714974)`, verified separately as a
-/// control while developing this fix and confirmed to already agree).
+/// A nanosecond-epoch-scale integer range (`~1.7e18`): #2131 kept it on an exact `i64` walk,
+/// ten values, which is not jq's answer. jq's first `$from < $upto` compares the two literals
+/// as decimals, emits `$from`, and `+ 1` is the double `1.7e18` again, which is not below the
+/// upper bound's double, so jq 1.7.1 and 1.8.2 emit one value; `succinctly jq` does since #7731.
 #[test]
-fn test_range_cap_hit_lookahead_overflow_keeps_exact_i64_answer_2131() -> Result<()> {
+fn test_range_nanosecond_epoch_scale_steps_in_doubles_7731() -> Result<()> {
+    let (stdout, code) = run_jq_null(
+        "[range(1700000000000000000;1700000000000000010;1)]",
+        &["-c"],
+    )?;
+    assert_eq!(code, 0, "stdout: {stdout:?}");
+    assert_eq!(stdout.trim(), "[1700000000000000000]");
+    Ok(())
+}
+
+/// #2131 round 3 pinned the exact `i64` answer (`250 * 92234642714974`) for this row, once the
+/// `i64` walk's cap-boundary lookahead stopped discarding the batch when it overflowed; that
+/// lookahead is still pinned by the `range_batch_int` unit tests (`src/jq/eval.rs`). Since #7731
+/// the upper bound past `2^53` puts this range on jq's double walk, whose sums past `2^53`
+/// round, and `23058660678743610` is jq 1.7.1's and 1.8.2's answer.
+#[test]
+fn test_range_nth_past_2_53_follows_jq_doubles_2131() -> Result<()> {
     let (stdout, code) = run_jq_null("nth(250; range(0;9223372036854775807;92234642714974))", &[])?;
     assert_eq!(code, 0, "stdout: {stdout:?}");
-    assert_eq!(stdout.trim(), (250i64 * 92234642714974).to_string());
+    assert_eq!(stdout.trim(), "23058660678743610");
     Ok(())
 }
 

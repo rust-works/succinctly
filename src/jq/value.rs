@@ -346,8 +346,12 @@ pub(crate) fn jq_negated_literal(repr: NumberRepr, text: &str) -> Option<(Number
         format!("-{magnitude}")
     };
     // The negated text parses to the negated repr (`jq_literal_text_to_f64` is
-    // sign-symmetric), so only `i64::MIN`, whose magnitude no `i64` holds,
-    // needs the parse.
+    // sign-symmetric), except where `i64`'s range is not, so two magnitudes
+    // take the parse: `i64::MIN`, whose magnitude no `i64` holds, and a
+    // `Float` of 2^63, whose negation may be spelled `-9223372036854775808`,
+    // which is `i64::MIN` (#7725: a `Float` there disagreed with a fresh
+    // parse of its own text). `9223372036854775809` rounds to the same
+    // double, and its negation stays a `Float`.
     let repr = match repr {
         NumberRepr::Int(_) if zero => NumberRepr::Int(0),
         NumberRepr::Float(_) if zero => NumberRepr::Float(0.0),
@@ -355,6 +359,9 @@ pub(crate) fn jq_negated_literal(repr: NumberRepr, text: &str) -> Option<(Number
             Some(n) => NumberRepr::Int(n),
             None => parse_i64_or_f64_in::<JqSemantics>(&spelled)?,
         },
+        NumberRepr::Float(f) if f == -(i64::MIN as f64) => {
+            parse_i64_or_f64_in::<JqSemantics>(&spelled)?
+        }
         NumberRepr::Float(f) => NumberRepr::Float(-f),
     };
     Some((repr, spelled))
@@ -714,9 +721,8 @@ pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
 /// function actually exists for), doubles are at least 16 apart on
 /// `[10^17, 10^18)` and at least 128 apart above `10^18`, while the
 /// 17-digit rounding moves a value by at most 5 or 50, so it rounds
-/// straight back to the double it started as. The one exact-`i64` producer
-/// past `2^53` that is *not* a literal is `range`, which stays on its
-/// documented exact walk (`docs/compliance/jq/limitations.md`).
+/// straight back to the double it started as. `range` walks jq's doubles past
+/// `2^53` (#7731) and emits no exact `i64` there but its own `from`.
 ///
 /// yq mode never calls this: real yq's arithmetic is exact `int64`, so its
 /// `Int`-to-`f64` widening stays a plain cast (`int_to_f64`).
@@ -1433,6 +1439,12 @@ pub fn jq_bare_float_display(f: f64) -> String {
 /// the "wrong" side of a tie (see above) and is returned unchanged with no
 /// arithmetic at all.
 ///
+/// A tie is only corrected when the lower candidate reads back as `f` (#7730). It does wherever
+/// the doubles either side of `f` are equally far away, since the upper one, `s`, does; at a power
+/// of two the double below is half as far away, and of every double only `±2^-24` has a tie whose
+/// lower candidate (`5.960464477539062e-08`) falls outside that narrower half. jq's dtoa never
+/// offers such a candidate, so jq prints `s` there, and so does this.
+///
 /// The expensive part is confirming a *genuine* tie rather than merely a
 /// same-length neighbor that also happens to round-trip: many non-tied
 /// doubles have a same-length decimal neighbor that round-trips too (the
@@ -1542,7 +1554,29 @@ pub(crate) fn shortest_decimal_is_wrong_tie(f: f64, s: &str, extra_exp10: i64) -
     // `exp_bits` is an 11-bit field (<= 0x7FF), always representable as `i64`.
     let e = i64::try_from(exp_bits).expect("11-bit exponent field always fits i64") - 1023 - 52;
 
-    is_exact_midpoint(m, e, q, n) == Some(true)
+    if is_exact_midpoint(m, e, q, n) != Some(true) {
+        return false;
+    }
+    // #7730: the lower candidate is only jq's answer when it reads back as `f`. Both candidates
+    // are `10^q / 2` from `f` and `s` round-trips, so they do alike wherever the doubles either
+    // side of `f` are equally far away; at a power of two (`m == 2^52`, any exponent but the
+    // smallest normal one, whose neighbour below is the subnormal one ulp away) the one below is
+    // half as far, and `2^-24`'s `...062e-08` reads back as it. dtoa never offers such a digit.
+    m != 1 << 52 || exp_bits == 1 || lower_tie_candidate_round_trips(e, q) == Some(true)
+}
+
+/// Whether `(n - 1) * 10^q`, the lower candidate of an exact tie at `2^52 * 2^e` (a power of two),
+/// reads back as that double (#7730): the double below is `2^(e - 1)` away, so the candidate,
+/// `10^q / 2` below, rounds back up when `10^q / 2 <= 2^(e - 2)`, that is `2^q * 5^q <= 2^(e - 1)`.
+/// Equality rounds to the even significand, `2^52`'s. `None` (a power too wide for `u128`) is
+/// read as `false` by the caller, which then keeps the upper candidate: that one always
+/// round-trips, so declining never prints a wrong double.
+fn lower_tie_candidate_round_trips(e: i64, q: i64) -> Option<bool> {
+    let (twos, fives) = (q - (e - 1), q);
+    let pow = |base: u128, exp: i64| base.checked_pow(u32::try_from(exp.max(0)).ok()?);
+    let lhs = pow(2, twos)?.checked_mul(pow(5, fives)?)?;
+    let rhs = pow(2, -twos)?.checked_mul(pow(5, -fives)?)?;
+    Some(lhs <= rhs)
 }
 
 /// Exactly (never approximately) decides whether `m * 2^e == (2n - 1) / 2 * 10^q`
@@ -7408,6 +7442,14 @@ mod tests {
             "9007199254740993",
             "-9223372036854775808",
             "9223372036854775807",
+            // #7725: 2^63 is a `Float` whose negation is spelled `i64::MIN`.
+            "9223372036854775808",
+            "0009223372036854775808",
+            "9223372036854775809",
+            "-9223372036854775809",
+            "9223372036854775808.0",
+            "9.223372036854775808e18",
+            "18446744073709551616",
             "1e1000",
             "-1E1000",
         ] {
@@ -10384,6 +10426,43 @@ mod tests {
         );
     }
 
+    /// #7730: `2^-24` is the exact midpoint of `...062e-08` and `...063e-08`, but the double below
+    /// it is half as far away as the one above, so only `...063e-08` reads back, and jq 1.7.1 and
+    /// 1.8.2 print it. `2^-25`, the tie #2542 pinned, keeps the even digit: its lower candidate
+    /// is close enough. Every power of two and its neighbours up to two ulps either side, in
+    /// both signs, print text that reads back as the same double.
+    #[test]
+    fn test_jq_bare_float_display_reads_back_at_a_power_of_two_7730() {
+        let p24 = 2f64.powi(-24);
+        assert_eq!(jq_bare_float_display(p24), "5.960464477539063e-08");
+        assert_eq!(jq_bare_float_display(-p24), "-5.960464477539063e-08");
+        assert_eq!(jq_bare_float_display(p24 / 2.0), "2.9802322387695312e-08");
+        let mut checked = 0;
+        for exp_bits in 1u64..0x7FF {
+            let power = exp_bits << 52;
+            for bits in power.saturating_sub(2)..=power + 2 {
+                for f in [f64::from_bits(bits), -f64::from_bits(bits)] {
+                    if !f.is_finite() || f == 0.0 {
+                        continue;
+                    }
+                    let text = jq_bare_float_display(f);
+                    assert_eq!(text.parse::<f64>(), Ok(f), "{f:e} printed {text}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 20_000);
+    }
+
+    /// #7730: the gap test itself, at the two ties next to the boundary (`q` and `e` of `2^-24`
+    /// and `2^-25`), and `None` where a power does not fit.
+    #[test]
+    fn test_lower_tie_candidate_round_trips_7730() {
+        assert_eq!(lower_tie_candidate_round_trips(-76, -23), Some(false));
+        assert_eq!(lower_tie_candidate_round_trips(-77, -24), Some(true));
+        assert_eq!(lower_tie_candidate_round_trips(0, 400), None);
+    }
+
     /// #4915: the `5^k | 2n - 1` prefilter only skips the exact-midpoint check where no tie is
     /// possible, so the correction answers exactly what the unfiltered check does -- over the
     /// non-scientific and scientific spellings, genuine ties included.
@@ -10418,9 +10497,16 @@ mod tests {
             let e = i64::try_from(exp_bits).unwrap() - 1023 - 52;
             match is_exact_midpoint(m, e, q, n) {
                 Some(true) => {
-                    let mut corrected = s.into_bytes();
+                    let mut corrected = s.clone().into_bytes();
                     *corrected.last_mut().unwrap() = last_byte - 1;
-                    String::from_utf8(corrected).unwrap()
+                    let corrected = String::from_utf8(corrected).unwrap();
+                    // #7730: by parsing, where the function under test reasons about the gaps.
+                    let reads_back = format!("{corrected}e{extra_exp10}").parse::<f64>() == Ok(f);
+                    if reads_back {
+                        corrected
+                    } else {
+                        s
+                    }
                 }
                 _ => s,
             }
@@ -10432,6 +10518,8 @@ mod tests {
             values.push(k / 8.0);
             values.push(k * 1e-3 + 0.0005);
             values.push((2.0f64).powi(k as i32 - 60) * 3.0);
+            // #7730: powers of two, `2^-24` among them.
+            values.push((2.0f64).powi(k as i32 - 100));
         }
         let mut state = 0xD1B5_4A32_D192_ED03_u64;
         for _ in 0..30_000 {

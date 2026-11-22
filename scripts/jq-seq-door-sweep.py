@@ -22,7 +22,8 @@ Usage:
 Exits 1 when a regression is found (or, without `--base`, when any case differs from jq), and 2 on a
 setup error. `succinctly dev compare jq --dimension sweeps` runs it with `--both` and no base
 (`comparison/jq/manifest.toml`, id `seq-door`), where it is a plain oracle sweep: every case must
-match jq 1.7.1.
+match jq 1.7.1. A case whose last record follows the stream's last newline is skipped and counted:
+`succinctly jq` reads it as jq 1.8.2 does, where 1.7.1 ends the stream at its RS (#7718).
 """
 
 import argparse
@@ -37,6 +38,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 RS = b"\x1e"
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _oracle_sweep():
+    """`jq-seq-oracle-sweep.py`, for its `reads_past_last_buffer` (#7718); its name has hyphens."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("jq_seq_oracle_sweep", REPO_ROOT / "scripts/jq-seq-oracle-sweep.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 # Faults: a record cut off inside a value, which jq warns about and reads on from.
 FAULTS = [RS + b"[1,\n", RS + b'{"a":\n', RS + b'"abc\n', RS + b"{\n", RS + b"tru\n"]
@@ -173,8 +184,14 @@ def main():
         return (program, flags, stream), want, got, before
 
     routes = [False, True] if args.both else [args.file]
-    work = [(case, route) for case in make_cases(args.cases, args.seed) for route in routes]
+    # #7718: `succinctly jq` reads past jq 1.7.1's last buffer as jq 1.8.2 does, so against the pinned
+    # 1.7.1 a stream whose last record follows its last newline is skipped (the cases that strip it).
+    reads_past = _oracle_sweep().reads_past_last_buffer
+    cases = make_cases(args.cases, args.seed)
+    kept = [case for case in cases if not reads_past(case[2], False)]
+    work = [(case, route) for case in kept for route in routes]
     tally = collections.Counter()
+    tally["skipped, read past 1.7.1's last buffer (#7718)"] = (len(cases) - len(kept)) * len(routes)
     regressions, fixes, shared = [], [], []
     with ThreadPoolExecutor(args.jobs) as pool:
         for case, want, got, before in pool.map(one, work):

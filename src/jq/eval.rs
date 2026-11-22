@@ -8281,6 +8281,11 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // collecting builtins read all of it first (2 GB for a 52 MB array, and never an end on
         // an endless pipe).
         Expr::Builtin(Builtin::FromStream(f)) => each_fromstream::<W, S>(f, value, optional, sink),
+        // #7726: `combinations` hands each row on as it is built, so `first(combinations(20))`
+        // builds one row, not 2^20 of them.
+        Expr::Builtin(builtin @ (Builtin::Combinations | Builtin::CombinationsN(_))) => {
+            each_combinations::<W, S>(builtin, value, optional, sink)
+        }
         Expr::Builtin(Builtin::TruncateStream(f)) => {
             each_truncate_stream_of::<W, S>(f, value, optional, sink)
         }
@@ -11029,7 +11034,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             {
                 // #5292: handed over a batch at a time, each drained into `sink`
                 // before the next is built.
-                let end = each_range_batches(
+                let end = each_range_batches::<S>(
                     from_val,
                     to_val,
                     step_val,
@@ -15674,6 +15679,279 @@ fn closed_expr_to_owned<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
     Some(value)
 }
 
+/// [`closed_expr_to_owned`], or else, for an operand that reads no input and has no effect
+/// ([`input_free_operand`]), its one value evaluated on `null` (#7451): `[$t | tostring |
+/// split("")]`, `[range(3)]`, `[[$t] | sort]`, the container a fold step appends or stores that the
+/// closed walk has no stage for. Without it the step declined to the evaluator's route, which
+/// evaluates the whole UPDATE on a borrowed state that the fold still holds, so the `+` or the write
+/// copied the accumulator every step: quadratic, where jq is linear.
+///
+/// The operand never reads `.`, so its value on `null` is its value on the state. It has no effect,
+/// so a step that evaluates it here and then declines (the evaluator then evaluates it again) is
+/// unobservable but for the time. An operand that raises, breaks out, or yields other than once
+/// declines, and the evaluator's route gives its answer and its text. jq mode only, and not while the
+/// #2889 embed table is live; [`input_free_operand`] admits no `as` binding's marker, so no node a
+/// binding names reaches the answer.
+#[inline]
+fn closed_operand_to_owned<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
+    closed_expr_to_owned::<S>(expr).or_else(|| input_free_operand_on_null::<S>(expr))
+}
+
+/// [`closed_operand_to_owned`]'s fallback: `expr`'s one value on `null`, through the evaluator.
+/// Out of line, so the callers' frames do not carry the evaluator's.
+#[inline(never)]
+fn input_free_operand_on_null<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq
+        || !yields_once_whatever_the_demand(expr)
+        || !input_free_operand(expr)
+        || super::eval_generic::embed_table_active()
+    {
+        return None;
+    }
+    let mut answer = None;
+    let mut seen = 0usize;
+    let flow = eval_each_owned::<S>(
+        expr,
+        &OwnedValue::Null,
+        false,
+        Reentry::REBUILT,
+        &mut |value| {
+            seen += 1;
+            if seen > 1 {
+                answer = None;
+                return Demand::Stop;
+            }
+            answer = Some(value);
+            Demand::Continue
+        },
+    );
+    match flow {
+        Flow::Exhausted if seen == 1 => answer,
+        _ => None,
+    }
+}
+
+/// Whether `expr` does all of its work and yields at most one value however its consumer's demand
+/// goes (#7451): a collect `[E]` (which runs `E` to its end in jq too), a literal, a fold's loop
+/// element, and an object, a string interpolation, a pipe or an arithmetic or comparison of these.
+/// [`input_free_operand_on_null`] runs the operand to its end to see that it yields once, where the
+/// evaluator's route might stop it early (`first(foreach ...)` stops after the first UPDATE
+/// output), so a generator such as `(1, (range(1e9) | empty))` is never evaluated there.
+fn yields_once_whatever_the_demand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Array(_) | Expr::Literal(_) => true,
+        Expr::TrackedVar(marker) => marker.fold_share,
+        Expr::Paren(inner) => yields_once_whatever_the_demand(inner),
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => yields_once_whatever_the_demand(inner),
+        }),
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            yields_once_whatever_the_demand(&entry.value)
+                && match &entry.key {
+                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Expr(key) => yields_once_whatever_the_demand(key),
+                    ObjectKey::Bare => false,
+                }
+        }),
+        // A later stage may also be a builtin with no argument that answers any input with one
+        // value or an error (`[$t] | sort`).
+        Expr::Pipe(stages) => stages.split_first().is_some_and(|(head, rest)| {
+            yields_once_whatever_the_demand(head)
+                && rest
+                    .iter()
+                    .all(|stage| yields_once_whatever_the_demand(stage) || one_value_builtin(stage))
+        }),
+        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            yields_once_whatever_the_demand(left) && yields_once_whatever_the_demand(right)
+        }
+        _ => false,
+    }
+}
+
+/// A builtin with no argument that answers any input with exactly one value or an error, for
+/// [`yields_once_whatever_the_demand`]'s pipe stages.
+fn one_value_builtin(stage: &Expr) -> bool {
+    matches!(
+        unwrap_paren(stage),
+        Expr::Builtin(
+            Builtin::Add
+                | Builtin::Min
+                | Builtin::Max
+                | Builtin::Sort
+                | Builtin::Reverse
+                | Builtin::Unique
+                | Builtin::Keys
+                | Builtin::KeysUnsorted
+                | Builtin::Flatten
+                | Builtin::ToEntries
+                | Builtin::FromEntries
+                | Builtin::ToNumber
+                | Builtin::ToJson
+                | Builtin::ToString
+                | Builtin::Length
+                | Builtin::Type
+        )
+    )
+}
+
+/// Whether `expr` reads nothing of its input and has no effect (#7451), checked without evaluating
+/// anything: [`reads_no_input`], and nothing under it that reads or writes outside the value
+/// ([`has_no_effect`]).
+fn input_free_operand(expr: &Expr) -> bool {
+    reads_no_input(expr) && has_no_effect(expr)
+}
+
+/// Whether `expr` is a collect `[E]` that is an [`input_free_operand`] with no `break` under it
+/// (#7451): exactly one value, or an error, whatever `E` yields, and the same whatever `.` is. A
+/// shape [`owned_state_expr_shape`] admits, so a stage or member that builds one (`.a += [[$t] |
+/// sort]` after another write, `[.[0] + [range(3)], .[1] + 1]`) keeps the owned step.
+fn input_free_collect(expr: &Expr) -> bool {
+    matches!(expr, Expr::Array(_))
+        && input_free_operand(expr)
+        && !crate::jq::walk::any_subexpr(expr, &mut |e| matches!(e, Expr::Break(_)))
+}
+
+/// Whether `expr`'s outputs do not depend on its input `.`: a literal, a fold's loop element, a
+/// constructor, operator or `if` of such parts, a pipe whose head is one (the later stages read the
+/// head's value, not `.`), a binding whose source and body are, a `reduce`/`foreach` whose source and
+/// start are, or a generator (`range`, `limit`, `first`, ...) of them. Conservative: anything else,
+/// a builtin or a call included, reads `.` as far as this says. Bounded by the parser's nesting
+/// limit, as [`closed_expr_shape`] is.
+fn reads_no_input(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Loc { .. } | Expr::Env | Expr::Var(_) | Expr::Break(_) => true,
+        Expr::TrackedVar(marker) => marker.fold_share,
+        Expr::Builtin(builtin) => match builtin {
+            Builtin::Empty | Builtin::NullLit | Builtin::Now | Builtin::Env => true,
+            Builtin::Limit(n, inner) => reads_no_input(n) && reads_no_input(inner),
+            Builtin::FirstStream(inner) | Builtin::LastStream(inner) | Builtin::IsEmpty(inner) => {
+                reads_no_input(inner)
+            }
+            Builtin::NthStream(n, inner) => reads_no_input(n) && reads_no_input(inner),
+            _ => false,
+        },
+        Expr::Paren(inner)
+        | Expr::Array(inner)
+        | Expr::Negate(inner)
+        | Expr::Optional(inner)
+        | Expr::FirstExpr(inner)
+        | Expr::LastExpr(inner)
+        | Expr::Label { body: inner, .. } => reads_no_input(inner),
+        Expr::Error(Some(inner)) => reads_no_input(inner),
+        Expr::Comma(items) => items.iter().all(reads_no_input),
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            reads_no_input(&entry.value)
+                && match &entry.key {
+                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Expr(key) => reads_no_input(key),
+                    ObjectKey::Bare => false,
+                }
+        }),
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => reads_no_input(inner),
+        }),
+        Expr::Pipe(stages) => stages.first().is_some_and(reads_no_input),
+        Expr::Compare { left, right, .. }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Alternative(left, right) => reads_no_input(left) && reads_no_input(right),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => reads_no_input(cond) && reads_no_input(then_branch) && reads_no_input(else_branch),
+        // The handler's input is the error, not `.`.
+        Expr::Try { expr, .. } => reads_no_input(expr),
+        Expr::As { expr, body, .. } => reads_no_input(expr) && reads_no_input(body),
+        // One pattern only: a `?//` chain runs its body again for a later alternative when a
+        // consumer's stop reaches it (#2180), so what it yields depends on who reads it.
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => {
+            patterns.len() == 1
+                && reads_no_input(expr)
+                && patterns.iter().all(static_pattern)
+                && reads_no_input(body)
+        }
+        // The UPDATE and EXTRACT read the accumulator, not `.`.
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            ..
+        }
+        | Expr::Foreach {
+            input,
+            patterns,
+            init,
+            ..
+        } => reads_no_input(input) && patterns.iter().all(static_pattern) && reads_no_input(init),
+        Expr::Limit { n, expr } | Expr::NthExpr { n, expr } => {
+            reads_no_input(n) && reads_no_input(expr)
+        }
+        Expr::Range { from, to, step } => {
+            reads_no_input(from)
+                && to.as_deref().map_or(true, reads_no_input)
+                && step.as_deref().map_or(true, reads_no_input)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a destructuring pattern names only literal keys, so [`reads_no_input`] need not ask
+/// what a computed key (`{(f): $v}`) reads.
+fn static_pattern(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Var(_) => true,
+        Pattern::Array(items) => items.iter().all(static_pattern),
+        Pattern::Object(entries) => entries.iter().all(|entry| {
+            !matches!(entry.key, ObjectKey::Expr(_)) && static_pattern(&entry.pattern)
+        }),
+    }
+}
+
+/// Whether nothing under `expr` reads input, writes output, stops the run, or calls anything this
+/// cannot see into (#7451): no `input`/`inputs`/`input_line_number`, `debug`, `stderr`, `halt`,
+/// `halt_error`, `system`, `eval`, `load`, `modulemeta` or `shuffle`, no call to a `def`, no `as`
+/// binding's marker or deferred binding, and no `?//` chain, whose body a consumer's stop runs again. Running such an expression twice, or once more than
+/// jq would, is observable only in the time it takes.
+fn has_no_effect(expr: &Expr) -> bool {
+    !crate::jq::walk::any_subexpr(expr, &mut |e| match e {
+        Expr::Builtin(builtin) => matches!(
+            builtin,
+            Builtin::Input
+                | Builtin::Inputs
+                | Builtin::InputLineNumber
+                | Builtin::Debug
+                | Builtin::DebugMsg(_)
+                | Builtin::Stderr
+                | Builtin::Halt
+                | Builtin::HaltError
+                | Builtin::HaltErrorCode(_)
+                | Builtin::System(..)
+                | Builtin::EvalExpr(..)
+                | Builtin::Load(..)
+                | Builtin::ModuleMeta
+                | Builtin::Shuffle
+        ),
+        Expr::TrackedVar(marker) => !marker.fold_share,
+        // A `?//` chain anywhere: a consumer's stop runs its body again (#2180).
+        Expr::AsPattern { patterns, .. } => patterns.len() > 1,
+        Expr::FuncDef { .. }
+        | Expr::FuncCall { .. }
+        | Expr::DefCall { .. }
+        | Expr::NamespacedCall { .. }
+        | Expr::Shared(_)
+        | Expr::DeferredVar(_) => true,
+        _ => false,
+    })
+}
+
 /// [`closed_expr_to_owned`], with a depth guard over the array/object
 /// shapes `owned_to_expr_at_depth` builds.
 ///
@@ -16222,13 +16500,13 @@ fn owned_assign_step<S: EvalSemantics>(
                             op, left, right, ..
                         },
                     ) if matches!(left.as_ref(), Expr::Identity) => {
-                        match closed_expr_to_owned::<S>(right) {
+                        match closed_operand_to_owned::<S>(right) {
                             Some(right) => OwnedAssignRhs::Combine(*op, right),
                             None if owned_state_expr_shape(right) => OwnedAssignRhs::Filter(filter),
                             None => return None,
                         }
                     }
-                    (None, other) => match closed_expr_to_owned::<S>(other) {
+                    (None, other) => match closed_operand_to_owned::<S>(other) {
                         Some(value) => OwnedAssignRhs::Value(value),
                         None if owned_state_expr_shape(other) => OwnedAssignRhs::Filter(other),
                         None => return None,
@@ -16710,12 +16988,15 @@ fn owned_state_expr_shape_in(expr: &Expr, calls: bool) -> bool {
         Expr::Paren(inner) | Expr::Negate(inner) => shape(inner),
         // #6567: `.[K]` of single-output operands is one value (or a raise, which declines).
         Expr::IndexExpr { target, key } => shape(target) && shape(key),
-        // `[]`, `[a, b]` and `[a]`: each element is one value, so the array is one.
-        Expr::Array(inner) => match inner.as_ref() {
-            Expr::Builtin(Builtin::Empty) => true,
-            Expr::Comma(items) => items.iter().all(shape),
-            single => shape(single),
-        },
+        // `[]`, `[a, b]` and `[a]`: each element is one value, so the array is one. #7451: so is a
+        // collect of anything that reads no input ([`input_free_collect`]), `[range(3)]`.
+        Expr::Array(inner) => {
+            (match inner.as_ref() {
+                Expr::Builtin(Builtin::Empty) => true,
+                Expr::Comma(items) => items.iter().all(shape),
+                single => shape(single),
+            }) || input_free_collect(expr)
+        }
         Expr::Object(entries) => entries.iter().all(|entry| {
             shape(&entry.value)
                 && match &entry.key {
@@ -16796,7 +17077,7 @@ fn owned_assign_operand_off_the_tree<S: EvalSemantics>(
     expr: &Expr,
     state: &OwnedValue,
 ) -> Option<OwnedValue> {
-    if let Some(value) = closed_expr_to_owned::<S>(expr) {
+    if let Some(value) = closed_operand_to_owned::<S>(expr) {
         return Some(value);
     }
     if S::TAG != EvalTag::Jq
@@ -17470,7 +17751,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // 2-term one, and settling operands that call no `def` loses. Kept as is;
     // the numbers and the evidence are in
     // docs/optimizations/jq-settled-operands.md.
-    if settles_both(left, right) {
+    if operands_settle::<S>(left, right) {
         binary_fanout_each_with::<W, S>(
             settled_operand_strategy(each_operand),
             left,
@@ -33290,6 +33571,11 @@ fn refuse_unknown_group_option(rest: &[char]) -> Result<(), EvalError> {
         Some('-') if !rest.get(1).is_some_and(char::is_ascii_digit) => {}
         // `(?)`: no option at all.
         Some(')') => return Err(EvalError::new("Regex failure: undefined group option")),
+        // #7689: a sign Oniguruma's Perl syntax opens no group with (`(?}`, `(??`, `(?|`, `(?[`,
+        // `(? `), which the `regex` crate refuses in its own words or reads as something else.
+        Some(c) if " \"$%*+,./;?@[\\]^_`|}".contains(*c) => {
+            return Err(EvalError::new("Regex failure: undefined group option"))
+        }
         _ => return Ok(()),
     }
     if rest.starts_with(&['R', ')']) {
@@ -34567,6 +34853,8 @@ fn translate_posix_brackets_scan(
     // item to jq: a repeat operator after it has nothing to repeat.
     let mut prev_option_group = false;
     let mut group_facts: Option<GroupFacts> = None;
+    // A refusal Oniguruma makes only after reading the whole pattern (#7689).
+    let mut late_refusal: Option<EvalError> = None;
     // The extended mode's ignored blanks are invisible to this scan (`^ *` is a repeated
     // assertion there), so a pattern in that mode is not judged as written: `translate_posix_brackets`
     // runs the scan again over the pattern without the blanks and comments (#6215, #6249) and keeps
@@ -34688,14 +34976,23 @@ fn translate_posix_brackets_scan(
                 ));
             }
             // #6070: the escapes Oniguruma reads that the `regex` crate refuses or reads another way.
-            if let Some((text, used)) = rewrite_onig_escape(
+            // #7689: a backreference to a group the pattern does not have is refused once the
+            // pattern has been read, so an error after it comes first (`\2\` ends at an escape).
+            let escape = match rewrite_onig_escape(
                 &chars,
                 i,
                 depth > 0,
                 class_from,
                 groups_opened,
                 &mut group_facts,
-            )? {
+            ) {
+                Err(refusal) if refusal.to_string().ends_with("invalid backref number/name") => {
+                    late_refusal.get_or_insert(refusal);
+                    None
+                }
+                other => other?,
+            };
+            if let Some((text, used)) = escape {
                 // #6240: a byte run no character has is a member of its own after a `-` that is
                 // itself a member (`[a-c-\xED\xA0\x80]`), which the `regex` crate would read as the
                 // start of a range up to a nested class.
@@ -34777,6 +35074,12 @@ fn translate_posix_brackets_scan(
                         let name = &chars[i + 3..i + 3 + close];
                         let caret = name.first() == Some(&'^');
                         let raw: String = name[usize::from(caret)..].iter().collect();
+                        // #7689: an empty name is refused where it stands, before a later error.
+                        if raw.is_empty() {
+                            return Err(EvalError::new(
+                                "Regex failure: invalid character property name {}",
+                            ));
+                        }
                         match property_name_kind(&raw) {
                             PropertyName::Refused => {
                                 return Err(EvalError::new(format!(
@@ -35084,6 +35387,54 @@ fn translate_posix_brackets_scan(
                 if wrapped.pop() == Some(true) {
                     out.push(')');
                 }
+            } else if c == ')' {
+                // #7689: Oniguruma refuses a `)` that closes no group where it reads it, before an
+                // error later in the pattern (`)\` ends at an escape, `\2)` names a group the
+                // pattern does not have, which Oniguruma checks once it has read it all). An error
+                // before it that a later pass words (`\k<x>)`, `(*a))`) still comes first.
+                let mut before: String = if extended {
+                    "(?x)".into()
+                } else {
+                    String::new()
+                };
+                before.extend(&chars[..i]);
+                const LATE: [&str; 5] = [
+                    "end pattern with unmatched parenthesis",
+                    "end pattern in group",
+                    "invalid backref number/name",
+                    "undefined group",
+                    "never ending recursion",
+                ];
+                // The text before it is read whole, with the checks that follow this scan (a
+                // repeated assertion, `(?=a)*)`; under `x`, a repeat with no target, `*+)`), then in
+                // the words of the pass after it. A call `\g<x>` is resolved once the pattern has been
+                // read, so its refusal is a late one.
+                let prefix: String = chars[..i].iter().collect();
+                let calls_only = |message: &String| {
+                    message
+                        .strip_prefix("undefined name <")
+                        .is_some_and(|rest| {
+                            let name = rest.split('>').next().unwrap_or_default();
+                            !prefix.contains(&format!("\\k<{name}>"))
+                                && !prefix.contains(&format!("\\k'{name}'"))
+                        })
+                };
+                let earlier = translate_posix_brackets(&prefix, extended, ignore_case)
+                    .err()
+                    .and_then(|refusal| {
+                        refusal
+                            .to_string()
+                            .strip_prefix("Regex failure: ")
+                            .map(String::from)
+                    })
+                    .or_else(|| oniguruma_refusal(&before))
+                    .filter(|message| {
+                        !LATE.iter().any(|late| message.contains(late)) && !calls_only(message)
+                    });
+                return Err(EvalError::new(format!(
+                    "Regex failure: {}",
+                    earlier.as_deref().unwrap_or("unmatched close parenthesis")
+                )));
             }
             // #6068: a `{` that does not open `{n}`, `{n,}` or `{n,m}` is the literal brace in
             // Oniguruma (`a{ 1}`, `a{1 }`, `a{1, 2}`, `a{,2}`); the `regex` crate allows blanks
@@ -35198,6 +35549,9 @@ fn translate_posix_brackets_scan(
     // #6229: a class still open at the end of the pattern.
     if depth > 0 {
         return Err(EvalError::new("Regex failure: premature end of char-class"));
+    }
+    if let Some(refusal) = late_refusal {
+        return Err(refusal);
     }
     Ok(if changed {
         std::borrow::Cow::Owned(out)
@@ -37806,9 +38160,12 @@ fn build_regex_uncached<S: EvalSemantics>(
         // (`a??++` is `(?>a*?)`), one quantifier per item, before the possessive scan reads it.
         let stacked = super::onig_quantifier::rewrite(pattern, extended);
         let pattern = stacked.as_deref().unwrap_or(pattern);
+        // #7689: the possessive scan's refusal is succinctly's own, of a pattern jq reads, so an error
+        // jq reports (`*+a` is `target of repeat operator is not specified`) comes before it.
+        let mut possessive_refusal = None;
         let scanned =
             refuse_possessive_quantifier_for(pattern, extended, n_flag).unwrap_or_else(|refusal| {
-                deferred_refusal.get_or_insert(refusal);
+                possessive_refusal = Some(refusal);
                 std::borrow::Cow::Borrowed(pattern)
             });
         let scanned = match escape_class_range_dashes(&scanned, extended) {
@@ -37832,7 +38189,11 @@ fn build_regex_uncached<S: EvalSemantics>(
                 None => scanned,
             }
         };
-        match translate_posix_brackets(&scanned, extended, flags.is_some_and(|f| f.contains('i'))) {
+        let translated = match translate_posix_brackets(
+            &scanned,
+            extended,
+            flags.is_some_and(|f| f.contains('i')),
+        ) {
             // #6108: a group repeated `{0}` keeps its capture slot.
             Ok(translated) => {
                 // #6196: each backreference carries the case mode in force where it stands.
@@ -37853,7 +38214,11 @@ fn build_regex_uncached<S: EvalSemantics>(
                 deferred_refusal.get_or_insert(refusal);
                 String::new()
             }
+        };
+        if let Some(refusal) = possessive_refusal {
+            deferred_refusal.get_or_insert(refusal);
         }
+        translated
     };
 
     // Apply flags
@@ -38340,6 +38705,38 @@ fn oniguruma_refusal(pattern: &str) -> Option<String> {
     oniguruma_refusal_within(pattern, 8)
 }
 
+/// Oniguruma's refusal of the callout whose name starts `rest` (the text after `(*`, #7689): a
+/// name is a letter or `_` and then letters, digits and `_`, closed by `)` or followed by its `[tag]`
+/// or `{args}`. `None` for a name jq knows, whose callout it runs.
+#[cfg(feature = "regex")]
+fn callout_refusal(rest: &str) -> Option<String> {
+    let Some(first) = rest.chars().next() else {
+        return Some("invalid callout pattern".into());
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Some("invalid callout name".into());
+    }
+    let len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    match rest[len..].chars().next() {
+        None => Some("end pattern in group".into()),
+        Some(')' | '[' | '{') => {
+            const BUILTIN: [&str; 7] = [
+                "FAIL",
+                "MISMATCH",
+                "ERROR",
+                "MAX",
+                "COUNT",
+                "TOTAL_COUNT",
+                "CMP",
+            ];
+            (!BUILTIN.contains(&&rest[..len])).then(|| "undefined callout name".into())
+        }
+        Some(_) => Some("invalid callout name".into()),
+    }
+}
+
 /// [`oniguruma_refusal`], which may read past a construct the crate cannot parse but jq accepts
 /// (a reference to a group the pattern has, a `(?'name'...)` group) by writing it as one the crate
 /// reads and looking again, up to `retries` times, for an error Oniguruma would meet later.
@@ -38372,6 +38769,13 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 }
                 ErrorKind::GroupUnclosed => Some(UNMATCHED_OPEN.into()),
                 ErrorKind::GroupUnopened => Some("unmatched close parenthesis".into()),
+                // #7689: `(*` opens a callout by name in Oniguruma, which the crate reads as a repeat
+                // of nothing. One of jq's builtin callouts (`(*MAX{2})`) has no refusal to word.
+                ErrorKind::RepetitionMissing
+                    if at(start).starts_with('*') && pattern.get(..start)?.ends_with('(') =>
+                {
+                    callout_refusal(at(start + 1))
+                }
                 // jq 1.8.2's parse depth limit, which `ONIG_NEST_LIMIT` is the crate's name for (#7528).
                 ErrorKind::NestLimitExceeded(_) => Some("parse depth limit over".into()),
                 ErrorKind::RepetitionCountInvalid => {
@@ -38414,9 +38818,17 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                         '\''
                     };
                     let Some((name, _)) = at(start + 3).split_once(close) else {
+                        // #7689: `\k<` and `\g<` with nothing after them.
+                        if at(start + 3).is_empty() {
+                            return Some("group name is empty".into());
+                        }
                         // `\k<x`: the name runs to the end of the pattern.
                         return Some(format!("invalid group name <{}>", at(start + 3)));
                     };
+                    // #7689: `\k<>`, `\g<>`, `\k''`.
+                    if name.is_empty() {
+                        return Some("group name is empty".into());
+                    }
                     let end = start + 3 + name.len() + 1;
                     let rewritten = || format!("{}(?:){}", &pattern[..start], at(end));
                     let numbered = name.strip_prefix(['-', '+']).unwrap_or(name);
@@ -38490,6 +38902,8 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 {
                     match at(start + 1).split_once('\'') {
                         Some((name, rest)) => retry(format!("{}<{name}>{rest}", &pattern[..start])),
+                        // #7689: `(?'` with nothing after it.
+                        None if at(start + 1).is_empty() => Some("group name is empty".into()),
                         // The name stops at the group's `)` when it has one (`(?'na)`).
                         None => Some(format!(
                             "invalid group name <{}>",
@@ -42341,6 +42755,9 @@ fn fanout_regex_pattern_with_collected_flags<'a, W: Clone + AsRef<[u64]>, S: Eva
                 // with no flags value there is no `match($re; ...)` call to
                 // evaluate, so `$re` is never inspected: `"abc" |
                 // [split(1; empty)]` is `[["abc"]]` in jq, not a type error.
+                // Nor is the input's: a non-string one is sliced whole
+                // (`null | split("b"; empty)` is `[null]`, #7560), see
+                // `unsplit_non_string`.
                 None => body("", &flags),
             }
         },
@@ -42723,6 +43140,13 @@ fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(cow) => cow.into_owned(),
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
+        _ if global_flags.is_empty() => {
+            return match unsplit_non_string::<W, S>(value) {
+                Ok(piece) => QueryResult::Owned(OwnedValue::array_from(vec![piece])),
+                Err(e) if suppresses(&e, optional) => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            }
+        }
         _ if optional => return QueryResult::None,
         _ => {
             return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy::<S, _>(value)))
@@ -42761,6 +43185,31 @@ fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         .collect();
 
     QueryResult::Owned(OwnedValue::array_from(parts))
+}
+
+/// The one piece `split(re; flags)` and `splits(re; flags)` cut from a non-string input when
+/// `flags` yields nothing (#7560).
+///
+/// jq 1.7.1 defines `splits($re; flags)` as `. as $s | [match($re; "g" + flags) | (.offset,
+/// .offset + .length)] | [0] + . + [$s | length] | _nwise(2) | $s[.[0]:.[1]]`: with no flags value
+/// no `match` runs, so nothing checks the input's type, and the one pair is `[0, ($s | length)]`.
+/// The piece is therefore `$s[0:($s | length)]`, which is `null` for `null` and the array itself
+/// for an array; a boolean has no length, and a number or an object cannot be sliced. jq 1.8.2
+/// binds `$flags` as a value and yields nothing instead, from a refactor (jqlang/jq#3260) that
+/// upstream does not call a fix, so 1.7.1 is the reference.
+#[cfg(feature = "regex")]
+fn unsplit_non_string<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'_, W>,
+) -> Result<OwnedValue, EvalError> {
+    let owned = to_owned::<S, _>(value)?;
+    match owned.type_name() {
+        "boolean" => Err(EvalError::has_no_length(&owned)),
+        container @ ("number" | "object") => {
+            Err(EvalError::cannot_index_with_type(container, "object"))
+        }
+        // `null`, an array, and a string (which the callers split themselves).
+        _ => Ok(owned),
+    }
 }
 
 /// Builtin: splits(re; flags) - split by regex with flags as stream
@@ -42839,6 +43288,13 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(cow) => cow.into_owned(),
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
+        _ if global_flags.is_empty() => {
+            return match unsplit_non_string::<W, S>(&value) {
+                Ok(piece) => QueryResult::Owned(piece),
+                Err(e) if suppresses(&e, optional) => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            }
+        }
         _ if optional => return QueryResult::None,
         _ => {
             return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy::<S, _>(
@@ -44358,7 +44814,7 @@ pub(crate) fn index_one_owned_read_of<S: EvalSemantics>(
 /// technique #1612/#1017 already established for this bug class:
 /// `arith_mul`'s string-repeat guard, `pad_with_nulls`'s array-grow
 /// guard). `err` supplies the caller's own `EvalError` message in place of
-/// a hardcoded one -- shared with [`cartesian_product`], whose own call
+/// a hardcoded one -- shared with [`CombinationRows::collect`], whose own call
 /// sites (`combinations`) never index anything, so `cannot_reserve_cross_
 /// product`'s "computed-index expansion" wording would mislead there
 /// (#1721); `factors` there is unrelated to any key/target below.
@@ -44378,11 +44834,11 @@ pub(crate) fn index_one_owned_read_of<S: EvalSemantics>(
 /// key/pair, that single upfront reservation stopped being computable at
 /// all, and each site moved to reserving per-item instead -- removing
 /// `try_reserve_product`'s last caller (#2139) once #2245 had already
-/// removed the other. This function remains for [`cartesian_product`],
+/// removed the other. This function remains for [`CombinationRows::collect`],
 /// whose factors (its own multiple input lists) are still fixed for the
 /// whole call, unlike a per-key target's.
 ///
-/// `cartesian_product`'s own `lens` (each input array's already-known
+/// `CombinationRows::collect`'s own `lens` (each input array's already-known
 /// length) -- and every one of the former call sites' `keys`/`ts`/
 /// `starts`/`ends`/`target_branches` before them -- are already-
 /// materialized `Vec`s by the time any caller runs, so unlike #1612's
@@ -92953,7 +93409,7 @@ fn owned_arith_accumulator_shape<S: EvalSemantics>(expr: &Expr) -> Option<(Arith
     // it reads off a literal that is not there is no output, not `null`: `. + [$i.a]` over an
     // absent `a` adds `[]`, not `[null]`. The closed walk then declines and the evaluator answers.
     let _read_only = S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(yq_read_only_context::enter);
-    Some((*op, closed_expr_to_owned::<S>(right.as_ref())?))
+    Some((*op, closed_operand_to_owned::<S>(right.as_ref())?))
 }
 
 /// `. + a + b - c`: a left-associated chain of arithmetic on the accumulator, each right
@@ -92975,7 +93431,7 @@ fn owned_arith_chain_shape<S: EvalSemantics>(expr: &Expr) -> Option<Vec<(ArithOp
         else {
             return None;
         };
-        links.push((*op, closed_expr_to_owned::<S>(right.as_ref())?));
+        links.push((*op, closed_operand_to_owned::<S>(right.as_ref())?));
         match left.as_ref() {
             Expr::Identity => break,
             next @ Expr::Arithmetic { .. } => at = next,
@@ -94220,7 +94676,7 @@ fn owned_slice_arith_step<S: EvalSemantics>(
     if !matches!(state, OwnedValue::Array(_) | OwnedValue::String(_)) {
         return OwnedStep::Declined(state);
     }
-    let Some(rhs) = closed_expr_to_owned::<S>(right) else {
+    let Some(rhs) = closed_operand_to_owned::<S>(right) else {
         return OwnedStep::Declined(state);
     };
     match try_eval_owned_step::<S>(slice, state) {
@@ -100890,8 +101346,12 @@ pub(crate) enum RangeNum {
 }
 
 impl RangeNum {
-    pub(crate) fn as_f64(self) -> f64 {
+    /// The double the walk steps with: in jq mode (`jq_doubles`) an integer widens with jq's
+    /// 17-digit literal rounding ([`jq_literal_int_to_f64`], #7731), what `jv_number_value` gives
+    /// jq's `RANGE` opcode and its `. + $by`; in yq mode with a plain cast, as yq's `int64` does.
+    pub(crate) fn as_f64(self, jq_doubles: bool) -> f64 {
         match self {
+            Self::Int(i) if jq_doubles => jq_literal_int_to_f64(i),
             Self::Int(i) => i as f64,
             Self::Float(f) => f,
         }
@@ -101351,11 +101811,18 @@ fn range_batch_f64(
     // downstream re-derives or cross-checks it against `from`, so a future
     // caller passing some other variant (or a value numerically unequal to
     // `from`) would silently splice a wrong value into a numeric range's
-    // output with no other defense.
+    // output with no other defense. #7731 adds the one other: an `Int` past 2^53, the integer
+    // `from` itself.
     // `map_or(true, ..)` rather than `is_none_or`: clippy's `msrv` (clippy.toml) is
     // 1.73 and `Option::is_none_or` is 1.82.
     debug_assert!(
-        first_value.map_or(true, |v| matches!(v, OwnedValue::NumberLiteral(..))),
+        first_value.map_or(true, |v| match v {
+            OwnedValue::NumberLiteral(..) => true,
+            OwnedValue::Int(i) => {
+                !jq_int_within_exact_f64_range(*i) && jq_literal_int_to_f64(*i) == from
+            }
+            _ => false,
+        }),
         "range's first_value override must be a NumberLiteral, got {first_value:?}"
     );
     let mut first_value = first_value;
@@ -101488,10 +101955,46 @@ fn drive_range_batches<T>(
 
 /// `range(from; to; step)` over numbers, handed to `each` in batches of at most
 /// [`MAX_RANGE`] values and at most `cap` in all (callers pass
-/// [`MAX_RANGE_TOTAL`]): integers when all three operands are, floats
-/// otherwise (`implicit_step`: see [`range_batch_f64`]). `from_literal` is the
-/// first value's source spelling (#3103); see [`range_from_literal_override`].
-pub(crate) fn each_range_batches(
+/// [`MAX_RANGE_TOTAL`]): integers when all three operands are and, in jq mode,
+/// lie within ±2^53, floats otherwise (`implicit_step`: see [`range_batch_f64`]).
+/// `from_literal` is the first value's source spelling (#3103); see
+/// [`range_from_literal_override`].
+///
+/// jq steps in doubles (#7731): `range/2` is the `RANGE` opcode,
+/// `jv_number(jv_number_value(v) + 1)` compared with `>=`, and `range/3` is
+/// `$from | while(. < $upto; . + $by)`. Within ±2^53 every value, every sum
+/// that can still be below `to` and every comparison is exact in a double, so the
+/// `i64` walk is that walk value for value; past it a sum rounds
+/// (`-9007199254740994 + 1` is `-9007199254740992`) and the walk takes jq's
+/// doubles, `from` itself first as jq emits `$from`. yq's integers are exact
+/// `int64`, so yq mode keeps the `i64` walk at every magnitude.
+#[inline]
+pub(crate) fn each_range_batches<S: EvalSemantics>(
+    from: RangeNum,
+    to: RangeNum,
+    step: RangeNum,
+    implicit_step: bool,
+    from_literal: Option<&OwnedValue>,
+    cap: usize,
+    each: &mut dyn FnMut(Vec<OwnedValue>) -> Demand,
+) -> RangeEnd {
+    each_range_batches_in(
+        S::TAG == EvalTag::Jq,
+        from,
+        to,
+        step,
+        implicit_step,
+        from_literal,
+        cap,
+        each,
+    )
+}
+
+/// [`each_range_batches`] for both modes in one instance (`jq_doubles` in jq mode): the
+/// `i64` walk it shares is the hot loop of every `range`, and a copy per mode moved it.
+#[allow(clippy::too_many_arguments)]
+fn each_range_batches_in(
+    jq_doubles: bool,
     from: RangeNum,
     to: RangeNum,
     step: RangeNum,
@@ -101509,24 +102012,40 @@ pub(crate) fn each_range_batches(
         // literal generally renders identically to its own `i64`, but `-0` is the one
         // legal-JSON exception.
         //
-        // Only that `-0` is kept here: any other integer literal, #6064's past-2^53 one
-        // included, is the same `i64` the walk pushes, as an exact `Int`. The float arm
-        // below keeps every literal [`range_from_literal_override`] returns.
-        (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => drive_range_batches(
-            f,
-            cap,
-            |from, max_len| {
-                let first = first_value
-                    .take()
-                    .filter(|v| matches!(v, OwnedValue::NumberLiteral(NumberRepr::Int(0), _)));
-                range_batch_int(from, t, st, first, max_len)
-            },
-            each,
-        ),
-        (f, t, st) => {
-            let (t, st) = (t.as_f64(), st.as_f64());
+        // Only that `-0` is kept here: within ±2^53 any other integer literal is the same
+        // `i64` the walk pushes, as an exact `Int`. The float arm below keeps every
+        // literal [`range_from_literal_override`] returns.
+        (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st))
+            if !jq_doubles
+                || (jq_int_within_exact_f64_range(f)
+                    && jq_int_within_exact_f64_range(t)
+                    && jq_int_within_exact_f64_range(st)) =>
+        {
             drive_range_batches(
-                f.as_f64(),
+                f,
+                cap,
+                |from, max_len| {
+                    let first = first_value
+                        .take()
+                        .filter(|v| matches!(v, OwnedValue::NumberLiteral(NumberRepr::Int(0), _)));
+                    range_batch_int(from, t, st, first, max_len)
+                },
+                each,
+            )
+        }
+        (f, t, st) => {
+            // #7731: an integer `from` a double cannot hold is emitted as itself, as jq emits
+            // `$from`, when it has no literal spelling to keep instead (a document's integer).
+            let exact_from;
+            if let (None, RangeNum::Int(i)) = (first_value, f) {
+                if !jq_int_within_exact_f64_range(i) {
+                    exact_from = OwnedValue::Int(i);
+                    first_value = Some(&exact_from);
+                }
+            }
+            let (t, st) = (t.as_f64(jq_doubles), st.as_f64(jq_doubles));
+            drive_range_batches(
+                f.as_f64(jq_doubles),
                 cap,
                 |from, max_len| {
                     range_batch_f64(from, t, st, implicit_step, first_value.take(), max_len)
@@ -101544,7 +102063,7 @@ pub(crate) fn each_range_batches(
 /// decimals there: a step literal too small for a double (`1e-1000`, `-1e-400`) is not zero, and
 /// the first `$from < $upto`, the one comparison of two literals before `+ $by` computes, can
 /// differ from the doubles' when they tie (`range(0; 1e-1000; 1)` is `[0]`), unless both are
-/// integers, which the `i64` walk compares exactly already. jq mode only; `range/1`
+/// integers within ±2^53, which the `i64` walk compares exactly already. jq mode only; `range/1`
 /// and `range/2` are jq's C opcode, which compares doubles, and yq's numbers are doubles.
 /// Whether `range(from; to; step)` (`implicit_step` for `range/1` and `range/2`) takes the numeric
 /// walk ([`each_range_batches`]) rather than [`range_values_generic`], once [`range_num`] has found all
@@ -101568,22 +102087,31 @@ pub(crate) fn range_reads_literals<S: EvalSemantics>(
     if S::TAG != EvalTag::Jq {
         return false;
     }
+    // The doubles the walk would compare: an integer literal widens as jq's does (#7731).
+    let walk_f64 = |v: &OwnedValue| match v {
+        OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Some(int_to_f64::<S>(*i)),
+        _ => v.as_f64(),
+    };
     let double_ties = |a: &OwnedValue, b: &OwnedValue| {
         matches!(a, OwnedValue::NumberLiteral(..))
             && matches!(b, OwnedValue::NumberLiteral(..))
-            && a.as_f64() == b.as_f64()
+            && walk_f64(a) == walk_f64(b)
             && jq_numeric_cmp(a, b) != Some(Ordering::Equal)
     };
-    // Two integers keep the exact `i64` walk, which already compares them exactly (and past
-    // `2^53` keeps every value, the recorded #2131 divergence from jq's doubles).
-    let both_ints = matches!(
-        (from, to),
+    // Two integers within ±2^53 keep the exact `i64` walk, which compares them exactly, as
+    // decimals compare. Past it the walk is doubles (#7731), and two integer literals jq
+    // compares as decimals first (`range(9223372036854775806; 9223372036854775807; 1)` is
+    // `[9223372036854775806]`, where both bounds are the double 2^63), so they take the walk
+    // that compares as jq does.
+    let from_to_ints_within = match (from, to) {
         (
-            OwnedValue::NumberLiteral(NumberRepr::Int(_), _),
-            OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
-        )
-    );
-    double_ties(step, &definition_zero_for::<S>(step)) || (!both_ints && double_ties(from, to))
+            OwnedValue::NumberLiteral(NumberRepr::Int(a), _),
+            OwnedValue::NumberLiteral(NumberRepr::Int(b), _),
+        ) => Some(jq_int_within_exact_f64_range(*a) && jq_int_within_exact_f64_range(*b)),
+        _ => None,
+    };
+    double_ties(step, &definition_zero_for::<S>(step))
+        || from_to_ints_within.map_or_else(|| double_ties(from, to), |within| !within)
 }
 
 /// `range/3`'s fallback once at least one of `from`/`to`/`step` fails
@@ -109585,10 +110113,9 @@ fn each_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         return Flow::Stopped { pending: None };
                     }
                 }
-                // jq's `inputs` re-raises anything but `break` (#2961). A `break` read from the
-                // queue itself is a read the driver raised that error for -- `--seq`'s empty
-                // record (#5662) -- so `inputs` ends there, and the next read resumes.
-                InputPop::ParseError(error) if error.message == "break" => return Flow::Exhausted,
+                // jq's `inputs` re-raises anything but `break` (#2961). (No reader queues a
+                // `break` since #7718: jq 1.7.1's `--seq` driver raised one at an empty record in
+                // its last buffer, #5662, and jq 1.8.2's does not.)
                 InputPop::ParseError(error) => return Flow::Escaped(Control::Error(error)),
                 InputPop::Exhausted => return Flow::Exhausted,
             }
@@ -109727,6 +110254,17 @@ fn broken_down_seconds(second: i64, raw: f64) -> f64 {
 /// practically-relevant range, confirmed by bisection up to ~1e16 seconds
 /// from the epoch in both directions.
 fn broken_down_time_from_unix_secs(secs: i64) -> Result<BrokenDownTime, EvalError> {
+    let t = civil_time_from_unix_secs(secs)?;
+    if t.year < i64::from(i32::MIN) || t.year > i64::from(i32::MAX) {
+        return Err(EvalError::datetime_out_of_range());
+    }
+    Ok(t)
+}
+
+/// [`broken_down_time_from_unix_secs`] without its year bound: the civil fields of `secs` for any
+/// year `i64` arithmetic reaches. `timegm`'s normalisation (#7606) bounds `tm_year`, the year less
+/// 1900, instead.
+fn civil_time_from_unix_secs(secs: i64) -> Result<BrokenDownTime, EvalError> {
     // Days since Unix epoch (Jan 1, 1970)
     let days = if secs >= 0 {
         secs / 86400
@@ -109752,10 +110290,6 @@ fn broken_down_time_from_unix_secs(secs: i64) -> Result<BrokenDownTime, EvalErro
     let day = (doy - (153 * mp + 2) / 5 + 1) as i64;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = y + i64::from(month <= 2);
-
-    if year < i64::from(i32::MIN) || year > i64::from(i32::MAX) {
-        return Err(EvalError::datetime_out_of_range());
-    }
 
     // Calculate weekday (0 = Sunday, 6 = Saturday)
     // Jan 1, 1970 was a Thursday (4)
@@ -109883,7 +110417,30 @@ fn jq_month_for_time(month: i64) -> i64 {
 /// jq's `timegm` path rejects dates normalized before 1900 from the year,
 /// month, day, hour, and minute fields, then adds the seconds field. It treats
 /// a final `-1` as its failure sentinel. `%s` prints it; `mktime` raises.
+///
+/// `f_mktime` also reads a final `-2` as its own "no `timegm` here" sentinel and raises `mktime
+/// not supported on this platform` for it (#7722), so the instant 1969-12-31T23:59:58Z is that
+/// error in jq 1.7.1 and 1.8.2 alike; it is the `Err` here.
 fn jq_timegm_secs(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Result<Option<i64>, EvalError> {
+    match jq_wall_clock_secs(year, month, day, hour, minute, second)? {
+        Some(-1) => Ok(None),
+        Some(-2) => Err(EvalError::new("mktime not supported on this platform")),
+        secs => Ok(secs),
+    }
+}
+
+/// [`jq_timegm_secs`] without the `-1` sentinel: the seconds a wall-clock reading is from the
+/// epoch as if it were UTC, `None` before 1900. `%s` subtracts the zone's offset from it, and the
+/// sentinel is the C conversion's answer for the resulting *instant*, not for the reading: under
+/// `TZ=Europe/Paris`, `[1969,11,31,23,59,59,3,364] | strflocaltime("%s")` is `"-3601"` (#7606).
+fn jq_wall_clock_secs(
     year: i64,
     month: i64,
     day: i64,
@@ -109903,7 +110460,12 @@ fn jq_timegm_secs(
     let secs = before_second
         .checked_add(second)
         .ok_or_else(EvalError::broken_down_time_out_of_range)?;
-    Ok((secs != -1).then_some(secs))
+    // `timegm` stores the normalised fields back, so it fails when the year less 1900 leaves C's
+    // `int` (#7723): `[2147485547,12,1,0,0,0,0,0] | mktime` is `invalid gmtime representation`.
+    if !civil_time_from_unix_secs(secs).is_ok_and(|t| i32::try_from(t.year - 1900).is_ok()) {
+        return Ok(None);
+    }
+    Ok(Some(secs))
 }
 
 /// The 8 fields of a broken-down-time array (`year, month, day, hour, minute,
@@ -109988,7 +110550,9 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(None) if optional => return QueryResult::None, // patchcov: coverage tolerate-line reason="`?` suppresses mktime's error outside builtin dispatch, so the optional flag is false even for an invalid date (#3083)"
         Ok(None) => return QueryResult::Error(EvalError::new("invalid gmtime representation")),
         Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable for mktime's C-int-clamped fields: checked civil-date arithmetic stays within i64; the guard protects other callers of the shared helpers (#3083)"
+        // `-2`'s `mktime not supported on this platform` (#7722); the range errors of the shared
+        // checked helpers are unreachable for C-int-clamped fields (#3083).
+        Err(e) => return QueryResult::Error(e),
     };
 
     QueryResult::Owned(OwnedValue::Float(timestamp as f64))
@@ -110214,6 +110778,14 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 });
             }
             t.second = jq_tm_field(broken_down_seconds(t.second, timestamp) as i64);
+            // #7606: jq 1.8.2 normalises that array before formatting it, which only moves
+            // anything when the seconds slot rounded up to 60 (`-1.0000000000000002` is
+            // `1970-01-01T00:00:00Z` there, `1969-12-31T23:59:60Z` in jq 1.7.1).
+            if t.second >= 60 {
+                if let Some(normalised) = normalised_broken_down_time(&t, local) {
+                    return Ok(normalised);
+                }
+            }
             Ok((t, zone))
         }
         // #1820: `scalar_decode_failure` first, same shape as
@@ -110254,6 +110826,12 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         weekday,
                         yearday,
                     };
+                    // #7606: jq 1.8.2 normalises the fields before formatting them (out-of-range
+                    // ones carry over, weekday and yearday are recomputed); jq 1.7.1 formats them
+                    // as given. A date before 1900 stays as given in both.
+                    if let Some(normalised) = normalised_broken_down_time(&t, local) {
+                        return Ok(normalised);
+                    }
                     // The fields already are local wall-clock time; the zone
                     // only labels them (`%z`, `%Z`, `%s`). `jq_month_for_time`:
                     // the month as the C time conversion sees it, not the
@@ -110277,6 +110855,45 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
     }
+}
+
+/// A broken-down time as jq 1.8.2 formats it after `jv2tm` has passed it through `timegm`
+/// (`mktime` with `tm_isdst = -1` when `local`), jqlang/jq#3203: out-of-range fields carry over
+/// (`[2024,5]`, May 0, is May 31) and the weekday and yearday are recomputed from the date, with
+/// the zone in effect at the resulting instant when `local`. `None` where the macOS conversion
+/// fails and leaves the fields as given: a date before 1900, by [`jq_timegm_secs`]'s rule.
+///
+/// jq 1.7.1 formats the fields as given; `succinctly jq` follows jq 1.8.2 (#7606), because 1.7.1's
+/// `todate` of out-of-range fields is text its own `fromdate` refuses (`"2024-14-35T25:61:61Z"`),
+/// its `%a` names the wrong weekday for a real date, and a short array (#7532) needs it.
+fn normalised_broken_down_time(
+    t: &BrokenDownTime,
+    local: bool,
+) -> Option<(BrokenDownTime, Option<LocalZone>)> {
+    let month = jq_month_for_time(t.month);
+    let wall = jq_wall_clock_secs(t.year, t.month, t.day, t.hour, t.minute, t.second).ok()??;
+    // `timegm` fails, leaving the fields as given, when the year less 1900 leaves C's `int`.
+    let civil = |secs: i64| {
+        civil_time_from_unix_secs(secs)
+            .ok()
+            .filter(|t| i32::try_from(t.year - 1900).is_ok())
+    };
+    if !local {
+        return Some((civil(wall)?, None));
+    }
+    // `mktime` reads the fields as a wall-clock reading in the local zone, then the
+    // instant it names is the one formatted, in the zone in effect at that instant.
+    let reading = local_zone::for_wall_clock(t.year, month, t.day, t.hour, t.minute, t.second);
+    let mut instant = wall.checked_sub(reading.offset_secs)?;
+    let mut zone = local_zone::zone_at(instant);
+    if zone.offset_secs != reading.offset_secs {
+        // A reading the zone skipped: `mktime` reads it with the offset in effect before the
+        // skip and lands past it (`TZ=Europe/Paris`, 2024-03-31 02:30 is 03:30 CEST).
+        instant = wall.checked_sub(zone.offset_secs)?;
+        zone = local_zone::zone_at(instant);
+    }
+    let local_secs = instant.checked_add(zone.offset_secs)?;
+    Some((civil(local_secs)?, Some(zone)))
 }
 
 /// `strftime`'s body, in UTC (`local: false`) or in the local zone
@@ -110309,7 +110926,7 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // Only these specifiers read the zone's labels; `E`/`O` modifiers
             // precede one of them, so the letters alone decide. A locale's own
             // `%c`/`%x`/`%X`/`%r` layout may also print the zone (#5754).
-            let labelled = fmt.bytes().any(|b| matches!(b, b'z' | b'Z' | b's'))
+            let labelled = fmt.bytes().any(|b| matches!(b, b'z' | b'Z' | b's' | b'+'))
                 || locale_time::layouts_may_name_the_zone(&fmt);
             let (t, zone) =
                 match broken_down_time_fields::<W, S>(&value, optional, local, labelled, name) {
@@ -110563,13 +111180,21 @@ fn format_strftime(
             }
             if let (
                 true,
-                Some(letter @ ('a' | 'A' | 'b' | 'B' | 'h' | 'p' | 'c' | 'x' | 'X' | 'r')),
+                Some(
+                    letter
+                    @ ('a' | 'A' | 'b' | 'B' | 'h' | 'p' | 'c' | 'x' | 'X' | 'r' | '+' | 'v'),
+                ),
             ) = (localized, spec)
             {
+                // `%+` is the locale's `date_fmt` in macOS's libc, and `%v` takes the locale's
+                // month abbreviation (#7784). glibc has neither (its `strftime` prints them as
+                // written), and there the pinned libc's C layout stands.
                 // A time the C library cannot hold (a year past `int`) gets the C rendering.
-                if let Some(text) = locale_time::render(&format!("%{letter}"), &tm) {
-                    result.push_str(&text);
-                    continue;
+                if !matches!(letter, '+' | 'v') || cfg!(target_vendor = "apple") {
+                    if let Some(text) = locale_time::render(&format!("%{letter}"), &tm) {
+                        result.push_str(&text);
+                        continue;
+                    }
                 }
             }
             match spec {
@@ -110663,7 +111288,7 @@ fn format_strftime(
                 // offset (#3046 review: `TZ=EST5EDT`, `0 |
                 // strflocaltime("%s")` is `"0"` in jq 1.7.1).
                 Some('s') => result.push_str(
-                    &match jq_timegm_secs(year, month, day, hour, minute, second)? {
+                    &match jq_wall_clock_secs(year, month, day, hour, minute, second)? {
                         Some(secs) => secs.checked_sub(zone_offset).ok_or_else(overflow)?,
                         None => -1,
                     }
@@ -110901,7 +111526,9 @@ fn strptime_name_len(
 /// - one `E` or `O`, before or after the width, which makes the specifier read as it does without
 ///   it; a second one is no match;
 /// - a `+` flag, which reads like no flag, only at the start or straight after that modifier
-///   (`%+Y`, `%E+Y`, `%+E+Y`; not `%++Y`, `%4+Y` or `%0+Y`);
+///   (`%+Y`, `%E+Y`, `%+E+Y`) and only before a specifier; any other `+` is the `%+`
+///   conversion, the locale's `date_fmt` (`%++Y`, `%4+Y` and `%0+Y` read it and then a `Y`,
+///   and so do `%+`, `%+%` and `%+ `, #7784);
 /// - a decimal width, the most digits a numeric field takes. A `0` before the digits is part of
 ///   them (`%04Y` is a width of 4, `%40Y` of 40), and a run of digits that is 0 changes nothing
 ///   (`%0d` is `%d`). A modifier ends a run, so a second run after it replaces the first
@@ -110920,7 +111547,7 @@ struct StrptimeSpecPrefix {
 }
 
 fn read_strptime_spec_prefix(
-    chars: &mut impl Iterator<Item = char>,
+    chars: &mut (impl Iterator<Item = char> + Clone),
     keep_consumed: bool,
 ) -> StrptimeSpecPrefix {
     let mut prefix = StrptimeSpecPrefix {
@@ -110932,7 +111559,8 @@ fn read_strptime_spec_prefix(
     };
     let mut flag_allowed = true;
     // The prefix so far ends in a modifier or a `+` flag, with no width after it. The libc refuses
-    // a `%` specifier then (`%+%`, `%E%`) and reads it after a width (`%5%`, `%E4%`, #5754).
+    // a `%` specifier then (`%E%`) and reads it after a width (`%5%`, `%E4%`, #5754); a `+` before
+    // a `%` is the `%+` conversion (#7784).
     let mut ends_in_marker = false;
     let mut run: Option<usize> = None;
     loop {
@@ -110950,11 +111578,16 @@ fn read_strptime_spec_prefix(
                 ends_in_marker = true;
                 run = None;
             }
-            Some('+') => {
-                if !flag_allowed {
-                    prefix.error = Some("a '+' flag after a width or another flag".to_string());
-                    return prefix;
-                }
+            // A `+` is a flag only where one may stand and when a specifier follows it; anywhere
+            // else it is `%+`, the locale's `date_fmt` layout (#7784). Apple's `strptime` reads it
+            // that way: a `+` followed by the end, a `%` or white space is the conversion.
+            Some('+')
+                if flag_allowed
+                    && chars
+                        .clone()
+                        .next()
+                        .is_some_and(|next| next != '%' && !is_c_space(next)) =>
+            {
                 flag_allowed = false;
                 ends_in_marker = true;
                 run = None;
@@ -110983,9 +111616,9 @@ fn read_strptime_spec_prefix(
     }
 }
 
-/// `fmt` with `%c`, `%x`, `%X` and `%r` replaced by the layout each stands for: the process
-/// locale's, else C's (`%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S`, `%I:%M:%S %p`), which is
-/// what the libc reads. A layout can name another (`en_US`'s `%c` holds `%X`), so this repeats
+/// `fmt` with `%c`, `%x`, `%X`, `%r` and `%+` replaced by the layout each stands for: the process
+/// locale's, else C's (`%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S`, `%I:%M:%S %p`, and
+/// `%a %b %e %H:%M:%S %Z %Y` for `%+`, #7784), which is what the libc reads. A layout can name another (`en_US`'s `%c` holds `%X`), so this repeats
 /// until none is left, to a bound that no locale's layouts reach.
 fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
     let names_a_layout = |text: &str| {
@@ -110993,7 +111626,9 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
         while let Some(c) = chars.next() {
             if c == '%' {
                 let prefix = read_strptime_spec_prefix(&mut chars, false);
-                if prefix.error.is_none() && matches!(prefix.spec, Some('c' | 'x' | 'X' | 'r')) {
+                if prefix.error.is_none()
+                    && matches!(prefix.spec, Some('c' | 'x' | 'X' | 'r' | '+'))
+                {
                     return true;
                 }
             }
@@ -111006,6 +111641,13 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
     let layouts = locale_time::layouts();
     let layout = |spec: char| -> &str {
         match (spec, layouts) {
+            (
+                '+',
+                Some(locale_time::Layouts {
+                    date_fmt: Some(f), ..
+                }),
+            ) => f.as_str(),
+            ('+', _) => "%a %b %e %H:%M:%S %Z %Y",
             ('c', Some(l)) => l.date_time.as_str(),
             ('x', Some(l)) => l.date.as_str(),
             ('X', Some(l)) => l.time.as_str(),
@@ -111029,7 +111671,7 @@ fn expand_strptime_layouts(fmt: &str) -> alloc::borrow::Cow<'_, str> {
             // modifier change nothing (#5754, #5989).
             let prefix = read_strptime_spec_prefix(&mut chars, true);
             match prefix.spec {
-                Some(spec @ ('c' | 'x' | 'X' | 'r')) if prefix.error.is_none() => {
+                Some(spec @ ('c' | 'x' | 'X' | 'r' | '+')) if prefix.error.is_none() => {
                     out.push_str(layout(spec));
                 }
                 _ => {
@@ -111962,7 +112604,8 @@ fn builtin_fromdateiso8601<W: Clone + AsRef<[u64]>>(
         Err(_) if optional => return QueryResult::None,
         Err(_) => return QueryResult::Error(EvalError::strptime_no_match(&input, FORMAT)),
     };
-    // ...then `mktime`'s own conversion, `-1` and the dates before 1900 it refuses included.
+    // ...then `mktime`'s own conversion, `-1`, `-2` (#7722) and the dates before 1900 it refuses
+    // included.
     match jq_timegm_secs(t.year, t.month, t.day, t.hour, t.minute, t.second) {
         Ok(Some(secs)) => QueryResult::Owned(OwnedValue::Float(secs as f64)),
         Ok(None) | Err(_) if optional => QueryResult::None,
@@ -113346,6 +113989,103 @@ fn empty_length_or_index_error<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// The product `combinations`/`combinations(n)` walk once their input has been read (#7726): at
+/// least one position, and a value at every position.
+///
+/// jq's definitions reach every position's error or emptiness on the way down to the first row
+/// (`.[0][] as $x | (.[1:] | combinations) as $w | ..` reads `.[1]` before the first row is out),
+/// so everything decided before this exists is decided before any row, whether the rows are then
+/// streamed ([`each_combinations`]) or collected ([`builtin_combinations`],
+/// [`builtin_combinations_n`]).
+enum CombinationRows {
+    /// Bare `combinations`: one position per input element, holding that element's values.
+    Positions(Vec<Vec<OwnedValue>>),
+    /// `combinations(n)`: the input's values at each of `width` positions.
+    Power { base: Vec<OwnedValue>, width: usize },
+}
+
+impl CombinationRows {
+    /// Hands each row to `emit` in jq's order, the last position turning fastest, until `emit`
+    /// asks for no more; answers `emit`'s last answer.
+    fn each_row(&self, emit: impl FnMut(OwnedValue) -> Demand) -> Demand {
+        match self {
+            Self::Positions(arrays) => mixed_radix_combinations(
+                arrays.len(),
+                |i| arrays[i].len(),
+                |indices| {
+                    arrays
+                        .iter()
+                        .zip(indices)
+                        .map(|(values, &k)| values[k].clone())
+                        .collect()
+                },
+                emit,
+            ),
+            Self::Power { base, width } => mixed_radix_combinations(
+                *width,
+                |_| base.len(),
+                |indices| indices.iter().map(|&k| base[k].clone()).collect(),
+                emit,
+            ),
+        }
+    }
+
+    /// Every row, collected, behind the refusals #1669 put on a product that cannot be held: the
+    /// row width, then the row count.
+    fn collect(&self) -> Result<Vec<OwnedValue>, EvalError> {
+        let mut results = match self {
+            Self::Positions(arrays) => {
+                // Guard the row width (arrays.len()) against the heaviest type that recurs at that
+                // length -- OwnedValue, not usize -- before building anything: many length-1
+                // factor arrays keep the product tiny while the row width stays unbounded (#1669
+                // review).
+                if Vec::<OwnedValue>::new()
+                    .try_reserve_exact(arrays.len())
+                    .is_err()
+                {
+                    return Err(cannot_allocate_combinations_count(arrays.len()));
+                }
+                let lens: Vec<usize> = arrays.iter().map(Vec::len).collect();
+                // `cannot_allocate_cartesian_product`'s own message, not `cannot_
+                // reserve_cross_product`'s: that one names ".[$keys]"-style computed indexing,
+                // which describes none of this builtin's own call sites (#1721).
+                try_reserve_product_labeled(&lens, cannot_allocate_cartesian_product)?
+            }
+            Self::Power { base, width } => {
+                // Two quantities, cheapest first (#1669 review): the row count `base^width` (pure
+                // arithmetic), then the row width, which `checked_combinations_len`'s `base <= 1`
+                // short-circuit leaves unbounded by the count.
+                let Some(total) = checked_combinations_len(base.len(), *width) else {
+                    return Err(cannot_allocate_combinations(base.len(), *width));
+                };
+                if Vec::<OwnedValue>::new().try_reserve_exact(*width).is_err() {
+                    return Err(cannot_allocate_combinations_count(*width));
+                }
+                let mut results = Vec::new();
+                if results.try_reserve_exact(total).is_err() {
+                    return Err(cannot_allocate_combinations(base.len(), *width));
+                }
+                results
+            }
+        };
+        self.each_row(|row| {
+            results.push(row);
+            Demand::Continue
+        });
+        Ok(results)
+    }
+}
+
+/// The widest row `combinations(n)` builds (#7726): `n` past 2^29 is refused before any row.
+///
+/// jq cannot answer such an `n` either: its definition collects `[range(n)]` first, which jq 1.8.2
+/// stops at `INT_MAX >> 2` with an assertion failure (`jv_is_valid(val)` in `stack_push`, captured
+/// for `[range(536870913)]`) and jq 1.7.1 grows without bound, and 1.7.1's recursion is quadratic
+/// in `n` besides (`first(combinations(30000))` on `{"a":[1]}` ran past 30 s and 7 GB). It is the
+/// bound [`MAX_PADDED_ARRAY_LEN`] puts on an index write, for the same reason: succinctly would
+/// write every element of the row.
+const MAX_COMBINATIONS_WIDTH: usize = MAX_PADDED_ARRAY_LEN;
+
 /// The values `.[0][]` iterates for one element of `combinations`' input (#4971): an array's elements or an
 /// object's values, and jq's `Cannot iterate over ..` for anything else.
 fn combinations_row<S: EvalSemantics>(element: &OwnedValue) -> Result<Vec<OwnedValue>, EvalError> {
@@ -113356,68 +114096,64 @@ fn combinations_row<S: EvalSemantics>(element: &OwnedValue) -> Result<Vec<OwnedV
     }
 }
 
-/// Builtin: combinations - generate all combinations from array of arrays
-/// Input: [[1,2], [3,4]] -> outputs [1,3], [1,4], [2,3], [2,4]
-fn builtin_combinations<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    value: StandardJson<'_, W>,
+/// An array's elements, owned, or the answer for one that cannot be decoded (#1755: to_owned, not
+/// to_owned_lossy -- an undecodable element must raise, not silently become "" and take part in the
+/// product; #1953: a non-decode-failure error respects `optional`).
+fn combinations_owned_elements<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    elements: impl Iterator<Item = StandardJson<'a, W>>,
     optional: bool,
-) -> QueryResult<'_, W> {
+) -> Result<OwnedValue, QueryResult<'a, W>> {
+    match elements
+        .map(|v| to_owned::<S, _>(&v))
+        .collect::<Result<Vec<OwnedValue>, EvalError>>()
+    {
+        Ok(items) => Ok(OwnedValue::array_from(items)),
+        Err(e) => Err(suppress_or_raise(e, optional)),
+    }
+}
+
+/// [`CombinationRows`] for bare `combinations` on `value`, or its whole answer when there is no
+/// product to walk.
+fn combinations_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'a, W>,
+    optional: bool,
+) -> Result<CombinationRows, QueryResult<'a, W>> {
     // jq: `def combinations: if length == 0 then [] else .[0][] as $x | (.[1:] | combinations) as $w | [$x] + $w end`.
     // The elements are read in order, and the first one that is empty (no output at all) or not iterable (the
     // error) decides: later elements are never reached (#4971).
-    let arrays = match &value {
-        StandardJson::Array(elements) => {
-            let mut arrays: Vec<Vec<OwnedValue>> = Vec::new();
-            for elem in *elements {
-                // #1755: to_owned, not to_owned_lossy -- an undecodable element must raise, not silently
-                // become "" and take part in the product. #1953: a non-decode-failure error respects `optional`.
-                let owned = match elem {
-                    StandardJson::Array(inner) => {
-                        OwnedValue::array_from(to_owned_vec_or_suppress!(inner, optional))
-                    }
-                    other => to_owned_lossy::<S, _>(&other),
-                };
-                match combinations_row::<S>(&owned) {
-                    Ok(row) if row.is_empty() => return QueryResult::None,
-                    Ok(row) => arrays.push(row),
-                    Err(_) if optional => return QueryResult::None,
-                    Err(e) => return QueryResult::Error(e),
-                }
-            }
-            arrays
+    let StandardJson::Array(elements) = value else {
+        return Err(match empty_length_or_index_error::<W, S>(value) {
+            Ok(()) => QueryResult::Owned(OwnedValue::array()),
+            Err(_) if optional => QueryResult::None,
+            Err(e) => QueryResult::Error(e),
+        });
+    };
+    let mut arrays: Vec<Vec<OwnedValue>> = Vec::new();
+    for elem in *elements {
+        let owned = match elem {
+            StandardJson::Array(inner) => combinations_owned_elements::<W, S>(inner, optional)?,
+            other => to_owned_lossy::<S, _>(&other),
+        };
+        match combinations_row::<S>(&owned) {
+            Ok(row) if row.is_empty() => return Err(QueryResult::None),
+            Ok(row) => arrays.push(row),
+            Err(_) if optional => return Err(QueryResult::None),
+            Err(e) => return Err(QueryResult::Error(e)),
         }
-        _ => match empty_length_or_index_error::<W, S>(&value) {
-            Ok(()) => return QueryResult::Owned(OwnedValue::array()),
-            Err(_) if optional => return QueryResult::None,
-            Err(e) => return QueryResult::Error(e),
-        },
-    };
-
-    // If any array is empty, return no results
-    if arrays.iter().any(alloc::vec::Vec::is_empty) {
-        return QueryResult::None;
     }
-
-    // If no arrays, return empty array
     if arrays.is_empty() {
-        return QueryResult::Owned(OwnedValue::array());
+        return Err(QueryResult::Owned(OwnedValue::array()));
     }
-
-    // Generate Cartesian product
-    let results = match cartesian_product(&arrays) {
-        Ok(results) => results,
-        Err(e) => return QueryResult::Error(e),
-    };
-    QueryResult::ManyOwned(results)
+    Ok(CombinationRows::Positions(arrays))
 }
 
-/// Builtin: combinations(n) - generate n-way combinations (Cartesian product with itself n times)
-/// Input with n=2: [1,2] -> outputs [1,1], [1,2], [2,1], [2,2]
-fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+/// [`CombinationRows`] for `combinations(n)` on `value`, or its whole answer when there is no
+/// product to walk.
+fn combinations_n_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
-    value: StandardJson<'a, W>,
+    value: &StandardJson<'a, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> Result<CombinationRows, QueryResult<'a, W>> {
     // `combinations(n)` is the one builtin in this family that must NOT fan
     // out (#1279). jq defines it as
     //
@@ -113438,6 +114174,8 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // is #1408's own requirement for this builtin, subsumed here rather than
     // dropped: it is the array constructor's answer, not the `x as $x |`
     // zero-fanout "produce nothing" every other builtin in this family gets.
+    // Only `[range(n)]` is collected: the product after it streams in jq, and
+    // does here (#7726).
     // #2196: `stream_outputs`, not the bare unchecked twin -- the
     // last document-value-fed `stream_outputs_lossy` call site in this file left
     // over after #1989 converted `fanout_two_args`'s two and
@@ -113459,7 +114197,7 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // nothing in jq. That is why this fires *before* the arity is used,
     // unlike `fanout_arg`'s "run the loop, then escape".
     if let Some(control) = trailing {
-        return partial(Vec::new(), control);
+        return Err(partial(Vec::new(), control));
     }
 
     // The arity *is* `[range(n)] | length`, so this reuses `range_num`, the
@@ -113475,23 +114213,22 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(RangeNum::Int(i)) => i.max(0) as usize,
             Ok(RangeNum::Float(f)) if f > 0.0 => f.ceil() as usize,
             Ok(RangeNum::Float(_)) => 0,
-            Err(_) if optional => return QueryResult::None,
-            Err(e) => return QueryResult::Error(e),
+            Err(_) if optional => return Err(QueryResult::None),
+            Err(e) => return Err(QueryResult::Error(e)),
         };
         // #1720: two or more large per-output arities can overflow this
         // running sum before `n` itself is even fully computed -- a
-        // different failure point from the allocation guards below, which
-        // all assume an already-valid `n`. `EvalError::new` (not gated by
-        // the local `optional` flag, same as the allocation guards below):
-        // confirmed live that a trailing `?` at the call site still catches
-        // it, matching those guards' own catchable behavior -- `optional`
-        // only short-circuits `range_num`'s own type-check errors above,
-        // not a capacity failure like this one. Real jq hangs indefinitely
-        // on this exact shape rather than erroring (confirmed live,
-        // ADR-0018) -- raising here instead is the documented "would take
-        // the host process down" exception.
+        // different failure point from the allocation guards, which all
+        // assume an already-valid `n`. `EvalError::new` (not gated by the
+        // local `optional` flag, same as the allocation guards): confirmed
+        // live that a trailing `?` at the call site still catches it --
+        // `optional` only short-circuits `range_num`'s own type-check errors
+        // above, not a capacity failure like this one. Real jq hangs
+        // indefinitely on this exact shape rather than erroring (confirmed
+        // live, ADR-0018) -- raising here instead is the documented "would
+        // take the host process down" exception.
         let Some(next) = n.checked_add(arity) else {
-            return QueryResult::Error(combinations_arity_overflow());
+            return Err(QueryResult::Error(combinations_arity_overflow()));
         };
         n = next;
     }
@@ -113499,116 +114236,129 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `. as $dot | [range(n)] | map($dot) | combinations`: with `n == 0` that is `[] | combinations`, which is `[]`
     // for any `$dot`; otherwise `$dot` is each element, and `.[0][]` iterates an array's elements or an object's
     // values and raises on anything else (#4971).
-    // #1755: to_owned, not to_owned_lossy -- an undecodable element must raise, not silently become "" and take
-    // part in the product.
-    let base_array: Vec<OwnedValue> = if n == 0 {
-        Vec::new()
-    } else {
-        let owned = match &value {
-            StandardJson::Array(elements) => {
-                // #1953: a non-decode-failure error respects `optional`, the same as the arm below.
-                OwnedValue::array_from(to_owned_vec_or_suppress!(*elements, optional))
-            }
-            other => to_owned_lossy::<S, _>(other),
-        };
-        match combinations_row::<S>(&owned) {
-            Ok(row) => row,
-            Err(_) if optional => return QueryResult::None,
-            Err(e) => return QueryResult::Error(e),
-        }
-    };
-
-    // n=0 returns single empty array
     if n == 0 {
-        return QueryResult::Owned(OwnedValue::array());
+        return Err(QueryResult::Owned(OwnedValue::array()));
     }
-
-    // If base array is empty and n > 0, return no results
-    if base_array.is_empty() {
-        return QueryResult::None;
-    }
-
-    // Compute the n-fold Cartesian power of base_array directly against a
-    // shared reference, rather than the tempting `(0..n).map(|_|
-    // base_array.clone()).collect()` -- that route needs two independent
-    // guards of its own (n alone drove a huge outer Vec::<Vec<_>> straight
-    // to the allocator before this fix, confirmed live: `[1] |
-    // combinations(288230376151711744)` aborted the process; and even a
-    // guarded n could still pair with a large base_array to exhaust memory
-    // one real clone at a time, since neither guard bounds *that* product)
-    // where indexing into one shared `base_array` needs neither.
-    //
-    // Two independent quantities need guarding here, cheapest first so a
-    // request that fails a cheap check never pays for a more expensive one
-    // first (#1669 review -- an earlier version of this fix committed
-    // `indices`' real memory via `resize` before ever running the O(log n),
-    // no-allocation-at-all check below that could reject the whole call):
-    //
-    // 1. base_array.len().pow(n), the actual output row *count* -- pure
-    //    arithmetic, no allocation.
-    // 2. n itself as a row *width*: every combination is n elements of
-    //    OwnedValue, rebuilt fresh each iteration, independent of how many
-    //    rows there are -- `checked_combinations_len`'s own `base <= 1`
-    //    short-circuit makes the row count permanently 1 regardless of n,
-    //    so that guard alone never bounds this. `OwnedValue` is a larger
-    //    type than the `usize` counter `mixed_radix_combinations` builds
-    //    internally, so a `Vec<OwnedValue>`-sized probe for this exact `n`
-    //    subsumes that counter's own allocation (a smaller request for the
-    //    same length) rather than needing a second, separate guard for it.
-    let Some(total) = checked_combinations_len(base_array.len(), n) else {
-        return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
+    let owned = match value {
+        StandardJson::Array(elements) => combinations_owned_elements::<W, S>(*elements, optional)?,
+        other => to_owned_lossy::<S, _>(other),
     };
-    if Vec::<OwnedValue>::new().try_reserve_exact(n).is_err() {
-        return QueryResult::Error(cannot_allocate_combinations_count(n));
+    let base = match combinations_row::<S>(&owned) {
+        Ok(row) => row,
+        Err(_) if optional => return Err(QueryResult::None),
+        Err(e) => return Err(QueryResult::Error(e)),
+    };
+    // An empty base and `n > 0`: no row at all.
+    if base.is_empty() {
+        return Err(QueryResult::None);
     }
-    let mut results = Vec::new();
-    if results.try_reserve_exact(total).is_err() {
-        return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
+    if n > MAX_COMBINATIONS_WIDTH {
+        return Err(QueryResult::Error(cannot_allocate_combinations_count(n)));
     }
-
-    mixed_radix_combinations(
-        n,
-        &mut results,
-        |_| base_array.len(),
-        |_, idx| base_array[idx].clone(),
-    );
-
-    QueryResult::ManyOwned(results)
+    // Every row indexes this one shared `base` rather than `n` clones of it: a moderate `n` with a
+    // large base would otherwise reach the allocator one clone at a time (#1669 review).
+    Ok(CombinationRows::Power { base, width: n })
 }
 
-/// The mixed-radix counting walk shared by [`cartesian_product`] and
-/// `builtin_combinations_n` (#1721): both build every combination of `width`
-/// positions by treating `indices` as a mixed-radix counter and carrying
-/// into the next position once the current one wraps, differing only in
-/// whether a position's own length is looked up per-position (independent
-/// arrays) or is one constant repeated `width` times (`combinations(n)`'s
-/// single array raised to itself). `len_at`/`value_at` abstract over that
-/// one difference; everything else -- the counter, the carry propagation,
-/// the termination check -- was previously hand-duplicated in both
-/// callers, ~30 lines apart, and had to be kept in sync by eye.
+/// Builtin: combinations - generate all combinations from array of arrays
+/// Input: [[1,2], [3,4]] -> outputs [1,3], [1,4], [2,3], [2,4]
 ///
-/// `results` must already be reserved for the caller's own already-guarded
-/// total capacity -- this only walks and pushes, it never sizes or grows
-/// the backing allocation itself, so it carries none of either caller's
-/// crash-prevention guards and must not be called before them. Both
-/// callers also guarantee `len_at(i) >= 1` for every `i` in `0..width`
-/// before calling in (an empty position would make `value_at(i, 0)`
-/// index out of bounds on the very first row, before any carry/bounds
-/// check runs) -- `builtin_combinations_n` via its own `n == 0`/
-/// `base_array.is_empty()` checks, `cartesian_product` via its own
-/// `arrays.is_empty()`/per-element emptiness checks.
-#[inline]
+/// Every row collected; [`each_combinations`] streams them for a consumer that may stop.
+fn builtin_combinations<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'_, W>,
+    optional: bool,
+) -> QueryResult<'_, W> {
+    match combinations_rows::<W, S>(&value, optional) {
+        Ok(rows) => collected_combinations(&rows),
+        Err(answer) => answer,
+    }
+}
+
+/// Builtin: combinations(n) - generate n-way combinations (Cartesian product with itself n times)
+/// Input with n=2: [1,2] -> outputs [1,1], [1,2], [2,1], [2,2]
+///
+/// Every row collected; [`each_combinations`] streams them for a consumer that may stop.
+fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    n_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match combinations_n_rows::<W, S>(n_expr, &value, optional) {
+        Ok(rows) => collected_combinations(&rows),
+        Err(answer) => answer,
+    }
+}
+
+fn collected_combinations<'a, W: Clone + AsRef<[u64]>>(
+    rows: &CombinationRows,
+) -> QueryResult<'a, W> {
+    match rows.collect() {
+        Ok(results) => QueryResult::ManyOwned(results),
+        Err(e) => QueryResult::Error(e),
+    }
+}
+
+/// `combinations` or `combinations(n)` with each row handed to `sink` as it is built (#7726), as
+/// jq's recursive definitions emit them: a consumer that stops (`first`, `limit`, `label`/`break`,
+/// `isempty`) stops the walk, so `first(combinations(1000))` on `[1,2]` builds one row of a
+/// product it could never hold. Collecting every row, where the product is refused when it cannot
+/// be held, is [`builtin_combinations`]'s and [`builtin_combinations_n`]'s.
+// Out of line, as `each_fromstream` is: `eval_each`'s frame is what a deep recursion's stack depth
+// is made of.
+#[inline(never)]
+fn each_combinations<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    builtin: &Builtin,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    // An undecodable input raises as `eval_builtin` raises it.
+    if matches!(value, StandardJson::Error(_)) {
+        return drain_result(eval_builtin::<W, S>(builtin, value, optional), sink);
+    }
+    let rows = match builtin {
+        Builtin::CombinationsN(n_expr) => combinations_n_rows::<W, S>(n_expr, &value, optional),
+        _ => combinations_rows::<W, S>(&value, optional),
+    };
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(answer) => return drain_result(answer, sink),
+    };
+    match rows.each_row(|row| sink(Item::Owned(row))) {
+        Demand::Stop => Flow::Stopped { pending: None },
+        Demand::Continue => Flow::Exhausted,
+    }
+}
+
+/// The mixed-radix counting walk behind both arities of `combinations` (#1721, #7726): every
+/// combination of `width` positions, `indices` read as a mixed-radix counter whose last position
+/// turns fastest -- jq's recursion order -- carrying into the position before it once it wraps.
+/// `len_at` says how many values each position holds and `row_at` builds the row the counter
+/// names: independent arrays for bare `combinations`, one array repeated `width` times for
+/// `combinations(n)`. Each row goes to `emit` as it is built,
+/// and the walk ends when `emit` answers [`Demand::Stop`] or the counter has wrapped all the way
+/// round; the answer is `emit`'s last.
+///
+/// Every caller guarantees `width >= 1` and `len_at(i) >= 1` for every `i` in `0..width` (an empty
+/// position would make `row_at` index out of bounds on the very first row): [`CombinationRows`] is
+/// built only for such a product.
+// Out of line, and each row built by zipping the counter with the positions: inlined into
+// `CombinationRows::collect` and indexing position `i` per element, the copy of a row compiled to
+// three or four more instructions per element on arm64 than the per-builtin loops this replaced
+// had (+0.5% on `[combinations(18)] | length` and on its bare twin).
+#[inline(never)]
 fn mixed_radix_combinations(
     width: usize,
-    results: &mut Vec<OwnedValue>,
     len_at: impl Fn(usize) -> usize,
-    value_at: impl Fn(usize, usize) -> OwnedValue,
-) {
+    row_at: impl Fn(&[usize]) -> Vec<OwnedValue>,
+    mut emit: impl FnMut(OwnedValue) -> Demand,
+) -> Demand {
     let mut indices = vec![0usize; width];
 
     loop {
-        let combination: Vec<OwnedValue> = (0..width).map(|i| value_at(i, indices[i])).collect();
-        results.push(OwnedValue::array_from(combination));
+        if emit(OwnedValue::array_from(row_at(&indices))) == Demand::Stop {
+            return Demand::Stop;
+        }
 
         // Increment indices (like counting in mixed radix).
         let mut carry = true;
@@ -113625,58 +114375,14 @@ fn mixed_radix_combinations(
 
         // If we carried all the way through, we're done.
         if carry {
-            break;
+            return Demand::Continue;
         }
     }
 }
 
-/// Compute the Cartesian product of a list of arrays.
-///
-/// The result has one entry per combination -- `arrays.iter().map(Vec::len)`'s
-/// product -- so that product is exactly what the guard below checks before
-/// the walk grows `results` one push at a time: without this, `results`
-/// grows via ordinary `Vec` doubling with no upfront size check at all, the
-/// identical missed guard #1612/#1634 already closed for other
-/// generator-controlled cross products (#1669).
-fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, EvalError> {
-    if arrays.is_empty() {
-        return Ok(vec![OwnedValue::array()]); // patchcov: coverage tolerate-line reason="unreachable from `combinations`, whose own empty-input return runs first; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
-    }
-
-    // Guard the row width (arrays.len()) against the heaviest type that
-    // recurs at that length -- OwnedValue, not usize -- before building
-    // anything: `lens` below is also arrays.len() elements long, but of
-    // the smaller `usize`, so this subsumes its own allocation cost.
-    // Independent of `results`' own length-*product* guard just below:
-    // many length-1 factor arrays keep that product tiny while the row
-    // width (arrays.len() itself) stays unbounded (#1669 review).
-    if Vec::<OwnedValue>::new()
-        .try_reserve_exact(arrays.len())
-        .is_err()
-    {
-        return Err(cannot_allocate_combinations_count(arrays.len()));
-    }
-
-    let lens: Vec<usize> = arrays.iter().map(Vec::len).collect();
-    // `cannot_allocate_cartesian_product`'s own message, not `cannot_
-    // reserve_cross_product`'s: that one names ".[$keys]"-style computed
-    // indexing, which describes none of this builtin's own call sites
-    // (#1721) -- `combinations` never indexes anything.
-    let mut results = try_reserve_product_labeled(&lens, cannot_allocate_cartesian_product)?;
-
-    mixed_radix_combinations(
-        arrays.len(),
-        &mut results,
-        |i| lens[i],
-        |i, idx| arrays[i][idx].clone(),
-    );
-
-    Ok(results)
-}
-
 /// Distinct from [`cannot_allocate_combinations`]/[`cannot_allocate_combinations_count`]
 /// (`combinations(n)`'s own guards): this one backs bare `combinations`
-/// (`cartesian_product`), whose factors are independent arrays' lengths
+/// ([`CombinationRows::Positions`]), whose factors are independent arrays' lengths
 /// rather than one base raised to a power, so it names the product
 /// directly instead of `base^n`.
 fn cannot_allocate_cartesian_product(lens: &[usize]) -> EvalError {
@@ -115719,26 +116425,52 @@ pub fn snapshot_environment() {
     ENVIRONMENT_SNAPSHOT.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// The object of all environment variables: built now, or the thread's snapshot of it once
-/// [`snapshot_environment`] has been called.
+/// Which of jq's two readings of the environment an object is (#7734). They differ only on an entry
+/// with no `=`, which only a raw `execve` makes.
 #[cfg(feature = "std")]
-fn environment_object() -> OwnedValue {
-    environment_object_in(ENVIRONMENT_SNAPSHOT.load(core::sync::atomic::Ordering::Relaxed))
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EnvironmentView {
+    /// `$ENV`, which jq builds once at compile time (`make_env` in `compile.c`): an entry with no
+    /// `=` deletes its name, so `A=1` then `A` leaves no `A`, and a later `A=3` adds it at the end.
+    Variable,
+    /// The `env` builtin (`f_env` in `builtin.c`): an entry with no `=` sets its name to `null`, in
+    /// place, so `A=1` then `A` is `{"A":null}` and `A` then `A=3` keeps `A` first.
+    Builtin,
+}
+
+/// The object of all environment variables as `view` reads them: built now, or the thread's
+/// snapshot of it once [`snapshot_environment`] has been called.
+#[cfg(feature = "std")]
+fn environment_object(view: EnvironmentView) -> OwnedValue {
+    environment_object_in(
+        view,
+        ENVIRONMENT_SNAPSHOT.load(core::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// [`environment_object`] with the snapshot choice passed in, so a test can read either way without
 /// switching the process-wide flag for every other test.
 #[cfg(feature = "std")]
-fn environment_object_in(snapshot: bool) -> OwnedValue {
-    fn build() -> OwnedValue {
+fn environment_object_in(view: EnvironmentView, snapshot: bool) -> OwnedValue {
+    fn build(view: EnvironmentView) -> OwnedValue {
         let mut env_obj = FieldMap::new();
         // jq splits every `environ` string at its first `=`; `std` skips a name that is empty and
         // reads `=X=1` as `X`, so Unix reads the strings themselves (#7487). An entry with no `=`
-        // is no variable, as in jq.
+        // is the whole string as a name: `null` in `env`, a deletion in `$ENV` (#7734). `std` skips
+        // it too.
         #[cfg(unix)]
         for entry in super::environ::entries() {
             use std::os::unix::ffi::OsStrExt;
             let Some(eq) = entry.iter().position(|&b| b == b'=') else {
+                let name = environment_text(std::ffi::OsStr::from_bytes(&entry));
+                match view {
+                    EnvironmentView::Builtin => {
+                        env_obj.insert(name, OwnedValue::Null);
+                    }
+                    EnvironmentView::Variable => {
+                        env_obj.shift_remove(name.as_str());
+                    }
+                }
                 continue;
             };
             env_obj.insert(
@@ -115751,22 +116483,33 @@ fn environment_object_in(snapshot: bool) -> OwnedValue {
         // `vars_os`, not `vars`: `vars` panics on the first name or value that is not UTF-8
         // (#6564); jq substitutes it instead.
         #[cfg(not(unix))]
-        for (key, value) in std::env::vars_os() {
-            env_obj.insert(
-                environment_text(&key),
-                OwnedValue::String(environment_text(&value).into()),
-            );
+        {
+            let _ = view;
+            for (key, value) in std::env::vars_os() {
+                env_obj.insert(
+                    environment_text(&key),
+                    OwnedValue::String(environment_text(&value).into()),
+                );
+            }
         }
         OwnedValue::Object(env_obj.into())
     }
     thread_local! {
-        static SNAPSHOT: core::cell::RefCell<Option<OwnedValue>> =
-            const { core::cell::RefCell::new(None) };
+        static SNAPSHOT: core::cell::RefCell<[Option<OwnedValue>; 2]> =
+            const { core::cell::RefCell::new([None, None]) };
     }
     if !snapshot {
-        return build();
+        return build(view);
     }
-    SNAPSHOT.with(|cell| cell.borrow_mut().get_or_insert_with(build).clone())
+    let slot = match view {
+        EnvironmentView::Variable => 0,
+        EnvironmentView::Builtin => 1,
+    };
+    SNAPSHOT.with(|cell| {
+        cell.borrow_mut()[slot]
+            .get_or_insert_with(|| build(view))
+            .clone()
+    })
 }
 
 /// $ENV expression - returns object of all environment variables
@@ -115775,7 +116518,7 @@ fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> 
     if let Some(refusal) = super::eval_generic::env_ops_refusal() {
         return QueryResult::Error(EvalError::new(refusal));
     }
-    QueryResult::Owned(environment_object())
+    QueryResult::Owned(environment_object(EnvironmentView::Variable))
 }
 
 /// An environment name or value as text: jq's maximal-subpart substitution of its bytes where the
@@ -115808,7 +116551,7 @@ fn builtin_env<W: Clone + AsRef<[u64]>>(
     if let Some(refusal) = super::eval_generic::env_ops_refusal() {
         return QueryResult::Error(EvalError::new(refusal));
     }
-    QueryResult::Owned(environment_object())
+    QueryResult::Owned(environment_object(EnvironmentView::Builtin))
 }
 
 #[cfg(not(feature = "std"))]
@@ -119029,6 +119772,26 @@ pub(crate) fn settles_both(left: &Expr, right: &Expr) -> bool {
     settles_both_with(left, right, settle_probe, settles_before_consumer)
 }
 
+/// Whether a binary operator in mode `S` settles its operands before their consumer (#3296):
+/// [`settles_both`], or, in jq mode, both operands are calls that answer at most once by
+/// [`call_head_settles`](super::tail_call::call_head_settles), which also reads a call whose
+/// definition's body uses `try`, `label`, `reduce`, an object, a builtin that answers once or
+/// another def (#7713). A tree recursion over such a body (`count` adding the counts of `.[0]`
+/// and `.[1]`) ran each call inside the other operand's output sink, so every call ever made
+/// held its native frames and depth 13 (8,192 leaves) was refused.
+pub(crate) fn operands_settle<S: EvalSemantics>(left: &Expr, right: &Expr) -> bool {
+    // Only a call, a parenthesis or a pipe can be one (`call_head_settles`): told apart here, so
+    // the operators of a level that are no such thing (`$n == 0`, `$n - 1`) ask nothing more.
+    let may_be_a_call =
+        |e: &Expr| matches!(e, Expr::DefCall { .. } | Expr::Paren(_) | Expr::Pipe(_));
+    settles_both(left, right)
+        || (S::TAG == EvalTag::Jq
+            && may_be_a_call(left)
+            && may_be_a_call(right)
+            && super::tail_call::call_head_settles(left, true)
+            && super::tail_call::call_head_settles(right, true))
+}
+
 /// How many nodes the probe in [`settles_both`] spends on an operand before
 /// leaving it to the full [`SETTLE_ANALYSIS_BUDGET`] walk.
 const SETTLE_PROBE_BUDGET: u32 = 8;
@@ -122063,6 +122826,100 @@ mod tests {
                 "{key:?} (yq: {yq}) must stay the evaluator's"
             );
         }
+    }
+
+    /// #7451: an operand that reads no input and has no effect is evaluated on `null`
+    /// ([`closed_operand_to_owned`]), so the owned step answers it and the accumulator's other
+    /// members are not copied. An operand that reads `.`, has an effect, raises, or yields other
+    /// than once still declines to the evaluator, as does yq mode.
+    #[test]
+    fn owned_update_step_takes_an_input_free_operand_7451() {
+        let literal = "x".repeat(100_000);
+        let text_ptr = |state: &OwnedValue| match state {
+            OwnedValue::Array(items) => match items.first() {
+                Some(OwnedValue::String(text)) => text.as_ptr(),
+                other => panic!("missing sibling: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- slot 0 holds the tracked string, which no step below touches (#7451)"
+            },
+            other => panic!("expected array: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every step below keeps the state an array (#7451)"
+        };
+        let start = || OwnedValue::array_from(vec![OwnedValue::string(&literal)]);
+        let step =
+            |src: &str, k: i64| substitute_vars(&parse(src).unwrap(), [("k", &OwnedValue::Int(k))]);
+        for src in [
+            r#". + [$k | tostring | split("")]"#,
+            ".[$k] = [range(3)]",
+            ". + [[$k] | sort]",
+            ". += [[$k, 1] | unique]",
+            ".[$k] |= [range(2)]",
+            ". |= . + [[$k] | reverse]",
+            ". + [[range(2)] as $x | $x | add]",
+            ". + [reduce range(3) as $u (0; . + $u)]",
+            ". + [first(range($k; 10))]",
+        ] {
+            let mut state = start();
+            let before = text_ptr(&state);
+            for k in 1..=40 {
+                state = match owned_update_step::<JqSemantics>(&step(src, k), state) {
+                    OwnedStep::Handled(Ok(next)) => next,
+                    _ => panic!("{src}: step {k} was not handled"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if an input-free operand declined, which is the regression this test pins (#7451)"
+                };
+            }
+            assert_eq!(text_ptr(&state), before, "{src}: the sibling was copied");
+        }
+        for src in [
+            ". + [[.[0]] | sort]",
+            ". + [[$k] | debug]",
+            ". + [[$k] | stderr]",
+            ". + [input]",
+            ". + [error(\"x\")]",
+            ". + [$k | error]",
+            ". + ([1], [2])",
+            ". + empty",
+            ". + [def f: 1; f]",
+        ] {
+            assert!(
+                matches!(
+                    owned_update_step::<JqSemantics>(&step(src, 1), start()),
+                    OwnedStep::Declined(_)
+                ),
+                "{src} must stay the evaluator's"
+            );
+        }
+        assert!(matches!(
+            owned_update_step::<YqSemantics>(&step(". + [[$k] | sort]", 1), start()),
+            OwnedStep::Declined(_)
+        ));
+        assert!(input_free_collect(&parse("[range(3)]").unwrap()));
+        assert!(!input_free_collect(&parse("[range(3), break $x]").unwrap()));
+        assert!(!input_free_collect(&parse("[length]").unwrap()));
+        assert!(!input_free_collect(&parse("1 | [.]").unwrap()));
+        assert!(!input_free_operand(&parse("error").unwrap()));
+        assert!(!yields_once_whatever_the_demand(
+            &parse("1, (range(9) | empty)").unwrap()
+        ));
+        assert!(yields_once_whatever_the_demand(
+            &parse("null | {a: [range(9)]}").unwrap()
+        ));
+        assert!(yields_once_whatever_the_demand(
+            &parse("[3, 1] | sort | tojson").unwrap()
+        ));
+        assert!(!yields_once_whatever_the_demand(
+            &parse("[3, 1] | .[]").unwrap()
+        ));
+        assert!(!input_free_operand(&parse("1 as $x ?// $y | 1").unwrap()));
+        assert!(!input_free_operand(
+            &parse("[1 | (. as $x ?// $y | 1)]").unwrap()
+        ));
+        assert!(input_free_operand(
+            &parse("[1, [2]] as [$a, [$b]] | $a + $b").unwrap()
+        ));
+        assert!(!input_free_operand(
+            &parse("{} as {(.k): $v} | $v").unwrap()
+        ));
+        assert!(!input_free_operand(
+            &parse("reduce ({}) as {(.k): $v} (0; .)").unwrap()
+        ));
+        assert!(input_free_operand(&parse("error(1)").unwrap()));
     }
 
     /// #7563, #7452: a fold step that writes an array slot by a negative index (`.[-$k]`, `.[-1]`)
@@ -126590,11 +127447,12 @@ mod tests {
     ) -> (Vec<OwnedValue>, usize, RangeEnd) {
         let mut seen = Vec::new();
         let mut batches = 0;
-        let end = each_range_batches(from, to, step, false, None, cap, &mut |values| {
-            batches += 1;
-            seen.extend(values);
-            Demand::Continue
-        });
+        let end =
+            each_range_batches::<JqSemantics>(from, to, step, false, None, cap, &mut |values| {
+                batches += 1;
+                seen.extend(values);
+                Demand::Continue
+            });
         (seen, batches, end)
     }
 
@@ -126654,7 +127512,8 @@ mod tests {
     #[test]
     fn test_range_batches_stop_at_the_total_cap_exactly_5292() {
         for cap in [1, 99_999, 100_000, 100_001, 250_000] {
-            let (seen, _, end) = batched_ints(0, i64::MAX, 1, cap);
+            // Within 2^53, where the walk is the `i64` one in jq mode too (#7731).
+            let (seen, _, end) = batched_ints(0, 1 << 53, 1, cap);
             assert_eq!(seen, (0..cap as i64).collect::<Vec<i64>>(), "cap {cap}");
             assert_eq!(end, RangeEnd::Capped, "cap {cap}");
         }
@@ -126681,7 +127540,7 @@ mod tests {
     #[test]
     fn test_range_batches_stop_when_the_consumer_does_5292() {
         let mut batches = 0;
-        let end = each_range_batches(
+        let end = each_range_batches::<JqSemantics>(
             RangeNum::Int(0),
             RangeNum::Int(i64::MAX),
             RangeNum::Int(1),
@@ -126741,7 +127600,7 @@ mod tests {
     fn test_range_batches_keep_the_first_values_spelling_on_the_first_batch_only_5292() {
         let literal = OwnedValue::NumberLiteral(NumberRepr::Float(0.0), "0.0".into());
         let mut firsts = Vec::new();
-        each_range_batches(
+        each_range_batches::<JqSemantics>(
             RangeNum::Float(0.0),
             RangeNum::Float(250_000.0),
             RangeNum::Float(1.0),
@@ -126859,7 +127718,7 @@ mod tests {
     fn test_range_first_value_literal_per_route_6064() {
         fn first(from: RangeNum, to: RangeNum, literal: &OwnedValue) -> OwnedValue {
             let mut out = Vec::new();
-            each_range_batches(
+            each_range_batches::<JqSemantics>(
                 from,
                 to,
                 RangeNum::Int(1),
@@ -126885,16 +127744,13 @@ mod tests {
             &big,
         );
         assert_eq!(value, big);
-        // The integer walk pushes the exact `Int`.
+        // Past 2^53 an all-integer range walks doubles as well (#7731), and keeps it too.
         let value = first(
             RangeNum::Int(9_007_199_254_740_993),
             RangeNum::Int(9_007_199_254_741_000),
             &big,
         );
-        assert!(
-            matches!(value, OwnedValue::Int(9_007_199_254_740_993)),
-            "{value:?}"
-        );
+        assert_eq!(value, big);
         // `-0` is kept by both.
         for to in [RangeNum::Int(3), RangeNum::Float(3.5)] {
             let value = first(RangeNum::Int(0), to, &neg_zero);
@@ -126909,20 +127765,59 @@ mod tests {
         assert!(range_from_literal_override(&at_limit).is_none());
     }
 
-    /// #2131 (revised fix)/#2219, end to end through the full
-    /// `each_range`/`emit` dispatch (not just [`eval_range_values`]
-    /// directly): a range with no overflow risk keeps its exact `Int`
-    /// values regardless of how large its magnitude is. Renamed by #2219,
-    /// which also retargeted this test's own premise: an `Int`/`Int`/`Int`
-    /// range that hits an `i64` overflow no longer falls back to `Float`
-    /// either -- it keeps the exact `Int` prefix already computed before
-    /// the overflow, proving the `None => range_batch_f64(...)` arm
-    /// in `each_range`'s `emit` closure is unreachable dead code for this
-    /// dispatch arm (see `eval_range_values`'s own doc comment). The `f64`
-    /// path itself is still real production code, just reachable only via
-    /// `emit`'s *other* match arm, for genuinely non-integer operands.
+    /// #7731: past ±2^53 jq mode walks doubles and yq mode keeps yq's exact `int64` walk; within
+    /// it both take the `i64` walk.
     #[test]
-    fn test_range_dispatch_keeps_exact_int_prefix_through_overflow_2219() {
+    fn test_range_batches_walk_doubles_past_2_53_in_jq_mode_only_7731() {
+        fn walk<S: EvalSemantics>(from: i64, to: i64) -> Vec<OwnedValue> {
+            let mut out = Vec::new();
+            each_range_batches::<S>(
+                RangeNum::Int(from),
+                RangeNum::Int(to),
+                RangeNum::Int(1),
+                true,
+                None,
+                usize::MAX,
+                &mut |batch| {
+                    out.extend(batch);
+                    Demand::Continue
+                },
+            );
+            out
+        }
+        let past = -9_007_199_254_740_994;
+        assert_eq!(
+            walk::<JqSemantics>(past, past + 4),
+            [
+                OwnedValue::Int(past),
+                OwnedValue::Float(-9_007_199_254_740_992.0),
+                OwnedValue::Float(-9_007_199_254_740_991.0),
+            ]
+        );
+        assert_eq!(
+            walk::<YqSemantics>(past, past + 4),
+            (past..past + 4).map(OwnedValue::Int).collect::<Vec<_>>()
+        );
+        let within = -9_007_199_254_740_992;
+        for got in [
+            walk::<JqSemantics>(within, within + 3),
+            walk::<YqSemantics>(within, within + 3),
+        ] {
+            assert_eq!(
+                got,
+                (within..within + 3)
+                    .map(OwnedValue::Int)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// #2131/#2219 end to end through the full `each_range`/`emit` dispatch: a range within
+    /// ±2^53 keeps its exact `Int` values, and since #7731 one past it walks jq's doubles and
+    /// prints what jq 1.7.1 and 1.8.2 print, at the magnitudes #2219 pinned the exact `i64`
+    /// prefix at (sourced from data where a bound is negative, #3044).
+    #[test]
+    fn test_range_dispatch_past_2_53_answers_as_jq_2219_7731() {
         fn range_values_from(json: &[u8], src: &str) -> Vec<OwnedValue> {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
@@ -126931,94 +127826,48 @@ mod tests {
             assert_eq!(tag, "ok", "`{src}` did not evaluate cleanly");
             values
         }
-        fn range_values(src: &str) -> Vec<OwnedValue> {
-            range_values_from(b"null", src)
+        fn printed(json: &[u8], src: &str) -> Vec<String> {
+            range_values_from(json, src)
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect()
         }
 
         // Ordinary small range: every value is an exact Int.
-        for v in range_values("range(0;10;1)") {
+        for v in range_values_from(b"null", "range(0;10;1)") {
             assert!(matches!(v, OwnedValue::Int(_)), "expected Int, got {v:?}");
         }
-
-        // The nanosecond-epoch-scale regression case: no overflow risk at
-        // all, so it must stay Int end to end, with the exact expected
-        // sequence (no precision loss, unlike the old `±2^53`-gated fix).
-        let ns = range_values("[range(1700000000000000000;1700000000000000010;1)]");
-        assert_eq!(ns.len(), 1, "expected a single array result");
-        match &ns[0] {
-            OwnedValue::Array(items) => {
-                let ints: Vec<i64> = items
-                    .iter()
-                    .map(|v| match v {
-                        OwnedValue::Int(i) => *i,
-                        other => panic!("expected Int, got {other:?}"),
-                    })
-                    .collect();
-                assert_eq!(
-                    ints,
-                    (1_700_000_000_000_000_000i64..1_700_000_000_000_000_010).collect::<Vec<_>>()
-                );
-            }
-            other => panic!("expected Array, got {other:?}"),
-        }
-
-        // #2219: overflows on the first `checked_add`, but `from` was
-        // already pushed as an exact `Int` before that overflow ends the
-        // loop, so it's kept rather than discarded for an `f64`
-        // recomputation. (Pre-#2219 this produced no values at all, via a
-        // `?`-triggered bail to `range_batch_f64`.)
-        //
-        // #3044 closed the unrelated divergence this comment used to cite
-        // (jq's unary minus collapsing a literal this large to `f64`
-        // before `range` ever sees it, `docs/compliance/jq/limitations.md`'s
-        // former #2357 section): succinctly's own filter-text unary minus
-        // now does the same, so a *bare literal* spelling of this repro no
-        // longer reaches this dispatch arm at all. Sourcing the bounds
-        // from data instead (as `range_values_from` does here) keeps them
-        // exact in both tools, so this still exercises the overflow-safety
-        // fix itself rather than the literal-parsing question #3044 owns.
         assert_eq!(
-            range_values_from(
+            printed(
+                b"null",
+                "[range(1700000000000000000;1700000000000000010;1)]"
+            ),
+            ["[1700000000000000000]"]
+        );
+        assert_eq!(
+            printed(
                 b"[-9223372036854775758,-9223372036854775808,-100]",
                 ".[0] as $from | .[1] as $to | .[2] as $step | range($from;$to;$step)"
             ),
-            vec![OwnedValue::Int(-9223372036854775758)]
+            ["-9223372036854775758"]
         );
-
-        // #2219: a genuine near-`i64::MAX` overflow no longer reaches
-        // `range_batch_f64` at all for `Int`/`Int`/`Int` operands --
-        // the overflowing candidate can never satisfy `< to` either way, so
-        // the loop ends and keeps the one exact `Int` value already pushed,
-        // instead of discarding it for a `Float` recomputation. This proves
-        // the `range_batch_f64` call this dispatch arm used to fall
-        // back to is unreachable from here (see `eval_range_values`'s own
-        // doc comment for why its signature no longer even offers that
-        // path) -- the f64 path remains reachable only via the *other*
-        // `emit` match arm, for genuinely non-integer `from`/`to`/`step`.
         assert_eq!(
-            range_values("range(9223372036854774000;9223372036854775807;1000000000000000)"),
-            vec![OwnedValue::Int(9223372036854774000)]
+            printed(
+                b"null",
+                "range(9223372036854774000;9223372036854775807;1000000000000000)"
+            ),
+            ["9223372036854774000"]
         );
-
-        // #2219, descending mirror of the multi-iteration overflow case
-        // `test_eval_range_values_overflow_detection_2131` already pins at
-        // the unit level (`eval_range_values_i64(0, i64::MAX, big_step)`):
-        // the first advance succeeds, the second overflows past `i64::MIN`,
-        // and both values computed before that overflow are kept end to
-        // end through the full dispatch, not just at the unit level.
-        //
-        // `to`/`step` are sourced from data (#3044): both are past `2^53`
-        // and negative, so writing them as bare filter-text literals would
-        // now route through the same `-1 * <literal>` split as the
-        // assertion above, changing what's under test.
+        // The first sum is `-4611686018427387904` as a double, and the second is `-2^63`,
+        // which is not above the bound.
         let big_step = i64::MAX / 2 + 100;
         let input = format!("[{},{}]", i64::MIN, -big_step);
         assert_eq!(
-            range_values_from(
+            printed(
                 input.as_bytes(),
                 ".[0] as $to | .[1] as $step | range(0;$to;$step)"
             ),
-            vec![OwnedValue::Int(0), OwnedValue::Int(-big_step)]
+            ["0", "-4611686018427388000"]
         );
     }
 
@@ -141242,7 +142091,7 @@ mod tests {
     /// per-key/per-pair scheme by #2139/#2245 respectively, at which point
     /// the thin `try_reserve_product` wrapper these tests originally called
     /// had no remaining production caller and was removed, leaving
-    /// `try_reserve_product_labeled` (still used by `cartesian_product`,
+    /// `try_reserve_product_labeled` (still used by `CombinationRows::collect`,
     /// whose own factors genuinely are fixed for the whole call) as the
     /// sole surviving general implementation these tests now call
     /// directly. Coverage for the guard's *reachability* now lives in the
@@ -159947,25 +160796,31 @@ mod tests {
             }
             format!("{:?}", OwnedValue::Object(map.into()))
         };
-        assert_eq!(format!("{:?}", environment_object_in(false)), expected());
-        let (first, second) = std::thread::spawn(|| {
-            (
-                format!("{:?}", environment_object_in(true)),
-                format!("{:?}", environment_object_in(true)),
-            )
-        })
-        .join()
-        .unwrap();
-        assert_eq!(first, expected());
-        assert_eq!(second, first);
-        // The same thread, switched back, reads the environment again rather than the snapshot.
-        let (cached, fresh) = std::thread::spawn(|| {
-            let cached = format!("{:?}", environment_object_in(true));
-            (cached, format!("{:?}", environment_object_in(false)))
-        })
-        .join()
-        .unwrap();
-        assert_eq!(cached, fresh);
+        // The test process's environment has no entry without `=`, so both views read it whole (#7734).
+        for view in [EnvironmentView::Variable, EnvironmentView::Builtin] {
+            assert_eq!(
+                format!("{:?}", environment_object_in(view, false)),
+                expected()
+            );
+            let (first, second) = std::thread::spawn(move || {
+                (
+                    format!("{:?}", environment_object_in(view, true)),
+                    format!("{:?}", environment_object_in(view, true)),
+                )
+            })
+            .join()
+            .unwrap();
+            assert_eq!(first, expected());
+            assert_eq!(second, first);
+            // The same thread, switched back, reads the environment again rather than the snapshot.
+            let (cached, fresh) = std::thread::spawn(move || {
+                let cached = format!("{:?}", environment_object_in(view, true));
+                (cached, format!("{:?}", environment_object_in(view, false)))
+            })
+            .join()
+            .unwrap();
+            assert_eq!(cached, fresh);
+        }
     }
 
     /// #6527: [`eval_owned_number_fold`] answers what the reindex bridge answers for every array of
@@ -161549,24 +162404,28 @@ mod tests {
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483647"));
         query!(b"null", r"[1970,-9223372036854775808,1,0,0,0,4,0] | todate",
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483647-01T00:00:00Z"));
+        // From 1900 the fields are normalised first, as in jq 1.8.2 (#7606; jq 1.7.1:
+        // `1970--2147483648-01T00:00:00Z`).
         query!(b"null", r"[1970,9223372036854775807,1,0,0,0,4,0] | todateiso8601",
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483648-01T00:00:00Z"));
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "178958940-08-01T00:00:00Z"));
         query!(b"null", r#"[1970,0,-9223372036854775808,0,0,0,4,0] | strftime("%d")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-2147483648"));
 
-        // Each pair is the exact direct-field output observed in jq 1.7.1
-        // after an input below/above the signed 32-bit range. The four
-        // values exercise both immediate boundaries and i64 extremes. The
+        // Each pair is the exact output of jq 1.8.2 after an input below/above
+        // the signed 32-bit range. The four values exercise both immediate
+        // boundaries and i64 extremes. A saturated field that carries the date
+        // before 1900 is left as given (`timegm` fails); one that does not is
+        // normalised (#7606), so the weekday and yearday are recomputed. The
         // year saturates after its 1900 offset (#7532):
         // `test_broken_down_year_saturates_after_its_offset_7532`.
         let fields = [
-            (1, "%m", "-2147483647", "-2147483648"),
-            (2, "%d", "-2147483648", "2147483647"),
-            (3, "%H", "-2147483648", "2147483647"),
-            (4, "%M", "-2147483648", "2147483647"),
-            (5, "%S", "-2147483648", "2147483647"),
-            (6, "%w", "-2147483648", "2147483647"),
-            (7, "%j", "-2147483647", "-2147483648"),
+            (1, "%m", "-2147483647", "08"),
+            (2, "%d", "-2147483648", "10"),
+            (3, "%H", "-2147483648", "07"),
+            (4, "%M", "-2147483648", "07"),
+            (5, "%S", "52", "07"),
+            (6, "%w", "4", "4"),
+            (7, "%j", "001", "001"),
         ];
         for (idx, specifier, negative, positive) in fields {
             for (value, expected) in [
@@ -161596,9 +162455,9 @@ mod tests {
         }
 
         query!(b"null", r"[1970,-1,1,0,0,0,4,0] | todate",
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970-00-01T00:00:00Z"));
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1969-12-01T00:00:00Z"));
         query!(b"null", r"[1970,9223372036854775807,1,0,0,0,4,0] | todate?",
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483648-01T00:00:00Z"));
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "178958940-08-01T00:00:00Z"));
     }
 
     #[test]
@@ -161733,11 +162592,15 @@ mod tests {
 
     #[test]
     fn test_strftime_extreme_week_fields_3083() {
-        // The C formatter does its week arithmetic with wrapping `int`s.
-        query!(b"null", r#"[1970,0,1,0,0,0,4,9223372036854775807] | strftime("%j %U %W")"#,
+        // The C formatter does its week arithmetic with wrapping `int`s. Before 1900 `timegm`
+        // leaves the fields as given (#7606), so they reach it; both jq releases agree.
+        query!(b"null", r#"[1899,0,1,0,0,0,4,9223372036854775807] | strftime("%j %U %W")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-2147483648 -306783378 -306783377"));
-        query!(b"null", r#"[1970,0,1,0,0,0,-9223372036854775808,0] | strftime("%U %W")"#,
+        query!(b"null", r#"[1899,0,1,0,0,0,-9223372036854775808,0] | strftime("%U %W")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-306783377 -306783377"));
+        // From 1900 jq 1.8.2 recomputes them (#7606; jq 1.7.1 prints the row above).
+        query!(b"null", r#"[1970,0,1,0,0,0,4,9223372036854775807] | strftime("%j %U %W")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "001 00 00"));
         query!(b"null", r#"[2024,5,15,10,30,0,6,166] | strftime("%j %U %W %V %G %g")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "167 23 24 24 2024 24"));
         // Sunday is the special case in %W's Monday-first weekday remap.
@@ -161912,10 +162775,17 @@ mod tests {
         );
 
         // jq's C formatter uses the raw out-of-range weekday in both week
-        // calculations (#3083); verified against pinned jq 1.7.1.
-        query!(b"[2024,0,1,0,0,0,-7,0]", r#"strftime("%U %W")"#,
+        // calculations (#3083), where `timegm` leaves it as given, before 1900;
+        // verified against jq 1.7.1 and 1.8.2. From 1900 jq 1.8.2 recomputes it
+        // (#7606): 2024-01-01 is a Monday, `00 01`, where jq 1.7.1 says `02 02`.
+        query!(b"[1899,0,1,0,0,0,-7,0]", r#"strftime("%U %W")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "02 02");
+            }
+        );
+        query!(b"[2024,0,1,0,0,0,-7,0]", r#"strftime("%U %W")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "00 01");
             }
         );
     }
@@ -162004,55 +162874,70 @@ mod tests {
     /// C-locale `/usr/bin/jq` 1.7.1.
     #[test]
     fn test_strftime_out_of_range_weekday_month_names_3159() {
+        // Before 1900 `timegm` leaves the fields as given (#7606), so they reach the
+        // formatter; every row here is the same in jq 1.7.1 and jq 1.8.2.
         // Weekday out of range: -1 (negative) and 7 (one past valid 0-6).
-        query!(b"null", r#"[2020,0,1,0,0,0,-1,0] | strftime("%a|%A|%w|%u|%c")"#,
+        query!(b"null", r#"[1899,0,1,0,0,0,-1,0] | strftime("%a|%A|%w|%u|%c")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "?|?|-1|-1|? Jan  1 00:00:00 2020");
+                assert_eq!(s, "?|?|-1|-1|? Jan  1 00:00:00 1899");
             }
         );
-        query!(b"null", r#"[2020,0,1,0,0,0,7,0] | strftime("%a|%A|%w|%u|%c")"#,
+        query!(b"null", r#"[1899,0,1,0,0,0,7,0] | strftime("%a|%A|%w|%u|%c")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "?|?|7|7|? Jan  1 00:00:00 2020");
+                assert_eq!(s, "?|?|7|7|? Jan  1 00:00:00 1899");
             }
         );
         // Boundary values: weekday 6 is the last valid name index.
-        query!(b"null", r#"[2020,0,1,0,0,0,6,0] | strftime("%a|%A")"#,
+        query!(b"null", r#"[1899,0,1,0,0,0,6,0] | strftime("%a|%A")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "Sat|Saturday");
             }
         );
-        // Month out of range: -1, 12, 13 (valid array months are 0-11).
-        query!(b"null", r#"[2020,-1,1,0,0,0,0,0] | strftime("%b|%h|%B|%m|%c")"#,
+        // Month out of range: -1 (valid array months are 0-11); 12 and 13
+        // carry into 1900 and 1900 is normalised.
+        query!(b"null", r#"[1899,-1,1,0,0,0,0,0] | strftime("%b|%h|%B|%m|%c")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "?|?|?|00|Sun ?  1 00:00:00 2020");
-            }
-        );
-        query!(b"null", r#"[2020,12,1,0,0,0,0,0] | strftime("%b|%B|%m|%c")"#,
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "?|?|13|Sun ?  1 00:00:00 2020");
-            }
-        );
-        query!(b"null", r#"[2020,13,1,0,0,0,0,0] | strftime("%b|%B|%m")"#,
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "?|?|14");
+                assert_eq!(s, "?|?|?|00|Sun ?  1 00:00:00 1899");
             }
         );
         // Boundary value: array month 11 is the last valid name index.
-        query!(b"null", r#"[2020,11,1,0,0,0,0,0] | strftime("%b|%B|%m")"#,
+        query!(b"null", r#"[1899,11,1,0,0,0,0,0] | strftime("%b|%B|%m")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "Dec|December|12");
             }
         );
         // Both out of range at once.
-        query!(b"null", r#"[2020,-1,1,0,0,0,-1,0] | strftime("%c")"#,
+        query!(b"null", r#"[1899,-1,1,0,0,0,-1,0] | strftime("%c")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "? ?  1 00:00:00 2020");
+                assert_eq!(s, "? ?  1 00:00:00 1899");
             }
         );
-        // Regression guard: the valid range still formats as before.
-        query!(b"null", r#"[2020,0,1,0,0,0,0,0] | strftime("%a|%A|%b|%B|%c")"#,
+        // From 1900 jq 1.8.2 normalises first (#7606), so an out-of-range field
+        // never reaches the names; jq 1.7.1 prints `?` here as above.
+        query!(b"null", r#"[2020,0,1,0,0,0,-1,0] | strftime("%a|%A|%w|%u|%c")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "Sun|Sunday|Jan|January|Sun Jan  1 00:00:00 2020");
+                assert_eq!(s, "Wed|Wednesday|3|3|Wed Jan  1 00:00:00 2020");
+            }
+        );
+        query!(b"null", r#"[2020,-1,1,0,0,0,-1,0] | strftime("%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Sun Dec  1 00:00:00 2019");
+            }
+        );
+        query!(b"null", r#"[2020,13,1,0,0,0,0,0] | strftime("%b|%B|%m")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Feb|February|02");
+            }
+        );
+        query!(b"null", r#"[1899,12,1,0,0,0,0,0] | strftime("%b|%B|%m|%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Jan|January|01|Mon Jan  1 00:00:00 1900");
+            }
+        );
+        // Regression guard: a consistent date formats as before.
+        query!(b"null", r#"[2020,0,1,0,0,0,3,0] | strftime("%a|%A|%b|%B|%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Wed|Wednesday|Jan|January|Wed Jan  1 00:00:00 2020");
             }
         );
     }
@@ -173142,8 +174027,19 @@ mod tests {
             &int(3),
             &int(1)
         ));
-        // Two integers whose doubles tie stay on the exact `i64` walk (#2131).
+        // Two integers past 2^53 compare as decimals first, as jq's `<` does, where the walk
+        // compares doubles (#7731); within 2^53 the exact `i64` walk compares them as jq does.
+        assert!(range_reads_literals::<JqSemantics>(
+            &int(1_700_000_000_000_000_000),
+            &int(1_700_000_000_000_000_001),
+            &int(1)
+        ));
         assert!(!range_reads_literals::<JqSemantics>(
+            &int(9_007_199_254_740_990),
+            &int(9_007_199_254_740_992),
+            &int(1)
+        ));
+        assert!(!range_reads_literals::<YqSemantics>(
             &int(1_700_000_000_000_000_000),
             &int(1_700_000_000_000_000_001),
             &int(1)
@@ -183994,6 +184890,31 @@ mod share_audit_2999 {
             "reduce .[] as $r ({}; .[$r.name] = ($r.name != $r.score))",
             &[],
         );
+    }
+
+    /// #7451: a fold step that appends or stores a container built by a builtin or a pipe from
+    /// nothing but the loop variable (`[$t | tostring | split("")]`, `[range(3)]`, `[[$t] |
+    /// sort]`) declined to the evaluator, whose `+` or write on the borrowed state copied the
+    /// accumulator on every step. The operand is now evaluated on `null`, and 1,000 steps force
+    /// no copy.
+    #[test]
+    fn fold_step_storing_an_input_free_operand_copies_nothing_7451() {
+        let json = ints(1000);
+        for filter in [
+            r#"reduce .[] as $t ([]; . + [$t | tostring | split("")])"#,
+            "reduce .[] as $t ([]; .[$t] = [range(3)])",
+            "reduce .[] as $t ([]; . + [[$t] | sort])",
+            "reduce .[] as $t ([]; . += [[$t] | sort])",
+            "reduce .[] as $t ([]; .[length] = [range(2)])",
+            "reduce .[] as $t ([]; setpath([$t]; [range(2)]))",
+            "reduce .[] as $t ({}; .a += [[$t] | sort])",
+            "reduce .[] as $t ({}; .n += 1 | .a += [[$t] | sort])",
+            "reduce .[] as $t ([[], 0]; [.[0] + [[$t] | sort], .[1] + 1])",
+            "reduce .[] as $t ([]; .[$t] = {a: [range(2)]})",
+            "reduce .[] as $t ([]; . + [limit(2; range(5))])",
+        ] {
+            assert_forced(&json, filter, &[]);
+        }
     }
 
     /// #5263: an operand that reads the accumulator -- the counting idiom's

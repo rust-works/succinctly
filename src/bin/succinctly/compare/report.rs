@@ -492,8 +492,9 @@ fn differential_section(s: &mut String, r: &Results) {
     let _ = writeln!(s, "\n## B. Differential: upstream jq test files\n");
     let _ = writeln!(
         s,
-        "Each case runs through both tools; stdout and exit status must be identical. \
-         The files' own expected outputs are not consulted.\n"
+        "Each case runs through both tools; stdout and exit status must be identical, and so \
+         must a `%%FAIL` case's error messages and their lines (not the source echo, and not \
+         bison's syntax-error wording). The files' own expected outputs are not consulted.\n"
     );
     let _ = writeln!(s, "| File | Cases | Agree |");
     let _ = writeln!(s, "|------|-------|-------|");

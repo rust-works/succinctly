@@ -5,7 +5,9 @@
 //! answers: `(args, stdout, stderr, exit status)`. The records, the RS before each output, and the
 //! `(at <stdin>:N)` a runtime error names have to survive the change of route, and the streams
 //! the reader warns about (a truncated record, junk after a value) have to keep the route that
-//! prints those warnings.
+//! prints those warnings. A stream whose last record follows its last newline is read as jq 1.8.2
+//! reads it since #7718 (every record, and the warning for a cut one), and those rows are 1.8.2's
+//! (`/opt/homebrew/bin/jq`), with jq 1.7.1's colours where `-C` differs.
 
 use anyhow::Result;
 
@@ -64,30 +66,32 @@ const STREAMS: &[(&str, &str, &[Row])] = &[
         "bare_last",
         "\x1e{\"a\":1}\n\x1e2",
         &[
-        (&["-c", "."], "\x1e{\"a\":1}\n", "", 0),
-        (&["-r", ".a?"], "\x1e1\n", "", 0),
-        (&["-c", ".a|error"], "", "jq: error (at <stdin>:1) (not a string): 1\n", 5),
+        (&["-c", "."], "\x1e{\"a\":1}\n", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 2\n", 0),
+        (&["-r", ".a?"], "\x1e1\n", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 2\n", 0),
+        (&["-c", ".a|error"], "", "jq: error (at <stdin>:1) (not a string): 1\njq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 2\n", 5),
         (&["-s", "-c", "."], "\x1e[{\"a\":1}]\n", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 2\n", 0),
         (&["-s", "error(\"x\")"], "", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 2\njq: error (at <unknown>): x\n", 5),
-        (&["--tab", "."], "\x1e{\n\t\"a\": 1\n}\n", "", 0),
-        (&["-j", ".a?"], "\x1e1", "", 0),
-        (&["-c", "[.[]?]"], "\x1e[1]\n", "", 0),
-        (&["-C", "-c", "."], "\x1e\x1b[1;39m{\x1b[0m\x1b[1;34m\"a\"\x1b[0m\x1b[1;39m:\x1b[0m\x1b[0;39m1\x1b[0m\x1b[1;39m\x1b[1;39m}\x1b[0m\n", "", 0),
+        (&["--tab", "."], "\x1e{\n\t\"a\": 1\n}\n", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 2\n", 0),
+        (&["-j", ".a?"], "\x1e1", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 2\n", 0),
+        (&["-c", "[.[]?]"], "\x1e[1]\n", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 2\n", 0),
+        // jq 1.8.2's reading; the rest of the answer is jq 1.7.1's (ADR-0018, #7718).
+        (&["-C", "-c", "."], "\x1e\x1b[1;39m{\x1b[0m\x1b[1;34m\"a\"\x1b[0m\x1b[1;39m:\x1b[0m\x1b[0;39m1\x1b[0m\x1b[1;39m\x1b[1;39m}\x1b[0m\n", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 2\n", 0),
         ],
     ),
     (
         "no_newline",
         "\x1e{\"a\":1}\n\x1e{\"a\":2}",
         &[
-        (&["-c", "."], "\x1e{\"a\":1}\n", "", 0),
-        (&["-r", ".a?"], "\x1e1\n", "", 0),
-        (&["-c", ".a|error"], "", "jq: error (at <stdin>:1) (not a string): 1\n", 5),
+        (&["-c", "."], "\x1e{\"a\":1}\n\x1e{\"a\":2}\n", "", 0),
+        (&["-r", ".a?"], "\x1e1\n\x1e2\n", "", 0),
+        (&["-c", ".a|error"], "", "jq: error (at <stdin>:1) (not a string): 1\njq: error (at <stdin>:1) (not a string): 2\n", 5),
         (&["-s", "-c", "."], "\x1e[{\"a\":1},{\"a\":2}]\n", "", 0),
         (&["-s", "error(\"x\")"], "", "jq: error (at <stdin>:1): x\n", 5),
-        (&["--tab", "."], "\x1e{\n\t\"a\": 1\n}\n", "", 0),
-        (&["-j", ".a?"], "\x1e1", "", 0),
-        (&["-c", "[.[]?]"], "\x1e[1]\n", "", 0),
-        (&["-C", "-c", "."], "\x1e\x1b[1;39m{\x1b[0m\x1b[1;34m\"a\"\x1b[0m\x1b[1;39m:\x1b[0m\x1b[0;39m1\x1b[0m\x1b[1;39m\x1b[1;39m}\x1b[0m\n", "", 0),
+        (&["--tab", "."], "\x1e{\n\t\"a\": 1\n}\n\x1e{\n\t\"a\": 2\n}\n", "", 0),
+        (&["-j", ".a?"], "\x1e1\x1e2", "", 0),
+        (&["-c", "[.[]?]"], "\x1e[1]\n\x1e[2]\n", "", 0),
+        // jq 1.8.2's reading; the rest of the answer is jq 1.7.1's (ADR-0018, #7718).
+        (&["-C", "-c", "."], "\x1e\x1b[1;39m{\x1b[0m\x1b[1;34m\"a\"\x1b[0m\x1b[1;39m:\x1b[0m\x1b[0;39m1\x1b[0m\x1b[1;39m\x1b[1;39m}\x1b[0m\n\x1e\x1b[1;39m{\x1b[0m\x1b[1;34m\"a\"\x1b[0m\x1b[1;39m:\x1b[0m\x1b[0;39m2\x1b[0m\x1b[1;39m\x1b[1;39m}\x1b[0m\n", "", 0),
         ],
     ),
     (

@@ -1210,6 +1210,12 @@ struct JqCommand {
     /// Show build configuration
     #[arg(long, overrides_with = "build_configuration")]
     build_configuration: bool,
+
+    /// jq's `--run-tests [file...]`, which runs jq's own test files and is not supported here
+    /// (#7715): `run_jq` refuses it, and the words after it are not read, as jq hands them to its
+    /// test runner. Hidden, as jq's own `--help` does not list it.
+    #[arg(long, hide = true)]
+    run_tests: bool,
 }
 
 /// `--on-error` of `succinctly jq` (#5471) and `succinctly yq` (#5507): how an uncaught error
@@ -2083,11 +2089,54 @@ struct JqArgv {
     /// Every positional word with the mode it was read in. The first is the program, or the
     /// program file under `-f`, whatever its mode.
     positional: Vec<(WordMode, std::ffi::OsString)>,
+    /// Where jq's option loop stops before the end of argv, if it does (#7712).
+    stop: Option<JqStop>,
+}
+
+/// A word jq's option loop stops at (#7712): jq reads argv left to right and exits at the first
+/// word it refuses, or at the first help, version or build-configuration option, so everything
+/// it checks on the way (an `--argjson` text, a `--slurpfile` file) is checked before it.
+#[derive(Debug, PartialEq, Eq)]
+struct JqStop {
+    /// How many of [`JqArgv::options`] come before the option that stops the loop: the words jq
+    /// read before it.
+    at: usize,
+    kind: JqStopKind,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum JqStopKind {
+    /// An option jq does not define.
+    Unknown(Vec<u8>),
+    /// `-h`, `-V` or `--build-configuration`, which clap prints, or an `--indent` jq refuses or a
+    /// succinctly-only option without its value, which clap reports.
+    Clap,
+    /// A jq option whose values argv does not hold (`--arg x` at the end), with jq's message.
+    MissingValue(&'static str),
+    /// An `--argjson` text or a `--jsonargs` word that is not JSON; the flag is named.
+    InvalidJson(&'static str),
 }
 
 /// The word jq names in `jq: Unknown option <word>`.
 #[derive(Debug, PartialEq, Eq)]
 struct UnknownJqOption(Vec<u8>);
+
+/// [`read_jq_argv`] with an unknown option as the error, for the tests that only need to know
+/// what clap is given.
+#[cfg(test)]
+fn walk_jq_argv<W: AsRef<std::ffi::OsStr>>(
+    cmd: &clap::Command,
+    argv: &[W],
+) -> Result<JqArgv, UnknownJqOption> {
+    let walked = read_jq_argv(cmd, argv);
+    match walked.stop {
+        Some(JqStop {
+            kind: JqStopKind::Unknown(word),
+            ..
+        }) => Err(UnknownJqOption(word)),
+        _ => Ok(walked),
+    }
+}
 
 /// Read `argv` (program name first) as jq 1.8.2's `main.c` does, against `cmd`, the built jq
 /// definition (#7438, #7494).
@@ -2107,15 +2156,18 @@ struct UnknownJqOption(Vec<u8>);
 ///
 /// Values are kept with their option by arity ([`jq_option_arity`]'s rule), whatever they look like:
 /// `--arg x -c` binds `-c`, `-L --` adds the directory `--`.
-fn walk_jq_argv<W: AsRef<std::ffi::OsStr>>(
-    cmd: &clap::Command,
-    argv: &[W],
-) -> Result<JqArgv, UnknownJqOption> {
+///
+/// The walk stops where jq's loop stops (#7712, [`JqStop`]): at an unknown option, at a help,
+/// version or build-configuration option, at an option whose values argv does not hold, at an
+/// `--indent` value jq refuses, and at an `--argjson` text or a `--jsonargs` word that is not JSON.
+/// An `--argjson` whose name an earlier named argument bound is skipped unread, as jq skips it.
+/// A `--slurpfile` or `--rawfile` file is not read here: [`parse_jq`] reads the ones before a stop.
+fn read_jq_argv<W: AsRef<std::ffi::OsStr>>(cmd: &clap::Command, argv: &[W]) -> JqArgv {
     let takes = |arg: &clap::Arg| arg.get_num_args().map_or(0, |range| range.min_values());
     let ends_the_walk = |arg: &clap::Arg| {
         matches!(
             arg.get_id().as_str(),
-            "help" | "version" | "build_configuration"
+            "help" | "version" | "build_configuration" | "run_tests"
         )
     };
     let long_arg = |name: &str| {
@@ -2144,14 +2196,53 @@ fn walk_jq_argv<W: AsRef<std::ffi::OsStr>>(
             .into_iter()
             .collect(),
         positional: Vec::new(),
+        stop: None,
     };
-    // The values an option takes follow it, whatever they look like.
-    let take_values = |walked: &mut JqArgv, n: usize, i: &mut usize| {
+    // The names `--arg`, `--argjson`, `--slurpfile` and `--rawfile` have bound: jq reads the value
+    // of a name only the first time (#5154).
+    let mut bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The values an option takes follow it, whatever they look like. `arg` is the option, `at`
+    // where it starts in `options`; a value jq refuses there stops the walk.
+    let take_values = |walked: &mut JqArgv,
+                       bound: &mut std::collections::HashSet<String>,
+                       arg: &clap::Arg,
+                       at: usize,
+                       i: &mut usize|
+     -> Option<JqStop> {
+        let n = takes(arg);
         let end = (*i + n).min(argv.len());
+        let values = &argv[*i..end];
         walked
             .options
-            .extend(argv[*i..end].iter().map(|w| w.as_ref().to_owned()));
+            .extend(values.iter().map(|w| w.as_ref().to_owned()));
         *i = end;
+        let stop = |kind| Some(JqStop { at, kind });
+        if values.len() < n {
+            return stop(
+                jq_missing_value_message(arg.get_id().as_str())
+                    .map_or(JqStopKind::Clap, JqStopKind::MissingValue),
+            );
+        }
+        let text = |k: usize| jq_word_text(values[k].as_ref());
+        match arg.get_id().as_str() {
+            "indent" if parse_jq_indent(&text(0)).is_err() => stop(JqStopKind::Clap),
+            // succinctly's own `--on-error`, whose value clap checks: refused where it stands too.
+            "on_error" if <OnError as clap::ValueEnum>::from_str(&text(0), false).is_err() => {
+                stop(JqStopKind::Clap)
+            }
+            id @ ("arg" | "argjson" | "slurpfile" | "rawfile") => {
+                let name = text(0);
+                if bound.contains(&name) {
+                    return None;
+                }
+                if id == "argjson" && !jq_runner::is_json_text(&text(1)) {
+                    return stop(JqStopKind::InvalidJson("argjson"));
+                }
+                bound.insert(name);
+                None
+            }
+            _ => None,
+        }
     };
     let mut mode = WordMode::File;
     let mut options_ended = false;
@@ -2164,6 +2255,17 @@ fn walk_jq_argv<W: AsRef<std::ffi::OsStr>>(
             && bytes[0] == b'-'
             && (bytes[1] == b'-' || bytes[1].is_ascii_alphabetic());
         if options_ended || !is_option {
+            // The first positional word is the program, whatever the mode.
+            if mode == WordMode::Json
+                && !walked.positional.is_empty()
+                && !jq_runner::is_json_text(&jq_word_text(word))
+            {
+                walked.stop = Some(JqStop {
+                    at: walked.options.len(),
+                    kind: JqStopKind::InvalidJson("jsonargs"),
+                });
+                return walked;
+            }
             walked.positional.push((mode, word.to_owned()));
             continue;
         }
@@ -2171,6 +2273,7 @@ fn walk_jq_argv<W: AsRef<std::ffi::OsStr>>(
             options_ended = true;
             continue;
         }
+        let at = walked.options.len();
         if bytes[1] == b'-' {
             let name = std::str::from_utf8(&bytes[2..]).ok();
             let Some(arg) = name.and_then(long_arg) else {
@@ -2184,7 +2287,11 @@ fn walk_jq_argv<W: AsRef<std::ffi::OsStr>>(
                     walked.options.push(word.to_owned());
                     continue;
                 }
-                return Err(UnknownJqOption(bytes.into_owned()));
+                walked.stop = Some(JqStop {
+                    at,
+                    kind: JqStopKind::Unknown(bytes.into_owned()),
+                });
+                return walked;
             };
             match arg.get_id().as_str() {
                 "args" => mode = WordMode::Str,
@@ -2192,51 +2299,88 @@ fn walk_jq_argv<W: AsRef<std::ffi::OsStr>>(
                 _ => {
                     walked.options.push(word.to_owned());
                     if ends_the_walk(arg) {
-                        return Ok(walked);
+                        walked.stop = Some(JqStop {
+                            at,
+                            kind: JqStopKind::Clap,
+                        });
+                        return walked;
                     }
-                    take_values(&mut walked, takes(arg), &mut i);
+                    if let Some(stop) = take_values(&mut walked, &mut bound, arg, at, &mut i) {
+                        walked.stop = Some(stop);
+                        return walked;
+                    }
                 }
             }
             continue;
         }
-        for (at, &letter) in bytes.iter().enumerate().skip(1) {
+        for (k, &letter) in bytes.iter().enumerate().skip(1) {
+            let at = walked.options.len();
             let Some(arg) = short_arg(letter) else {
-                return Err(UnknownJqOption(vec![b'-', letter]));
+                walked.stop = Some(JqStop {
+                    at,
+                    kind: JqStopKind::Unknown(vec![b'-', letter]),
+                });
+                return walked;
             };
             walked
                 .options
                 .push(format!("-{}", char::from(letter)).into());
             if ends_the_walk(arg) {
-                return Ok(walked);
+                walked.stop = Some(JqStop {
+                    at,
+                    kind: JqStopKind::Clap,
+                });
+                return walked;
             }
-            let n = takes(arg);
-            if n > 0 {
+            if takes(arg) > 0 {
                 // `-Llib`: the rest of the word is the value; `-nL lib`: the next word is.
-                if at + 1 < bytes.len() {
-                    walked.options.push(os_word_from_bytes(&bytes[at + 1..]));
-                } else {
-                    take_values(&mut walked, n, &mut i);
+                if k + 1 < bytes.len() {
+                    walked.options.push(os_word_from_bytes(&bytes[k + 1..]));
+                } else if let Some(stop) = take_values(&mut walked, &mut bound, arg, at, &mut i) {
+                    walked.stop = Some(stop);
+                    return walked;
                 }
                 break;
             }
         }
     }
-    Ok(walked)
+    walked
 }
 
 /// jq's refusal of an option it does not define (#7438): `jq: Unknown option <word>` and its usage
 /// hint on standard error, exit 2. The word is printed as given, as jq's `fprintf` prints it.
 fn exit_unknown_jq_option(UnknownJqOption(word): UnknownJqOption) -> ! {
+    let mut line = b"jq: Unknown option ".to_vec();
+    line.extend_from_slice(&word);
+    exit_jq_usage_error(&line)
+}
+
+/// One line of jq's usage error, then the usage hint jq's `die()` prints, on standard error, and
+/// exit 2.
+fn exit_jq_usage_error(line: &[u8]) -> ! {
     use std::io::Write;
     let mut stderr = std::io::stderr().lock();
-    let _ = stderr.write_all(b"jq: Unknown option ");
-    let _ = stderr.write_all(&word);
+    let _ = stderr.write_all(line);
     let _ = stderr.write_all(
         b"\nUse jq --help for help with command-line options,\n\
           or see the jq manpage, or online docs  at https://jqlang.github.io/jq\n",
     );
     let _ = stderr.flush();
     std::process::exit(output::exit_codes::USAGE_ERROR)
+}
+
+/// jq's report of an option at the end of argv without the values it takes (#7712), for the jq
+/// options that take values; `None` for a succinctly-only option, which clap reports.
+fn jq_missing_value_message(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "arg" => "jq: --arg takes two parameters (e.g. --arg varname value)",
+        "argjson" => "jq: --argjson takes two parameters (e.g. --argjson varname text)",
+        "slurpfile" => "jq: --slurpfile takes two parameters (e.g. --slurpfile varname filename)",
+        "rawfile" => "jq: --rawfile takes two parameters (e.g. --rawfile varname filename)",
+        "indent" => "jq: --indent takes one parameter",
+        "library_path" => "-L takes a parameter: (e.g. -L /search/path or -L/search/path)",
+        _ => return None,
+    })
 }
 
 /// Returns `Some(exit_code)` if a multi-call alias was detected,
@@ -2434,11 +2578,34 @@ pub fn main() -> Result<()> {
     // recursion of any shape refuses once it has spent half of it instead of
     // overflowing -- registered first thing, where the stack still available
     // and the thread's size agree.
-    let child = spawn_eval_thread()?;
+    let child = match spawn_eval_thread() {
+        Ok(child) => child,
+        Err(failed) => return run_main_on_this_thread(failed),
+    };
     match child.join() {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+/// Run on the main thread when no evaluation thread can be created (#7733): at the user's process
+/// or thread limit (`ulimit -u`, a container's pids limit) every size fails `EAGAIN`, where jq,
+/// which is single-threaded, runs.
+///
+/// The floor is registered at the stack this thread really has ([`main_thread_stack::available`]),
+/// so deep recursion is refused, sooner than on the evaluation thread, instead of overflowing; under
+/// a cap on the address space no more than a quarter of the cap is counted, as
+/// [`eval_stack_start`] does. Where the stack's bounds cannot be read the spawn failure stands.
+fn run_main_on_this_thread(failed: anyhow::Error) -> Result<()> {
+    let Some(stack) = main_thread_stack::available() else {
+        return Err(failed);
+    };
+    let stack = match address_space::cap() {
+        Some(cap) => stack.min(cap / 4),
+        None => stack,
+    }
+    .min(EVAL_STACK_SIZE);
+    succinctly::jq::with_stack_budget(stack, run_main)
 }
 
 /// Exit after a `jq`/`yq` run.
@@ -2470,7 +2637,7 @@ const YQ_SUBCOMMAND_ABOUT: &str = "Command-line YAML processor (jq-compatible sy
 /// `argv` (program name first) parsed as `jq`, for the `sjq` multi-call path (`about` is `None`: its
 /// own text) and for `succinctly jq` (`about` is the one the tree shows, #7149).
 ///
-/// jq's grammar is not clap's (#7438, #7494): [`walk_jq_argv`] reads argv as jq does, refusing what
+/// jq's grammar is not clap's (#7438, #7494): [`read_jq_argv`] reads argv as jq does, refusing what
 /// jq refuses, and clap then parses only the options it found, so no positional word (`-1`, `-.a`)
 /// ever reaches clap. One definition serves both, built once.
 fn parse_jq(argv: Vec<std::ffi::OsString>, about: Option<&'static str>) -> JqCommand {
@@ -2479,9 +2646,22 @@ fn parse_jq(argv: Vec<std::ffi::OsString>, about: Option<&'static str>) -> JqCom
     if let Some(about) = about {
         command = command.about(about);
     }
-    // `walk_jq_argv` reads each option's arity, which is only filled in once the command is built.
+    // `read_jq_argv` reads each option's arity, which is only filled in once the command is built.
     command.build();
-    let walked = walk_jq_argv(&command, &argv).unwrap_or_else(|e| exit_unknown_jq_option(e));
+    let walked = read_jq_argv(&command, &argv);
+    if let Some(stop) = &walked.stop {
+        // jq checks every option before the one it stops at first (#7712).
+        report_jq_errors_before(&mut command, &walked.options[..stop.at], &walked.positional);
+        match &stop.kind {
+            JqStopKind::Unknown(word) => exit_unknown_jq_option(UnknownJqOption(word.clone())),
+            JqStopKind::InvalidJson(flag) => {
+                jq_runner::exit_invalid_json_text(flag);
+            }
+            JqStopKind::MissingValue(message) => exit_jq_usage_error(message.as_bytes()),
+            // clap prints the help and reports the `--indent` it refuses.
+            JqStopKind::Clap => {}
+        }
+    }
     let matches = command
         .try_get_matches_from_mut(walked.options)
         .unwrap_or_else(|e| e.exit());
@@ -2491,8 +2671,36 @@ fn parse_jq(argv: Vec<std::ffi::OsString>, about: Option<&'static str>) -> JqCom
     cmd
 }
 
+/// Report the first error jq would find in the words before the one its option loop stops at
+/// (#7712), and exit with jq's status for it; return when there is none. `options` are the options
+/// [`read_jq_argv`] read before the stop and `positional` the positional words.
+///
+/// clap parses `options` first, so a bad value of a succinctly-only option there is reported in
+/// clap's words. The `--slurpfile` and `--rawfile` files are then read and every named argument
+/// bound, as `run_jq` does: the walk has already checked each `--argjson` text and `--jsonargs` word.
+/// With nothing before the stop but the program name there is nothing to check.
+fn report_jq_errors_before(
+    command: &mut clap::Command,
+    options: &[std::ffi::OsString],
+    positional: &[(WordMode, std::ffi::OsString)],
+) {
+    use clap::FromArgMatches;
+    if options.len() <= 1 {
+        return;
+    }
+    let matches = command
+        .try_get_matches_from_mut(options)
+        .unwrap_or_else(|e| e.exit());
+    let mut cmd = JqCommand::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    cmd.named_order = jq_runner::named_flag_order_of(&matches);
+    cmd.set_positional_words(positional.to_vec());
+    if let Some(code) = jq_runner::report_named_argument_error(&cmd) {
+        std::process::exit(code);
+    }
+}
+
 impl JqCommand {
-    /// Take the positional words [`walk_jq_argv`] read (#7494): the first is the program (under
+    /// Take the positional words [`read_jq_argv`] read (#7494): the first is the program (under
     /// `-f`, `resolve_positional_args` moves it to `program_file`), and each later one goes where
     /// the mode it was read in sends it: an input file, or an `--args`/`--jsonargs` word.
     fn set_positional_words(&mut self, words: Vec<(WordMode, std::ffi::OsString)>) {
@@ -3671,6 +3879,7 @@ mod jq_seq_reader;
 mod jq_stream_errors;
 mod json_validate;
 mod m2_gate;
+mod main_thread_stack;
 mod malloc_arena;
 mod output;
 mod relocation_pages;
@@ -4532,6 +4741,61 @@ mod jq_argv_7438 {
             walk_jq_argv(&cmd, &[OsString::from("jq"), bad(b"--a\xff")]),
             Err(UnknownJqOption(b"--a\xff".to_vec()))
         );
+    }
+}
+
+/// #7712: where [`read_jq_argv`] stops, and how many options come before the stop.
+#[cfg(test)]
+mod jq_argv_stop_7712 {
+    use super::*;
+
+    fn stop(words: &[&str]) -> Option<(usize, JqStopKind)> {
+        use clap::CommandFactory;
+        let mut cmd = JqCommand::command();
+        cmd.build();
+        read_jq_argv(&cmd, words).stop.map(|s| (s.at, s.kind))
+    }
+
+    #[test]
+    fn the_walk_stops_where_jq_s_option_loop_stops() {
+        use JqStopKind::{Clap, InvalidJson, MissingValue, Unknown};
+        assert_eq!(stop(&["jq", "-n", "--argjson", "a", "1", "."]), None);
+        // The options before the stop: `jq`, `-n`, `--slurpfile a f`.
+        assert_eq!(
+            stop(&["jq", "-n", "--slurpfile", "a", "f", "-h"]),
+            Some((5, Clap))
+        );
+        assert_eq!(stop(&["jq", "-ch", "-x"]), Some((2, Clap)));
+        assert_eq!(
+            stop(&["jq", "--argjson", "a", "{", "-x"]),
+            Some((1, InvalidJson("argjson")))
+        );
+        // A bound name's value is not read, so it cannot stop the walk.
+        assert_eq!(
+            stop(&["jq", "--arg", "a", "1", "--argjson", "a", "{", "-x"]),
+            Some((7, Unknown(b"-x".to_vec())))
+        );
+        assert_eq!(
+            stop(&["jq", "--jsonargs", "{", "1", "{", "-x"]),
+            Some((1, InvalidJson("jsonargs")))
+        );
+        assert_eq!(stop(&["jq", "--indent", "9", "-x"]), Some((1, Clap)));
+        assert_eq!(
+            stop(&["jq", "--on-error", "stop", "-x"]),
+            Some((3, Unknown(b"-x".to_vec())))
+        );
+        assert_eq!(stop(&["jq", "--on-error", "bogus", "-x"]), Some((1, Clap)));
+        assert_eq!(
+            stop(&["jq", ".", "--arg", "x"]),
+            Some((
+                1,
+                MissingValue("jq: --arg takes two parameters (e.g. --arg varname value)")
+            ))
+        );
+        assert!(
+            matches!(stop(&["jq", "-nL"]), Some((2, MissingValue(m))) if m.starts_with("-L takes"))
+        );
+        assert_eq!(stop(&["jq", "-cq"]), Some((2, Unknown(b"-q".to_vec()))));
     }
 }
 

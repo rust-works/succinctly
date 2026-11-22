@@ -2,7 +2,7 @@
 //! `TZ=posix/Asia/Tokyo`, `TZ=right/...` and `TZ=Asia//Tokyo` were UTC, `TZDIR` was not read as
 //! glibc reads it, and names matched whatever their case. libc reads `TZ` as a tz file under the
 //! zoneinfo directory (or at a path) before it reads it as a POSIX string. Every row is jq 1.7.1's
-//! output, captured on x86_64 Linux (glibc, `/home/jky/.local/bin/jq`) and on macOS arm64
+//! output, captured on x86_64 Linux (glibc, `~/.local/bin/jq`) and on macOS arm64
 //! (`/usr/bin/jq`; jq 1.8.2 printed the same there).
 //!
 //! The rows need the machine's zoneinfo (`Asia/Tokyo`, and on Linux the `posix/` tree): a machine

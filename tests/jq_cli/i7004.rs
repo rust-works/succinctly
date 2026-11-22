@@ -2,8 +2,10 @@
 //! `gmtime`/`localtime` return, as jq does, whose seconds slot is `tm_sec + (t - floor(t))` read back
 //! as an integer. For a negative timestamp a hair below a whole second that sum rounds up to the next
 //! integer: `-1e-17` prints second `01` where its truncated second is `00`, and `-1.0000000000000002`
-//! prints `23:59:60`. Every row was captured from jq 1.7.1
-//! on macOS under the zone it names.
+//! prints `23:59:60` in jq 1.7.1. jq 1.8.2 normalises that array before formatting it, so a second
+//! 60 carries into the next minute (`00:00:00`), and `succinctly jq` follows it (#7606); those rows
+//! carry jq 1.7.1's answer in a comment. Every other row was captured from jq 1.7.1, and agrees with
+//! jq 1.8.2, on macOS under the zone it names.
 
 use std::process::Command;
 
@@ -173,23 +175,26 @@ const ROWS: &[(&str, &str, &str, &str)] = &[
         "\"01 00:00:01\"\n",
     ),
     // A hair below a whole second further from zero rounds up as well, to second `60` below `-1`.
+    // jq 1.7.1: "1969-12-31T23:59:60Z"
     (
         "UTC",
         "-1.0000000000000002",
         "todate",
-        "\"1969-12-31T23:59:60Z\"\n",
+        "\"1970-01-01T00:00:00Z\"\n",
     ),
+    // jq 1.7.1: "60 23:59:60 0"
     (
         "UTC",
         "-1.0000000000000002",
         "strftime(\"%S %T %s\")",
-        "\"60 23:59:60 0\"\n",
+        "\"00 00:00:00 0\"\n",
     ),
+    // jq 1.7.1: "60 23:59:60"
     (
         "UTC",
         "-1.0000000000000002",
         "strflocaltime(\"%S %T\")",
-        "\"60 23:59:60\"\n",
+        "\"00 00:00:00\"\n",
     ),
     (
         "UTC",
@@ -245,11 +250,12 @@ const ROWS: &[(&str, &str, &str, &str)] = &[
         "strflocaltime(\"%S %T\")",
         "\"59 23:58:59\"\n",
     ),
+    // jq 1.7.1: "60 18:59:60"
     (
         "EST5EDT",
         "-1.0000000000000002",
         "strflocaltime(\"%S %T\")",
-        "\"60 18:59:60\"\n",
+        "\"00 19:00:00\"\n",
     ),
     (
         "EST5EDT",

@@ -8,6 +8,10 @@
 //! `--seq -s --stream` (whose fault is a warning), `-s --stream-errors`, and the `-n` and
 //! non-slurp readers, which are rows here because they build the same tail source.
 //! Every row was captured from jq 1.7.1.
+//!
+//! Since #7718 `succinctly jq` reads `--seq` past the last bytes as jq 1.8.2 does (jqlang/jq#3279), so
+//! the rows that read differently there are jq 1.8.2's (`/opt/homebrew/bin/jq`), with jq 1.7.1's
+//! position after the last input (#7607) and its reads past a last directory.
 
 use anyhow::Result;
 
@@ -40,13 +44,13 @@ fn a_fault_met_two_reads_behind_the_last_file_is_in_the_array_6773() -> Result<(
         (&["-c", "--seq", "-s", "--stream-errors", "input_line_number"][..], &["trunc", "pa", "missing", "missing2"][..], "\u{1e}0\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
         (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "pa", "missing"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
         (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "pa", "dir"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "", 2),
-        (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "pa"][..], "\u{1e}[[[0],1],[[1,0],1]]\n\u{1e}[[1,0]]\n\u{1e}[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]\n", "", 0),
+        (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "pa"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n\u{1e}[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]\n", "", 0),
         (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "missing", "pa", "missing2"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
         (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["pa", "missing", "missing2"][..], "\u{1e}[[\"Unfinished abandoned text at EOF at line 1, column 3\",[]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
         (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "pa", "missing", "missing2"][..], "", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 2),
         (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "pa", "missing", "dir"][..], "", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 2),
         (&["-c", "-s", "--stream-errors", "."][..], &["trunc", "pa", "missing", "missing2"][..], "[[\"Invalid numeric literal at line 1, column 2\",[]],[[0],1],[[0]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
-        (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "missing", "pa"][..], "\u{1e}[[[0],1],[[1,0],1]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
+        (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["trunc", "missing", "pa"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
         (&["-c", "--seq", "-s", "--stream-errors", "."][..], &["missing", "trunc", "pa", "missing2"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
         (&["-c", "--seq", "-s", "-n", "--stream-errors", "[., input]"][..], &["trunc", "pa", "missing", "missing2"][..], "\u{1e}[null,[[[0],1],[[1,0],1],[[1,0]],[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\njq: error: Could not open file @DIR@/missing2: No such file or directory\n", 2),
         (&["-c", "--seq", "-s", "-n", "--stream-errors", "input"][..], &["trunc", "pa", "missing"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
