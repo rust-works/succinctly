@@ -15726,6 +15726,14 @@ jq 1.8 fixed that ([jqlang/jq@7a1fd72d](https://github.com/jqlang/jq/commit/7a1f
 A named argument is still read first, as in both jq releases: `jq -f --rawfile x nope` reports the missing `--rawfile` file.
 Pinned by `tests/jq_cli/i7439.rs`.
 
+## `--run-tests` is not supported ([#7715](https://github.com/rust-works/succinctly/issues/7715))
+
+jq 1.7.1's manual documents `--run-tests [filename]`, and jq 1.7.1 and jq 1.8.2 both implement it: it runs a file of jq test cases (the format of jq's own `tests/jq.test`, or standard input without a file), prints `Test #N: ...` for each case and a `N of M tests passed (K malformed, S skipped)` summary, and exits 0 when every case passed and 1 otherwise.
+It is a harness for jq's own test suite (`jq_testsuite` in `src/jq_test.c`, with `%%FAIL` cases that compare compile-error text and `--skip`/`--take`), not an option for processing data, so `succinctly jq` does not implement it.
+It refuses the option with `jq: --run-tests is not supported: succinctly jq does not run jq's test files`, exit 2, where it printed `Unknown option --run-tests` before #7715.
+As in jq, the option ends the command line: the words after it are not read as options (`--run-tests -x` is the refusal, not `Unknown option -x`), an error before it is reported first, and `--run-tests=x` is `Unknown option --run-tests=x` in all three.
+Pinned by `tests/jq_cli/i7715.rs`.
+
 ## Short-option bundles are read as jq 1.8.2 reads them, not as jq 1.7.1 does ([#7438](https://github.com/rust-works/succinctly/issues/7438))
 
 `succinctly jq` reads its command line as jq's own option loop does (`walk_jq_argv`), and clap parses only the options it found (#7438, #7494).

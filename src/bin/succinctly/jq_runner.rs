@@ -5121,6 +5121,10 @@ impl Drop for RunIndex<'_> {
 ///
 /// A value the program builds is bounded by the native-stack floor `main` registered, not by
 /// `MAX_VALUE_TREE_DEPTH`, as jq bounds it by its C stack alone (#5554).
+/// `succinctly jq`'s refusal of jq's `--run-tests` (#7715), after `jq: `.
+const RUN_TESTS_UNSUPPORTED: &str =
+    "--run-tests is not supported: succinctly jq does not run jq's test files";
+
 pub fn run_jq(args: JqCommand) -> Result<i32> {
     let run = jq::with_value_depth_on_stack_floor(|| run_jq_on_stack_floor(args));
     // #7455: a regular file on standard input the run did not read to the end is left where jq's
@@ -5205,6 +5209,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // allocations) to a process about to end was a quarter of the run (#5673).
     let mut context = std::mem::ManuallyDrop::new(context);
     share_named_strings(&mut context);
+
+    // jq's test-file runner is not implemented (#7715, docs/compliance/jq/limitations.md). jq
+    // reaches the option after the named arguments before it, so their errors come first.
+    if args.run_tests {
+        report_usage_error(RUN_TESTS_UNSUPPORTED);
+        return Ok(exit_codes::USAGE_ERROR);
+    }
 
     // `-f` with no program file is jq 1.8.2's usage error (#7439), reached after the named
     // arguments are read, as jq reads them while it parses argv.
