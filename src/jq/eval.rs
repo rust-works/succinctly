@@ -39963,6 +39963,18 @@ fn scan_fancy_pattern(pattern: &str) -> Option<(String, bool)> {
                     if reversed || chars.get(j + 1) == Some(&'+') {
                         return None;
                     }
+                    // #7669: a `?` right after a fixed interval makes it reluctant in jq's syntax
+                    // (Perl_NT has no `ONIG_SYN_FIXED_INTERVAL_IS_GREEDY_ONLY`), and a reluctant
+                    // `x{n}` still matches `n` times: `"a" | test("(?>a){2}?a")` is `false`.
+                    // `fancy-regex`'s Oniguruma mode reads it as another quantifier, Ruby's
+                    // `(?:x{n})?`, so the `?` is dropped. A quantifier after it then applies to
+                    // `x{n}` in both (`x{n}??` is `(?:x{n})?`, `x{n}?+` is `(?:x{n})+`).
+                    if hi.is_none() && chars.get(j + 1) == Some(&'?') {
+                        out.extend(&chars[i..=j]);
+                        at_start = false;
+                        i = j + 2;
+                        continue;
+                    }
                 }
             }
             '(' if chars.get(i + 1) == Some(&'?') => {
@@ -149569,6 +149581,33 @@ mod tests {
         for pattern in ["(?=a)a{3,2}", "(?=a)a{2,3}+", "(?=a)a{2,}+", "(?=a)a{2}+"] {
             assert!(prepare_fancy_pattern(pattern).is_none(), "{pattern}");
         }
+    }
+
+    /// #7669: a `?` right after a fixed interval is the reluctant marker in jq's Perl_NT syntax, and
+    /// a reluctant `x{n}` is `x{n}`; `fancy-regex`'s Oniguruma mode would read it as `(?:x{n})?`. It
+    /// is dropped there, and only there: not after a range, a gap, an escape or inside a class.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_prepare_fancy_pattern_drops_the_lazy_mark_of_a_fixed_interval_7669() {
+        let prepared = |pattern: &str| prepare_fancy_pattern(pattern).expect(pattern);
+        assert_eq!(prepared("(?>a){2}?a"), "(?>a){2}a");
+        assert_eq!(prepared("(?>a){02}?a"), "(?>a){02}a");
+        // A quantifier after the reluctant interval stays, and repeats `x{n}`.
+        assert_eq!(prepared("(?>a){2}??"), "(?>a){2}?");
+        assert_eq!(prepared("(?>a){2}?+a"), "(?>a){2}+a");
+        assert_eq!(prepared("(?=a)a{0}?a{1}?"), "(?=a)a{0}a{1}");
+        for pattern in [
+            "(?=a)a{2,2}?",
+            "(?=a)a{1,2}?",
+            "(?=a)a{2,}?",
+            "(?x)(?=a)a{2} ?",
+            "(?=a)a\\{2}?",
+            "(?=a)[{2}?]",
+            "(?=a)(?#{2}?)",
+        ] {
+            assert_eq!(prepared(pattern), pattern);
+        }
+        assert_eq!(prepared("(?=a)b{,2}?"), "(?=a)b\\{,2}?");
     }
 
     #[cfg(feature = "regex")]
