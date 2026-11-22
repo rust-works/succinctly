@@ -15652,3 +15652,20 @@ A dump of at most 29 bytes is whole, and a longer one keeps 25 bytes (cut back t
 
 `format("urid")` is the one divergence from the 1.8.2 behaviour: `"%41" | format("urid")` is `"A"` there, and here it stays jq 1.7.1's `urid is not a valid format` (pinned in `tests/jq_cli_tests.rs` and `tests/jq_cli/i6726.rs`).
 It keeps following the pin, as `add/1`, `trimstr/1`, `have_decnum/0` and `have_literal_numbers/0` do.
+
+### `--indent` refuses a malformed value, as jq 1.8 does — newer than the 1.7.1 pin (#7501)
+
+jq 1.7.1 reads the value of `--indent` with C's `atoi`, so `--indent abc` and `--indent ""` are 0, `--indent 3x` and `--indent " 2"` are 3 and 2, and `--indent 99999999999999999999` wraps to an `int` (#6017 pinned that rule).
+Upstream called it a bug and jq 1.8.0 fixed it: "Fix `--indent` option to error for malformed values" ([jqlang/jq#3195](https://github.com/jqlang/jq/pull/3195), NEWS.md of 1.8).
+jq 1.8.2 accepts an optional `+` or `-` followed by one or more ASCII digits and nothing else, in -1 to 7, and exits 2 with `--indent takes a number between -1 and 7` for every other value.
+So `+3`, `007` and `-00` are accepted, and an empty value, white space before or after the digits, `3x`, `3.0`, `1e1`, `0x3`, `+-3`, `--`, a following option such as `-c` (the value is taken from the next word, as before) and a number past an `int` are refused.
+`succinctly jq` follows 1.8.2 since #7501 (`parse_jq_indent`); the usage text around the message is clap's, not jq's three lines.
+Pinned by `tests/jq_cli/i6017.rs` and the unit test beside `parse_jq_indent`.
+
+```console
+$ jq-1.7.1 -nc --indent abc '[1]'   # [1], exit 0
+$ jq-1.8.2 -nc --indent abc '[1]'   # jq: --indent takes a number between -1 and 7, exit 2
+$ sjq      -nc --indent abc '[1]'   # error: invalid value 'abc' for '--indent <N>': --indent takes a number between -1 and 7, exit 2
+```
+
+Not adopted with it: jq 1.8 also stopped printing `--indent 0` compactly (`--indent 0` prints the newlines with no indentation, jqlang/jq#3232), which is a separate change; `succinctly jq` keeps 1.7.1's compact output there (#3155).
