@@ -6,12 +6,15 @@ difference that is not listed here and on a listed one that no longer differs.
 An entry is `<suite>/<probe>.toml`. Its id is the path: the directory is the suite, the file name
 is the probe, and the `/` before an arity is written `.`:
 
-| Id                    | File                               |
-|-----------------------|------------------------------------|
-| `cli:version`         | `cli/version.toml`                 |
-| `features:strftime/1` | `features/strftime.1.toml`         |
+| Id                      | File                               |
+|-------------------------|------------------------------------|
+| `cli:version`           | `cli/version.toml`                 |
+| `features:strftime/1`   | `features/strftime.1.toml`         |
+| `upstream-jq.test:1942` | `upstream-jq.test/1942.toml`       |
 
-A suite and a probe use only letters, digits, `_` and `-`. A file that no id maps to, a file that
+A suite and a probe use only letters, digits, `_` and `-`, and a suite also a `.` after its first
+character: the differential suites are named after their test file (`upstream-jq.test`), and the
+id of a case is its line there. A file that no id maps to, a file that
 is not `.toml`, and a `divergences.toml` beside this directory fail the loader
 (`src/bin/succinctly/compare/ledger.rs`).
 

@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+reason = "`. | last((. | nulls))` on an array: `nulls` yields nothing, and jq 1.7.1's `last(f)` (`reduce f as $x (null; $x)`) answers its `null` seed, where jq 1.8 yields nothing (jqlang/jq#3179, a bug fix); jq 1.8.2 and succinctly print nothing (exit 0). The syntax:man-last-empty entry is the same difference (#7518)."
+issue = "#7518"

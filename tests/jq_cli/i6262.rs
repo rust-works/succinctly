@@ -5,6 +5,8 @@
 //! one match and the group at `[1,"b"]`. The shape is refused on that engine (`Regex failure`), as
 //! #6096's is. A reference to a group that is open under no such repeat, or to one that has closed,
 //! keeps its route and answers as `/usr/bin/jq` 1.7.1 does for `match($p; $f)`.
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -77,11 +79,11 @@ fn a_reference_that_reads_an_unset_or_a_closed_group_keeps_its_route() -> Result
             r"ab",
             r"(a|\1)?",
             r"g",
-            r#"[[0,"a",[0,"a"]],[1,"",[1,""]],[2,"",[2,""]]]"#,
+            r#"[[0,"a",[0,"a"]],[1,"",[-1,null]],[2,"",[-1,null]]]"#,
         ),
         (r"ab", r"(a|\1){1}", r"", r#"[[0,"a",[0,"a"]]]"#),
         (r"ab", r"(a|\1){0,1}", r"", r#"[[0,"a",[0,"a"]]]"#),
-        (r"ab", r"(a|\1){0}", r"", r#"[[0,"",[0,""]]]"#),
+        (r"ab", r"(a|\1){0}", r"", r#"[[0,"",[-1,null]]]"#),
         (r"ab", r"(a(?=\1))", r"", r"[]"),
         (r"ab", r"(a)(?=\1)", r"", r"[]"),
         (r"ab", r"(a)\1+", r"", r"[]"),

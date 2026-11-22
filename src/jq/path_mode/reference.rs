@@ -485,7 +485,6 @@ def _sp_all(condition): all(.[]; condition);
 def _sp_any(condition): any(.[]; condition);
 def _sp_all: all(.[]; .);
 def _sp_any: any(.[]; .);
-def _sp_last(g): reduce g as $item (null; $item);
 def _sp_nth($n; g):
   if $n < 0 then error("nth doesn't support negative indices")
   else label $out | foreach g as $item ($n + 1; . - 1; if . <= 0 then $item, break $out else empty end) end;
@@ -690,17 +689,13 @@ impl<'e> Interp<'e> {
             }
             Expr::Literal(lit) => match self.constant(expr) {
                 Some(value) => sink(value, reg),
-                // A negative spelling is `_negate` of a literal: computed.
+                // A negative spelling is `_negate` of a literal: a fresh
+                // literal in jq 1.8 (#7453).
                 None => match lit {
-                    Literal::NumberLiteral(repr, _) => {
-                        let value = match repr {
-                            // `-0`'s sign lives only in its spelling (#6042).
-                            NumberRepr::Int(0) => OwnedValue::Float(-0.0),
-                            NumberRepr::Int(i) => OwnedValue::Int(*i),
-                            NumberRepr::Float(f) => OwnedValue::Float(*f),
-                        };
-                        sink(SVal::computed(value), reg)
-                    }
+                    Literal::NumberLiteral(repr, spelling) => sink(
+                        SVal::literal(OwnedValue::NumberLiteral(*repr, spelling.as_str().into())),
+                        reg,
+                    ),
                     _ => Err(unsupported("a literal that is not a constant")), // patchcov: coverage tolerate-line reason="unreachable: constant_value answers every literal but a negative number, which the arm above computes"
                 },
             },
@@ -1535,6 +1530,8 @@ impl<'e> Interp<'e> {
 
     /// `gen_foreach`: as `reduce`, but `EXTRACT` runs straight after each
     /// `UPDATE` output, on that output and at the register `UPDATE` left.
+    /// Every `INIT` output's `SOURCE` sees the input (#7519): jq 1.8 compiles
+    /// `foreach` without the `DUPN` [`FoldInput`] models (jqlang/jq#3266).
     #[allow(clippy::too_many_arguments)]
     fn foreach(
         &self,
@@ -1548,10 +1545,9 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
-        let fold_input = FoldInput::new(input.clone());
-        self.eval(init, env, input, reg, &mut |initial, reg_init| {
+        self.eval(init, env, input.clone(), reg, &mut |initial, reg_init| {
             let state = RefCell::new(initial);
-            self.eval(source, env, fold_input.take(), reg_init, &mut |s, reg_s| {
+            self.eval(source, env, input.clone(), reg_init, &mut |s, reg_s| {
                 self.destructure(patterns, s, env, reg_s, &mut |env_p, reg_p| {
                     let current = state.replace(SVal::Null);
                     self.eval(update, &env_p, current, reg_p, &mut |u, reg_u| {
@@ -1767,6 +1763,37 @@ impl<'e> Interp<'e> {
         })
     }
 
+    /// `last(g)` as jq 1.8 compiles it (`gen_last_1`, jqlang/jq#3179, #7518):
+    ///
+    /// ```text
+    /// DUP; null; STOREV last; DUP; true; STOREV is_empty;
+    /// FORK [CALL g; DUP; STOREV last; false; STOREV is_empty; BACKTRACK];
+    /// LOADVN is_empty; JUMP_F L; BACKTRACK; L: LOADVN last
+    /// ```
+    ///
+    /// `g` runs from the entry register and its movement is undone by the
+    /// backtrack, as it is for a `reduce` source; the last value it emitted is
+    /// answered at the entry register, and nothing at all when `g` emitted
+    /// nothing (1.7.1's `reduce g as $item (null; $item)` answered `null`).
+    fn last_fold(
+        &self,
+        g: &'e Expr,
+        env: &Env<'e>,
+        input: SVal,
+        reg: Reg,
+        sink: &mut Sink<'_>,
+    ) -> R {
+        let last: RefCell<Option<SVal>> = RefCell::new(None);
+        self.eval(g, env, input, reg.clone(), &mut |v, _| {
+            *last.borrow_mut() = Some(v);
+            Ok(())
+        })?;
+        match last.into_inner() {
+            Some(v) => sink(v, reg),
+            None => Ok(()),
+        }
+    }
+
     fn call_prelude(
         &self,
         name: &str,
@@ -1776,6 +1803,11 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
+        // `last(g)` is bytecoded in jq 1.8 (`gen_last_1`), not a `reduce`: see
+        // [`Self::last_fold`]. The 0-arity `last` is still the prelude's `.[-1]`.
+        if name == "_sp_last" && args.len() == 1 {
+            return self.last_fold(args[0], env, input, reg, sink);
+        }
         let callee = self
             .prelude_env
             .lookup_func(name, args.len())
@@ -2160,7 +2192,7 @@ fn slice_bounds(len: usize, bounds: &[(Rc<str>, SVal)]) -> Option<(usize, usize)
 }
 
 /// `-1` is `_negate` applied to the literal `1` at run time (`'-' Exp`), so a
-/// negative spelling is computed, never a constant.
+/// negative spelling is a fresh literal (jq 1.8, #7453), never a constant.
 fn literal_value(lit: &Literal) -> Option<SVal> {
     Some(match lit {
         Literal::Null => SVal::Null,

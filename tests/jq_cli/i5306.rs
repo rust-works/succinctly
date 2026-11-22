@@ -251,7 +251,7 @@ fn test_5306_index_over_an_owned_array_and_a_plain_field_key() -> Result<()> {
         ("null", "[{\"id\":1},\"s\"] | INDEX(.id)", "", "Cannot index string with string \"id\"", 5),
         ("null", "[[1],[2]] | INDEX(.id)", "", "Cannot index array with string \"id\"", 5),
         ("null", "[{\"id\":1,\"w\":{\"k\":[1,2]}}] | INDEX(.id)", "{\"1\":{\"id\":1,\"w\":{\"k\":[1,2]}}}\n", "", 0),
-        ("null", "[{\"id\":-0},{\"id\":1e3},{\"id\":1.0}] | INDEX(.id)", "{\"-0\":{\"id\":-0},\"1E+3\":{\"id\":1E+3},\"1.0\":{\"id\":1.0}}\n", "", 0),
+        ("null", "[{\"id\":-0},{\"id\":1e3},{\"id\":1.0}] | INDEX(.id)", "{\"0\":{\"id\":0},\"1E+3\":{\"id\":1E+3},\"1.0\":{\"id\":1.0}}\n", "", 0),
         ("null", "[{\"id\":1},{\"id\":2}] | INDEX(.[]; .id)", "{\"1\":{\"id\":1},\"2\":{\"id\":2}}\n", "", 0),
         ("null", "5 | INDEX(.id)", "", "Cannot iterate over number (5)", 5),
         ("null", "null | INDEX(.id)", "", "Cannot iterate over null (null)", 5),

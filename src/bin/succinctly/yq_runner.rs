@@ -11216,6 +11216,8 @@ fn output_value<W: Write>(
             } else {
                 &config.indent_str
             },
+            // yq has no `--indent 0` rule of jq 1.8's: an empty indent is compact there.
+            compact: config.compact || config.indent_str.is_empty(),
             sort_keys: config.sort_keys,
             ascii: config.ascii_output,
             json_sourced: config.json_sourced_floats,

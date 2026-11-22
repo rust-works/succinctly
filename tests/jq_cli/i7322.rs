@@ -135,8 +135,8 @@ fn a_seq_stream_whose_first_record_is_cut_reads_every_record_7322() -> Result<()
 
 /// Stretches in the middle of the stream, twice: the values jq's reader finds in them are run, each
 /// on the line jq names for it, and its warnings come between them where the reader met them. The
-/// bare `n` is "Invalid literal" for the `u` of the plain `"bu"` before it, and the number cut short
-/// by an RS is a warning. jq 1.7.1's output.
+/// bare `n` is "Invalid numeric literal" (jq 1.7.1 said "Invalid literal" for the `u` of the plain
+/// `"bu"` before it, #7525), and the number cut short by an RS is a warning.
 #[test]
 fn a_seq_stream_carries_on_after_stretches_in_its_middle_7322() -> Result<()> {
     let stream = format!(
@@ -150,7 +150,7 @@ fn a_seq_stream_carries_on_after_stretches_in_its_middle_7322() -> Result<()> {
         "jq: ignoring parse error: Truncated value at line 20002, column 1\n",
         "jq: ignoring parse error: Unmatched '}' at line 40002, column 2 (need RS to resync)\n",
         "jq: ignoring parse error: Expected another array element at line 40004, column 5 (need RS to resync)\n",
-        "jq: ignoring parse error: Invalid literal at line 40007, column 0 (need RS to resync)\n",
+        "jq: ignoring parse error: Invalid numeric literal at line 40007, column 0 (need RS to resync)\n",
         "jq: ignoring parse error: Potentially truncated top-level numeric value at line 40007, column 3\n",
     ];
     for (run, name) in [(named as fn(_, _) -> _, "<file>"), (piped, "<stdin>")] {
@@ -205,7 +205,7 @@ fn a_seq_stream_is_handed_on_after_stretches_it_carried_on_past_7322() -> Result
                 "jq: ignoring parse error: Truncated value at line 2, column 1\n\
                  jq: ignoring parse error: Unmatched '}' at line 30002, column 2 (need RS to resync)\n\
                  jq: ignoring parse error: Expected another array element at line 30004, column 5 (need RS to resync)\n\
-                 jq: ignoring parse error: Invalid literal at line 30007, column 0 (need RS to resync)\n\
+                 jq: ignoring parse error: Invalid numeric literal at line 30007, column 0 (need RS to resync)\n\
                  jq: ignoring parse error: Potentially truncated top-level numeric value at line 30007, column 3\n\
                  jq: ignoring parse error: Invalid numeric literal at line 45009, column 0 (need RS to resync)\n",
                 0
@@ -217,7 +217,7 @@ fn a_seq_stream_is_handed_on_after_stretches_it_carried_on_past_7322() -> Result
             err.ends_with(&format!(
                 "jq: error (at {name}:30003): n\n\
                  jq: ignoring parse error: Expected another array element at line 30004, column 5 (need RS to resync)\n\
-                 jq: ignoring parse error: Invalid literal at line 30007, column 0 (need RS to resync)\n\
+                 jq: ignoring parse error: Invalid numeric literal at line 30007, column 0 (need RS to resync)\n\
                  jq: ignoring parse error: Potentially truncated top-level numeric value at line 30007, column 3\n\
                  jq: error (at {name}:45007): n\n\
                  jq: ignoring parse error: Invalid numeric literal at line 45009, column 0 (need RS to resync)\n"

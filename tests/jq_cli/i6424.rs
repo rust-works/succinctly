@@ -3,6 +3,8 @@
 //! second exit with no consuming way after it is the one every loop ends with, and an anchor that
 //! holds only where the first does is never the first to hold. Every row was captured from jq 1.7.1
 //! (`/usr/bin/jq`), and the first group differed from it before.
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -16,7 +18,7 @@ fn a_second_exit_is_not_read_as_a_first_once_it_is_a_part_of_a_longer_way_6424()
         (
             r"((\A|\B)\b)*",
             "bab",
-            r#"[[0,"",["",""]],[1,"",["",""]],[2,"",["",""]],[3,"",["",""]]]"#,
+            r#"[[0,"",["",""]],[1,"",[null,null]],[2,"",[null,null]],[3,"",[null,null]]]"#,
         ),
         (
             r"(\A|\B)(b*)",
@@ -26,14 +28,14 @@ fn a_second_exit_is_not_read_as_a_first_once_it_is_a_part_of_a_longer_way_6424()
         (
             r"((\A|a|\B)b*)*",
             "bab",
-            r#"[[0,"bab",["ab","a"]],[3,"",["",""]]]"#,
+            r#"[[0,"bab",["ab","a"]],[3,"",[null,null]]]"#,
         ),
         (r"((\A|a|\B)\b)+", "bab", r#"[[0,"",["",""]]]"#),
         (r"(\A|a|\B)b", "bab", r#"[[0,"b",[""]],[1,"ab",["a"]]]"#),
         (
             r"((\b|a|\B)|(\z|b|\A))+",
             "a b",
-            r#"[[0,"",["","",""]],[1,"",["","",""]],[2,"",["","",""]],[3,"",["","",""]]]"#,
+            r#"[[0,"",["","",null]],[1,"",["","",null]],[2,"",["","",null]],[3,"",["","",null]]]"#,
         ),
     ] {
         assert_matches(pattern, input, expected)?;
@@ -48,12 +50,12 @@ fn a_second_exit_in_a_nested_group_or_beside_a_flag_switch_6424() -> Result<()> 
         (
             r"((\A|a|\B))*",
             "aab",
-            r#"[[0,"",["",""]],[1,"a",["",""]],[2,"",["",""]],[3,"",["",""]]]"#,
+            r#"[[0,"",["",""]],[1,"a",["",""]],[2,"",["",""]],[3,"",[null,null]]]"#,
         ),
         (
             r"((?:\A|a|\B))*",
             "aab",
-            r#"[[0,"",[""]],[1,"a",[""]],[2,"",[""]],[3,"",[""]]]"#,
+            r#"[[0,"",[""]],[1,"a",[""]],[2,"",[""]],[3,"",[null]]]"#,
         ),
         (
             r"x?(\A|a|\B)+",
@@ -63,7 +65,7 @@ fn a_second_exit_in_a_nested_group_or_beside_a_flag_switch_6424() -> Result<()> 
         (
             r"(((\b|a|\B))*b)*",
             "ab",
-            r#"[[0,"ab",["ab","",""]],[2,"",["","",""]]]"#,
+            r#"[[0,"ab",["ab","",""]],[2,"",[null,null,null]]]"#,
         ),
         (
             r"(\b|(?i)a|\b)*",
@@ -83,7 +85,7 @@ fn a_second_exit_in_a_nested_group_or_beside_a_flag_switch_6424() -> Result<()> 
         (
             r"(\b|(a)|\B)*",
             "ba",
-            r#"[[0,"",["",""]],[1,"a",["","a"]],[2,"",["",""]]]"#,
+            r#"[[0,"",["",null]],[1,"a",["","a"]],[2,"",["",null]]]"#,
         ),
         (
             r"(\b|a|\B)*(\b|b|\B)*",
@@ -243,13 +245,13 @@ fn an_anchor_that_holds_only_where_the_first_does_is_dropped_6424() -> Result<()
         (
             r"(\A|a|^|b){0,2}",
             "ab",
-            r#"[[0,"",[""]],[1,"b",["b"]],[2,"",[""]]]"#,
+            r#"[[0,"",[""]],[1,"b",["b"]],[2,"",[null]]]"#,
         ),
         (r"($|a|\z|b)*", "ab", r#"[[0,"ab",[""]],[2,"",[""]]]"#),
         (
             r"(\z|a|\z|ab)*",
             "ab",
-            r#"[[0,"a",["a"]],[1,"",[""]],[2,"",[""]]]"#,
+            r#"[[0,"a",["a"]],[1,"",[null]],[2,"",[""]]]"#,
         ),
     ] {
         assert_matches(pattern, input, expected)?;

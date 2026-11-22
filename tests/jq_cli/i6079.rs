@@ -5,6 +5,8 @@
 //!
 //! Every row's answer is what `/usr/bin/jq` 1.7.1 printed for `[match($p; $f) | [offset, length, string,
 //! captures]]`.
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -18,7 +20,7 @@ const ROWS: &[(&str, &str, &str, &str)] = &[
     (r"abab", r".{2}+*|c", r"n", r#"[[0,4,"abab",[]]]"#),
     (r"abab", r"(a|b){2}+*|c", r"n", r#"[[0,4,"abab",["b"]]]"#),
     (r"aaa", r"a{2}+*|c", r"n", r#"[[0,2,"aa",[]]]"#),
-    (r"abab", r"(a){2}+*$", r"", r#"[[4,0,"",[""]]]"#),
+    (r"abab", r"(a){2}+*$", r"", r#"[[4,0,"",[null]]]"#),
     (r"ab", r"[ab]{2}+*$", r"n", r#"[[0,2,"ab",[]]]"#),
     (r"", r"\d{2}+*$", r"n", r"[]"),
     (r"aaa", r"(?:ab){2}+*$", r"gi", r#"[[3,0,"",[]]]"#),
@@ -105,7 +107,7 @@ const ROWS: &[(&str, &str, &str, &str)] = &[
         r"aaaa",
         r"(a|b){2}+?",
         r"gi",
-        r#"[[0,2,"aa",["a"]],[2,2,"aa",["a"]],[4,0,"",[""]]]"#,
+        r#"[[0,2,"aa",["a"]],[2,2,"aa",["a"]],[4,0,"",[null]]]"#,
     ),
     (r"aaa", r"\d{2}+", r"gi", r"[]"),
     (r"aaaa", r".{2}+", r"n", r#"[[0,2,"aa",[]]]"#),
@@ -208,7 +210,7 @@ const ROWS: &[(&str, &str, &str, &str)] = &[
         r"ab",
         r"(a|b){2}+?$",
         r"g",
-        r#"[[0,2,"ab",["b"]],[2,0,"",[""]]]"#,
+        r#"[[0,2,"ab",["b"]],[2,0,"",[null]]]"#,
     ),
     (r"ab", r"(?:ab){2}+$", r"", r"[]"),
     (r"aaa", r"\w{2}+$", r"x", r#"[[1,2,"aa",[]]]"#),
@@ -229,7 +231,7 @@ const ROWS: &[(&str, &str, &str, &str)] = &[
     (r"aaa", r"(a|b){1}+|c", r"", r#"[[0,1,"a",["a"]]]"#),
     (r"abab", r".{2}+?|c", r"n", r#"[[0,2,"ab",[]]]"#),
     (r"aaa", r"(a){2}+?|c", r"", r#"[[0,2,"aa",["a"]]]"#),
-    (r"a1b2", r"(a){2}+?|c", r"x", r#"[[0,0,"",[""]]]"#),
+    (r"a1b2", r"(a){2}+?|c", r"x", r#"[[0,0,"",[null]]]"#),
     (r"aaa", r"[ab]{2}+?|c", r"", r#"[[0,2,"aa",[]]]"#),
     (
         r"aaaa",

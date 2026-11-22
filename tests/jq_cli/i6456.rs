@@ -3,6 +3,8 @@
 //! after any newline, one more match at the end of a text that ends with one. A match of the crate that ends at
 //! the end of such a text is asked of `fancy-regex`, with each `(?m)` `^` written as `(?:\A|^(?!\z))`. Every
 //! row was captured from jq 1.7.1 (`jq -nc`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -367,7 +369,7 @@ fn a_repeated_group_name_is_checked_for_a_caret_at_the_end_too_6456() -> Result<
             "a\nb\n",
             "(?m)((?<n>a)\\w|(?<n>a)|^^)+",
             "g",
-            "[[0,\"a\",[\"a\",null,\"a\"]],[2,\"\",[\"\",\"\",\"\"]]]",
+            "[[0,\"a\",[\"a\",null,\"a\"]],[2,\"\",[\"\",null,null]]]",
         ),
         (
             "ab\n",
@@ -379,7 +381,7 @@ fn a_repeated_group_name_is_checked_for_a_caret_at_the_end_too_6456() -> Result<
             "\n",
             "(?m)((?<n>a)\\w|(?<n>a)|^^)+",
             "g",
-            "[[0,\"\",[\"\",\"\",\"\"]]]",
+            "[[0,\"\",[\"\",null,null]]]",
         ),
         (
             "a\n",
@@ -397,7 +399,7 @@ fn a_repeated_group_name_is_checked_for_a_caret_at_the_end_too_6456() -> Result<
             "a\nb\n",
             "(?m)(?<n>a)|(?<n>^)",
             "g",
-            "[[0,\"a\",[\"a\",null]],[2,\"\",[\"\",\"\"]]]",
+            "[[0,\"a\",[\"a\",null]],[2,\"\",[null,\"\"]]]",
         ),
         (
             "ab\n",
@@ -405,7 +407,7 @@ fn a_repeated_group_name_is_checked_for_a_caret_at_the_end_too_6456() -> Result<
             "g",
             "[[0,\"a\",[\"a\",null]]]",
         ),
-        ("\n", "(?m)(?<n>a)|(?<n>^)", "g", "[[0,\"\",[\"\",\"\"]]]"),
+        ("\n", "(?m)(?<n>a)|(?<n>^)", "g", "[[0,\"\",[null,\"\"]]]"),
         (
             "a\n",
             "(?m)^(?<n>a)?(?<n>b)?",
@@ -430,7 +432,7 @@ fn a_repeated_group_name_is_checked_for_a_caret_at_the_end_too_6456() -> Result<
             "g",
             "[[0,\"ab\",[\"a\",\"b\"]]]",
         ),
-        ("\n", "(?m)^(?<n>a)?(?<n>b)?", "g", "[[0,\"\",[\"\",\"\"]]]"),
+        ("\n", "(?m)^(?<n>a)?(?<n>b)?", "g", "[[0,\"\",[null,null]]]"),
     ] {
         assert_eq!(
             run(

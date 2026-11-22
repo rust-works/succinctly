@@ -311,6 +311,55 @@ pub(crate) fn parse_i64_exact(s: &str) -> Option<i64> {
     Some(value)
 }
 
+/// A number literal's spelling without its sign.
+pub(crate) fn literal_magnitude(text: &str) -> &str {
+    text.strip_prefix('-')
+        .or_else(|| text.strip_prefix('+'))
+        .unwrap_or(text)
+}
+
+/// Whether a number literal's decimal is zero, whatever its double: every
+/// mantissa digit is `0` (`0.00e5`, not `1e-400`).
+pub(crate) fn literal_is_zero(magnitude: &str) -> bool {
+    magnitude
+        .split(['e', 'E'])
+        .next()
+        .is_some_and(|mantissa| mantissa.bytes().all(|b| b == b'0' || b == b'.'))
+}
+
+/// jq 1.8's `_negate` of a number literal (#7453): the negated decimal, still
+/// a literal, so it keeps every digit and compares exactly (jqlang/jq#3242,
+/// which fixed jq 1.7.1 turning the operand into a double, jqlang/jq#2704).
+/// `decNumberMinus` computes `0 - x`, so a zero of either sign negates to
+/// positive zero with its spelling otherwise kept (`-0` is `0`, `-0.0` is
+/// `0.0`). Zero is the decimal's, not the double's: `1e-400` negates to
+/// `-1E-400`. `None` for a NaN, which has no decimal to negate.
+pub(crate) fn jq_negated_literal(repr: NumberRepr, text: &str) -> Option<(NumberRepr, String)> {
+    if matches!(repr, NumberRepr::Float(f) if f.is_nan()) {
+        return None;
+    }
+    let magnitude = literal_magnitude(text);
+    let zero = literal_is_zero(magnitude);
+    let spelled = if zero || text.starts_with('-') {
+        magnitude.to_string()
+    } else {
+        format!("-{magnitude}")
+    };
+    // The negated text parses to the negated repr (`jq_literal_text_to_f64` is
+    // sign-symmetric), so only `i64::MIN`, whose magnitude no `i64` holds,
+    // needs the parse.
+    let repr = match repr {
+        NumberRepr::Int(_) if zero => NumberRepr::Int(0),
+        NumberRepr::Float(_) if zero => NumberRepr::Float(0.0),
+        NumberRepr::Int(n) => match n.checked_neg() {
+            Some(n) => NumberRepr::Int(n),
+            None => parse_i64_or_f64_in::<JqSemantics>(&spelled)?,
+        },
+        NumberRepr::Float(f) => NumberRepr::Float(-f),
+    };
+    Some((repr, spelled))
+}
+
 /// [`parse_i64_or_f64`] under `S`'s number model (#2936): the `Int` arm is
 /// the exact `i64` in both modes (jq widens it through
 /// [`jq_literal_int_to_f64`] only when arithmetic reads it, #2906), and the
@@ -1043,6 +1092,11 @@ fn format_number_jq_compat_at(raw: &[u8], mantissa_digit_cap: Option<usize>) -> 
         Ok(s) => s,
         Err(_) => return String::from_utf8_lossy(raw).into_owned(),
     };
+
+    // #7469: a parsed infinity's text is decNumber's word, which jq prints as `DBL_MAX`.
+    if let Some(sign) = literal_infinity_sign(s) {
+        return infinite_float_preview_text(sign < 0).to_string();
+    }
 
     // #2802: a YAML integer written `0x1f` or `0o17` is no JSON number, and the plain-integer
     // path below would read its `0` as an insignificant leading zero (`x1f`). It prints as the
@@ -3385,6 +3439,17 @@ impl SharableString {
         matches!(self.0, SharableStringInner::Shared(_))
     }
 
+    /// Whether another handle currently shares this storage, i.e. whether
+    /// the next write through this handle will copy the string. `false` for
+    /// an inline string and for the last handle on promoted storage.
+    #[inline]
+    pub fn is_aliased(&self) -> bool {
+        match &self.0 {
+            SharableStringInner::Owned(_) => false,
+            SharableStringInner::Shared(rc) => alloc::rc::Rc::strong_count(rc) > 1,
+        }
+    }
+
     /// Consume the wrapper, yielding the `String` it wraps -- by move when
     /// it is inline or this handle was the last one, by copy otherwise.
     #[inline]
@@ -4210,6 +4275,26 @@ impl OwnedValue {
         Self::NumberLiteral(NumberRepr::Float(f64::from_bits(bits)), "null".into())
     }
 
+    /// An infinity jq *parsed* rather than computed (#7469): a document's, `fromjson`'s or
+    /// `tonumber`'s `Infinity`, `infinity` or `+Infinity` (decNumber's infinity).
+    ///
+    /// jq 1.7.1 keeps it as a decNumber literal, and two literals compare as exact decimals, so it
+    /// orders above every finite literal, one past `DBL_MAX` included (`. > 1e1000` is `true`,
+    /// `[., 1e1000] | unique` keeps both), where against a computed double it is the double
+    /// infinity (`. == infinite`). A `NumberLiteral`, as a parsed NaN is
+    /// ([`nan_instance`](Self::nan_instance)), so that arithmetic collapses it to the computed
+    /// infinity. Its text is decNumber's word, which no other stored literal spells: the decimal
+    /// comparison orders it past every finite literal ([`cmp_literal_texts`]), and the number
+    /// formatter prints it as jq prints it, `DBL_MAX`'s text ([`format_number_jq_compat`]).
+    pub(crate) fn parsed_infinity(negative: bool) -> Self {
+        let (f, text) = if negative {
+            (f64::NEG_INFINITY, "-Infinity")
+        } else {
+            (f64::INFINITY, "Infinity")
+        };
+        Self::NumberLiteral(NumberRepr::Float(f), text.into())
+    }
+
     /// A double the reindex bridge decoded: the [`nan_instance`](Self::nan_instance)
     /// it was written from when it carries one's payload
     /// ([`push_nan_instance_token`]), a bare computed `Float` otherwise (#2902).
@@ -4413,6 +4498,10 @@ impl OwnedValue {
         // is letters, so the two can't collide; bridge decoding lives in
         // `from_json_number`, ahead of this whole function (#3034).
         if let Some(f) = crate::json::validate::jq_special_number(bytes) {
+            // #7469: jq's parsed infinity is a literal, which a computed one is not.
+            if f.is_infinite() && S::DECNUMBER_LITERALS {
+                return Self::parsed_infinity(f.is_sign_negative());
+            }
             return Self::Float(f);
         }
         // A leading `+` (#2877): `+X` behaves exactly like `X` in jq, and
@@ -4476,8 +4565,12 @@ impl OwnedValue {
             // reaching here for a `Float`).
             Self::Float(f) => Some(Cow::Owned(jq_bare_float_display(*f))),
             // #2802: a spelled integer prints as the number it is in a message.
+            // A negative zero is the exception (#7468): its sign lives in the spelling
+            // (`-00`), which an `i64` has no room for, so it goes through the formatter,
+            // which keeps it as jq prints it (`-0`).
             Self::NumberLiteral(NumberRepr::Int(n), literal)
-                if crate::yaml::is_spelled_int(literal) =>
+                if crate::yaml::is_spelled_int(literal)
+                    && !(*n == 0 && literal.starts_with('-')) =>
             {
                 Some(Cow::Owned(n.to_string()))
             }
@@ -5143,8 +5236,13 @@ impl OwnedValue {
                 }
             }
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => nan_fmt(out, *f),
+            // A parsed infinity (#7469) is written as a computed one is: `DBL_MAX`'s text for
+            // output, the bridge's infinity token for a bridge, which a finite literal of that
+            // text must not become.
             Self::NumberLiteral(NumberRepr::Float(f), literal)
-                if f.is_infinite() && crate::yaml::nonfinite_literal_index(literal).is_some() =>
+                if f.is_infinite()
+                    && (crate::yaml::nonfinite_literal_index(literal).is_some()
+                        || is_parsed_infinity(*f, literal)) =>
             {
                 out.push_str(infinite_fmt(f.is_sign_negative()));
             }
@@ -6169,6 +6267,13 @@ fn overflow_literal_text(negative: bool) -> &'static str {
 /// [`format_number_jq_compat`] uses would hit the exact `NaN`-mantissa
 /// failure that path only avoids by never being called on a non-finite
 /// input in the first place.
+/// Whether a `NumberLiteral` of double `f` and text `text` is an
+/// [`OwnedValue::parsed_infinity`] (#7469): an infinite double under decNumber's word.
+#[inline]
+pub(crate) fn is_parsed_infinity(f: f64, text: &str) -> bool {
+    f.is_infinite() && literal_infinity_sign(text).is_some()
+}
+
 pub(crate) fn infinite_float_preview_text(negative: bool) -> &'static str {
     if negative {
         "-1.7976931348623157e+308"
@@ -6801,10 +6906,27 @@ pub(crate) fn cmp_jq_number_literals(
 /// byte-equal ones short-circuiting.
 pub(crate) fn cmp_literal_texts(a: &str, b: &str) -> core::cmp::Ordering {
     if a == b {
-        core::cmp::Ordering::Equal
-    } else {
-        cmp_decimal_literals(a, b)
+        return core::cmp::Ordering::Equal;
     }
+    // #7469: decNumber's infinity (a document's `Infinity`, `-infinity`, `+Infinity`) is a literal
+    // that orders past every finite one, `1e1000` included. Only a double tie reaches here, and a
+    // finite literal spells no letter, so the check is one byte for every other pair.
+    match (literal_infinity_sign(a), literal_infinity_sign(b)) {
+        (None, None) => cmp_decimal_literals(a, b),
+        (a, b) => a.unwrap_or(0).cmp(&b.unwrap_or(0)),
+    }
+}
+
+/// `1` or `-1` for a literal text that spells decNumber's infinity (`Infinity`, `-inf`, ...), `None`
+/// for any other: what [`cmp_literal_texts`] orders past every finite literal.
+fn literal_infinity_sign(text: &str) -> Option<i8> {
+    let body = text.strip_prefix(['-', '+']).unwrap_or(text);
+    if !body.starts_with(['i', 'I']) {
+        return None;
+    }
+    let f = crate::json::validate::jq_special_number(text.as_bytes())?;
+    f.is_infinite()
+        .then_some(if f.is_sign_negative() { -1 } else { 1 })
 }
 
 /// jq's own number comparison (`jvp_number_cmp`, `src/jv.c`), behind
@@ -7239,6 +7361,54 @@ mod tests {
     }
 
     use super::*;
+
+    /// #7453: a negated literal's repr is the parse of its negated spelling,
+    /// and a decimal zero negates to positive zero whatever its sign.
+    #[test]
+    fn negated_literal_repr_matches_its_spelling_7453() {
+        for text in [
+            "1",
+            "-1",
+            "0",
+            "-0",
+            "00",
+            "1.500",
+            "-1.500",
+            "1e-400",
+            "-1e-400",
+            "0.0",
+            "-0.0",
+            "0e5",
+            "007",
+            "9007199254740993",
+            "-9223372036854775808",
+            "9223372036854775807",
+            "1e1000",
+            "-1E1000",
+        ] {
+            let repr = parse_i64_or_f64_in::<JqSemantics>(text).unwrap();
+            let (negated, spelled) = jq_negated_literal(repr, text).unwrap();
+            assert_eq!(
+                Some(negated),
+                parse_i64_or_f64_in::<JqSemantics>(&spelled),
+                "{text}"
+            );
+            let zero = literal_is_zero(literal_magnitude(text));
+            if zero {
+                assert!(!spelled.starts_with('-'), "{text} -> {spelled}");
+            } else {
+                assert_ne!(
+                    spelled.starts_with('-'),
+                    text.starts_with('-'),
+                    "{text} -> {spelled}"
+                );
+            }
+        }
+        assert_eq!(
+            jq_negated_literal(NumberRepr::Float(f64::NAN), "null"),
+            None
+        );
+    }
 
     /// #2429/#3506: the subarray search counts overlapping matches, answers
     /// `[]` (never `null`) for an empty needle, a miss, or a needle longer
@@ -9495,7 +9665,7 @@ mod tests {
         // Real jq number spellings read identically on both routes, except
         // that a cursor read of a NaN spelling is a parse instance (#3309),
         // the same NaN once collapsed.
-        for text in ["nan", "sNaN12"] {
+        for text in ["nan", "sNaN0"] {
             let read = read_as_bridge_text::<JqSemantics>(text);
             assert!(
                 matches!(&read, OwnedValue::NumberLiteral(NumberRepr::Float(f), t) if f.is_nan() && &**t == "null"),
@@ -9775,27 +9945,64 @@ mod tests {
     #[test]
     fn test_from_number_bytes_reads_decnumber_specials_and_leading_plus_2877() {
         for word in [
-            "nan", "NaN", "-nan", "+nan", "nan1", "sNaN", "SNAN12", "-sNaN",
+            "nan", "NaN", "-nan", "+nan", "nan0", "sNaN", "SNAN0", "-sNaN",
         ] {
             assert!(
                 matches!(OwnedValue::from_number_bytes::<JqSemantics>(word.as_bytes()), OwnedValue::Float(f) if f.is_nan()),
                 "{word}"
             );
         }
-        for (word, f) in [
-            ("inf", f64::INFINITY),
-            ("Infinity", f64::INFINITY),
-            ("iNfInItY", f64::INFINITY),
-            ("+inf", f64::INFINITY),
-            ("-inf", f64::NEG_INFINITY),
-            ("-Infinity", f64::NEG_INFINITY),
+        // #7469: an infinity is decNumber's literal, which compares past every finite literal.
+        for (word, negative) in [
+            ("inf", false),
+            ("Infinity", false),
+            ("iNfInItY", false),
+            ("+inf", false),
+            ("-inf", true),
+            ("-Infinity", true),
         ] {
-            assert_eq!(
-                OwnedValue::from_number_bytes::<JqSemantics>(word.as_bytes()),
-                OwnedValue::Float(f),
+            let read = OwnedValue::from_number_bytes::<JqSemantics>(word.as_bytes());
+            assert_eq!(read, OwnedValue::parsed_infinity(negative), "{word}");
+            assert!(
+                matches!(&read, OwnedValue::NumberLiteral(NumberRepr::Float(f), text)
+                    if f.is_infinite() && f.is_sign_negative() == negative && is_parsed_infinity(*f, text)),
                 "{word}"
             );
+            let past_dbl_max = OwnedValue::from_number_bytes::<JqSemantics>(if negative {
+                b"-1e1000"
+            } else {
+                b"1e1000"
+            });
+            let expected = if negative {
+                core::cmp::Ordering::Less
+            } else {
+                core::cmp::Ordering::Greater
+            };
+            assert_eq!(
+                jq_numeric_cmp(&read, &past_dbl_max),
+                Some(expected),
+                "{word}"
+            );
+            let computed = OwnedValue::Float(if negative {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            });
+            assert_eq!(
+                jq_numeric_cmp(&read, &computed),
+                Some(core::cmp::Ordering::Equal),
+                "{word}"
+            );
+            assert_eq!(
+                format_number_jq_compat(word.as_bytes()),
+                infinite_float_preview_text(negative)
+            );
         }
+        // yq's number model keeps the bare double.
+        assert_eq!(
+            OwnedValue::from_number_bytes::<YqSemantics>(b"Infinity"),
+            OwnedValue::Float(f64::INFINITY)
+        );
         // `+X` is `X`, stored unsigned: the strict grammar and the three
         // lenient escapes (leading dot, leading zero, trailing dot before
         // an exponent) each hold through the peel, and compose.
@@ -9896,7 +10103,7 @@ mod tests {
             "NaN",
             "-nan",
             "+nan",
-            "sNaN12",
+            "sNaN0",
             "inf",
             "-Infinity",
             "+inf",
@@ -10458,6 +10665,23 @@ mod tests {
         // number_str, via Display rather than format_number_jq_compat.
         assert_eq!(OwnedValue::Int(7).number_str().as_deref(), Some("7"));
         assert_eq!(OwnedValue::Float(2.5).number_str().as_deref(), Some("2.5"));
+    }
+
+    /// #7468: a negative zero spelled with extra zeros keeps its sign in the text, as every
+    /// other spelled integer keeps its value (`-007` is `-7`).
+    #[test]
+    fn number_str_keeps_the_sign_of_a_spelled_negative_zero_7468() {
+        for (literal, text) in [
+            ("-0", "-0"),
+            ("-00", "-0"),
+            ("-0000", "-0"),
+            ("-007", "-7"),
+            ("00", "0"),
+            ("+00", "0"),
+        ] {
+            let value = OwnedValue::from_number_literal::<JqSemantics>(literal);
+            assert_eq!(value.number_str().as_deref(), Some(text), "{literal}");
+        }
     }
 
     #[test]

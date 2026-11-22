@@ -3,6 +3,8 @@
 //! can match a newline: `(?:$\z|\B(\w*)){2,}` on `"ba b"` was `["a",""]`, where jq answers
 //! `["",""]`. A pattern that may match the final newline its `$` stands before keeps the plain
 //! rewrite, which reads it as jq does. Every row was captured from jq 1.7.1 (`jq -nc`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -15,32 +17,32 @@ fn a_loop_with_groups_beside_dollar_and_z_answers_as_jq_does_6488() -> Result<()
             r"(?:$\z|\B(\w*)){2,}",
             "g",
             "ba b",
-            r#"[[1,"",[""]],[4,"",[""]]]"#,
+            r#"[[1,"",[""]],[4,"",[null]]]"#,
         ),
         (
             r"(?:$\z|\B(\w*)){2,}",
             "g",
             "ab",
-            r#"[[1,"b",["b"]],[2,"",[""]]]"#,
+            r#"[[1,"b",["b"]],[2,"",[null]]]"#,
         ),
         (
             r"(?:$\z|\B(\w*)){2,}",
             "g",
             "ba b\n",
-            r#"[[1,"",[""]],[5,"",[""]]]"#,
+            r#"[[1,"",[""]],[5,"",[null]]]"#,
         ),
         // The `i` and `x` flags are read by the rewrites as they are by the engine.
         (
             r"(?:$\z|\B(\w*)){2,}",
             "gi",
             "BA B",
-            r#"[[1,"",[""]],[4,"",[""]]]"#,
+            r#"[[1,"",[""]],[4,"",[null]]]"#,
         ),
         (
             r"(?: $\z | \B(\w*) ){2,}",
             "gx",
             "ba b",
-            r#"[[1,"",[""]],[4,"",[""]]]"#,
+            r#"[[1,"",[""]],[4,"",[null]]]"#,
         ),
         // A way that may take the final newline after `$`: the plain rewrite's reading, as jq's.
         (
@@ -53,14 +55,14 @@ fn a_loop_with_groups_beside_dollar_and_z_answers_as_jq_does_6488() -> Result<()
             r"($(a)?|(b)*(a)|(a|\n))+",
             "g",
             "a\n",
-            r#"[[0,"a",["",null,null,"a",null]],[1,"",["","","","",""]],[2,"",["","","","",""]]]"#,
+            r#"[[0,"a",["",null,null,"a",null]],[1,"",["",null,null,null,null]],[2,"",["",null,null,null,null]]]"#,
         ),
         // A group that holds only an anchor keeps the plain rewrite too (#6492).
         (
             r"(?:(a)|b*|c)+(?:(?i)|(\w*)(\z)){2,5}?$",
             "g",
             "cba",
-            r#"[[0,"cba",[null,"cba",""]],[3,"",["","",""]]]"#,
+            r#"[[0,"cba",[null,"cba",""]],[3,"",[null,null,null]]]"#,
         ),
         // The copies write `(.+?)*?`, which `fancy-regex` answers wrongly beside a lookaround: the
         // rewrite is refused there.
@@ -70,19 +72,19 @@ fn a_loop_with_groups_beside_dollar_and_z_answers_as_jq_does_6488() -> Result<()
             r"(?:|(\w*)((?:\z))){2}$",
             "g",
             "ab",
-            r#"[[0,"ab",["ab",""]],[2,"",["",""]]]"#,
+            r#"[[0,"ab",["ab",""]],[2,"",[null,null]]]"#,
         ),
         (
             r"(?:|(\w*)((?i)\z)){2}$",
             "g",
             "ab",
-            r#"[[0,"ab",["ab",""]],[2,"",["",""]]]"#,
+            r#"[[0,"ab",["ab",""]],[2,"",[null,null]]]"#,
         ),
         (
             r"(?:|(\w*)( \z)){2}$",
             "gx",
             "ab",
-            r#"[[0,"ab",["ab",""]],[2,"",["",""]]]"#,
+            r#"[[0,"ab",["ab",""]],[2,"",[null,null]]]"#,
         ),
         // A `[` in a comment opens no class that would hide the `.` after it.
         (
@@ -106,7 +108,7 @@ fn a_loop_with_groups_beside_dollar_and_z_answers_as_jq_does_6488() -> Result<()
             r"(?:(b*|(?:(a)|b?){0,2}(b|)*){0,12}?$|c){0,3}",
             "g",
             "ba",
-            r#"[[0,"ba",["a","a",""]],[2,"",["","",""]]]"#,
+            r#"[[0,"ba",["a","a",""]],[2,"",[null,null,null]]]"#,
         ),
     ] {
         let (stdout, stderr, status) = run_jq_full(

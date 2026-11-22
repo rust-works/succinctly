@@ -28,11 +28,25 @@
 //!   or an argument (`c_builtin_identity`), when that value itself is the
 //!   answer.
 //!
-//! It is reachable from `succinctly dev jq-path-mode` (hidden) and from tests,
-//! never from `succinctly jq`. A construct it does not implement raises
-//! `Raise::Unsupported`, which nothing catches, so a row it cannot run is never
-//! mistaken for one it answers. See `docs/plan/jq-path-mode-interpreter-spike.md`
-//! for the Phase 0 go/no-go report.
+//! `succinctly jq` runs a program through it when `route` sends it here
+//! (ADR-0026, #5223, #5233): a jq-mode program with a dynamic path target,
+//! that is an argument of `path`, `del` or `pick` or the left side of an
+//! assignment that is not one of the static shapes the shipped walkers take
+//! natively (`.k`, `.[n]`, `.[$k]`, `.[i:j]`, `.[]`, `..` and their pipes and
+//! commas), such as `1 |= 1`, `del(1)` or `path(1)`, even in a branch that
+//! never runs. The evaluator entries in `eval.rs` (`eval_full`,
+//! `eval_owned_with_file_index`) and `eval_generic.rs` ask `route` and hand
+//! such a program to `run_program`; `jq_runner.rs` refuses up front, through
+//! [`refusal`], one that also uses a construct the interpreter declines. It is
+//! also reachable from `succinctly dev jq-path-mode` (hidden) and from tests.
+//! A construct it does not implement raises `Raise::Unsupported`, which
+//! nothing in the interpreter catches, so a row it cannot run is never
+//! mistaken for one it answers: the dev entry reports it apart (`path-mode:
+//! unsupported`), and on the routed path, where `route` has already sent
+//! every program holding such a construct elsewhere, `run_program` turns it
+//! into an internal error. See
+//! `docs/plan/jq-path-mode-interpreter-spike.md` for the Phase 0 go/no-go
+//! report.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -144,6 +158,79 @@ fn combine(op: ArithOp, l: &OwnedValue, r: &OwnedValue) -> Result<OwnedValue, Ev
             Ok(fresh(merged, &[l, r]))
         }
         _ => arith_combine::<JqSemantics>(op, l.clone(), r.clone()).map(|v| fresh(v, &[l, r])),
+    }
+}
+
+/// Whether a `reduce` update only adds to its state, which
+/// [`Interp::append_step`] runs in place when the state is an array (#7564):
+/// `.`, `. + E`, or `if C then U else U end` of those, each `E` and `C`
+/// [`is_input_free`]. builtin.jq's `add` (`. + $x`) and `_flatten`
+/// (`if $i | ... then . + ($i | _flatten($x-1)) else . + [$i] end`) are.
+fn is_append_update(update: &Expr) -> bool {
+    match update {
+        Expr::Paren(inner) => is_append_update(inner),
+        Expr::Identity => true,
+        Expr::Arithmetic {
+            op: ArithOp::Add,
+            left,
+            right,
+            ..
+        } => matches!(**left, Expr::Identity) && is_input_free(right),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => is_input_free(cond) && is_append_update(then_branch) && is_append_update(else_branch),
+        _ => false,
+    }
+}
+
+/// Whether a `reduce` state is an object or a string that no other value
+/// shares, which [`Interp::grow_step`] adds to in place (#7610).
+fn grows_in_place(state: &OwnedValue) -> bool {
+    match state {
+        OwnedValue::Object(map) => !map.is_shared(),
+        OwnedValue::String(s) => !s.is_aliased(),
+        _ => false,
+    }
+}
+
+/// Whether `expr` never reads its input, so that running it on `null` gives
+/// what running it on any input gives: constants and variables, and
+/// constructors (string interpolation among them) and operators over them;
+/// a pipe reads its input only in its first stage. Anything else (a call, a
+/// builtin, a path) may read it.
+fn is_input_free(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Loc { .. } | Expr::Var(_) | Expr::TrackedVar(_) => true,
+        Expr::Paren(inner) | Expr::Negate(inner) | Expr::Array(inner) => is_input_free(inner),
+        Expr::Pipe(stages) => stages.first().is_some_and(is_input_free),
+        Expr::Comma(items) => items.iter().all(is_input_free),
+        // `"k\($i)"` reads the input only through its slots (#7610).
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Expr(slot) => is_input_free(slot),
+            StringPart::Literal(_) => true,
+        }),
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            let key_free = match &entry.key {
+                ObjectKey::Literal(_) => true,
+                ObjectKey::Expr(key) => is_input_free(key),
+                ObjectKey::Bare => false,
+            };
+            key_free && is_input_free(&entry.value)
+        }),
+        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            is_input_free(left) && is_input_free(right)
+        }
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Alternative(a, b) => {
+            is_input_free(a) && is_input_free(b)
+        }
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => is_input_free(cond) && is_input_free(then_branch) && is_input_free(else_branch),
+        _ => false,
     }
 }
 
@@ -703,7 +790,6 @@ def _sp_all(condition): all(.[]; condition);
 def _sp_any(condition): any(.[]; condition);
 def _sp_all: all(.[]; .);
 def _sp_any: any(.[]; .);
-def _sp_last(g): reduce g as $item (null; $item);
 def _sp_nth($n; g):
   if $n < 0 then error("nth doesn't support negative indices")
   else label $out | foreach g as $item ($n + 1; . - 1; if . <= 0 then $item, break $out else empty end) end;
@@ -1466,22 +1552,14 @@ impl<'e> Interp<'e> {
             }
             Expr::Literal(lit) => match self.constant(expr) {
                 Some(value) => sink(value, reg),
-                // A negative number is `_negate` of a literal: computed. The
-                // parser folds some negations itself (`-01`, `-1.5`, a
-                // negative past 2^53) into a spelling-less `Int`/`Float`.
+                // A negative number is `_negate` of a literal, which jq 1.8
+                // answers with a fresh literal (#7453, jqlang/jq#3242): not
+                // a constant, and identical to nothing else. A synthesized
+                // spelling-less `Int`/`Float` is computed.
                 None => match lit {
-                    // `-0` is the one negative whose sign lives only in its
-                    // spelling (`Int(0)` has none): jq computes `-0.0`, a
-                    // number identical to another by its bits (#6042).
-                    Literal::NumberLiteral(NumberRepr::Int(0), _) => {
-                        sink(OwnedValue::Float(-0.0), reg)
-                    }
-                    Literal::NumberLiteral(NumberRepr::Int(i), _) | Literal::Int(i) => {
-                        sink(OwnedValue::Int(*i), reg)
-                    }
-                    Literal::NumberLiteral(NumberRepr::Float(f), _) | Literal::Float(f) => {
-                        sink(OwnedValue::Float(*f), reg)
-                    }
+                    Literal::NumberLiteral(repr, spelling) => sink(literal(*repr, spelling), reg),
+                    Literal::Int(i) => sink(OwnedValue::Int(*i), reg),
+                    Literal::Float(f) => sink(OwnedValue::Float(*f), reg),
                     _ => Err(unsupported("a literal that is not a constant")), // patchcov: coverage tolerate-line reason="unreachable: constant_value answers every literal but a negative number, which the arm above computes"
                 },
             },
@@ -2331,8 +2409,10 @@ impl<'e> Interp<'e> {
         sink: &mut Sink<'_>,
     ) -> R {
         let fold_input = FoldInput::new(input.clone());
+        let appends = is_append_update(update);
         self.eval(init, env, input, reg, &mut |initial, reg_init| {
             let state = RefCell::new(initial);
+            let promoted = Cell::new(false);
             self.eval(
                 source,
                 env,
@@ -2340,9 +2420,19 @@ impl<'e> Interp<'e> {
                 reg_init.clone(),
                 &mut |s, reg_s| {
                     self.destructure(patterns, s, env, reg_s, &mut |env_p, reg_p| {
-                        let current = state.replace(OwnedValue::Null);
+                        let current = match state.replace(OwnedValue::Null) {
+                            OwnedValue::Array(items) if appends => {
+                                return self.append_step(update, &env_p, items, reg_p, &state);
+                            }
+                            base if appends && grows_in_place(&base) => {
+                                return self
+                                    .grow_step(update, &env_p, base, &reg_p, &state, &promoted);
+                            }
+                            current => current,
+                        };
                         self.eval(update, &env_p, current, reg_p, &mut |u, _| {
                             *state.borrow_mut() = u;
+                            promoted.set(false);
                             Ok(())
                         })
                     })
@@ -2352,8 +2442,177 @@ impl<'e> Interp<'e> {
         })
     }
 
+    /// One `reduce` step whose update [`is_append_update`] and whose state is
+    /// the array `items`, run as jq runs it in place (#7564).
+    ///
+    /// jq's `f_plus` frees its input before `jv_array_concat`, so the state
+    /// of `reduce .[] as $x (..; . + $x)` is the only reference to the array
+    /// and every step appends to it in place: `add` and `flatten` are linear.
+    /// The generic arms hold the state three times over (the update's input,
+    /// `binop`'s two subexpression inputs), so `arith_combine` copied the
+    /// whole state on every step, quadratic in the result.
+    ///
+    /// Here the update's right operands and conditions run on `null`, which
+    /// they never read ([`is_input_free`]), so `items` stays unique. Each
+    /// output is `items` cut back to the state's length plus that output's
+    /// operand, in order: a later output of a generator still adds to the
+    /// state, not to the earlier sum, and nothing but the next step reads the
+    /// sum. `null` and `[]` add nothing, which keeps the state itself, as
+    /// `binop_keeps` does; any other operand is `combine`'s type error.
+    fn append_step(
+        &self,
+        update: &'e Expr,
+        env: &Env<'e>,
+        items: ArrayVec,
+        reg: Reg,
+        state: &RefCell<OwnedValue>,
+    ) -> R {
+        let base = items.len();
+        // A state another value shares is kept, so that an output adding
+        // nothing is that value itself (jq's refcount is above one, so it
+        // copies on every append too); a unique one is cut back instead.
+        let shared = items.is_shared().then(|| items.clone());
+        let acc = RefCell::new(items);
+        let mut produced = false;
+        self.append_operands(update, env, &reg, &mut |operand| {
+            let mut acc = acc.borrow_mut();
+            let cut_back = |acc: &mut ArrayVec| match &shared {
+                Some(state) => *acc = state.clone(),
+                None if acc.len() > base => acc.make_vec().truncate(base),
+                None => {}
+            };
+            match operand {
+                OwnedValue::Null => cut_back(&mut acc),
+                OwnedValue::Array(more) if more.is_empty() => cut_back(&mut acc),
+                OwnedValue::Array(more) => {
+                    cut_back(&mut acc);
+                    let mut vec = acc.make_vec();
+                    vec.extend(more.iter().cloned());
+                    vec[base..].iter_mut().for_each(promote_built);
+                }
+                other => {
+                    cut_back(&mut acc);
+                    let state = OwnedValue::Array(acc.clone());
+                    return match combine(ArithOp::Add, &state, &other) {
+                        Err(e) => Err(raise_eval(e)),
+                        Ok(_) => Err(unsupported("an array plus a scalar that is not an error")), // patchcov: coverage tolerate-line reason="unreachable: jq's `+` of an array and a boolean, number, string or object always raises"
+                    };
+                }
+            }
+            produced = true;
+            Ok(())
+        })?;
+        if produced {
+            *state.borrow_mut() = OwnedValue::Array(acc.into_inner());
+        }
+        Ok(())
+    }
+
+    /// One `reduce` step whose update [`is_append_update`] and whose state
+    /// `base` is an object or a string no other value shares, run in place
+    /// as jq runs it (#7610): object `+` is `jv_object_merge`, string `+` is
+    /// `jv_string_concat`, and `f_plus` frees its input first, so the state of
+    /// `add` or `reduce ... (. + {(k): v})` is unique and grows in place.
+    /// The generic arms hold the state as [`Interp::append_step`] says and
+    /// so copied the whole object or string on every step.
+    ///
+    /// The operands run on `null`, as there. Each output of the update is
+    /// `base` plus that output's operand, and only the last one is the next
+    /// state, so each operand is checked against `base` as it comes (a type
+    /// error names `base`, as `combine`'s does) and only the last is added.
+    /// `null` and `{}` add nothing ([`binop_keeps`]). A shared state takes
+    /// the generic arms, which copy it once; the copy is unique. A state
+    /// that did not come from this step is promoted when something is first
+    /// added to it, as `combine`'s [`fresh`] result would have been, so the
+    /// values it holds are what the copying step left (`promoted`, which the
+    /// generic arms clear).
+    fn grow_step(
+        &self,
+        update: &'e Expr,
+        env: &Env<'e>,
+        mut base: OwnedValue,
+        reg: &Reg,
+        state: &RefCell<OwnedValue>,
+        promoted: &Cell<bool>,
+    ) -> R {
+        let mut last: Option<OwnedValue> = None;
+        self.append_operands(update, env, reg, &mut |operand| {
+            let adds = match (&base, &operand) {
+                (_, OwnedValue::Null) => false,
+                (OwnedValue::Object(_), OwnedValue::Object(more)) => !more.is_empty(),
+                (OwnedValue::String(_), OwnedValue::String(_)) => true,
+                _ => {
+                    return match combine(ArithOp::Add, &base, &operand) {
+                        Err(e) => Err(raise_eval(e)),
+                        Ok(_) => Err(unsupported("a `+` of two kinds that is no error")), // patchcov: coverage tolerate-line reason="unreachable: jq's `+` of an object or string and a value of another kind always raises"
+                    };
+                }
+            };
+            last = Some(if adds { operand } else { OwnedValue::Null });
+            Ok(())
+        })?;
+        let Some(operand) = last else {
+            // No output: the state is `null`, as `LOADVN` leaves it.
+            return Ok(());
+        };
+        let adds = !matches!(operand, OwnedValue::Null);
+        if adds && !promoted.replace(true) {
+            promote_built(&mut base);
+        }
+        match (&mut base, operand) {
+            (OwnedValue::Object(map), OwnedValue::Object(more)) => {
+                for (k, v) in more.iter_stored() {
+                    let mut key = k.clone();
+                    key.promote();
+                    let mut value = v.clone();
+                    promote_built(&mut value);
+                    map.insert_shared(key, value);
+                }
+            }
+            (OwnedValue::String(s), OwnedValue::String(more)) => {
+                s.push_str(&more);
+                s.promote();
+            }
+            _ => {}
+        }
+        *state.borrow_mut() = base;
+        Ok(())
+    }
+
+    /// The right operands of an [`is_append_update`] update's outputs, in
+    /// the order the generic arms produce its outputs.
+    fn append_operands(
+        &self,
+        update: &'e Expr,
+        env: &Env<'e>,
+        reg: &Reg,
+        f: &mut dyn FnMut(OwnedValue) -> R,
+    ) -> R {
+        match update {
+            Expr::Paren(inner) => self.append_operands(inner, env, reg, f),
+            Expr::Identity => f(OwnedValue::Null),
+            Expr::Arithmetic { right, .. } => {
+                self.eval(right, env, OwnedValue::Null, reg.sub(), &mut |r, _| f(r))
+            }
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => self.eval(cond, env, OwnedValue::Null, reg.sub(), &mut |c, _| {
+                let branch = if truthy(&c) { then_branch } else { else_branch };
+                self.append_operands(branch, env, reg, f)
+            }),
+            _ => Err(unsupported("an update that is not an append")), // patchcov: coverage tolerate-line reason="unreachable: `is_append_update` admits only the arms above"
+        }
+    }
+
     /// `gen_foreach`: as `reduce`, but `EXTRACT` runs straight after each
     /// `UPDATE` output, on that output and at the register `UPDATE` left.
+    /// Every `INIT` output's `SOURCE` sees the input, not only the first's
+    /// (#7519): jq 1.8 compiles `foreach` as `DUP; INIT; STOREV; DUP; SOURCE;
+    /// ...` (jqlang/jq#3266, a fix of the `DUPN` that [`FoldInput`] models for
+    /// `reduce`), so `{"a":1} | [path(foreach .a as $i ((1,2); $i))]` is
+    /// `[["a"],["a"]]` in jq 1.8.2, where jq 1.7.1 raises on the second fork.
     #[allow(clippy::too_many_arguments)]
     fn foreach(
         &self,
@@ -2367,10 +2626,9 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
-        let fold_input = FoldInput::new(input.clone());
-        self.eval(init, env, input, reg, &mut |initial, reg_init| {
+        self.eval(init, env, input.clone(), reg, &mut |initial, reg_init| {
             let state = RefCell::new(initial);
-            self.eval(source, env, fold_input.take(), reg_init, &mut |s, reg_s| {
+            self.eval(source, env, input.clone(), reg_init, &mut |s, reg_s| {
                 self.destructure(patterns, s, env, reg_s, &mut |env_p, reg_p| {
                     let current = state.replace(OwnedValue::Null);
                     self.eval(update, &env_p, current, reg_p, &mut |u, reg_u| {
@@ -3222,6 +3480,37 @@ impl<'e> Interp<'e> {
         })
     }
 
+    /// `last(g)` as jq 1.8 compiles it (`gen_last_1`, jqlang/jq#3179, #7518):
+    ///
+    /// ```text
+    /// DUP; null; STOREV last; DUP; true; STOREV is_empty;
+    /// FORK [CALL g; DUP; STOREV last; false; STOREV is_empty; BACKTRACK];
+    /// LOADVN is_empty; JUMP_F L; BACKTRACK; L: LOADVN last
+    /// ```
+    ///
+    /// `g` runs from the entry register and its movement is undone by the
+    /// backtrack, as it is for a `reduce` source; the last value it emitted is
+    /// answered at the entry register, and nothing at all when `g` emitted
+    /// nothing (1.7.1's `reduce g as $item (null; $item)` answered `null`).
+    fn last_fold(
+        &self,
+        g: &'e Expr,
+        env: &Env<'e>,
+        input: OwnedValue,
+        reg: Reg,
+        sink: &mut Sink<'_>,
+    ) -> R {
+        let last: RefCell<Option<OwnedValue>> = RefCell::new(None);
+        self.eval(g, env, input, reg.clone(), &mut |v, _| {
+            *last.borrow_mut() = Some(v);
+            Ok(())
+        })?;
+        match last.into_inner() {
+            Some(v) => sink(v, reg),
+            None => Ok(()),
+        }
+    }
+
     fn call_prelude(
         &self,
         name: &str,
@@ -3231,6 +3520,11 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
+        // `last(g)` is bytecoded in jq 1.8 (`gen_last_1`), not a `reduce`: see
+        // [`Self::last_fold`]. The 0-arity `last` is still the prelude's `.[-1]`.
+        if name == "_sp_last" && args.len() == 1 {
+            return self.last_fold(args[0], env, input, reg, sink);
+        }
         let callee = self
             .prelude_env
             .lookup_func(name, args.len())
@@ -3949,11 +4243,12 @@ fn is_label_payload(error: &EvalError, id: u64) -> bool {
             .is_some_and(|n| n == id as f64)
 }
 
-/// The fold's input as `DUPN` leaves it: `gen_reduce`/`gen_foreach` start
-/// each loop with `DUPN`, which *moves* the input out of a stack slot that
-/// `INIT`'s fork point shares, so every `INIT` output after the first runs
-/// `SOURCE` on `null` (`{"a":1} | [reduce .a as $i ((1,2); [$i,.])]` is
-/// `[[1,1],[null,2]]` in jq 1.7.1, which value mode already reproduces).
+/// The fold's input as `DUPN` leaves it: `gen_reduce` starts each loop with
+/// `DUPN`, which *moves* the input out of a stack slot that `INIT`'s fork
+/// point shares, so every `INIT` output after the first runs `SOURCE` on
+/// `null` (`{"a":1} | [reduce .a as $i ((1,2); [$i,.])]` is `[[1,1],[null,2]]`
+/// in jq 1.7.1 and 1.8.2, which value mode already reproduces). `gen_foreach`
+/// did the same in jq 1.7.1; jq 1.8 dropped its `DUPN` (jqlang/jq#3266, #7519).
 struct FoldInput(RefCell<Option<OwnedValue>>);
 
 impl FoldInput {
@@ -4325,7 +4620,7 @@ fn number_f64(value: &OwnedValue) -> Option<f64> {
 }
 
 /// `-1` is `_negate` applied to the literal `1` at run time (`'-' Exp`), so a
-/// negative number is computed, never a constant.
+/// negative number is a fresh literal (jq 1.8, #7453), never a constant.
 fn literal_value(lit: &Literal) -> Option<OwnedValue> {
     Some(match lit {
         Literal::Null => OwnedValue::Null,

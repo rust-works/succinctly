@@ -420,7 +420,7 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     (
         "[] as $a | [range(2) | $a | last(.[])]",
-        "[null,null]\n",
+        "[]\n",
         "",
         0,
     ),
@@ -480,7 +480,7 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     (
         "[] as $a | [range(2) | $a | last(.[]?)]",
-        "[null,null]\n",
+        "[]\n",
         "",
         0,
     ),
@@ -504,7 +504,7 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     (
         "[] as $a | [range(2) | $a | first(.[]), last(.[])]",
-        "[null,null]\n",
+        "[]\n",
         "",
         0,
     ),
@@ -612,7 +612,7 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     (
         "[] as $a | [foreach range(2) as $i (null; $a | last(.[]))]",
-        "[null,null]\n",
+        "[]\n",
         "",
         0,
     ),
@@ -1776,7 +1776,7 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     (
         "\"héllo\" as $a | [range(2) | $a | last(.[]?)]",
-        "[null,null]\n",
+        "[]\n",
         "",
         0,
     ),
@@ -2100,7 +2100,7 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     (
         "null as $a | [range(2) | $a | last(.[]?)]",
-        "[null,null]\n",
+        "[]\n",
         "",
         0,
     ),
@@ -2688,7 +2688,7 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     (
         "{} as $a | [range(2) | $a | last(.[])]",
-        "[null,null]\n",
+        "[]\n",
         "",
         0,
     ),
@@ -2748,7 +2748,7 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     (
         "{} as $a | [range(2) | $a | last(.[]?)]",
-        "[null,null]\n",
+        "[]\n",
         "",
         0,
     ),
@@ -2772,7 +2772,7 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     (
         "{} as $a | [range(2) | $a | first(.[]), last(.[])]",
-        "[null,null]\n",
+        "[]\n",
         "",
         0,
     ),
@@ -2880,7 +2880,7 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     (
         "{} as $a | [foreach range(2) as $i (null; $a | last(.[]))]",
-        "[null,null]\n",
+        "[]\n",
         "",
         0,
     ),
@@ -3072,7 +3072,7 @@ const NULL_INPUT_ROWS: &[(&str, &str, &str, i32)] = &[
     ),
     (
         "5 as $a | [range(2) | $a | last(.[]?)]",
-        "[null,null]\n",
+        "[]\n",
         "",
         0,
     ),
