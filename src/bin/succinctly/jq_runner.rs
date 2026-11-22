@@ -298,8 +298,9 @@ pub struct ModuleLoader {
     /// at all, so [`Self::failure_report`] can walk it last, where jq does (#5339, #5351).
     /// `None` for one with neither: there is nothing of it to walk.
     dot_jq_path: Option<PathBuf>,
-    /// Why a `~/.jq` that exists cannot be used (#5351): it does not read, does not parse, or
-    /// holds a main expression. jq refuses to compile anything while it is so, and
+    /// Why a `~/.jq` that was read cannot be used (#5351): it does not parse, or holds a main
+    /// expression (one that does not read is left out, #7665). jq refuses to compile anything
+    /// while it is so, and
     /// [`Self::bind_dot_jq`] raises this.
     dot_jq_failure: Option<ReportEntry>,
     /// The modules whose own dependencies are currently being loaded, by resolved
@@ -1748,17 +1749,16 @@ impl ModuleLoader {
             if jq_path.is_file() {
                 // Auto-load ~/.jq file - functions defined here are always available
                 //
-                // One that cannot be used is a compile error for every program (#5351), which
+                // One that does not parse is a compile error for every program (#5351), which
                 // this constructor cannot return: the failure waits for `bind_dot_jq`.
+                //
+                // One that does not read is left out, as an absent one is (#7665): jq imports
+                // `~/.jq` as an `optional` library, and its `load_library` reports a file
+                // `jv_load_file` cannot read only for an import that is not optional
+                // (captured from jq 1.7.1 and 1.8.2).
                 let canonical = canonical_or_self(&jq_path);
                 match read_library(&jq_path) {
-                    Err(e) => {
-                        dot_jq_path = Some(jq_path.clone());
-                        dot_jq_failure = Some(ReportEntry::Data(DataFileFailure {
-                            path: canonical,
-                            detail: strerror_only(&e),
-                        }));
-                    }
+                    Err(_) => {}
                     Ok(contents) => match jq::parse_program(&contents) {
                         Err(error) => {
                             dot_jq_path = Some(jq_path.clone());
