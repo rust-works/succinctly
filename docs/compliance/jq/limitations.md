@@ -5948,6 +5948,17 @@ A `--slurp` stream is read again from its files, so one slurped from stdin keeps
 Since [#7444](https://github.com/rust-works/succinctly/issues/7444) `/dev/null` in the file list reads again as the nothing it gave, and a regular file named through a descriptor (`/dev/fd/3 3<t.json`, `/dev/stdin < t.json`) is read again from its start by position, so both get jq's wording too; a pipe behind such a path still cannot be read again.
 `input`/`inputs` and `-n` are not on this route, and word their faults as [#5555](https://github.com/rust-works/succinctly/issues/5555) does.
 
+**A field lookup reads the members of its own object, not the values it steps over ([#7448](https://github.com/rust-works/succinctly/issues/7448)).**
+Since #7448 a lookup refuses an object of its own level whose member has no value or no key, as jq does: `{"a":}`, `{"a"}`, `{:1}`, `{"a":1,"b":}` and `{"b":,"a":1}` all raise jq's parse error for `.a` and `.b`.
+It steps over every other member's value by the index's bracket structure, reading none of its text, so a member with no value one level down is that value's own business, as `{bad}` is in `{"ok":1,"x":{bad}} | .ok` above.
+`{"x":{"a":},"y":1} | .a` prints `null`, `.y` prints `1` and `keys` prints `["x","y"]`, exit 0, where jq 1.7.1 and 1.8.2 refuse the document with `jq: parse error: Unmatched '}' at line 1, column 11`, exit 5.
+`.x.a`, `.`, `-n input`, `--stream .` and `--slurp .` read the inner object and raise as jq does (`--slurp` from stdin in the evaluator's wording, as above).
+A filter that fails on the document's own type before it reads an element names that failure, not jq's parse error: `[{"a":}] | .a` is `jq: error (at <stdin>:0): Cannot index array with string "a"`, exit 5, where jq prints `jq: parse error: Unmatched '}' at line 1, column 7`, exit 5; `[1,,3] | .a` and `{"a":} | .[0]` are the same.
+A lookup also checks the `,` and `:` of the member it returns and the gap after the last member, but not the gaps of the members it steps over: `{"a":1 "b":2} | .a` prints `1`, and `{"a",1} | .b` and `{"a" 1} | .b` print `null`, exit 0, where jq refuses all three.
+Seeing either kind of fault would mean reading text the lookup now skips, for every member of every object a field lookup walks, which is the hot path of every program; it stays as recorded here until that cost is measured.
+NDJSON lines and a windowed stream of 1 MiB or more answer in the same way, line by line.
+Pinned by `tests/jq_cli/i7448_nested.rs`.
+
 ### A parse error past 2^31 lines or columns reports the true position ([#7461](https://github.com/rust-works/succinctly/issues/7461))
 
 jq's parser keeps its line and column in C `int`s (`int line, column;` in `src/jv_parse.c`, at jq-1.7.1 and at jq-1.8.2, printed with `%d`), so a parse error past 2^31-1 newlines in the stream, or 2^31-1 bytes on one line, reports a negative position.
