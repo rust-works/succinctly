@@ -8634,6 +8634,40 @@ fn read_inputs(
         }
         let mut locations =
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
+        // #7603: a stream that opens with part of a byte-order mark and departs from it is
+        // `Malformed BOM` before jq's parser reads a byte, on every read, with `--stream-errors`
+        // too: there is no input. Under `-n` each `input` raises it (the reader's queue repeats
+        // it); otherwise it is the main loop's parse error, whatever `-s` would have read.
+        if crate::cli::jq_stream_errors::opens_with_malformed_bom(&raw_bytes) {
+            if args.null_input {
+                LAZY_STREAM_INPUTS.with(|slot| {
+                    *slot.borrow_mut() = Some(LazyStreamInputs {
+                        files: raw_bytes.iter().map(|(file, _)| *file).collect(),
+                        last_source: u32::try_from(locations.files().len().saturating_sub(1))
+                            .unwrap_or(u32::MAX),
+                        reader: crate::cli::jq_stream_errors::Reader::from_source(Box::new(
+                            crate::cli::jq_stream_errors::MemorySources::new(raw_bytes),
+                        )),
+                        raise_errors: true,
+                    });
+                });
+                return Ok(Ok((Vec::new(), locations, None, Vec::new())));
+            }
+            let raised = crate::cli::jq_stream_errors::Reader::new(&raw_bytes[..])
+                .next_yielded()
+                .filter(|yielded| yielded.raised);
+            if let Some(yielded) = raised {
+                let (source, line) = stream_location(&raw_bytes, yielded.location);
+                let trailing = TrailingParseError {
+                    error: EvalError::new(yielded.error.unwrap_or_default()),
+                    source: u32::try_from(source).unwrap_or(u32::MAX),
+                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                    seq_warning: false,
+                    as_parse_error: true,
+                };
+                return Ok(Ok((Vec::new(), locations, Some(trailing), Vec::new())));
+            }
+        }
         // #5498: the program reads its inputs through `input`/`inputs` (under `-n`) or the driver
         // loop pops them (a plain walk), and the reader hands them out as they are asked for, so a
         // stream of events is never held. Since #7571 that includes `--stream-errors` without `-n`.
@@ -16951,7 +16985,34 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
     // #7126: jq says nothing of a standard input that fails when it is the only source (the run's exit
     // 2 is its whole report); a file that fails part-way is reported (#5498).
     let stdin_only = files.iter().all(Option::is_none);
-    Box::new(move || match reader.next_yielded() {
+    // #7603: `Malformed BOM` is what every later read returns too, since jq's parser never gets past
+    // it; the reader ends with it, so it is kept for the reads after.
+    let mut raised: Option<(String, (u32, u32))> = None;
+    Box::new(move || {
+        if let Some((message, at)) = &raised {
+            return jq::ProducedInput::Error(EvalError::new(message.clone()), *at);
+        }
+        stream_reader_produce(
+            &mut reader,
+            &files,
+            last_source,
+            raise_errors,
+            stdin_only,
+            &mut raised,
+        )
+    })
+}
+
+/// One read of [`stream_reader_producer`]'s queue.
+fn stream_reader_produce<R: crate::cli::jq_stream_errors::RefillSource>(
+    reader: &mut crate::cli::jq_stream_errors::Reader<R>,
+    files: &[Option<usize>],
+    last_source: u32,
+    raise_errors: bool,
+    stdin_only: bool,
+    raised: &mut Option<(String, (u32, u32))>,
+) -> jq::ProducedInput {
+    match reader.next_yielded() {
         Some(input) => {
             let (source, line) = input.location;
             // The same tags the whole read gave: a value yielded after jq closed its input has
@@ -16965,6 +17026,10 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
                 )
             };
             match input.error {
+                Some(message) if input.raised => {
+                    *raised = Some((message.clone(), (tag, line)));
+                    jq::ProducedInput::Error(EvalError::new(message), (tag, line))
+                }
                 Some(message) if raise_errors => {
                     jq::ProducedInput::Error(EvalError::new(message), (tag, line))
                 }
@@ -16987,7 +17052,7 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
                     .map(|lines| (last_source, u32::try_from(lines).unwrap_or(u32::MAX))),
             )
         }
-    })
+    }
 }
 
 thread_local! {
