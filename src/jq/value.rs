@@ -714,9 +714,8 @@ pub(crate) fn jq_literal_text_to_f64(text: &str) -> Option<f64> {
 /// function actually exists for), doubles are at least 16 apart on
 /// `[10^17, 10^18)` and at least 128 apart above `10^18`, while the
 /// 17-digit rounding moves a value by at most 5 or 50, so it rounds
-/// straight back to the double it started as. The one exact-`i64` producer
-/// past `2^53` that is *not* a literal is `range`, which stays on its
-/// documented exact walk (`docs/compliance/jq/limitations.md`).
+/// straight back to the double it started as. `range` walks jq's doubles past
+/// `2^53` (#7731) and emits no exact `i64` there but its own `from`.
 ///
 /// yq mode never calls this: real yq's arithmetic is exact `int64`, so its
 /// `Int`-to-`f64` widening stays a plain cast (`int_to_f64`).

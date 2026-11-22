@@ -11029,7 +11029,7 @@ fn each_range<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             {
                 // #5292: handed over a batch at a time, each drained into `sink`
                 // before the next is built.
-                let end = each_range_batches(
+                let end = each_range_batches::<S>(
                     from_val,
                     to_val,
                     step_val,
@@ -100760,8 +100760,12 @@ pub(crate) enum RangeNum {
 }
 
 impl RangeNum {
-    pub(crate) fn as_f64(self) -> f64 {
+    /// The double the walk steps with: in jq mode (`jq_doubles`) an integer widens with jq's
+    /// 17-digit literal rounding ([`jq_literal_int_to_f64`], #7731), what `jv_number_value` gives
+    /// jq's `RANGE` opcode and its `. + $by`; in yq mode with a plain cast, as yq's `int64` does.
+    pub(crate) fn as_f64(self, jq_doubles: bool) -> f64 {
         match self {
+            Self::Int(i) if jq_doubles => jq_literal_int_to_f64(i),
             Self::Int(i) => i as f64,
             Self::Float(f) => f,
         }
@@ -101221,11 +101225,18 @@ fn range_batch_f64(
     // downstream re-derives or cross-checks it against `from`, so a future
     // caller passing some other variant (or a value numerically unequal to
     // `from`) would silently splice a wrong value into a numeric range's
-    // output with no other defense.
+    // output with no other defense. #7731 adds the one other: an `Int` past 2^53, the integer
+    // `from` itself.
     // `map_or(true, ..)` rather than `is_none_or`: clippy's `msrv` (clippy.toml) is
     // 1.73 and `Option::is_none_or` is 1.82.
     debug_assert!(
-        first_value.map_or(true, |v| matches!(v, OwnedValue::NumberLiteral(..))),
+        first_value.map_or(true, |v| match v {
+            OwnedValue::NumberLiteral(..) => true,
+            OwnedValue::Int(i) => {
+                !jq_int_within_exact_f64_range(*i) && jq_literal_int_to_f64(*i) == from
+            }
+            _ => false,
+        }),
         "range's first_value override must be a NumberLiteral, got {first_value:?}"
     );
     let mut first_value = first_value;
@@ -101358,10 +101369,46 @@ fn drive_range_batches<T>(
 
 /// `range(from; to; step)` over numbers, handed to `each` in batches of at most
 /// [`MAX_RANGE`] values and at most `cap` in all (callers pass
-/// [`MAX_RANGE_TOTAL`]): integers when all three operands are, floats
-/// otherwise (`implicit_step`: see [`range_batch_f64`]). `from_literal` is the
-/// first value's source spelling (#3103); see [`range_from_literal_override`].
-pub(crate) fn each_range_batches(
+/// [`MAX_RANGE_TOTAL`]): integers when all three operands are and, in jq mode,
+/// lie within ±2^53, floats otherwise (`implicit_step`: see [`range_batch_f64`]).
+/// `from_literal` is the first value's source spelling (#3103); see
+/// [`range_from_literal_override`].
+///
+/// jq steps in doubles (#7731): `range/2` is the `RANGE` opcode,
+/// `jv_number(jv_number_value(v) + 1)` compared with `>=`, and `range/3` is
+/// `$from | while(. < $upto; . + $by)`. Within ±2^53 every value, every sum
+/// that can still be below `to` and every comparison is exact in a double, so the
+/// `i64` walk is that walk value for value; past it a sum rounds
+/// (`-9007199254740994 + 1` is `-9007199254740992`) and the walk takes jq's
+/// doubles, `from` itself first as jq emits `$from`. yq's integers are exact
+/// `int64`, so yq mode keeps the `i64` walk at every magnitude.
+#[inline]
+pub(crate) fn each_range_batches<S: EvalSemantics>(
+    from: RangeNum,
+    to: RangeNum,
+    step: RangeNum,
+    implicit_step: bool,
+    from_literal: Option<&OwnedValue>,
+    cap: usize,
+    each: &mut dyn FnMut(Vec<OwnedValue>) -> Demand,
+) -> RangeEnd {
+    each_range_batches_in(
+        S::TAG == EvalTag::Jq,
+        from,
+        to,
+        step,
+        implicit_step,
+        from_literal,
+        cap,
+        each,
+    )
+}
+
+/// [`each_range_batches`] for both modes in one instance (`jq_doubles` in jq mode): the
+/// `i64` walk it shares is the hot loop of every `range`, and a copy per mode moved it.
+#[allow(clippy::too_many_arguments)]
+fn each_range_batches_in(
+    jq_doubles: bool,
     from: RangeNum,
     to: RangeNum,
     step: RangeNum,
@@ -101379,24 +101426,40 @@ pub(crate) fn each_range_batches(
         // literal generally renders identically to its own `i64`, but `-0` is the one
         // legal-JSON exception.
         //
-        // Only that `-0` is kept here: any other integer literal, #6064's past-2^53 one
-        // included, is the same `i64` the walk pushes, as an exact `Int`. The float arm
-        // below keeps every literal [`range_from_literal_override`] returns.
-        (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st)) => drive_range_batches(
-            f,
-            cap,
-            |from, max_len| {
-                let first = first_value
-                    .take()
-                    .filter(|v| matches!(v, OwnedValue::NumberLiteral(NumberRepr::Int(0), _)));
-                range_batch_int(from, t, st, first, max_len)
-            },
-            each,
-        ),
-        (f, t, st) => {
-            let (t, st) = (t.as_f64(), st.as_f64());
+        // Only that `-0` is kept here: within ±2^53 any other integer literal is the same
+        // `i64` the walk pushes, as an exact `Int`. The float arm below keeps every
+        // literal [`range_from_literal_override`] returns.
+        (RangeNum::Int(f), RangeNum::Int(t), RangeNum::Int(st))
+            if !jq_doubles
+                || (jq_int_within_exact_f64_range(f)
+                    && jq_int_within_exact_f64_range(t)
+                    && jq_int_within_exact_f64_range(st)) =>
+        {
             drive_range_batches(
-                f.as_f64(),
+                f,
+                cap,
+                |from, max_len| {
+                    let first = first_value
+                        .take()
+                        .filter(|v| matches!(v, OwnedValue::NumberLiteral(NumberRepr::Int(0), _)));
+                    range_batch_int(from, t, st, first, max_len)
+                },
+                each,
+            )
+        }
+        (f, t, st) => {
+            // #7731: an integer `from` a double cannot hold is emitted as itself, as jq emits
+            // `$from`, when it has no literal spelling to keep instead (a document's integer).
+            let exact_from;
+            if let (None, RangeNum::Int(i)) = (first_value, f) {
+                if !jq_int_within_exact_f64_range(i) {
+                    exact_from = OwnedValue::Int(i);
+                    first_value = Some(&exact_from);
+                }
+            }
+            let (t, st) = (t.as_f64(jq_doubles), st.as_f64(jq_doubles));
+            drive_range_batches(
+                f.as_f64(jq_doubles),
                 cap,
                 |from, max_len| {
                     range_batch_f64(from, t, st, implicit_step, first_value.take(), max_len)
@@ -101414,7 +101477,7 @@ pub(crate) fn each_range_batches(
 /// decimals there: a step literal too small for a double (`1e-1000`, `-1e-400`) is not zero, and
 /// the first `$from < $upto`, the one comparison of two literals before `+ $by` computes, can
 /// differ from the doubles' when they tie (`range(0; 1e-1000; 1)` is `[0]`), unless both are
-/// integers, which the `i64` walk compares exactly already. jq mode only; `range/1`
+/// integers within ±2^53, which the `i64` walk compares exactly already. jq mode only; `range/1`
 /// and `range/2` are jq's C opcode, which compares doubles, and yq's numbers are doubles.
 /// Whether `range(from; to; step)` (`implicit_step` for `range/1` and `range/2`) takes the numeric
 /// walk ([`each_range_batches`]) rather than [`range_values_generic`], once [`range_num`] has found all
@@ -101438,22 +101501,31 @@ pub(crate) fn range_reads_literals<S: EvalSemantics>(
     if S::TAG != EvalTag::Jq {
         return false;
     }
+    // The doubles the walk would compare: an integer literal widens as jq's does (#7731).
+    let walk_f64 = |v: &OwnedValue| match v {
+        OwnedValue::NumberLiteral(NumberRepr::Int(i), _) => Some(int_to_f64::<S>(*i)),
+        _ => v.as_f64(),
+    };
     let double_ties = |a: &OwnedValue, b: &OwnedValue| {
         matches!(a, OwnedValue::NumberLiteral(..))
             && matches!(b, OwnedValue::NumberLiteral(..))
-            && a.as_f64() == b.as_f64()
+            && walk_f64(a) == walk_f64(b)
             && jq_numeric_cmp(a, b) != Some(Ordering::Equal)
     };
-    // Two integers keep the exact `i64` walk, which already compares them exactly (and past
-    // `2^53` keeps every value, the recorded #2131 divergence from jq's doubles).
-    let both_ints = matches!(
-        (from, to),
+    // Two integers within ±2^53 keep the exact `i64` walk, which compares them exactly, as
+    // decimals compare. Past it the walk is doubles (#7731), and two integer literals jq
+    // compares as decimals first (`range(9223372036854775806; 9223372036854775807; 1)` is
+    // `[9223372036854775806]`, where both bounds are the double 2^63), so they take the walk
+    // that compares as jq does.
+    let from_to_ints_within = match (from, to) {
         (
-            OwnedValue::NumberLiteral(NumberRepr::Int(_), _),
-            OwnedValue::NumberLiteral(NumberRepr::Int(_), _)
-        )
-    );
-    double_ties(step, &definition_zero_for::<S>(step)) || (!both_ints && double_ties(from, to))
+            OwnedValue::NumberLiteral(NumberRepr::Int(a), _),
+            OwnedValue::NumberLiteral(NumberRepr::Int(b), _),
+        ) => Some(jq_int_within_exact_f64_range(*a) && jq_int_within_exact_f64_range(*b)),
+        _ => None,
+    };
+    double_ties(step, &definition_zero_for::<S>(step))
+        || from_to_ints_within.map_or_else(|| double_ties(from, to), |within| !within)
 }
 
 /// `range/3`'s fallback once at least one of `from`/`to`/`step` fails
@@ -126310,11 +126382,12 @@ mod tests {
     ) -> (Vec<OwnedValue>, usize, RangeEnd) {
         let mut seen = Vec::new();
         let mut batches = 0;
-        let end = each_range_batches(from, to, step, false, None, cap, &mut |values| {
-            batches += 1;
-            seen.extend(values);
-            Demand::Continue
-        });
+        let end =
+            each_range_batches::<JqSemantics>(from, to, step, false, None, cap, &mut |values| {
+                batches += 1;
+                seen.extend(values);
+                Demand::Continue
+            });
         (seen, batches, end)
     }
 
@@ -126374,7 +126447,8 @@ mod tests {
     #[test]
     fn test_range_batches_stop_at_the_total_cap_exactly_5292() {
         for cap in [1, 99_999, 100_000, 100_001, 250_000] {
-            let (seen, _, end) = batched_ints(0, i64::MAX, 1, cap);
+            // Within 2^53, where the walk is the `i64` one in jq mode too (#7731).
+            let (seen, _, end) = batched_ints(0, 1 << 53, 1, cap);
             assert_eq!(seen, (0..cap as i64).collect::<Vec<i64>>(), "cap {cap}");
             assert_eq!(end, RangeEnd::Capped, "cap {cap}");
         }
@@ -126401,7 +126475,7 @@ mod tests {
     #[test]
     fn test_range_batches_stop_when_the_consumer_does_5292() {
         let mut batches = 0;
-        let end = each_range_batches(
+        let end = each_range_batches::<JqSemantics>(
             RangeNum::Int(0),
             RangeNum::Int(i64::MAX),
             RangeNum::Int(1),
@@ -126461,7 +126535,7 @@ mod tests {
     fn test_range_batches_keep_the_first_values_spelling_on_the_first_batch_only_5292() {
         let literal = OwnedValue::NumberLiteral(NumberRepr::Float(0.0), "0.0".into());
         let mut firsts = Vec::new();
-        each_range_batches(
+        each_range_batches::<JqSemantics>(
             RangeNum::Float(0.0),
             RangeNum::Float(250_000.0),
             RangeNum::Float(1.0),
@@ -126579,7 +126653,7 @@ mod tests {
     fn test_range_first_value_literal_per_route_6064() {
         fn first(from: RangeNum, to: RangeNum, literal: &OwnedValue) -> OwnedValue {
             let mut out = Vec::new();
-            each_range_batches(
+            each_range_batches::<JqSemantics>(
                 from,
                 to,
                 RangeNum::Int(1),
@@ -126605,16 +126679,13 @@ mod tests {
             &big,
         );
         assert_eq!(value, big);
-        // The integer walk pushes the exact `Int`.
+        // Past 2^53 an all-integer range walks doubles as well (#7731), and keeps it too.
         let value = first(
             RangeNum::Int(9_007_199_254_740_993),
             RangeNum::Int(9_007_199_254_741_000),
             &big,
         );
-        assert!(
-            matches!(value, OwnedValue::Int(9_007_199_254_740_993)),
-            "{value:?}"
-        );
+        assert_eq!(value, big);
         // `-0` is kept by both.
         for to in [RangeNum::Int(3), RangeNum::Float(3.5)] {
             let value = first(RangeNum::Int(0), to, &neg_zero);
@@ -126629,20 +126700,59 @@ mod tests {
         assert!(range_from_literal_override(&at_limit).is_none());
     }
 
-    /// #2131 (revised fix)/#2219, end to end through the full
-    /// `each_range`/`emit` dispatch (not just [`eval_range_values`]
-    /// directly): a range with no overflow risk keeps its exact `Int`
-    /// values regardless of how large its magnitude is. Renamed by #2219,
-    /// which also retargeted this test's own premise: an `Int`/`Int`/`Int`
-    /// range that hits an `i64` overflow no longer falls back to `Float`
-    /// either -- it keeps the exact `Int` prefix already computed before
-    /// the overflow, proving the `None => range_batch_f64(...)` arm
-    /// in `each_range`'s `emit` closure is unreachable dead code for this
-    /// dispatch arm (see `eval_range_values`'s own doc comment). The `f64`
-    /// path itself is still real production code, just reachable only via
-    /// `emit`'s *other* match arm, for genuinely non-integer operands.
+    /// #7731: past ±2^53 jq mode walks doubles and yq mode keeps yq's exact `int64` walk; within
+    /// it both take the `i64` walk.
     #[test]
-    fn test_range_dispatch_keeps_exact_int_prefix_through_overflow_2219() {
+    fn test_range_batches_walk_doubles_past_2_53_in_jq_mode_only_7731() {
+        fn walk<S: EvalSemantics>(from: i64, to: i64) -> Vec<OwnedValue> {
+            let mut out = Vec::new();
+            each_range_batches::<S>(
+                RangeNum::Int(from),
+                RangeNum::Int(to),
+                RangeNum::Int(1),
+                true,
+                None,
+                usize::MAX,
+                &mut |batch| {
+                    out.extend(batch);
+                    Demand::Continue
+                },
+            );
+            out
+        }
+        let past = -9_007_199_254_740_994;
+        assert_eq!(
+            walk::<JqSemantics>(past, past + 4),
+            [
+                OwnedValue::Int(past),
+                OwnedValue::Float(-9_007_199_254_740_992.0),
+                OwnedValue::Float(-9_007_199_254_740_991.0),
+            ]
+        );
+        assert_eq!(
+            walk::<YqSemantics>(past, past + 4),
+            (past..past + 4).map(OwnedValue::Int).collect::<Vec<_>>()
+        );
+        let within = -9_007_199_254_740_992;
+        for got in [
+            walk::<JqSemantics>(within, within + 3),
+            walk::<YqSemantics>(within, within + 3),
+        ] {
+            assert_eq!(
+                got,
+                (within..within + 3)
+                    .map(OwnedValue::Int)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// #2131/#2219 end to end through the full `each_range`/`emit` dispatch: a range within
+    /// ±2^53 keeps its exact `Int` values, and since #7731 one past it walks jq's doubles and
+    /// prints what jq 1.7.1 and 1.8.2 print, at the magnitudes #2219 pinned the exact `i64`
+    /// prefix at (sourced from data where a bound is negative, #3044).
+    #[test]
+    fn test_range_dispatch_past_2_53_answers_as_jq_2219_7731() {
         fn range_values_from(json: &[u8], src: &str) -> Vec<OwnedValue> {
             let index = JsonIndex::build(json);
             let cursor = index.root(json);
@@ -126651,94 +126761,48 @@ mod tests {
             assert_eq!(tag, "ok", "`{src}` did not evaluate cleanly");
             values
         }
-        fn range_values(src: &str) -> Vec<OwnedValue> {
-            range_values_from(b"null", src)
+        fn printed(json: &[u8], src: &str) -> Vec<String> {
+            range_values_from(json, src)
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect()
         }
 
         // Ordinary small range: every value is an exact Int.
-        for v in range_values("range(0;10;1)") {
+        for v in range_values_from(b"null", "range(0;10;1)") {
             assert!(matches!(v, OwnedValue::Int(_)), "expected Int, got {v:?}");
         }
-
-        // The nanosecond-epoch-scale regression case: no overflow risk at
-        // all, so it must stay Int end to end, with the exact expected
-        // sequence (no precision loss, unlike the old `±2^53`-gated fix).
-        let ns = range_values("[range(1700000000000000000;1700000000000000010;1)]");
-        assert_eq!(ns.len(), 1, "expected a single array result");
-        match &ns[0] {
-            OwnedValue::Array(items) => {
-                let ints: Vec<i64> = items
-                    .iter()
-                    .map(|v| match v {
-                        OwnedValue::Int(i) => *i,
-                        other => panic!("expected Int, got {other:?}"),
-                    })
-                    .collect();
-                assert_eq!(
-                    ints,
-                    (1_700_000_000_000_000_000i64..1_700_000_000_000_000_010).collect::<Vec<_>>()
-                );
-            }
-            other => panic!("expected Array, got {other:?}"),
-        }
-
-        // #2219: overflows on the first `checked_add`, but `from` was
-        // already pushed as an exact `Int` before that overflow ends the
-        // loop, so it's kept rather than discarded for an `f64`
-        // recomputation. (Pre-#2219 this produced no values at all, via a
-        // `?`-triggered bail to `range_batch_f64`.)
-        //
-        // #3044 closed the unrelated divergence this comment used to cite
-        // (jq's unary minus collapsing a literal this large to `f64`
-        // before `range` ever sees it, `docs/compliance/jq/limitations.md`'s
-        // former #2357 section): succinctly's own filter-text unary minus
-        // now does the same, so a *bare literal* spelling of this repro no
-        // longer reaches this dispatch arm at all. Sourcing the bounds
-        // from data instead (as `range_values_from` does here) keeps them
-        // exact in both tools, so this still exercises the overflow-safety
-        // fix itself rather than the literal-parsing question #3044 owns.
         assert_eq!(
-            range_values_from(
+            printed(
+                b"null",
+                "[range(1700000000000000000;1700000000000000010;1)]"
+            ),
+            ["[1700000000000000000]"]
+        );
+        assert_eq!(
+            printed(
                 b"[-9223372036854775758,-9223372036854775808,-100]",
                 ".[0] as $from | .[1] as $to | .[2] as $step | range($from;$to;$step)"
             ),
-            vec![OwnedValue::Int(-9223372036854775758)]
+            ["-9223372036854775758"]
         );
-
-        // #2219: a genuine near-`i64::MAX` overflow no longer reaches
-        // `range_batch_f64` at all for `Int`/`Int`/`Int` operands --
-        // the overflowing candidate can never satisfy `< to` either way, so
-        // the loop ends and keeps the one exact `Int` value already pushed,
-        // instead of discarding it for a `Float` recomputation. This proves
-        // the `range_batch_f64` call this dispatch arm used to fall
-        // back to is unreachable from here (see `eval_range_values`'s own
-        // doc comment for why its signature no longer even offers that
-        // path) -- the f64 path remains reachable only via the *other*
-        // `emit` match arm, for genuinely non-integer `from`/`to`/`step`.
         assert_eq!(
-            range_values("range(9223372036854774000;9223372036854775807;1000000000000000)"),
-            vec![OwnedValue::Int(9223372036854774000)]
+            printed(
+                b"null",
+                "range(9223372036854774000;9223372036854775807;1000000000000000)"
+            ),
+            ["9223372036854774000"]
         );
-
-        // #2219, descending mirror of the multi-iteration overflow case
-        // `test_eval_range_values_overflow_detection_2131` already pins at
-        // the unit level (`eval_range_values_i64(0, i64::MAX, big_step)`):
-        // the first advance succeeds, the second overflows past `i64::MIN`,
-        // and both values computed before that overflow are kept end to
-        // end through the full dispatch, not just at the unit level.
-        //
-        // `to`/`step` are sourced from data (#3044): both are past `2^53`
-        // and negative, so writing them as bare filter-text literals would
-        // now route through the same `-1 * <literal>` split as the
-        // assertion above, changing what's under test.
+        // The first sum is `-4611686018427387904` as a double, and the second is `-2^63`,
+        // which is not above the bound.
         let big_step = i64::MAX / 2 + 100;
         let input = format!("[{},{}]", i64::MIN, -big_step);
         assert_eq!(
-            range_values_from(
+            printed(
                 input.as_bytes(),
                 ".[0] as $to | .[1] as $step | range(0;$to;$step)"
             ),
-            vec![OwnedValue::Int(0), OwnedValue::Int(-big_step)]
+            ["0", "-4611686018427388000"]
         );
     }
 
@@ -172847,8 +172911,19 @@ mod tests {
             &int(3),
             &int(1)
         ));
-        // Two integers whose doubles tie stay on the exact `i64` walk (#2131).
+        // Two integers past 2^53 compare as decimals first, as jq's `<` does, where the walk
+        // compares doubles (#7731); within 2^53 the exact `i64` walk compares them as jq does.
+        assert!(range_reads_literals::<JqSemantics>(
+            &int(1_700_000_000_000_000_000),
+            &int(1_700_000_000_000_000_001),
+            &int(1)
+        ));
         assert!(!range_reads_literals::<JqSemantics>(
+            &int(9_007_199_254_740_990),
+            &int(9_007_199_254_740_992),
+            &int(1)
+        ));
+        assert!(!range_reads_literals::<YqSemantics>(
             &int(1_700_000_000_000_000_000),
             &int(1_700_000_000_000_000_001),
             &int(1)
