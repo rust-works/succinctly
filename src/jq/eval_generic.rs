@@ -463,6 +463,20 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
     crate::jq::eval::unary_math_apply::<S>(builtin, n)
 }
 
+/// [`crate::jq::eval::jq_literal_length`] of a document number (#7534): jq 1.8.2's `length` of a
+/// number literal, read as an owned value as [`binary_math_of_document_number`] reads one. `None`
+/// (the double's `numeric_length_owned` below) in yq mode, for a value that is not a valid RFC 8259
+/// number span (a bridge token, a lenient span, a non-number) and for a number with no literal.
+fn jq_literal_length_of_document_number<S: EvalSemantics, V: DocumentValue>(
+    value: &V,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    value.valid_number_text()?;
+    crate::jq::eval::jq_literal_length(to_owned::<S, V>(value).ok()?)
+}
+
 /// `split(SEP)` of a string value, for a literal string `SEP` (#5682): the pieces, read straight
 /// off the value's text. The bridge this stands in for materializes the string, writes it out as
 /// JSON text, indexes that, and has `builtin_split` read it back -- the writing alone cost as much
@@ -5702,6 +5716,22 @@ impl<V: DocumentValue> LazySeq<V> {
             // comment.
             None => self.instructions = Some(Rc::new(alloc::vec![instr])),
         }
+    }
+
+    /// Whether pushing a `map(h)` stage onto this chain would change what can be observed
+    /// (#7565): jq runs every stage on every element before the next stage starts, and the
+    /// chain runs them element by element, so the two orders differ only when `h` and a stage
+    /// already on the chain can each raise or have an effect, which
+    /// [`expr_is_inert`](super::eval::expr_is_inert) is the one test of. jq mode only:
+    /// `succinctly yq` keeps the chain as it was (yq's own evaluation order is #7405).
+    fn fusing_is_observable<S: EvalSemantics>(&self, h: &Expr) -> bool {
+        S::TAG == EvalTag::Jq
+            && !super::eval::expr_is_inert(h, false)
+            && self
+                .instructions
+                .iter()
+                .flat_map(|rc| rc.iter())
+                .any(|instr| !super::eval::expr_is_inert(&instr.f, false))
     }
 
     /// Builder-style wrapper around [`Self::push_map_in_place`], for the
@@ -16134,6 +16164,22 @@ fn fold_lazy_seq_stage<S: EvalSemantics, V: DocumentValue>(
         // same-size replacement -- the hot path for a chained
         // `map(f) | map(g) | map(h)`, where this arm runs once per stage.
         Expr::Builtin(Builtin::Map(h)) => {
+            // #7565: jq's `map(f)` is `[.[] | f]`, so `map(f) | map(g)` runs `f` on every
+            // element before `g` sees the array. Fusing `h` onto the chain runs the stages
+            // element by element instead, which is unobservable only when `h` or every stage
+            // already on the chain is inert; otherwise `h`'s error, `debug` or `input` came
+            // before a later element's `f`. Such a chain is drained first (the cursors stay
+            // cursors, nothing is decoded) and `h` starts a new one over what it answered.
+            if seq.fusing_is_observable::<S>(h) {
+                return match seq.drain_atomic() {
+                    Ok(elems) => GenericResult::LazySeq(Box::new(
+                        LazySeq::from_mixed(elems).push_map(h, S::TAG),
+                    )),
+                    Err(Control::Error(e)) => GenericResult::Error(e),
+                    Err(Control::Break(label)) => GenericResult::Break(label),
+                    Err(Control::Halt(code)) => GenericResult::Halt(code),
+                };
+            }
             seq.push_map_in_place(h, S::TAG);
             GenericResult::LazySeq(seq)
         }
@@ -20313,10 +20359,12 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
 /// ([`embed_table`]). The entry makes the accumulator's first in-place write copy
 /// once, and a live table reshapes owned navigation, neither of which a fold that
 /// cannot certify a marker should pay -- hence the gate. Only the *first* output:
-/// jq 1.7.1 evaluates SOURCE against `null` on every later fork
+/// jq evaluates a `reduce`'s SOURCE against `null` on every later fork
 /// (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a loop variable there is
 /// never the accumulator's own node, and an entry would answer a write through it
-/// that jq refuses.
+/// that jq refuses. A `foreach`'s later forks read the real input since #7519, and the
+/// writes through a loop variable that `tests/jq_cli/i7519.rs` pins on them answer as
+/// jq 1.8.2 does without an entry.
 fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: &V,
@@ -20364,7 +20412,8 @@ fn drive_foreach_expr_generic<S: EvalSemantics, V: DocumentValue>(
 
 /// A fold's SOURCE drive on the generic evaluator (#3895): the first INIT fork
 /// reads the fold's own input through [`drive_foreach_expr_generic`], every
-/// later one reads `null`, as jq 1.7.1 does. This route has no `null` of its
+/// later `reduce` fork reads `null`, as jq does (a `foreach` fork always reads
+/// the real input, #7519). This route has no `null` of its
 /// own value type to hand `eval_each_generic`, so a later fork runs the
 /// as-written source against an owned `null` instead
 /// ([`crate::jq::eval::drive_source_against_null`]).
@@ -21915,6 +21964,8 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
     //   prove every read happens where one is in hand.
     let mentions = core::cell::OnceCell::new();
     let names_var = || *mentions.get_or_init(|| mentions_var(body, var));
+    // #7471: whether the body reads `$var` at all, answered for a whole chain of binds at once.
+    let reads_var = super::eval::as_body_reads_var(body, var);
     let reads = core::cell::OnceCell::new();
     let body_reads = || *reads.get_or_init(|| deferred_bind_reads(body, var));
     let defer = |bound: &V::Cursor, decode_failed: bool| {
@@ -21962,8 +22013,14 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
                         cursor.as_ref(),
                         body,
                     );
-                    let substituted_body =
-                        substitute_bound_var_from::<S>(expr, body, var, &bound_val, origin);
+                    // #7471: a body that does not read `$var` is evaluated as it is.
+                    let substituted_body = if reads_var.reads {
+                        alloc::borrow::Cow::Owned(substitute_bound_var_from::<S>(
+                            expr, body, var, &bound_val, origin,
+                        ))
+                    } else {
+                        alloc::borrow::Cow::Borrowed(body)
+                    };
                     eval_each_generic::<S, V>(
                         &substituted_body,
                         value.clone(),
@@ -24480,7 +24537,19 @@ fn eval_each_pipe_generic_stages<S: EvalSemantics, V: DocumentValue>(
                 }
             }
         });
-        eval_each_generic::<S, V>(first, value, optional, cursor, &mut driver)
+        // #7460: `eval_each_pipe`'s rule, for a call that settles.
+        if S::TAG == EvalTag::Jq && crate::jq::tail_call::call_head_settles(first, true) {
+            settle_then_replay(
+                |collect| {
+                    eval_each_generic::<S, V>(first, value, optional, cursor, &mut |item| {
+                        collect(item)
+                    })
+                },
+                |item| driver.push(item),
+            )
+        } else {
+            eval_each_generic::<S, V>(first, value, optional, cursor, &mut driver)
+        }
     };
 
     crate::jq::eval::pipe_terminal_after_retry(
@@ -27834,7 +27903,10 @@ fn settled_each_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    if !settles_before_consumer(expr) {
+    // #7460: or a call whose body answers once, as `eval::fanout_arg_each_inner` settles it.
+    if !(settles_before_consumer(expr)
+        || (S::TAG == EvalTag::Jq && crate::jq::tail_call::call_head_settles(expr, true)))
+    {
         return eval_each_generic::<S, V>(expr, value, optional, cursor, sink);
     }
     settle_then_replay(
@@ -28678,6 +28750,12 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    // #7572: a target with an effect runs depth-first, as in `eval::eval_index_expr`.
+    if crate::jq::eval::index_target_runs_depth_first::<S>(target) {
+        return collect_drive_generic::<S, V>(|sink| {
+            each_index_expr_generic::<S, V>(target, key, value, optional, cursor, sink)
+        });
+    }
     let sum_or_merge = crate::jq::eval::yq_sum_or_merge_read::<S>(target);
     // Keys first: an empty key stream must not evaluate the target at all.
     //
@@ -37451,8 +37529,18 @@ fn collect_each_generic<S: EvalSemantics, V: DocumentValue>(
     optional: bool,
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
+    collect_drive_generic::<S, V>(|sink| {
+        eval_each_generic::<S, V>(expr, value, optional, cursor, sink)
+    })
+}
+
+/// [`collect_each_generic`] over any demand-driven producer `drive` runs into the sink it is given:
+/// its outputs, ended by the flow it returns, as one result.
+fn collect_drive_generic<S: EvalSemantics, V: DocumentValue>(
+    drive: impl FnOnce(&mut dyn Sink<V>) -> Flow,
+) -> GenericResult<V> {
     let mut collected = Collected::Empty;
-    let flow = eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| {
+    let flow = drive(&mut |item| {
         collected.push(item);
         Demand::Continue
     });
@@ -41680,6 +41768,8 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     Ok(len) => GenericResult::Owned(OwnedValue::Int(len as i64)),
                     Err(err) => GenericResult::Error(err),
                 }
+            } else if let Some(length) = jq_literal_length_of_document_number::<S, V>(&value) {
+                GenericResult::Owned(length)
             } else if let Some(i) = value.as_i64() {
                 // Reached only for a value with no source text of its own
                 // to answer from (`as_str()` above already declined), or a
@@ -53266,6 +53356,35 @@ mod tests {
         );
     }
 
+    /// #7565: a `map(g)` joins the chain only when running the stages element by element
+    /// cannot be seen (`g`, or every stage already on it, is inert); otherwise the chain is
+    /// drained first and `g` is the one stage of a new one, as jq's `[.[] | f]` builds the array
+    /// before `map(g)` starts. yq mode keeps fusing (#7405).
+    #[test]
+    fn test_map_map_fuses_only_when_the_order_is_unobservable_7565() {
+        fn stages<S: EvalSemantics>(filter: &str) -> usize {
+            let json = br"[1,2,3]";
+            let index = JsonIndex::build(json);
+            let expr = crate::jq::parse(filter).unwrap();
+            match eval_with_cursor_using::<S, _>(&expr, index.root(json)) {
+                GenericResult::LazySeq(seq) => seq.instructions.as_deref().map_or(0, Vec::len),
+                other => panic!("{filter}: not a LazySeq: {other:?}"),
+            }
+        }
+        for (filter, jq) in [
+            ("map(. + 1) | map(. * 10)", 1),
+            ("map(. + 1) | map(.) | map(. * 10)", 1),
+            ("map(.) | map(. + 1)", 2),
+            ("map(. + 1) | map(tostring)", 2),
+            ("map(. + 1) | map(.)", 2),
+            ("map(.) | map(.) | map(. + 1)", 3),
+            ("map(. + 1) | map(. + 2) | map(.)", 2),
+        ] {
+            assert_eq!(stages::<JqSemantics>(filter), jq, "jq: {filter}");
+        }
+        assert_eq!(stages::<YqSemantics>("map(. + 1) | map(. * 10)"), 2);
+    }
+
     #[test]
     fn test_generic_lazy_seq_composability_native_consumers_725() {
         // `length`, `.[]`, `first`, `.[0]` after a `map` all get a native,
@@ -63841,6 +63960,66 @@ mod tests {
         ] {
             let (got, _) = outputs_and_reindexes(doc, query);
             assert_eq!(got, want, "{query}");
+        }
+    }
+
+    /// #7473: an `until`/`while` round that adds an entry to an object in its state under a key
+    /// read off the state -- a string interpolation of it (`.p["k\(.i)"] = 1`) or an `as` binding of
+    /// `.i | tostring` -- is the owned step's, so no round re-indexes the state. Each round used to:
+    /// the key was not an operand the step reads off the tree, so the round fell to the evaluator's
+    /// route, which serialised and re-indexed the whole state (3 reindexes per round), and the loop
+    /// was quadratic in its rounds. The outputs are jq 1.7.1's (captured live; 1.8.2 agrees).
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // STYLE-0004: jq object literals, not format strings
+    fn test_until_while_state_read_key_needs_no_reindex_per_round_7473() {
+        for (query, want) in [
+            (
+                r#"{i:0,p:{}} | until(.i>=50; .p["k\(.i)"]=1 | .i += 1) | [.i, (.p|length), .p.k49]"#,
+                "[50,50,1]",
+            ),
+            (
+                r#"{i:0,p:{}} | until(.i>=50; (.i|tostring) as $cs | .p[$cs]=.i | .i += 1) | [.i, (.p|length), .p["49"]]"#,
+                "[50,50,49]",
+            ),
+            (
+                r#"[{i:0,p:{}} | while(.i<50; .p["k\(.i)"]=1 | .i += 1)] | [length, (.[-1].p|length)]"#,
+                "[50,49]",
+            ),
+            // `last(while ...)` re-indexes no round either, but it still copies the state every round
+            // and stays quadratic (#7473); this row pins the reindex count and jq's output only.
+            (
+                r#"{i:0,p:{}} | last(while(.i<50; .p["k\(.i)"]=1 | .i += 1)) | [.i, (.p|length)]"#,
+                "[49,49]",
+            ),
+            (
+                r#"{i:0,a:{b:2},p:{}} | until(.i>=50; .p["\(.a.b)-\(.i + 1)"] = (.i|tostring) | .i += 1) | [(.p|length), .p["2-50"]]"#,
+                r#"[50,"49"]"#,
+            ),
+            (
+                r#"{i:0,p:{},n:null,t:true} | until(.i>=50; .p["\(.n)\(.t)\(.i)"] = 1 | .i += 1) | [(.p|length), .p.nulltrue49]"#,
+                "[50,1]",
+            ),
+        ] {
+            let (got, reindexes) = outputs_and_reindexes("null", query);
+            assert_eq!(got, [want], "{query}");
+            assert!(
+                reindexes <= 3,
+                "{query}: {reindexes} reindexes over 50 rounds"
+            );
+        }
+        // A slot that is not a scalar read off the state keeps the evaluator's route and answer.
+        for (query, want) in [
+            (
+                r#"{i:0,p:{}} | until(.i>=3; .p["\(.p)"] = 1 | .i += 1) | .p"#,
+                r#"{"{}":1,"{\"{}\":1}":1,"{\"{}\":1,\"{\\\"{}\\\":1}\":1}":1}"#,
+            ),
+            (
+                r#"{i:0,p:{},f:1.50} | until(.i>=2; .p["\(.f)"] = (.f|tostring) | .i += 1) | .p"#,
+                r#"{"1.50":"1.50"}"#,
+            ),
+        ] {
+            let (got, _) = outputs_and_reindexes("null", query);
+            assert_eq!(got, [want], "{query}");
         }
     }
 

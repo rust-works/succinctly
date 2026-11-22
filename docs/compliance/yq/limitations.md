@@ -604,6 +604,15 @@ That is ADR-0018 rule 4(c): matching would take the host process down, because t
 It is the ceiling a long run of `+` already has.
 Pinned by `tests/yq_cli/i5629.rs`.
 
+### A chain of bindings past the native-stack floor — rule 4(c) ([#7475](https://github.com/rust-works/succinctly/issues/7475))
+
+Real yq parses a chain of `E as $x |` bindings of any length: 100,000 of them answer `1`, its Go stack growing on demand.
+`succinctly yq` parses a binding's body by recursion on a fixed native stack, and a chain of about 48,000 overflowed it and aborted the process.
+Since #7475 the body checks ADR-0025's native-stack floor, and a chain past it is refused at parse time: `Error: parse error: parse error at position N: memory exhausted`, exit 1, from about 70,000 bindings in a release build (a yq-mode binding spends less stack than a jq-mode one).
+That is ADR-0018 rule 4(c): matching would take the host process down.
+A chain of 500 still runs.
+Pinned by `tests/yq_cli/i7475.rs`.
+
 ### A JSON integer past 2^53 keeps its exact digits — rule 4(b) ([#3605](https://github.com/rust-works/succinctly/issues/3605))
 
 yq's JSON decoder reads every number through a `float64`, so an integer a document spelled past
