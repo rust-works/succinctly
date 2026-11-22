@@ -138,14 +138,19 @@ impl<W: core::fmt::Debug> core::fmt::Debug for JsonIndex<W> {
 /// many `ib_rank` probes a lookup costs, never what it answers. The one
 /// answer it *does* supply directly is for `k == rank`, where `pos` is the
 /// value the same deterministic search returned a moment ago.
+///
+/// Packed to 4-byte alignment, 12 bytes: `pos` is 64 bits since #7537, and
+/// an 8-aligned hint would make every [`JsonIndex`] 8 bytes larger than the
+/// 8-byte hint did, where 12 fit in the padding beside `bridge_tokens`.
 #[derive(Clone, Copy, Debug)]
+#[repr(C, packed(4))]
 struct SeqHint {
     /// `u32::MAX` means "no previous lookup" -- a rank the index cannot hold,
     /// since every constructor holds the interest bits to `u32::MAX` (#188).
     rank: u32,
     /// A text position, which passes `u32::MAX` in a text of 4 GiB or more
     /// (#7537).
-    pos: usize,
+    pos: u64,
 }
 
 impl SeqHint {
@@ -305,6 +310,17 @@ impl ScalarIndexParts {
     }
 }
 
+/// [`JsonIndex::build`]'s refusal of a text of `len` bytes whose counts pass
+/// [`JsonIndex::MAX_COUNT`], out of the way of the build it guards.
+#[cold]
+#[inline(never)]
+fn count_ceiling_panic(len: usize) -> ! {
+    panic!(
+        "JsonIndex holds at most u32::MAX (4294967295) interest bits and balanced parentheses; a \
+         text of {len} bytes has more (#188, #7537)"
+    )
+}
+
 impl JsonIndex<Vec<u64>> {
     /// The longest text, in bytes, every index holds whatever it contains: `u32::MAX`, just under
     /// 4 GiB (#188). A longer text is held when its counts are within [`Self::MAX_COUNT`]
@@ -329,39 +345,16 @@ impl JsonIndex<Vec<u64>> {
     /// [`build`](Self::build), or `None` for a text whose interest bits or balanced parentheses
     /// pass [`Self::MAX_COUNT`] (#7537). Only a text of more than [`Self::MAX_TEXT_LEN`] bytes
     /// can, and only such a text pays for the count, after the scan.
+    ///
+    /// A caller that indexes every document asks [`can_index`](Self::can_index) first and calls
+    /// [`build`](Self::build) when it holds: `build` writes the index where its caller keeps it,
+    /// and passing every index back through an `Option` cost about 170 instructions a document
+    /// (`memcpy` of the index), 1-2% of a record-by-record NDJSON run.
     #[must_use]
     pub fn try_build(json: &[u8]) -> Option<Self> {
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        let semi = crate::json::simd::build_semi_index_standard(json);
-
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let semi = crate::json::standard::build_semi_index(json);
-
-        let ib_len = json.len();
-
-        // Two bits per open; a malformed document short of closes gets them
-        // as zero words (#7482).
-        let mut bp_words = semi.bp;
-        let bp_bit_count = bp_len_supplying_missing_closes(&mut bp_words);
-        if !Self::can_index(ib_len)
-            && (bp_bit_count > Self::MAX_COUNT || ones_exceed_max_count(&semi.ib))
-        {
-            return None;
-        }
-
-        // Build cumulative popcount index for IB
-        let ib_rank = build_ib_rank(&semi.ib);
-
-        Some(Self {
-            ib: semi.ib,
-            ib_len,
-            ib_rank,
-            bp: BalancedParens::new(bp_words, bp_bit_count),
-            lines: OnceCell::new(),
-            seq_hint: Cell::new(SeqHint::NONE),
-            close_runs: RefCell::new(Vec::new()),
-            bridge_tokens: false,
-        })
+        let mut over = false;
+        let index = Self::build_counted(json, Some(&mut over));
+        (!over).then_some(index)
     }
 
     /// Build a JSON index from JSON text.
@@ -379,14 +372,66 @@ impl JsonIndex<Vec<u64>> {
     /// [`Self::MAX_COUNT`]: the rank directories store cumulative counts as
     /// `u32` (#188). Only an input of more than `u32::MAX` bytes (4 GiB) can
     /// (#7537); [`try_build`](Self::try_build) answers `None` for one instead.
+    #[inline]
     pub fn build(json: &[u8]) -> Self {
-        Self::try_build(json).unwrap_or_else(|| {
-            panic!(
-                "JsonIndex holds at most u32::MAX (4294967295) interest bits and balanced \
-                 parentheses; a text of {} bytes has more (#188, #7537)",
-                json.len()
-            )
-        })
+        Self::build_counted(json, None)
+    }
+
+    /// The one body of [`build`](Self::build) and [`try_build`](Self::try_build) (#7537): the
+    /// index of `json`, or, for a text whose counts pass [`Self::MAX_COUNT`], `build`'s panic when
+    /// `over` is `None` and an empty index with `over` set otherwise.
+    ///
+    /// Out of line, so the scan and the rank directory are inlined into this one body as they
+    /// were into `build` before `try_build` existed: two bodies made LLVM stop inlining the
+    /// scanner's dispatch into either, about 33 instructions a document (+0.25-0.45% `Ir` on
+    /// record-by-record NDJSON).
+    #[inline(never)]
+    fn build_counted(json: &[u8], over: Option<&mut bool>) -> Self {
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        let semi = crate::json::simd::build_semi_index_standard(json);
+
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let semi = crate::json::standard::build_semi_index(json);
+
+        let ib_len = json.len();
+
+        // Two bits per open; a malformed document short of closes gets them
+        // as zero words (#7482).
+        let mut bp_words = semi.bp;
+        let bp_bit_count = bp_len_supplying_missing_closes(&mut bp_words);
+        // Never for a text `can_index` holds, so only a longer one pays for the count.
+        if !Self::can_index(ib_len)
+            && (bp_bit_count > Self::MAX_COUNT || ones_exceed_max_count(&semi.ib))
+        {
+            let Some(over) = over else {
+                count_ceiling_panic(json.len())
+            };
+            *over = true;
+            return Self {
+                ib: Vec::new(),
+                ib_len: 0,
+                ib_rank: alloc::vec![0],
+                bp: BalancedParens::new(Vec::new(), 0),
+                lines: OnceCell::new(),
+                seq_hint: Cell::new(SeqHint::NONE),
+                close_runs: RefCell::new(Vec::new()),
+                bridge_tokens: false,
+            };
+        }
+
+        // Build cumulative popcount index for IB
+        let ib_rank = build_ib_rank(&semi.ib);
+
+        Self {
+            ib: semi.ib,
+            ib_len,
+            ib_rank,
+            bp: BalancedParens::new(bp_words, bp_bit_count),
+            lines: OnceCell::new(),
+            seq_hint: Cell::new(SeqHint::NONE),
+            close_runs: RefCell::new(Vec::new()),
+            bridge_tokens: false,
+        }
     }
 
     /// [`build`](Self::build) for text the jq reindex bridge wrote
@@ -758,7 +803,8 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
     pub fn ib_select1_sequential(&self, k: usize) -> Option<usize> {
         let last = self.seq_hint.get();
         if last.rank != u32::MAX && k == last.rank as usize {
-            return Some(last.pos);
+            // Fits: it is a position in the text, which `usize` holds.
+            return Some(last.pos as usize);
         }
         let hint = self.seed_word(k, last);
         let result = self.ib_select1_from(k, hint);
@@ -767,7 +813,7 @@ impl<W: AsRef<[u64]>> JsonIndex<W> {
             // constructor holds the ones to `u32::MAX` (#188, #7537).
             self.seq_hint.set(SeqHint {
                 rank: k as u32,
-                pos,
+                pos: pos as u64,
             });
         }
         result
@@ -9261,6 +9307,15 @@ mod tests {
         assert_eq!(index.ib_len(), u32::MAX as usize + 1);
         assert_eq!(index.ib_select1(0), Some(0));
         assert_eq!(index.ib_select1_sequential(0), Some(0));
+    }
+
+    /// #7537: the hint's 64-bit position keeps it at 12 bytes, 4-aligned, so it shares the
+    /// index's tail padding with `bridge_tokens` as the 8-byte hint did, instead of growing every
+    /// index by 8 bytes.
+    #[test]
+    fn the_sequential_hint_is_twelve_bytes_four_aligned_7537() {
+        assert_eq!(core::mem::size_of::<SeqHint>(), 12);
+        assert_eq!(core::mem::align_of::<SeqHint>(), 4);
     }
 
     /// #7537: the count ceiling at its boundary, `u32::MAX` set bits held and one more refused.

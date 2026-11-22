@@ -5780,6 +5780,9 @@ impl ReindexedDoc {
         );
         let index = if scalar_root {
             crate::json::JsonIndex::build_reindex_scalar_from(text.len(), scalar_index_pool::take())
+        } else if crate::json::JsonIndex::can_index(text.len()) {
+            // Built in place: every text shorter than 4 GiB is held (#7537).
+            crate::json::JsonIndex::build_reindex(text.as_bytes())
         } else {
             crate::json::JsonIndex::try_build_reindex(text.as_bytes())
                 .ok_or_else(|| EvalError::resource_limit(index_ceiling_message(text.len())))?
