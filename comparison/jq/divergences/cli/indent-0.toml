@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+reason = "`--indent 0` prints newlines and the space after each `:` with no indentation, as jq 1.8 does (jqlang/jq#3232, \"Fix `--indent 0` implicitly enabling `--compact-output`\"); jq 1.7.1 prints it compactly. succinctly follows 1.8.2 (docs/compliance/jq/limitations.md, #7605)."
+issue = "7605"
