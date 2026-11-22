@@ -15,7 +15,16 @@ use anyhow::Result;
 use crate::run_jq_full;
 
 /// (extra flags, input, filter, stdout, stderr, exit status), from jq 1.7.1.
-const ROWS: &[(&[&str], &str, &str, &str, &str, i32)] = &[
+type Row = (
+    &'static [&'static str],
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    i32,
+);
+
+const ROWS: &[Row] = &[
     (&[], "null\n", r#"split("b"; empty)"#, "[null]\n", "", 0),
     (&[], "null\n", r#"[splits("b"; empty)]"#, "[null]\n", "", 0),
     (
