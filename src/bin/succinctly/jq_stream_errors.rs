@@ -731,7 +731,7 @@ impl<R: RefillSource> Reader<R> {
         }
         if parser.source != refill.source {
             parser.source = refill.source;
-            parser.lines_read = 0;
+            parser.lines_read = crate::cli::jq_runner::line_seed();
         }
         if refill.newline {
             parser.lines_read += 1;
@@ -1279,7 +1279,7 @@ impl Parser {
             token_buf: Vec::new(),
             token_len: 0,
             source: 0,
-            lines_read: 0,
+            lines_read: crate::cli::jq_runner::line_seed(),
             closed: false,
             pending: std::collections::VecDeque::new(),
             yielded: 0,

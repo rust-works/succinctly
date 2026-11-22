@@ -154,7 +154,7 @@ fn a_read_tells_the_hook_which_source_it_reached_6475() {
 fn a_producer_read_tells_the_hook_and_a_seed_clears_it_6475() {
     let seen = Rc::new(RefCell::new(Vec::new()));
     let mut left = vec![
-        Some((OwnedValue::Int(1), 0u32, 1u32)),
+        Some((OwnedValue::Int(1), 0u32, 1u64)),
         Some((OwnedValue::Int(2), 2, 2)),
         None,
     ];
