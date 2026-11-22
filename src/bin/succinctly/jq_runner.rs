@@ -6160,23 +6160,26 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // jq's main loop ends the run once an open has failed, after the one value it was
             // fetching when it met the failure: the first the files past it hold. It reads
             // nothing beyond that value, so a fault further on is never reached (#5472).
-            let past_open_failure = stop_at.is_some_and(|at| idx >= at) && !values.is_empty();
             // #6480: the file's last value before the cut below, which keeps one value past a
             // file that did not open: that one is the input's last only if it was already.
             let last_span = values.last().copied();
+            // #4311: a number or literal the fault's own byte completes is
+            // never read (`1\n2]` reads `1`, then the error).
+            // #7752: before the cut below, which keeps the one value past a file that did not open:
+            // when that value is such a token (`1}`), jq's fetch past the failure returns the fault
+            // instead, so the run reports it.
+            if let (Some(offset), Some(&last)) = (split_error, values.last()) {
+                if bare_token_lost_to_fault(raw, last, offset, false) {
+                    values.pop();
+                }
+            }
+            let past_open_failure = stop_at.is_some_and(|at| idx >= at) && !values.is_empty();
             let split_error = if past_open_failure {
                 values.truncate(1);
                 None
             } else {
                 split_error
             };
-            // #4311: a number or literal the fault's own byte completes is
-            // never read (`1\n2]` reads `1`, then the error).
-            if let (Some(offset), Some(&last)) = (split_error, values.last()) {
-                if bare_token_lost_to_fault(raw, last, offset, false) {
-                    values.pop();
-                }
-            }
             // `values`' end offsets are non-decreasing (find_json_values is
             // a single left-to-right scan), so one LineCounter shared across
             // every value in this file keeps the whole loop O(n) (#1213).
