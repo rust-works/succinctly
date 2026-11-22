@@ -9782,6 +9782,7 @@ jq's parser stops at the `x`, drops the rest of its read (through the newline) a
 The fault and every value after it were read from the next file instead: `input_filename` named that file ([#7751](https://github.com/rust-works/succinctly/issues/7751)), a file that did not open between the two was reported before the fault and the run exited 2 where jq raises the fault and exits 5 ([#7753](https://github.com/rust-works/succinctly/issues/7753)), and a program reading past the fault with `try input` met that failure one value later and stopped, losing the rest of the input ([#7750](https://github.com/rust-works/succinctly/issues/7750)).
 Since #7750 a tail the brackets leave open is carried only if jq's parser, reading it, meets no fault before the end of the file (`token_runs_to_end`), so only a file that ends inside a container or string pays for that read.
 Pinned by `tests/jq_cli/i7750.rs`, `i7751.rs` and `i7753.rs`.
+`scripts/jq-filelist-differential.py` cuts random texts with faults into 2-40 files, puts a missing file, a directory or a mode-000 file at random places in the list, and compares stdout, stderr and the exit status with jq under 36 programs.
 
 **Where a file cut falls can decide whether a lookup meets a fault it steps over.**
 A lookup reads only what it returns ("Every M2 filter streams" below, and #7448), so `type` over `[1,\n}2]\n` in one file answers `"array"` and `.a` answers `Cannot index array with string "a"`, where jq 1.7.1 and 1.8.2 refuse the text with `jq: parse error: Unmatched '}' at line 2, column 1`.
