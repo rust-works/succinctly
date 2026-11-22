@@ -27713,28 +27713,32 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
     // *ambient* `optional` (never forced `true`) and catches the resulting
     // `Error`/`Partial(_, Error)` itself, one layer out. So `optional` is
     // always `false` on every dispatch path that reaches this function
-    // today, and `last(empty)?` (`null`) vs. `last(error("x"))?` (empty)
-    // stays correct entirely via that outer boundary, not anything here.
+    // today, and `last(error("x"))?` (empty) stays correct entirely via that
+    // outer boundary, not anything here.
     // #5377: a generator that makes its values runs as the `reduce` jq defines `last` by, which
     // holds one at a time.
     if let Some(fold) = crate::jq::last_as_reduce(inner) {
-        return eval_single::<S, V>(&fold, value, optional, cursor);
+        // The closing `.[]?` of the fold answers its one value as a collection of one.
+        return match eval_single::<S, V>(&fold, value, optional, cursor) {
+            GenericResult::ManyOwned(vs) => owned_vec_to_generic_result(vs),
+            other => other,
+        };
     }
     match eval_single::<S, V>(inner, value, optional, cursor) {
         GenericResult::One(v) => GenericResult::One(v),
         GenericResult::OneCursor(c) => GenericResult::OneCursor(c),
         GenericResult::Many(vs) => match vs.into_iter().next_back() {
             Some(v) => GenericResult::One(v),
-            None => GenericResult::Owned(OwnedValue::Null),
+            None => GenericResult::None,
         },
         GenericResult::ManyCursor(cs) => match cs.into_iter().next_back() {
             Some(c) => GenericResult::OneCursor(c),
-            None => GenericResult::Owned(OwnedValue::Null),
+            None => GenericResult::None,
         },
         GenericResult::Owned(v) => GenericResult::Owned(v),
         GenericResult::ManyOwned(vs) => match vs.into_iter().next_back() {
             Some(v) => GenericResult::Owned(v),
-            None => GenericResult::Owned(OwnedValue::Null),
+            None => GenericResult::None,
         },
         // `inner`'s stream has exactly one output (the whole `keys`/
         // `keys_unsorted` result) — forward it unchanged, same as
@@ -27756,10 +27760,9 @@ fn eval_first_or_last_generic<S: EvalSemantics, V: DocumentValue>(
         // materializes it, and any error surfaces there.
         GenericResult::LazySeq(seq) => GenericResult::LazySeq(seq),
         GenericResult::LazyObject(obj) => GenericResult::LazyObject(obj),
-        // jq's `last(f)` is `reduce f as $x (null; $x)`, which always
-        // produces exactly one output -- an empty operand answers the
-        // seed. `first` is deliberately not symmetric (#1521).
-        GenericResult::None => GenericResult::Owned(OwnedValue::Null),
+        // jq 1.8's `last(f)` yields nothing when `f` yields nothing, like
+        // `first(f)` (jqlang/jq#3179, #7518); 1.7.1 answered `null`.
+        GenericResult::None => GenericResult::None,
         GenericResult::Error(e) => GenericResult::Error(e),
         GenericResult::Break(label) => GenericResult::Break(label),
         GenericResult::Halt(code) => GenericResult::Halt(code),
@@ -33209,7 +33212,7 @@ enum PathNode<V: DocumentValue> {
     Absent,
     /// A value that is not a document node, standing at a position (spine
     /// 2416, walk residue): the array a slice built, a `catch` handler's
-    /// output, the `null` of a `last(empty)`. It is what lets the walk keep
+    /// output. It is what lets the walk keep
     /// going through a slice or a `getpath` head instead of refusing them --
     /// navigation inside it descends the owned value with the same component
     /// rules the owned identity pipe applies ([`owned_nav_children`]), and
@@ -35592,20 +35595,13 @@ fn path_context_step_generic<S: EvalSemantics, V: DocumentValue>(
             });
             path_context_count_walk_result::<S, V>(walk_error, flow, n, out, produced_from)
         }
-        // `last(body)` is jq 1.7.1's `reduce body as $x (null; $x)`: the
-        // last position, or `null` at this same position when there was
-        // none -- the answer `eval_owned_identity_stages` gives it.
+        // `last(body)` is the last position, or nothing when there was none
+        // (jq 1.8, jqlang/jq#3179, #7518) -- the answer
+        // `eval_owned_identity_stages` gives it.
         Expr::LastExpr(inner) => {
             let mut branch = Vec::new();
             path_context_step_generic::<S, V>(inner, pos, &mut branch)?;
-            match branch.pop() {
-                Some(last) => out.push(last),
-                None => out.push(PathContextPos {
-                    node: PathNode::Owned(Rc::new(OwnedValue::Null)),
-                    trail: pos.trail.clone(),
-                    at_key: false,
-                }),
-            }
+            out.extend(branch.pop());
             Ok(())
         }
         Expr::Builtin(Builtin::Empty) => Ok(()),
@@ -47788,9 +47784,9 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 tail,
             )
         }
-        // `last(body)` is jq 1.7.1's `reduce body as $x (null; $x)`: the
-        // last output, or `null` at this same position when there was none
-        // (`.a | last(empty) | key` is `"a"`, pinned since #1521).
+        // `last(body)` is the last output, or nothing when there was none
+        // (jq 1.8, jqlang/jq#3179, #7518: jq 1.7.1 answered `null` at this
+        // same position, `.a | last(empty) | key` was `"a"`).
         Expr::LastExpr(inner) => {
             let mut last: Option<(OwnedValue, OwnedIdentity<V>)> = None;
             let flow = eval_owned_identity_stages::<S, V>(
@@ -47806,7 +47802,9 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             if let Flow::Escaped(control) = flow {
                 return Flow::Escaped(control);
             }
-            let (v, vid) = last.unwrap_or((OwnedValue::Null, id));
+            let Some((v, vid)) = last else {
+                return Flow::Exhausted;
+            };
             eval_owned_identity_stages::<S, V>(rest, Cow::Owned(v), vid, optional, tail)
         }
         Expr::AsPattern {

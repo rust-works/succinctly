@@ -2,6 +2,8 @@
 //! and keys into the events instead of copying them. The events, their order, the closing events
 //! after the last child (a leaf, a container, an empty container) and the path arrays must be the
 //! ones jq's streaming parser emits. Every row was captured from jq 1.7.1 (`/usr/bin/jq`).
+//! Pin moved (#7523): a `--stream -s` row whose closing event jq 1.7.1 gave out after the array is jq
+//! 1.8.2's answer, with the event in the array.
 
 use anyhow::Result;
 
@@ -168,8 +170,7 @@ const ROWS: &[Row] = &[
     (
         &["--stream", "-c", "-s", "."],
         r"[1,2,3]",
-        r"[[[0],1],[[1],2],[[2],3]]
-[[2]]",
+        r"[[[0],1],[[1],2],[[2],3],[[2]]]",
         0,
     ),
     (
@@ -192,8 +193,7 @@ const ROWS: &[Row] = &[
     (
         &["--stream", "-c", "-s", "."],
         r#"{"a":1,"b":2}"#,
-        r#"[[["a"],1],[["b"],2]]
-[["b"]]"#,
+        r#"[[["a"],1],[["b"],2],[["b"]]]"#,
         0,
     ),
     (
@@ -216,8 +216,7 @@ const ROWS: &[Row] = &[
     (
         &["--stream", "-c", "-s", "."],
         r#"{"a":[1,2],"b":3}"#,
-        r#"[[["a",0],1],[["a",1],2],[["a",1]],[["b"],3]]
-[["b"]]"#,
+        r#"[[["a",0],1],[["a",1],2],[["a",1]],[["b"],3],[["b"]]]"#,
         0,
     ),
     (
@@ -378,8 +377,7 @@ const ROWS: &[Row] = &[
     (
         &["--stream", "-c", "-s", "."],
         r#"{"users":[{"id":1,"name":"x"},{"id":2,"name":"y"}],"n":2}"#,
-        r#"[[["users",0,"id"],1],[["users",0,"name"],"x"],[["users",0,"name"]],[["users",1,"id"],2],[["users",1,"name"],"y"],[["users",1,"name"]],[["users",1]],[["n"],2]]
-[["n"]]"#,
+        r#"[[["users",0,"id"],1],[["users",0,"name"],"x"],[["users",0,"name"]],[["users",1,"id"],2],[["users",1,"name"],"y"],[["users",1,"name"]],[["users",1]],[["n"],2],[["n"]]]"#,
         0,
     ),
     (
@@ -586,8 +584,7 @@ const ROWS: &[Row] = &[
     (
         &["--stream", "-c", "-s", "."],
         r#"1 [2,3] {"a":4}"#,
-        r#"[[[],1],[[0],2],[[1],3],[[1]],[["a"],4]]
-[["a"]]"#,
+        r#"[[[],1],[[0],2],[[1],3],[[1]],[["a"],4],[["a"]]]"#,
         0,
     ),
     (

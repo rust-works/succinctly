@@ -1254,14 +1254,7 @@ fn test_a_stream_read_under_null_input_matches_jq_5661() -> Result<()> {
             r"",
             0,
         ),
-        (
-            r"",
-            r"last(inputs)",
-            r"null
-",
-            r"",
-            0,
-        ),
+        (r"", r"last(inputs)", r"", r"", 0),
         (
             r"",
             r"isempty(inputs)",

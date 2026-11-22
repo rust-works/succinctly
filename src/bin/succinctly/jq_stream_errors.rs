@@ -1180,7 +1180,10 @@ pub(crate) enum Afterwards {
 ///
 /// Memory is the events and one entry per fault, as [`read_for_slurp`]'s is: the location of only
 /// the last [`SLURP_TAIL`] events is kept, since the inputs after the array are among them.
-pub(crate) fn read_for_deferred_slurp(sources: &[(Option<usize>, Vec<u8>)]) -> DeferredSlurp {
+pub(crate) fn read_for_deferred_slurp(
+    sources: &[(Option<usize>, Vec<u8>)],
+    closer_in_array: bool,
+) -> DeferredSlurp {
     let mut reader = Reader::new(sources);
     // Every event, and the faults with where they came in the sequence of inputs jq yielded.
     let mut events = Vec::new();
@@ -1220,12 +1223,31 @@ pub(crate) fn read_for_deferred_slurp(sources: &[(Option<usize>, Vec<u8>)]) -> D
         }
     }
     after.sort_by_key(|(at, _)| *at);
+    // jq 1.8 reads once more after the last byte before it closes the array (jqlang/jq#3279,
+    // #7523), so the closing event its parser still held at that point is in the array. jq 1.7.1
+    // gave it out after the array, as an input of its own. A run with a file that did not open keeps
+    // the 1.7.1 reads (`closer_in_array` is false), and so does one whose text ends in a fault.
+    if closer_in_array
+        && after.len() == 1
+        && matches!(after.first(), Some((_, Afterwards::Value(value, _))) if is_closing_event(value))
+    {
+        if let (_, Afterwards::Value(value, _)) = after.remove(0) {
+            events.push(value);
+        }
+    }
     DeferredSlurp {
         array: events,
         slurp_at: end.slurp_at,
         before,
         after: after.into_iter().map(|(_, item)| item).collect(),
     }
+}
+
+/// Whether `value` is a container's closing event, `[path]`: not a leaf (`[path, value]`) and not a
+/// fault (`[message, path]`).
+pub(crate) fn is_closing_event(value: &OwnedValue) -> bool {
+    matches!(value, OwnedValue::Array(parts)
+        if parts.len() == 1 && matches!(parts[0], OwnedValue::Array(_)))
 }
 
 /// What [`Parser::feed`] did with a refill.
@@ -3040,7 +3062,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, bytes)| (Some(i), bytes.to_vec()))
                 .collect();
-            read_for_deferred_slurp(&sources)
+            read_for_deferred_slurp(&sources, false)
         };
         let shape = |read: &DeferredSlurp| {
             let after: Vec<String> = read
@@ -3055,9 +3077,15 @@ mod tests {
         };
         // Nothing to read: an empty array.
         assert_eq!(shape(&read(&[b""])), (0, 0, vec![]));
-        // A clean stream is the array, and the close of the last container that jq's loop still
-        // held when it closed the array.
+        // A clean stream is the array, and the close of the last container that jq 1.7.1's loop
+        // still held when it closed the array.
         assert_eq!(shape(&read(&[b"1 [2]"])), (2, 0, vec!["value".to_string()]));
+        // jq 1.8 puts that close in the array (#7523), unless a file did not open.
+        let sources = vec![(Some(0), b"1 [2]".to_vec())];
+        assert_eq!(
+            shape(&read_for_deferred_slurp(&sources, true)),
+            (3, 0, vec![])
+        );
         // A fault in the middle comes before the array, which holds the events around it.
         assert_eq!(shape(&read(&[b"1 2 }\n3"])), (3, 1, vec![]));
         // Two faults are two calls before the array.
