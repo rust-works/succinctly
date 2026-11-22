@@ -139,6 +139,203 @@ fn literal(token: &[u8]) -> Result<Pending, Stop> {
     }
 }
 
+/// The offset of the first NUL byte in `hay` (#7437).
+///
+/// The one search for a NUL that [`blank_nul_number_tails`] and the CLI's reading routes make. A
+/// text with no NUL costs one unsigned `min` per vector of bytes (`util::simd::nul`).
+#[inline]
+pub fn find_nul(hay: &[u8]) -> Option<usize> {
+    crate::util::simd::nul::find_nul(hay)
+}
+
+/// What [`scan_utf8_and_nul`] finds of a text: whether it is UTF-8 (as
+/// [`validate_utf8`](crate::text::utf8::validate_utf8) answers) and whether it holds a NUL byte (as
+/// [`find_nul`] answers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextScan {
+    /// The text is UTF-8.
+    pub utf8: bool,
+    /// The text holds a NUL byte.
+    pub nul: bool,
+}
+
+/// The bytes [`scan_utf8_and_nul`] reads for their smallest and largest byte before it validates
+/// them: few enough to still be in the core's own cache when the validation reads them again.
+const SCAN_PIECE: usize = 128 * 1024;
+
+/// Validates `text` as UTF-8 and looks for a NUL byte in it, in one read of it from memory (#7437).
+///
+/// Every route that reads JSON input validates each text before anything else reads it, and the
+/// search for the NUL a number token may hold was a second pass over the same bytes: on a text
+/// bigger than the cache it read them from memory again (+1.8-3.1% wall clock on whole-file 100 MB
+/// rows on a Ryzen 9 7950X), and on an Apple M4 Pro even a search of each piece the validation had
+/// just read cost +1.5-2.6%. So each piece of the text is read once for its smallest and largest
+/// byte (`util::simd::nul::min_max`): the smallest is 0 where it holds a NUL, and
+/// a largest under 0x80 is ASCII, which is UTF-8 with no further check. Only a piece with a byte
+/// past 0x7F is validated, while it is still in the cache.
+///
+/// The pieces are cut before a byte that is not a continuation byte, so no character is cut: a
+/// UTF-8 text cut there is pieces that are each UTF-8, and a text that is not leaves a piece that is
+/// not (a sequence cut short ends the piece before it, and a stray continuation byte stays in one).
+/// So [`TextScan::utf8`] is the whole text's verdict.
+#[must_use]
+pub fn scan_utf8_and_nul(text: &[u8]) -> TextScan {
+    scan_utf8_and_nul_in(text, SCAN_PIECE)
+}
+
+/// [`scan_utf8_and_nul`] with pieces of about `piece` bytes.
+fn scan_utf8_and_nul_in(text: &[u8], piece: usize) -> TextScan {
+    let mut scan = TextScan {
+        utf8: true,
+        nul: false,
+    };
+    let mut at = 0;
+    while at < text.len() {
+        let mut end = (at + piece).min(text.len());
+        // On to the end of the character `end` is inside of, three bytes at most: a fourth
+        // continuation byte in a row is no character's, and the piece after it is not UTF-8.
+        let ceiling = (end + 3).min(text.len());
+        while end < ceiling && text[end] & 0xC0 == 0x80 {
+            end += 1;
+        }
+        let bytes = &text[at..end];
+        let (lo, hi) = crate::util::simd::nul::min_max(bytes);
+        // A piece of ASCII bytes is UTF-8: only one with a byte past 0x7F is validated.
+        if scan.utf8 && hi >= 0x80 {
+            scan.utf8 = crate::text::utf8::validate_utf8(bytes).is_ok();
+        }
+        scan.nul |= lo == 0;
+        if !scan.utf8 && scan.nul {
+            break;
+        }
+        at = end;
+    }
+    scan
+}
+
+/// Whether `byte` ends a bare token for jq's tokenizer (`classify` in `jv_parse.c`): whitespace,
+/// structure or a quote. Every other byte, a NUL included, is part of the token.
+fn ends_token(byte: u8) -> bool {
+    matches!(
+        byte,
+        b' ' | b'\t' | b'\r' | b'\n' | b'[' | b']' | b'{' | b'}' | b',' | b':' | b'"'
+    )
+}
+
+/// Where jq's tokenizer stands after `bytes` of one line, from `in_string` and `escaped` before
+/// them: inside a string (and right after a backslash there), and where in `bytes` the bare token
+/// being read starts, `0` when it started before them.
+fn token_state(bytes: &[u8], mut in_string: bool, mut escaped: bool) -> (bool, bool, usize) {
+    let mut token_start = 0;
+    for (at, &byte) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+                token_start = at + 1;
+            }
+        } else if ends_token(byte) {
+            in_string = byte == b'"';
+            token_start = at + 1;
+        }
+    }
+    (in_string, escaped, token_start)
+}
+
+/// Blanks to spaces what jq's number parser never reads of a number token that holds a NUL byte
+/// (#7437), and says whether it blanked anything.
+///
+/// jq's tokenizer reads a NUL into a bare token like any other byte, so `1`, a NUL and `abc` are
+/// one token, and `check_literal` hands the token to its number parser as a C string, which stops
+/// at the NUL: the token is the number `1` when what comes before the NUL is one jq accepts (the
+/// port of `check_literal` above). Anything else is left as it is: a token jq refuses (`-`, `1e`,
+/// `true`, a NUL at a token's start), and a NUL inside a string, which is a control character jq
+/// refuses. Blanking the tail keeps every offset, so a line, a column or a later fault is placed as
+/// jq places it.
+///
+/// `fgets_chunk` is jq's read of its input stream: a line is handed to the parser that many bytes
+/// at a time, and a read that ends without a newline only up to its first NUL (#5654), so a NUL in
+/// such a read and what follows it are never seen and nothing is blanked for it. `None` for a text
+/// jq parses whole by its length (`fromjson`). `lead` is how many bytes of the first line were read
+/// before `text` starts (a byte-order mark taken off it), so that line's reads fall where jq's do.
+/// `line_head` is the part of `text`'s first line that came before it, in an earlier file of the
+/// same stream: the string or token open at its end goes on in `text`. jq reads each file from its
+/// start, so the reads of `text` start at `text`, whatever `line_head` holds.
+///
+/// A JSON string holds no line break, so the scan for strings starts afresh at each line: a text
+/// where one does is refused by jq at that string whatever this does. Costs one search for a NUL
+/// on a text with none.
+pub fn blank_nul_number_tails(
+    text: &mut [u8],
+    fgets_chunk: Option<usize>,
+    lead: usize,
+    line_head: &[u8],
+) -> bool {
+    let mut changed = false;
+    let Some(first) = find_nul(text) else {
+        return false;
+    };
+    // The scan state, at `scanned`: inside a string (and after a backslash there), and where the
+    // bare token being read starts, which is in `line_head` (at `head_token`) when it is `0`.
+    let (mut in_string, mut escaped, head_token) = token_state(line_head, false, false);
+    let mut head = &line_head[head_token..];
+    let (mut scanned, mut token_start, mut line_start) = (0, 0, 0);
+    let mut nul = first;
+    loop {
+        // A line break since the scan stopped starts a new line, read from its start.
+        if let Some(last) = text[scanned..nul].iter().rposition(|&b| b == b'\n') {
+            line_start = scanned + last + 1;
+            (scanned, in_string, escaped, token_start, head) =
+                (line_start, false, false, line_start, &[]);
+        }
+        let (string, escape, start) = token_state(&text[scanned..nul], in_string, escaped);
+        if start > 0 || string != in_string {
+            token_start = scanned + start;
+            head = &[];
+        }
+        (in_string, escaped, scanned) = (string, escape, nul);
+        // A NUL in a string is a byte of the string: the search goes on after it.
+        let search = if in_string {
+            nul + 1
+        } else {
+            let token_end = text[nul..]
+                .iter()
+                .position(|&b| ends_token(b))
+                .map_or(text.len(), |at| nul + at);
+            let seen = fgets_chunk.map_or(true, |chunk| {
+                let lead = if line_start == 0 { lead } else { 0 };
+                let read_end = line_start + ((nul - line_start + lead) / chunk + 1) * chunk - lead;
+                text[nul..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .is_some_and(|at| nul + at < read_end)
+            });
+            // The first NUL of the token decides it: one later in it is part of the same tail.
+            let number = |token: &[u8]| !token.is_empty() && literal(token).is_ok();
+            let accepted = seen
+                && if head.is_empty() {
+                    number(&text[token_start..token_end])
+                } else {
+                    number(&[head, &text[token_start..token_end]].concat())
+                };
+            if accepted {
+                text[nul..token_end].fill(b' ');
+                changed = true;
+            }
+            // The token's bytes up to its end are bare bytes of the same token.
+            (scanned, token_start, head) = (token_end, token_end, &[]);
+            token_end.max(nul + 1)
+        };
+        match find_nul(&text[search..]) {
+            Some(found) => nul = search + found,
+            None => return changed,
+        }
+    }
+}
+
 fn hex4(digits: &[u8]) -> Option<u32> {
     if digits.len() < 4 || !digits[..4].iter().all(u8::is_ascii_hexdigit) {
         return None;
@@ -1246,5 +1443,173 @@ mod tests {
         // The parse-depth limit is a fault like any other.
         let deep = "[".repeat(JQ_MAX_PARSING_DEPTH + 1);
         assert_eq!(place(&["1", &deep]), Some((1, false)));
+    }
+
+    /// #7437: what [`blank_nul_number_tails`] makes of a text, `None` for one it leaves as it is.
+    fn blanked(text: &[u8], chunk: Option<usize>, lead: usize, head: &[u8]) -> Option<Vec<u8>> {
+        let mut text = text.to_vec();
+        blank_nul_number_tails(&mut text, chunk, lead, head).then_some(text)
+    }
+
+    /// What the scan must answer: the whole text's UTF-8 verdict and whether [`find_nul`] finds one.
+    fn scan_reference(text: &[u8]) -> TextScan {
+        TextScan {
+            utf8: core::str::from_utf8(text).is_ok(),
+            nul: find_nul(text).is_some(),
+        }
+    }
+
+    #[test]
+    fn the_scan_answers_as_a_validation_and_a_nul_search_of_the_whole_text_do_7437() {
+        // Characters of one to four bytes, so that pieces end inside each.
+        let chars: [&[u8]; 6] = [
+            b"a",
+            b"{\"k\":1}",
+            "\u{e9}".as_bytes(),
+            "\u{20ac}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            b" \n",
+        ];
+        let mut seed: u32 = 7437;
+        let mut next = move |n: usize| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 8) as usize % n
+        };
+        for round in 0..400 {
+            let mut text = Vec::new();
+            while text.len() < 40 + round % 60 {
+                text.extend_from_slice(chars[next(chars.len())]);
+            }
+            for piece in [1, 2, 3, 4, 5, 7, 16, 32, 64] {
+                assert_eq!(
+                    scan_utf8_and_nul_in(&text, piece),
+                    scan_reference(&text),
+                    "{text:?} piece {piece}"
+                );
+                // A NUL, and a byte that breaks the UTF-8, at every offset.
+                for at in 0..text.len() {
+                    for bad in [0x00, 0x80, 0xC3, 0xF0, 0xFF] {
+                        let mut one = text.clone();
+                        one[at] = bad;
+                        assert_eq!(
+                            scan_utf8_and_nul_in(&one, piece),
+                            scan_reference(&one),
+                            "{one:?} piece {piece}"
+                        );
+                    }
+                }
+            }
+        }
+        // The real piece size: a NUL either side of each boundary, and a four-byte character across
+        // it, both alone and with a fault after it.
+        let len = 3 * SCAN_PIECE + 64;
+        let plain: Vec<u8> = (0..len).map(|i| b"0123456789,[]{} \n"[i % 17]).collect();
+        assert_eq!(
+            scan_utf8_and_nul(&plain),
+            TextScan {
+                utf8: true,
+                nul: false
+            }
+        );
+        for boundary in [SCAN_PIECE, 2 * SCAN_PIECE, 3 * SCAN_PIECE] {
+            for at in boundary - 4..boundary + 4 {
+                let mut nul = plain.clone();
+                nul[at] = 0;
+                assert_eq!(
+                    scan_utf8_and_nul(&nul),
+                    TextScan {
+                        utf8: true,
+                        nul: true
+                    },
+                    "NUL at {at}"
+                );
+                let mut wide = plain.clone();
+                wide[at..at + 4].copy_from_slice("\u{1f600}".as_bytes());
+                assert_eq!(
+                    scan_utf8_and_nul(&wide),
+                    scan_reference(&wide),
+                    "character at {at}"
+                );
+                wide[len - 1] = 0xFF;
+                assert_eq!(
+                    scan_utf8_and_nul(&wide),
+                    TextScan {
+                        utf8: false,
+                        nul: false
+                    },
+                    "fault after {at}"
+                );
+            }
+        }
+        assert_eq!(
+            scan_utf8_and_nul(b""),
+            TextScan {
+                utf8: true,
+                nul: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_nul_tail_of_a_number_token_is_blanked_and_nothing_else_7437() {
+        let cases: &[(&[u8], Option<&[u8]>)] = &[
+            (b"[1\0x,2]\n", Some(b"[1  ,2]\n")),
+            (b"1\0\0\0\n", Some(b"1   \n")),
+            (b"{\"a\":12\0\"b\"}\n", Some(b"{\"a\":12 \"b\"}\n")),
+            (b"nan\0 1.5\0e3\n", Some(b"nan  1.5   \n")),
+            // Every NUL of a token after the first is part of the same tail.
+            (b"1\0a\0b 2\0\n", Some(b"1     2 \n")),
+            // Refused tokens, a NUL at a token's start and one in a string stay.
+            (b"[true\0,-\0,1e\0,\0,nu\0]\n", None),
+            (b"[\"1\0\",\"a\\\"1\0\"]\n", None),
+            // A string closed on the line before the NUL does not hide it.
+            (b"[\"a\\\\\",1\0]\n", Some(b"[\"a\\\\\",1 ]\n")),
+            // A line break ends a string jq would refuse, and the next line is read afresh.
+            (b"\"a\n1\0\n", Some(b"\"a\n1 \n")),
+            // No newline after the NUL in its read: jq never sees it.
+            (b"[1\0,2]", None),
+        ];
+        for (text, want) in cases {
+            assert_eq!(
+                blanked(text, Some(4095), 0, &[]).as_deref(),
+                *want,
+                "{text:?}"
+            );
+        }
+        // `fromjson` reads its text whole, newline or not.
+        assert_eq!(
+            blanked(b"[1\0,2]", None, 0, &[]).as_deref(),
+            Some(&b"[1 ,2]"[..])
+        );
+    }
+
+    #[test]
+    fn the_reads_of_a_line_decide_whether_a_nul_is_seen_7437() {
+        let line = |spaces: usize| [vec![b' '; spaces], b"1\0x\n".to_vec()].concat();
+        // The NUL at 4094 is in the first read, which ends without a newline; at 4095 it is in
+        // the second, which holds it.
+        assert_eq!(blanked(&line(4093), Some(4095), 0, &[]), None);
+        assert!(blanked(&line(4094), Some(4095), 0, &[]).is_some());
+        // A lead of three bytes read before the text moves the read boundary three bytes in.
+        assert!(blanked(&line(4091), Some(4095), 3, &[]).is_some());
+        assert_eq!(blanked(&line(4090), Some(4095), 3, &[]), None);
+        // The lead is the first line's only: a later line's reads start at its own start.
+        let second = [b"\n".to_vec(), line(4094)].concat();
+        assert!(blanked(&second, Some(4095), 3, &[]).is_some());
+    }
+
+    #[test]
+    fn a_token_or_string_open_in_the_line_head_goes_on_7437() {
+        // The token started in an earlier file: `1` there and `2`, a NUL, `x` here are `12`.
+        assert_eq!(
+            blanked(b"2\0x]\n", Some(4095), 0, b"[1").as_deref(),
+            Some(&b"2  ]\n"[..])
+        );
+        // `e` there and `5` here are `e5`, which jq refuses.
+        assert_eq!(blanked(b"5\0x]\n", Some(4095), 0, b"[e"), None);
+        // A string open there holds the NUL.
+        assert_eq!(blanked(b"1\0\"]\n", Some(4095), 0, b"[\"a"), None);
+        // One closed in the head does not.
+        assert!(blanked(b"1\0]\n", Some(4095), 0, b"[\"a\",").is_some());
     }
 }

@@ -433,6 +433,9 @@ pub(super) struct WindowedFile {
     blank_rs: bool,
     /// A read failed: the bytes read before it are run, and the error is returned after them.
     read_error: Option<io::Error>,
+    /// The bytes of the BOM taken off the front of the file, which jq's first read of its first line
+    /// holds (#7437).
+    front_lead: usize,
     /// The file's place in the stream it is one of (#7024).
     index: usize,
     /// Another file follows, so the open tail at this file's end is cut off and handed on.
@@ -532,6 +535,7 @@ impl WindowedFile {
             done: false,
             blank_rs: false,
             read_error: None,
+            front_lead: 0,
             index: place.index,
             hold_tail: place.hold_tail,
             seam_raw: place.seam.clone(),
@@ -1039,6 +1043,7 @@ impl WindowedFile {
             let bom = crate::cli::front_matter::leading_bom_len(&self.buf);
             if bom > 0 {
                 self.buf.drain(..bom);
+                self.front_lead = bom;
                 self.offset += bom;
                 // jq's first read holds the mark, so the reads of the first line start before the
                 // text (#7569).
@@ -1125,13 +1130,40 @@ impl WindowedFile {
             return;
         }
         let from = self.validated;
-        if succinctly::text::utf8::validate_utf8(&self.buf[from..end]).is_ok() {
+        let blanks_nul_tails = !self.blank_rs && self.seq_gate.is_none();
+        // #7437: the region is searched for a NUL as it is validated, while it is in the cache
+        // (`scan_utf8_and_nul`); a region with none is not read again for it.
+        let scan = if blanks_nul_tails {
+            succinctly::jq::scan_utf8_and_nul(&self.buf[from..end])
+        } else {
+            succinctly::jq::TextScan {
+                utf8: succinctly::text::utf8::validate_utf8(&self.buf[from..end]).is_ok(),
+                nul: false,
+            }
+        };
+        if scan.utf8 {
             self.validated = end;
         } else {
             self.substitute_region(end);
         }
         if self.blank_rs {
             blank_rs_bytes(&mut self.buf[from..self.validated]);
+        } else if blanks_nul_tails && scan.nul {
+            // #7437: a number token's NUL tail, as the whole-file route blanks it
+            // (`blank_nul_number_tails_in`): the region is whole lines, so its reads are jq's, and
+            // its first line is the file's first when no line has been dropped, behind the BOM.
+            // The substitution adds no NUL (it writes U+FFFD), so a region with none has none after it.
+            let lead = if from == 0 && self.lines_before == 0 {
+                self.front_lead
+            } else {
+                0
+            };
+            succinctly::jq::blank_nul_number_tails(
+                &mut self.buf[from..self.validated],
+                Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
+                lead,
+                &[],
+            );
         }
     }
 

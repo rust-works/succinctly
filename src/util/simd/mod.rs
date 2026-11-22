@@ -16,6 +16,9 @@ pub mod x86;
 /// Shared SIMD escape scanning (portable; SIMD kernels are gated internally).
 pub(crate) mod escape;
 
+/// The first NUL byte of a buffer, the search every JSON reading route makes per source (#7437).
+pub(crate) mod nul;
+
 /// 64-byte block classification of a JSON string's specials, for the
 /// canonical-echo gate's string scan (#3340).
 pub(crate) mod specials;
