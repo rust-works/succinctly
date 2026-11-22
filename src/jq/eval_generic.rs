@@ -26330,8 +26330,9 @@ fn binary_fanout_each_generic<V: DocumentValue, S: EvalSemantics>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     // #3296: decided once per operator, as in `eval::binary_fanout_each`;
-    // #4132 measured it, see docs/optimizations/jq-settled-operands.md.
-    if settles_both(left, right) {
+    // #4132 measured it, see docs/optimizations/jq-settled-operands.md. #7713: and calls that
+    // answer once, as there.
+    if crate::jq::eval::operands_settle::<S>(left, right) {
         binary_fanout_each_generic_with::<V, S>(
             settled_operand_strategy_generic(each_operand),
             left,
