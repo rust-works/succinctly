@@ -43640,12 +43640,13 @@ fn run_safe(stage: &Expr) -> bool {
 /// Whether a tail or a run of stateless stages is small enough to keep: no
 /// more than [`MAX_KEPT_TAIL_NODES`] nodes.
 fn may_keep_run(stages: &[Expr]) -> bool {
+    // Every occurrence counted, a called def's body at each call, as before #7786: counted once per
+    // shared node, so a chain of defs that each call the one below twice stays linear.
     let mut nodes = 0usize;
-    let small = !stages.iter().any(|stage| {
-        any_subexpr(stage, &mut |_| {
-            nodes += 1;
-            nodes > MAX_KEPT_TAIL_NODES
-        })
+    let small = stages.iter().all(|stage| {
+        let budget = MAX_KEPT_TAIL_NODES + 1 - nodes;
+        nodes += crate::jq::walk::count_subexpr(stage, &mut |_| true, budget);
+        nodes <= MAX_KEPT_TAIL_NODES
     });
     #[cfg(test)]
     if small {
@@ -60837,14 +60838,12 @@ fn source_destructures_only_foreign_nodes(source: &Expr, register: &OwnedValue) 
 /// reading states only for the ones [`update_entry_try_bodies`] names. A handler that emits nothing (`catch empty`)
 /// has no output to misplace.
 fn emitting_handler_count(expr: &Expr) -> usize {
-    let mut count = 0;
-    any_subexpr(expr, &mut |e| {
-        if matches!(e, Expr::Try { catch: Some(handler), .. } if !emits_nothing(handler)) {
-            count += 1;
-        }
-        false
-    });
-    count
+    // Every occurrence, a called def's body at each call (#7786: counted once per shared node).
+    crate::jq::walk::count_subexpr(
+        expr,
+        &mut |e| matches!(e, Expr::Try { catch: Some(handler), .. } if !emits_nothing(handler)),
+        usize::MAX,
+    )
 }
 
 /// Where [`nested_landing`] ends up.
