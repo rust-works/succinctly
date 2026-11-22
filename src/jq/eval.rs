@@ -37820,7 +37820,24 @@ fn build_regex_uncached<S: EvalSemantics>(
                     .as_deref()
                     .and_then(|written| build_fancy_regex_with::<S>(written, modes))
             });
-            if let Some(re) = built {
+            // #7670: under `n` a repeated group that can match empty keeps its last, empty
+            // iteration, as it does without the flag (#6069): the capture rewrite writes that
+            // iteration into the pattern, which the engine then searches in its not-empty mode.
+            // The pattern as written answers a search that exhausts the budget on the rewrite
+            // (#6488), and a pattern the rewrite leaves alone, or whose rewrite the engine refuses,
+            // is searched as written.
+            let rewritten = (modes.not_empty && !modes.longest)
+                .then(|| not_empty_capture_rewrite::<S>(&pattern, modes))
+                .flatten();
+            let engine = match (rewritten, built) {
+                (Some((re, groups)), as_written) => Some(RegexEngine::RewrittenFancy {
+                    re,
+                    groups,
+                    as_written: as_written.map(Box::new),
+                }),
+                (None, built) => built.map(RegexEngine::Fancy),
+            };
+            if let Some(engine) = engine {
                 // #6085: an `l` search with `\K` measures a match from where its attempt began.
                 // Under the `x` flag the closing parenthesis follows a newline, so that a `#`
                 // comment at the end of the pattern cannot swallow it; an inline `(?x)`, a switch
@@ -37837,7 +37854,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 })
                 .flatten();
                 return Ok(JqRegex {
-                    engine: RegexEngine::Fancy(re),
+                    engine,
                     needs_trailing_nl_check: false,
                     exact_end: None,
                     caret_end: None,
@@ -38471,6 +38488,32 @@ fn rewritten_engine<S: EvalSemantics>(
                 .then_some(RegexEngine::Rewritten { re, groups })
         })
     })
+}
+
+/// The capture rewrite of `pattern` (#6069) on `fancy-regex` with the search policy `modes` sets
+/// (`n`, #7670), or `None` when the rewrite leaves the pattern alone or the engine refuses it.
+///
+/// Not for a pattern the engine reads with an atomic group (a possessive quantifier, which jq's
+/// syntax reads after a lazy one, `(a)??+`): the rewrite reads the pattern with the `regex` crate's
+/// parser, which has none, and would write the repeat without it.
+#[cfg(feature = "regex")]
+fn not_empty_capture_rewrite<S: EvalSemantics>(
+    pattern: &str,
+    modes: FancyModes,
+) -> Option<(fancy_regex::Regex, super::onig_capture_loop::LoopRewrite)> {
+    let (expr, _) = parse_fancy_tree(prepare_fancy_pattern(pattern)?)?;
+    if expr.has_descendant_or_self(|e| matches!(e, fancy_regex::Expr::AtomicGroup(_))) {
+        return None;
+    }
+    let groups = super::onig_capture_loop::rewrite(pattern)?;
+    let re = build_fancy_regex_with::<S>(
+        &groups.pattern,
+        FancyModes {
+            rewritten: true,
+            ..modes
+        },
+    )?;
+    (re.captures_len() == groups.compiled_groups).then_some((re, groups))
 }
 
 /// The engine for `pattern` written by the loop rewrite with its groups copied (#6332), or `None`
@@ -149741,6 +149784,29 @@ mod tests {
             r"a\",
         ] {
             assert!(prepare_fancy_pattern(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    /// #7670: under `n` a loop whose body can match empty is read through the capture rewrite,
+    /// except where `fancy-regex` reads the pattern with an atomic group (a possessive quantifier).
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_not_empty_capture_rewrite_skips_an_atomic_reading_7670() {
+        let modes = FancyModes {
+            not_empty: true,
+            ..FancyModes::default()
+        };
+        for pattern in ["(a*)*", "(a?)+", "(?:(a?)+)?", "(?:(a)??)+"] {
+            assert!(
+                not_empty_capture_rewrite::<JqSemantics>(pattern, modes).is_some(),
+                "{pattern}"
+            );
+        }
+        for pattern in ["(a)??++", "(?:(a?)+)++", "a*", "(a)"] {
+            assert!(
+                not_empty_capture_rewrite::<JqSemantics>(pattern, modes).is_none(),
+                "{pattern}"
+            );
         }
     }
 

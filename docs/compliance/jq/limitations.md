@@ -8501,7 +8501,9 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   Oniguruma stops a loop after an iteration that matched nothing and keeps that iteration: `"a" | match("(a*)*")` has `[1,0,""]` for group 1, and `"bcba" | match("b(c|(|.))*")` is `"bc"`.
   The `regex` crate kept the last non-empty iteration (`[0,1,"a"]`) until such a loop was rewritten to end with its empty iteration (#6069, the entry below), and with a capture group it still matches `"bcba"` (#6106).
   Without the capture groups the match agrees: `"bcba" | match("b(?:c|(?:|.))*")` is `"bc"` in both since [#6106](#a-loop-ends-at-an-iteration-that-matches-nothing-6106), which leaves a body with a group as written.
-  `fancy-regex` reports the empty iteration as jq does for the captures, so `"a" | match("(a*)*";"n")` now agrees, but it backtracks out of an empty iteration to a longer match, so `"bcba" | match("b(c|(|.))*";"n")` is still `"bcba"`.
+  Under `n` the pattern goes to `fancy-regex`, which kept the last non-empty iteration of such a loop (`"a" | match("(a*)*";"n")` had the group at `[0,1]`); since [#7670](https://github.com/rust-works/succinctly/issues/7670) the capture rewrite of #6069 runs there too, and the group is at `[1,0]` as in jq, unless the engine reads the pattern with an atomic group (a possessive quantifier), which the rewrite cannot read.
+  A bounded repeat is not rewritten, so under `n` it still keeps the last non-empty iteration: `"a" | match("(a??){1,3}b?";"n")` has the group at `[1,0]` in jq and `[0,1]` here.
+  `fancy-regex` also backtracks out of an empty iteration to a longer match, so `"bcba" | match("b(c|(|.))*";"n")` is still `"bcba"`.
   A repeated group with an empty alternative and `n` is another shape: `"ab" | match("(((b)|(|a))){2}";"n")` is `"ab"` in jq, `"a"` here and `"b"` before.
   This predates `l` and `n`, which only move a pattern to the other route.
 - **A search can run out of budget where jq's optimizer does not.**
