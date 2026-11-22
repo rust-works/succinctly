@@ -46,6 +46,8 @@ use super::document::{
     DisplayKeyGuard, DocumentCursor, DocumentElements, DocumentFields,
 };
 use super::glob::yq_match_key;
+#[cfg(feature = "std")]
+use super::input_lines::LineHighs;
 use super::key_index;
 use super::local_zone::{self, LocalZone};
 use super::locale_time;
@@ -108434,7 +108436,7 @@ fn builtin_now<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'
 /// with no CLI driver to seed it anyway.
 #[cfg(feature = "std")]
 mod remaining_inputs {
-    use super::{EvalError, OwnedValue};
+    use super::{EvalError, LineHighs, OwnedValue};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
@@ -108444,15 +108446,18 @@ mod remaining_inputs {
     /// the *only* other place this same "no real position" concept exists
     /// (its own `UNKNOWN_LINE`, used to resolve the `(at ...)` error marker)
     /// -- shared here so both sides agree on one value instead of each
-    /// independently picking `u32::MAX` and hoping they never drift (#1549:
+    /// independently picking a sentinel and hoping they never drift (#1549:
     /// `input_line_number` used to read the raw sentinel straight off this
     /// queue with no idea it meant "unknown," reporting `4294967295` instead
     /// of real jq's own `0`).
-    pub const UNKNOWN_LINE: u32 = u32::MAX;
+    ///
+    /// 64 bits like every line here (#7472): jq counts lines in a `size_t`, so no real line
+    /// is `u64::MAX`.
+    pub const UNKNOWN_LINE: u64 = u64::MAX;
 
     /// A parse error among the queued documents: how many documents come
     /// before it, the error, and the `(source, line)` jq's marker names there.
-    type QueuedError = (usize, EvalError, (u32, u32));
+    type QueuedError = (usize, EvalError, (u32, u64));
 
     /// What the CLI's producer hands the queue at each read (#5498, #5661).
     pub use super::ProducedInput as Produced;
@@ -108464,15 +108469,18 @@ mod remaining_inputs {
         // `(document, source tag, 1-based end line)`. The source tag is opaque
         // here: the CLI assigns it and resolves it back to a file name itself,
         // so no string ever crosses this module's boundary (#1309).
+        // The line is its low 32 bits; `QUEUE_HIGHS` holds the high words by the document's
+        // index since the seed (#7472), which `POPPED` is for the one at the front.
         static QUEUE: RefCell<VecDeque<(OwnedValue, u32, u32)>> =
             const { RefCell::new(VecDeque::new()) };
+        static QUEUE_HIGHS: RefCell<LineHighs> = const { RefCell::new(LineHighs::new()) };
         // Where the documents come from when they are produced as they are read (#5498, #5661);
         // `None` when nothing is seeded that way or the producer has reported the end.
         static PRODUCER: RefCell<Option<Producer>> = const { RefCell::new(None) };
         // jq reports the *last successfully read* document's line, not the
         // next one still queued -- starts at 0 (matching real jq's own
         // `input_line_number` before anything has been read yet).
-        static LAST_LINE: Cell<u32> = const { Cell::new(0) };
+        static LAST_LINE: Cell<u64> = const { Cell::new(0) };
         // Whether a CLI driver has seeded at all on this thread. Distinct from
         // "the queue is non-empty": it stays true once the queue drains, and
         // it is false in every embedding that never seeds (yq mode, library
@@ -108480,12 +108488,12 @@ mod remaining_inputs {
         static SEEDED: Cell<bool> = const { Cell::new(false) };
         // Where jq's `(at <file>:<line>)` marker points right now, or `None`
         // before any read has been *attempted* -- jq's `<unknown>` (#1309).
-        static CURRENT: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+        static CURRENT: Cell<Option<(u32, u64)>> = const { Cell::new(None) };
         // Where the marker settles once the queue runs dry, or `None` for
         // jq's `<unknown>`. Supplied by the CLI because only it knows the file
         // list and whether the whole input was slurped into one value; see
         // `seed`.
-        static EXHAUSTED: Cell<Option<(u32, u32)>> = const { Cell::new(None) };
+        static EXHAUSTED: Cell<Option<(u32, u64)>> = const { Cell::new(None) };
         // The parse errors in the input stream, in order, each with how many
         // documents come before it and where jq's marker names once its
         // parser stopped there -- each delivered by exactly one pop, once
@@ -108614,16 +108622,21 @@ mod remaining_inputs {
     ///
     /// `errors` are `(documents before it, error, marker)`, in order of the
     /// first field.
+    ///
+    /// Each document's line is its low 32 bits, and `highs` the high words by
+    /// the document's index (#7472).
     pub fn seed(
         documents: Vec<(OwnedValue, u32, u32)>,
-        exhausted: Option<(u32, u32)>,
-        errors: Vec<(usize, EvalError, (u32, u32))>,
+        highs: LineHighs,
+        exhausted: Option<(u32, u64)>,
+        errors: Vec<(usize, EvalError, (u32, u64))>,
     ) {
         debug_assert!(errors.windows(2).all(|w| w[0].0 <= w[1].0));
         debug_assert!(errors.iter().all(|e| e.0 <= documents.len()));
         QUEUE.with(|q| {
             *q.borrow_mut() = documents.into();
         });
+        QUEUE_HIGHS.with(|h| *h.borrow_mut() = highs);
         PRODUCER.with(|p| *p.borrow_mut() = None);
         ERRORS.with(|e| *e.borrow_mut() = errors.into());
         POPPED.with(|p| p.set(0));
@@ -108644,6 +108657,7 @@ mod remaining_inputs {
     /// ([`Produced::End`]), so `EXHAUSTED` is unset until then.
     pub fn seed_producer(producer: Producer) {
         QUEUE.with(|q| q.borrow_mut().clear());
+        QUEUE_HIGHS.with(|h| *h.borrow_mut() = LineHighs::new());
         PRODUCER.with(|p| *p.borrow_mut() = Some(producer));
         ERRORS.with(|e| e.borrow_mut().clear());
         POPPED.with(|p| p.set(0));
@@ -108754,7 +108768,8 @@ mod remaining_inputs {
             return pop;
         }
         let popped = QUEUE.with(|q| q.borrow_mut().pop_front());
-        if let Some((doc, src, line)) = popped {
+        if let Some((doc, src, low)) = popped {
+            let line = QUEUE_HIGHS.with(|h| h.borrow().join(popped_so_far, low));
             POPPED.with(|p| p.set(popped_so_far + 1));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
@@ -108795,7 +108810,7 @@ mod remaining_inputs {
 
     /// The `(source, line)` jq's `(at ...)` marker names right now, or `None`
     /// before any read has been attempted.
-    pub fn current_location() -> Option<(u32, u32)> {
+    pub fn current_location() -> Option<(u32, u64)> {
         CURRENT.with(Cell::get)
     }
 
@@ -108807,7 +108822,7 @@ mod remaining_inputs {
     /// This is `last_line`'s only caller crate-wide, so folding the check in
     /// here costs nothing and makes "unknown" a type-level fact instead of a
     /// convention.
-    pub fn last_line() -> Option<u32> {
+    pub fn last_line() -> Option<u64> {
         match LAST_LINE.with(Cell::get) {
             UNKNOWN_LINE => None,
             line => Some(line),
@@ -109033,17 +109048,18 @@ pub mod cli_context {
 /// maps it back to `0` at read time instead of exposing the raw sentinel.
 /// Shared here so the CLI's own line-resolution logic (which independently
 /// needs the same "no position" concept for its `(at ...)` error marker)
-/// can reference one value instead of each side picking `u32::MAX` on its
+/// can reference one value instead of each side picking a sentinel on its
 /// own and hoping they never drift apart.
 #[cfg(feature = "std")]
-pub const UNKNOWN_INPUT_LINE: u32 = remaining_inputs::UNKNOWN_LINE;
+pub const UNKNOWN_INPUT_LINE: u64 = remaining_inputs::UNKNOWN_LINE;
 
 /// Seeds the `input`/`inputs`/`input_line_number` queue (#723).
 ///
 /// The CLI driver's own entry point into the (private) `remaining_inputs`
 /// module, called once before evaluating any filter.
 ///
-/// `documents` is `(value, source tag, 1-based end line)` in input order, and
+/// `documents` is `(value, source tag, 1-based end line)` in input order (a line below 2^32:
+/// [`seed_remaining_inputs_with_line_highs`] takes the high words of longer streams, #7472), and
 /// `exhausted` is the `(source, line)` [`current_input_location`] settles on
 /// once they run out, or `None` for jq's `<unknown>`. The source tag is opaque
 /// to this crate: the CLI assigns it and resolves it back to a file name
@@ -109051,9 +109067,9 @@ pub const UNKNOWN_INPUT_LINE: u32 = remaining_inputs::UNKNOWN_LINE;
 #[cfg(feature = "std")]
 pub fn seed_remaining_inputs(
     documents: Vec<(OwnedValue, u32, u32)>,
-    exhausted: Option<(u32, u32)>,
+    exhausted: Option<(u32, u64)>,
 ) {
-    remaining_inputs::seed(documents, exhausted, Vec::new());
+    remaining_inputs::seed(documents, LineHighs::new(), exhausted, Vec::new());
 }
 
 /// [`seed_remaining_inputs`] for an input stream that ended in a parse error
@@ -109067,15 +109083,15 @@ pub fn seed_remaining_inputs(
 #[cfg(feature = "std")]
 pub fn seed_remaining_inputs_with_error(
     documents: Vec<(OwnedValue, u32, u32)>,
-    exhausted: Option<(u32, u32)>,
-    trailing_error: Option<(EvalError, (u32, u32))>,
+    exhausted: Option<(u32, u64)>,
+    trailing_error: Option<(EvalError, (u32, u64))>,
 ) {
     let before = documents.len();
     let errors = trailing_error
         .into_iter()
         .map(|(error, at)| (before, error, at))
         .collect();
-    remaining_inputs::seed(documents, exhausted, errors);
+    remaining_inputs::seed(documents, LineHighs::new(), exhausted, errors);
 }
 
 /// [`seed_remaining_inputs`] for an input stream with parse errors among its
@@ -109089,36 +109105,51 @@ pub fn seed_remaining_inputs_with_error(
 #[cfg(feature = "std")]
 pub fn seed_remaining_inputs_with_errors(
     documents: Vec<(OwnedValue, u32, u32)>,
-    exhausted: Option<(u32, u32)>,
-    errors: Vec<(usize, EvalError, (u32, u32))>,
+    exhausted: Option<(u32, u64)>,
+    errors: Vec<(usize, EvalError, (u32, u64))>,
 ) {
-    remaining_inputs::seed(documents, exhausted, errors);
+    remaining_inputs::seed(documents, LineHighs::new(), exhausted, errors);
+}
+
+/// [`seed_remaining_inputs_with_errors`] for documents whose lines may reach past 2^32 (#7472).
+///
+/// Each document carries its line's low 32 bits, and `highs` the high words by the document's
+/// index, as a [`LineTable`](super::LineTable) keeps them. The other seeds take lines below 2^32.
+#[cfg(feature = "std")]
+pub fn seed_remaining_inputs_with_line_highs(
+    documents: Vec<(OwnedValue, u32, u32)>,
+    highs: LineHighs,
+    exhausted: Option<(u32, u64)>,
+    errors: Vec<(usize, EvalError, (u32, u64))>,
+) {
+    remaining_inputs::seed(documents, highs, exhausted, errors);
 }
 
 /// One item an [`InputProducer`] hands the `input` queue when a read asks for it (#5498, #5661).
 ///
 /// Source tags and lines are what [`seed_remaining_inputs`] documents carry: an opaque source tag
-/// the CLI resolves itself, and a 1-based line.
+/// the CLI resolves itself, and a 1-based line, here in full 64 bits (#7472: jq does not wrap at
+/// 2^32 lines).
 #[cfg(feature = "std")]
 #[derive(Debug)]
 pub enum ProducedInput {
     /// The next document, with its source tag and the line jq's reader had reached when it
     /// finished it.
-    Document(OwnedValue, u32, u32),
+    Document(OwnedValue, u32, u64),
     /// A parse error, raised by the read as an ordinary catchable error, with the
     /// `(source, line)` jq's marker names there. Items may follow it: jq resumes reading after a
     /// parse error that `input` raises (#4311).
-    Error(EvalError, (u32, u32)),
+    Error(EvalError, (u32, u64)),
     /// Nothing is left. Carries the `(source, line)` [`current_input_location`] settles on once
     /// the stream is exhausted, or `None` for jq's `<unknown>`. The producer is dropped and not
     /// asked again.
-    End(Option<(u32, u32)>),
+    End(Option<(u32, u64)>),
 }
 
 #[cfg(feature = "std")]
 impl ProducedInput {
     /// A document, or the parse error converting it met, at `(source, line)`.
-    pub fn converted(converted: Result<OwnedValue, EvalError>, source: u32, line: u32) -> Self {
+    pub fn converted(converted: Result<OwnedValue, EvalError>, source: u32, line: u64) -> Self {
         match converted {
             Ok(document) => Self::Document(document, source, line),
             Err(error) => Self::Error(error, (source, line)),
@@ -109235,7 +109266,7 @@ pub fn pop_remaining_input() -> Option<OwnedValue> {
 /// `jq '[inputs] | .[0] | error("boom")' a b c` reports **c**, even though
 /// `.[0]` came from **b**.
 #[cfg(feature = "std")]
-pub fn current_input_location() -> Option<(u32, u32)> {
+pub fn current_input_location() -> Option<(u32, u64)> {
     remaining_inputs::current_location()
 }
 
@@ -132725,7 +132756,7 @@ mod tests {
                 return ProducedInput::End(Some((0, 4)));
             }
             counter.set(counter.get() + 1);
-            let line = index as u32 + 1;
+            let line = index as u64 + 1;
             let result = if index == 2 {
                 Err(EvalError::new("cannot convert"))
             } else {
@@ -132826,6 +132857,80 @@ mod tests {
             assert_eq!(remaining_inputs::last_line(), Some(0));
         }
         assert_eq!(pulls.get(), 4);
+    }
+
+    /// #7472: jq counts input lines in a `size_t`, so `input_line_number` and the marker go on
+    /// past 2^32 (jq 1.7.1 and 1.8.2 print `4294967302` for a value on that line). The queue keeps
+    /// each document's line as its low word and the high words as a run table, and hands the whole
+    /// line back; a produced line is 64 bits as it is.
+    #[cfg(feature = "std")]
+    #[test]
+    fn lines_past_two_to_the_32_read_back_whole_7472() {
+        use crate::jq::eval_generic::eval_using;
+        use crate::jq::LineTable;
+
+        let line_number = |input: &str| -> String {
+            let expr = crate::jq::parse(&format!("{input} | input_line_number")).unwrap();
+            let json = b"null";
+            let index = crate::json::JsonIndex::build(json);
+            let result = eval_using::<JqSemantics, _>(&expr, index.root(json).value());
+            let outputs = result.collect_owned::<JqSemantics>().unwrap();
+            outputs
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let two_32: u64 = 1 << 32;
+        let lines = [
+            (0, two_32 - 2),
+            (0, two_32 - 1),
+            (0, two_32),
+            (1, 3),
+            (1, two_32 + 6),
+        ];
+        let table: LineTable = lines.iter().copied().collect();
+        let documents = table
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(index, &(source, low))| (OwnedValue::Int(index as i64), source, low))
+            .collect();
+        seed_remaining_inputs_with_line_highs(
+            documents,
+            table.highs().clone(),
+            Some((1, two_32 + 7)),
+            vec![(5, EvalError::new("bad"), (1, two_32 + 8))],
+        );
+        count_reads_past_end();
+        for (index, &(source, line)) in lines.iter().enumerate() {
+            assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(index as i64)));
+            assert_eq!(current_input_location(), Some((source, line)));
+            assert_eq!(remaining_inputs::last_line(), Some(line));
+        }
+        assert_eq!(line_number("."), "4294967302");
+        assert!(matches!(pop_input(), InputPop::ParseError(e) if e.message == "bad"));
+        assert_eq!(current_input_location(), Some((1, two_32 + 8)));
+        assert_eq!(line_number("."), "4294967304");
+        assert!(matches!(pop_input(), InputPop::Exhausted));
+        assert_eq!(current_input_location(), Some((1, two_32 + 7)));
+        assert_eq!(line_number("."), "4294967303");
+        // `u32::MAX` itself is a line, not the "no position" sentinel.
+        seed_remaining_inputs(vec![(OwnedValue::Int(1), 0, u32::MAX)], None);
+        assert_eq!(line_number("input"), "4294967295");
+        assert_eq!(current_input_location(), Some((0, u64::from(u32::MAX))));
+        // A produced line is whole.
+        let mut items = vec![ProducedInput::converted(
+            Ok(OwnedValue::Int(1)),
+            0,
+            3 * two_32 + 1,
+        )]
+        .into_iter();
+        seed_remaining_inputs_from(Box::new(move || {
+            items.next().unwrap_or(ProducedInput::End(None))
+        }));
+        assert_eq!(line_number("input"), "12884901889");
+        seed_remaining_inputs(Vec::new(), None);
     }
 
     /// #5498: a producer that reports `End(None)` leaves jq's `<unknown>` marker, and without

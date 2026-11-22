@@ -6803,7 +6803,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             } else if let Some(lazy) = LAZY_STREAM_INPUTS.with(|slot| slot.borrow_mut().take()) {
                 // #5498: `--stream` and `--stream-errors` read as the program asks. The end of the
                 // stream is settled when the reader reaches it.
-                debug_assert_eq!(locations.per_value(), &[]);
+                debug_assert!(locations.per_value().is_empty());
                 // #6480: the reader settles its own end at the last file that opened, which a
                 // missing last file does not move yet.
                 jq::seed_remaining_inputs_from(end_producer_at(
@@ -7571,7 +7571,7 @@ fn no_program_is_a_usage_error(
 struct TrailingParseError {
     error: EvalError,
     source: u32,
-    line: u32,
+    line: u64,
     /// A `--seq -s` warning jq raises only on the `next_input` call after
     /// the slurped array (#3201): the driver prints it as an ignored parse
     /// error, not an uncaught one, and it never costs exit 5. `input`/
@@ -7624,7 +7624,7 @@ fn get_inputs(
 
 /// `producer`, with the end it finds replaced by the unopened last file's (#6480): a lazy route
 /// settles its end from the last file that opened.
-fn end_producer_at(end: Option<(u32, u32)>, mut producer: jq::InputProducer) -> jq::InputProducer {
+fn end_producer_at(end: Option<(u32, u64)>, mut producer: jq::InputProducer) -> jq::InputProducer {
     match end {
         None => producer,
         Some(end) => Box::new(move || match producer() {
@@ -7639,8 +7639,8 @@ fn end_producer_at(end: Option<(u32, u32)>, mut producer: jq::InputProducer) -> 
 /// parse error at `fault_end`, a fault at the end of the text. It reads one item ahead to know an
 /// item is the last.
 fn last_item_at(
-    document_end: Option<(u32, u32)>,
-    fault_end: Option<(u32, u32)>,
+    document_end: Option<(u32, u64)>,
+    fault_end: Option<(u32, u64)>,
     mut producer: jq::InputProducer,
 ) -> jq::InputProducer {
     if document_end.is_none() && fault_end.is_none() {
@@ -8583,7 +8583,7 @@ fn read_inputs(
         }
         if track_eof && !args.slurp {
             locations.eof_tail = Some(EofTail {
-                newlines: u32::try_from(read.open_at_end.unwrap_or(0)).unwrap_or(u32::MAX),
+                newlines: read.open_at_end.unwrap_or(0) as u64,
                 unknown: read.open_at_end.is_none(),
             });
         }
@@ -8649,7 +8649,7 @@ fn read_inputs(
                     TrailingParseError {
                         error: EvalError::new(fault.message),
                         source: u32::try_from(source).unwrap_or(u32::MAX),
-                        line: u32::try_from(line).unwrap_or(u32::MAX),
+                        line: line as u64,
                         seq_warning: false,
                         as_parse_error: false,
                     },
@@ -8698,9 +8698,7 @@ fn read_inputs(
                     source: at_tail.map_or(NO_SOURCE, |(source, _)| {
                         u32::try_from(source).unwrap_or(u32::MAX)
                     }),
-                    line: at_tail.map_or(UNKNOWN_LINE, |(_, line)| {
-                        u32::try_from(line).unwrap_or(u32::MAX)
-                    }),
+                    line: at_tail.map_or(UNKNOWN_LINE, |(_, line)| line as u64),
                     seq_warning: true,
                     as_parse_error: false,
                 });
@@ -8783,7 +8781,7 @@ fn read_inputs(
                 let trailing = TrailingParseError {
                     error: EvalError::new(yielded.error.unwrap_or_default()),
                     source: u32::try_from(source).unwrap_or(u32::MAX),
-                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                    line: line as u64,
                     seq_warning: false,
                     as_parse_error: true,
                 };
@@ -8821,7 +8819,7 @@ fn read_inputs(
                 TrailingParseError {
                     error: EvalError::new(message),
                     source: u32::try_from(source).unwrap_or(u32::MAX),
-                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                    line: line as u64,
                     seq_warning: false,
                     as_parse_error: false,
                 }
@@ -8904,7 +8902,7 @@ fn read_inputs(
                                 trailing_error = Some(TrailingParseError {
                                     error: EvalError::new(message),
                                     source: u32::try_from(source).unwrap_or(u32::MAX),
-                                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                                    line: line as u64,
                                     seq_warning: false,
                                     as_parse_error: true,
                                 });
@@ -9002,7 +9000,7 @@ fn read_inputs(
         }
         if track_eof && !args.slurp {
             locations.eof_tail = Some(EofTail {
-                newlines: u32::try_from(read.open_at_end.unwrap_or(0)).unwrap_or(u32::MAX),
+                newlines: read.open_at_end.unwrap_or(0) as u64,
                 unknown: read.open_at_end.is_none(),
             });
         }
@@ -9688,7 +9686,7 @@ fn read_inputs(
                         line: if slurp_keeps_prefix {
                             UNKNOWN_LINE
                         } else {
-                            u32::try_from(error_line).unwrap_or(u32::MAX)
+                            error_line as u64
                         },
                         seq_warning: false,
                         as_parse_error: false,
@@ -9853,7 +9851,7 @@ fn seq_fault_errors_of(
                     line: if fault.position_lost {
                         UNKNOWN_LINE
                     } else {
-                        u32::try_from(fault.line).unwrap_or(u32::MAX)
+                        fault.line as u64
                     },
                     seq_warning: false,
                     as_parse_error: false,
@@ -10080,7 +10078,8 @@ fn content_lines(raw: &str) -> usize {
 /// `--seq` trailing record real jq itself never resolves). Never a real
 /// line number: every genuine line comes from an actual newline count or
 /// 1-based line index, bounded by the input's own byte length, and no real
-/// input has close to `u32::MAX` lines. [`InputLocations::resolve`] checks
+/// input has close to `u64::MAX` lines (#7472: a 4 GiB file of newlines does
+/// have `u32::MAX` of them, so lines are 64 bits). [`InputLocations::resolve`] checks
 /// for it once, centrally, so every consumer of a `(source, line)` pair --
 /// [`get`](InputLocations::get)'s direct lookup *and* the shared
 /// `input`/`inputs` queue's `#1309` `ErrorAt::Live` path, which reads
@@ -10089,13 +10088,35 @@ fn content_lines(raw: &str) -> usize {
 /// checking a side flag `resolve` itself didn't know about.
 ///
 /// Value comes from the library crate's own `jq::UNKNOWN_INPUT_LINE` (#1549)
-/// rather than an independently-picked `u32::MAX` here: this same raw value
+/// rather than an independently-picked sentinel here: this same raw value
 /// also crosses into the shared `input`/`inputs`/`input_line_number` queue
 /// (`seed_remaining_inputs`, below), so `builtin_input_line_number` needs to
 /// recognize the exact sentinel this side emits -- previously it didn't,
 /// and reported the raw `u32::MAX` (`4294967295`) instead of real jq's own
 /// `0` for a dropped trailing `--seq -s` record.
-const UNKNOWN_LINE: u32 = jq::UNKNOWN_INPUT_LINE;
+const UNKNOWN_LINE: u64 = jq::UNKNOWN_INPUT_LINE;
+
+#[cfg(test)]
+std::thread_local! {
+    /// #7472: line breaks every source's line count starts after, for a test that counts from just
+    /// below 2^32 without a 4 GiB input. Only the counters of a source read whole take it (not a
+    /// window's carried count). 0 unless a test sets it.
+    pub(crate) static TEST_LINE_SEED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The line breaks a source's line count starts after: 0, but in a test that sets
+/// [`TEST_LINE_SEED`] (#7472).
+#[inline(always)]
+pub(crate) fn line_seed() -> usize {
+    #[cfg(test)]
+    {
+        TEST_LINE_SEED.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
+}
 
 /// A source tag no input has: once jq has closed its stream it names no file,
 /// so `input_filename` answers `null` after reading a location tagged with it
@@ -10115,8 +10136,9 @@ pub struct InputLocations {
     /// `(source index, 1-based line)` per value. Empty means there is no input
     /// to point at (`-n`), which jq renders as `<unknown>`. A line of
     /// [`UNKNOWN_LINE`] means the same thing for one specific value within
-    /// an otherwise-populated table (#1542).
-    per_value: Vec<(u32, u32)>,
+    /// an otherwise-populated table (#1542). 8 bytes per value, and a run per
+    /// 2^32 lines past 2^32 (#7472).
+    per_value: jq::LineTable,
     /// How the input stream ends, for [`exhausted`](Self::exhausted) (#4303);
     /// `None` where it was not recorded, which keeps the per-value fallback.
     eof_tail: Option<EofTail>,
@@ -10153,8 +10175,8 @@ pub struct InputLocations {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EofTail {
-    /// Newlines in the last source.
-    newlines: u32,
+    /// Newlines in the last source (64 bits, as jq counts them: #7472).
+    newlines: u64,
     /// Whether the read that reached the end of input completed a value.
     unknown: bool,
 }
@@ -10186,9 +10208,10 @@ impl EofTail {
                 .map_or(0, |seam| seam.base)
                 .min(sources[last].len())
         });
-        let newlines = sources
-            .last()
-            .map_or(0, |last| count_newlines(&last[base..]));
+        let newlines = line_seed()
+            + sources
+                .last()
+                .map_or(0, |last| count_newlines(&last[base..]));
         let unknown = if raw {
             Self::raw_line_ends_at_eof(sources)
         } else {
@@ -10199,7 +10222,7 @@ impl EofTail {
             )
         };
         Self {
-            newlines: newlines as u32,
+            newlines: newlines as u64,
             unknown,
         }
     }
@@ -10314,7 +10337,7 @@ impl EofTail {
         let unknown =
             last.is_some_and(|(first, end)| Self::completes_at_byte(first, end) >= final_read);
         Self {
-            newlines: count_newlines(&bytes[base..]) as u32,
+            newlines: (line_seed() + count_newlines(&bytes[base..])) as u64,
             unknown,
         }
     }
@@ -10361,7 +10384,7 @@ fn seq_eof_tail(sources: &[(Option<usize>, Vec<u8>)], ranges: &[(usize, usize)])
         0
     };
     EofTail {
-        newlines: u32::try_from(count_newlines(last) + base).unwrap_or(u32::MAX),
+        newlines: (count_newlines(last) + base) as u64,
         unknown,
     }
 }
@@ -10370,7 +10393,7 @@ impl InputLocations {
     fn new(files: Vec<Option<String>>) -> Self {
         Self {
             files,
-            per_value: Vec::new(),
+            per_value: jq::LineTable::new(),
             eof_tail: None,
             unopened_tail: false,
             last_value_at_tail: false,
@@ -10389,19 +10412,19 @@ impl InputLocations {
     /// Where every read past the end leaves jq's position when the last file named did not open
     /// (#6480): at that file, line 0, however many reads go past it, and whatever a producer
     /// found at the end of the last file that did open.
-    fn unopened_end(&self) -> Option<(u32, u32)> {
+    fn unopened_end(&self) -> Option<(u32, u64)> {
         self.unopened_tail.then(|| (self.last_src(), 0))
     }
 
     /// Where the last value is read when it completes only at the end of the input, whose last
     /// file did not open (#6480): [`unopened_end`](Self::unopened_end).
-    fn last_value_end(&self) -> Option<(u32, u32)> {
+    fn last_value_end(&self) -> Option<(u32, u64)> {
         self.unopened_end().filter(|_| self.last_value_at_tail)
     }
 
     /// Where a fault at the end of the text is raised when the last file did not open (#6480):
     /// [`unopened_end`](Self::unopened_end).
-    fn fault_end(&self) -> Option<(u32, u32)> {
+    fn fault_end(&self) -> Option<(u32, u64)> {
         self.unopened_end().filter(|_| self.fault_at_tail)
     }
 
@@ -10444,12 +10467,22 @@ impl InputLocations {
 
     fn single(at: InputLocation) -> Self {
         let mut locations = Self::new(vec![at.file.clone()]);
-        locations.push(0, at.line.unwrap_or(UNKNOWN_LINE as usize));
+        match at.line {
+            Some(line) => locations.push(0, line),
+            None => locations.per_value.push(0, UNKNOWN_LINE),
+        }
         locations
     }
 
+    /// Appends the location of the next value. A `line` of `usize::MAX` is [`UNKNOWN_LINE`]
+    /// carried through a `usize` (`UNKNOWN_LINE as usize`), on any width of `usize`.
     fn push(&mut self, src: usize, line: usize) {
-        self.per_value.push((src as u32, line as u32));
+        let line = if line == usize::MAX {
+            UNKNOWN_LINE
+        } else {
+            line as u64
+        };
+        self.per_value.push(src as u32, line);
     }
 
     fn len(&self) -> usize {
@@ -10512,7 +10545,7 @@ impl InputLocations {
     /// Location of the value at `idx`.
     pub fn get(&self, idx: usize) -> InputLocation {
         match self.per_value.get(idx) {
-            Some(&(src, line)) => self.resolve(src, line),
+            Some((src, line)) => self.resolve(src, line),
             None => InputLocation::unknown(),
         }
     }
@@ -10528,7 +10561,7 @@ impl InputLocations {
         &self.files
     }
 
-    fn per_value(&self) -> &[(u32, u32)] {
+    fn per_value(&self) -> &jq::LineTable {
         &self.per_value
     }
 
@@ -10541,13 +10574,13 @@ impl InputLocations {
     /// `get`/`resolve` already treat as "no real position" the way #1549
     /// found `input_line_number` had.
     fn source_at(&self, idx: usize) -> Option<u32> {
-        let &(src, line) = self.per_value.get(idx)?;
+        let (src, line) = self.per_value.get(idx)?;
         (line != UNKNOWN_LINE).then_some(src)
     }
 
     /// Turn a raw `(source, line)` -- as handed back by
     /// `jq::current_input_location` -- into a printable location.
-    fn resolve(&self, src: u32, line: u32) -> InputLocation {
+    fn resolve(&self, src: u32, line: u64) -> InputLocation {
         if line == UNKNOWN_LINE {
             return InputLocation::unknown();
         }
@@ -10600,7 +10633,7 @@ impl InputLocations {
     /// jq -R -s '., input' < two-lines    => <unknown>
     /// jq -s 'error("x")'  a.json b.json  => b.json:1    (unchanged)
     /// ```
-    fn exhausted(&self, slurping: bool) -> Option<(u32, u32)> {
+    fn exhausted(&self, slurping: bool) -> Option<(u32, u64)> {
         let last_src = self.last_src();
         if self.unopened_tail {
             return Some((last_src, 0));
@@ -10615,7 +10648,7 @@ impl InputLocations {
             return (!tail.unknown).then_some((last_src, tail.newlines));
         }
         Some(match self.per_value.last() {
-            Some(&(src, line)) if src == last_src => (last_src, line),
+            Some((src, line)) if src == last_src => (last_src, line),
             _ => (last_src, 0),
         })
     }
@@ -10635,12 +10668,12 @@ impl InputLocations {
     /// afterward to fall back on the way `exhausted` does -- the caller must
     /// compute `eof_line` directly from the last source's raw text before
     /// it's consumed, and pass it in.
-    fn slurp_eof(&self, eof_line: Option<usize>) -> Option<(u32, u32)> {
+    fn slurp_eof(&self, eof_line: Option<usize>) -> Option<(u32, u64)> {
         if self.unopened_tail {
             return Some((self.last_src(), 0));
         }
         let line = eof_line?;
-        Some((self.last_src(), line as u32))
+        Some((self.last_src(), line as u64))
     }
 }
 
@@ -13829,7 +13862,7 @@ impl<'a> LineCounter<'a> {
         Self {
             bytes,
             pos: base,
-            newlines_before_pos: 0,
+            newlines_before_pos: line_seed(),
             line_start: base,
             next_newline: None,
             lead: seam.lead,
@@ -13841,9 +13874,10 @@ impl<'a> LineCounter<'a> {
     /// breaks before it (#6920): the lines it names are the file's.
     fn set_lines_before(&mut self, lines: usize) {
         debug_assert!(
-            self.pos == self.seam.base.min(self.bytes.len()) && self.newlines_before_pos == 0
+            self.pos == self.seam.base.min(self.bytes.len())
+                && self.newlines_before_pos == line_seed()
         );
-        self.newlines_before_pos = lines;
+        self.newlines_before_pos = line_seed() + lines;
     }
 
     /// Where this counter is in its text, kept without a borrow of it between calls (#5661).
@@ -14966,7 +15000,7 @@ fn read_json_tail(
             TrailingParseError {
                 error,
                 source: u32::try_from(fault_source).unwrap_or(u32::MAX),
-                line: u32::try_from(line).unwrap_or(u32::MAX),
+                line: line as u64,
                 seq_warning: false,
                 as_parse_error: false,
             },
@@ -15017,7 +15051,7 @@ fn read_json_tail(
                 TrailingParseError {
                     error,
                     source: u32::try_from(fault_source).unwrap_or(u32::MAX),
-                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                    line: line as u64,
                     seq_warning: false,
                     as_parse_error: false,
                 },
@@ -15125,8 +15159,7 @@ impl DroppedText {
     /// `tail` with the line breaks of the dropped text added: the end of the stream counts them.
     fn count_in(self, tail: EofTail) -> EofTail {
         EofTail {
-            newlines: u32::try_from(self.newlines)
-                .map_or(u32::MAX, |dropped| tail.newlines.saturating_add(dropped)),
+            newlines: tail.newlines.saturating_add(self.newlines as u64),
             ..tail
         }
     }
@@ -16154,7 +16187,7 @@ impl LazyBatch {
 fn lazy_json_producer_then(
     sources: std::collections::VecDeque<LazyJsonInputs>,
     mut tail: Box<dyn Iterator<Item = jq::ProducedInput>>,
-    mut exhausted: Option<(u32, u32)>,
+    mut exhausted: Option<(u32, u64)>,
 ) -> jq::InputProducer {
     // A source with no documents (a file of white space) has nothing to hand out, and is kept for
     // the eager reader an earlier file's fault hands the stream to (#6455).
@@ -16241,8 +16274,8 @@ fn lazy_json_producer_then(
                 .and_then(|batch| batch.document(bytes, &lazy.spans, at))
                 .unwrap_or_else(|| stream_document_validated(&bytes[start..end], None, &[], 0)),
         };
-        // Narrowed as `InputLocations::push` narrows the eager route's lines.
-        let produced = jq::ProducedInput::converted(converted, lazy.source, line as u32);
+        // In 64 bits, as `InputLocations::push` keeps the eager route's lines (#7472).
+        let produced = jq::ProducedInput::converted(converted, lazy.source, line as u64);
         if cursor.next == lazy.spans.len() && lazy.more.is_none() {
             // The source's text goes with its last document, not with the read past it; the next
             // source starts its own count.
@@ -16285,7 +16318,7 @@ fn lazy_scan_on(
     lazy: &mut LazyJsonInputs,
     later: &mut [LazyJsonInputs],
     tail: &mut Box<dyn Iterator<Item = jq::ProducedInput>>,
-    exhausted: &mut Option<(u32, u32)>,
+    exhausted: &mut Option<(u32, u64)>,
     lines: &mut Option<LinePlace>,
 ) -> bool {
     let Some(mut more) = lazy.more.take() else {
@@ -16574,7 +16607,7 @@ fn hand_off_later_sources(
     last_source: u32,
 ) -> (
     Box<dyn Iterator<Item = jq::ProducedInput>>,
-    Option<(u32, u32)>,
+    Option<(u32, u64)>,
 ) {
     #[cfg(test)]
     HAND_OFFS.with(|n| n.set(n.get() + 1));
@@ -16731,7 +16764,7 @@ impl Default for LazyCursor {
 #[cfg(test)]
 fn lazy_raw_producer(
     files: Vec<(u32, String)>,
-    exhausted: Option<(u32, u32)>,
+    exhausted: Option<(u32, u64)>,
 ) -> jq::InputProducer {
     lazy_raw_producer_windowed(files, None, exhausted)
 }
@@ -16744,7 +16777,7 @@ fn lazy_raw_producer(
 fn lazy_raw_producer_windowed(
     files: Vec<(u32, String)>,
     rest: Option<Vec<Option<window::LineWindows>>>,
-    exhausted: Option<(u32, u32)>,
+    exhausted: Option<(u32, u64)>,
 ) -> jq::InputProducer {
     let mut files = files;
     // A file read in windows is not counted before the program starts: the end of the stream is the
@@ -16756,7 +16789,8 @@ fn lazy_raw_producer_windowed(
     // number is the count at its own newline, and a final line without one is on the file's
     // last), and the front of a line an earlier file left open.
     let (mut file, mut at) = (0usize, 0usize);
-    let mut newlines = 0u32;
+    // #7472: 64 bits, as jq's `size_t` count: past 2^32 lines it does not wrap.
+    let mut newlines = line_seed() as u64;
     let mut open = String::new();
     let mut ended_open = false;
     Box::new(move || {
@@ -16804,7 +16838,7 @@ fn lazy_raw_producer_windowed(
                 *done = None;
             }
             file += 1;
-            newlines = 0;
+            newlines = line_seed() as u64;
         }
         if open.is_empty() {
             return jq::ProducedInput::End(if windowed {
@@ -16985,10 +17019,13 @@ fn seed_input_queue(
             locations.per_value().len(),
             "one location per queued document"
         );
+        // #7472: each document carries its line's low word, and `highs` the high words, as the
+        // table keeps them: no wider entry per document.
+        let mut highs = locations.per_value().highs().clone();
         let mut queue: Vec<(OwnedValue, u32, u32)> = inputs
             .into_iter()
-            .zip(locations.per_value().iter().copied())
-            .map(|(v, (src, line))| (v, src, line))
+            .zip(locations.per_value().entries().iter().copied())
+            .map(|(v, (src, low))| (v, src, low))
             .collect();
         // #6480: the last value, read at a last file that did not open, unless a fault follows it.
         let documents = queue.len();
@@ -16996,7 +17033,7 @@ fn seed_input_queue(
             if trailing_error.is_none()
                 && resumed_errors.iter().all(|&(before, _)| before < documents)
             {
-                (last.1, last.2) = end;
+                (last.1, last.2) = (end.0, highs.resplit_last(documents - 1, end.1));
             }
         }
         // A stream that turned malformed partway queues each parse
@@ -17018,7 +17055,7 @@ fn seed_input_queue(
         }
         // #6625, #6656: a text's faults each say whether they are at the end of the text.
         note_fault_ends(errors.iter().map(|(_, error, _)| error.to_string()));
-        jq::seed_remaining_inputs_with_errors(queue, locations.exhausted(slurp), errors);
+        jq::seed_remaining_inputs_with_line_highs(queue, highs, locations.exhausted(slurp), errors);
         // #4303: where the stream's own end was recorded, reads past it
         // move on from it as jq's do. A slurp read the whole stream to build its one value, so
         // every read past that value is already past the end: line 0 and `<unknown>` (#6145).
@@ -17078,7 +17115,7 @@ fn lazy_tail_items(
     let documents = inputs.len();
     LazyTail {
         values: inputs.into_iter(),
-        places: locations.per_value().to_vec(),
+        places: locations.per_value().clone(),
         index: 0,
         errors: resumed_errors
             .into_iter()
@@ -17094,7 +17131,7 @@ fn lazy_tail_items(
 struct LazyTail {
     values: std::vec::IntoIter<OwnedValue>,
     /// `(source, line)` of every value, in order.
-    places: Vec<(u32, u32)>,
+    places: jq::LineTable,
     /// How many values were handed out.
     index: usize,
     errors: std::iter::Peekable<std::vec::IntoIter<(usize, TrailingParseError)>>,
@@ -17118,7 +17155,7 @@ impl Iterator for LazyTail {
             });
         }
         let value = self.values.next()?;
-        let (source, line) = self.places[self.index];
+        let (source, line) = self.places.get(self.index)?;
         self.index += 1;
         Some(jq::ProducedInput::Document(value, source, line))
     }
@@ -17140,8 +17177,9 @@ struct LazySeqInputs {
     ranges: Vec<(usize, usize)>,
     /// The bytes of `combined` that are not part of any record (`SeqStreamWalk::cuts`, #7340).
     cuts: Vec<(usize, usize)>,
-    /// `(source tag, line)` of every record, as jq's reader stood when it yielded it.
-    places: Vec<(u32, u32)>,
+    /// `(source tag, line)` of every record, as jq's reader stood when it yielded it, at 8 bytes a
+    /// record below 2^32 lines (#7472).
+    places: jq::LineTable,
     /// The reader's faults, each with how many records come before it.
     errors: std::iter::Peekable<std::vec::IntoIter<(usize, TrailingParseError)>>,
     /// The record [`LazySeqInputs::next`] reads next.
@@ -17164,7 +17202,7 @@ impl LazySeqInputs {
             .map(|&(source, line)| {
                 (
                     u32::try_from(sources[source].0.unwrap_or(0)).unwrap_or(u32::MAX),
-                    u32::try_from(line).unwrap_or(u32::MAX),
+                    line as u64,
                 )
             })
             .collect();
@@ -17208,7 +17246,7 @@ impl LazySeqInputs {
                 });
             }
             let &(start, end) = self.ranges.get(self.next)?;
-            let (source, line) = self.places[self.next];
+            let (source, line) = self.places.get(self.next)?;
             self.next += 1;
             // A record the checked materializer refuses is dropped, with its place.
             if let Some(value) =
@@ -17220,7 +17258,7 @@ impl LazySeqInputs {
     }
 
     /// The producer the `input` queue pulls the stream from; `exhausted` is where its end is read.
-    fn into_producer(mut self, exhausted: Option<(u32, u32)>) -> jq::InputProducer {
+    fn into_producer(mut self, exhausted: Option<(u32, u64)>) -> jq::InputProducer {
         Box::new(move || self.next().unwrap_or(jq::ProducedInput::End(exhausted)))
     }
 }
@@ -17254,7 +17292,7 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
     let stdin_only = files.iter().all(Option::is_none);
     // #7603: `Malformed BOM` is what every later read returns too, since jq's parser never gets past
     // it; the reader ends with it, so it is kept for the reads after.
-    let mut raised: Option<(String, (u32, u32))> = None;
+    let mut raised: Option<(String, (u32, u64))> = None;
     Box::new(move || {
         if let Some((message, at)) = &raised {
             return jq::ProducedInput::Error(EvalError::new(message.clone()), *at);
@@ -17277,7 +17315,7 @@ fn stream_reader_produce<R: crate::cli::jq_stream_errors::RefillSource>(
     last_source: u32,
     raise_errors: bool,
     stdin_only: bool,
-    raised: &mut Option<(String, (u32, u32))>,
+    raised: &mut Option<(String, (u32, u64))>,
 ) -> jq::ProducedInput {
     match reader.next_yielded() {
         Some(input) => {
@@ -17289,7 +17327,7 @@ fn stream_reader_produce<R: crate::cli::jq_stream_errors::RefillSource>(
             } else {
                 (
                     u32::try_from(files[source].unwrap_or(0)).unwrap_or(u32::MAX),
-                    u32::try_from(line).unwrap_or(u32::MAX),
+                    line as u64,
                 )
             };
             match input.error {
@@ -17316,7 +17354,7 @@ fn stream_reader_produce<R: crate::cli::jq_stream_errors::RefillSource>(
                 reader
                     .end()
                     .open_at_end
-                    .map(|lines| (last_source, u32::try_from(lines).unwrap_or(u32::MAX))),
+                    .map(|lines| (last_source, lines as u64)),
             )
         }
     }
@@ -17779,7 +17817,7 @@ fn lazy_json_sources(
         .map_or(0, |seam| seam.base.min(last.len()));
     let tail = if last_spans.is_empty() && last_more.is_none() {
         EofTail {
-            newlines: count_newlines(&last[base..]) as u32,
+            newlines: count_newlines(&last[base..]) as u64,
             unknown: false,
         }
     } else if sources.iter().any(|(_, more)| more.is_some()) {
@@ -23239,7 +23277,7 @@ mod tests {
                 OwnedValue::Int(5)
             ]
         );
-        assert_eq!(locations.per_value(), &[(0, 4), (0, 5)]);
+        assert_eq!(locations.per_value().to_vec(), [(0, 4), (0, 5)]);
         assert!(trailing.is_none());
         // One parse error, after the lazy documents and before the first eager one.
         assert_eq!(resumed.len(), 1);
@@ -23272,7 +23310,7 @@ mod tests {
     }
 
     /// [`observe_inputs`] with `flags` (`-R`) before the program.
-    fn observe_inputs_with(
+    pub(super) fn observe_inputs_with(
         dir: &std::path::Path,
         files: &[&[u8]],
         flags: &[&str],
@@ -23335,7 +23373,7 @@ mod tests {
     /// many values were built up front, and everything the queue pops (every document and
     /// parse error, with the `(at ...)` marker after each, through and past the end, #4303).
     /// `lazy_off` is the eager route, the reference the lazy one is held to.
-    fn observe_seq(
+    pub(super) fn observe_seq(
         dir: &std::path::Path,
         files: &[&[u8]],
         flags: &[&str],
@@ -25821,13 +25859,13 @@ mod tests {
         };
         let (inputs, locations, lines) = read(&["jq", "-R", ".", &path]);
         assert_eq!(inputs, Vec::<OwnedValue>::new());
-        assert_eq!(locations.per_value(), &[]);
+        assert!(locations.per_value().is_empty());
         assert_eq!(locations.eof_tail, None);
         assert_eq!(lines, Some(vec![(0, "a\nb\nc".to_string())]));
         // The producer places each line as the eager route does: line 1, 2, and the last, which has
         // no newline, on the file's last line.
         let mut producer = lazy_raw_producer(lines.unwrap(), None);
-        let placed: Vec<(String, u32, u32)> = std::iter::from_fn(|| match producer() {
+        let placed: Vec<(String, u32, u64)> = std::iter::from_fn(|| match producer() {
             jq::ProducedInput::Document(OwnedValue::String(text), tag, line) => {
                 Some((text.to_string(), tag, line))
             }
@@ -26152,7 +26190,7 @@ mod tests {
     /// [`lazy_json_producer_then`] for a stream with nothing after its lazy documents.
     fn lazy_json_producer(
         lazy: LazyJsonInputs,
-        exhausted: Option<(u32, u32)>,
+        exhausted: Option<(u32, u64)>,
     ) -> jq::InputProducer {
         lazy_json_producer_then(
             std::collections::VecDeque::from([lazy]),
@@ -31533,7 +31571,7 @@ mod tests {
         type Held = (
             Vec<u8>,
             Vec<(usize, usize)>,
-            Vec<(u32, u32)>,
+            jq::LineTable,
             Vec<(usize, String)>,
         );
         // Held after `get_inputs`, and whether the check kept its walk and the file's bytes.
@@ -32581,5 +32619,269 @@ mod plain_record_sequence_tests {
                 String::from_utf8_lossy(raw)
             );
         }
+    }
+}
+
+/// #7472: jq counts its input lines in a `size_t` (`util.c`'s `current_line`), so past 2^32 lines
+/// `input_line_number` and the `(at FILE:N)` marker go on counting: a value on line 4294967302 is
+/// on that line in jq 1.7.1 and 1.8.2, where these routes used to answer 6. Each route's count
+/// starts from [`TEST_LINE_SEED`] here, two line breaks short of 2^32, in place of a 4 GiB input.
+#[cfg(test)]
+mod lines_past_u32_tests_7472 {
+    use super::tests::{observe_inputs_with, observe_seq};
+    use super::*;
+
+    /// Two line breaks short of 2^32: the first line counted is `u32::MAX`, which used to collide
+    /// with the "no position" sentinel, and the ones after it are past 2^32.
+    const SEED: usize = (1 << 32) - 2;
+
+    /// Sets [`TEST_LINE_SEED`] for its lifetime.
+    struct Seeded;
+
+    impl Seeded {
+        fn new(lines: usize) -> Self {
+            TEST_LINE_SEED.with(|seed| seed.set(lines));
+            Self
+        }
+    }
+
+    impl Drop for Seeded {
+        fn drop(&mut self) {
+            TEST_LINE_SEED.with(|seed| seed.set(0));
+        }
+    }
+
+    /// `seen`, as [`observe_inputs_with`] gives it, with every `Some((source, line))` moved `by`
+    /// lines on: what a count that started `by` line breaks into each source reads.
+    fn shifted(seen: &[String], by: u64) -> Vec<String> {
+        seen.iter()
+            .map(|row| {
+                let Some(at) = row.find("at Some((") else {
+                    return row.clone();
+                };
+                let (head, place) = row.split_at(at + "at Some((".len());
+                let (source, line) = place
+                    .trim_end_matches("))")
+                    .split_once(", ")
+                    .expect("a (source, line) pair");
+                let line: u64 = line.parse().expect("a line");
+                format!("{head}{source}, {}))", line + by)
+            })
+            .collect()
+    }
+
+    const STREAMS: &[&[&[u8]]] = &[
+        &[b"1\n2\n3\n"],
+        &[b"1\n2\n3"],
+        &[b"1 2\n\n3\n\n"],
+        // A fault partway: the documents after it are read eagerly, into the line table.
+        &[b"{\"a\":1}\n[2]\n}\n{\"a\":4}\n5\n"],
+        &[b"1\n2\n", b"3\n\n4\n"],
+        &[b"1\n2\n", b"3 }\n4\n"],
+    ];
+
+    /// The lazy JSON route, the eager one (the line table and the queue's run table), a stream
+    /// that turned malformed (the table the lazy tail hands out), and `-R`'s lines: each counts on
+    /// past 2^32 as it counts from 0.
+    #[test]
+    fn json_and_raw_routes_count_past_two_to_the_32_7472() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut compared = 0;
+        for files in STREAMS {
+            for flags in [&[][..], &["-R"][..]] {
+                for lazy_off in [false, true] {
+                    let (from_zero, _) =
+                        observe_inputs_with(dir.path(), files, flags, lazy_off, None);
+                    let seeded = Seeded::new(SEED);
+                    let (from_seed, _) =
+                        observe_inputs_with(dir.path(), files, flags, lazy_off, None);
+                    drop(seeded);
+                    assert_eq!(
+                        from_seed,
+                        shifted(&from_zero, SEED as u64),
+                        "{files:?} {flags:?} lazy_off={lazy_off}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, STREAMS.len() * 4);
+    }
+
+    /// What the first stream reads, spelled out: lines 4294967295 (once the sentinel), 4294967296
+    /// and 4294967297, and the end of the stream at 4294967297, on both routes.
+    #[test]
+    fn a_value_on_line_two_to_the_32_plus_one_is_on_that_line_7472() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _seeded = Seeded::new(SEED);
+        for lazy_off in [false, true] {
+            let (seen, _) = observe_inputs_with(dir.path(), &[b"1\n2\n3\n"], &[], lazy_off, None);
+            assert_eq!(
+                seen,
+                [
+                    "doc NumberLiteral(Int(1), \"1\") at Some((0, 4294967295))",
+                    "doc NumberLiteral(Int(2), \"2\") at Some((0, 4294967296))",
+                    "doc NumberLiteral(Int(3), \"3\") at Some((0, 4294967297))",
+                    "end at Some((0, 4294967297))",
+                    "end at None",
+                    "end at None",
+                ],
+                "lazy_off={lazy_off}"
+            );
+        }
+    }
+
+    /// `--seq` keeps every record's place in [`LazySeqInputs`]' table (and the eager route in the
+    /// line table): a stream resumed that many line breaks in (#7260) counts from there.
+    #[test]
+    fn seq_records_count_past_two_to_the_32_7472() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let streams: &[&[u8]] = &[
+            b"\x1e1\n\x1e2\n\x1e3\n",
+            b"\x1e1\n\x1e[2\n\x1e3\n",
+            b"\x1e{\"a\":1}\n\n\x1e4\n",
+        ];
+        for stream in streams {
+            for lazy_off in [false, true] {
+                let (_, _, from_zero) = observe_seq(dir.path(), &[stream], &["-n"], lazy_off);
+                crate::cli::jq_seq_reader::seed_line_base(SEED);
+                let (_, _, from_seed) = observe_seq(dir.path(), &[stream], &["-n"], lazy_off);
+                crate::cli::jq_seq_reader::seed_line_base(0);
+                assert_eq!(
+                    from_seed,
+                    shifted(&from_zero, SEED as u64),
+                    "{stream:?} lazy_off={lazy_off}"
+                );
+            }
+        }
+    }
+
+    /// `--stream`'s reader counts its lines as it reads, one location at a time.
+    #[test]
+    fn stream_inputs_count_past_two_to_the_32_7472() {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("s.json");
+        std::fs::write(&path, "1\n[2]\n3\n").unwrap();
+        let read = |seed: usize| {
+            let _seeded = Seeded::new(seed);
+            let argv = ["jq", "-n", "--stream", "inputs", path.to_str().unwrap()];
+            let cmd = JqCommand::try_parse_from(argv).unwrap();
+            let (mut open_failed, mut opened) = (false, Vec::new());
+            get_inputs(&cmd, true, true, &mut open_failed, &mut opened)
+                .expect("no exit code")
+                .expect("reads");
+            let lazy = LAZY_STREAM_INPUTS
+                .with(|slot| slot.borrow_mut().take())
+                .expect("--stream reads as the program asks");
+            jq::seed_remaining_inputs_from(stream_reader_producer(lazy));
+            jq::count_reads_past_end();
+            let mut seen = Vec::new();
+            while let jq::InputPop::Document(value) = jq::pop_input() {
+                seen.push(format!(
+                    "doc {} at {:?}",
+                    value.to_json(),
+                    jq::current_input_location()
+                ));
+            }
+            seen.push(format!("end at {:?}", jq::current_input_location()));
+            seen
+        };
+        let from_zero = read(0);
+        assert!(from_zero.len() > 4, "{from_zero:?}");
+        assert_eq!(read(SEED), shifted(&from_zero, SEED as u64));
+    }
+
+    /// The `(at FILE:N)` marker prints the whole line, and an `UNKNOWN_LINE` entry still reads as
+    /// `<unknown>`, past 2^32 lines as below.
+    #[test]
+    fn the_marker_names_a_line_past_two_to_the_32_7472() {
+        let mut locations = InputLocations::new(vec![Some("nl.json".to_string())]);
+        locations.push(0, (1 << 32) + 6);
+        locations.push(0, usize::MAX);
+        locations.push(0, u32::MAX as usize);
+        assert_eq!(locations.get(0).to_string(), "nl.json:4294967302");
+        assert_eq!(locations.get(1).to_string(), "<unknown>");
+        assert_eq!(locations.get(2).to_string(), "nl.json:4294967295");
+        assert_eq!(locations.source_at(1), None);
+        assert_eq!(locations.source_at(2), Some(0));
+        assert_eq!(
+            locations.resolve(0, (1 << 32) + 6).to_string(),
+            "nl.json:4294967302"
+        );
+        assert_eq!(
+            InputLocations::single(InputLocation::at(Some("nl.json"), (1 << 33) + 1))
+                .get(0)
+                .to_string(),
+            "nl.json:8589934593"
+        );
+        locations.eof_tail = Some(EofTail {
+            newlines: (1 << 32) + 7,
+            unknown: false,
+        });
+        assert_eq!(locations.exhausted(false), Some((0, (1 << 32) + 7)));
+        assert_eq!(
+            locations.slurp_eof(Some((1 << 32) + 7)),
+            Some((0, (1 << 32) + 7))
+        );
+        // A window's dropped line breaks are added in 64 bits.
+        let dropped = DroppedText {
+            bytes: 1,
+            newlines: 1 << 32,
+            moved_newlines: 0,
+        };
+        let tail = EofTail {
+            newlines: 5,
+            unknown: false,
+        };
+        assert_eq!(dropped.count_in(tail).newlines, (1 << 32) + 5);
+    }
+
+    /// Below 2^32 lines nothing grows: the line table keeps 8 bytes a value and no run of high
+    /// words, and the queue it seeds keeps 40 bytes a document.
+    #[test]
+    fn the_line_table_is_unchanged_below_two_to_the_32_7472() {
+        use clap::Parser;
+
+        assert_eq!(std::mem::size_of::<(u32, u32)>(), 8);
+        assert_eq!(std::mem::size_of::<(OwnedValue, u32, u32)>(), 40);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fault.json");
+        let mut text = String::from("{\"a\":1}\n}\n");
+        for n in 0..1000 {
+            text.push_str(&format!("{n}\n"));
+        }
+        std::fs::write(&path, &text).unwrap();
+        let read = |seed: usize| {
+            let _seeded = Seeded::new(seed);
+            let argv = ["jq", "-n", "inputs", path.to_str().unwrap()];
+            let cmd = JqCommand::try_parse_from(argv).unwrap();
+            let (mut open_failed, mut opened) = (false, Vec::new());
+            let (inputs, locations, ..) =
+                get_inputs(&cmd, true, true, &mut open_failed, &mut opened)
+                    .expect("no exit code")
+                    .expect("reads");
+            LAZY_JSON_INPUTS.with(|slot| slot.borrow_mut().take());
+            (inputs.len(), locations)
+        };
+        let (values, below) = read(0);
+        assert_eq!(values, 1001);
+        let table = below.per_value();
+        assert_eq!(table.len(), 1001);
+        assert_eq!(table.highs().runs(), 0, "no run below 2^32 lines");
+        // The entries are the 8-byte pairs, at the capacity the plain vector had.
+        assert_eq!(std::mem::size_of_val(table.entries()), 8 * 1001);
+        let mut plain: Vec<(u32, u32)> = Vec::new();
+        for _ in 0..1001 {
+            plain.push((0, 0));
+        }
+        assert_eq!(table.capacity(), plain.capacity());
+        // Crossing 2^32 partway adds one run, and the entries stay the same size.
+        let (_, above) = read(SEED);
+        assert_eq!(above.per_value().highs().runs(), 1);
+        assert_eq!(above.per_value().capacity(), plain.capacity());
+        assert_eq!(above.per_value().get(0), Some((0, SEED as u64 + 1)));
+        assert_eq!(above.per_value().get(1000), Some((0, SEED as u64 + 1002)));
     }
 }

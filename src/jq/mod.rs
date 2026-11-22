@@ -96,6 +96,7 @@ mod go_print;
 mod go_regex;
 mod go_sort;
 mod go_time;
+mod input_lines;
 mod json_fast;
 pub(crate) use eval_generic::SiblingShape;
 #[doc(hidden)]
@@ -223,12 +224,16 @@ pub use eval::snapshot_environment;
 // backing store needs `std`, and there is no meaningful "remaining input
 // stream" to seed under a `no_std` embedding with no CLI driver anyway).
 #[cfg(feature = "std")]
+pub use eval::seed_remaining_inputs_with_line_highs;
+#[cfg(feature = "std")]
 pub use eval::{
     clear_input_reads, count_reads_past_end, current_input_location, hold_reads_past_end,
     input_reads, pop_input, pop_remaining_input, seed_remaining_inputs, seed_remaining_inputs_from,
     seed_remaining_inputs_with_error, seed_remaining_inputs_with_errors, set_input_read_hook,
     InputPop, InputProducer, InputReads, ProducedInput, UNKNOWN_INPUT_LINE,
 };
+// #7472: per-value line tables that stay at 8 bytes an entry past 2^32 lines.
+pub use input_lines::{LineHighs, LineTable};
 // `input_queue_is_active` exists under both gates (a `const fn` returning
 // `false` without `std`), so `eval_generic` can consult it unconditionally.
 pub use eval::input_queue_is_active;
