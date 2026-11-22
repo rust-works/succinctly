@@ -110341,6 +110341,10 @@ fn jq_month_for_time(month: i64) -> i64 {
 /// jq's `timegm` path rejects dates normalized before 1900 from the year,
 /// month, day, hour, and minute fields, then adds the seconds field. It treats
 /// a final `-1` as its failure sentinel. `%s` prints it; `mktime` raises.
+///
+/// `f_mktime` also reads a final `-2` as its own "no `timegm` here" sentinel and raises `mktime
+/// not supported on this platform` for it (#7722), so the instant 1969-12-31T23:59:58Z is that
+/// error in jq 1.7.1 and 1.8.2 alike; it is the `Err` here.
 fn jq_timegm_secs(
     year: i64,
     month: i64,
@@ -110349,7 +110353,11 @@ fn jq_timegm_secs(
     minute: i64,
     second: i64,
 ) -> Result<Option<i64>, EvalError> {
-    Ok(jq_wall_clock_secs(year, month, day, hour, minute, second)?.filter(|&secs| secs != -1))
+    match jq_wall_clock_secs(year, month, day, hour, minute, second)? {
+        Some(-1) => Ok(None),
+        Some(-2) => Err(EvalError::new("mktime not supported on this platform")),
+        secs => Ok(secs),
+    }
 }
 
 /// [`jq_timegm_secs`] without the `-1` sentinel: the seconds a wall-clock reading is from the
@@ -110376,6 +110384,11 @@ fn jq_wall_clock_secs(
     let secs = before_second
         .checked_add(second)
         .ok_or_else(EvalError::broken_down_time_out_of_range)?;
+    // `timegm` stores the normalised fields back, so it fails when the year less 1900 leaves C's
+    // `int` (#7723): `[2147485547,12,1,0,0,0,0,0] | mktime` is `invalid gmtime representation`.
+    if !civil_time_from_unix_secs(secs).is_ok_and(|t| i32::try_from(t.year - 1900).is_ok()) {
+        return Ok(None);
+    }
     Ok(Some(secs))
 }
 
@@ -110461,7 +110474,9 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(None) if optional => return QueryResult::None, // patchcov: coverage tolerate-line reason="`?` suppresses mktime's error outside builtin dispatch, so the optional flag is false even for an invalid date (#3083)"
         Ok(None) => return QueryResult::Error(EvalError::new("invalid gmtime representation")),
         Err(_) if optional => return QueryResult::None,
-        Err(e) => return QueryResult::Error(e), // patchcov: coverage tolerate-line reason="unreachable for mktime's C-int-clamped fields: checked civil-date arithmetic stays within i64; the guard protects other callers of the shared helpers (#3083)"
+        // `-2`'s `mktime not supported on this platform` (#7722); the range errors of the shared
+        // checked helpers are unreachable for C-int-clamped fields (#3083).
+        Err(e) => return QueryResult::Error(e),
     };
 
     QueryResult::Owned(OwnedValue::Float(timestamp as f64))
@@ -110780,21 +110795,7 @@ fn normalised_broken_down_time(
     local: bool,
 ) -> Option<(BrokenDownTime, Option<LocalZone>)> {
     let month = jq_month_for_time(t.month);
-    let month0 = month - 1;
-    let year = t.year.checked_add(month0.div_euclid(12))?;
-    let before_second = unix_secs_from_broken_down_time(
-        year,
-        month0.rem_euclid(12) + 1,
-        t.day,
-        t.hour,
-        t.minute,
-        0,
-    )
-    .ok()?;
-    if before_second < -2_208_988_800 {
-        return None;
-    }
-    let wall = before_second.checked_add(t.second)?;
+    let wall = jq_wall_clock_secs(t.year, t.month, t.day, t.hour, t.minute, t.second).ok()??;
     // `timegm` fails, leaving the fields as given, when the year less 1900 leaves C's `int`.
     let civil = |secs: i64| {
         civil_time_from_unix_secs(secs)
@@ -112502,7 +112503,8 @@ fn builtin_fromdateiso8601<W: Clone + AsRef<[u64]>>(
         Err(_) if optional => return QueryResult::None,
         Err(_) => return QueryResult::Error(EvalError::strptime_no_match(&input, FORMAT)),
     };
-    // ...then `mktime`'s own conversion, `-1` and the dates before 1900 it refuses included.
+    // ...then `mktime`'s own conversion, `-1`, `-2` (#7722) and the dates before 1900 it refuses
+    // included.
     match jq_timegm_secs(t.year, t.month, t.day, t.hour, t.minute, t.second) {
         Ok(Some(secs)) => QueryResult::Owned(OwnedValue::Float(secs as f64)),
         Ok(None) | Err(_) if optional => QueryResult::None,
