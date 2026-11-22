@@ -1,6 +1,8 @@
 //! #6331: `%I`, `%l` and `%r` print the hour modulo 12 (12 for a multiple of 12), with C's sign, for an
-//! hour outside 0-23 in a hand-built broken-down time. Every row was captured from jq 1.7.1
-//! (`/usr/bin/jq -nc`).
+//! hour outside 0-23 in a hand-built broken-down time that reaches the formatter as given, which is
+//! one before 1900 since #7606 (`timegm` refuses it, so jq 1.8.2 leaves it alone too). Those rows
+//! were captured from jq 1.7.1 (`/usr/bin/jq -nc`) and agree with jq 1.8.2; from 1900 the hour is
+//! normalised first, as in jq 1.8.2 (`/opt/homebrew/bin/jq`).
 
 use anyhow::Result;
 
@@ -22,19 +24,19 @@ fn assert_rows(rows: &[(&str, &str)]) -> Result<()> {
 fn test_the_twelve_hour_clock_is_the_hour_modulo_twelve_6331() -> Result<()> {
     assert_rows(&[
         (
-            r#"[2015,2,5,25,0,0,4,63] | strftime("%I|%l|%r|%p")"#,
+            r#"[1899,2,5,25,0,0,4,63] | strftime("%I|%l|%r|%p")"#,
             r#""01| 1|01:00:00 PM|PM""#,
         ),
         (
-            r#"[2015,2,5,36,0,0,4,63] | strftime("%I|%l|%r|%p")"#,
+            r#"[1899,2,5,36,0,0,4,63] | strftime("%I|%l|%r|%p")"#,
             r#""12|12|12:00:00 PM|PM""#,
         ),
         (
-            r#"[2015,2,5,100,0,0,4,63] | strftime("%I|%l|%r|%p")"#,
+            r#"[1899,2,5,100,0,0,4,63] | strftime("%I|%l|%r|%p")"#,
             r#""04| 4|04:00:00 PM|PM""#,
         ),
         (
-            r#"[2015,2,5,-13,0,0,4,63] | strftime("%I|%l|%r|%p")"#,
+            r#"[1899,2,5,-13,0,0,4,63] | strftime("%I|%l|%r|%p")"#,
             r#""-1|-1|-1:00:00 AM|AM""#,
         ),
     ])

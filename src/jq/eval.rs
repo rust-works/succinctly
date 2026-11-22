@@ -109860,6 +109860,17 @@ fn broken_down_seconds(second: i64, raw: f64) -> f64 {
 /// practically-relevant range, confirmed by bisection up to ~1e16 seconds
 /// from the epoch in both directions.
 fn broken_down_time_from_unix_secs(secs: i64) -> Result<BrokenDownTime, EvalError> {
+    let t = civil_time_from_unix_secs(secs)?;
+    if t.year < i64::from(i32::MIN) || t.year > i64::from(i32::MAX) {
+        return Err(EvalError::datetime_out_of_range());
+    }
+    Ok(t)
+}
+
+/// [`broken_down_time_from_unix_secs`] without its year bound: the civil fields of `secs` for any
+/// year `i64` arithmetic reaches. `timegm`'s normalisation (#7606) bounds `tm_year`, the year less
+/// 1900, instead.
+fn civil_time_from_unix_secs(secs: i64) -> Result<BrokenDownTime, EvalError> {
     // Days since Unix epoch (Jan 1, 1970)
     let days = if secs >= 0 {
         secs / 86400
@@ -109885,10 +109896,6 @@ fn broken_down_time_from_unix_secs(secs: i64) -> Result<BrokenDownTime, EvalErro
     let day = (doy - (153 * mp + 2) / 5 + 1) as i64;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = y + i64::from(month <= 2);
-
-    if year < i64::from(i32::MIN) || year > i64::from(i32::MAX) {
-        return Err(EvalError::datetime_out_of_range());
-    }
 
     // Calculate weekday (0 = Sunday, 6 = Saturday)
     // Jan 1, 1970 was a Thursday (4)
@@ -110024,6 +110031,21 @@ fn jq_timegm_secs(
     minute: i64,
     second: i64,
 ) -> Result<Option<i64>, EvalError> {
+    Ok(jq_wall_clock_secs(year, month, day, hour, minute, second)?.filter(|&secs| secs != -1))
+}
+
+/// [`jq_timegm_secs`] without the `-1` sentinel: the seconds a wall-clock reading is from the
+/// epoch as if it were UTC, `None` before 1900. `%s` subtracts the zone's offset from it, and the
+/// sentinel is the C conversion's answer for the resulting *instant*, not for the reading: under
+/// `TZ=Europe/Paris`, `[1969,11,31,23,59,59,3,364] | strflocaltime("%s")` is `"-3601"` (#7606).
+fn jq_wall_clock_secs(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Result<Option<i64>, EvalError> {
     let month = jq_month_for_time(month) - 1;
     let year = year
         .checked_add(month.div_euclid(12))
@@ -110036,7 +110058,7 @@ fn jq_timegm_secs(
     let secs = before_second
         .checked_add(second)
         .ok_or_else(EvalError::broken_down_time_out_of_range)?;
-    Ok((secs != -1).then_some(secs))
+    Ok(Some(secs))
 }
 
 /// The 8 fields of a broken-down-time array (`year, month, day, hour, minute,
@@ -110347,6 +110369,14 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 });
             }
             t.second = jq_tm_field(broken_down_seconds(t.second, timestamp) as i64);
+            // #7606: jq 1.8.2 normalises that array before formatting it, which only moves
+            // anything when the seconds slot rounded up to 60 (`-1.0000000000000002` is
+            // `1970-01-01T00:00:00Z` there, `1969-12-31T23:59:60Z` in jq 1.7.1).
+            if t.second >= 60 {
+                if let Some(normalised) = normalised_broken_down_time(&t, local) {
+                    return Ok(normalised);
+                }
+            }
             Ok((t, zone))
         }
         // #1820: `scalar_decode_failure` first, same shape as
@@ -110387,6 +110417,12 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         weekday,
                         yearday,
                     };
+                    // #7606: jq 1.8.2 normalises the fields before formatting them (out-of-range
+                    // ones carry over, weekday and yearday are recomputed); jq 1.7.1 formats them
+                    // as given. A date before 1900 stays as given in both.
+                    if let Some(normalised) = normalised_broken_down_time(&t, local) {
+                        return Ok(normalised);
+                    }
                     // The fields already are local wall-clock time; the zone
                     // only labels them (`%z`, `%Z`, `%s`). `jq_month_for_time`:
                     // the month as the C time conversion sees it, not the
@@ -110410,6 +110446,59 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
         }
     }
+}
+
+/// A broken-down time as jq 1.8.2 formats it after `jv2tm` has passed it through `timegm`
+/// (`mktime` with `tm_isdst = -1` when `local`), jqlang/jq#3203: out-of-range fields carry over
+/// (`[2024,5]`, May 0, is May 31) and the weekday and yearday are recomputed from the date, with
+/// the zone in effect at the resulting instant when `local`. `None` where the macOS conversion
+/// fails and leaves the fields as given: a date before 1900, by [`jq_timegm_secs`]'s rule.
+///
+/// jq 1.7.1 formats the fields as given; `succinctly jq` follows jq 1.8.2 (#7606), because 1.7.1's
+/// `todate` of out-of-range fields is text its own `fromdate` refuses (`"2024-14-35T25:61:61Z"`),
+/// its `%a` names the wrong weekday for a real date, and a short array (#7532) needs it.
+fn normalised_broken_down_time(
+    t: &BrokenDownTime,
+    local: bool,
+) -> Option<(BrokenDownTime, Option<LocalZone>)> {
+    let month = jq_month_for_time(t.month);
+    let month0 = month - 1;
+    let year = t.year.checked_add(month0.div_euclid(12))?;
+    let before_second = unix_secs_from_broken_down_time(
+        year,
+        month0.rem_euclid(12) + 1,
+        t.day,
+        t.hour,
+        t.minute,
+        0,
+    )
+    .ok()?;
+    if before_second < -2_208_988_800 {
+        return None;
+    }
+    let wall = before_second.checked_add(t.second)?;
+    // `timegm` fails, leaving the fields as given, when the year less 1900 leaves C's `int`.
+    let civil = |secs: i64| {
+        civil_time_from_unix_secs(secs)
+            .ok()
+            .filter(|t| i32::try_from(t.year - 1900).is_ok())
+    };
+    if !local {
+        return Some((civil(wall)?, None));
+    }
+    // `mktime` reads the fields as a wall-clock reading in the local zone, then the
+    // instant it names is the one formatted, in the zone in effect at that instant.
+    let reading = local_zone::for_wall_clock(t.year, month, t.day, t.hour, t.minute, t.second);
+    let mut instant = wall.checked_sub(reading.offset_secs)?;
+    let mut zone = local_zone::zone_at(instant);
+    if zone.offset_secs != reading.offset_secs {
+        // A reading the zone skipped: `mktime` reads it with the offset in effect before the
+        // skip and lands past it (`TZ=Europe/Paris`, 2024-03-31 02:30 is 03:30 CEST).
+        instant = wall.checked_sub(zone.offset_secs)?;
+        zone = local_zone::zone_at(instant);
+    }
+    let local_secs = instant.checked_add(zone.offset_secs)?;
+    Some((civil(local_secs)?, Some(zone)))
 }
 
 /// `strftime`'s body, in UTC (`local: false`) or in the local zone
@@ -110796,7 +110885,7 @@ fn format_strftime(
                 // offset (#3046 review: `TZ=EST5EDT`, `0 |
                 // strflocaltime("%s")` is `"0"` in jq 1.7.1).
                 Some('s') => result.push_str(
-                    &match jq_timegm_secs(year, month, day, hour, minute, second)? {
+                    &match jq_wall_clock_secs(year, month, day, hour, minute, second)? {
                         Some(secs) => secs.checked_sub(zone_offset).ok_or_else(overflow)?,
                         None => -1,
                     }
@@ -161702,24 +161791,28 @@ mod tests {
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483647"));
         query!(b"null", r"[1970,-9223372036854775808,1,0,0,0,4,0] | todate",
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483647-01T00:00:00Z"));
+        // From 1900 the fields are normalised first, as in jq 1.8.2 (#7606; jq 1.7.1:
+        // `1970--2147483648-01T00:00:00Z`).
         query!(b"null", r"[1970,9223372036854775807,1,0,0,0,4,0] | todateiso8601",
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483648-01T00:00:00Z"));
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "178958940-08-01T00:00:00Z"));
         query!(b"null", r#"[1970,0,-9223372036854775808,0,0,0,4,0] | strftime("%d")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-2147483648"));
 
-        // Each pair is the exact direct-field output observed in jq 1.7.1
-        // after an input below/above the signed 32-bit range. The four
-        // values exercise both immediate boundaries and i64 extremes. The
+        // Each pair is the exact output of jq 1.8.2 after an input below/above
+        // the signed 32-bit range. The four values exercise both immediate
+        // boundaries and i64 extremes. A saturated field that carries the date
+        // before 1900 is left as given (`timegm` fails); one that does not is
+        // normalised (#7606), so the weekday and yearday are recomputed. The
         // year saturates after its 1900 offset (#7532):
         // `test_broken_down_year_saturates_after_its_offset_7532`.
         let fields = [
-            (1, "%m", "-2147483647", "-2147483648"),
-            (2, "%d", "-2147483648", "2147483647"),
-            (3, "%H", "-2147483648", "2147483647"),
-            (4, "%M", "-2147483648", "2147483647"),
-            (5, "%S", "-2147483648", "2147483647"),
-            (6, "%w", "-2147483648", "2147483647"),
-            (7, "%j", "-2147483647", "-2147483648"),
+            (1, "%m", "-2147483647", "08"),
+            (2, "%d", "-2147483648", "10"),
+            (3, "%H", "-2147483648", "07"),
+            (4, "%M", "-2147483648", "07"),
+            (5, "%S", "52", "07"),
+            (6, "%w", "4", "4"),
+            (7, "%j", "001", "001"),
         ];
         for (idx, specifier, negative, positive) in fields {
             for (value, expected) in [
@@ -161749,9 +161842,9 @@ mod tests {
         }
 
         query!(b"null", r"[1970,-1,1,0,0,0,4,0] | todate",
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970-00-01T00:00:00Z"));
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1969-12-01T00:00:00Z"));
         query!(b"null", r"[1970,9223372036854775807,1,0,0,0,4,0] | todate?",
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970--2147483648-01T00:00:00Z"));
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "178958940-08-01T00:00:00Z"));
     }
 
     #[test]
@@ -161886,11 +161979,15 @@ mod tests {
 
     #[test]
     fn test_strftime_extreme_week_fields_3083() {
-        // The C formatter does its week arithmetic with wrapping `int`s.
-        query!(b"null", r#"[1970,0,1,0,0,0,4,9223372036854775807] | strftime("%j %U %W")"#,
+        // The C formatter does its week arithmetic with wrapping `int`s. Before 1900 `timegm`
+        // leaves the fields as given (#7606), so they reach it; both jq releases agree.
+        query!(b"null", r#"[1899,0,1,0,0,0,4,9223372036854775807] | strftime("%j %U %W")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-2147483648 -306783378 -306783377"));
-        query!(b"null", r#"[1970,0,1,0,0,0,-9223372036854775808,0] | strftime("%U %W")"#,
+        query!(b"null", r#"[1899,0,1,0,0,0,-9223372036854775808,0] | strftime("%U %W")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-306783377 -306783377"));
+        // From 1900 jq 1.8.2 recomputes them (#7606; jq 1.7.1 prints the row above).
+        query!(b"null", r#"[1970,0,1,0,0,0,4,9223372036854775807] | strftime("%j %U %W")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "001 00 00"));
         query!(b"null", r#"[2024,5,15,10,30,0,6,166] | strftime("%j %U %W %V %G %g")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "167 23 24 24 2024 24"));
         // Sunday is the special case in %W's Monday-first weekday remap.
@@ -162065,10 +162162,17 @@ mod tests {
         );
 
         // jq's C formatter uses the raw out-of-range weekday in both week
-        // calculations (#3083); verified against pinned jq 1.7.1.
-        query!(b"[2024,0,1,0,0,0,-7,0]", r#"strftime("%U %W")"#,
+        // calculations (#3083), where `timegm` leaves it as given, before 1900;
+        // verified against jq 1.7.1 and 1.8.2. From 1900 jq 1.8.2 recomputes it
+        // (#7606): 2024-01-01 is a Monday, `00 01`, where jq 1.7.1 says `02 02`.
+        query!(b"[1899,0,1,0,0,0,-7,0]", r#"strftime("%U %W")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "02 02");
+            }
+        );
+        query!(b"[2024,0,1,0,0,0,-7,0]", r#"strftime("%U %W")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "00 01");
             }
         );
     }
@@ -162157,55 +162261,70 @@ mod tests {
     /// C-locale `/usr/bin/jq` 1.7.1.
     #[test]
     fn test_strftime_out_of_range_weekday_month_names_3159() {
+        // Before 1900 `timegm` leaves the fields as given (#7606), so they reach the
+        // formatter; every row here is the same in jq 1.7.1 and jq 1.8.2.
         // Weekday out of range: -1 (negative) and 7 (one past valid 0-6).
-        query!(b"null", r#"[2020,0,1,0,0,0,-1,0] | strftime("%a|%A|%w|%u|%c")"#,
+        query!(b"null", r#"[1899,0,1,0,0,0,-1,0] | strftime("%a|%A|%w|%u|%c")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "?|?|-1|-1|? Jan  1 00:00:00 2020");
+                assert_eq!(s, "?|?|-1|-1|? Jan  1 00:00:00 1899");
             }
         );
-        query!(b"null", r#"[2020,0,1,0,0,0,7,0] | strftime("%a|%A|%w|%u|%c")"#,
+        query!(b"null", r#"[1899,0,1,0,0,0,7,0] | strftime("%a|%A|%w|%u|%c")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "?|?|7|7|? Jan  1 00:00:00 2020");
+                assert_eq!(s, "?|?|7|7|? Jan  1 00:00:00 1899");
             }
         );
         // Boundary values: weekday 6 is the last valid name index.
-        query!(b"null", r#"[2020,0,1,0,0,0,6,0] | strftime("%a|%A")"#,
+        query!(b"null", r#"[1899,0,1,0,0,0,6,0] | strftime("%a|%A")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "Sat|Saturday");
             }
         );
-        // Month out of range: -1, 12, 13 (valid array months are 0-11).
-        query!(b"null", r#"[2020,-1,1,0,0,0,0,0] | strftime("%b|%h|%B|%m|%c")"#,
+        // Month out of range: -1 (valid array months are 0-11); 12 and 13
+        // carry into 1900 and 1900 is normalised.
+        query!(b"null", r#"[1899,-1,1,0,0,0,0,0] | strftime("%b|%h|%B|%m|%c")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "?|?|?|00|Sun ?  1 00:00:00 2020");
-            }
-        );
-        query!(b"null", r#"[2020,12,1,0,0,0,0,0] | strftime("%b|%B|%m|%c")"#,
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "?|?|13|Sun ?  1 00:00:00 2020");
-            }
-        );
-        query!(b"null", r#"[2020,13,1,0,0,0,0,0] | strftime("%b|%B|%m")"#,
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "?|?|14");
+                assert_eq!(s, "?|?|?|00|Sun ?  1 00:00:00 1899");
             }
         );
         // Boundary value: array month 11 is the last valid name index.
-        query!(b"null", r#"[2020,11,1,0,0,0,0,0] | strftime("%b|%B|%m")"#,
+        query!(b"null", r#"[1899,11,1,0,0,0,0,0] | strftime("%b|%B|%m")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
                 assert_eq!(s, "Dec|December|12");
             }
         );
         // Both out of range at once.
-        query!(b"null", r#"[2020,-1,1,0,0,0,-1,0] | strftime("%c")"#,
+        query!(b"null", r#"[1899,-1,1,0,0,0,-1,0] | strftime("%c")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "? ?  1 00:00:00 2020");
+                assert_eq!(s, "? ?  1 00:00:00 1899");
             }
         );
-        // Regression guard: the valid range still formats as before.
-        query!(b"null", r#"[2020,0,1,0,0,0,0,0] | strftime("%a|%A|%b|%B|%c")"#,
+        // From 1900 jq 1.8.2 normalises first (#7606), so an out-of-range field
+        // never reaches the names; jq 1.7.1 prints `?` here as above.
+        query!(b"null", r#"[2020,0,1,0,0,0,-1,0] | strftime("%a|%A|%w|%u|%c")"#,
             QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "Sun|Sunday|Jan|January|Sun Jan  1 00:00:00 2020");
+                assert_eq!(s, "Wed|Wednesday|3|3|Wed Jan  1 00:00:00 2020");
+            }
+        );
+        query!(b"null", r#"[2020,-1,1,0,0,0,-1,0] | strftime("%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Sun Dec  1 00:00:00 2019");
+            }
+        );
+        query!(b"null", r#"[2020,13,1,0,0,0,0,0] | strftime("%b|%B|%m")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Feb|February|02");
+            }
+        );
+        query!(b"null", r#"[1899,12,1,0,0,0,0,0] | strftime("%b|%B|%m|%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Jan|January|01|Mon Jan  1 00:00:00 1900");
+            }
+        );
+        // Regression guard: a consistent date formats as before.
+        query!(b"null", r#"[2020,0,1,0,0,0,3,0] | strftime("%a|%A|%b|%B|%c")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "Wed|Wednesday|Jan|January|Wed Jan  1 00:00:00 2020");
             }
         );
     }
