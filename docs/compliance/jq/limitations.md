@@ -5983,9 +5983,14 @@ It steps over every other member's value by the index's bracket structure, readi
 `.x.a`, `.`, `-n input`, `--stream .` and `--slurp .` read the inner object and raise as jq does (`--slurp` from stdin in the evaluator's wording, as above).
 A filter that fails on the document's own type before it reads an element names that failure, not jq's parse error: `[{"a":}] | .a` is `jq: error (at <stdin>:0): Cannot index array with string "a"`, exit 5, where jq prints `jq: parse error: Unmatched '}' at line 1, column 7`, exit 5; `[1,,3] | .a` and `{"a":} | .[0]` are the same.
 A lookup also checks the `,` and `:` of the member it returns and the gap after the last member, but not the gaps of the members it steps over: `{"a":1 "b":2} | .a` prints `1`, and `{"a",1} | .b` and `{"a" 1} | .b` print `null`, exit 0, where jq refuses all three.
-Seeing either kind of fault would mean reading text the lookup now skips, for every member of every object a field lookup walks, which is the hot path of every program; it stays as recorded here until that cost is measured.
+A lookup of a key the object does not hold walks every member and finds none, so it returns no member whose gaps it would check ([#7556](https://github.com/rust-works/succinctly/issues/7556)): `{"z":1 "y":2}`, `{"z":1,,"y":2}`, `{"z":1,"y"::2}` and `{,"z":1}` answer `.a`, `.["a"]`, `getpath(["a"])`, `.a // "d"` and `{a}` as `{"z":1,"y":2}` does, exit 0, where `has("a")` on the same objects raises jq's parse error, as jq 1.7.1 and 1.8.2 do for every one of these filters.
+Seeing either kind of fault means reading the text of every gap the lookup steps over: the index holds no bit for a `,` or a `:`, so `{"z":1 "y":2}` and `{"z":1,"y":2}` index identically.
+That cost was measured for #7556 with the check made only on the absent-key path, which leaves a lookup that finds its key unchanged.
+As a second walk of the members it cost +48-60% wall clock on `.users | map(.nope)` and +72-79% on `.nope` over one wide object at 100 MB, on an Apple M4 Pro and an AMD Ryzen 9 7950X.
+As a scan of the interest bits, which steps from one node to the next without the tree, it still cost +13-14% and +16% in instructions on the same two queries (Apple M5 Max, instruction counts only).
+That is a measurable cost on well-formed input to report a fault in input jq refuses, so an absent key keeps the trade a found key has had since #2288.
 NDJSON lines and a windowed stream of 1 MiB or more answer in the same way, line by line.
-Pinned by `tests/jq_cli/i7448_nested.rs`.
+Pinned by `tests/jq_cli/i7448_nested.rs` and `tests/jq_cli/i7556.rs`.
 
 ### A parse error past 2^31 lines or columns reports the true position ([#7461](https://github.com/rust-works/succinctly/issues/7461))
 
