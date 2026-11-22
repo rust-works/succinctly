@@ -934,7 +934,7 @@ impl PlainScan {
     }
 
     fn read(&mut self, bytes: &[u8]) -> PlainRead {
-        use PlainExpect::*;
+        use PlainExpect::{Colon, CommaOrClose, Key, KeyOrClose, Value, ValueOrClose};
         let mut at = 0;
         while at < bytes.len() {
             if self.string == 1 {
@@ -1381,7 +1381,7 @@ mod tests {
             (state % bound as u64) as usize
         };
         for round in 0..60_000 {
-            let mut text = vec![[b'[', b'{', b'"'][round % 3]];
+            let mut text = vec![b"[{\""[round % 3]];
             if round % 3 == 1 && next(2) == 0 {
                 text.extend_from_slice(b"\"k\":");
             }

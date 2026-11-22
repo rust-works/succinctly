@@ -14689,9 +14689,10 @@ fn stitch_json_file_seams_onto<'a>(
             });
             let tail = match continued {
                 Some(reader) => {
+                    let text: &[u8] = raw;
                     debug_assert!(
-                        raw.len() > 1 << 20
-                            || open_tail_start(raw, resumes, seams[index].clone(), stream)
+                        text.len() > 1 << 20
+                            || open_tail_start(text, resumes, seams[index].clone(), stream)
                                 == Some(0),
                         "the reader of a carried value answers as a scan of the file from its front"
                     );
@@ -14880,7 +14881,11 @@ fn open_tail_after_split_reading(
     last: Option<(usize, usize)>,
 ) -> Option<(usize, Option<jq::JqOpenTail>)> {
     match fault {
-        Some(start) => tail_cut_off(&raw[start..]).map(|reader| (start, reader)),
+        Some(start) => match tail_cut_off(&raw[start..]) {
+            TailCut::Malformed => None,
+            TailCut::Open(reader) => Some((start, Some(reader))),
+            TailCut::BareToken => Some((start, None)),
+        },
         None => bare_token_at_end(raw, last).map(|start| (start, None)),
     }
 }
@@ -14907,19 +14912,33 @@ fn bare_token_at_end(raw: &[u8], last: Option<(usize, usize)>) -> Option<usize> 
 /// inside a container or string pays for the parser, and it reads each byte once: the reader goes on
 /// with the next file's bytes from where it stopped ([`tail_cut_off`]).
 fn token_runs_to_end(tail: &[u8]) -> bool {
-    tail_cut_off(tail).is_some()
+    !matches!(tail_cut_off(tail), TailCut::Malformed)
 }
 
-/// [`token_runs_to_end`]: `None` when `tail` is not cut off; `Some(reader)` for a container or string,
-/// with jq's parser after reading it, which only a value it holds open and has met no fault in passes;
-/// `Some(None)` for a bare token with no byte after it.
-fn tail_cut_off(tail: &[u8]) -> Option<Option<jq::JqOpenTail>> {
+/// How a token the splitter could not finish ends, by [`tail_cut_off`].
+enum TailCut {
+    /// Not cut off by the end of the file: malformed.
+    Malformed,
+    /// A container or string jq's parser holds open and has met no fault in, with the parser after
+    /// reading it.
+    Open(jq::JqOpenTail),
+    /// A bare token with no byte after it to end it.
+    BareToken,
+}
+
+/// [`token_runs_to_end`], with jq's parser after reading a container or string it holds open.
+fn tail_cut_off(tail: &[u8]) -> TailCut {
     match tail.first() {
         Some(b'{' | b'[' | b'"') => {
             let mut reader = jq::JqOpenTail::new();
-            (reader.read(tail, 0) == jq::TailRead::Open).then_some(Some(reader))
+            if reader.read(tail, 0) == jq::TailRead::Open {
+                TailCut::Open(reader)
+            } else {
+                TailCut::Malformed
+            }
         }
-        _ => brackets_run_to_end(tail).then_some(None),
+        _ if brackets_run_to_end(tail) => TailCut::BareToken,
+        _ => TailCut::Malformed,
     }
 }
 
@@ -28767,7 +28786,7 @@ mod tests {
         };
         for _ in 0..4000 {
             let mut text = Vec::new();
-            for _ in 0..1 + next(8) {
+            for _ in 0..=next(8) {
                 text.extend_from_slice(pieces[next(pieces.len())]);
             }
             let files = 2 + next(5);
