@@ -3,6 +3,8 @@
 //! look-behind reads no further than one character past the search's start. A look-behind that
 //! consumes fails there once two characters follow, and a negative one holds. Every expected
 //! answer was captured from jq 1.7.1 (`/usr/bin/jq`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -59,7 +61,11 @@ fn a_consuming_look_behind_reads_as_the_end_search_does_6510() -> Result<()> {
         (r"(?:(?<=b)|(?<=a))\z", "ab", r#"[[],false,"ab"]"#),
         (r"(?<=(b))\z", "ab", r#"[[],false,"ab"]"#),
         (r"((?<!b))\z", "ab", r#"[[[2,[2]]],true,"abX"]"#),
-        (r"(?:(?<=(b))|())\z", "ab", r#"[[[2,[2,2]]],true,"abX"]"#),
+        // The look-behind never matches on this search (#6510), so the second way answers; its
+        // group is set and the first is not (jq 1.8.2, #7520: 1.7.1 reported both as `2`). jq 1.8.2
+        // itself matches the look-behind here, as its Oniguruma reads `(?<=b)\z` over `ab`: that
+        // difference is the end search's, not this row's.
+        (r"(?:(?<=(b))|())\z", "ab", r#"[[[2,[-1,2]]],true,"abX"]"#),
         ("\\z(?<=\\n)", "a\n", r#"[[],false,"a\n"]"#),
         (r"(?m)\z(?<=b)", "a\nb", r#"[[],false,"a\nb"]"#),
         (r"(?i)(?<=B)\z", "ab", r#"[[],false,"ab"]"#),
@@ -101,7 +107,7 @@ fn the_usual_search_is_left_alone_6510() -> Result<()> {
         (r"(?<=b|c?)\z", "ab", r#"[[[2,[]]],true,"abX"]"#),
         (r"(?<=b|c*)\z", "ab", r#"[[[2,[]]],true,"abX"]"#),
         (r"(?<=(?:b|))\z", "ab", r#"[[[2,[]]],true,"abX"]"#),
-        (r"(?<=(b)|)\z", "ab", r#"[[[2,[2]]],true,"abX"]"#),
+        (r"(?<=(b)|)\z", "ab", r#"[[[2,[-1]]],true,"abX"]"#),
         (r"(?<!b|)\z", "ab", r#"[[],false,"ab"]"#),
         (r"(?<!b?|c)\z", "ab", r#"[[],false,"ab"]"#),
     ])

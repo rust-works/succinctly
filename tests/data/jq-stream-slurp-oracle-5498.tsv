@@ -313,51 +313,51 @@
 {"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[inputs]|length	-c --stream -s	0\n		0
 {"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[inputs]|length	-c --stream -s -n	1\n		0
 {"a":{"b":{"c":[1,{"d":2}]}}}\n[[[]]]\n{}\n	[inputs]|length	-c --stream -s -e	0\n		0
-{"a":1}	.	-c --stream -s	[[["a"],1]]\n[["a"]]\n		0
+{"a":1}	.	-c --stream -s	[[["a"],1],[["a"]]]\n		0
 {"a":1}	.	-c --stream -s -n	null\n		0
-{"a":1}	.	-c --stream -s -e	[[["a"],1]]\n[["a"]]\n		0
-{"a":1}	length	-c --stream -s	1\n1\n		0
+{"a":1}	.	-c --stream -s -e	[[["a"],1],[["a"]]]\n		0
+{"a":1}	length	-c --stream -s	2\n		0
 {"a":1}	length	-c --stream -s -n	0\n		0
-{"a":1}	length	-c --stream -s -e	1\n1\n		0
-{"a":1}	.[0]	-c --stream -s	[["a"],1]\n["a"]\n		0
+{"a":1}	length	-c --stream -s -e	2\n		0
+{"a":1}	.[0]	-c --stream -s	[["a"],1]\n		0
 {"a":1}	.[0]	-c --stream -s -n	null\n		0
-{"a":1}	.[0]	-c --stream -s -e	[["a"],1]\n["a"]\n		0
-{"a":1}	[limit(5;.[])]	-c --stream -s	[[["a"],1]]\n[["a"]]\n		0
+{"a":1}	.[0]	-c --stream -s -e	[["a"],1]\n		0
+{"a":1}	[limit(5;.[])]	-c --stream -s	[[["a"],1],[["a"]]]\n		0
 {"a":1}	[limit(5;.[])]	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
-{"a":1}	[limit(5;.[])]	-c --stream -s -e	[[["a"],1]]\n[["a"]]\n		0
-{"a":1}	map(select(length==2))|length	-c --stream -s	1\n0\n		0
+{"a":1}	[limit(5;.[])]	-c --stream -s -e	[[["a"],1],[["a"]]]\n		0
+{"a":1}	map(select(length==2))|length	-c --stream -s	1\n		0
 {"a":1}	map(select(length==2))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
-{"a":1}	map(select(length==2))|length	-c --stream -s -e	1\n0\n		0
-{"a":1}	map(select(length==1))|length	-c --stream -s	0\n1\n		0
+{"a":1}	map(select(length==2))|length	-c --stream -s -e	1\n		0
+{"a":1}	map(select(length==1))|length	-c --stream -s	1\n		0
 {"a":1}	map(select(length==1))|length	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
-{"a":1}	map(select(length==1))|length	-c --stream -s -e	0\n1\n		0
-{"a":1}	[.[]|select(length==2)|.[1]]|add	-c --stream -s	1\nnull\n		0
+{"a":1}	map(select(length==1))|length	-c --stream -s -e	1\n		0
+{"a":1}	[.[]|select(length==2)|.[1]]|add	-c --stream -s	1\n		0
 {"a":1}	[.[]|select(length==2)|.[1]]|add	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
-{"a":1}	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	1\nnull\n		1
-{"a":1}	input_line_number	-c --stream -s	0\n0\n		0
+{"a":1}	[.[]|select(length==2)|.[1]]|add	-c --stream -s -e	1\n		0
+{"a":1}	input_line_number	-c --stream -s	0\n		0
 {"a":1}	input_line_number	-c --stream -s -n	0\n		0
-{"a":1}	input_line_number	-c --stream -s -e	0\n0\n		0
-{"a":1}	[., input_line_number]	-c --stream -s	[[[["a"],1]],0]\n[[["a"]],0]\n		0
+{"a":1}	input_line_number	-c --stream -s -e	0\n		0
+{"a":1}	[., input_line_number]	-c --stream -s	[[[["a"],1],[["a"]]],0]\n		0
 {"a":1}	[., input_line_number]	-c --stream -s -n	[null,0]\n		0
-{"a":1}	[., input_line_number]	-c --stream -s -e	[[[["a"],1]],0]\n[[["a"]],0]\n		0
-{"a":1}	first	-c --stream -s	[["a"],1]\n["a"]\n		0
+{"a":1}	[., input_line_number]	-c --stream -s -e	[[[["a"],1],[["a"]]],0]\n		0
+{"a":1}	first	-c --stream -s	[["a"],1]\n		0
 {"a":1}	first	-c --stream -s -n	null\n		0
-{"a":1}	first	-c --stream -s -e	[["a"],1]\n["a"]\n		0
-{"a":1}	last	-c --stream -s	[["a"],1]\n["a"]\n		0
+{"a":1}	first	-c --stream -s -e	[["a"],1]\n		0
+{"a":1}	last	-c --stream -s	[["a"]]\n		0
 {"a":1}	last	-c --stream -s -n	null\n		0
-{"a":1}	last	-c --stream -s -e	[["a"],1]\n["a"]\n		0
-{"a":1}	tojson	-c --stream -s	"[[[\\"a\\"],1]]"\n"[[\\"a\\"]]"\n		0
+{"a":1}	last	-c --stream -s -e	[["a"]]\n		0
+{"a":1}	tojson	-c --stream -s	"[[[\\"a\\"],1],[[\\"a\\"]]]"\n		0
 {"a":1}	tojson	-c --stream -s -n	"null"\n		0
-{"a":1}	tojson	-c --stream -s -e	"[[[\\"a\\"],1]]"\n"[[\\"a\\"]]"\n		0
-{"a":1}	map(.[0])|unique	-c --stream -s	[["a"]]\n["a"]\n		0
+{"a":1}	tojson	-c --stream -s -e	"[[[\\"a\\"],1],[[\\"a\\"]]]"\n		0
+{"a":1}	map(.[0])|unique	-c --stream -s	[["a"]]\n		0
 {"a":1}	map(.[0])|unique	-c --stream -s -n		jq: error (at <unknown>): Cannot iterate over null (null)\n	5
-{"a":1}	map(.[0])|unique	-c --stream -s -e	[["a"]]\n["a"]\n		0
-{"a":1}	try input catch "E"	-c --stream -s	[["a"]]\n		0
-{"a":1}	try input catch "E"	-c --stream -s -n	[[["a"],1]]\n		0
-{"a":1}	try input catch "E"	-c --stream -s -e	[["a"]]\n		0
-{"a":1}	[inputs]|length	-c --stream -s	1\n		0
-{"a":1}	[inputs]|length	-c --stream -s -n	2\n		0
-{"a":1}	[inputs]|length	-c --stream -s -e	1\n		0
+{"a":1}	map(.[0])|unique	-c --stream -s -e	[["a"]]\n		0
+{"a":1}	try input catch "E"	-c --stream -s	"E"\n		0
+{"a":1}	try input catch "E"	-c --stream -s -n	[[["a"],1],[["a"]]]\n		0
+{"a":1}	try input catch "E"	-c --stream -s -e	"E"\n		0
+{"a":1}	[inputs]|length	-c --stream -s	0\n		0
+{"a":1}	[inputs]|length	-c --stream -s -n	1\n		0
+{"a":1}	[inputs]|length	-c --stream -s -e	0\n		0
 \n\n[1]\n\n{"a":[]}\n	.	-c --stream -s	[[[0],1],[[0]],[["a"],[]],[["a"]]]\n		0
 \n\n[1]\n\n{"a":[]}\n	.	-c --stream -s -n	null\n		0
 \n\n[1]\n\n{"a":[]}\n	.	-c --stream -s -e	[[[0],1],[[0]],[["a"],[]],[["a"]]]\n		0

@@ -3,10 +3,9 @@
 //! (`-1` is a tab); anything else (empty, white space, `3x`, `3.0`, `0x2`, `abc`, `--`, a value past
 //! a `long`) is refused with exit 2. jq 1.7.1 read it with C's `atoi` (#6017) and ran those. `-L ""`
 //! is a search-path element, not a missing value. Expectations are what jq 1.8.2
-//! (`/opt/homebrew/bin/jq`) printed (stdout and exit status; the error wording is clap's here),
-//! except the values that read as 0: jq 1.8 also stopped printing `--indent 0` compactly (#3232,
-//! "Fix `--indent 0` implicitly enabling `--compact-output`"), which is not adopted here, so those
-//! rows keep jq 1.7.1's output.
+//! (`/opt/homebrew/bin/jq`) printed (stdout and exit status; the error wording is clap's here).
+//! That includes the values that read as 0, which print newlines with no indentation as jq 1.8
+//! does (#7605, jqlang/jq#3232); jq 1.7.1 printed them compactly.
 
 use anyhow::Result;
 
@@ -17,7 +16,7 @@ use crate::run_jq_full;
 fn the_option_values_are_read_as_jq_reads_them() -> Result<()> {
     let rows: &[(&[&str], &str, &str, i32)] = &[
         (&["--indent", "", "."], "{\"a\":[1]}", "", 2),
-        (&["--indent", "0", "."], "{\"a\":[1]}", "{\"a\":[1]}\n", 0),
+        (&["--indent", "0", "."], "{\"a\":[1]}", "{\n\"a\": [\n1\n]\n}\n", 0),
         (&["--indent", "1", "."], "{\"a\":[1]}", "{\n \"a\": [\n  1\n ]\n}\n", 0),
         (&["--indent", "2", "."], "{\"a\":[1]}", "{\n  \"a\": [\n    1\n  ]\n}\n", 0),
         (&["--indent", "7", "."], "{\"a\":[1]}", "{\n       \"a\": [\n              1\n       ]\n}\n", 0),
@@ -45,7 +44,7 @@ fn the_option_values_are_read_as_jq_reads_them() -> Result<()> {
         (&["--indent", "\t3", "."], "{\"a\":[1]}", "", 2),
         (&["--indent", " -1", "."], "{\"a\":[1]}", "", 2),
         (&["--indent", "+-3", "."], "{\"a\":[1]}", "", 2),
-        (&["--indent", "-0", "."], "{\"a\":[1]}", "{\"a\":[1]}\n", 0),
+        (&["--indent", "-0", "."], "{\"a\":[1]}", "{\n\"a\": [\n1\n]\n}\n", 0),
         (&["--indent", "3", "-c", "."], "{\"a\":[1]}", "{\"a\":[1]}\n", 0),
         (&["-c", "--indent", "3", "."], "{\"a\":[1]}", "{\n   \"a\": [\n      1\n   ]\n}\n", 0),
         (&["--tab", "--indent", "2", "."], "{\"a\":[1]}", "{\n  \"a\": [\n    1\n  ]\n}\n", 0),

@@ -3,6 +3,8 @@
 //! has `["","a"]`), where the crate's copies of the body kept `["a","a"]`. The capture rewrite of
 //! #6309 now writes such a repeat as the `*` loop, and the loop rewrite of #6332 reads its groups.
 //! Every row was captured from jq 1.7.1 (`/usr/bin/jq -nc`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -32,39 +34,39 @@ fn test_a_counted_repeat_of_a_group_with_a_group_inside_ends_at_the_empty_way_63
         (
             "ba",
             "((a)|b*){2,}",
-            r#"[[0,"ba",["","a"]],[2,"",["",""]]]"#,
+            r#"[[0,"ba",["","a"]],[2,"",["",null]]]"#,
         ),
         (
             "bab",
             "((a)|b*){3,}",
-            r#"[[0,"bab",["","a"]],[3,"",["",""]]]"#,
+            r#"[[0,"bab",["","a"]],[3,"",["",null]]]"#,
         ),
         (
             "abab",
             "((a)|b*){2,}",
-            r#"[[0,"abab",["","a"]],[4,"",["",""]]]"#,
+            r#"[[0,"abab",["","a"]],[4,"",["",null]]]"#,
         ),
         (
             "ba",
             "((a)|(b)|c*){2,}",
-            r#"[[0,"ba",["","a","b"]],[2,"",["","",""]]]"#,
+            r#"[[0,"ba",["","a","b"]],[2,"",["",null,null]]]"#,
         ),
         (
             "ba",
             "(((a)|b*)c*){2,}",
-            r#"[[0,"ba",["","","a"]],[2,"",["","",""]]]"#,
+            r#"[[0,"ba",["","","a"]],[2,"",["","",null]]]"#,
         ),
         (
             "ba",
             "(?<x>(a)|b*){2,}",
-            r#"[[0,"ba",["","a"]],[2,"",["",""]]]"#,
+            r#"[[0,"ba",["","a"]],[2,"",["",null]]]"#,
         ),
     ] {
         assert_rows(&[(&row(subject, pattern), expected)])?;
     }
     assert_rows(&[(
         r#""ba" | [capture("(?<x>(?<y>a)|b*){2,}";"g")]"#,
-        r#"[{"x":"","y":"a"},{"x":"","y":""}]"#,
+        r#"[{"x":"","y":"a"},{"x":"","y":null}]"#,
     )])
 }
 
@@ -74,7 +76,7 @@ fn test_a_counted_repeat_of_a_group_with_a_group_inside_ends_at_the_empty_way_63
 fn test_loops_over_a_group_that_already_agreed_still_do_6347() -> Result<()> {
     for (subject, pattern, expected) in [
         ("abb", "(b|){2,}$", r#"[[1,"bb",[""]],[3,"",[""]]]"#),
-        ("ba", "((a)|b*)+", r#"[[0,"ba",["","a"]],[2,"",["",""]]]"#),
+        ("ba", "((a)|b*)+", r#"[[0,"ba",["","a"]],[2,"",["",null]]]"#),
     ] {
         assert_rows(&[(&row(subject, pattern), expected)])?;
     }

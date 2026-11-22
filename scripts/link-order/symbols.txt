@@ -401,6 +401,8 @@ succinctly::cli::jq_runner::input_display_name
 alloc::io::read::default_read_to_end::small_probe_read::<std::fs::File>
 succinctly::json::simd::avx2::build_semi_index_standard_avx2
 succinctly::trees::bp::build_bp_index
+# #7537: added by hand: the body of `build`, which now inlines to a call of it, so it stays in the hot text
+<succinctly::json::light::JsonIndex>::build_counted
 <succinctly::json::light::JsonIndex>::build
 succinctly::trees::bp::build_l1_index_sse41_impl
 succinctly::trees::bp::build_l2_index_sse41_impl

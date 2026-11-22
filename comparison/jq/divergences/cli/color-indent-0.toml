@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+reason = "`-C --indent 0` prints jq 1.7.1's colour bytes in jq 1.8's `--indent 0` layout (newlines, no indentation, jqlang/jq#3232); jq 1.7.1 prints it compactly. succinctly follows 1.8.2's layout (docs/compliance/jq/limitations.md, #7605)."
+issue = "7605"

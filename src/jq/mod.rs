@@ -120,6 +120,8 @@ mod onig_fold_data;
 mod onig_look_behind;
 #[cfg(feature = "regex")]
 mod onig_loop;
+#[cfg(feature = "regex")]
+mod onig_quantifier;
 mod parse_message;
 mod parser;
 #[cfg(feature = "regex")]
