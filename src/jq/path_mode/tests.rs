@@ -2784,7 +2784,9 @@ fn the_key_handing_prelude_table_is_derived_from_the_prelude_7489() {
 /// nothing (#7489). Through the library entry, a path program that calls its
 /// own `def` first is then refused at that call, as eval.rs's
 /// `every_route_checks_the_native_stack_floor_3262` pins, where deciding by
-/// parsing the prelude's bodies panicked before the run began.
+/// parsing the prelude's bodies panicked before the run began. Without `std`
+/// there is no floor ([`crate::jq::with_stack_budget`] is a no-op).
+#[cfg(feature = "std")]
 #[test]
 fn the_key_decision_is_reached_at_the_native_stack_floor_7489() {
     on_big_stack(|| {
