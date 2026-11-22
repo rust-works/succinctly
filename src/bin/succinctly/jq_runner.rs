@@ -12143,28 +12143,42 @@ fn blank_nul_number_tails_in<'a>(
             0
         };
         // The part of the first line the earlier files hold, when the NUL is on that line, behind
-        // the BOM jq skips at the stream's front.
+        // the BOM jq skips at the stream's front: where in each file it starts, last file first.
         let mut head: Vec<u8> = Vec::new();
+        let mut parts: Vec<(usize, usize)> = Vec::new();
         if !raw[..nul].contains(&b'\n') {
             for (index, earlier) in before.iter().enumerate().rev() {
-                if let Some(last) = earlier.iter().rposition(|&b| b == b'\n') {
-                    head.splice(0..0, earlier[last + 1..].iter().copied());
+                let line_break = earlier.iter().rposition(|&b| b == b'\n');
+                let from = match line_break {
+                    Some(last) => last + 1,
+                    None if Some(index) == front => {
+                        crate::cli::front_matter::leading_bom_len(earlier)
+                    }
+                    None => 0,
+                };
+                head.splice(0..0, earlier[from..].iter().copied());
+                parts.push((index, from));
+                if line_break.is_some() {
                     break;
                 }
-                let skip = if Some(index) == front {
-                    crate::cli::front_matter::leading_bom_len(earlier)
-                } else {
-                    0
-                };
-                head.splice(0..0, earlier[skip..].iter().copied());
             }
         }
-        succinctly::jq::blank_nul_number_tails(
+        let rewrote = succinctly::jq::blank_nul_number_tails(
             &mut raw[bom..],
             Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
             bom,
-            &head,
+            &mut head,
         );
+        // #7749: a number that started in the earlier files is rewritten over them too.
+        if rewrote && !head.is_empty() {
+            let mut end = head.len();
+            for &(index, from) in &parts {
+                let earlier = &mut *before[index];
+                let len = earlier.len() - from;
+                earlier[from..].copy_from_slice(&head[end - len..end]);
+                end -= len;
+            }
+        }
     }
 }
 
@@ -15700,11 +15714,32 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
         }
         // The scan reads the text after the BOM jq skips (#5291), as `get_inputs` strips it.
         let bom = crate::cli::front_matter::leading_bom_len(&bytes);
+        // The front validated and searched for a NUL in one read of it (#7437).
+        let scan = succinctly::jq::scan_utf8_and_nul(&bytes[bom..]);
+        // #7748: the number tokens' NUL tails of the front, as the route that reads the source whole
+        // rewrites them ([`blank_nul_number_tails_in`]) and as each window after it is
+        // ([`blank_lazy_window_nul_tails`]), before the scan reads it: the text handed to the lazy
+        // route is the front, and only the windows read after it were rewritten. A NUL whose read
+        // has no newline yet is left to the next read, or to the window that brings the newline.
+        // The rewrite writes ASCII over whole tokens, so a UTF-8 front stays UTF-8; one that was not
+        // is validated again below, as the rewrite may have taken its stray byte out of a tail.
+        if scan.nul {
+            succinctly::jq::blank_nul_number_tails(
+                &mut bytes[bom..],
+                Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
+                bom,
+                &mut [],
+            );
+        }
         // Up to the last whole character: the front may end inside one.
-        let valid_end = match std::str::from_utf8(&bytes[bom..]) {
-            Ok(_) => bytes.len(),
-            Err(e) if e.error_len().is_none() => bom + e.valid_up_to(),
-            Err(_) => bom,
+        let valid_end = if scan.utf8 {
+            bytes.len()
+        } else {
+            match std::str::from_utf8(&bytes[bom..]) {
+                Ok(_) => bytes.len(),
+                Err(e) if e.error_len().is_none() => bom + e.valid_up_to(),
+                Err(_) => bom,
+            }
         };
         // The line of a document is jq's count through the read that completes it, which runs to the
         // next newline ([`LineCounter::read_end_line`]): a newline after the chunk's last document
@@ -16005,7 +16040,7 @@ fn blank_lazy_window_nul_tails(text: &mut [u8], kept: usize) {
             &mut text[line_start..],
             Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
             0,
-            &[],
+            &mut [],
         );
     }
 }

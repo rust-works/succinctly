@@ -353,6 +353,8 @@ A chunk that does hold a newline is handed to the parser whole, NULs included, a
 A NUL that starts a token, follows `true`, `false` or `null`, or sits in a string is then an error (`Invalid numeric literal`, `Invalid literal`, or the control-character one).
 One glued to a number is not: `check_literal` hands the number's token to its parser as a C string, which stops at the NUL, so `[1`, a NUL, `x,2]` and a newline is `[1,2]` and the rest of the token is dropped with the NUL (#7437).
 `succinctly jq` reads both the same way, on every route that reads JSON input, and in `fromjson`, which reads its string by its length and so needs no newline (`"[1\u0000,2]" | fromjson` is `[1,2]` in jq 1.7.1 and 1.8.2).
+The token still ends where jq's tokenizer ends it, at the next byte that ends a token, not at the NUL: `[[1]1`, a NUL, `]` is `Expected separator between values` at column 7, and `1`, a NUL, `}` is `Unmatched '}'` with no `1` printed first, in both jq versions and in `succinctly jq` (#7749).
+That includes the front of a lone source the lazy `input`/`inputs` route starts on (#7748).
 
 Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinctly jq`:
 
@@ -449,6 +451,19 @@ What the same upstream change does not reach here: a text that ends in a fault (
 `--seq` keeps the 1.7.1 model of the slurp loop, and so do the cases that read a directory in the middle of the file list.
 `succinctly yq` is not changed.
 Pinned by `tests/jq_cli/i7523.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
+## After the last input has been read to its end, the position is jq 1.7.1's, not jq 1.8.2's (#7607)
+
+jq 1.7.1's `jq_util_input_read_more` (`src/util.c`) forgets the file name and the line count in the call that finds the last file already at end of file, which happens when its last line has no newline, and it reports the run done in that same call.
+So a program that reads every input and then fails names no position: `jq -n -c '[inputs], error("x")' nonl.json`, where `nonl.json` is `[1,2,3]\n[4]` with no newline after `[4]`, prints `jq: error (at <unknown>): x`, and `[inputs] | input_line_number, input_filename` is `0` and `null`.
+The same holds for standard input, `-R`, `--stream`, `-s` and several files (the last one decides), and a directory given last is not reported at all (`jq . a.json dir` prints `1` and exits 2 with nothing on stderr), where a directory given earlier prints `jq: error: Is a directory`.
+jq 1.8.2 keeps the name and the count past the end of the last file and makes one more call, which reports the directory: `(at nonl.json:1)`, `1` and `"nonl.json"`, `(at <stdin>:1)` for standard input, `(at nonl2.json:0)` when the last of several files is `[5]`, and `jq: error: Is a directory` for a last directory too.
+A last line with its newline keeps the position in both releases (`(at nl.json:2)`).
+Both changes come from upstream commit 4e3088f ([jqlang/jq#3279](https://github.com/jqlang/jq/pull/3279), "Fix behavior of `--slurp --stream` when input has no trailing newline character"), which moves the reset of the name and the count to the branch that opens the next file and makes `read_more` report the end only once `current_input` is closed.
+Its message, its PR text and its test name only the `--slurp --stream` fix, which `succinctly jq` follows (#7523, above); neither effect described here is called a bug or a fix upstream, so `succinctly jq` keeps jq 1.7.1's answers, the reference ADR-0018 pins, and the rules modelled on 1.7.1's reader (#2947, #3003, #6146, the directory-last family #6472, #6604, #6625, #6661, #6775, #6789) stand.
+Whether to follow jq 1.8.2 here is a question for the owners (#7607); #7461's true line number and #7472's 64-bit count are unaffected either way.
+`succinctly yq` is not affected: these are jq's reader rules.
+Pinned by `tests/jq_cli/i7607.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`), with jq 1.8.2's (`/opt/homebrew/bin/jq`) answers in its comments.
 
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
@@ -7330,6 +7345,17 @@ beyond switching helpers. Same reachability analysis applies: `succinctly yq`'s 
 site into `eval.rs` only ever sees an already-materialized, pre-validated `OwnedValue`, so
 this remains inert for both CLIs today, same as the rest of #2293's fix.
 
+### A reader raises where the reader jq defines it as raises ([#7554](https://github.com/rust-works/succinctly/issues/7554), [#7555](https://github.com/rust-works/succinctly/issues/7555))
+
+The rule these two follow is consistency between two spellings of one jq definition, not whole-document validation: a reader raises jq's parse error exactly when the reader jq defines it as already raises on the same container.
+Bare `first` is `.[0]` in jq, and `.[0]` resolves its index through the checked length walk (#2261), so `first` makes that walk too: `[,1]`, `[1,]`, `[1 2]` and `[1,,2]` piped to `first` raise as they do for `.[0]`, where `first` printed the element.
+On a YAML document, whose parser validates as it reads, `first` keeps its O(1) read.
+`all(f)` and `any(f)` are `all(.[]; f)` and `any(.[]; f)` in jq, so they check each element's `,` as the walk reaches it and the gap before the `]` when the walk runs out, as `.[]` does: `[1,] | all(. < 5)` and `[1 2] | all(. == 1)` raise, where they answered `true` and `false` (the second from the `2` after the missing comma).
+A decision before the fault stops the walk there, as `.[]` stops under `any(.[]; f)`, so `[1 2] | any(. == 1)` still answers `true` where jq rejects the document (the early-exit trade of #2103).
+Arity-0 `any`/`all` on an array still answer over a gap fault: a truthiness scan reads no element, by design (#2692).
+On an object they resolve its keys, and the zero-member `{,}` now raises there as `{"a":1,}` already did.
+Pinned by `tests/jq_cli/i7554.rs`.
+
 ## Refusing an allocation jq does not survive
 
 `setpath` takes its array index from the document, so the array it pads is sized by the
@@ -8159,6 +8185,10 @@ The three surrogate blocks hold no scalar value, so they match nothing.
 The table (`src/jq/regex_blocks.rs`, 328 blocks) is read from the pinned `/usr/bin/jq` by `scripts/jq-regex-block-table.py`, which also checks it (`--check`), so it is the Unicode version that Oniguruma links (15.0, which includes Kawi and Nag Mundari), not that of `Blocks.txt` or of the `regex` crate.
 A jq built with an older Oniguruma lacks the newest blocks, and answers `invalid character property name` for them.
 Inside a class a negated block is spelled as its complement, since under `i` Oniguruma folds the complement and the crate folds the block before it negates.
+So is any other negated property and a negated POSIX bracket inside a class where `i` may be on (the flag or an inline `(?i)`): `"A" | test("[\\P{Lu}]"; "i")` and `"a" | test("[[:^upper:]]"; "i")` are `true` in jq 1.7.1 and 1.8.2, and were `false` here, and `"a" | test("[^\\P{Lu}]"; "i")` is `false` in jq and was `true` (found by the wider regex fuzz of [#7689](https://github.com/rust-works/succinctly/issues/7689)).
+The complement is read off the crate's own table of the property, without case folding, and written as ranges, which the crate then folds as Oniguruma does.
+Outside a class a property is not folded at all, as before (#6068).
+Pinned by `tests/jq_cli/i7689_fold.rs`.
 Over every block in three spellings, the nine forms, with and without `i` (17,712 cases), the answers match jq.
 `scripts/jq-regex-property-name-sweep.py` regenerates the sweep from the `regex-syntax` version `Cargo.lock` pins, so a release that adds a name Oniguruma lacks shows up there.
 Pinned by `tests/jq_cli/i6217.rs` and `tests/jq_cli/i6228.rs`.

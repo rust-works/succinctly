@@ -22928,7 +22928,9 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     target_truthy: bool,
 ) -> QueryResult<'a, W> {
     match value {
-        StandardJson::Array(elements) => any_all_f_over::<W, S>(cond, elements, target_truthy),
+        StandardJson::Array(elements) => {
+            any_all_f_over::<W, S>(cond, gap_checked_elements(elements), target_truthy)
+        }
         // #2658: the object's *effective* values -- a repeated key collapsed
         // onto its last occurrence, in both modes, as the generic `.[]` arm
         // and `any_all_f_generic` walk them and as real yq's own `.[]`
@@ -22942,7 +22944,7 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // builtins, where yq keeps every occurrence.
         StandardJson::Object(fields) => match effective_fields(&fields, true) {
             Ok(fields) => {
-                any_all_f_over::<W, S>(cond, fields.into_iter().map(|f| f.value), target_truthy)
+                any_all_f_over::<W, S>(cond, fields.into_iter().map(|f| Ok(f.value)), target_truthy)
             }
             // A malformed value a repeated key shadows (#7427).
             Err(e) => QueryResult::Error(e),
@@ -22970,7 +22972,7 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// actually gets reached.
 fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
     cond: &Expr,
-    elements: impl Iterator<Item = StandardJson<'a, W>>,
+    elements: impl Iterator<Item = Result<StandardJson<'a, W>, EvalError>>,
     target_truthy: bool,
 ) -> QueryResult<'a, W> {
     // #3819: a count, as in `any_all_gen_cond` -- a `?//` in `cond` that
@@ -22981,6 +22983,10 @@ fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
         counted_bool_flow_to_result(matches, target_truthy, !target_truthy, flow)
     };
     for cursor_elem in elements {
+        let cursor_elem = match cursor_elem {
+            Ok(cursor_elem) => cursor_elem,
+            Err(e) => return counted(matches, Flow::Escaped(Control::Error(e))),
+        };
         let elem = match to_owned::<S, _>(&cursor_elem) {
             Ok(v) => v,
             Err(e) => {
@@ -23008,6 +23014,69 @@ fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
         }
     }
     counted(matches, Flow::Exhausted)
+}
+
+/// An array's elements as `.[]` walks them (#7555): an `Err` in place of the
+/// element whose leading `,` is missing, doubled or stray, or after the last
+/// one when the gap before the `]` holds a stray `,` -- the checks of
+/// `eval_generic`'s `each_lazy_array_iterate_sink`, made as each element is
+/// pulled, so a consumer that stops early never pays for the rest.
+fn gap_checked_elements<'a, W: Clone + AsRef<[u64]> + 'a>(
+    elements: JsonElements<'a, W>,
+) -> impl Iterator<Item = Result<StandardJson<'a, W>, EvalError>> + 'a {
+    let mut elems = elements;
+    let mut is_first = true;
+    let mut last: Option<JsonCursor<'a, W>> = None;
+    let mut done = false;
+    core::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let Some((cursor, rest)) = elems.uncons_cursor() else {
+            done = true;
+            let last = last?;
+            return (!super::document::trailing_element_gap_ok(&last, b']'))
+                .then(|| Err(elements.malformed_element_error()));
+        };
+        if !cursor.element_gap_ok(is_first) {
+            done = true;
+            return Some(Err(elements.malformed_element_error()));
+        }
+        is_first = false;
+        last = Some(cursor);
+        elems = rest;
+        Some(Ok(cursor.value()))
+    })
+}
+
+#[cfg(test)]
+mod gap_fault_readers_7554 {
+    use super::{eval_single, JqSemantics, QueryResult};
+    use crate::json::JsonIndex;
+
+    fn raises(doc: &str, filter: &str) -> bool {
+        let json = doc.as_bytes();
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(filter).expect("parses");
+        let result = eval_single::<Vec<u64>, JqSemantics>(&expr, index.root(json).value(), false);
+        matches!(result, QueryResult::Error(_))
+    }
+
+    /// This evaluator's own `first` and `all(f)`/`any(f)` arms refuse an array's gap fault as
+    /// its `.[0]` and `.[]` do (#7554, #7555), and still answer on well-formed input.
+    #[test]
+    fn first_and_any_all_f_refuse_gap_faults_7554_7555() {
+        for doc in ["[,1]", "[1,]", "[1 2]", "[1,,2]"] {
+            for filter in ["first", ".[0]", "all(. < 5)", "any(. > 5)"] {
+                assert!(raises(doc, filter), "{doc} | {filter}");
+            }
+        }
+        for filter in ["first", "all(. < 5)", "any(. > 5)", "any(. == 1)"] {
+            assert!(!raises("[1,2]", filter), "[1,2] | {filter}");
+        }
+        // A decision before the fault stops the walk, as `.[]` stops.
+        assert!(!raises("[1 2]", "any(. == 1)"));
+    }
 }
 
 /// Builtin: `any(cond)` - true if cond is truthy for any element of `.[]`.
@@ -24643,11 +24712,19 @@ fn builtin_first<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
-        StandardJson::Array(elements) => match elements.get(0) {
-            Some(v) => QueryResult::One(v),
-            // jq: [] | first => null
-            None => QueryResult::Owned(OwnedValue::Null),
-        },
+        StandardJson::Array(elements) => {
+            // #7554: `.[0]`'s length walk (`get_element_at_index` ->
+            // `count_elements`), so `first` refuses the gap faults `.[0]`
+            // refuses, as jq's `def first: .[0];` does.
+            if let Err(err) = count_elements(elements) {
+                return QueryResult::Error(err);
+            }
+            match elements.get(0) {
+                Some(v) => QueryResult::One(v),
+                // jq: [] | first => null
+                None => QueryResult::Owned(OwnedValue::Null),
+            }
+        }
         // jq: null | first => null
         StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
         // #1755: a decode failure on the scalar itself must raise
@@ -30273,7 +30350,7 @@ fn parse_complete_json(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
     if parsed.is_err() && !yq_mode && s.as_bytes().contains(&0) {
         let mut blanked = s.as_bytes().to_vec();
         // Spaces over whole characters: the text stays UTF-8.
-        if super::parse_message::blank_nul_number_tails(&mut blanked, None, 0, &[]) {
+        if super::parse_message::blank_nul_number_tails(&mut blanked, None, 0, &mut []) {
             if let Ok(Ok(value)) = core::str::from_utf8(&blanked)
                 .map(|text| parse_complete_json_after_bom(text, false))
             {
@@ -34031,6 +34108,40 @@ enum PropertyName {
 /// The code points of a block, or all the other scalar values when `negate` (#6228), as inclusive
 /// ranges in order. The surrogates are in neither: the crate refuses `\x{D800}`.
 #[cfg(feature = "regex")]
+/// The complement of the class `[body]`, read without case folding, spelled as a class of positive
+/// ranges (`[\x{0}-\x{40}...]`), for a negated property or POSIX bracket inside a class that `i`
+/// may fold (#7689). Oniguruma negates such an item before it folds the class, so `"A" |
+/// test("[\\P{Lu}]"; "i")` is `true` in jq (`a` is in the complement, and `A` folds with it);
+/// the `regex` crate folds the property first and then negates it, which leaves out every cased
+/// letter. `None` when the crate does not read `body`.
+#[cfg(feature = "regex")]
+fn spelled_complement(body: &str) -> Option<String> {
+    use regex_syntax::hir::{Class, HirKind};
+    let hir = crate::jq::onig_hir_parser()
+        .parse(&alloc::format!("(?-i:[{body}])"))
+        .ok()?;
+    let mut class = match hir.into_kind() {
+        HirKind::Class(Class::Unicode(class)) => class,
+        _ => return None,
+    };
+    class.negate();
+    let mut out = String::from("[");
+    if class.ranges().is_empty() {
+        out.push_str("^\\x{0}-\\x{10FFFF}");
+    }
+    for range in class.ranges() {
+        use std::fmt::Write as _;
+        let _ = write!(
+            out,
+            "\\x{{{:X}}}-\\x{{{:X}}}",
+            u32::from(range.start()),
+            u32::from(range.end())
+        );
+    }
+    out.push(']');
+    Some(out)
+}
+
 fn block_set(ranges: &[(u32, u32)], negate: bool) -> Vec<(u32, u32)> {
     if !negate {
         return ranges.to_vec();
@@ -34726,10 +34837,20 @@ fn translate_posix_brackets_scan(
                             }
                             PropertyName::Other => {}
                         }
+                        // #7689: a negated property in a class that `i` may fold is its complement
+                        // spelled out, which the crate folds as Oniguruma does.
+                        let spelled = (depth > 0
+                            && (kind == 'P') != caret
+                            && (ignore_case || pattern_may_set_ignore_case(pattern)))
+                        .then(|| spelled_complement(&alloc::format!("\\p{{{raw}}}")))
+                        .flatten();
                         if depth == 0 {
                             out.push_str("(?-i:");
                             out.extend(&chars[i..end]);
                             out.push(')');
+                            changed = true;
+                        } else if let Some(spelled) = spelled {
+                            out.push_str(&spelled);
                             changed = true;
                         } else {
                             out.extend(&chars[i..end]);
@@ -34990,12 +35111,21 @@ fn translate_posix_brackets_scan(
                     // Identical in both engines: copied through as written.
                     out.extend(&chars[i..name_end]);
                 } else if let Some(body) = unicode_posix_class(&name) {
-                    out.push('[');
-                    if negated {
-                        out.push('^');
+                    // #7689: under `i` Oniguruma folds the complement (see `spelled_complement`).
+                    let spelled = (negated
+                        && (ignore_case || pattern_may_set_ignore_case(pattern)))
+                    .then(|| spelled_complement(body))
+                    .flatten();
+                    if let Some(spelled) = spelled {
+                        out.push_str(&spelled);
+                    } else {
+                        out.push('[');
+                        if negated {
+                            out.push('^');
+                        }
+                        out.push_str(body);
+                        out.push(']');
                     }
-                    out.push_str(body);
-                    out.push(']');
                     changed = true;
                 } else {
                     return Err(EvalError::new("Regex failure: invalid POSIX bracket type"));
@@ -150144,6 +150274,21 @@ mod tests {
                 "{pattern}"
             );
         }
+    }
+
+    /// #7689: a negated property inside a class is written as its complement's ranges, read
+    /// without case folding.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_spelled_complement_reads_the_property_unfolded_7689() {
+        let lu = spelled_complement(r"\p{Lu}").expect("Lu");
+        assert!(lu.starts_with(r"[\x{0}-\x{40}\x{5B}-"), "{lu}");
+        assert!(lu.ends_with(r"-\x{10FFFF}]"), "{lu}");
+        assert_eq!(
+            spelled_complement(r"\x{0}-\x{10FFFF}").as_deref(),
+            Some(r"[^\x{0}-\x{10FFFF}]")
+        );
+        assert_eq!(spelled_complement(r"\p{NoSuchName}"), None);
     }
 
     /// #7689: a part that never matches leaves `regex-syntax` without a minimum length, which is
