@@ -1718,9 +1718,10 @@ struct FailureWalk<'a> {
     /// jq's own directory, which a `search` entry's `$ORIGIN/` stands for (#5338).
     jq_origin: &'a Path,
     /// The modules already reached, by canonical file, whether or not they
-    /// failed: jq loads a module once, so a second path to it reports and
+    /// parsed: jq loads a module once, so a second path to it reports and
     /// counts nothing. Recorded when a module is finished, not when it starts,
-    /// so a module still being walked is a cycle, not a repeat.
+    /// so a module still being walked is a cycle, not a repeat. A module that
+    /// could not be read is never recorded, as jq never caches one (#7709).
     visited: BTreeSet<PathBuf>,
     /// The modules whose own directives are being walked, by canonical file.
     chain: Vec<PathBuf>,
@@ -1800,20 +1801,25 @@ impl FailureWalk<'_> {
         if self.visited.contains(&canonical) {
             return 0;
         }
-        let errors = match read_library(file) {
+        match read_library(file) {
             // An unreadable module is counted like a data file that did not
-            // load, and the walk goes on (see [`ReportEntry::Data`]).
+            // load, and the walk goes on (see [`ReportEntry::Data`]). It is not
+            // recorded as reached: jq's `load_library` (1.7.1 and 1.8.2) returns
+            // before it enters a file it could not open in its table, so every
+            // directive that reaches it reports it again (#7709).
             Err(e) => {
                 self.entries.push(ReportEntry::Data(DataFileFailure {
                     detail: library_read_detail(&canonical, &e),
-                    path: canonical.clone(),
+                    path: canonical,
                 }));
                 1
             }
-            Ok(contents) => self.parsed_module(file, &canonical, contents),
-        };
-        self.visited.insert(canonical);
-        errors
+            Ok(contents) => {
+                let errors = self.parsed_module(file, &canonical, contents);
+                self.visited.insert(canonical);
+                errors
+            }
+        }
     }
 
     /// [`Self::module`] for a module whose text was read.
@@ -2663,12 +2669,14 @@ impl ModuleLoader {
     ///   `bad`, `m1`, `1 compile error`, but a *module* that includes `m1`,
     ///   included beside the same data import, is `bad`, `m1`, `2 compile
     ///   errors`);
-    /// - a module is reached **once**, whether or not it failed: a second
+    /// - a module is reached **once**, whether or not it parsed: a second
     ///   `include` of it, or a second path to it, prints nothing and counts
     ///   nothing.
     ///
     /// - a module that exists but cannot be read is printed as `error loading
-    ///   data file` and counted, and the walk goes on, as for a data file.
+    ///   data file` and counted, and the walk goes on, as for a data file --
+    ///   and, as for a data file, at **every** directive that reaches it: jq
+    ///   1.7.1 and 1.8.2 never cache a file they could not open (#7709).
     ///
     /// A module cycle is #2865's divergence (jq runs out of stack). It ends the
     /// walk the way a missing module does, after what jq printed before it
