@@ -5077,6 +5077,21 @@ impl<'a> RunIndex<'a> {
             hold_in: last_of_its_run_or_window.then_some(held),
         }
     }
+
+    /// [`build`](Self::build) for an index the caller built already, with
+    /// [`JsonIndex::try_build`]: a document of 4 GiB or more (#7537), whose caller has given
+    /// `held` back first. Every other document takes `build`, which writes the index in place.
+    fn of_built(
+        index: JsonIndex,
+        held: &'a mut Option<JsonIndex>,
+        last_of_its_run_or_window: bool,
+    ) -> Self {
+        *held = None;
+        Self {
+            index: Some(index),
+            hold_in: last_of_its_run_or_window.then_some(held),
+        }
+    }
 }
 
 impl core::ops::Deref for RunIndex<'_> {
@@ -6216,9 +6231,19 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     continue;
                 }
 
-                // #7425: a document no index can hold (4 GiB or more, a slurp of that much
-                // included) is read into a tree without one, and the program runs on the tree.
-                if !JsonIndex::can_index(json_bytes.len()) {
+                // #7537: a document of 4 GiB or more (a slurp of that much included) is indexed
+                // like any other unless it holds more than 2^31 values; #7425: one no index can
+                // hold is read into a tree without one, and the program runs on the tree. Its
+                // index is boxed, so every other document carries a pointer here and builds its
+                // own in place below.
+                let long_index = if JsonIndex::can_index(json_bytes.len()) {
+                    None
+                } else {
+                    // A previous window's last index is given back before this one is built.
+                    held_index = None;
+                    Some(JsonIndex::try_build(json_bytes).map(Box::new))
+                };
+                if let Some(None) = long_index {
                     let at = ErrorAt::Fixed(locator.at(end));
                     evaluate_unindexable_document(
                         json_bytes,
@@ -6253,7 +6278,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
 
                 // Slow path: build index and evaluate expression
-                let index = RunIndex::build(json_bytes, &mut held_index, is_last_value);
+                let index = match long_index.flatten() {
+                    None => RunIndex::build(json_bytes, &mut held_index, is_last_value),
+                    Some(index) => RunIndex::of_built(*index, &mut held_index, is_last_value),
+                };
                 // #5497: jq's parser refuses a document past its depth limit before any filter
                 // runs, and reads nothing after it, this file or any later one.
                 let source = if slurped.is_some() {
@@ -19509,13 +19537,17 @@ fn evaluate_input_streaming_via(
         }
         let doc = if preserve {
             let text = input.to_json_jq_preserve();
-            // #7425: no index holds a text of 4 GiB or more.
-            if !JsonIndex::can_index(text.len()) {
+            // #7425, #7537: no index holds a text of 4 GiB or more with more than 2^31 values.
+            // Every shorter one is built in place (`JsonIndex::try_build`).
+            let index = if JsonIndex::can_index(text.len()) {
+                JsonIndex::build(text.as_bytes())
+            } else if let Some(index) = JsonIndex::try_build(text.as_bytes()) {
+                index
+            } else {
                 return Some(jq::Control::Error(EvalError::resource_limit(
                     jq::index_ceiling_message(text.len()),
                 )));
-            }
-            let index = JsonIndex::build(text.as_bytes());
+            };
             InputDoc::Preserve(text, index)
         } else {
             match bridge_doc_of(input) {
@@ -21578,10 +21610,15 @@ fn json_document_to_owned_value(
     at: Option<&dyn Fn() -> (usize, usize)>,
     delimiters: Delimiters,
 ) -> core::result::Result<OwnedValue, EvalError> {
-    if !JsonIndex::can_index(bytes.len()) {
+    // #7537: a document of 4 GiB or more is indexed unless it holds more than 2^31 values.
+    // Every shorter one is built in place (`JsonIndex::try_build`).
+    let index = if JsonIndex::can_index(bytes.len()) {
+        JsonIndex::build(bytes)
+    } else if let Some(index) = JsonIndex::try_build(bytes) {
+        index
+    } else {
         return unindexable_document_value(bytes);
-    }
-    let index = JsonIndex::build(bytes);
+    };
     if let Some(at) = at {
         if let Some(message) =
             jq::jq_input_depth_fault(bytes, index.bp(), jq::InputSource::Stream, at)
@@ -30756,9 +30793,9 @@ mod tests {
             assert_eq!(
                 error.message,
                 format!(
-                    "Cannot index a value of {} bytes: the index holds at most 4294967295 bytes \
-                     (4 GiB), and the document is not plain JSON, which is all that is read \
-                     without an index",
+                    "Cannot index a value of {} bytes: the index holds at most 2147483647 values, \
+                     and the document is not plain JSON, which is all that is read without an \
+                     index",
                     unread.len()
                 ),
                 "{unread:.20}"

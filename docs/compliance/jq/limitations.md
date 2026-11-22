@@ -7424,23 +7424,28 @@ against the pinned jq 1.7.1 binary), so refusing with a catchable error is the s
 "would take the host process down" exception as the rest of this entry, not a new kind of
 divergence.
 
-## A document of 4 GiB or more is read without an index (#7425)
+## A document of 4 GiB or more (#7425, #7537)
 
-`succinctly jq` indexes a document before it runs the program on it, and the index holds a text of at most `u32::MAX` bytes ([Input Size Limits](../../reference/limits.md)).
-A document longer than that, a `-s` slurp of a stream that long included, is read into a tree instead, by the one-pass reader of plain JSON (`jq::parse_plain`), and the program runs on the tree with the owned evaluator.
-Before #7425 such a document panicked with exit 101 where jq 1.7.1 (and 1.8.2) answers.
-Measured over a 4,296,011,781-byte array of 4097 strings of 1 MiB and a last `"x"` (Apple M5 Max, against `/usr/bin/jq` 1.7.1): `length` prints `4098` as jq does, named or on a pipe, and so does `-s length` over the same strings one per line; `keys | length`, `.[-1], (.[0] | length)`, `.[1:3] | length` and `-s '.[4097]'` print jq's answers too.
-`length` took 14 s and 8.6 GB at its peak (the text and the tree), where jq took about 60 s and 4.2 GB.
+`succinctly jq` indexes a document before it runs the program on it ([Input Size Limits](../../reference/limits.md)).
+The index's rank directories count its interest bits (one per value, keys included) and its balanced parentheses (two per value) in 32 bits, so it holds a text of any length with at most 2,147,483,647 values.
+A text of at most `u32::MAX` bytes always is; a longer one is unless its values are about two bytes each, as in `[0,0,...]`.
+Before #7537 the index refused every text longer than `u32::MAX` bytes, and before #7425 such a document panicked with exit 101 where jq 1.7.1 (and 1.8.2) answers.
 
-Three cases are refused with an error at exit 5 where jq answers, a known limitation: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
-Lifting it needs an index that holds longer texts (64-bit rank directories), which is a change of its own.
+Measured over a 4,296,011,781-byte array of 4097 strings of 1 MiB and a last `"x"` (AMD Ryzen 9 7950X, Linux, release build, `--features cli`): every program #7537 lists answers, `map(length) | add` with `4295999485` in 4.1 s at 4.99 GB peak RSS (the mapped text and the index).
+`length`, `[.[] | length]`, `[.[] | select(length > 1)]`, `first(.[])`, `[paths]`, `keys`, `.[-1]` and `.[1:3]` take 2.6-4.0 s at the same peak, and `sort`, `to_entries`, `del(.[0])` and `.[0] = 1`, which copy the array, take about 6 s at 9.2 GB; `-s length` takes 6.0 s at 8.4 GB.
+The same array as `"s"` of `{"k":1,"k":2,"s":...}` on a pipe, a document with a repeated key, answers `.s | map(length) | add`, `.k` (`2`) and `keys`, and `at_offset(4296011776)` and `at_position(1; 4296011777)` find the last `"x"`, past the 4 GiB mark.
+jq 1.7.1 prints the same output for each of those programs on the same machine, in 17.7-29.1 s at 4.2 GB.
+The build before #7537 refused `map(length) | add` there at exit 5, after 11 s at 12.6 GB.
 
-- A program the owned evaluator answers only by indexing the whole document (its reindex bridge): `Cannot index a value of N bytes: the index holds at most 4294967295 bytes (4 GiB)`.
-  On the array above this is `map(length) | add`, `[.[] | length]`, `[.[] | select(length > 1)]`, `first(.[])`, `sort`, `to_entries`, `del(.[0])`, `.[0] = 1` and `[paths]`, and any comma or pipe that has one of them as a stage.
+A document past both counts is read into a tree instead, by the one-pass reader of plain JSON (`jq::parse_plain`), and the program runs on the tree with the owned evaluator, as every document of 4 GiB or more was between #7425 and #7537.
+Three cases are refused there with an error at exit 5 where jq answers, a known limitation: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
+Lifting it needs 64-bit rank directories, which double the interest bits' rank array (about 6% of the input) on every document.
+
+- A program the owned evaluator answers only by indexing the whole document (its reindex bridge): `Cannot index a value of N bytes: the index holds at most 2147483647 values`.
   A program that first steps to a smaller value (`.[0]`, `.key`, `.[1:3]`) indexes only that value.
 - A document that is not plain RFC 8259 JSON: a repeated key, a lone low `\u` surrogate escape (jq reads it as U+FFFD), a jq leniency such as `nan` or `007`, or nesting past 128 levels.
   The one-pass reader declines these, and the route that reads them needs the index.
-  The message is `Cannot index a value of N bytes: the index holds at most 4294967295 bytes (4 GiB), and the document is not plain JSON, which is all that is read without an index`.
+  The message is `Cannot index a value of N bytes: the index holds at most 2147483647 values, and the document is not plain JSON, which is all that is read without an index`.
 - `--preserve-input`, which writes such a document out and indexes the text, with the first message.
 
 A malformed document of that length is reported as jq's parser reports it, at exit 5 as jq exits, with one difference: jq's column counter is a 32-bit `int`, so past 4 GiB on one line it wraps (`Expected another array element at line 1, column 1044485` for the array above with its last `]` replaced by `,]`), and succinctly prints the real column, `4296011781`.
@@ -11621,7 +11626,7 @@ A number literal of more than 999,999,999 characters (`DEC_MAX_DIGITS`) is `pars
 jq 1.7.1 aborts (SIGABRT, exit 134) on a 2.2 GB string token and reads the 1,000,000,001-digit number (`"number"`).
 `succinctly jq` reads both: `length` of the 2.2 GB string is `2200000000` and `type` of the 1,000,000,001-digit number is `"number"` (1.2 GB resident).
 These rows are the issue's measurements, not re-run here.
-What bounds it: the 4 GiB document limit of the index, beyond which a document is read without one ([A document of 4 GiB or more](#a-document-of-4-gib-or-more-is-read-without-an-index-7425)), and available memory.
+What bounds it: the index's counts, past which a document is read without one ([A document of 4 GiB or more](#a-document-of-4-gib-or-more-7425-7537)), and available memory.
 
 **Function parameters: 4,095 (#7527).**
 jq 1.8.2 refuses a `def` with more than 4,095 parameters (4,096 is refused, 4,095 is accepted) with `jq: error: too many function parameters or local function definitions (max 4095)` and `jq: 1 compile error`, exit 3.
