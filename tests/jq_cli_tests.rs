@@ -52663,8 +52663,9 @@ fn test_syntax_error_exits_with_the_compile_error_code_1473() -> Result<()> {
         stderr.contains("unexpected end of input at <top-level>, line 1:"),
         "the jq line-header is missing: {stderr:?}"
     );
+    // jq 1.7.1's padding: the error is at the start of the last match, the `+` (#7711).
     assert!(
-        stderr.contains("\n1 +   \njq: 1 compile error"),
+        stderr.contains("\n1 +  \njq: 1 compile error"),
         "the echoed line + trailer are missing: {stderr:?}"
     );
     assert!(
