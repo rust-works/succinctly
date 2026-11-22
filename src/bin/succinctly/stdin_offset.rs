@@ -79,9 +79,14 @@ pub(crate) fn start_run() {
 /// Records how the run reads standard input: `None` when it reads none, or reads it in a way whose
 /// offset is left where the read left it (named files with no `-`, `--slurp`, `--seq`, DSV,
 /// `--stream-errors`). `files` are the input files: standard input is the first `-` among them,
-/// or the only input when there are none.
+/// or the only input when there are none. A path that opens as descriptor 0 itself, sharing its
+/// offset (`/dev/stdin` or `/dev/fd/0` on macOS, which duplicates the descriptor), is standard input
+/// too, read through the path: jq's stdio puts the offset back on it as it does on `-`.
 pub(crate) fn set_run(items: Option<Items>, main_loop: bool, files: &[PathBuf]) {
-    let items = match files.iter().position(|path| path.as_os_str() == "-") {
+    let at = files
+        .iter()
+        .position(|path| path.as_os_str() == "-" || (items.is_some() && opens_as_stdin(path)));
+    let items = match at {
         Some(dash) => {
             BEFORE.with(|b| *b.borrow_mut() = files[..dash].to_vec());
             items
@@ -90,6 +95,52 @@ pub(crate) fn set_run(items: Option<Items>, main_loop: bool, files: &[PathBuf]) 
         None => None,
     };
     RUN.with(|r| r.set(items.map(|items| Run { items, main_loop })));
+}
+
+/// Whether `path` names standard input and opens as descriptor 0 itself, sharing its offset, when that
+/// is a regular file: macOS duplicates the descriptor for `/dev/stdin` and `/dev/fd/0`, where Linux
+/// opens the file again from its start (and jq's reads there leave descriptor 0 alone, as this then
+/// does). Asked by moving the offset of a new open of the path and looking whether descriptor 0's
+/// moved too, then putting it back: once a run, before anything is read. Records where descriptor 0
+/// stands, for [`restore`].
+#[cfg(unix)]
+fn opens_as_stdin(path: &std::path::Path) -> bool {
+    use std::os::fd::AsRawFd;
+    if path != std::path::Path::new("/dev/stdin") && path != std::path::Path::new("/dev/fd/0") {
+        return false;
+    }
+    // SAFETY: `stat` is written by `fstat` before it is read, and only on success.
+    let regular = unsafe {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) == 0
+            && stat.assume_init().st_mode & libc::S_IFMT == libc::S_IFREG
+    };
+    if !regular {
+        return false;
+    }
+    // SAFETY: `lseek` reads and moves only the descriptor's offset.
+    let at = |fd| unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+    let here = at(libc::STDIN_FILENO);
+    let Ok(opened) = std::fs::File::open(path) else {
+        return false;
+    };
+    let fd = opened.as_raw_fd();
+    // SAFETY: as above, on the descriptor just opened.
+    let shared = here >= 0
+        && unsafe { libc::lseek(fd, here + 1, libc::SEEK_SET) } == here + 1
+        && at(libc::STDIN_FILENO) == here + 1;
+    // Back where it stood, which is descriptor 0's place too when the two share it.
+    // SAFETY: as above.
+    unsafe { libc::lseek(fd, here.max(0), libc::SEEK_SET) };
+    if shared {
+        note_origin(here as u64);
+    }
+    shared
+}
+
+#[cfg(not(unix))]
+fn opens_as_stdin(_: &std::path::Path) -> bool {
+    false
 }
 
 /// Records the offset a regular file on standard input stood at before the run read it.
