@@ -8764,7 +8764,7 @@ fn read_inputs(
                 let trailing = TrailingParseError {
                     error: EvalError::new(yielded.error.unwrap_or_default()),
                     source: u32::try_from(source).unwrap_or(u32::MAX),
-                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                    line: line as u64,
                     seq_warning: false,
                     as_parse_error: true,
                 };
@@ -17155,7 +17155,7 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
     let stdin_only = files.iter().all(Option::is_none);
     // #7603: `Malformed BOM` is what every later read returns too, since jq's parser never gets past
     // it; the reader ends with it, so it is kept for the reads after.
-    let mut raised: Option<(String, (u32, u32))> = None;
+    let mut raised: Option<(String, (u32, u64))> = None;
     Box::new(move || {
         if let Some((message, at)) = &raised {
             return jq::ProducedInput::Error(EvalError::new(message.clone()), *at);
@@ -17178,7 +17178,7 @@ fn stream_reader_produce<R: crate::cli::jq_stream_errors::RefillSource>(
     last_source: u32,
     raise_errors: bool,
     stdin_only: bool,
-    raised: &mut Option<(String, (u32, u32))>,
+    raised: &mut Option<(String, (u32, u64))>,
 ) -> jq::ProducedInput {
     match reader.next_yielded() {
         Some(input) => {
