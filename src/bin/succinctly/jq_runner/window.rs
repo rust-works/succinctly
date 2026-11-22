@@ -1202,7 +1202,7 @@ impl WindowedFile {
                 &mut self.buf[from..self.validated],
                 Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
                 lead,
-                &[],
+                &mut [],
             );
         }
     }
