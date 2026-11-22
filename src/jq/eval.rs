@@ -110168,12 +110168,12 @@ fn normalised_broken_down_time(
     // instant it names is the one formatted, in the zone in effect at that instant.
     let reading = local_zone::for_wall_clock(t.year, month, t.day, t.hour, t.minute, t.second);
     let mut instant = wall.checked_sub(reading.offset_secs)?;
-    let mut zone = local_zone::at_instant(instant);
+    let mut zone = local_zone::zone_at(instant);
     if zone.offset_secs != reading.offset_secs {
         // A reading the zone skipped: `mktime` reads it with the offset in effect before the
         // skip and lands past it (`TZ=Europe/Paris`, 2024-03-31 02:30 is 03:30 CEST).
         instant = wall.checked_sub(zone.offset_secs)?;
-        zone = local_zone::at_instant(instant);
+        zone = local_zone::zone_at(instant);
     }
     let local_secs = instant.checked_add(zone.offset_secs)?;
     Some((civil(local_secs)?, Some(zone)))

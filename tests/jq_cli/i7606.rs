@@ -178,6 +178,20 @@ const FULL_ARRAYS: &[(&str, &str, &str, &str)] = &[
         "strftime(\"%Y %a %j\")",
         "\"2147485547 Wed 001\"\n",
     ),
+    // An hour past the day carries into it (#6331's rows; 1.7.1: "01| 1|01:00:00 PM|PM" and
+    // "-1|-1|-1:00:00 AM|AM").
+    (
+        "UTC",
+        "[2015,2,5,25,0,0,4,63]",
+        "strftime(\"%I|%l|%r|%p\")",
+        "\"01| 1|01:00:00 AM|AM\"\n",
+    ),
+    (
+        "UTC",
+        "[2015,2,5,-13,0,0,4,63]",
+        "strftime(\"%I|%l|%r|%p\")",
+        "\"11|11|11:00:00 AM|AM\"\n",
+    ),
     // A consistent array is the same in both releases.
     (
         "UTC",
