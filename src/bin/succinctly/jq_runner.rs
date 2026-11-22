@@ -12683,14 +12683,11 @@ fn windowed_source(args: &JqCommand, min: u64) -> Option<WindowedSource> {
         return Some((files, reader, reread));
     }
     let (path, meta) = lone_regular_file(&files, min)?;
-    let file = std::fs::File::open(path).ok()?;
-    let reread = window::Reread::new(&file, 0, meta.len(), path.clone()).ok()?;
+    let (file, start, len) = lone_windowed_file(path, &meta)?;
+    let reread = window::Reread::new(&file, start, len, path.clone()).ok()?;
     Some((
         files,
-        window::WindowedFiles::new(
-            vec![(std::rc::Rc::new(file), meta.len())],
-            window::window_bytes(),
-        ),
+        window::WindowedFiles::new(vec![(std::rc::Rc::new(file), len)], window::window_bytes()),
         std::rc::Rc::new(reread),
     ))
 }
@@ -12845,17 +12842,44 @@ fn regular_file(path: &PathBuf) -> Option<std::fs::Metadata> {
 
 /// The one regular file of at least `min_len` bytes that `files` names, with its `stat`: the shape
 /// every route that reads a file a window at a time takes (#6920, #7023), judged in one place. Not
-/// stdin, a descriptor the run already holds, a pipe or directory, several files or a small file.
+/// stdin, standard output or error, a pipe or directory, several files or a small file.
 /// The path is judged by `stat`, which opens nothing: opening a named pipe pairs with its writer, and
 /// a handle dropped on the way to another route would take the writer's bytes with it. A path that
-/// names a descriptor the run already holds (`/dev/stdin`, `/dev/fd/N`) is left alone too: the file it
-/// opens may share an offset with the descriptor on some systems, so it is not read from its start.
+/// names a descriptor the run holds (`/dev/fd/7 7<f`, `/dev/stdin`) is one: the file it opens may
+/// share that descriptor's offset (macOS duplicates the descriptor), so its windows are read from
+/// where that offset stands ([`lone_windowed_file`]), as jq reads it, and on to the end it has then
+/// (#7446), where the route that reads it whole read it before the program ran.
 fn lone_regular_file(files: &[PathBuf], min_len: u64) -> Option<(&PathBuf, std::fs::Metadata)> {
     let [path] = files else {
         return None;
     };
-    let meta = regular_file(path)?;
+    let meta = match descriptor_path(path) {
+        // Standard output and error, whose `stat` on macOS names the descriptor's own file system and so
+        // escapes [`names_output`].
+        Some(1 | 2) => return None,
+        Some(_) => std::fs::metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?,
+        None => regular_file(path)?,
+    };
     (meta.len() >= min_len && !names_stdin(&meta) && !names_output(&meta)).then_some((path, meta))
+}
+
+/// The descriptor a `/dev/fd/N` path names.
+fn descriptor_path(path: &Path) -> Option<u32> {
+    path.strip_prefix("/dev/fd/").ok()?.to_str()?.parse().ok()
+}
+
+/// The lone file [`lone_regular_file`] judged, opened, with where its stream starts and how much of it
+/// was there to read then: where the open left its offset, which is its start, or for a path that
+/// names a descriptor and shares its offset, where that offset stands (#7446). `None` when the offset
+/// is past the length `stat` gave.
+fn lone_windowed_file(path: &Path, meta: &std::fs::Metadata) -> Option<(std::fs::File, u64, u64)> {
+    use std::io::Seek;
+    let mut file = std::fs::File::open(path).ok()?;
+    let start = file.stream_position().ok()?;
+    let len = meta.len().checked_sub(start)?;
+    Some((file, start, len))
 }
 
 /// Standard input when it is a regular file of 4 MiB or more left to read (`jq … < file`, #7024),
@@ -24063,10 +24087,21 @@ mod tests {
         let mut long_with_directory = with_tinies(40);
         long_with_directory.push(directory.as_str());
         assert!(!takes(&long_with_directory), "one is no regular file");
-        // A descriptor the run already holds, named by path: opening it again shares its offset on
-        // some systems, and the fault's second read would find the end of the file.
+        // The test's own standard input, named by path, is no regular file of 1 MiB.
         assert!(!takes(&["jq", ".", "/dev/stdin"]));
         assert!(!takes(&["jq", ".", "/dev/fd/0"]));
+        // #7446: a descriptor that holds one is, read from where its offset stands; standard output
+        // and error are not, whatever they hold.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let held = std::fs::File::open(&big).expect("open");
+            let named = format!("/dev/fd/{}", held.as_raw_fd());
+            assert!(takes(&["jq", ".", &named]), "{named}");
+            assert!(!takes(&["jq", ".", "/dev/fd/1"]));
+            assert!(!takes(&["jq", ".", "/dev/fd/2"]));
+            assert!(!takes(&["jq", ".", "/dev/fd/x"]));
+        }
         // A run that reads the stream whole or otherwise.
         for flags in [&["-s"][..], &["--validate"], &["--seq"], &["-n"]] {
             let mut argv = vec!["jq"];

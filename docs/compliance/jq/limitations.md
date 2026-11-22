@@ -7592,7 +7592,9 @@ Dropping the span vector alone would take about 0.15 per MiB off the plain route
 ### The plain route over a regular file is windowed (#6920, #7024)
 
 `-c .`, `-r .name`, `select(...)` and the like, over one regular file of 4 MiB or more with no `--slurp`, `--validate` or `--seq`, read the file in windows (`WindowedFile`, `src/bin/succinctly/jq_runner/window.rs`).
-The route judges the path by `stat` and opens nothing it declines: a named pipe (`<(cmd)`) would otherwise pair with its writer and lose its bytes, and `/dev/stdin` and `/dev/fd/N` name a descriptor the run already holds.
+The route judges the path by `stat` and opens nothing it declines: a named pipe (`<(cmd)`) would otherwise pair with its writer and lose its bytes.
+A lone path that names a descriptor the run holds (`/dev/fd/7 7<f`, `/dev/stdin < f`) is read a window at a time from where that descriptor's offset stands, since macOS opens such a path as the descriptor itself, sharing its offset, and jq reads it from there; Linux opens the file again, from its start, in both tools (#7446).
+Its fault is worded from the same place, by position, and `/dev/fd/1` and `/dev/fd/2` are left to the route that reads them whole.
 A window is about 256 KiB (1 MiB before [#7412](https://github.com/rust-works/succinctly/issues/7412)) and ends at a line break, so the read that completes each document, and with it jq's line for the document, is inside it.
 Since #7412 every size this section and the ones below give in MiB for the windowed routes is that of the 1 MiB window, and each is now a quarter of it: a file (or several, between them) is read in windows from 1 MiB, a pipe once it holds 512 KiB, and a document is read on to eight windows (2 MiB) before the end of the file.
 A file under 4 MiB whose window ends inside a document is read on to its end at once instead, as the whole-file route read it before #7412.
@@ -7613,7 +7615,7 @@ A file read to its length reads once more there, which returns nothing, as jq's 
 A file cut short while the run goes ends where the reads find its end, with what was read before it run and no fault for the rest, as in jq.
 A file renamed over the path is not read: the run holds the file it opened, as jq does.
 Two routes still read a file to the length it had, so a line appended during the run is dropped where jq reads it.
-The route that reads a file whole (a file under 1 MiB under the plain filter or `-R`, a path such as `/dev/fd/N`, and every flag that reads the stream whole) reads it before the run starts, so what is appended after that is not read; `--slurp` reads all of its input before the program runs in jq too, and matches.
+The route that reads a file whole (a file under 1 MiB under the plain filter or `-R`, a `/dev/fd/N` path among several files, and every flag that reads the stream whole) reads it before the run starts, so what is appended after that is not read; `--slurp` reads all of its input before the program runs in jq too, and matches.
 A `--seq` file read a window at a time stops at the length its records were vouched for up to before the run (`Reread::is_plain_seq_records`), since a record read past it would be one no prepass judged; a file a gate of its own reads (one the prepass turned down) reads on as a pipe does.
 A depth refusal names the position from the window's line count; where a window was substituted it is worded from the file read again, as the whole-file route words it from the originals.
 Standard input that is a regular file (`jq … < file`, a here-file, a descriptor a parent opened) takes the same route from its current offset: what a shell or parent has read already is not part of the stream, as on a pipe, and a fault is worded from a duplicate of descriptor 0 read by position.
