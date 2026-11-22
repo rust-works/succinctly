@@ -116,19 +116,80 @@ fn object_key(key: &SharableString) -> OwnedValue {
 ///
 /// A `def` of the program is walked where it is defined, and a call of a
 /// name the prelude also defines is taken to reach the prelude's definition,
-/// which can only answer `true` more often.
-fn hands_out_keys(program: &Expr, prelude: &Prelude) -> bool {
-    expr_hands_out_keys(program, prelude, &mut Vec::new())
+/// which can only answer `true` more often. Which prelude definitions reach a
+/// key is a constant of the build, [`KEY_HANDING_PRELUDE_DEFS`], so the
+/// decision parses nothing: a run that starts at the native-stack floor,
+/// where the parser refuses (#7475), decides it as any other run does.
+fn hands_out_keys(program: &Expr) -> bool {
+    reaches_a_key(program, &mut |name, arity| {
+        KEY_HANDING_PRELUDE_DEFS
+            .binary_search(&(name, arity))
+            .is_ok()
+    })
 }
 
-/// [`hands_out_keys`] of `expr`, `seen` the prelude definitions already
-/// looked inside (a recursive one is looked inside once, and a definition
-/// met again adds nothing to the answer already being found).
-fn expr_hands_out_keys(
-    expr: &Expr,
-    prelude: &Prelude,
-    seen: &mut Vec<(&'static str, usize)>,
-) -> bool {
+/// The [`PRELUDE`] definitions whose body can hand a key out, directly or
+/// through a definition it calls (#7489), by name and arity, sorted.
+///
+/// Derived from the prelude's bodies by [`reaches_a_key`], which a unit test
+/// re-runs over every parsed definition and fails when its answer and this
+/// table disagree, so an edit of [`PRELUDE`] that changes the answer fails
+/// there with the table to paste.
+const KEY_HANDING_PRELUDE_DEFS: &[(&str, usize)] = &[
+    ("_sp_INDEX", 1),
+    ("_sp__flatten", 1),
+    ("_sp_add", 0),
+    ("_sp_all", 0),
+    ("_sp_all", 1),
+    ("_sp_any", 0),
+    ("_sp_any", 1),
+    ("_sp_ascii_downcase", 0),
+    ("_sp_ascii_upcase", 0),
+    ("_sp_capture", 1),
+    ("_sp_capture", 2),
+    ("_sp_combinations", 0),
+    ("_sp_combinations", 1),
+    ("_sp_flatten", 0),
+    ("_sp_flatten", 1),
+    ("_sp_from_entries", 0),
+    ("_sp_group_by", 1),
+    ("_sp_gsub", 2),
+    ("_sp_gsub", 3),
+    ("_sp_join", 1),
+    ("_sp_leaf_paths", 0),
+    ("_sp_map", 1),
+    ("_sp_map_values", 1),
+    ("_sp_match", 1),
+    ("_sp_match", 2),
+    ("_sp_max_by", 1),
+    ("_sp_min_by", 1),
+    ("_sp_paths", 0),
+    ("_sp_paths", 1),
+    ("_sp_recurse", 0),
+    ("_sp_recurse_down", 0),
+    ("_sp_scan", 1),
+    ("_sp_scan", 2),
+    ("_sp_sort_by", 1),
+    ("_sp_split", 2),
+    ("_sp_splits", 1),
+    ("_sp_splits", 2),
+    ("_sp_sub", 2),
+    ("_sp_sub", 3),
+    ("_sp_to_entries", 0),
+    ("_sp_tostream", 0),
+    ("_sp_transpose", 0),
+    ("_sp_unique", 0),
+    ("_sp_unique_by", 1),
+    ("_sp_walk", 1),
+    ("_sp_with_entries", 1),
+];
+
+/// Whether `expr` can hand a key out, `prelude_reaches(name, arity)` answering
+/// it for a call of the prelude definition `name/arity` (or of a name the
+/// prelude does not define, which answers `false`): the walk
+/// [`hands_out_keys`] runs over a program, and the derivation of
+/// [`KEY_HANDING_PRELUDE_DEFS`] over the prelude's own bodies.
+fn reaches_a_key(expr: &Expr, prelude_reaches: &mut dyn FnMut(&str, usize) -> bool) -> bool {
     any_subexpr(expr, &mut |e| {
         let (name, arity) = match e {
             Expr::Iterate | Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys => {
@@ -162,7 +223,7 @@ fn expr_hands_out_keys(
                 // `def` answers it.
                 if builtin_fallback
                     .as_deref()
-                    .is_some_and(|fallback| expr_hands_out_keys(fallback, prelude, seen))
+                    .is_some_and(|fallback| reaches_a_key(fallback, prelude_reaches))
                 {
                     return true;
                 }
@@ -170,14 +231,7 @@ fn expr_hands_out_keys(
             }
             _ => return false,
         };
-        let Some(def) = prelude.find(name, arity) else {
-            return false;
-        };
-        if seen.contains(&(def.name, def.arity)) {
-            return false;
-        }
-        seen.push((def.name, def.arity));
-        expr_hands_out_keys(def.expr(), prelude, seen)
+        prelude_reaches(name, arity)
     })
 }
 
@@ -1584,7 +1638,7 @@ impl<'e> Interp<'e> {
     /// Decide [`Self::key_ids`] for a run of `program`, and give `input`
     /// (a document, materialized for this run) its identities to match.
     fn prepare(&self, program: &Expr, input: &mut OwnedValue) {
-        let keys = hands_out_keys(program, self.prelude);
+        let keys = hands_out_keys(program);
         self.key_ids.set(keys);
         input.promote_identities(keys);
     }

@@ -2667,7 +2667,6 @@ fn an_object_key_is_one_value_per_object_7401() {
 #[test]
 fn a_program_hands_out_keys_only_through_each_or_keys_7489() {
     on_big_stack(|| {
-        let prelude = Prelude::new();
         let blind = [
             ". as $d | path($d)",
             "path(getpath([\"a\", \"b\"]))",
@@ -2715,7 +2714,7 @@ fn a_program_hands_out_keys_only_through_each_or_keys_7489() {
         ];
         let classify = |filter: &str| {
             let program = compile(filter).unwrap_or_else(|e| panic!("{filter}: {e}"));
-            hands_out_keys(&program, &prelude)
+            hands_out_keys(&program)
         };
         let wrong: Vec<String> = blind
             .iter()
@@ -2729,6 +2728,101 @@ fn a_program_hands_out_keys_only_through_each_or_keys_7489() {
             )
             .collect();
         assert!(wrong.is_empty(), "{wrong:#?}");
+    });
+}
+
+/// [`KEY_HANDING_PRELUDE_DEFS`] is what [`reaches_a_key`] answers over every
+/// parsed [`PRELUDE`] definition, looking inside each definition it calls
+/// (#7489): the walk is the one definition of the answer, and the table only
+/// spares a run parsing the prelude to find it.
+#[test]
+fn the_key_handing_prelude_table_is_derived_from_the_prelude_7489() {
+    /// Whether the prelude definition `name/arity` can hand a key out, `seen`
+    /// the definitions already being looked inside (a recursive one is looked
+    /// inside once).
+    fn reaches(
+        prelude: &Prelude,
+        name: &str,
+        arity: usize,
+        seen: &mut Vec<(&'static str, usize)>,
+    ) -> bool {
+        let Some(def) = prelude.find(name, arity) else {
+            return false;
+        };
+        if seen.contains(&(def.name, def.arity)) {
+            return false;
+        }
+        seen.push((def.name, def.arity));
+        reaches_a_key(def.expr(), &mut |name, arity| {
+            reaches(prelude, name, arity, seen)
+        })
+    }
+    on_big_stack(|| {
+        let prelude = Prelude::new();
+        let mut derived: Vec<(&str, usize)> = prelude
+            .defs
+            .iter()
+            .filter(|def| reaches(&prelude, def.name, def.arity, &mut Vec::new()))
+            .map(|def| (def.name, def.arity))
+            .collect();
+        derived.sort_unstable();
+        assert!(derived.contains(&("_sp_to_entries", 0)), "{derived:?}");
+        assert!(prelude.find("_sp_first", 1).is_some());
+        assert!(!derived.contains(&("_sp_first", 1)), "{derived:?}");
+        assert_eq!(
+            KEY_HANDING_PRELUDE_DEFS,
+            derived.as_slice(),
+            "KEY_HANDING_PRELUDE_DEFS disagrees with the prelude; the derived table is\n{derived:?}"
+        );
+        // Sorted and without repeats, as its binary search needs.
+        assert!(KEY_HANDING_PRELUDE_DEFS.windows(2).all(|w| w[0] < w[1]));
+    });
+}
+
+/// ADR-0025 (#3262, #7475): a run that starts at the native-stack floor,
+/// where the parser refuses, still decides [`hands_out_keys`], which parses
+/// nothing (#7489). Through the library entry, a path program that calls its
+/// own `def` first is then refused at that call, as eval.rs's
+/// `every_route_checks_the_native_stack_floor_3262` pins, where deciding by
+/// parsing the prelude's bodies panicked before the run began.
+#[test]
+fn the_key_decision_is_reached_at_the_native_stack_floor_7489() {
+    on_big_stack(|| {
+        let json = br#"{"a":{"b":1}}"#;
+        let index = JsonIndex::build(json);
+        for (filter, keys) in [
+            ("def f: .a; [path(f)]", false),
+            ("def f(g): g; [path(f(.a))]", false),
+            ("def f(g): g; f(.a) |= 2", false),
+            ("def f: .a; first(f)", false),
+            ("def f: .a; [path(f | first(.b, .c))]", false),
+            ("def f: .; [path(f | .a | to_entries)]", true),
+            ("def f: .; [path(f | paths)]", true),
+            ("def f: .; del(f | .[] | select(. == 1))", true),
+            ("[path(first(.a, .b))]", false),
+            ("[path(.a | select(.b))]", false),
+            ("[paths]", true),
+            ("[path(..)]", true),
+        ] {
+            let program = compile(filter).unwrap_or_else(|e| panic!("{filter}: {e}"));
+            let at_floor = crate::jq::with_stack_budget(0, || hands_out_keys(&program));
+            assert_eq!(at_floor, keys, "{filter}");
+            assert_eq!(hands_out_keys(&program), keys, "{filter}: off the floor");
+            if !filter.starts_with("def f") {
+                continue;
+            }
+            let expr = crate::jq::parse(filter).expect("parses");
+            match crate::jq::with_stack_budget(0, || {
+                crate::jq::eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+            }) {
+                crate::jq::QueryResult::Error(e) => assert!(
+                    e.message.ends_with("exceeded maximum recursion depth"),
+                    "{filter}: {}",
+                    e.message
+                ),
+                other => panic!("{filter}: expected a refusal, got {other:?}"),
+            }
+        }
     });
 }
 
@@ -2789,7 +2883,7 @@ fn leaving_the_keys_as_read_changes_no_answer_7489() {
             let Ok(program) = compile(&filter) else {
                 continue;
             };
-            if hands_out_keys(&program, &prelude) {
+            if hands_out_keys(&program) {
                 continue;
             }
             let input = parse_doc(&doc);
