@@ -2778,3 +2778,39 @@ fn the_append_step_answers_as_jq_7564() {
         ),
     ]);
 }
+
+/// `PathList::to_array` gathers a path of up to `SHORT_PATH` keys on the stack
+/// and builds its array at that exact length (#7465); a longer one takes the
+/// `Vec` route. Both answer the keys root first, at and either side of the
+/// boundary.
+#[test]
+fn path_list_to_array_answers_keys_root_first_either_side_of_short_path_7465() {
+    for len in [0, 1, 3, SHORT_PATH - 1, SHORT_PATH, SHORT_PATH + 1, 40] {
+        let mut path = PathList::default();
+        for i in 0..len {
+            path = path.push(OwnedValue::Int(i as i64));
+        }
+        let expected: Vec<OwnedValue> = (0..len).map(|i| OwnedValue::Int(i as i64)).collect();
+        assert_eq!(
+            path.to_array(),
+            OwnedValue::Array(expected.into()),
+            "len {len}"
+        );
+    }
+}
+
+/// End to end: `path()` of a 17-key path (one past `SHORT_PATH`) and of a
+/// three-key one, collected and counted.
+#[test]
+fn path_answers_long_and_short_paths_7465() {
+    let deep = "[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]";
+    check(&[
+        (deep, "[path(..)] | length", ok(&["18"])),
+        (deep, "[path(..)] | last | length", ok(&["17"])),
+        (
+            r#"{"a":[{"b":1}]}"#,
+            "[path(.a[0].b)]",
+            ok(&[r#"[["a",0,"b"]]"#]),
+        ),
+    ]);
+}

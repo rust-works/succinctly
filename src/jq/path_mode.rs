@@ -265,6 +265,9 @@ fn truthy(value: &OwnedValue) -> bool {
     value.is_truthy()
 }
 
+/// The longest path [`PathList::to_array`] gathers on the stack.
+const SHORT_PATH: usize = 16;
+
 /// A persistent path prefix: a fork shares its parent for free.
 #[derive(Clone, Default)]
 struct PathList(Option<Rc<(Self, OwnedValue, usize)>>);
@@ -294,7 +297,30 @@ impl PathList {
         self.0.as_ref().map_or(0, |node| node.2)
     }
 
+    /// The keys as `path()` answers them, in a block of exactly their number
+    /// of slots when the path is short (#7465). A `Vec` grown by `push` holds
+    /// four, so a one- to three-key path took a 144-byte chunk on glibc, just
+    /// past its 128-byte fastbin limit. Once a site's key no longer sat
+    /// between them, many such paths freed in a row (a collected
+    /// `[path(..)]` dropped) coalesced into a 64 KiB chunk, and that free
+    /// sweeps every fastbin chunk the run has freed (`malloc_consolidate`),
+    /// a pointer chase through the freed document costing more than the paths.
     fn to_array(&self) -> OwnedValue {
+        let len = self.len();
+        if len <= SHORT_PATH {
+            let unset = OwnedValue::Null;
+            let mut keys = [&unset; SHORT_PATH];
+            let mut at = self;
+            let mut i = len;
+            while let Some(node) = &at.0 {
+                i -= 1;
+                keys[i] = &node.1;
+                at = &node.0;
+            }
+            // A slice's iterator has an exact length, so the array is built
+            // in a block of exactly `len` slots.
+            return OwnedValue::Array(keys[..len].iter().map(|&k| k.clone()).collect());
+        }
         let mut keys = Vec::new();
         let mut at = self;
         while let Some(node) = &at.0 {
@@ -1541,10 +1567,7 @@ impl<'e> Interp<'e> {
                     .ok_or_else(|| unsupported("a location that is not a constant"))?;
                 sink(value, reg)
             }
-            Expr::Field(name) => {
-                let key = self.site_key(expr, || string(name));
-                self.index(input, reg, key, false, sink)
-            }
+            Expr::Field(name) => self.field(expr, name, input, reg, false, sink),
             Expr::Index { idx, key } => {
                 let key = self.site_key(expr, || index_key(*idx, key.as_ref()));
                 self.index(input, reg, key, false, sink)
@@ -1864,6 +1887,33 @@ impl<'e> Interp<'e> {
         value
     }
 
+    /// `.name` at `site`: [`index`](Self::index) with the site's key. Outside
+    /// any `path()`, or in a subexpression, `path_append` is a no-op and the
+    /// key never leaves the step, so an object or `null` is read by the name
+    /// itself and no key is fetched (#7465).
+    fn field(
+        &self,
+        site: &'e Expr,
+        name: &str,
+        input: OwnedValue,
+        reg: Reg,
+        opt: bool,
+        sink: &mut Sink<'_>,
+    ) -> R {
+        if !reg.tracking() {
+            match &input {
+                OwnedValue::Object(map) => {
+                    let value = map.get(name).cloned().unwrap_or(OwnedValue::Null);
+                    return sink(value, reg);
+                }
+                OwnedValue::Null => return sink(OwnedValue::Null, reg),
+                _ => {}
+            }
+        }
+        let key = self.site_key(site, || string(name));
+        self.index(input, reg, key, opt, sink)
+    }
+
     /// `INDEX`/`INDEX_OPT` on `container` with `key`: `path_intact` first
     /// (a failure raises even under `INDEX_OPT`), then `jv_get`, then
     /// `path_append` with the key as given. 1.7.1 does not renormalize a
@@ -2049,10 +2099,7 @@ impl<'e> Interp<'e> {
         sink: &mut Sink<'_>,
     ) -> R {
         match inner {
-            Expr::Field(name) => {
-                let key = self.site_key(inner, || string(name));
-                self.index(input, reg, key, true, sink)
-            }
+            Expr::Field(name) => self.field(inner, name, input, reg, true, sink),
             Expr::Index { idx, key } => {
                 let key = self.site_key(inner, || index_key(*idx, key.as_ref()));
                 self.index(input, reg, key, true, sink)
