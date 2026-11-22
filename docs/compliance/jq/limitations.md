@@ -12055,7 +12055,8 @@ What differs from jq 1.7.1:
   `%E` and `%O` modifiers pass through for every specifier, and a flag may stand before or after one (`%-Ed` and `%E_d`); a second modifier or flag is a character that names nothing, and a flag or modifier that ends the format is printed as itself.
   `%+` is `%a %b %e %H:%M:%S %Z %Y` and `%v` is `%e-%b-%Y`, as the pinned libc has them.
   On macOS `%+` is the locale's own `date_fmt` under any other locale (#7784), as jq prints it there: `LC_ALL=de_DE.UTF-8 TZ=Europe/Berlin`, `1700000000 | strflocaltime("%+")` is `"Di. 14 Nov. 2023 23:13:20 CET"`, and `ja_JP.UTF-8` prints `"2023年 11月14日 火曜日 23時13分20秒 CET"`.
-  glibc has no `%+`: a glibc jq prints it as written (`"%+"`) under every locale, and cannot read it back; `succinctly jq` prints the C layout there, as the pinned macOS libc does in C.
+  `%v` takes the locale's month abbreviation there too (`de_DE`: `" 1-Jan.-1970"`, `cs_CZ`: `" 1-led-1970"`).
+  glibc has neither: a glibc jq prints `%+` and `%v` as written (`"%+"`) under every locale, and cannot read `%+` back; `succinctly jq` prints the C layouts there, as the pinned macOS libc does in C.
   A NUL in the format ends it, as it ends a C string (`"a\u0000b"` formats as `a`), and the buffer limit is measured on the part before it.
   A character after `%` that names nothing is printed bare, with the flag before it dropped: `%Q` is `Q`, `%5Y` is `5Y` and `%^a` is `^a`, where a glibc `jq` honours `^`, `#` and a width and prints `%Q` as written.
 - **`strptime` reads the locale's names and layouts.**

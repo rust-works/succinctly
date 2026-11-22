@@ -111104,13 +111104,17 @@ fn format_strftime(
             }
             if let (
                 true,
-                Some(letter @ ('a' | 'A' | 'b' | 'B' | 'h' | 'p' | 'c' | 'x' | 'X' | 'r' | '+')),
+                Some(
+                    letter
+                    @ ('a' | 'A' | 'b' | 'B' | 'h' | 'p' | 'c' | 'x' | 'X' | 'r' | '+' | 'v'),
+                ),
             ) = (localized, spec)
             {
-                // `%+` is the locale's `date_fmt` in macOS's libc (#7784). glibc has no `%+` (its
-                // `strftime` prints it as written), and there the pinned libc's C layout stands.
+                // `%+` is the locale's `date_fmt` in macOS's libc, and `%v` takes the locale's
+                // month abbreviation (#7784). glibc has neither (its `strftime` prints them as
+                // written), and there the pinned libc's C layout stands.
                 // A time the C library cannot hold (a year past `int`) gets the C rendering.
-                if letter != '+' || cfg!(target_vendor = "apple") {
+                if !matches!(letter, '+' | 'v') || cfg!(target_vendor = "apple") {
                     if let Some(text) = locale_time::render(&format!("%{letter}"), &tm) {
                         result.push_str(&text);
                         continue;

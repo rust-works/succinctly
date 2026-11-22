@@ -103,3 +103,31 @@ fn percent_plus_is_the_locales_date_fmt_on_macos_7784() -> Result<()> {
     }
     Ok(())
 }
+
+/// `%v` takes the locale's month abbreviation on macOS (#7784), as jq prints it there.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn percent_v_names_the_locales_month_on_macos_7784() -> Result<()> {
+    for (locale, want) in [
+        (
+            "de_DE.UTF-8",
+            "[\" 1-Jan.-1970\",\"14-Nov.-2023\",\" 3-Juli-2024\"]\n",
+        ),
+        (
+            "cs_CZ.UTF-8",
+            "[\" 1-led-1970\",\"14-lis-2023\",\" 3-čvc-2024\"]\n",
+        ),
+    ] {
+        if !installed(locale) {
+            eprintln!("skipping {locale}: not installed");
+            continue;
+        }
+        let env = [("TZ", "UTC"), ("LC_ALL", locale)];
+        assert_eq!(
+            run("[0,1700000000,1720000000] | map(strftime(\"%v\"))", &env)?,
+            want,
+            "{locale}"
+        );
+    }
+    Ok(())
+}
