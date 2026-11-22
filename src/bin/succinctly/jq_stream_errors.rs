@@ -149,6 +149,12 @@ pub(crate) trait RefillSource {
     fn take_error(&mut self) -> Option<std::io::Error> {
         None
     }
+
+    /// Whether a byte-order mark (whole, or all the stream holds of one) was cut off the front of
+    /// the sources before they reached the reader (`front_matter::stream_bom_cuts`, #7566). When
+    /// none was, the sources start with the stream's own first bytes, and the reader matches them
+    /// against the mark as jq's parser does (#7603).
+    fn bom_cut(&self) -> bool;
 }
 
 impl RefillSource for Box<dyn RefillSource> {
@@ -158,6 +164,10 @@ impl RefillSource for Box<dyn RefillSource> {
 
     fn take_error(&mut self) -> Option<std::io::Error> {
         (**self).take_error()
+    }
+
+    fn bom_cut(&self) -> bool {
+        (**self).bom_cut()
     }
 }
 
@@ -190,6 +200,10 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> RefillSource for MemorySources<S> {
             newline: refill.newline,
             is_last: refill.is_last,
         })
+    }
+
+    fn bom_cut(&self) -> bool {
+        self.cursor.leads.iter().any(|&lead| lead > 0)
     }
 }
 
@@ -449,6 +463,10 @@ impl RefillSource for ChunkedSources {
     fn take_error(&mut self) -> Option<std::io::Error> {
         self.error.take()
     }
+
+    fn bom_cut(&self) -> bool {
+        self.bom_cuts.iter().any(|&cut| cut > 0)
+    }
 }
 
 /// Where the refills jq makes over a list of sources have got to, so that the next one can be
@@ -574,6 +592,9 @@ pub(crate) struct Yielded {
     /// The message, when the input is a parse error: `[message, path]` is the input under
     /// `--stream-errors`, and the message is the error jq raises without it.
     pub(crate) error: Option<String>,
+    /// Whether `error` is raised under `--stream-errors` too, not made an input: `Malformed BOM`,
+    /// which `jv_parser_next` returns before it scans (#7603).
+    pub(crate) raised: bool,
 }
 
 /// How jq's reader ended, known once [`Reader::next`] has returned `None`.
@@ -663,10 +684,16 @@ impl<R: RefillSource> Reader<R> {
             stop_is_barrier: false,
         });
         let seq = seq.is_some();
+        let mut parser = Parser::new(seq);
+        // #7603: the stream's first bytes reach a plain parser with no mark cut off them only when
+        // they are no mark, or one that breaks off, which `jv_parser_set_buf` meets as jq does.
+        if !seq && !source.bom_cut() {
+            parser.bom = 0;
+        }
         Self {
             source,
             buf: Vec::new(),
-            parser: Parser::new(seq),
+            parser,
             deferred: Vec::new(),
             inside: None,
             slurp_at: (0, 0),
@@ -736,6 +763,22 @@ impl<R: RefillSource> Reader<R> {
         if refill.newline {
             parser.lines_read += 1;
         }
+        if !parser.seq && parser.bom == BOM_MALFORMED {
+            // #7603: a mark that breaks off makes `jv_parser_next` return `Malformed BOM` before it
+            // scans, on this call and every later one, so jq reads nothing more: its parser never
+            // empties the refill. The error is raised under `--stream-errors` too, not made an
+            // event, and the reader ends with it: a caller that asks again gets it again
+            // ([`Yielded::raised`]).
+            parser.pending.push_back(Yielded {
+                value: OwnedValue::Null,
+                location: (parser.source, parser.lines_read),
+                error: Some(String::from("Malformed BOM")),
+                raised: true,
+            });
+            self.finished = true;
+            self.done = true;
+            return;
+        }
         // The call that follows a refill starts with `stream_check_done`.
         let drained = !self.deferred.is_empty();
         for value in std::mem::take(&mut self.deferred) {
@@ -775,6 +818,7 @@ impl<R: RefillSource> Reader<R> {
                 value: OwnedValue::Null,
                 location: (parser.source, parser.lines_read),
                 error: Some(crate::cli::jq_seq_reader::MESSAGELESS_RETURN.to_string()),
+                raised: false,
             });
             let rest = &self.buf[fed.consumed..];
             fed = if rest.is_empty() {
@@ -844,6 +888,28 @@ impl<R: RefillSource> Reader<R> {
             first_error: self.parser.first_error,
         }
     }
+}
+
+/// Whether the stream `sources` make opens with part of a UTF-8 byte-order mark and then departs
+/// from it (`EF` then `1`, or `EF BB` in one source and `1` in the next), which `jv_parser_next`
+/// answers with `Malformed BOM` before it scans a byte, on every call (#7603). A stream that ends
+/// inside the mark is not one: it is empty input (#7454). The sources hold the stream's first bytes
+/// only when no mark was cut off them ([`STREAM_BOM_LEADS`]); one that was cut is never malformed.
+pub(crate) fn opens_with_malformed_bom(sources: &[(Option<usize>, Vec<u8>)]) -> bool {
+    if STREAM_BOM_LEADS.with(|leads| leads.borrow().iter().any(|&lead| lead > 0)) {
+        return false;
+    }
+    let mut matched = 0;
+    for &byte in sources.iter().flat_map(|(_, raw)| raw) {
+        if byte != UTF8_BOM[matched] {
+            return matched > 0;
+        }
+        matched += 1;
+        if matched == UTF8_BOM.len() {
+            return false;
+        }
+    }
+    false
 }
 
 /// Read `sources` (each source's bytes as read, a leading BOM already removed) the way
@@ -931,6 +997,12 @@ fn read_keeping(
     let mut locations = std::collections::VecDeque::new();
     let mut first_fault = None;
     while let Some(yielded) = reader.next_yielded() {
+        if yielded.raised {
+            // #7603: an error that is not an input, which ends the read (`jq_runner` meets it
+            // before it reads: `opens_with_malformed_bom`).
+            first_fault = yielded.error.map(|message| (message, yielded.location));
+            break;
+        }
         if let (Some(message), None) = (yielded.error, &first_fault) {
             first_fault = Some((message, yielded.location));
             if stop_at_fault {
@@ -1108,7 +1180,10 @@ pub(crate) enum Afterwards {
 ///
 /// Memory is the events and one entry per fault, as [`read_for_slurp`]'s is: the location of only
 /// the last [`SLURP_TAIL`] events is kept, since the inputs after the array are among them.
-pub(crate) fn read_for_deferred_slurp(sources: &[(Option<usize>, Vec<u8>)]) -> DeferredSlurp {
+pub(crate) fn read_for_deferred_slurp(
+    sources: &[(Option<usize>, Vec<u8>)],
+    closer_in_array: bool,
+) -> DeferredSlurp {
     let mut reader = Reader::new(sources);
     // Every event, and the faults with where they came in the sequence of inputs jq yielded.
     let mut events = Vec::new();
@@ -1148,12 +1223,31 @@ pub(crate) fn read_for_deferred_slurp(sources: &[(Option<usize>, Vec<u8>)]) -> D
         }
     }
     after.sort_by_key(|(at, _)| *at);
+    // jq 1.8 reads once more after the last byte before it closes the array (jqlang/jq#3279,
+    // #7523), so the closing event its parser still held at that point is in the array. jq 1.7.1
+    // gave it out after the array, as an input of its own. A run with a file that did not open keeps
+    // the 1.7.1 reads (`closer_in_array` is false), and so does one whose text ends in a fault.
+    if closer_in_array
+        && after.len() == 1
+        && matches!(after.first(), Some((_, Afterwards::Value(value, _))) if is_closing_event(value))
+    {
+        if let (_, Afterwards::Value(value, _)) = after.remove(0) {
+            events.push(value);
+        }
+    }
     DeferredSlurp {
         array: events,
         slurp_at: end.slurp_at,
         before,
         after: after.into_iter().map(|(_, item)| item).collect(),
     }
+}
+
+/// Whether `value` is a container's closing event, `[path]`: not a leaf (`[path, value]`) and not a
+/// fault (`[message, path]`).
+pub(crate) fn is_closing_event(value: &OwnedValue) -> bool {
+    matches!(value, OwnedValue::Array(parts)
+        if parts.len() == 1 && matches!(parts[0], OwnedValue::Array(_)))
 }
 
 /// What [`Parser::feed`] did with a refill.
@@ -1329,6 +1423,7 @@ impl Parser {
             value,
             location: (self.source, line),
             error,
+            raised: false,
         });
         self.yielded += 1;
     }
@@ -2967,7 +3062,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, bytes)| (Some(i), bytes.to_vec()))
                 .collect();
-            read_for_deferred_slurp(&sources)
+            read_for_deferred_slurp(&sources, false)
         };
         let shape = |read: &DeferredSlurp| {
             let after: Vec<String> = read
@@ -2982,9 +3077,15 @@ mod tests {
         };
         // Nothing to read: an empty array.
         assert_eq!(shape(&read(&[b""])), (0, 0, vec![]));
-        // A clean stream is the array, and the close of the last container that jq's loop still
-        // held when it closed the array.
+        // A clean stream is the array, and the close of the last container that jq 1.7.1's loop
+        // still held when it closed the array.
         assert_eq!(shape(&read(&[b"1 [2]"])), (2, 0, vec!["value".to_string()]));
+        // jq 1.8 puts that close in the array (#7523), unless a file did not open.
+        let sources = vec![(Some(0), b"1 [2]".to_vec())];
+        assert_eq!(
+            shape(&read_for_deferred_slurp(&sources, true)),
+            (3, 0, vec![])
+        );
         // A fault in the middle comes before the array, which holds the events around it.
         assert_eq!(shape(&read(&[b"1 2 }\n3"])), (3, 1, vec![]));
         // Two faults are two calls before the array.

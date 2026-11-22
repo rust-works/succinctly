@@ -1093,6 +1093,11 @@ fn format_number_jq_compat_at(raw: &[u8], mantissa_digit_cap: Option<usize>) -> 
         Err(_) => return String::from_utf8_lossy(raw).into_owned(),
     };
 
+    // #7469: a parsed infinity's text is decNumber's word, which jq prints as `DBL_MAX`.
+    if let Some(sign) = literal_infinity_sign(s) {
+        return infinite_float_preview_text(sign < 0).to_string();
+    }
+
     // #2802: a YAML integer written `0x1f` or `0o17` is no JSON number, and the plain-integer
     // path below would read its `0` as an insignificant leading zero (`x1f`). It prints as the
     // number it is.
@@ -4270,6 +4275,26 @@ impl OwnedValue {
         Self::NumberLiteral(NumberRepr::Float(f64::from_bits(bits)), "null".into())
     }
 
+    /// An infinity jq *parsed* rather than computed (#7469): a document's, `fromjson`'s or
+    /// `tonumber`'s `Infinity`, `infinity` or `+Infinity` (decNumber's infinity).
+    ///
+    /// jq 1.7.1 keeps it as a decNumber literal, and two literals compare as exact decimals, so it
+    /// orders above every finite literal, one past `DBL_MAX` included (`. > 1e1000` is `true`,
+    /// `[., 1e1000] | unique` keeps both), where against a computed double it is the double
+    /// infinity (`. == infinite`). A `NumberLiteral`, as a parsed NaN is
+    /// ([`nan_instance`](Self::nan_instance)), so that arithmetic collapses it to the computed
+    /// infinity. Its text is decNumber's word, which no other stored literal spells: the decimal
+    /// comparison orders it past every finite literal ([`cmp_literal_texts`]), and the number
+    /// formatter prints it as jq prints it, `DBL_MAX`'s text ([`format_number_jq_compat`]).
+    pub(crate) fn parsed_infinity(negative: bool) -> Self {
+        let (f, text) = if negative {
+            (f64::NEG_INFINITY, "-Infinity")
+        } else {
+            (f64::INFINITY, "Infinity")
+        };
+        Self::NumberLiteral(NumberRepr::Float(f), text.into())
+    }
+
     /// A double the reindex bridge decoded: the [`nan_instance`](Self::nan_instance)
     /// it was written from when it carries one's payload
     /// ([`push_nan_instance_token`]), a bare computed `Float` otherwise (#2902).
@@ -4473,6 +4498,10 @@ impl OwnedValue {
         // is letters, so the two can't collide; bridge decoding lives in
         // `from_json_number`, ahead of this whole function (#3034).
         if let Some(f) = crate::json::validate::jq_special_number(bytes) {
+            // #7469: jq's parsed infinity is a literal, which a computed one is not.
+            if f.is_infinite() && S::DECNUMBER_LITERALS {
+                return Self::parsed_infinity(f.is_sign_negative());
+            }
             return Self::Float(f);
         }
         // A leading `+` (#2877): `+X` behaves exactly like `X` in jq, and
@@ -4619,16 +4648,35 @@ impl OwnedValue {
     /// `jv`, so two reads of one key are identical, and the reader's sharing
     /// of one key among sibling records (#7260) would make keys of two
     /// objects identical where jq's parser allocated each.
-    pub(crate) fn promote_identities(&mut self) {
+    ///
+    /// With `keys` false the keys are left as they were read: for a run that
+    /// can never hand a key out as a value, where no key's identity can be
+    /// asked, so that storage would only cost an allocation per key (#7489).
+    pub(crate) fn promote_identities(&mut self, keys: bool) {
+        if keys {
+            self.promote_identities_in::<true>();
+        } else {
+            self.promote_identities_in::<false>();
+        }
+    }
+
+    /// [`promote_identities`](Self::promote_identities) with the choice made
+    /// once per walk, not per object.
+    fn promote_identities_in<const KEYS: bool>(&mut self) {
         match self {
             Self::String(s) => s.promote(),
             Self::NumberLiteral(_, spelling) | Self::SpelledScalar(_, spelling) => {
                 spelling.promote();
             }
-            Self::Array(items) => items.iter_mut().for_each(Self::promote_identities),
+            Self::Array(items) => items
+                .iter_mut()
+                .for_each(Self::promote_identities_in::<KEYS>),
             Self::Object(map) => {
-                map.own_keys();
-                map.values_mut().for_each(Self::promote_identities);
+                if KEYS {
+                    map.own_keys();
+                }
+                map.values_mut()
+                    .for_each(Self::promote_identities_in::<KEYS>);
             }
             Self::Null | Self::Bool(_) | Self::Int(_) | Self::Float(_) => {}
         }
@@ -5207,8 +5255,13 @@ impl OwnedValue {
                 }
             }
             Self::NumberLiteral(NumberRepr::Float(f), _) if f.is_nan() => nan_fmt(out, *f),
+            // A parsed infinity (#7469) is written as a computed one is: `DBL_MAX`'s text for
+            // output, the bridge's infinity token for a bridge, which a finite literal of that
+            // text must not become.
             Self::NumberLiteral(NumberRepr::Float(f), literal)
-                if f.is_infinite() && crate::yaml::nonfinite_literal_index(literal).is_some() =>
+                if f.is_infinite()
+                    && (crate::yaml::nonfinite_literal_index(literal).is_some()
+                        || is_parsed_infinity(*f, literal)) =>
             {
                 out.push_str(infinite_fmt(f.is_sign_negative()));
             }
@@ -5638,11 +5691,11 @@ impl OwnedValue {
                 reindex_count::bump_string(text.len());
             }
         }
-        Ok(ReindexedDoc::new(
-            indexable_bridge_text(self.to_json_for_reindex::<S>()?)?,
+        ReindexedDoc::new(
+            self.to_json_for_reindex::<S>()?,
             S::REINDEX_BRIDGE_KEEPS_IDENTITY.then_some(self),
             self.is_scalar_root(),
-        ))
+        )
     }
 
     /// [`reindexed`](Self::reindexed)'s document, spelled as `S` spells it but
@@ -5657,10 +5710,10 @@ impl OwnedValue {
         #[cfg(test)]
         reindex_count::bump();
         let mut doc = ReindexedDoc::new(
-            indexable_bridge_text(self.to_json_for_reindex::<S>()?)?,
+            self.to_json_for_reindex::<S>()?,
             None,
             self.is_scalar_root(),
-        );
+        )?;
         if matches!(self, Self::String(_)) {
             doc.root_string = Some(self.clone());
         }
@@ -5673,8 +5726,7 @@ impl OwnedValue {
     pub fn try_input_bridge_doc(&self) -> Result<ReindexedDoc, EvalError> {
         #[cfg(test)]
         reindex_count::bump();
-        let text = indexable_bridge_text(self.to_json_input_bridge())?;
-        Ok(ReindexedDoc::new(text, None, self.is_scalar_root()))
+        ReindexedDoc::new(self.to_json_input_bridge(), None, self.is_scalar_root())
     }
 
     /// [`to_json_input_bridge`](Self::to_json_input_bridge)'s text, indexed
@@ -5683,10 +5735,16 @@ impl OwnedValue {
     /// the input queue rather than for a round trip, so the rule that makes
     /// handing back the source sound (`reindex_bridge_is_identity`) was
     /// never shown to hold for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a value no index holds (#7425, #7537): [`try_input_bridge_doc`](Self::try_input_bridge_doc)
+    /// returns its error instead.
     pub fn input_bridge_doc(&self) -> ReindexedDoc {
         #[cfg(test)]
         reindex_count::bump();
         ReindexedDoc::new(self.to_json_input_bridge(), None, self.is_scalar_root())
+            .unwrap_or_else(|error| panic!("{}", error.message))
     }
 
     /// Whether the bridge writes this value as one scalar token (#4154): every
@@ -5696,24 +5754,16 @@ impl OwnedValue {
     }
 }
 
-/// `text` if a [`JsonIndex`](crate::json::JsonIndex) can hold it; otherwise the bridge's refusal
-/// (#7425), a resource limit like the bridge's depth refusal, since jq has no ceiling here: a value
-/// of 4 GiB or more is one only a document that large (or a program building one) gives.
-fn indexable_bridge_text(text: String) -> Result<String, EvalError> {
-    if crate::json::JsonIndex::can_index(text.len()) {
-        Ok(text)
-    } else {
-        Err(EvalError::resource_limit(index_ceiling_message(text.len())))
-    }
-}
-
 /// The refusal of a value or document of `len` bytes that no [`JsonIndex`](crate::json::JsonIndex)
-/// can hold, for the reindex bridge and for the CLI's reader of such a document (#7425).
+/// can hold, for the reindex bridge and for the CLI's reader of such a document (#7425): one of
+/// more than 4 GiB whose interest bits or balanced parentheses pass
+/// [`JsonIndex::MAX_COUNT`](crate::json::JsonIndex::MAX_COUNT), two parentheses a value (#7537). A
+/// resource limit like the bridge's depth refusal, since jq has no ceiling here.
 #[must_use]
 pub(crate) fn index_ceiling_message(len: usize) -> String {
     alloc::format!(
-        "Cannot index a value of {len} bytes: the index holds at most {} bytes (4 GiB)",
-        crate::json::JsonIndex::MAX_TEXT_LEN
+        "Cannot index a value of {len} bytes: the index holds at most {} values",
+        crate::json::JsonIndex::MAX_COUNT / 2
     )
 }
 
@@ -5775,7 +5825,12 @@ pub struct ReindexedDoc {
 }
 
 impl ReindexedDoc {
-    fn new(text: String, source: Option<&OwnedValue>, scalar_root: bool) -> Self {
+    /// The document of `text`, or the bridge's refusal of a text no index holds (#7425, #7537).
+    fn new(
+        text: String,
+        source: Option<&OwnedValue>,
+        scalar_root: bool,
+    ) -> Result<Self, EvalError> {
         // #4154: a one-token document's index follows from its length alone,
         // so it skips the scanner and the directory build the general
         // constructor pays for.
@@ -5789,8 +5844,12 @@ impl ReindexedDoc {
         );
         let index = if scalar_root {
             crate::json::JsonIndex::build_reindex_scalar_from(text.len(), scalar_index_pool::take())
-        } else {
+        } else if crate::json::JsonIndex::can_index(text.len()) {
+            // Built in place: every text shorter than 4 GiB is held (#7537).
             crate::json::JsonIndex::build_reindex(text.as_bytes())
+        } else {
+            crate::json::JsonIndex::try_build_reindex(text.as_bytes())
+                .ok_or_else(|| EvalError::resource_limit(index_ceiling_message(text.len())))?
         };
         // Only a container has storage to share. The key is the text's heap
         // buffer, which -- unlike the index's own address, the
@@ -5802,13 +5861,13 @@ impl ReindexedDoc {
             }
             _ => false,
         };
-        Self {
+        Ok(Self {
             text,
             index,
             registered,
             scalar_root,
             root_string: None,
-        }
+        })
     }
 
     /// The root cursor over the bridge text.
@@ -6233,6 +6292,13 @@ fn overflow_literal_text(negative: bool) -> &'static str {
 /// [`format_number_jq_compat`] uses would hit the exact `NaN`-mantissa
 /// failure that path only avoids by never being called on a non-finite
 /// input in the first place.
+/// Whether a `NumberLiteral` of double `f` and text `text` is an
+/// [`OwnedValue::parsed_infinity`] (#7469): an infinite double under decNumber's word.
+#[inline]
+pub(crate) fn is_parsed_infinity(f: f64, text: &str) -> bool {
+    f.is_infinite() && literal_infinity_sign(text).is_some()
+}
+
 pub(crate) fn infinite_float_preview_text(negative: bool) -> &'static str {
     if negative {
         "-1.7976931348623157e+308"
@@ -6865,10 +6931,27 @@ pub(crate) fn cmp_jq_number_literals(
 /// byte-equal ones short-circuiting.
 pub(crate) fn cmp_literal_texts(a: &str, b: &str) -> core::cmp::Ordering {
     if a == b {
-        core::cmp::Ordering::Equal
-    } else {
-        cmp_decimal_literals(a, b)
+        return core::cmp::Ordering::Equal;
     }
+    // #7469: decNumber's infinity (a document's `Infinity`, `-infinity`, `+Infinity`) is a literal
+    // that orders past every finite one, `1e1000` included. Only a double tie reaches here, and a
+    // finite literal spells no letter, so the check is one byte for every other pair.
+    match (literal_infinity_sign(a), literal_infinity_sign(b)) {
+        (None, None) => cmp_decimal_literals(a, b),
+        (a, b) => a.unwrap_or(0).cmp(&b.unwrap_or(0)),
+    }
+}
+
+/// `1` or `-1` for a literal text that spells decNumber's infinity (`Infinity`, `-inf`, ...), `None`
+/// for any other: what [`cmp_literal_texts`] orders past every finite literal.
+fn literal_infinity_sign(text: &str) -> Option<i8> {
+    let body = text.strip_prefix(['-', '+']).unwrap_or(text);
+    if !body.starts_with(['i', 'I']) {
+        return None;
+    }
+    let f = crate::json::validate::jq_special_number(text.as_bytes())?;
+    f.is_infinite()
+        .then_some(if f.is_sign_negative() { -1 } else { 1 })
 }
 
 /// jq's own number comparison (`jvp_number_cmp`, `src/jv.c`), behind
@@ -7657,7 +7740,7 @@ mod tests {
         .expect("a valid document");
         let before = doc.to_json_jq_preserve();
         let e_storage = doc.as_object().expect("an object")["e"].clone();
-        doc.promote_identities();
+        doc.promote_identities(true);
         assert_eq!(doc.to_json_jq_preserve(), before);
 
         let map = doc.as_object().expect("an object");
@@ -7694,7 +7777,7 @@ mod tests {
         assert!(first.ptr_eq(&second), "the reader shares a sibling's key");
 
         let before = doc.to_json_jq_preserve();
-        doc.promote_identities();
+        doc.promote_identities(true);
         assert_eq!(doc.to_json_jq_preserve(), before);
         let records = doc.as_array().expect("an array");
         let keys: Vec<&SharableString> = records
@@ -9894,20 +9977,57 @@ mod tests {
                 "{word}"
             );
         }
-        for (word, f) in [
-            ("inf", f64::INFINITY),
-            ("Infinity", f64::INFINITY),
-            ("iNfInItY", f64::INFINITY),
-            ("+inf", f64::INFINITY),
-            ("-inf", f64::NEG_INFINITY),
-            ("-Infinity", f64::NEG_INFINITY),
+        // #7469: an infinity is decNumber's literal, which compares past every finite literal.
+        for (word, negative) in [
+            ("inf", false),
+            ("Infinity", false),
+            ("iNfInItY", false),
+            ("+inf", false),
+            ("-inf", true),
+            ("-Infinity", true),
         ] {
-            assert_eq!(
-                OwnedValue::from_number_bytes::<JqSemantics>(word.as_bytes()),
-                OwnedValue::Float(f),
+            let read = OwnedValue::from_number_bytes::<JqSemantics>(word.as_bytes());
+            assert_eq!(read, OwnedValue::parsed_infinity(negative), "{word}");
+            assert!(
+                matches!(&read, OwnedValue::NumberLiteral(NumberRepr::Float(f), text)
+                    if f.is_infinite() && f.is_sign_negative() == negative && is_parsed_infinity(*f, text)),
                 "{word}"
             );
+            let past_dbl_max = OwnedValue::from_number_bytes::<JqSemantics>(if negative {
+                b"-1e1000"
+            } else {
+                b"1e1000"
+            });
+            let expected = if negative {
+                core::cmp::Ordering::Less
+            } else {
+                core::cmp::Ordering::Greater
+            };
+            assert_eq!(
+                jq_numeric_cmp(&read, &past_dbl_max),
+                Some(expected),
+                "{word}"
+            );
+            let computed = OwnedValue::Float(if negative {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            });
+            assert_eq!(
+                jq_numeric_cmp(&read, &computed),
+                Some(core::cmp::Ordering::Equal),
+                "{word}"
+            );
+            assert_eq!(
+                format_number_jq_compat(word.as_bytes()),
+                infinite_float_preview_text(negative)
+            );
         }
+        // yq's number model keeps the bare double.
+        assert_eq!(
+            OwnedValue::from_number_bytes::<YqSemantics>(b"Infinity"),
+            OwnedValue::Float(f64::INFINITY)
+        );
         // `+X` is `X`, stored unsigned: the strict grammar and the three
         // lenient escapes (leading dot, leading zero, trailing dot before
         // an exponent) each hold through the peel, and compose.

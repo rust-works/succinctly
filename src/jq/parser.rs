@@ -362,6 +362,33 @@ const DEF_CHAIN_LINK_STACK: usize = if cfg!(debug_assertions) {
     2 * 1024
 };
 
+/// The native stack the parse and the walks after it (the resolver, the analyses, the evaluator,
+/// a clone or a drop of the tree) spend on each level of a jq program's nesting, a bracket, a
+/// parenthesis, a `try`, an `if` or a local `def`, charged against the stack's room when the parser
+/// starts (#7435). Measured on an Apple M5 with the charge taken off: the deepest walk of a nesting
+/// level took 8.9 to 10.7 KiB in a release build (25,000 levels of parentheses, brackets, `if`s,
+/// string interpolations, labels or local `def`s ran on the CLI's 256 MiB thread, 30,000 aborted)
+/// and 27 to 54 KiB in a debug one (40,000 ran and 80,000 aborted on 2 GiB). This is about 1.3 and
+/// 1.5 times the larger figure, against half the thread's stack (the floor's room), so a program the
+/// parser admits leaves the walks more than half the stack to spare: about 9,300 levels in a release
+/// build and 13,000 in a debug one, where jq's parser stops at 10,000.
+const EXPR_LEVEL_STACK: usize = if cfg!(debug_assertions) {
+    80 * 1024
+} else {
+    14 * 1024
+};
+
+/// [`EXPR_LEVEL_STACK`] for one link of a binary-operator chain (`+`, `-`, `*`, `and`, `or`, `//`,
+/// a postfix `?`), which the parser reads in a loop and the walks after it recurse down (#7435).
+/// Measured the same way: 3.8 to 4.5 KiB a link in a release build (60,000 operands of `+` ran,
+/// 70,000 aborted) and 21 to 36 KiB in a debug one (60,000 ran, 100,000 aborted), so this is about
+/// 1.3 times the larger figure: about 21,000 links in either build.
+const CHAIN_LINK_STACK: usize = if cfg!(debug_assertions) {
+    48 * 1024
+} else {
+    6 * 1024
+};
+
 /// jq's own words when its parser runs out of room, `memory exhausted` (a compile error, exit 3):
 /// what a program too long for the native-stack floor is refused with (#7475). Out of line, so the
 /// recursive parse functions that raise it keep their frames.
@@ -1573,8 +1600,12 @@ fn nwise_expansion(mut args: Vec<Expr>) -> Expr {
     // `n` and `$n` are jq's own names. An argument expression sits outside the scope of both
     // (`a` of the two-argument form is evaluated under `$__nwise_m` alone).
     const BODY: &str = "def n: if length <= $n then . else .[0:$n] , (.[$n:] | n) end; n";
+    // The template binds `$n` with `as`, whose body the parser refuses at the native-stack floor
+    // (#7475); a program parsed close to the floor reaches this from inside its own parse, so the
+    // template is parsed with the floor lifted, as a fixed, shallow text (#7676).
     let template = |source: String| {
-        parse_with_mode(&source, ParserMode::Jq).expect("jq's _nwise template parses")
+        super::eval::with_native_stack_floor_lifted(|| parse_with_mode(&source, ParserMode::Jq))
+            .expect("jq's _nwise template parses")
     };
     if args.len() == 1 {
         Expr::As {
@@ -1850,6 +1881,18 @@ struct Parser<'a> {
     interp_depth: usize,
     /// Current `Expr` recursion depth; see [`MAX_EXPR_DEPTH`].
     expr_depth: usize,
+    /// The native stack this thread has room for when the parser starts, which a jq program's
+    /// nesting ([`EXPR_LEVEL_STACK`] a level) and every binary-operator link of it
+    /// ([`CHAIN_LINK_STACK`] a link) are charged against (#7435); `None` where [`MAX_EXPR_DEPTH`]
+    /// holds instead: in yq mode, and on a thread whose stack has no room for more than that (no
+    /// budget is registered, or a small one), where every chain is held to that limit on its own
+    /// as before.
+    stack_room: Option<usize>,
+    /// The binary-operator links (`+`, `or`, `//`, a postfix `?`, ...) read so far, under
+    /// [`Self::stack_room`]: a chain is read in a loop, but it is a left-deep tree that every
+    /// walk after the parse recurses down, and the links of a chain in another chain's left operand
+    /// add up, so all of them are counted.
+    chain_links: usize,
     /// Whether a string bracket key (`.["k"]`) stays an [`Expr::IndexExpr`] rather than folding
     /// into [`Expr::Field`]: set only while yq mode parses a `del(...)` argument (#2126), the one
     /// place the bracket and dotted spellings part ways (`del()` vivifies a `null` behind the
@@ -3322,6 +3365,13 @@ impl<'a> Parser<'a> {
             pattern_computed_keys: 0,
             interp_depth: 0,
             expr_depth: 0,
+            stack_room: if mode == ParserMode::Jq {
+                super::eval::native_stack_room()
+                    .filter(|&room| room / EXPR_LEVEL_STACK > MAX_EXPR_DEPTH)
+            } else {
+                None
+            },
+            chain_links: 0,
             keep_bracket_keys: false,
             call_sites: Vec::new(),
             var_sites: Vec::new(),
@@ -5699,11 +5749,8 @@ impl<'a> Parser<'a> {
     /// their own productions. `--jq-extensions` enables the generic form.
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         self.expr_depth += 1;
-        let result = if self.expr_depth > MAX_EXPR_DEPTH {
-            Err(ParseError::new(
-                format!("expression nesting exceeds depth limit of {MAX_EXPR_DEPTH}"),
-                self.pos,
-            ))
+        let result = if self.nesting_exceeded() {
+            Err(self.nesting_error())
         } else {
             self.parse_primary_optional()
         };
@@ -5741,6 +5788,50 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Whether the nesting at the cursor is past the limit: [`MAX_EXPR_DEPTH`] levels, or, under
+    /// [`Self::stack_room`], that room, at [`EXPR_LEVEL_STACK`] a level and [`CHAIN_LINK_STACK`] for
+    /// every chain link of the program read so far (#7435).
+    fn nesting_exceeded(&self) -> bool {
+        match self.stack_room {
+            Some(room) => {
+                self.expr_depth * EXPR_LEVEL_STACK + self.chain_links * CHAIN_LINK_STACK > room
+            }
+            None => self.expr_depth > MAX_EXPR_DEPTH,
+        }
+    }
+
+    /// The refusal of a program nested past [`Self::nesting_exceeded`]'s limit: jq's own words for a
+    /// program too deep for its parser's stack, `memory exhausted`, under the native stack's limit
+    /// (#7435), and the fixed limit's own words under that. Out of line, as a recursive parse
+    /// function raises it.
+    #[cold]
+    #[inline(never)]
+    fn nesting_error(&self) -> ParseError {
+        match self.stack_room {
+            Some(_) => stack_exhausted_error(self.pos),
+            None => ParseError::new(
+                format!("expression nesting exceeds depth limit of {MAX_EXPR_DEPTH}"),
+                self.pos,
+            ),
+        }
+    }
+
+    /// Accounts for the `chain_depth`th link of a binary-operator chain read in a loop (or the
+    /// `chain_depth`th postfix `?` of a term), which wraps the chain so far in another node: against
+    /// [`MAX_EXPR_DEPTH`] on its own ([`Self::check_expr_nesting`]), or under
+    /// [`Self::stack_room`] as one more level of the program's (#7435), so that a jq program's
+    /// `or` chain of a few hundred allow-list terms is read where jq reads it.
+    fn check_chain_link(&mut self, chain_depth: usize) -> Result<(), ParseError> {
+        if self.stack_room.is_none() {
+            return self.check_expr_nesting(chain_depth);
+        }
+        self.chain_links += 1;
+        if self.nesting_exceeded() {
+            return Err(self.nesting_error());
+        }
+        Ok(())
+    }
+
     /// The real `parse_primary` body, entered only through the depth-checked
     /// wrapper above -- every recursive descent goes back through
     /// `self.parse_primary()`, not this function, so the counter sees every
@@ -5755,7 +5846,7 @@ impl<'a> Parser<'a> {
             }
             self.next();
             wraps += 1;
-            self.check_expr_nesting(wraps)?;
+            self.check_chain_link(wraps)?;
             // #3038: this generic `EXPR?` suppression is jq's `Exp: Exp
             // '?'` production, never `Term` -- unlike `.foo?`/`.[0]?`
             // (handled entirely inside `parse_postfix`'s own loop, which
@@ -11682,7 +11773,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let right = self.parse_operand()?;
             chain_depth += 1;
-            self.check_expr_nesting(chain_depth)?;
+            self.check_chain_link(chain_depth)?;
             left = Expr::Arithmetic {
                 op,
                 left: Box::new(left),
@@ -11723,7 +11814,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let right = self.parse_multiplicative()?;
             chain_depth += 1;
-            self.check_expr_nesting(chain_depth)?;
+            self.check_chain_link(chain_depth)?;
             left = Expr::Arithmetic {
                 op,
                 left: Box::new(left),
@@ -11921,7 +12012,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let right = self.parse_comparison()?;
             chain_depth += 1;
-            self.check_expr_nesting(chain_depth)?;
+            self.check_chain_link(chain_depth)?;
             left = Expr::And(Box::new(left), Box::new(right));
         }
 
@@ -11950,7 +12041,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let right = self.parse_and()?;
             chain_depth += 1;
-            self.check_expr_nesting(chain_depth)?;
+            self.check_chain_link(chain_depth)?;
             left = Expr::Or(Box::new(left), Box::new(right));
         }
 
@@ -11986,7 +12077,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let right = operand(self)?;
             chain_depth += 1;
-            self.check_expr_nesting(chain_depth)?;
+            self.check_chain_link(chain_depth)?;
             left = Expr::Alternative(Box::new(left), Box::new(right));
         }
 
@@ -18497,6 +18588,26 @@ mod tests {
                 "`{program}` (the `{word}` form) does not parse with --jq-extensions"
             );
         }
+    }
+
+    /// #7676: the `_nwise` template binds `$n` with `as`, whose body the parser refuses at the
+    /// native-stack floor (#7475). A program that reaches the floor in its own parse reaches the
+    /// template there, and its refusal was a panic (`expect`), not the program's refusal: it is
+    /// parsed with the floor lifted. A program with nothing the floor checks before `_nwise`
+    /// stands for that one here, with no stack left.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_nwise_template_parses_at_the_native_stack_floor_7676() {
+        for src in ["[1,2,3] | _nwise(2)", "[1,2,3] | _nwise(.; 2)"] {
+            let at_floor = crate::jq::with_stack_budget(0, || parse(src));
+            assert_eq!(at_floor, parse(src), "{src}");
+        }
+        // The program's own binding is still refused there.
+        let refused = crate::jq::with_stack_budget(0, || parse("1 as $x | [1,2,3] | _nwise(2)"));
+        assert_eq!(
+            refused.map_err(|e| e.message),
+            Err(String::from("memory exhausted"))
+        );
     }
 
     /// #6684: `_nwise(n)` and `_nwise(a; n)` are expanded to jq's definitions at the call site, in

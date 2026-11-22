@@ -259,6 +259,9 @@ pub struct ModuleLoader {
     search_path: Vec<PathBuf>,
     /// The library directories alone, which `modulemeta` searches (#5321)
     lib_dirs: Vec<PathBuf>,
+    /// The note a `module not found` on [`Self::search_path`] or [`Self::lib_dirs`] carries: jq
+    /// cannot expand the `~/` of `~/.jq` or of a `-L` entry with `HOME` unset, and says so (#7608).
+    default_note: Option<String>,
     /// The `-L` entries as given, kept so the directories can be worked out again once the
     /// program and jq origins are known (#7430): a `~/` and a `$ORIGIN/` entry names no
     /// directory until then.
@@ -298,8 +301,9 @@ pub struct ModuleLoader {
     /// at all, so [`Self::failure_report`] can walk it last, where jq does (#5339, #5351).
     /// `None` for one with neither: there is nothing of it to walk.
     dot_jq_path: Option<PathBuf>,
-    /// Why a `~/.jq` that exists cannot be used (#5351): it does not read, does not parse, or
-    /// holds a main expression. jq refuses to compile anything while it is so, and
+    /// Why a `~/.jq` that was read cannot be used (#5351): it does not parse, or holds a main
+    /// expression (one that does not read is left out, #7665). jq refuses to compile anything
+    /// while it is so, and
     /// [`Self::bind_dot_jq`] raises this.
     dot_jq_failure: Option<ReportEntry>,
     /// The modules whose own dependencies are currently being loaded, by resolved
@@ -399,7 +403,13 @@ pub(crate) enum ReportEntry {
     /// show for this case: `module not found: {module_path}`, a blank line
     /// standing in for the missing echo, then the usual trailer. Confirmed
     /// live against jq 1.7.1, byte-for-byte.
-    NotFound { module_path: String },
+    NotFound {
+        module_path: String,
+        /// jq's parenthesised note after the message: the last search entry it could not
+        /// expand (`Could not expand ~/.jq. (Could not find home directory.)` with `HOME`
+        /// unset, #7608), or `None`.
+        note: Option<String>,
+    },
     /// A module's own `include`/`import` chain leads back to a module still
     /// being loaded (`ca` includes `cb` includes `ca`, or a module including
     /// itself). jq 1.8.2 reports `circular import of {path}` (CVE-2026-44777, #7530)
@@ -565,11 +575,14 @@ fn print_report_entry(entry: &ReportEntry) {
     match entry {
         // jq's own shape for a module it cannot find: the message, then a blank
         // line standing in for the missing source echo.
-        ReportEntry::NotFound { module_path } => {
+        ReportEntry::NotFound { module_path, note } => {
             // jq rejects a malformed path before it searches, in the same report (#5322).
             match invalid_module_path(module_path) {
                 Some(message) => eprintln!("jq: error: {message}"),
-                None => eprintln!("jq: error: module not found: {module_path}"),
+                None => eprintln!(
+                    "jq: error: {}",
+                    module_not_found(module_path, note.as_deref())
+                ),
             }
             eprintln!();
         }
@@ -850,13 +863,59 @@ fn invalid_module_path(module_path: &str) -> Option<String> {
 struct Target<'a> {
     path: &'a str,
     search: Option<Vec<PathBuf>>,
+    /// The note a `module not found` for `search` carries ([`unexpanded_home_note`]).
+    search_note: Option<String>,
 }
 
 #[cfg(test)]
 impl<'a> Target<'a> {
     /// A directive without `search` metadata, resolved on the default list.
     const fn plain(path: &'a str) -> Self {
-        Self { path, search: None }
+        Self {
+            path,
+            search: None,
+            search_note: None,
+        }
+    }
+}
+
+/// jq's `module not found: <path>`, with the note of the search list it was looked for in, in
+/// parentheses, when there is one (#7608).
+fn module_not_found(module_path: &str, note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!("module not found: {module_path} ({note})"),
+        None => format!("module not found: {module_path}"),
+    }
+}
+
+/// The note jq's `find_lib` puts after a `module not found` (#7608): `build_lib_search_chain`
+/// expands each search entry in turn and keeps the error of the last one that does not expand.
+/// Only a `~/` entry can fail, and only with `HOME` unset (`get_home`); an empty `HOME` expands
+/// (to `/...`). `entries` are the search list as written, in order.
+fn unexpanded_home_note<'e>(entries: impl IntoIterator<Item = &'e str>) -> Option<String> {
+    if std::env::var_os("HOME").is_some() {
+        return None;
+    }
+    entries
+        .into_iter()
+        .filter(|entry| entry.starts_with("~/"))
+        .last()
+        .map(|entry| format!("Could not expand {entry}. (Could not find home directory.)"))
+}
+
+/// [`unexpanded_home_note`] for the library list ([`library_dirs`]): the `-L` entries, or jq's
+/// default list when there are none. A `-L` entry that names a directory as written is no `~/`
+/// to jq, which takes its real path first.
+fn library_note(cli_dirs: &[PathBuf]) -> Option<String> {
+    if cli_dirs.is_empty() {
+        unexpanded_home_note(DEFAULT_LIBRARY_ENTRIES)
+    } else {
+        unexpanded_home_note(
+            cli_dirs
+                .iter()
+                .filter(|entry| !entry.is_dir())
+                .filter_map(|entry| entry.to_str()),
+        )
     }
 }
 
@@ -880,8 +939,19 @@ fn directive_search(
     origin: &Path,
     jq_origin: &Path,
 ) -> Option<Vec<PathBuf>> {
+    Some(
+        directive_search_entries(metadata)?
+            .into_iter()
+            .filter_map(|entry| expand_search_entry(entry, origin, jq_origin))
+            .collect(),
+    )
+}
+
+/// The `search` entries of a directive's metadata as written, or `None` without one; see
+/// [`directive_search`].
+fn directive_search_entries(metadata: Option<&MetaObject>) -> Option<Vec<&str>> {
     let (_, value) = metadata?.iter().find(|(key, _)| key == "search")?;
-    let entries: Vec<&str> = match value {
+    Some(match value {
         MetaValue::String(entry) => vec![entry.as_str()],
         MetaValue::Array(items) => items
             .iter()
@@ -891,13 +961,12 @@ fn directive_search(
             })
             .collect(),
         _ => Vec::new(),
-    };
-    Some(
-        entries
-            .into_iter()
-            .filter_map(|entry| expand_search_entry(entry, origin, jq_origin))
-            .collect(),
-    )
+    })
+}
+
+/// The note a `module not found` for a directive with `search` metadata carries (#7608).
+fn directive_search_note(metadata: Option<&MetaObject>) -> Option<String> {
+    unexpanded_home_note(directive_search_entries(metadata)?)
 }
 
 /// One `search` entry as a directory; see [`directive_search`].
@@ -1002,6 +1071,14 @@ fn resolve_module_in(search_path: &[PathBuf], module_path: &str) -> Option<PathB
 /// `import "b"`, `p/q/q.jq` for `import "p/q"`), in that order -- confirmed live with
 /// all three present, where `b/jq/main.jq` beat `b/b.jq`, and with one directory
 /// holding `b/b.jq` ahead of a later one holding `b.jq`, where the earlier directory won.
+///
+/// A spelling is found when `stat` finds anything there, as in jq's `find_lib` (#7663): a
+/// directory, or a file that will not open, is the module, and reading it then fails with
+/// `error loading data file <path>: Could not open <path>: It's a directory` (or the open's own
+/// error), never `module not found` or a module further down the path. Only a spelling `stat`
+/// says is absent (`ENOENT`) moves on to the next spelling; any other failure (a symlink loop,
+/// a file where a directory should be) moves on to the next search directory, skipping the
+/// directory-module spellings, as jq does.
 fn resolve_with_suffix(
     search_path: &[PathBuf],
     module_path: &str,
@@ -1022,12 +1099,26 @@ fn resolve_with_suffix(
             // one is `lib//a.jq`, the file system's `lib/a.jq`. `Path::join` would take it as an
             // absolute path and drop the directory.
             let full_path = base.join(spelling.trim_start_matches('/'));
-            if full_path.is_file() {
-                return Some(full_path);
+            match std::fs::metadata(&full_path) {
+                Ok(_) => return Some(full_path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => break,
             }
         }
     }
     None
+}
+
+/// The `<detail>` of jq's `error loading data file <path>: <detail>` for a module or data file
+/// that was found but would not read (#7663): jq's `jv_load_file` says `Could not open <path>:
+/// <reason>`, naming the file by the resolved path the report names it by, with `It's a
+/// directory` for a directory ([`load_file_detail`]).
+fn library_read_detail(canonical: &Path, e: &std::io::Error) -> String {
+    format!(
+        "Could not open {}: {}",
+        canonical.display(),
+        load_file_detail(e)
+    )
 }
 
 /// Resolve a **data** import's path (`{module_path}.json`) against the
@@ -1059,25 +1150,48 @@ fn resolve_data_file_in(search_path: &[PathBuf], module_path: &str) -> Option<Pa
 /// data file <path>: <detail>` for the latter.
 fn load_data_import(
     search_path: &[PathBuf],
+    note: Option<String>,
     module_path: &str,
+    raw: bool,
 ) -> Result<OwnedValue, ModuleLoadError> {
     let Some(path) = resolve_data_file_in(search_path, module_path) else {
         return Err(ModuleLoadError::single(ReportEntry::NotFound {
             module_path: module_path.to_string(),
+            note,
         }));
     };
-    read_data_file(&path).map_err(|failure| ModuleLoadError::single(ReportEntry::Data(failure)))
+    read_data_file(&path, raw)
+        .map_err(|failure| ModuleLoadError::single(ReportEntry::Data(failure)))
+}
+
+/// Whether a data import's metadata asks for its file's text (#7645): `import "f" as $d {raw:
+/// true};` binds `$d` to one string, the file read as `--rawfile` reads its file, where any other
+/// import parses it as a stream of JSON values. jq's `process_dependencies` reads `raw` as raw only
+/// when it is `true` itself, so `raw: 1`, `raw: "true"` and `raw: null` parse the file (captured
+/// against jq 1.7.1 and 1.8.2). A library import reads its file as text either way, so `raw` means
+/// nothing to one.
+fn data_import_is_raw(metadata: Option<&MetaObject>) -> bool {
+    metadata.is_some_and(|metadata| {
+        metadata
+            .iter()
+            .any(|(key, value)| key == "raw" && *value == MetaValue::Bool(true))
+    })
 }
 
 /// Read and parse one resolved data file ([`load_data_import`]'s second half),
 /// so the failure report's walk reads a data import exactly as the loader does
-/// (#3573).
-fn read_data_file(path: &Path) -> Result<OwnedValue, DataFileFailure> {
+/// (#3573). A `raw` import's file is its text instead, one string ([`data_import_is_raw`]).
+fn read_data_file(path: &Path, raw: bool) -> Result<OwnedValue, DataFileFailure> {
     let unreadable = |detail: String| DataFileFailure {
         path: canonical_or_self(path),
         detail,
     };
-    let bytes = std::fs::read(path).map_err(|e| unreadable(strerror_only(&e)))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| unreadable(library_read_detail(&canonical_or_self(path), &e)))?;
+    if raw {
+        // `jv_load_file(path, 1)`, as for `--rawfile` (#7645).
+        return Ok(OwnedValue::String(jq_raw_file_text(&bytes).into()));
+    }
     // jq's parser reads the bytes (`jv_load_file`, as for `--slurpfile`), and a string's that are
     // not UTF-8 are U+FFFD by the rule the main input's are (#7604).
     let contents = match String::from_utf8(bytes) {
@@ -1098,26 +1212,26 @@ fn read_data_file(path: &Path) -> Result<OwnedValue, DataFileFailure> {
 /// import, `is_data` and `relpath`) and `defs` (`name/arity` of each top-level `def`). A
 /// module that fails to load is not an error of the filter: jq prints the diagnostic and
 /// answers `null`, with exit 0, so it comes back as stderr text.
-fn module_meta_outcome(lib_dirs: &[PathBuf], name: &str) -> jq::cli_context::ModuleMetaOutcome {
+fn module_meta_outcome(
+    lib_dirs: &[PathBuf],
+    note: Option<&str>,
+    name: &str,
+) -> jq::cli_context::ModuleMetaOutcome {
     use jq::cli_context::ModuleMetaOutcome::{Error, LoadFailure, Meta};
 
     if let Some(message) = invalid_module_path(name) {
         return Error(message);
     }
     let Some(file) = resolve_module_in(lib_dirs, name) else {
-        return Error(format!("module not found: {name}"));
+        return Error(module_not_found(name, note));
     };
     let canonical = canonical_or_self(&file);
-    // Lossily, as `import` reads a module (#5351, #7429): jq parses the raw bytes.
-    let contents = match read_library(&file) {
-        Ok(contents) => contents,
-        Err(e) => {
-            return LoadFailure(format!(
-                "jq: error loading data file {}: {}\n\n",
-                canonical.display(),
-                strerror_only(&e)
-            ));
-        }
+    // Lossily, as `import` reads a module (#5351, #7429): jq parses the raw bytes. A module that
+    // was found but will not read (a directory, a file the user cannot open) is `null`, with
+    // nothing on stderr: jq's `load_module_meta` drops the failed `jv_load_file` without a word,
+    // where `import` reports it (#7663, captured from jq 1.7.1 and 1.8.2).
+    let Ok(contents) = read_library(&file) else {
+        return Meta(OwnedValue::Null);
     };
     let program = match jq::parse_program(&contents) {
         Ok(program) => program,
@@ -1561,6 +1675,10 @@ struct Directive<'a> {
     data: bool,
     /// The directories its `search` metadata names in place of the default list (#5338).
     search: Option<Vec<PathBuf>>,
+    /// The note a `module not found` for `search` carries (#7608).
+    search_note: Option<String>,
+    /// A data import whose metadata says `raw: true`, read as text (#7645).
+    raw: bool,
 }
 
 /// `program`'s directives in jq's walk order: last-declared first. `origin` is the directory
@@ -1575,12 +1693,16 @@ fn directives_of<'p>(program: &'p Program, origin: &Path, jq_origin: &Path) -> V
             path: &include.path,
             data: false,
             search: directive_search(include.metadata.as_ref(), origin, jq_origin),
+            search_note: directive_search_note(include.metadata.as_ref()),
+            raw: false,
         })
         .chain(program.imports.iter().map(|import| Directive {
             decl_index: import.decl_index,
             path: &import.path,
             data: import.data,
             search: directive_search(import.metadata.as_ref(), origin, jq_origin),
+            search_note: directive_search_note(import.metadata.as_ref()),
+            raw: import.data && data_import_is_raw(import.metadata.as_ref()),
         }))
         .collect();
     directives.sort_by_key(|directive| core::cmp::Reverse(directive.decl_index));
@@ -1591,6 +1713,8 @@ fn directives_of<'p>(program: &'p Program, origin: &Path, jq_origin: &Path) -> V
 /// (#3573). [`ModuleLoader::failure_report`] documents the rules this follows.
 struct FailureWalk<'a> {
     search_path: &'a [PathBuf],
+    /// The note a `module not found` on `search_path` carries (#7608).
+    default_note: Option<&'a str>,
     /// jq's own directory, which a `search` entry's `$ORIGIN/` stands for (#5338).
     jq_origin: &'a Path,
     /// The modules already reached, by canonical file, whether or not they
@@ -1622,15 +1746,20 @@ impl FailureWalk<'_> {
             let Some(resolved) = resolved else {
                 // A missing module stops this level and returns `1` for it,
                 // whatever the level had counted.
+                let note = match &directive.search {
+                    Some(_) => directive.search_note.clone(),
+                    None => self.default_note.map(str::to_string),
+                };
                 self.entries.push(ReportEntry::NotFound {
                     module_path: directive.path.to_string(),
+                    note,
                 });
                 return 1;
             };
             if directive.data {
                 // Counted, and never deduplicated: the same file imported
                 // twice is reported twice.
-                if let Err(failure) = read_data_file(&resolved) {
+                if let Err(failure) = read_data_file(&resolved, directive.raw) {
                     self.entries.push(ReportEntry::Data(failure));
                     errors += 1;
                 }
@@ -1676,8 +1805,8 @@ impl FailureWalk<'_> {
             // load, and the walk goes on (see [`ReportEntry::Data`]).
             Err(e) => {
                 self.entries.push(ReportEntry::Data(DataFileFailure {
+                    detail: library_read_detail(&canonical, &e),
                     path: canonical.clone(),
-                    detail: strerror_only(&e),
                 }));
                 1
             }
@@ -1748,17 +1877,16 @@ impl ModuleLoader {
             if jq_path.is_file() {
                 // Auto-load ~/.jq file - functions defined here are always available
                 //
-                // One that cannot be used is a compile error for every program (#5351), which
+                // One that does not parse is a compile error for every program (#5351), which
                 // this constructor cannot return: the failure waits for `bind_dot_jq`.
+                //
+                // One that does not read is left out, as an absent one is (#7665): jq imports
+                // `~/.jq` as an `optional` library, and its `load_library` reports a file
+                // `jv_load_file` cannot read only for an import that is not optional
+                // (captured from jq 1.7.1 and 1.8.2).
                 let canonical = canonical_or_self(&jq_path);
                 match read_library(&jq_path) {
-                    Err(e) => {
-                        dot_jq_path = Some(jq_path.clone());
-                        dot_jq_failure = Some(ReportEntry::Data(DataFileFailure {
-                            path: canonical,
-                            detail: strerror_only(&e),
-                        }));
-                    }
+                    Err(_) => {}
                     Ok(contents) => match jq::parse_program(&contents) {
                         Err(error) => {
                             dot_jq_path = Some(jq_path.clone());
@@ -1819,6 +1947,7 @@ impl ModuleLoader {
         Self {
             search_path,
             lib_dirs,
+            default_note: library_note(&cli_dirs),
             cli_dirs,
             env_dirs,
             prog_origin: PathBuf::from("."),
@@ -1876,6 +2005,7 @@ impl ModuleLoader {
         Target {
             path,
             search: directive_search(metadata, &origin, &self.jq_origin),
+            search_note: directive_search_note(metadata),
         }
     }
 
@@ -1917,6 +2047,15 @@ impl ModuleLoader {
     /// The directories `target` is looked for in: its own `search` list, else the default.
     fn search_for<'t>(&'t self, target: &'t Target<'_>) -> &'t [PathBuf] {
         target.search.as_deref().unwrap_or(&self.search_path)
+    }
+
+    /// The note a `module not found` for `target` carries: its own `search` list's, else the
+    /// default list's (#7608).
+    fn note_for(&self, target: &Target<'_>) -> Option<String> {
+        match &target.search {
+            Some(_) => target.search_note.clone(),
+            None => self.default_note.clone(),
+        }
     }
 
     /// The canonical file a run id names, for compile-error attribution.
@@ -2028,6 +2167,7 @@ impl ModuleLoader {
             resolve_module_in(self.search_for(target), module_path).ok_or_else(|| {
                 ModuleLoadError::single(ReportEntry::NotFound {
                     module_path: module_path.to_string(),
+                    note: self.note_for(target),
                 })
             })?;
 
@@ -2041,8 +2181,8 @@ impl ModuleLoader {
         // Read and parse the module
         let contents = read_library(&file_path).map_err(|e| {
             ModuleLoadError::single(ReportEntry::Data(DataFileFailure {
+                detail: library_read_detail(&canonical, &e),
                 path: canonical.clone(),
-                detail: strerror_only(&e),
             }))
         })?;
 
@@ -2285,7 +2425,12 @@ impl ModuleLoader {
             if import.data {
                 data_bindings.push((
                     import.alias.clone(),
-                    load_data_import(self.search_for(&target), import.path.as_str())?,
+                    load_data_import(
+                        self.search_for(&target),
+                        self.note_for(&target),
+                        import.path.as_str(),
+                        data_import_is_raw(import.metadata.as_ref()),
+                    )?,
                 ));
                 continue;
             }
@@ -2482,6 +2627,7 @@ impl ModuleLoader {
                 if resolve_data_file_in(self.search_for(&target), &import.path).is_none() {
                     let missing = ModuleLoadError::single(ReportEntry::NotFound {
                         module_path: import.path.clone(),
+                        note: self.note_for(&target),
                     });
                     return Err(self.failure_report(program, missing));
                 }
@@ -2530,6 +2676,7 @@ impl ModuleLoader {
     fn failure_report(&self, program: &Program, first: ModuleLoadError) -> ModuleLoadError {
         let mut walk = FailureWalk {
             search_path: &self.search_path,
+            default_note: self.default_note.as_deref(),
             jq_origin: &self.jq_origin,
             visited: BTreeSet::new(),
             chain: Vec::new(),
@@ -2625,7 +2772,12 @@ impl ModuleLoader {
             // (#2956). A load failure (missing file, unreadable, bad JSON)
             // ends the pass like any other directive's.
             if import.data {
-                match load_data_import(self.search_for(&target), &import.path) {
+                match load_data_import(
+                    self.search_for(&target),
+                    self.note_for(&target),
+                    &import.path,
+                    data_import_is_raw(import.metadata.as_ref()),
+                ) {
                     Ok(value) => data_bindings.push((import.alias.clone(), value)),
                     Err(e) => return Err(self.failure_report(program, e)),
                 }
@@ -3415,6 +3567,12 @@ impl OutputConfig {
         }
     }
 
+    /// `--indent 0` without a later `-c`: pretty output whose indent is empty, which jq 1.8 prints
+    /// with its newlines and no indentation (jqlang/jq#3232, #7605); jq 1.7.1 printed it as `-c`.
+    fn indents_by_zero(&self) -> bool {
+        !self.compact && self.indent_string.is_empty()
+    }
+
     fn from_args(args: &JqCommand) -> Self {
         let indent_string = if args.uses_tab_indent() {
             "\t".to_string()
@@ -3500,10 +3658,9 @@ impl OutputConfig {
         // binary ever constructs -- caught by review as a 2.7x-4.8x
         // slowdown on ordinary input with no DEL at all.
         //
-        // `--indent 0` counts as compact here for the same reason it does in
-        // both streaming printers (#3155): its output *is* `-c`'s, so it can
-        // take the same echo.
-        (self.compact || self.indent_string.is_empty())
+        // `--indent 0` is not compact (#7605): jq 1.8 prints its newlines
+        // with no indentation, so it cannot take `-c`'s echo.
+        self.compact
             && !self.color_output
             && !self.sort_keys
             && !self.ascii_output
@@ -4920,6 +5077,21 @@ impl<'a> RunIndex<'a> {
             hold_in: last_of_its_run_or_window.then_some(held),
         }
     }
+
+    /// [`build`](Self::build) for an index the caller built already, with
+    /// [`JsonIndex::try_build`]: a document of 4 GiB or more (#7537), whose caller has given
+    /// `held` back first. Every other document takes `build`, which writes the index in place.
+    fn of_built(
+        index: JsonIndex,
+        held: &'a mut Option<JsonIndex>,
+        last_of_its_run_or_window: bool,
+    ) -> Self {
+        *held = None;
+        Self {
+            index: Some(index),
+            hold_in: last_of_its_run_or_window.then_some(held),
+        }
+    }
 }
 
 impl core::ops::Deref for RunIndex<'_> {
@@ -5041,6 +5213,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         return Ok(exit_codes::USAGE_ERROR);
     }
 
+    // jq's `main.c` takes `.` for a missing program unless standard input and output are both
+    // terminals, where it prints its usage and exits 2 instead of waiting for input there (#7462).
+    if no_program_is_a_usage_error(
+        args.filter.is_some() || args.program_file.is_some(),
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) {
+        eprint!("{}", jq_short_usage());
+        return Ok(exit_codes::USAGE_ERROR);
+    }
+
     // Get the filter expression. An unreadable `-f`/`--from-file` file is
     // jq's own usage error (exit 2), so it gets the same two-arm treatment
     // as the build_context failure above -- mirror that match, don't drift
@@ -5113,7 +5296,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         program_ctx.jq_origin.as_deref(),
     );
     let module_lib_dirs = module_loader.lib_dirs().to_vec();
-    jq::cli_context::set_module_resolver(move |name| module_meta_outcome(&module_lib_dirs, name));
+    let module_lib_note = module_loader.default_note.clone();
+    jq::cli_context::set_module_resolver(move |name| {
+        module_meta_outcome(&module_lib_dirs, module_lib_note.as_deref(), name)
+    });
 
     // #2395: re-parse the filter once the module-sourced def names are known,
     // so a `def` arriving through `include` or `~/.jq` can shadow a builtin
@@ -5291,6 +5477,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         succinctly::jq::set_debug_line_renderer(move |line| {
             let opts = JsonFormatOpts {
                 indent: "",
+                compact: true,
                 sort_keys,
                 ascii,
                 convention,
@@ -5362,6 +5549,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // #5674: the streamer writes no RS before a record, which `--seq` input reaching this
         // route has to see.
         && !output_config.seq
+        // #7605: the streamer's width 0 is `-c`'s layout (`IndentSpec::is_compact`), and jq 1.8
+        // prints `--indent 0` with newlines and no indentation, which it has no spelling for.
+        && !output_config.indents_by_zero()
         && context.named.is_empty();
 
     // Indent width/unit for the fast path's streamer -- built directly from
@@ -6052,9 +6242,19 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     continue;
                 }
 
-                // #7425: a document no index can hold (4 GiB or more, a slurp of that much
-                // included) is read into a tree without one, and the program runs on the tree.
-                if !JsonIndex::can_index(json_bytes.len()) {
+                // #7537: a document of 4 GiB or more (a slurp of that much included) is indexed
+                // like any other unless it holds more than 2^31 values; #7425: one no index can
+                // hold is read into a tree without one, and the program runs on the tree. Its
+                // index is boxed, so every other document carries a pointer here and builds its
+                // own in place below.
+                let long_index = if JsonIndex::can_index(json_bytes.len()) {
+                    None
+                } else {
+                    // A previous window's last index is given back before this one is built.
+                    held_index = None;
+                    Some(JsonIndex::try_build(json_bytes).map(Box::new))
+                };
+                if let Some(None) = long_index {
                     let at = ErrorAt::Fixed(locator.at(end));
                     evaluate_unindexable_document(
                         json_bytes,
@@ -6089,7 +6289,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
 
                 // Slow path: build index and evaluate expression
-                let index = RunIndex::build(json_bytes, &mut held_index, is_last_value);
+                let index = match long_index.flatten() {
+                    None => RunIndex::build(json_bytes, &mut held_index, is_last_value),
+                    Some(index) => RunIndex::of_built(*index, &mut held_index, is_last_value),
+                };
                 // #5497: jq's parser refuses a document past its depth limit before any filter
                 // runs, and reads nothing after it, this file or any later one.
                 let source = if slurped.is_some() {
@@ -7336,6 +7539,18 @@ fn should_force_read_under_null_input(
     uses_input_builtins && !(null_input && no_files_given && stdin_is_terminal)
 }
 
+/// Whether a run with no program is jq's usage error: jq's `main.c` defaults the program to `.`
+/// `if (!isatty(STDOUT_FILENO) || !isatty(STDIN_FILENO))` and prints its usage (exit 2) otherwise, so
+/// only a run with a terminal on both sides refuses (#7462). jq 1.7.1 and 1.8.2 agree, whatever the
+/// options (`-n`, `-c`, `-e`, `--arg x 1` are all options, not a program).
+fn no_program_is_a_usage_error(
+    has_program: bool,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> bool {
+    !has_program && stdin_is_terminal && stdout_is_terminal
+}
+
 /// A parse error that ended a JSON input stream after a clean prefix of
 /// documents (#2961): the error, and the `(source, line)` jq's marker names
 /// once its parser has stopped there.
@@ -8522,6 +8737,40 @@ fn read_inputs(
         }
         let mut locations =
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
+        // #7603: a stream that opens with part of a byte-order mark and departs from it is
+        // `Malformed BOM` before jq's parser reads a byte, on every read, with `--stream-errors`
+        // too: there is no input. Under `-n` each `input` raises it (the reader's queue repeats
+        // it); otherwise it is the main loop's parse error, whatever `-s` would have read.
+        if crate::cli::jq_stream_errors::opens_with_malformed_bom(&raw_bytes) {
+            if args.null_input {
+                LAZY_STREAM_INPUTS.with(|slot| {
+                    *slot.borrow_mut() = Some(LazyStreamInputs {
+                        files: raw_bytes.iter().map(|(file, _)| *file).collect(),
+                        last_source: u32::try_from(locations.files().len().saturating_sub(1))
+                            .unwrap_or(u32::MAX),
+                        reader: crate::cli::jq_stream_errors::Reader::from_source(Box::new(
+                            crate::cli::jq_stream_errors::MemorySources::new(raw_bytes),
+                        )),
+                        raise_errors: true,
+                    });
+                });
+                return Ok(Ok((Vec::new(), locations, None, Vec::new())));
+            }
+            let raised = crate::cli::jq_stream_errors::Reader::new(&raw_bytes[..])
+                .next_yielded()
+                .filter(|yielded| yielded.raised);
+            if let Some(yielded) = raised {
+                let (source, line) = stream_location(&raw_bytes, yielded.location);
+                let trailing = TrailingParseError {
+                    error: EvalError::new(yielded.error.unwrap_or_default()),
+                    source: u32::try_from(source).unwrap_or(u32::MAX),
+                    line: u32::try_from(line).unwrap_or(u32::MAX),
+                    seq_warning: false,
+                    as_parse_error: true,
+                };
+                return Ok(Ok((Vec::new(), locations, Some(trailing), Vec::new())));
+            }
+        }
         // #5498: the program reads its inputs through `input`/`inputs` (under `-n`) or the driver
         // loop pops them (a plain walk), and the reader hands them out as they are asked for, so a
         // stream of events is never held. Since #7571 that includes `--stream-errors` without `-n`.
@@ -8543,7 +8792,10 @@ fn read_inputs(
         // faults the slurp loop meets come first, one per call, then the array, then whatever the
         // loop left for the calls after it. A program that never asks for one prints its result.
         if args.slurp && args.null_input && stream_by_reader {
-            let read = crate::cli::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
+            let read = crate::cli::jq_stream_errors::read_for_deferred_slurp(
+                &raw_bytes,
+                !any_open_failure,
+            );
             let place = |at| stream_location(&raw_bytes, at);
             let fault = |message: String, at: (usize, usize)| {
                 let (source, line) = place(at);
@@ -8603,7 +8855,10 @@ fn read_inputs(
             // reader places the fault itself: before the array's last call it is the whole result,
             // and after it (behind a closing event the file before the failure held back) it is not.
             if args.slurp {
-                let deferred = crate::cli::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
+                let deferred = crate::cli::jq_stream_errors::read_for_deferred_slurp(
+                    &raw_bytes,
+                    !any_open_failure,
+                );
                 if deferred.before.is_empty() {
                     let place = |at| stream_location(&raw_bytes, at);
                     let (array_source, array_line) = place(deferred.slurp_at);
@@ -8654,9 +8909,28 @@ fn read_inputs(
         let mut value_locations = read.locations;
         // `--slurp` closes its array at the call that empties jq's buffer, so what that call left
         // behind comes out after the array as inputs of their own.
+        //
+        // jq 1.8 reads once more after the last byte before it closes the array (jqlang/jq#3279,
+        // #7523), so the closing event of a top-level container that ends the text, which 1.7.1's
+        // parser still held at that point and gave out after the array, is in the array: `printf
+        // '[1,2]' | jq -c -s --stream .` is one array of all three events. That is `--stream -s`
+        // and `--stream-errors -s`. `--seq` keeps the 1.7.1 model of the loop, and so does a run
+        // with a file that did not open and one whose text ends in a fault, which jq 1.8.2 reads
+        // differently too (an uncaught fault, a closed input's name), unchecked here.
+        let inside = if (args.stream || args.stream_errors) && !args.seq && !any_open_failure {
+            read.inside
+                + usize::from(
+                    values.len() == read.inside + 1
+                        && values
+                            .get(read.inside)
+                            .is_some_and(crate::cli::jq_stream_errors::is_closing_event),
+                )
+        } else {
+            read.inside
+        };
         let after_array = args.slurp.then(|| {
-            let outside = values.split_off(read.inside);
-            let outside_locations = value_locations.split_off(read.inside - read.locations_from);
+            let outside = values.split_off(inside);
+            let outside_locations = value_locations.split_off(inside - read.locations_from);
             let (source, line) = read.slurp_at;
             values = vec![OwnedValue::array_from(std::mem::take(&mut values))];
             value_locations = vec![(source, line)];
@@ -9964,10 +10238,10 @@ impl EofTail {
         let mut last_event = None;
         let mut offset = 0;
         loop {
-            // #7470: past a fault, only through the first depth refusal.
+            // #7470, #7611: past a fault, only through the next fault.
             let rest = &last[offset..];
             let read = if offset > 0 {
-                &rest[..depth_refusal_cut(rest, stream)]
+                &rest[..fault_cut(rest, stream)]
             } else {
                 rest
             };
@@ -13905,21 +14179,31 @@ fn meet_fault(
 }
 
 /// How many bytes of `text`, which jq's parser reads on into from a fault, a loop that resumes
-/// past faults has to split and parse (#7470): through the bracket jq refuses for its depth limit,
-/// when that is the first fault the parser meets in `text`, or all of it. `--stream` (`stream`)
-/// has no depth limit, so all of it there.
+/// past faults has to split and parse (#7470, #7611): through the byte at which jq's parser meets
+/// the first fault in `text` ([`jq::jq_stream_fault_offset`]), whatever the fault, and on to the end
+/// of the character it is in; all of it when the parser meets none before the end. `--stream`
+/// (`stream`) reads with jq's streaming parser, which that model is not, so all of it there.
 ///
-/// jq stops on that bracket and drops the rest of its read, so nothing after it changes the values
-/// before it or the fault. But a container that deep closes only near the end of the text, and the
-/// splitter, the index and the validators each walked it whole, once per read the loop resumed at:
-/// a deeply nested document's refusal was quadratic in its depth. The cut ends inside the refused
-/// container and leaves it unclosed, so the splitter stops at its start, where over the whole text
-/// the refused span starts, with the same values before it.
-fn depth_refusal_cut(text: &[u8], stream: bool) -> usize {
+/// jq stops on that byte and drops the rest of its read, so nothing after it changes the values
+/// before it or the fault. But the value holding a fault can run to the end of the text (a deeply
+/// nested document, or `[x[x[x...` with its closers at the end), and the splitter, the index and
+/// the validators each walked it whole, once per read the loop resumed at: quadratic in the text
+/// after the first fault. The cut ends inside the malformed value or just after it, so the
+/// splitter stops at the value's start, where over the whole text the malformed span starts, with
+/// the same values before it.
+fn fault_cut(text: &[u8], stream: bool) -> usize {
     if stream {
         return text.len();
     }
-    jq::jq_stream_depth_fault_offset(text).map_or(text.len(), |at| at + 1)
+    let Some(at) = jq::jq_stream_fault_offset(text) else {
+        return text.len();
+    };
+    // A `&str` caller slices at the cut, so it ends on a character boundary.
+    let mut cut = at + 1;
+    while text.get(cut).is_some_and(|&b| b & 0xC0 == 0x80) {
+        cut += 1;
+    }
+    cut
 }
 
 /// The line jq's parser stands on when it meets the fault that ends `raw`'s clean prefix of
@@ -14307,10 +14591,10 @@ fn open_tail_start(raw: &[u8], resumes: bool, seam: Seam, stream: bool) -> Optio
     let mut offset = 0;
     loop {
         let split = if resumes {
-            // #7470: past a fault, only through the first depth refusal.
+            // #7470, #7611: past a fault, only through the next fault.
             let rest = &raw[offset..];
             let read = if offset > 0 {
-                &rest[..depth_refusal_cut(rest, stream)]
+                &rest[..fault_cut(rest, stream)]
             } else {
                 rest
             };
@@ -14515,11 +14799,11 @@ fn read_json_tail(
     let mut file_end: Option<(usize, usize)> = None;
     loop {
         let mut segment = &raw[offset..];
-        // #7470: past a fault, only through the first depth refusal. The parse below names the
+        // #7470, #7611: past a fault, only through the next fault. The parse below names the
         // fault with jq's parser model over these same bytes, which a `lossy` text does not hold
         // (the model reads the bytes jq read), so that one is read whole.
         if parser_at.is_some() && cx.lossy.is_none() {
-            segment = &segment[..depth_refusal_cut(segment.as_bytes(), cx.stream)];
+            segment = &segment[..fault_cut(segment.as_bytes(), cx.stream)];
         }
         let seg_pos = (!cx.stream).then(|| {
             parser_at.unwrap_or_else(|| {
@@ -16869,7 +17153,34 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
     // #7126: jq says nothing of a standard input that fails when it is the only source (the run's exit
     // 2 is its whole report); a file that fails part-way is reported (#5498).
     let stdin_only = files.iter().all(Option::is_none);
-    Box::new(move || match reader.next_yielded() {
+    // #7603: `Malformed BOM` is what every later read returns too, since jq's parser never gets past
+    // it; the reader ends with it, so it is kept for the reads after.
+    let mut raised: Option<(String, (u32, u32))> = None;
+    Box::new(move || {
+        if let Some((message, at)) = &raised {
+            return jq::ProducedInput::Error(EvalError::new(message.clone()), *at);
+        }
+        stream_reader_produce(
+            &mut reader,
+            &files,
+            last_source,
+            raise_errors,
+            stdin_only,
+            &mut raised,
+        )
+    })
+}
+
+/// One read of [`stream_reader_producer`]'s queue.
+fn stream_reader_produce<R: crate::cli::jq_stream_errors::RefillSource>(
+    reader: &mut crate::cli::jq_stream_errors::Reader<R>,
+    files: &[Option<usize>],
+    last_source: u32,
+    raise_errors: bool,
+    stdin_only: bool,
+    raised: &mut Option<(String, (u32, u32))>,
+) -> jq::ProducedInput {
+    match reader.next_yielded() {
         Some(input) => {
             let (source, line) = input.location;
             // The same tags the whole read gave: a value yielded after jq closed its input has
@@ -16883,6 +17194,10 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
                 )
             };
             match input.error {
+                Some(message) if input.raised => {
+                    *raised = Some((message.clone(), (tag, line)));
+                    jq::ProducedInput::Error(EvalError::new(message), (tag, line))
+                }
                 Some(message) if raise_errors => {
                     jq::ProducedInput::Error(EvalError::new(message), (tag, line))
                 }
@@ -16905,7 +17220,7 @@ fn stream_reader_producer(lazy: LazyStreamInputs) -> jq::InputProducer {
                     .map(|lines| (last_source, lines as u64)),
             )
         }
-    })
+    }
 }
 
 thread_local! {
@@ -19308,13 +19623,17 @@ fn evaluate_input_streaming_via(
         }
         let doc = if preserve {
             let text = input.to_json_jq_preserve();
-            // #7425: no index holds a text of 4 GiB or more.
-            if !JsonIndex::can_index(text.len()) {
+            // #7425, #7537: no index holds a text of 4 GiB or more with more than 2^31 values.
+            // Every shorter one is built in place (`JsonIndex::try_build`).
+            let index = if JsonIndex::can_index(text.len()) {
+                JsonIndex::build(text.as_bytes())
+            } else if let Some(index) = JsonIndex::try_build(text.as_bytes()) {
+                index
+            } else {
                 return Some(jq::Control::Error(EvalError::resource_limit(
                     jq::index_ceiling_message(text.len()),
                 )));
-            }
-            let index = JsonIndex::build(text.as_bytes());
+            };
             InputDoc::Preserve(text, index)
         } else {
             match bridge_doc_of(input) {
@@ -20561,10 +20880,7 @@ fn echoable_span<'a, Wrd: Clone + AsRef<[u64]>>(
     let JqValue::Cursor(cursor) = value else {
         return None;
     };
-    if !writes_lazily(config)
-        || config.convention.preserves_source_values()
-        || !(config.compact || config.indent_string.is_empty())
-    {
+    if !writes_lazily(config) || config.convention.preserves_source_values() || !config.compact {
         return None;
     }
     cursor.canonical_compact_span(depth)
@@ -21380,10 +21696,15 @@ fn json_document_to_owned_value(
     at: Option<&dyn Fn() -> (usize, usize)>,
     delimiters: Delimiters,
 ) -> core::result::Result<OwnedValue, EvalError> {
-    if !JsonIndex::can_index(bytes.len()) {
+    // #7537: a document of 4 GiB or more is indexed unless it holds more than 2^31 values.
+    // Every shorter one is built in place (`JsonIndex::try_build`).
+    let index = if JsonIndex::can_index(bytes.len()) {
+        JsonIndex::build(bytes)
+    } else if let Some(index) = JsonIndex::try_build(bytes) {
+        index
+    } else {
         return unindexable_document_value(bytes);
-    }
-    let index = JsonIndex::build(bytes);
+    };
     if let Some(at) = at {
         if let Some(message) =
             jq::jq_input_depth_fault(bytes, index.bp(), jq::InputSource::Stream, at)
@@ -21642,21 +21963,11 @@ where
         let marker = output::SkippedKind::of_jq_value(value).marker(formatter.marks_nan());
         return Ok(out.write_all(marker.as_bytes())?);
     }
-    // `|| indent_string.is_empty()`: `--indent 0` sets an empty indent with
-    // `compact` false, and jq 1.7.1 prints that compactly -- confirmed live,
-    // `jq --indent 0 '{a:[1,2]}'` is `{"a":[1,2]}`. `format_json`
-    // (`output.rs`) has always keyed compactness off `indent.is_empty()` and
-    // so already agreed with the reference; these two streaming printers
-    // keyed it off `config.compact` alone and emitted newlines with
-    // zero-width indents instead (#3155).
-    //
-    // That split used to be invisible because the two routes never met: the
-    // eager `-n`/`--slurp`/DSV route formatted through `format_json` and the
-    // lazy route streamed through here. Merging the owned writers put the
-    // reference-correct route onto this code, so the divergence had to be
-    // settled rather than documented -- and it is settled in the reference's
-    // favour, per ADR-0018.
-    let compact = config.compact || config.indent_string.is_empty();
+    // `config.compact` alone: `--indent 0` sets an empty indent with `compact` false, and jq
+    // 1.8 prints that with its newlines and no indentation (jqlang/jq#3232, "Fix `--indent 0`
+    // implicitly enabling `--compact-output`"; #7605). jq 1.7.1 printed it compactly, which
+    // #3155 had pinned on every route. `format_json` (`output.rs`) reads the same flag.
+    let compact = config.compact;
     let indent = &config.indent_string;
     let current_indent = if compact {
         String::new()
@@ -22366,21 +22677,11 @@ where
         let marker = output::SkippedKind::of(value).marker(formatter.marks_nan());
         return Ok(out.write_all(marker.as_bytes())?);
     }
-    // `|| indent_string.is_empty()`: `--indent 0` sets an empty indent with
-    // `compact` false, and jq 1.7.1 prints that compactly -- confirmed live,
-    // `jq --indent 0 '{a:[1,2]}'` is `{"a":[1,2]}`. `format_json`
-    // (`output.rs`) has always keyed compactness off `indent.is_empty()` and
-    // so already agreed with the reference; these two streaming printers
-    // keyed it off `config.compact` alone and emitted newlines with
-    // zero-width indents instead (#3155).
-    //
-    // That split used to be invisible because the two routes never met: the
-    // eager `-n`/`--slurp`/DSV route formatted through `format_json` and the
-    // lazy route streamed through here. Merging the owned writers put the
-    // reference-correct route onto this code, so the divergence had to be
-    // settled rather than documented -- and it is settled in the reference's
-    // favour, per ADR-0018.
-    let compact = config.compact || config.indent_string.is_empty();
+    // `config.compact` alone: `--indent 0` sets an empty indent with `compact` false, and jq
+    // 1.8 prints that with its newlines and no indentation (jqlang/jq#3232, "Fix `--indent 0`
+    // implicitly enabling `--compact-output`"; #7605). jq 1.7.1 printed it compactly, which
+    // #3155 had pinned on every route. `format_json` (`output.rs`) reads the same flag.
+    let compact = config.compact;
     let indent = &config.indent_string;
     let current_indent = if compact {
         String::new()
@@ -22487,6 +22788,7 @@ fn format_json_text(value: &OwnedValue, config: &OutputConfig) -> String {
         } else {
             &config.indent_string
         },
+        compact: config.compact,
         sort_keys: config.sort_keys,
         ascii: config.ascii_output,
         // #2852: `-S`/`-a`/`-C`/`-s` used to reformat a `NumberLiteral`
@@ -27522,6 +27824,35 @@ mod tests {
         assert!(!should_force_read_under_null_input(true, true, true, true));
     }
 
+    /// #7462: a run with no program is jq's usage error only when stdin and stdout are both
+    /// terminals, which `cargo test` never has. A real terminal on each side needs a pty:
+    /// `python3 - <<'PY'` with `pty.openpty()` as both stdin and stdout of
+    /// `succinctly jq`, `succinctly jq -c` and `succinctly jq -n` must exit 2 at once with the
+    /// usage on stderr, as jq 1.7.1 and 1.8.2 do (the manual check recorded in
+    /// `docs/compliance/jq/limitations.md`).
+    #[test]
+    fn test_no_program_is_a_usage_error_only_on_two_terminals_7462() {
+        // (has a program, stdin is a terminal, stdout is a terminal, refused)
+        for (has_program, stdin, stdout, refused) in [
+            (false, true, true, true),
+            // A pipe on either side makes the program `.`.
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, false),
+            // A program is never missing.
+            (true, true, true, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, false),
+        ] {
+            assert_eq!(
+                no_program_is_a_usage_error(has_program, stdin, stdout),
+                refused,
+                "program {has_program}, stdin terminal {stdin}, stdout terminal {stdout}"
+            );
+        }
+    }
+
     /// #1371: `rewrite_namespaced_calls` runs once, on the freshly parsed
     /// program, strictly before evaluation ever builds an `Expr::Shared` or
     /// `Expr::DefCall` -- so this pass can never actually receive one from
@@ -30027,11 +30358,10 @@ mod tests {
         let mut configs = Vec::new();
         for (indent_string, compact) in [
             (String::new(), true),
-            // `--indent 0`: an empty indent with `compact` false. Previously
-            // excluded here because the two printers disagreed with
-            // `format_json` about it; both now key compactness off the indent
-            // string as well, matching jq 1.7.1, so this shape is covered
-            // like any other (#3155).
+            // `--indent 0`: an empty indent with `compact` false, which jq 1.8
+            // prints with newlines and no indentation (#7605; #3155 had it
+            // compact, as jq 1.7.1 did). Every printer reads `compact`, so this
+            // shape is covered like any other.
             (String::new(), false),
             ("  ".to_string(), false),
             ("    ".to_string(), false),
@@ -30144,15 +30474,11 @@ mod tests {
     /// the *body*: everything below the prologue, where the two routes
     /// genuinely differ.
     ///
-    /// **`--indent 0` is covered, and settling it was not optional.** Both
-    /// printers used to key compactness off `config.compact` alone, so with
-    /// an empty `indent_string` they emitted newlines with zero-width
-    /// indents, while `format_json` keyed it off `indent.is_empty()` and
-    /// printed compact. jq 1.7.1 agrees with `format_json` (confirmed live).
-    /// While the eager `-n`/`--slurp`/DSV route had its own writer this was
-    /// a dormant divergence on the lazy route only; merging the two owned
-    /// writers would have carried the *wrong* spelling onto the route that
-    /// was right, so both printers now key off the indent string too.
+    /// **`--indent 0` is covered.** The printers once disagreed about it:
+    /// two keyed compactness off `config.compact` and `format_json` off an
+    /// empty indent (#3155 settled it as compact, jq 1.7.1's output). jq 1.8
+    /// prints it with newlines and no indentation (jqlang/jq#3232), and all
+    /// three now read `compact` and follow it (#7605).
     #[test]
     fn write_output_owned_value_matches_rebuilt_route_3009() {
         let corpus = owned_print_corpus_3009();
@@ -30582,9 +30908,9 @@ mod tests {
             assert_eq!(
                 error.message,
                 format!(
-                    "Cannot index a value of {} bytes: the index holds at most 4294967295 bytes \
-                     (4 GiB), and the document is not plain JSON, which is all that is read \
-                     without an index",
+                    "Cannot index a value of {} bytes: the index holds at most 2147483647 values, \
+                     and the document is not plain JSON, which is all that is read without an \
+                     index",
                     unread.len()
                 ),
                 "{unread:.20}"

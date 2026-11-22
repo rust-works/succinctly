@@ -121,6 +121,8 @@ mod onig_fold_data;
 mod onig_look_behind;
 #[cfg(feature = "regex")]
 mod onig_loop;
+#[cfg(feature = "regex")]
+mod onig_quantifier;
 mod parse_message;
 mod parser;
 #[cfg(feature = "regex")]
@@ -257,8 +259,8 @@ pub use lazy::JqValue;
 // #5497: jq's parse-depth limit, applied by the CLI's document routes.
 #[doc(hidden)]
 pub use parse_message::{
-    is_jq_depth_fault, jq_depth_fault_offset, jq_input_depth_fault, jq_stream_depth_fault_offset,
-    jq_stream_fault, jq_stream_fault_chunk, jq_stream_fault_end, jq_stream_prefix_fault,
+    is_jq_depth_fault, jq_depth_fault_offset, jq_input_depth_fault, jq_stream_fault,
+    jq_stream_fault_chunk, jq_stream_fault_end, jq_stream_fault_offset, jq_stream_prefix_fault,
     InputSource, JqStreamFaults, JQ_MAX_PARSING_DEPTH,
 };
 pub use parser::{

@@ -20,7 +20,9 @@
 //!   builtin's result as it is answered (`fresh`), as jq allocates every `jv`.
 //!   So does every object key (#7401): one per object, which `.[]`, `keys`
 //!   and `keys_unsorted` hand out, and which a write keeps or takes from the
-//!   key it is given, as jq's `jv_object_set` does.
+//!   key it is given, as jq's `jv_object_set` does. A run whose program
+//!   cannot reach either hand-out leaves the document's keys as they were
+//!   read (`hands_out_keys`, #7489): no key's identity is ever asked there.
 //! - Each `Expr` arm follows the bytecode `compile.c` emits for it, cited at
 //!   the arm. The jq-defined builtins run their `builtin.jq` bodies
 //!   ([`PRELUDE`]); the C-coded ones are delegated to the existing evaluator
@@ -28,11 +30,25 @@
 //!   or an argument (`c_builtin_identity`), when that value itself is the
 //!   answer.
 //!
-//! It is reachable from `succinctly dev jq-path-mode` (hidden) and from tests,
-//! never from `succinctly jq`. A construct it does not implement raises
-//! `Raise::Unsupported`, which nothing catches, so a row it cannot run is never
-//! mistaken for one it answers. See `docs/plan/jq-path-mode-interpreter-spike.md`
-//! for the Phase 0 go/no-go report.
+//! `succinctly jq` runs a program through it when `route` sends it here
+//! (ADR-0026, #5223, #5233): a jq-mode program with a dynamic path target,
+//! that is an argument of `path`, `del` or `pick` or the left side of an
+//! assignment that is not one of the static shapes the shipped walkers take
+//! natively (`.k`, `.[n]`, `.[$k]`, `.[i:j]`, `.[]`, `..` and their pipes and
+//! commas), such as `1 |= 1`, `del(1)` or `path(1)`, even in a branch that
+//! never runs. The evaluator entries in `eval.rs` (`eval_full`,
+//! `eval_owned_with_file_index`) and `eval_generic.rs` ask `route` and hand
+//! such a program to `run_program`; `jq_runner.rs` refuses up front, through
+//! [`refusal`], one that also uses a construct the interpreter declines. It is
+//! also reachable from `succinctly dev jq-path-mode` (hidden) and from tests.
+//! A construct it does not implement raises `Raise::Unsupported`, which
+//! nothing in the interpreter catches, so a row it cannot run is never
+//! mistaken for one it answers: the dev entry reports it apart (`path-mode:
+//! unsupported`), and on the routed path, where `route` has already sent
+//! every program holding such a construct elsewhere, `run_program` turns it
+//! into an internal error. See
+//! `docs/plan/jq-path-mode-interpreter-spike.md` for the Phase 0 go/no-go
+//! report.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -48,9 +64,9 @@ use super::error::{dump_truncated_with, Control, EvalError};
 use super::eval::{
     apply_compare_op, arith_combine, arith_negate, compare_values, definition_zero_for,
     is_tree_descending_f, native_stack_exhausted, owned_to_string, range_max_exceeded_error,
-    recurse_max_items, recurse_node_cost, recurse_value_size, EvalTag, JqSemantics, LoopCounters,
-    QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_LOOP_ROUNDS, MAX_RANGE,
-    MAX_RANGE_TOTAL, REPEAT_WIDTH_BUDGET,
+    recurse_max_items, recurse_node_cost, recurse_value_size, with_native_stack_floor_lifted,
+    EvalTag, JqSemantics, LoopCounters, QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES,
+    MAX_LOOP_ROUNDS, MAX_RANGE, MAX_RANGE_TOTAL, REPEAT_WIDTH_BUDGET,
 };
 use super::expr::{
     ArithOp, Builtin, CompareOp, Expr, Literal, MergeFlags, NumberKey, ObjectKey, Param, Pattern,
@@ -87,14 +103,150 @@ fn literal(repr: NumberRepr, spelling: &str) -> OwnedValue {
 /// An object's key as jq hands it out (`jv_object_iter_key`, which `.[]`,
 /// `keys` and `keys_unsorted` read): the object's own key `jv`, so two reads
 /// of one key are identical (#7401). Every object the interpreter holds has
-/// its keys promoted (`promote_identities`, `promote_built`, the constructor);
-/// a key that is still inline gets fresh storage instead, as it did before.
+/// its keys promoted (`promote_identities`, `promote_built`, the constructor)
+/// in a run that can reach this ([`hands_out_keys`], #7489); a key that is
+/// still inline gets fresh storage instead, as it did before.
 fn object_key(key: &SharableString) -> OwnedValue {
     if key.is_shared() {
         OwnedValue::String(key.clone())
     } else {
         string(key)
     }
+}
+
+/// Whether a run of `program` can hand an object's key out as a value, the
+/// only way a key's identity is ever asked (#7489).
+///
+/// The interpreter hands a key out at two sites, `EACH` on an object (the key
+/// it appends to the register, which `path(f)` then answers) and `keys`/
+/// `keys_unsorted`; [`object_key`] serves both. So a program reaches one only
+/// through `.[]`, `..`, `recurse`, `keys`, `keys_unsorted` or a jq-defined
+/// builtin whose [`PRELUDE`] body does (`to_entries`, `paths`, `map`, ...),
+/// which is looked inside, as is every definition it calls. A run of any
+/// other program never needs a key's identity, so its objects keep the keys
+/// they were read with, which saves an allocation per key; jq's answer is
+/// the same either way. Both hand-out sites assert the decision in debug
+/// builds.
+///
+/// A `def` of the program is walked where it is defined, and a call of a
+/// name the prelude also defines is taken to reach the prelude's definition,
+/// which can only answer `true` more often. Which prelude definitions reach a
+/// key is a constant of the build, [`KEY_HANDING_PRELUDE_DEFS`], so the
+/// decision parses nothing: a run that starts at the native-stack floor,
+/// where the parser refuses (#7475), decides it as any other run does.
+fn hands_out_keys(program: &Expr) -> bool {
+    reaches_a_key(program, &mut |name, arity| {
+        KEY_HANDING_PRELUDE_DEFS
+            .binary_search(&(name, arity))
+            .is_ok()
+    })
+}
+
+/// The [`PRELUDE`] definitions whose body can hand a key out, directly or
+/// through a definition it calls (#7489), by name and arity, sorted.
+///
+/// Derived from the prelude's bodies by [`reaches_a_key`], which a unit test
+/// re-runs over every parsed definition and fails when its answer and this
+/// table disagree, so an edit of [`PRELUDE`] that changes the answer fails
+/// there with the table to paste.
+const KEY_HANDING_PRELUDE_DEFS: &[(&str, usize)] = &[
+    ("_sp_INDEX", 1),
+    ("_sp__flatten", 1),
+    ("_sp_add", 0),
+    ("_sp_all", 0),
+    ("_sp_all", 1),
+    ("_sp_any", 0),
+    ("_sp_any", 1),
+    ("_sp_ascii_downcase", 0),
+    ("_sp_ascii_upcase", 0),
+    ("_sp_capture", 1),
+    ("_sp_capture", 2),
+    ("_sp_combinations", 0),
+    ("_sp_combinations", 1),
+    ("_sp_flatten", 0),
+    ("_sp_flatten", 1),
+    ("_sp_from_entries", 0),
+    ("_sp_group_by", 1),
+    ("_sp_gsub", 2),
+    ("_sp_gsub", 3),
+    ("_sp_join", 1),
+    ("_sp_leaf_paths", 0),
+    ("_sp_map", 1),
+    ("_sp_map_values", 1),
+    ("_sp_match", 1),
+    ("_sp_match", 2),
+    ("_sp_max_by", 1),
+    ("_sp_min_by", 1),
+    ("_sp_paths", 0),
+    ("_sp_paths", 1),
+    ("_sp_recurse", 0),
+    ("_sp_recurse_down", 0),
+    ("_sp_scan", 1),
+    ("_sp_scan", 2),
+    ("_sp_sort_by", 1),
+    ("_sp_split", 2),
+    ("_sp_splits", 1),
+    ("_sp_splits", 2),
+    ("_sp_sub", 2),
+    ("_sp_sub", 3),
+    ("_sp_to_entries", 0),
+    ("_sp_tostream", 0),
+    ("_sp_transpose", 0),
+    ("_sp_unique", 0),
+    ("_sp_unique_by", 1),
+    ("_sp_walk", 1),
+    ("_sp_with_entries", 1),
+];
+
+/// Whether `expr` can hand a key out, `prelude_reaches(name, arity)` answering
+/// it for a call of the prelude definition `name/arity` (or of a name the
+/// prelude does not define, which answers `false`): the walk
+/// [`hands_out_keys`] runs over a program, and the derivation of
+/// [`KEY_HANDING_PRELUDE_DEFS`] over the prelude's own bodies.
+fn reaches_a_key(expr: &Expr, prelude_reaches: &mut dyn FnMut(&str, usize) -> bool) -> bool {
+    any_subexpr(expr, &mut |e| {
+        let (name, arity) = match e {
+            Expr::Iterate | Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys => {
+                return true;
+            }
+            Expr::Builtin(Builtin::Keys | Builtin::KeysUnsorted | Builtin::Recurse) => {
+                return true;
+            }
+            Expr::Builtin(builtin) => match prelude_call(builtin) {
+                Some((name, args)) => (name, args.len()),
+                None => return false,
+            },
+            // The arms that run a prelude definition by name ([`Interp::call_prelude`]).
+            Expr::Limit { .. } => ("_sp_limit", 2),
+            Expr::FirstExpr(_) => ("_sp_first", 1),
+            Expr::LastExpr(_) => ("_sp_last", 1),
+            Expr::NthExpr { .. } => ("_sp_nth", 2),
+            Expr::Until { .. } => ("_sp_until", 2),
+            Expr::While { .. } => ("_sp_while", 2),
+            Expr::Assign { .. } => ("_sp_assign", 2),
+            // Every update-assignment runs `_sp_modify` (`_sp_upd_*` wraps it).
+            Expr::Update { .. } | Expr::CompoundAssign { .. } | Expr::AlternativeAssign { .. } => {
+                ("_sp_modify", 2)
+            }
+            Expr::FuncCall {
+                name,
+                args,
+                builtin_fallback,
+            } => {
+                // The walk leaves out a call's unsettled builtin, which the call runs when no
+                // `def` answers it.
+                if builtin_fallback
+                    .as_deref()
+                    .is_some_and(|fallback| reaches_a_key(fallback, prelude_reaches))
+                {
+                    return true;
+                }
+                (name.as_str(), args.len())
+            }
+            _ => return false,
+        };
+        prelude_reaches(name, arity)
+    })
 }
 
 /// A C builtin's result as jq's fresh `jv`.
@@ -281,6 +433,9 @@ fn truthy(value: &OwnedValue) -> bool {
     value.is_truthy()
 }
 
+/// The longest path [`PathList::to_array`] gathers on the stack.
+const SHORT_PATH: usize = 16;
+
 /// A persistent path prefix: a fork shares its parent for free.
 #[derive(Clone, Default)]
 struct PathList(Option<Rc<(Self, OwnedValue, usize)>>);
@@ -310,7 +465,30 @@ impl PathList {
         self.0.as_ref().map_or(0, |node| node.2)
     }
 
+    /// The keys as `path()` answers them, in a block of exactly their number
+    /// of slots when the path is short (#7465). A `Vec` grown by `push` holds
+    /// four, so a one- to three-key path took a 144-byte chunk on glibc, just
+    /// past its 128-byte fastbin limit. Once a site's key no longer sat
+    /// between them, many such paths freed in a row (a collected
+    /// `[path(..)]` dropped) coalesced into a 64 KiB chunk, and that free
+    /// sweeps every fastbin chunk the run has freed (`malloc_consolidate`),
+    /// a pointer chase through the freed document costing more than the paths.
     fn to_array(&self) -> OwnedValue {
+        let len = self.len();
+        if len <= SHORT_PATH {
+            let unset = OwnedValue::Null;
+            let mut keys = [&unset; SHORT_PATH];
+            let mut at = self;
+            let mut i = len;
+            while let Some(node) = &at.0 {
+                i -= 1;
+                keys[i] = &node.1;
+                at = &node.0;
+            }
+            // A slice's iterator has an exact length, so the array is built
+            // in a block of exactly `len` slots.
+            return OwnedValue::Array(keys[..len].iter().map(|&k| k.clone()).collect());
+        }
         let mut keys = Vec::new();
         let mut at = self;
         while let Some(node) = &at.0 {
@@ -776,7 +954,6 @@ def _sp_all(condition): all(.[]; condition);
 def _sp_any(condition): any(.[]; condition);
 def _sp_all: all(.[]; .);
 def _sp_any: any(.[]; .);
-def _sp_last(g): reduce g as $item (null; $item);
 def _sp_nth($n; g):
   if $n < 0 then error("nth doesn't support negative indices")
   else label $out | foreach g as $item ($n + 1; . - 1; if . <= 0 then $item, break $out else empty end) end;
@@ -998,24 +1175,38 @@ impl PreludeDef {
     /// The definition's `FuncDef`, its chain `rest` an identity.
     ///
     /// The first call of a definition parses it wherever the evaluation is, no
-    /// longer at the top. One definition's parse is shallow (the unit tests parse
-    /// every one on a 2 MiB debug thread), and the native-stack floor
-    /// ([`native_stack_exhausted`]) leaves half of
-    /// the registered stack unspent, so the parse has room at the floor.
+    /// longer at the top. One definition's parse is shallow (a unit test parses
+    /// every one on a thread of `TRUSTED_PARSE_STACK`), and the native-stack floor
+    /// ([`native_stack_exhausted`]) leaves half of the registered stack unspent,
+    /// so the parse has room at the floor. It runs with the floor lifted
+    /// (#7676): since #7475 the parser refuses at the floor, which here was a
+    /// panic, and the call this lookup serves refuses there anyway.
     fn expr(&self) -> &Expr {
-        self.parsed.get_or_init(|| {
-            let src = format!("def {} .", self.source);
-            let def = parse(&src).unwrap_or_else(|e| panic!("prelude: {e:?}"));
-            mark_loadvn(&def)
-        })
+        self.parsed.get_or_init(|| self.parse())
+    }
+
+    /// The definition's `FuncDef`, parsed; out of line, so a first use costs
+    /// [`Self::expr`]'s frame nothing.
+    #[cold]
+    #[inline(never)]
+    fn parse(&self) -> Expr {
+        let src = format!("def {} .", self.source);
+        let def = with_native_stack_floor_lifted(|| parse(&src))
+            .unwrap_or_else(|e| panic!("prelude: {e:?}"));
+        mark_loadvn(&def)
     }
 }
 
 impl Prelude {
     /// Read the prelude's definitions and parse its one-off expressions. Panics
-    /// only if [`PRELUDE`] itself fails to parse, which a unit test pins.
+    /// only if [`PRELUDE`] itself fails to parse, which a unit test pins. A
+    /// thread's first path-mode run builds it, which can be at the native-stack
+    /// floor, so its parses run with the floor lifted too (#7676).
     pub fn new() -> Self {
-        let parse_ok = |src: &str| parse(src).unwrap_or_else(|e| panic!("prelude: {e:?}"));
+        let parse_ok = |src: &str| {
+            with_native_stack_floor_lifted(|| parse(src))
+                .unwrap_or_else(|e| panic!("prelude: {e:?}"))
+        };
         let defs: Vec<PreludeDef> = prelude_definitions().map(PreludeDef::new).collect();
         let index = defs
             .iter()
@@ -1063,8 +1254,9 @@ pub struct Interp<'e> {
     prelude_env: Env<'e>,
     /// One `jv` per constant site, as `LOADK` hands out (keyed by the `Expr`'s
     /// address, which is stable: the interpreter never rewrites the program).
-    /// A substituted variable (`Expr::TrackedVar`) is one `jv` too, keyed by
-    /// its marker, and so is an object constructor's literal key, keyed by its
+    /// A path component's key (`Expr::Field`, `Expr::Index`) is one `jv` per
+    /// site too (#7465). A substituted variable (`Expr::TrackedVar`) is one
+    /// `jv` too, keyed by its marker, and so is an object constructor's literal key, keyed by its
     /// `ObjectKey`'s address (#7401), which holds no `Expr` inline and so is no
     /// `Expr`'s address.
     consts: RefCell<BTreeMap<usize, OwnedValue>>,
@@ -1076,6 +1268,12 @@ pub struct Interp<'e> {
     /// The `def` bodies [`Self::pure`] and [`Self::single`] are looking inside right
     /// now, by address, so a definition that reaches itself is seen as it is (#5263).
     def_walk: RefCell<Vec<usize>>,
+    /// Whether the objects of this run carry one identity per key (#7401):
+    /// only when the program can hand a key out as a value
+    /// ([`hands_out_keys`]), since nothing else could ever ask a key's
+    /// identity, and the storage costs one allocation per key (#7489). On
+    /// until a run decides, so an interpreter nobody configured stays exact.
+    key_ids: Cell<bool>,
 }
 
 /// How a run ended.
@@ -1426,7 +1624,7 @@ pub(crate) fn run_program(
     with_prelude(|prelude| {
         let interp = Interp::new(prelude);
         let mut input = input;
-        input.promote_identities();
+        interp.prepare(program, &mut input);
         let result = interp.eval(program, &Env::default(), input, Reg::top(), &mut |v, _| {
             if on_value(v) {
                 Ok(())
@@ -1487,13 +1685,22 @@ impl<'e> Interp<'e> {
             next_label: Cell::new(0),
             depth: Cell::new(0),
             def_walk: RefCell::new(Vec::new()),
+            key_ids: Cell::new(true),
         }
+    }
+
+    /// Decide [`Self::key_ids`] for a run of `program`, and give `input`
+    /// (a document, materialized for this run) its identities to match.
+    fn prepare(&self, program: &Expr, input: &mut OwnedValue) {
+        let keys = hands_out_keys(program);
+        self.key_ids.set(keys);
+        input.promote_identities(keys);
     }
 
     /// Run `program` on `input`, a document: its strings and numbers are
     /// promoted first, so each node has one identity, as `jv_parse` gives it.
     pub fn run(&self, program: &'e Expr, mut input: OwnedValue) -> Run {
-        input.promote_identities();
+        self.prepare(program, &mut input);
         let mut outputs = Vec::new();
         let result = self.eval(program, &Env::default(), input, Reg::top(), &mut |v, _| {
             outputs.push(v);
@@ -1556,9 +1763,9 @@ impl<'e> Interp<'e> {
                     .ok_or_else(|| unsupported("a location that is not a constant"))?;
                 sink(value, reg)
             }
-            Expr::Field(name) => self.index(input, reg, string(name), false, sink),
+            Expr::Field(name) => self.field(expr, name, input, reg, false, sink),
             Expr::Index { idx, key } => {
-                let key = index_key(*idx, key.as_ref());
+                let key = self.site_key(expr, || index_key(*idx, key.as_ref()));
                 self.index(input, reg, key, false, sink)
             }
             Expr::Slice {
@@ -1677,7 +1884,7 @@ impl<'e> Interp<'e> {
                 let cached = self.consts.borrow().get(&key).cloned();
                 let value = cached.unwrap_or_else(|| {
                     let mut value = tracked.value.clone();
-                    value.promote_identities();
+                    value.promote_identities(self.key_ids.get());
                     self.consts.borrow_mut().insert(key, value.clone());
                     value
                 });
@@ -1860,6 +2067,49 @@ impl<'e> Interp<'e> {
         Some(value)
     }
 
+    /// The key a path component spells, the `"a"` of `.a` or the `0` of
+    /// `.[0]`: one `jv` per site, as jq's `gen_index(gen_noop(),
+    /// gen_const(k))` loads it with `LOADK` (#7465). So the key read at two
+    /// elements is identical (`[.[] | path(.a)[0]] | .[0] as $k | .[1] |
+    /// path($k)` is `[]`), and a step allocates no key. Kept with the
+    /// constants, by the component's address.
+    fn site_key(&self, site: &'e Expr, make: impl FnOnce() -> OwnedValue) -> OwnedValue {
+        let at = site as *const Expr as usize;
+        if let Some(value) = self.consts.borrow().get(&at) {
+            return value.clone();
+        }
+        let value = make();
+        self.consts.borrow_mut().insert(at, value.clone());
+        value
+    }
+
+    /// `.name` at `site`: [`index`](Self::index) with the site's key. Outside
+    /// any `path()`, or in a subexpression, `path_append` is a no-op and the
+    /// key never leaves the step, so an object or `null` is read by the name
+    /// itself and no key is fetched (#7465).
+    fn field(
+        &self,
+        site: &'e Expr,
+        name: &str,
+        input: OwnedValue,
+        reg: Reg,
+        opt: bool,
+        sink: &mut Sink<'_>,
+    ) -> R {
+        if !reg.tracking() {
+            match &input {
+                OwnedValue::Object(map) => {
+                    let value = map.get(name).cloned().unwrap_or(OwnedValue::Null);
+                    return sink(value, reg);
+                }
+                OwnedValue::Null => return sink(OwnedValue::Null, reg),
+                _ => {}
+            }
+        }
+        let key = self.site_key(site, || string(name));
+        self.index(input, reg, key, opt, sink)
+    }
+
     /// `INDEX`/`INDEX_OPT` on `container` with `key`: `path_intact` first
     /// (a failure raises even under `INDEX_OPT`), then `jv_get`, then
     /// `path_append` with the key as given. 1.7.1 does not renormalize a
@@ -1959,6 +2209,8 @@ impl<'e> Interp<'e> {
                 Ok(())
             }
             OwnedValue::Object(map) => {
+                // A key handed out unpromoted would be identical to nothing it should be (#7489).
+                debug_assert!(self.key_ids.get(), "hands_out_keys missed an iteration");
                 for (k, item) in map.iter_stored() {
                     sink(
                         item.clone(),
@@ -2045,9 +2297,9 @@ impl<'e> Interp<'e> {
         sink: &mut Sink<'_>,
     ) -> R {
         match inner {
-            Expr::Field(name) => self.index(input, reg, string(name), true, sink),
+            Expr::Field(name) => self.field(inner, name, input, reg, true, sink),
             Expr::Index { idx, key } => {
-                let key = index_key(*idx, key.as_ref());
+                let key = self.site_key(inner, || index_key(*idx, key.as_ref()));
                 self.index(input, reg, key, true, sink)
             }
             Expr::Slice {
@@ -3320,16 +3572,30 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
+        // A key handed out unpromoted would be identical to nothing it should be (#7489).
+        debug_assert!(
+            self.key_ids.get() || !matches!(builtin, Builtin::Keys | Builtin::KeysUnsorted),
+            "hands_out_keys missed {builtin:?}"
+        );
+        let key_ids = self.key_ids.get();
         let kids = builtin_args(builtin);
         if kids.is_empty() {
-            return emit_c_builtin(node, builtin, &input, &[], &reg, sink);
+            return emit_c_builtin(node, builtin, &input, &[], &reg, key_ids, sink);
         }
         self.c_args(&kids, env, &input, &reg, &mut |values| {
             let mut next = values.iter();
             let call = map_builtin_subexprs(builtin, &mut |_| {
                 Expr::tracked_value(next.next().cloned().unwrap_or(OwnedValue::Null))
             });
-            emit_c_builtin(&Expr::Builtin(call), builtin, &input, values, &reg, sink)
+            emit_c_builtin(
+                &Expr::Builtin(call),
+                builtin,
+                &input,
+                values,
+                &reg,
+                key_ids,
+                sink,
+            )
         })
     }
 
@@ -3467,6 +3733,37 @@ impl<'e> Interp<'e> {
         })
     }
 
+    /// `last(g)` as jq 1.8 compiles it (`gen_last_1`, jqlang/jq#3179, #7518):
+    ///
+    /// ```text
+    /// DUP; null; STOREV last; DUP; true; STOREV is_empty;
+    /// FORK [CALL g; DUP; STOREV last; false; STOREV is_empty; BACKTRACK];
+    /// LOADVN is_empty; JUMP_F L; BACKTRACK; L: LOADVN last
+    /// ```
+    ///
+    /// `g` runs from the entry register and its movement is undone by the
+    /// backtrack, as it is for a `reduce` source; the last value it emitted is
+    /// answered at the entry register, and nothing at all when `g` emitted
+    /// nothing (1.7.1's `reduce g as $item (null; $item)` answered `null`).
+    fn last_fold(
+        &self,
+        g: &'e Expr,
+        env: &Env<'e>,
+        input: OwnedValue,
+        reg: Reg,
+        sink: &mut Sink<'_>,
+    ) -> R {
+        let last: RefCell<Option<OwnedValue>> = RefCell::new(None);
+        self.eval(g, env, input, reg.clone(), &mut |v, _| {
+            *last.borrow_mut() = Some(v);
+            Ok(())
+        })?;
+        match last.into_inner() {
+            Some(v) => sink(v, reg),
+            None => Ok(()),
+        }
+    }
+
     fn call_prelude(
         &self,
         name: &str,
@@ -3476,6 +3773,11 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
+        // `last(g)` is bytecoded in jq 1.8 (`gen_last_1`), not a `reduce`: see
+        // [`Self::last_fold`]. The 0-arity `last` is still the prelude's `.[-1]`.
+        if name == "_sp_last" && args.len() == 1 {
+            return self.last_fold(args[0], env, input, reg, sink);
+        }
         let callee = self
             .prelude_env
             .lookup_func(name, args.len())
@@ -4731,12 +5033,16 @@ fn number_owned(value: f64) -> OwnedValue {
 /// argument itself when the builtin hands it back unchanged ([`kept`]), a
 /// fresh value otherwise. The call runs either way, for its side effects
 /// (`debug`) and its errors.
+///
+/// `key_ids` is the run's [`Interp::key_ids`]: whether a parsed document's
+/// keys get an identity each.
 fn emit_c_builtin(
     expr: &Expr,
     builtin: &Builtin,
     input: &OwnedValue,
     args: &[OwnedValue],
     reg: &Reg,
+    key_ids: bool,
     sink: &mut Sink<'_>,
 ) -> R {
     let keep = kept(builtin, input, args);
@@ -4811,9 +5117,10 @@ fn emit_c_builtin(
         } else if matches!(builtin, Builtin::FromJson | Builtin::Input) {
             // A parsed document, as the run's input is: the reader shares one
             // key among sibling records (#7260), where jq's parser allocates
-            // each, so each object's keys get storage of their own (#7401).
+            // each, so each object's keys get storage of their own (#7401),
+            // in a run that can hand one out (#7489).
             let mut v = v;
-            v.promote_identities();
+            v.promote_identities(key_ids);
             v
         } else {
             fresh(v, &inputs)
