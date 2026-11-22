@@ -1122,6 +1122,14 @@ fn builtin_fallback_children(fallback: &Expr) -> Vec<&Expr> {
         }
         Expr::Error(msg) => msg.iter().map(alloc::boxed::Box::as_ref).collect(),
         Expr::Break(_) => Vec::new(),
+        // #7739: an operator jq compiles into a call (`parser::shadow_operator`).
+        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            alloc::vec![left.as_ref(), right.as_ref()]
+        }
+        Expr::Assign { path, value } => alloc::vec![path.as_ref(), value.as_ref()],
+        Expr::Update { path, filter } => alloc::vec![path.as_ref(), filter.as_ref()],
+        Expr::Negate(operand) => alloc::vec![operand.as_ref()],
+        Expr::RecursiveDescent | Expr::Format(_) => Vec::new(),
         Expr::Builtin(builtin) => match builtin_kids(builtin) {
             BuiltinKids::None => Vec::new(),
             BuiltinKids::One(a) => alloc::vec![a],
@@ -2168,6 +2176,17 @@ fn builtin_fallback_arity(fallback: &Expr) -> usize {
         // argument (it's not even in scope as a call argument would be),
         // so this is arity 0, same as a bare `error`.
         Expr::Break(_) => 0,
+        // #7739: the calls jq compiles these operators into
+        // (`parser::shadow_operator`): `_plus(a; b)` and the other binary
+        // operators, `_assign(paths; value)`, `_modify(paths; update)`,
+        // `format(name)`, and `_negate`/`recurse`, which take their operand
+        // as input.
+        Expr::Arithmetic { .. }
+        | Expr::Compare { .. }
+        | Expr::Assign { .. }
+        | Expr::Update { .. } => 2,
+        Expr::Format(_) => 1,
+        Expr::Negate(_) | Expr::RecursiveDescent => 0,
         Expr::Builtin(builtin) => match builtin_kids(builtin) {
             BuiltinKids::None => 0,
             BuiltinKids::One(_) => 1,
@@ -2244,6 +2263,21 @@ fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
         // `Expr::Break` -- label name included -- is simply discarded; it was
         // never going to reach the label-catching machinery either way.
         Expr::Break(_) => Vec::new(),
+        // #7739: see `builtin_fallback_arity`'s matching arms. A shadowed
+        // `_negate` takes its operand as input, which `check` arranges before
+        // it gets here, so a `Negate` reaching this arm has nothing left to hand
+        // over.
+        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            alloc::vec![*left, *right]
+        }
+        Expr::Assign { path, value } => alloc::vec![*path, *value],
+        Expr::Update { path, filter } => alloc::vec![*path, *filter],
+        Expr::Format(format) => alloc::vec![Expr::Literal(super::expr::Literal::String(
+            super::parser::format_call_argument(&format)
+                .unwrap_or_default()
+                .into()
+        ))],
+        Expr::Negate(_) | Expr::RecursiveDescent => Vec::new(),
         // `builtin_kids` only ever borrows -- there is no by-value
         // counterpart, so this one case clones rather than moves. Bounded
         // even so: it can only fire once per node that check() has just
@@ -2265,6 +2299,51 @@ fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
     }
 }
 
+/// #7739: jq compiles `-E` into `E | _negate`, so a `def _negate` in scope gets
+/// `E`'s outputs as its input. The parser wraps a unary minus as a call to
+/// `_negate` with the `Negate` as its fallback (`parser::shadow_operator`);
+/// when that call resolves to a `def` (or a parameter), this rewrites the node
+/// to the pipe, whose call the `FuncCall` arm then resolves as any other.
+fn negate_through_def(expr: &mut Expr, cx: &CheckCtx) {
+    let Expr::FuncCall {
+        name,
+        args,
+        builtin_fallback: Some(fallback),
+    } = &*expr
+    else {
+        return;
+    };
+    if !args.is_empty() || !matches!(**fallback, Expr::Negate(_)) {
+        return;
+    }
+    let scan = in_scope(&cx.scope, name, 0);
+    let resolved = scan.hit.is_some()
+        || matches!(&scan.run, Some((_, Some(alias)))
+            if in_scope(&cx.scope, &alloc::format!("{alias}::{name}"), 0).hit.is_some());
+    if !resolved {
+        return;
+    }
+    let Expr::FuncCall {
+        name,
+        builtin_fallback: Some(fallback),
+        ..
+    } = core::mem::replace(expr, Expr::Identity)
+    else {
+        unreachable!("matched above");
+    };
+    let Expr::Negate(operand) = *fallback else {
+        unreachable!("matched above");
+    };
+    *expr = Expr::pipe(alloc::vec![
+        *operand,
+        Expr::FuncCall {
+            name,
+            args: Vec::new(),
+            builtin_fallback: None,
+        },
+    ]);
+}
+
 /// Recurse into `expr` under `cx`'s scopes, restoring every scope in `cx` to
 /// what it was on entry before returning so a sibling never sees a binding
 /// introduced by its neighbour. Appends every unresolvable call, variable and
@@ -2272,6 +2351,7 @@ fn builtin_fallback_into_args(fallback: Expr) -> Vec<Expr> {
 /// jq's own compiler keeps going to report every compile error in one pass
 /// (#2037). `reachable` is the set of `def` bodies a call can reach (#2740).
 fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
+    negate_through_def(expr, cx);
     match expr {
         // #1371: neither variant can occur here. This pass runs once, on the
         // freshly parsed program, before evaluation begins; both are built

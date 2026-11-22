@@ -10068,7 +10068,32 @@ They are jq's internals: the C functions behind the operators and the helper def
 jq hides them from `builtins` and its manual never names them, so a program that calls one is written against jq's implementation rather than its language.
 The list was probed from a candidate set of internal names, so it may not be complete; `jq --debug-dump-disasm` does not list a builtin's name.
 [#6684](https://github.com/rust-works/succinctly/issues/6684) recorded it.
+Defining one of the operator names replaces the operator, as in jq (#7739, the section below); calling one is still the compile error.
 Pinned in `tests/jq_cli/i6684.rs` and, for the expansion's shape, in `nwise_expands_in_jq_mode_unless_the_program_defines_it_6684` in `src/jq/parser.rs`.
+
+## A `def` named like an operator jq compiles into a call replaces the operator (#7739)
+
+jq's parser compiles several operators and syntactic forms into calls by name (`gen_binop`, `gen_format`, `gen_update` and `gen_definedor_assign` in jq 1.7.1's and 1.8.2's `parser.y`), which are resolved by ordinary lexical scope like any other call.
+So a `def` (or a parameter) of that name and arity in scope at the operator replaces it, in both jq versions:
+every binary arithmetic and comparison operator is a call to `_plus`, `_minus`, `_multiply`, `_divide`, `_mod`, `_equal`, `_notequal`, `_less`, `_greater`, `_lesseq` or `_greatereq` with its operands as the two arguments, unless both operands are constants (a literal, `$__loc__`, or an array or object of constants), which `constant_fold` folds at compile time;
+unary minus is `E | _negate`, a negative number literal included (a negative number is therefore never a constant);
+`@name` is `format("name")`, and a string with slots is `"" + (E | format(F))` joined with `_plus`, `F` the prefix format or `text` (the literal text before the first slot folds into the `""`);
+`..` is `recurse/0`;
+`|=` is `_modify(paths; update)`, `=` is `_assign(paths; value)`, and `PATH op= V` is `V as $tmp | _modify(PATH; . op $tmp)` (`. // $tmp` for `//=`), so a `def _plus` reaches into `+=` too.
+`def _plus(a;b): "P"; 1 | . + 2` is `"P"`, `def _plus(a;b): "P"; 1 + 2` is `3`, `def format(f): "<" + f + ">"; "id=\(1)"` is `"id=<text>"`, `def recurse: "R"; [..]` is `["R"]` and `def f(recurse): [..]; f("R")` is `["R"]`.
+jq's own builtins keep their operators: `def _less(a;b): true; [3,1,2] | sort_by(.)` is `[1,2,3]`.
+
+Since [#7739](https://github.com/rust-works/succinctly/issues/7739) `succinctly jq` does the same.
+A program whose text has a `def` (or a parameter) of one of these names (`Parser::shadows_operators`, from the same over-approximate scan #2036's shadowable builtins use) builds each such operator as a call to that name with the operator itself as the fallback, which `resolve::check` turns into the call when a definition of the name and arity is in scope there and back into the operator otherwise.
+Every other program parses exactly as before.
+In such a program a negative number literal stays a negation of the positive literal, and an update-assignment is built as jq builds it, whether or not the definition reaches it; both answer as the operator they replace.
+`succinctly yq` is unaffected: yq has no such calls.
+
+Two things are not followed:
+- `label` compares the error it catches with `_equal` (`gen_label`), so in jq `def _equal(a;b): false; [label $f | 1, break $f]` raises `{"__jq":0}` (exit 5); succinctly's `label` compares natively and answers `[1]`, because the shipped evaluator does not hold the label's value (#7719 routes only programs that can observe it).
+- A definition that calls the operator it replaces (`def _plus(a;b): a + b; 1 | . + 1`, `def _negate: -.; 1 | -.`, `def recurse: ..`, `def format(f): "<\(f)>"; "a\(1)"`) recurses without end: jq runs until it aborts (`cannot allocate memory`) or is stopped; succinctly stops at its recursion limit with an error (ADR-0018: matching would take the process down).
+
+Pinned by `tests/jq_cli/i7739.rs`, every row captured from jq 1.7.1.
 
 ## `skip` with a generator count
 

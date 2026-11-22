@@ -1678,6 +1678,118 @@ pub(crate) fn nwise_fallback_children(expr: &Expr) -> Option<Vec<&Expr>> {
     }
 }
 
+/// #7739: the names jq's parser compiles an operator or a syntactic form into a
+/// call to (`gen_binop`, `gen_format`, `gen_update`, `gen_definedor_assign` in
+/// jq 1.7.1's and 1.8.2's `parser.y`): every binary arithmetic and comparison
+/// operator that is not constant-folded, unary minus (`_negate`), `@name` and
+/// string interpolation (`format/1`, and `_plus/2` for the concatenation), `..`
+/// (`recurse/0`), `|=` and the update-assignments (`_modify/2`) and `=`
+/// (`_assign/2`). The call is resolved by ordinary lexical scope, so a `def` of
+/// the name and arity in scope replaces the operator. `error/0` (`break`) has its
+/// own path (#2687).
+pub(crate) const OPERATOR_CALL_NAMES: [&str; 16] = [
+    "_plus",
+    "_minus",
+    "_multiply",
+    "_divide",
+    "_mod",
+    "_equal",
+    "_notequal",
+    "_less",
+    "_greater",
+    "_lesseq",
+    "_greatereq",
+    "_negate",
+    "format",
+    "recurse",
+    "_modify",
+    "_assign",
+];
+
+/// The variable an update-assignment's right side is bound to (#7739), as jq's
+/// `gen_update` binds it to a fresh `$tmp`: a name no program can spell.
+pub(crate) const UPDATE_TMP_VAR: &str = "*update-tmp";
+
+/// The call jq compiles a binary arithmetic operator into (#7739).
+fn arith_call_name(op: &ArithOp) -> &'static str {
+    match op {
+        ArithOp::Add => "_plus",
+        ArithOp::Sub => "_minus",
+        ArithOp::Mul(_) => "_multiply",
+        ArithOp::Div => "_divide",
+        ArithOp::Mod => "_mod",
+    }
+}
+
+/// The binary operator an update-assignment applies (#7739).
+fn assign_arith_op(op: &AssignOp) -> ArithOp {
+    match op {
+        AssignOp::Add => ArithOp::Add,
+        AssignOp::Sub => ArithOp::Sub,
+        AssignOp::Mul(flags) => ArithOp::Mul(*flags),
+        AssignOp::Div => ArithOp::Div,
+        AssignOp::Mod => ArithOp::Mod,
+    }
+}
+
+/// The call jq compiles a comparison operator into (#7739).
+fn compare_call_name(op: &CompareOp) -> &'static str {
+    match op {
+        CompareOp::Eq => "_equal",
+        CompareOp::Ne => "_notequal",
+        CompareOp::Lt => "_less",
+        CompareOp::Le => "_lesseq",
+        CompareOp::Gt => "_greater",
+        CompareOp::Ge => "_greatereq",
+    }
+}
+
+/// The argument jq's `gen_format` hands `format/1` for an `@name` (#7739):
+/// the name after the `@`. `None` for a format jq has no `@name` for.
+pub(crate) fn format_call_argument(format: &FormatType) -> Option<String> {
+    Some(
+        match format {
+            FormatType::Text => "text",
+            FormatType::Json => "json",
+            FormatType::Uri => "uri",
+            FormatType::Csv => "csv",
+            FormatType::Tsv => "tsv",
+            FormatType::Base64 => "base64",
+            FormatType::Base64d => "base64d",
+            FormatType::Html => "html",
+            FormatType::Sh => "sh",
+            FormatType::Urid => "urid",
+            FormatType::Yaml => "yaml",
+            FormatType::Props => "props",
+            FormatType::Unknown(name) => name.as_str(),
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// Whether jq's `constant_fold` folds `expr` as an operand (#7739): a single
+/// constant -- a literal (a negative number is `_negate` of one, so not), `$__loc__`,
+/// or an array or object built of constants. Two such operands fold at
+/// compile time, so no call is made and no `def` replaces the operator.
+fn is_fold_constant(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Literal::NumberLiteral(_, text)) => !text.starts_with('-'),
+        Expr::Literal(Literal::Int(i)) => *i >= 0,
+        Expr::Literal(Literal::Float(f)) => !f.is_sign_negative(),
+        Expr::Literal(_) | Expr::Loc { .. } => true,
+        Expr::Paren(inner) => is_fold_constant(inner),
+        Expr::Array(inner) => match &**inner {
+            Expr::Comma(items) => items.iter().all(is_fold_constant),
+            item => is_fold_constant(item),
+        },
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            matches!(entry.key, ObjectKey::Literal(_)) && is_fold_constant(&entry.value)
+        }),
+        _ => false,
+    }
+}
+
 /// #2036 Direction 3: a cheap, deliberately over-approximate scan for every
 /// identifier spelled after a `def` keyword anywhere in `input`, plus (#2723)
 /// every identifier spelled in that `def`'s own parameter list -- see
@@ -1978,6 +2090,11 @@ struct Parser<'a> {
     /// `limit`/`nth`/`skip` accept full first-argument expressions, so a valid
     /// comma argument no longer enters this fallback.
     shadow_retry_budget: usize,
+    /// #7739: jq mode, and [`Self::shadowable_defs`] holds a name jq's parser
+    /// compiles an operator or a syntactic form into a call to
+    /// ([`OPERATOR_CALL_NAMES`]). Only then are those forms built as shadow
+    /// candidates; every other program parses them exactly as before.
+    shadows_operators: bool,
     /// #4185: how many more parenthesised pair-group attempts
     /// ([`Self::try_parse_yq_pair_group`]) this parse may start.
     ///
@@ -3356,6 +3473,10 @@ impl<'a> Parser<'a> {
     ) -> Self {
         let mut shadowable_defs = collect_def_names(input);
         shadowable_defs.extend(extra.iter().cloned());
+        let shadows_operators = mode == ParserMode::Jq
+            && OPERATOR_CALL_NAMES
+                .iter()
+                .any(|name| shadowable_defs.contains(*name));
         Parser {
             input,
             pos: 0,
@@ -3380,6 +3501,7 @@ impl<'a> Parser<'a> {
             def_sites: Vec::new(),
             shadowable_defs,
             shadow_retry_budget: SHADOW_RETRY_BUDGET,
+            shadows_operators,
             pair_group_budget: PAIR_GROUP_BUDGET,
             wrong_arity_call: None,
             last_primary_is_term: true,
@@ -4246,7 +4368,7 @@ impl<'a> Parser<'a> {
         if self.mode == ParserMode::Jq {
             return Ok(match self.parse_string_or_interpolation()? {
                 Expr::Literal(Literal::String(name)) => PathStep::Field(name.to_string()),
-                computed => PathStep::Computed(computed),
+                computed => PathStep::Computed(self.finish_string(computed, None)),
             });
         }
         self.parse_path_step_name().map(PathStep::Field)
@@ -5613,7 +5735,8 @@ impl<'a> Parser<'a> {
         }
         match self.peek() {
             Some('"') if self.string_literal_has_interpolation() => {
-                self.parse_string_or_interpolation().map(Some)
+                let string = self.parse_string_or_interpolation()?;
+                Ok(Some(self.finish_string(string, None)))
             }
             Some('@') => {
                 let start = self.pos;
@@ -5624,7 +5747,7 @@ impl<'a> Parser<'a> {
                     return Ok(None);
                 }
                 let string = self.parse_string_or_interpolation()?;
-                Ok(Some(Self::apply_format_to_interpolation(string, &format)))
+                Ok(Some(self.finish_string(string, Some(&format))))
             }
             _ => Ok(None),
         }
@@ -5918,7 +6041,7 @@ impl<'a> Parser<'a> {
             // jq-mode gate.
             Some('"') => {
                 let string = self.parse_string_or_interpolation()?;
-                self.postfix_if_jq(string)
+                self.postfix_if_jq(self.finish_string(string, None))
             }
 
             // Format strings: @text, @json, @uri, etc. #2741 review: the
@@ -5951,10 +6074,10 @@ impl<'a> Parser<'a> {
                 self.skip_ws();
                 if self.mode == ParserMode::Jq && self.peek() == Some('"') {
                     let s = self.parse_string_or_interpolation()?;
-                    let formatted = Self::apply_format_to_interpolation(s, &format);
+                    let formatted = self.finish_string(s, Some(&format));
                     self.parse_postfix(formatted)
                 } else {
-                    self.postfix_if_jq(format)
+                    self.postfix_if_jq(self.shadowed(format))
                 }
             }
 
@@ -5989,7 +6112,11 @@ impl<'a> Parser<'a> {
                     let lit = self.parse_number_literal()?;
                     // #3397: an `as` or a multiplicative operator after the
                     // literal means the negation covers it (jq's `'-' Exp`).
-                    if self.mode == ParserMode::Jq && self.negation_scopes_over_what_follows() {
+                    // #7739: jq negates a literal through `_negate` too, and a
+                    // negative number is no constant to `constant_fold`.
+                    if self.mode == ParserMode::Jq
+                        && (self.shadows_operators || self.negation_scopes_over_what_follows())
+                    {
                         self.pos = start;
                     } else {
                         folded = Some(lit);
@@ -6077,7 +6204,7 @@ impl<'a> Parser<'a> {
                     } else {
                         first
                     };
-                    return Ok(Expr::Negate(Box::new(operand)));
+                    return Ok(self.shadowed(Expr::Negate(Box::new(operand))));
                 }
             }
 
@@ -6139,7 +6266,7 @@ impl<'a> Parser<'a> {
                     }
                     // jq reads a suffix after `..` as a postfix on the term (`..[0]?`, `..[]?`,
                     // `.. .a`), which yq's lexer rejects (#5248), so only jq mode takes it.
-                    let term = self.postfix_if_jq(Expr::RecursiveDescent)?;
+                    let term = self.postfix_if_jq(self.shadowed(Expr::RecursiveDescent))?;
                     self.last_primary_is_term = true; // #3038: leaf Term, no recursion below to reset a stale flag
                     return Ok(term);
                 }
@@ -8941,6 +9068,172 @@ impl<'a> Parser<'a> {
             args: Vec::new(),
             builtin_fallback: Some(Box::new(original)),
         }
+    }
+
+    /// #7739: in a program that may `def` one of [`OPERATOR_CALL_NAMES`], wrap
+    /// the operator node `expr` the parser just built as the call jq compiles
+    /// it into, with `expr` itself as the `builtin_fallback`, so that
+    /// [`super::resolve::check`] makes it that call when a `def` of the name and
+    /// arity is in scope and puts `expr` back otherwise (as for #2036's special
+    /// forms). Constant-folded operands, which jq never calls on, and a format
+    /// with no `@name` are left alone. Out of line, so the recursive-descent
+    /// frames that call it hold no more than the node they hand over (#5629).
+    #[inline(never)]
+    fn shadowed(&self, mut expr: Expr) -> Expr {
+        self.shadow_operator(&mut expr);
+        expr
+    }
+
+    /// [`Self::shadowed`]'s rule for one node, in place.
+    fn shadow_operator(&self, expr: &mut Expr) {
+        if !self.shadows_operators {
+            return;
+        }
+        let name = match &*expr {
+            Expr::Arithmetic {
+                op, left, right, ..
+            } => {
+                if is_fold_constant(left) && is_fold_constant(right) {
+                    return;
+                }
+                arith_call_name(op)
+            }
+            Expr::Compare { op, left, right } => {
+                if is_fold_constant(left) && is_fold_constant(right) {
+                    return;
+                }
+                compare_call_name(op)
+            }
+            Expr::Negate(_) => "_negate",
+            Expr::RecursiveDescent => "recurse",
+            Expr::Format(format) if format_call_argument(format).is_some() => "format",
+            Expr::Assign { .. } => "_assign",
+            Expr::Update { .. } => "_modify",
+            _ => return,
+        };
+        if !self.shadowable_defs.contains(name) {
+            return;
+        }
+        let original = core::mem::replace(expr, Expr::Identity);
+        *expr = Expr::FuncCall {
+            name: name.to_string(),
+            args: Vec::new(),
+            builtin_fallback: Some(Box::new(original)),
+        };
+    }
+
+    /// #7739: an update-assignment as jq's `gen_update` and
+    /// `gen_definedor_assign` compile it, when the program may `def` `_modify`
+    /// or the operator's own call: `value as $tmp | path |= (. op $tmp)` (or
+    /// `(. // $tmp)` for `//=`), with `|=` and `op` each a shadow candidate.
+    /// Every other assignment is left as built.
+    #[inline(never)]
+    fn shadowed_update_assignment(&self, mut expr: Expr) -> Expr {
+        self.shadow_update_assignment(&mut expr);
+        expr
+    }
+
+    /// [`Self::shadowed_update_assignment`]'s rule, in place.
+    fn shadow_update_assignment(&self, expr: &mut Expr) {
+        if !self.shadows_operators {
+            return;
+        }
+        let modify = self.shadowable_defs.contains("_modify");
+        let wanted = match &*expr {
+            Expr::CompoundAssign { op, .. } => {
+                modify
+                    || self
+                        .shadowable_defs
+                        .contains(arith_call_name(&assign_arith_op(op)))
+            }
+            Expr::AlternativeAssign { .. } => modify,
+            _ => false,
+        };
+        if !wanted {
+            return;
+        }
+        let tmp = || Box::new(Expr::Var(UPDATE_TMP_VAR.to_string()));
+        let (path, value, mut update) = match core::mem::replace(expr, Expr::Identity) {
+            Expr::CompoundAssign { op, path, value } => {
+                let update = Expr::Arithmetic {
+                    op: assign_arith_op(&op),
+                    left: Box::new(Expr::Identity),
+                    right: tmp(),
+                    settle: ArithSettleMemo::default(),
+                };
+                (path, value, update)
+            }
+            Expr::AlternativeAssign { path, value } => (
+                path,
+                value,
+                Expr::Alternative(Box::new(Expr::Identity), tmp()),
+            ),
+            other => unreachable!("only an update-assignment is wanted: {other:?}"),
+        };
+        self.shadow_operator(&mut update);
+        let mut body = Expr::Update {
+            path,
+            filter: Box::new(update),
+        };
+        self.shadow_operator(&mut body);
+        *expr = Expr::As {
+            expr: value,
+            var: UPDATE_TMP_VAR.to_string(),
+            body: Box::new(body),
+        };
+    }
+
+    /// #7739: a string with interpolations as jq's grammar builds it when the
+    /// program may `def` `format` or `_plus`: `"" + (E | format(F))`, then `+`
+    /// each literal and slot in turn, the literal text before the first slot
+    /// folded into that `""` (`gen_binop` folds two constants), `F` the
+    /// format the string is prefixed with or `text`. Otherwise `string` as
+    /// [`Self::apply_format_to_interpolation`] has always built it.
+    #[inline(never)]
+    fn finish_string(&self, string: Expr, format: Option<&Expr>) -> Expr {
+        let rebuild = self.shadows_operators
+            && (self.shadowable_defs.contains("format") || self.shadowable_defs.contains("_plus"));
+        let parts = match string {
+            Expr::StringInterpolation(parts) if rebuild => parts,
+            string => {
+                return match format {
+                    Some(format) => Self::apply_format_to_interpolation(string, format),
+                    None => string,
+                }
+            }
+        };
+        let format = format.cloned().unwrap_or(Expr::Format(FormatType::Text));
+        let mut text = String::new();
+        let mut built: Option<Expr> = None;
+        let plus = |left: Expr, right: Expr| {
+            let mut sum = Expr::Arithmetic {
+                op: ArithOp::Add,
+                left: Box::new(left),
+                right: Box::new(right),
+                settle: ArithSettleMemo::default(),
+            };
+            self.shadow_operator(&mut sum);
+            sum
+        };
+        for part in parts {
+            match part {
+                StringPart::Literal(literal) => match built.take() {
+                    None => text.push_str(&literal),
+                    Some(left) => {
+                        built = Some(plus(left, Expr::Literal(Literal::String(literal.into()))));
+                    }
+                },
+                StringPart::Expr(slot) => {
+                    let left = built.take().unwrap_or_else(|| {
+                        Expr::Literal(Literal::String(core::mem::take(&mut text).into()))
+                    });
+                    let mut applied = format.clone();
+                    self.shadow_operator(&mut applied);
+                    built = Some(plus(left, Expr::pipe(vec![*slot, applied])));
+                }
+            }
+        }
+        built.unwrap_or_else(|| Expr::Literal(Literal::String(text.into())))
     }
 
     /// The bare identifier text starting at `pos`, independent of how far
@@ -11774,12 +12067,12 @@ impl<'a> Parser<'a> {
             let right = self.parse_operand()?;
             chain_depth += 1;
             self.check_chain_link(chain_depth)?;
-            left = Expr::Arithmetic {
+            left = self.shadowed(Expr::Arithmetic {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
                 settle: ArithSettleMemo::default(),
-            };
+            });
         }
 
         Ok(left)
@@ -11815,12 +12108,12 @@ impl<'a> Parser<'a> {
             let right = self.parse_multiplicative()?;
             chain_depth += 1;
             self.check_chain_link(chain_depth)?;
-            left = Expr::Arithmetic {
+            left = self.shadowed(Expr::Arithmetic {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
                 settle: ArithSettleMemo::default(),
-            };
+            });
         }
 
         Ok(left)
@@ -11953,11 +12246,11 @@ impl<'a> Parser<'a> {
         if self.mode == ParserMode::Yq {
             return self.fold_yq_comparison_chain(left, op, right);
         }
-        Ok(Expr::Compare {
+        Ok(self.shadowed(Expr::Compare {
             op,
             left: Box::new(left),
             right: Box::new(right),
-        })
+        }))
     }
 
     /// yq mode: `left op right` is read; gather the operators that follow and fold the chain
@@ -12432,7 +12725,7 @@ impl<'a> Parser<'a> {
             self.next(); // =
             self.skip_ws();
             let filter = self.parse_assignment_operand()?;
-            return Ok(self.finish_update(left, filter));
+            return Ok(self.shadowed(self.finish_update(left, filter)));
         }
 
         // Check for //= (alternative assignment)
@@ -12443,10 +12736,10 @@ impl<'a> Parser<'a> {
             self.next(); // =
             self.skip_ws();
             let value = self.parse_assignment_operand()?;
-            return Ok(Expr::AlternativeAssign {
+            return Ok(self.shadowed_update_assignment(Expr::AlternativeAssign {
                 path: Box::new(Self::fold_sum_or_merge_key(left)),
                 value: Box::new(value),
-            });
+            }));
         }
 
         // Check for *= (merge assignment), with optional yq merge-flag
@@ -12464,7 +12757,11 @@ impl<'a> Parser<'a> {
             };
             self.skip_ws();
             let value = self.parse_assignment_operand()?;
-            return Ok(self.compound_assign(AssignOp::Mul(flags), left, value));
+            return Ok(self.shadowed_update_assignment(self.compound_assign(
+                AssignOp::Mul(flags),
+                left,
+                value,
+            )));
         }
 
         // Check for compound assignments: +=, -=, /=, %=
@@ -12484,7 +12781,7 @@ impl<'a> Parser<'a> {
                 self.next(); // =
                 self.skip_ws();
                 let value = self.parse_assignment_operand()?;
-                return Ok(self.compound_assign(op, left, value));
+                return Ok(self.shadowed_update_assignment(self.compound_assign(op, left, value)));
             }
         }
 
@@ -12494,7 +12791,7 @@ impl<'a> Parser<'a> {
             self.next(); // =
             self.skip_ws();
             let value = self.parse_assignment_operand()?;
-            return Ok(self.assign_or_rename_key(left, value, false));
+            return Ok(self.shadowed(self.assign_or_rename_key(left, value, false)));
         }
 
         if self.mode == ParserMode::Yq {
@@ -18787,5 +19084,76 @@ mod tests {
         let patterns = ireduce_patterns(".[] as [$a, $b] ireduce([]; . + [($a|path)])");
         assert_eq!(patterns.len(), 1);
         assert!(matches!(&patterns[0], Pattern::Array(vars) if vars.len() == 2));
+    }
+
+    /// #7739: an operator jq compiles into a call is a shadow candidate only in
+    /// a jq-mode program that may `def` that call, and never over two constants.
+    #[test]
+    fn operators_are_shadow_candidates_only_where_a_def_may_reach_them_7739() {
+        use super::super::walk::any_subexpr;
+        // Every candidate, the ones nested in another's fallback included.
+        fn collect(e: &Expr, names: &mut Vec<String>) {
+            any_subexpr(e, &mut |x| {
+                if let Expr::FuncCall {
+                    name,
+                    builtin_fallback: Some(fallback),
+                    ..
+                } = x
+                {
+                    names.push(name.clone());
+                    collect(fallback, names);
+                }
+                false
+            });
+        }
+        let candidates = |e: &Expr| {
+            let mut names = Vec::new();
+            collect(e, &mut names);
+            names
+        };
+        // No such `def`: the tree is the one it always was.
+        for src in [
+            ". + 1",
+            "-1",
+            "-.",
+            "..",
+            "@csv",
+            "\"a\\(1)\"",
+            ".a |= 1",
+            ".a += 1",
+            ".a = 1",
+        ] {
+            assert_eq!(
+                candidates(&parse(src).unwrap()),
+                Vec::<String>::new(),
+                "{src}"
+            );
+        }
+        assert!(matches!(parse("-1").unwrap(), Expr::Literal(_)));
+        for (src, want) in [
+            ("def _plus(a;b): 1; . + 1", &["_plus"][..]),
+            ("def _plus(a;b): 1; 1 + 2", &[]),
+            ("def _plus(a;b): 1; [1] + {\"a\":[2]}", &[]),
+            ("def _plus(a;b): 1; -1 + 2", &["_plus"]),
+            ("def _negate: 1; -1", &["_negate"]),
+            ("def _equal(a;b): 1; 1 == .", &["_equal"]),
+            ("def recurse: 1; ..", &["recurse"]),
+            ("def f(recurse): ..; f(1)", &["recurse"]),
+            ("def format(f): f; @csv", &["format"]),
+            ("def format(f): f; \"a\\(1)b\"", &["format"]),
+            ("def _plus(a;b): 1; \"a\\(1)b\"", &["_plus", "_plus"]),
+            ("def _modify(p;f): 1; .a |= 1", &["_modify"]),
+            ("def _modify(p;f): 1; .a += 1", &["_modify"]),
+            ("def _plus(a;b): 1; .a += 1", &["_plus"]),
+            ("def _assign(p;v): 1; .a = 1", &["_assign"]),
+        ] {
+            let mut got = candidates(&parse(src).unwrap());
+            got.sort();
+            assert_eq!(got, want, "{src}");
+        }
+        // yq has no such calls.
+        let yq = parse_with_mode_and_extensions("def _plus(a;b): 1; . + 1", ParserMode::Yq, true)
+            .expect("parses");
+        assert_eq!(candidates(&yq), Vec::<String>::new());
     }
 }
