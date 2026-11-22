@@ -6015,7 +6015,7 @@ A lookup of a key the object does not hold walks every member and finds none, so
 Seeing either kind of fault means reading the text of every gap the lookup steps over: the index holds no bit for a `,` or a `:`, so `{"z":1 "y":2}` and `{"z":1,"y":2}` index identically.
 That cost was measured for #7556 with the check made only on the absent-key path, which leaves a lookup that finds its key unchanged.
 As a second walk of the members it cost +48-60% wall clock on `.users | map(.nope)` and +72-79% on `.nope` over one wide object at 100 MB, on an Apple M4 Pro and an AMD Ryzen 9 7950X.
-As a scan of the interest bits, which steps from one node to the next without the tree, it still cost +13-14% and +16% in instructions on the same two queries (Apple M5 Max, instruction counts only).
+As a scan of the interest bits, which steps from one node to the next without the tree, it still added a read of every gap's text on the same two queries (measured as instruction counts on a development laptop only, so no figure is quoted).
 That is a measurable cost on well-formed input to report a fault in input jq refuses, so an absent key keeps the trade a found key has had since #2288.
 NDJSON lines and a windowed stream of 1 MiB or more answer in the same way, line by line.
 Pinned by `tests/jq_cli/i7448_nested.rs` and `tests/jq_cli/i7556.rs`.
@@ -7549,7 +7549,7 @@ A lone source starts its lazy read on its front since [#6451](https://github.com
 A first document longer than that is read to its end first ([#7447](https://github.com/rust-works/succinctly/issues/7447)), as jq has to read it.
 `--stream` reads a chunk at a time (`ChunkedSources`, [#5498](https://github.com/rust-works/succinctly/issues/5498)).
 Since [#7478](https://github.com/rust-works/succinctly/issues/7478) a lone input named on the command line that gives its bytes once is read the way standard input is: `-`, a FIFO or a socket by its path (`mkfifo`, `<(cmd)`), and `/dev/stdin` or `/dev/fd/N` naming one.
-A program that calls `input`/`inputs` starts on its front (`lone_lazy_start`), the plain filter reads it a window at a time once it holds two windows and `-R` once it holds one, so `-n first(inputs)`, `-n input`, `limit`, `halt` and `-R -n input` over a producer that never ends its stream answer at once, as jq does, where each read such a source to its end first (1.4 to 2.0 GB before `timeout` killed it at 5 s).
+A program that calls `input`/`inputs` starts on its front (`lone_lazy_start`), the plain filter reads it a window at a time once it holds two windows and `-R` once it holds one, so `-n first(inputs)`, `-n input`, `limit`, `halt` and `-R -n input` over a producer that never ends its stream answer at once, as jq does, where each read such a source to its end first (its memory grew until `timeout` killed it).
 Such a source is opened once (the open waits for its writer, as jq's does) and never turned back once read: a pipe that ends before a windowed route would take it hands its bytes to the route that reads it whole (`hand_back_short_pipe`), as standard input's are handed on.
 `--seq` (`--seq -n input <(yes ...)` still waits for the end of the stream) and a list of several files with a pipe among them still read such a source whole; `--stream` and `--stream-errors` read it a chunk at a time, as before.
 The cause on the other routes is that `read_stdin_bytes` is `read_to_end`, and the plain route then splits the whole text into values before its loop.
@@ -7654,7 +7654,7 @@ What holds the memory, from the slope between 10 and 100 MiB (MiB of peak per Mi
   A fault is worded from the end of the last good document by the eager reader, which never needed the text before it, so the file is not read again and standard input is windowed as a file is.
   `-R` reads whole lines in windows the same way, and settles the end of the stream from the lines its producer counted.
   A container or string left open at a window's end (the splitter found no end to it) reads the source on, twice as far each time, so a stream whose last document never closes is read to its end once, as it was before.
-  Since [#7447](https://github.com/rust-works/succinctly/issues/7447) the start reads on the same way when the first document is longer than the 256 KiB front, for a lone source and for the first of several files with a document: until then such a start was turned down and the whole stream read, so an NDJSON file whose first line is a 300 KB string held the file (`-n 'reduce inputs as $x (0;.+1)'` on an M4 Pro: 105, 305 and 1029 MiB at 100 MiB, 300 MiB and 1 GiB; 305 MiB at 300 MiB on the 7950X), where the same line anywhere later held a window, and holds 5.6 to 5.8 MiB at all three sizes (6.1 on the 7950X).
+  Since [#7447](https://github.com/rust-works/succinctly/issues/7447) the start reads on the same way when the first document is longer than the 256 KiB front, for a lone source and for the first of several files with a document: until then such a start was turned down and the whole stream read, so an NDJSON file whose first line is a 300 KB string held the file (`-n 'reduce inputs as $x (0;.+1)'`: peak RSS about the size of the file at 100 MiB, 300 MiB and 1 GiB; 305 MiB at 300 MiB on the 7950X), where the same line anywhere later held a window, and is flat in the size of the source since (6.1 MiB at 300 MiB on the 7950X).
   A first chunk that cannot end in more text (a fault no byte can change, a BOM, a byte that is not UTF-8) still reads the source whole, as before.
   Since [#7502](https://github.com/rust-works/succinctly/issues/7502) the start's buffer is no longer sized for the whole file: that reservation, never written past the front, aborted the run (`memory allocation of <file size> bytes failed`, exit 134) under a `ulimit -v` smaller than the file, where the route reads a window at a time and jq streams.
 - **A span per document, about 0.15 per MiB more, on the plain route (fixed for a regular file by #6920).**
@@ -11750,14 +11750,14 @@ Unaffected in 1.8.2, and so equal in all three: `[paths] | length`, `flatten`, `
 At 200,000 levels jq 1.7.1 on macOS dies with SIGSEGV (exit 139) in these consumers; jq 1.8.2 refuses and `succinctly jq` answers (`getpath` of a 200,000-deep path re-run here; the others are the issue's rows, captured in a debug build).
 `succinctly jq` has no 10,000-level cap in any of them.
 What bounds it: a document read from input is held to jq's own parse limit of 256 levels ([Nesting depth](#nesting-depth-5497)), so a value deeper than that exists only because the program built it, and every recursive walk over a built value checks ADR-0025's native-stack floor once per level, refusing with `nesting depth exceeds limit of the native stack` (exit 5, uncatchable) where the walk has spent half the evaluation thread's stack.
-On a release build on an Apple Silicon laptop `contains`, `*` and `sort` reach that refusal at 1,000,000 levels and `==` at 3,000,000; the depth differs per build, per architecture and per consumer, and a debug build refuses sooner.
+On a release build `contains`, `*`, `sort` and `==` each reach that refusal at a depth of their own; the depth differs per build, per architecture and per consumer, and a debug build refuses sooner.
 `succinctly yq` is separately bounded by the YAML parser's 128 levels.
 
 **String length: 2^31 - 9 bytes (#7540).**
 jq 1.8.2 refuses a string result of 2,147,483,639 bytes or more (`currlen + len >= INT_MAX - sizeof(jvp_string)/2` in `jvp_string_append`) with `String too long`, from `+`, `add`, `join`, string interpolation and `--rawfile` (`jq: Bad JSON in --rawfile x FILE: String too long`, exit 2).
 Upstream: CVE-2026-32316 (`jvp_string_append` and `jvp_string_copy_replace_bad`) and CVE-2026-49839 (raw file loading), both in jq 1.8.2's NEWS.
 jq 1.7.1 overflows its heap there: SIGSEGV from `"x" * 1100000000 | . + .`, and a wrapped length of 52,516,352 from `--rawfile` of a 2,200,000,000-byte file.
-`succinctly jq` builds the string and answers `2200000000` on every one of those rows (about 9 to 11 GB resident for the in-program builds, 2.2 GB for `--rawfile`).
+`succinctly jq` builds the string and answers `2200000000` on every one of those rows.
 These rows are the issue's measurements; they were not re-run for this change, since each needs several GB.
 What bounds it: available memory, and the allocation refusal below.
 `-R`/`-Rs` over a 2.2 GB line is not part of this entry: jq 1.8.2 has no check there either and answers a wrapped `52515461`, where `succinctly jq` answers `2200000000`.
@@ -11766,7 +11766,7 @@ What bounds it: available memory, and the allocation refusal below.
 jq 1.8.2's `tokenadd` refuses to grow its token buffer past `INT_MAX / 2`, so a single token (a string body, a number, a literal) of about 2^30 bytes is `parse error: Token too long at line 1, column 1073741825` (exit 5; upstream GHSA-hj52-j2c9-r8r4).
 A number literal of more than 999,999,999 characters (`DEC_MAX_DIGITS`) is `parse error: Invalid numeric literal` (upstream CVE-2026-43894).
 jq 1.7.1 aborts (SIGABRT, exit 134) on a 2.2 GB string token and reads the 1,000,000,001-digit number (`"number"`).
-`succinctly jq` reads both: `length` of the 2.2 GB string is `2200000000` and `type` of the 1,000,000,001-digit number is `"number"` (1.2 GB resident).
+`succinctly jq` reads both: `length` of the 2.2 GB string is `2200000000` and `type` of the 1,000,000,001-digit number is `"number"`.
 These rows are the issue's measurements, not re-run here.
 What bounds it: the index's counts, past which a document is read without one ([A document of 4 GiB or more](#a-document-of-4-gib-or-more-7425-7537)), and available memory.
 

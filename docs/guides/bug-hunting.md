@@ -287,7 +287,7 @@ diffed in memory), and compare with succinctly's other routes where jq is too sl
 This found a 4 GiB document panicking (#7425), most programs refused on one (#7537), `input_line_number` wrapping at
 2^32 (#7472), parse-error positions past 2^31 (recorded as a divergence, #7461), and memory growing with the input on
 routes documented as flat (#7447, #7480). Verifying these fixes needs the same sizes: the 4.3 GB rows were checked on
-the x86_64 Linux box on 2026-11-22 at `47c652241`, where jq 1.7.1 took 221 s to count 2^32 newlines.
+the x86_64 Linux box on 2026-11-22 at `47c652241`, where jq 1.7.1 took 221 s to count 2^32 newlines (AMD Ryzen 9 7950X).
 
 ### Resource limits
 
@@ -410,8 +410,9 @@ counts are not here. Their territories, so the next hunt can read their reports 
   covered).
 - **The index budget at 2^21 keys or elements and above** (sizes 2^21 and 2^21+1 did not finish), and the memory
   findings repeated at 8 GB or on pipes with several files.
-- **CPU-bound real programs against jq:** several Rosetta Code programs ran 3 to 5 times slower, measured only under
-  load (one cause is #7699).
+- **CPU-bound real programs against jq:** several Rosetta Code programs ran slower than jq, seen only in loaded,
+  uncontrolled runs, so no ratio is quoted (one cause is #7699; its measured gap on the benchmark machines is in
+  [docs/compliance/jq/limitations.md](../compliance/jq/limitations.md)).
 - **The library API** apart from the CLI, except the builder differential behind #7539.
 
 ## Territories and the hunter's report
@@ -468,7 +469,7 @@ Each rule comes from an incident in this hunt.
   died with `OSError: [Errno 24] Too many open files`. Four concurrent children per hunter was the working limit;
   check that load and open descriptors stay flat before scaling a driver up.
 - **Cap input sizes and memory.** jq builds a full DOM: it held 4.1 GB for a 4.3 GB file, and the reproductions of the
-  unbounded-read bugs (#7463, #7478) took 5 to 12 GB each. Give each run a size limit (500 MB to 1 GB on shared remote
+  unbounded-read bugs (#7463, #7478) took several GB each. Give each run a size limit (500 MB to 1 GB on shared remote
   machines), watch peak RSS, and delete multi-GB inputs as soon as their runs are done.
 - **Never pipe a differential run through `tail` or `head`.** Write the full output to a file and search the file. A
   truncated tail once read as "only a documented extension differs" and hid a real regression (#2658).
