@@ -174,15 +174,18 @@ fn many_oversized_counts_after_an_earlier_error_are_one_compile_6433() -> Result
 }
 
 /// A callout (`(?{...})`, `(*name)`) is not read here, but its braces are never counted: the refusal
-/// is the crate's, never `too big` (jq answers `true` and `invalid callout name`).
+/// is never `too big`. jq answers `true` for the first, whose refusal is the crate's, and `invalid
+/// callout name` for the second, in its words since #7689.
 #[test]
 fn a_callout_s_braces_are_no_interval_6433() -> Result<()> {
-    for pattern in ["(?{100001})", "(*{100001})"] {
-        let answer = caught(pattern)?;
-        assert!(
-            answer.starts_with(r#""Regex failure: regex parse error"#),
-            "{pattern}: {answer}"
-        );
-    }
+    let answer = caught("(?{100001})")?;
+    assert!(
+        answer.starts_with(r#""Regex failure: regex parse error"#),
+        "{answer}"
+    );
+    assert_eq!(
+        caught("(*{100001})")?,
+        r#""Regex failure: invalid callout name""#
+    );
     Ok(())
 }
