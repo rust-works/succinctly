@@ -2434,11 +2434,34 @@ pub fn main() -> Result<()> {
     // recursion of any shape refuses once it has spent half of it instead of
     // overflowing -- registered first thing, where the stack still available
     // and the thread's size agree.
-    let child = spawn_eval_thread()?;
+    let child = match spawn_eval_thread() {
+        Ok(child) => child,
+        Err(failed) => return run_main_on_this_thread(failed),
+    };
     match child.join() {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
     }
+}
+
+/// Run on the main thread when no evaluation thread can be created (#7733): at the user's process
+/// or thread limit (`ulimit -u`, a container's pids limit) every size fails `EAGAIN`, where jq,
+/// which is single-threaded, runs.
+///
+/// The floor is registered at the stack this thread really has ([`main_thread_stack::available`]),
+/// so deep recursion is refused, sooner than on the evaluation thread, instead of overflowing; under
+/// a cap on the address space no more than a quarter of the cap is counted, as
+/// [`eval_stack_start`] does. Where the stack's bounds cannot be read the spawn failure stands.
+fn run_main_on_this_thread(failed: anyhow::Error) -> Result<()> {
+    let Some(stack) = main_thread_stack::available() else {
+        return Err(failed);
+    };
+    let stack = match address_space::cap() {
+        Some(cap) => stack.min(cap / 4),
+        None => stack,
+    }
+    .min(EVAL_STACK_SIZE);
+    succinctly::jq::with_stack_budget(stack, run_main)
 }
 
 /// Exit after a `jq`/`yq` run.
@@ -3671,6 +3694,7 @@ mod jq_seq_reader;
 mod jq_stream_errors;
 mod json_validate;
 mod m2_gate;
+mod main_thread_stack;
 mod malloc_arena;
 mod output;
 mod relocation_pages;

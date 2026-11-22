@@ -9684,6 +9684,12 @@ ADR-0025's floor follows the size it got, so a recursion that reaches it refuses
 At a cap of 32 MiB the thread cannot be mapped at all.
 A document too large for the cap still aborts on the failed allocation, as jq does.
 
+At the user's process or thread limit (`ulimit -u`, `prlimit --nproc`, a container's pids limit) no evaluation thread can be created at any size (`EAGAIN`), and the run goes on the main thread instead (#7733), as jq, which is single-threaded, runs there.
+The floor is registered at the stack that thread has: on Linux the soft `RLIMIT_STACK` is raised to 64 MiB first when it is lower and the hard limit allows (the kernel keeps at least 128 MiB free below the stack's top), and elsewhere the main thread's stack is used as it is.
+So a recursion that reaches the floor refuses with `exceeded maximum recursion depth` at about a quarter of the depth a release build allows on its 256 MiB thread (a thirty-second of it under a hard stack limit of 8 MiB, which cannot be raised), where jq answers it; a debug build answers `def f(n): if n == 0 then 0 else f(n - 1) + 1 end; f(200)` there and refuses `f(400)`.
+That is a resource limit of this implementation, not a rule of the language, as under `ulimit -v` above.
+Real yq (Go) aborts at the same limit (`runtime/cgo: pthread_create failed`), and `succinctly yq` runs on the main thread too.
+
 ## An input read whole with no room for it (#7576)
 
 An input `succinctly jq` reads whole that there is no room for ends the run as jq's failed allocation does: `jq: error: cannot allocate memory` and `abort()`, exit 134 to a shell, with nothing on stdout.
