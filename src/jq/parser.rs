@@ -346,6 +346,58 @@ const MAX_PATTERN_COMPUTED_KEYS: usize = 4096;
 /// brackets or parentheses stay guarded through the bracket's own depth unit.
 const MAX_EXPR_DEPTH: usize = 256;
 
+/// The native stack a later walk of the program spends on each definition of a module-level
+/// chain (`def f0: ...; def f1: ...; ...`), charged against the stack's room when the parser reads
+/// the chain (#7475). The parser reads such a chain in a loop and spends nothing on its length,
+/// but the walks after it (the resolver, the def binder, the analyses, a clone of the tree)
+/// recurse once per definition, and a long enough chain overflowed the stack in one of them:
+/// measured on an Apple M5, the deepest walk took up to 670 bytes a definition in a release build
+/// (400,000 ran, 500,000 aborted, on the CLI's 256 MiB thread) and up to 21 KiB in a debug build
+/// (100,000 ran, 150,000 aborted, on 2 GiB). This is about three times the first and twice the
+/// second, against the room left to the floor, half the thread's stack, so a chain the parser
+/// admits leaves the walks at least that much to spare.
+const DEF_CHAIN_LINK_STACK: usize = if cfg!(debug_assertions) {
+    48 * 1024
+} else {
+    2 * 1024
+};
+
+/// The native stack the parse and the walks after it (the resolver, the analyses, the evaluator,
+/// a clone or a drop of the tree) spend on each level of a jq program's nesting, a bracket, a
+/// parenthesis, a `try`, an `if` or a local `def`, charged against the stack's room when the parser
+/// starts (#7435). Measured on an Apple M5 with the charge taken off: the deepest walk of a nesting
+/// level took 8.9 to 10.7 KiB in a release build (25,000 levels of parentheses, brackets, `if`s,
+/// string interpolations, labels or local `def`s ran on the CLI's 256 MiB thread, 30,000 aborted)
+/// and 27 to 54 KiB in a debug one (40,000 ran and 80,000 aborted on 2 GiB). This is about 1.3 and
+/// 1.5 times the larger figure, against half the thread's stack (the floor's room), so a program the
+/// parser admits leaves the walks more than half the stack to spare: about 9,300 levels in a release
+/// build and 13,000 in a debug one, where jq's parser stops at 10,000.
+const EXPR_LEVEL_STACK: usize = if cfg!(debug_assertions) {
+    80 * 1024
+} else {
+    14 * 1024
+};
+
+/// [`EXPR_LEVEL_STACK`] for one link of a binary-operator chain (`+`, `-`, `*`, `and`, `or`, `//`,
+/// a postfix `?`), which the parser reads in a loop and the walks after it recurse down (#7435).
+/// Measured the same way: 3.8 to 4.5 KiB a link in a release build (60,000 operands of `+` ran,
+/// 70,000 aborted) and 21 to 36 KiB in a debug one (60,000 ran, 100,000 aborted), so this is about
+/// 1.3 times the larger figure: about 21,000 links in either build.
+const CHAIN_LINK_STACK: usize = if cfg!(debug_assertions) {
+    48 * 1024
+} else {
+    6 * 1024
+};
+
+/// jq's own words when its parser runs out of room, `memory exhausted` (a compile error, exit 3):
+/// what a program too long for the native-stack floor is refused with (#7475). Out of line, so the
+/// recursive parse functions that raise it keep their frames.
+#[cold]
+#[inline(never)]
+fn stack_exhausted_error(position: usize) -> ParseError {
+    ParseError::new("memory exhausted", position)
+}
+
 /// yq's `--string-interpolation` (#7025): whether a string literal reads `\(expr)` as an
 /// interpolation. Process-wide, as yq's own setting is, so an `eval(..)` text and every other
 /// parse in the run read the same one. Only `ParserMode::Yq` consults it.
@@ -1825,6 +1877,18 @@ struct Parser<'a> {
     interp_depth: usize,
     /// Current `Expr` recursion depth; see [`MAX_EXPR_DEPTH`].
     expr_depth: usize,
+    /// The native stack this thread has room for when the parser starts, which a jq program's
+    /// nesting ([`EXPR_LEVEL_STACK`] a level) and every binary-operator link of it
+    /// ([`CHAIN_LINK_STACK`] a link) are charged against (#7435); `None` where [`MAX_EXPR_DEPTH`]
+    /// holds instead: in yq mode, and on a thread whose stack has no room for more than that (no
+    /// budget is registered, or a small one), where every chain is held to that limit on its own
+    /// as before.
+    stack_room: Option<usize>,
+    /// The binary-operator links (`+`, `or`, `//`, a postfix `?`, ...) read so far, under
+    /// [`Self::stack_room`]: a chain is read in a loop, but it is a left-deep tree that every
+    /// walk after the parse recurses down, and the links of a chain in another chain's left operand
+    /// add up, so all of them are counted.
+    chain_links: usize,
     /// Whether a string bracket key (`.["k"]`) stays an [`Expr::IndexExpr`] rather than folding
     /// into [`Expr::Field`]: set only while yq mode parses a `del(...)` argument (#2126), the one
     /// place the bracket and dotted spellings part ways (`del()` vivifies a `null` behind the
@@ -2903,7 +2967,11 @@ pub(crate) fn unbound_value_args_call(expr: &Expr) -> Option<Expr> {
 /// call) is left as written, so it costs nothing at run time. yq mode keeps
 /// [`bind_retrying_value_arg`]: real yq takes the first value of most of these arguments, or
 /// refuses a second one, rather than fanning out.
-fn bind_value_args(mut builtin: Builtin) -> Expr {
+fn bind_value_args(builtin: Builtin) -> Expr {
+    let mut builtin = match retry_collected_arg(builtin) {
+        Ok(retried) => return retried,
+        Err(builtin) => builtin,
+    };
     let mut slots = builtin.value_args_mut();
     let Some(innermost) = slots
         .iter()
@@ -2925,6 +2993,291 @@ fn bind_value_args(mut builtin: Builtin) -> Expr {
             var: var.to_string(),
             body: Box::new(body),
         })
+}
+
+/// The variables [`retry_collected_arg`] binds. They are not [`VALUE_ARG_VARS`]: the argument it
+/// rewrites reads them, so the resolver checks these bindings as the ordinary `as` they are, not as
+/// the call they came from.
+const COLLECTED_RE_VAR: &str = "%re";
+const COLLECTED_ARG_VAR: &str = "%collected";
+const COLLECTED_VALUES_VAR: &str = "%collected_values";
+const IN_INPUT_VAR: &str = "%in";
+
+/// A `?//` bind in an argument jq reads *inside an array it collects* (#7558): `split`'s and
+/// `splits`' flags (`def splits($re; flags): . as $s | [match($re; "g" + flags) | ...] | ...`) and
+/// `combinations`' count (`def combinations(n): . as $dot | [range(n) | $dot] | combinations;`).
+///
+/// A failure the collected expression raises after one of the argument's values (`"g" + 1`, a
+/// regex refusal, `range("x")`) backtracks into the argument's next alternative. The argument
+/// cannot be bound ahead of the call the way [`bind_value_args`] binds the others, because every
+/// value it yields lands in the one array: `split("a"; ("", "i"))` is one split by both, not two.
+/// So its values are collected first, with the step that can fail run right after each one,
+/// where a failure retries the bind, and the call then reads the values that survived:
+/// `[F as $f | (match($re; "g" + $f) | empty), $f] as $fs | splits($re; $fs[])`, and
+/// `[N as $n | range($n; $n), $n] as $ns | combinations($ns[])` (`range(x; x)` yields nothing
+/// for a number and refuses anything else with `range(n)`'s own sentence). The builtin's own
+/// evaluation of the argument cannot retry a bind, which is why the values reach it settled.
+/// `split`'s and `splits`' `$re` is bound first, as jq binds it, so the check matches with the
+/// pattern the call uses.
+///
+/// `in(xs)` is the third shape: `def in(xs): . as $x | xs | has($x);` binds its input before
+/// `xs` runs, so binding `xs` first would put the argument's errors ahead of the input's own
+/// (#2202). An argument that holds a `?//` is spelled out as that definition instead, where a
+/// refusal of `has` retries the bind as any later pipe stage does. Any other argument keeps the
+/// call, which the resolver reports compile errors for as jq does (a closure operand).
+/// `Err` hands back a builtin with none of these arguments.
+fn retry_collected_arg(builtin: Builtin) -> Result<Expr, Builtin> {
+    let var = |name: &str| Expr::Var(name.to_string());
+    // `[source as $c | check, $c] as $cs`, then `body` reading `$cs[]` in the argument's slot.
+    let settled = |source: Box<Expr>, check: Expr, body: &dyn Fn(Box<Expr>) -> Expr| Expr::As {
+        expr: Box::new(Expr::Array(Box::new(Expr::As {
+            expr: source,
+            var: COLLECTED_ARG_VAR.to_string(),
+            body: Box::new(Expr::Comma(vec![check, var(COLLECTED_ARG_VAR)])),
+        }))),
+        var: COLLECTED_VALUES_VAR.to_string(),
+        body: Box::new(body(Box::new(Expr::pipe(vec![
+            var(COLLECTED_VALUES_VAR),
+            Expr::Iterate,
+        ])))),
+    };
+    let split_regex = matches!(builtin, Builtin::SplitRegex(..));
+    match builtin {
+        Builtin::SplitsFlags(re, flags) | Builtin::SplitRegex(re, flags)
+            if contains_retrying_pattern_bind(&flags) =>
+        {
+            let matched = Builtin::MatchFlags(
+                Box::new(var(COLLECTED_RE_VAR)),
+                Box::new(Expr::arithmetic(
+                    ArithOp::Add,
+                    Expr::Literal(Literal::String("g".into())),
+                    var(COLLECTED_ARG_VAR),
+                )),
+            );
+            let check = Expr::pipe(vec![Expr::Builtin(matched), Expr::Builtin(Builtin::Empty)]);
+            let call = settled(flags, check, &|flags| {
+                let re = Box::new(var(COLLECTED_RE_VAR));
+                Expr::Builtin(if split_regex {
+                    Builtin::SplitRegex(re, flags)
+                } else {
+                    Builtin::SplitsFlags(re, flags)
+                })
+            });
+            Ok(Expr::As {
+                expr: re,
+                var: COLLECTED_RE_VAR.to_string(),
+                body: Box::new(call),
+            })
+        }
+        Builtin::In(xs) if contains_retrying_pattern_bind(&xs) => Ok(Expr::As {
+            expr: Box::new(Expr::Identity),
+            var: IN_INPUT_VAR.to_string(),
+            body: Box::new(Expr::pipe(vec![
+                *xs,
+                Expr::Builtin(Builtin::Has(Box::new(var(IN_INPUT_VAR)))),
+            ])),
+        }),
+        // #7602: `map(f)`, `with_entries(f)` and `walk(f)` are spelled out as jq defines them when
+        // `f` holds a `?//` ([`jq_defined_call`]). Each element's `f` then runs as a stage of a
+        // pipe, where a failure raised after the bind's value (`map(startswith([1, "x"] as [$a]
+        // ?// [$b, $a] | $a))`, a builtin refusing the first alternative) retries the bind, as in
+        // jq; the builtins' own element walks run `f` where it cannot.
+        Builtin::Map(f) if contains_retrying_pattern_bind(&f) => {
+            Ok(jq_defined_call(MAP_DEF, collected_map(closure_call()), *f))
+        }
+        Builtin::WithEntries(f) if contains_retrying_pattern_bind(&f) => {
+            let body = Expr::pipe(vec![
+                Expr::Builtin(Builtin::ToEntries),
+                collected_map(closure_call()),
+                Expr::Builtin(Builtin::FromEntries),
+            ]);
+            Ok(jq_defined_call(WITH_ENTRIES_DEF, body, *f))
+        }
+        Builtin::Walk(f) if contains_retrying_pattern_bind(&f) => {
+            Ok(jq_defined_call(WALK_DEF, walk_body(), *f))
+        }
+        Builtin::CombinationsN(count) if contains_retrying_pattern_bind(&count) => {
+            let check = Expr::Range {
+                from: Box::new(var(COLLECTED_ARG_VAR)),
+                to: Some(Box::new(var(COLLECTED_ARG_VAR))),
+                step: None,
+            };
+            Ok(settled(count, check, &|count| {
+                Expr::Builtin(Builtin::CombinationsN(count))
+            }))
+        }
+        other => Err(other),
+    }
+}
+
+/// The names of the `def`s [`jq_defined_call`] spells `map`, `with_entries` and `walk` with, and
+/// of their closure parameter and `walk`'s inner `w`: none is spellable in source.
+const MAP_DEF: &str = "%map";
+const WITH_ENTRIES_DEF: &str = "%with_entries";
+const WALK_DEF: &str = "%walk";
+const WALK_INNER_DEF: &str = "%w";
+const CLOSURE_PARAM: &str = "%f";
+
+/// A call of the parameterless `def` or closure parameter `name`.
+fn bare_call(name: &str) -> Expr {
+    Expr::FuncCall {
+        name: name.to_string(),
+        args: Vec::new(),
+        builtin_fallback: None,
+    }
+}
+
+/// A call of [`CLOSURE_PARAM`].
+fn closure_call() -> Expr {
+    bare_call(CLOSURE_PARAM)
+}
+
+/// `def <name>(f): <body>; <name>(<arg>)`: a builtin spelled out as jq's own `def` of it
+/// ([`retry_collected_arg`], #7602), `f` a closure parameter as in jq, so `arg` is a closure of the
+/// block the call is in (#3391): its compile errors hide under that block's, as jq's do.
+fn jq_defined_call(name: &str, body: Expr, arg: Expr) -> Expr {
+    Expr::FuncDef {
+        name: name.to_string(),
+        params: vec![Param::Bare(CLOSURE_PARAM.to_string())],
+        body: Box::new(body),
+        then: Box::new(Expr::FuncCall {
+            name: name.to_string(),
+            args: vec![arg],
+            builtin_fallback: None,
+        }),
+        bound: FuncDefBound::default(),
+    }
+}
+
+/// `map(f)` as jq defines it, `[.[] | f]` ([`retry_collected_arg`], #7602).
+fn collected_map(f: Expr) -> Expr {
+    Expr::Array(Box::new(Expr::pipe(vec![Expr::Iterate, f])))
+}
+
+/// The body of jq 1.7.1's `def walk(f)` ([`retry_collected_arg`], #7602): `def w: if type ==
+/// "object" then map_values(w) elif type == "array" then map(w) else . end | f; w`, with `map(w)` as
+/// `[.[] | w]`.
+fn walk_body() -> Expr {
+    let is_type = |name: &str| Expr::Compare {
+        op: CompareOp::Eq,
+        left: Box::new(Expr::Builtin(Builtin::Type)),
+        right: Box::new(Expr::Literal(Literal::String(name.into()))),
+    };
+    let children = Expr::If {
+        cond: Box::new(is_type("object")),
+        then_branch: Box::new(Expr::Builtin(Builtin::MapValues(Box::new(bare_call(
+            WALK_INNER_DEF,
+        ))))),
+        else_branch: Box::new(Expr::If {
+            cond: Box::new(is_type("array")),
+            then_branch: Box::new(collected_map(bare_call(WALK_INNER_DEF))),
+            else_branch: Box::new(Expr::Identity),
+        }),
+    };
+    Expr::FuncDef {
+        name: WALK_INNER_DEF.to_string(),
+        params: Vec::new(),
+        body: Box::new(Expr::pipe(vec![children, closure_call()])),
+        then: Box::new(bare_call(WALK_INNER_DEF)),
+        bound: FuncDefBound::default(),
+    }
+}
+
+/// Which call a [`retry_collected_arg`] shape was parsed from.
+#[derive(Clone, Copy)]
+enum CollectedCall {
+    In,
+    Split,
+    Splits,
+    Combinations,
+}
+
+/// Whether `var` is the outermost binding of a [`retry_collected_arg`] shape, which the resolver
+/// checks as the call it was parsed from (#7558).
+pub(crate) fn is_collected_arg_var(var: &str) -> bool {
+    var == COLLECTED_RE_VAR || var == COLLECTED_VALUES_VAR || var == IN_INPUT_VAR
+}
+
+/// The program's own operands in a [`retry_collected_arg`] shape, in the call's operand order,
+/// or `None` when `expr` is not one.
+fn collected_arg_operands_mut(expr: &mut Expr) -> Option<(CollectedCall, Vec<&mut Expr>)> {
+    // `[source as $c | check, $c] as $cs | body`: the source, and the body.
+    fn settled(expr: &mut Expr) -> Option<(&mut Expr, &mut Expr)> {
+        let Expr::As { expr, var, body } = expr else {
+            return None;
+        };
+        let Expr::Array(inner) = expr.as_mut() else {
+            return None;
+        };
+        let Expr::As { expr: source, .. } = inner.as_mut() else {
+            return None;
+        };
+        (var == COLLECTED_VALUES_VAR).then_some((source.as_mut(), body.as_mut()))
+    }
+    let Expr::As { expr, var, body } = expr else {
+        return None;
+    };
+    match var.as_str() {
+        IN_INPUT_VAR => match body.as_mut() {
+            Expr::Pipe(stages) => Some((CollectedCall::In, stages.iter_mut().take(1).collect())),
+            _ => None,
+        },
+        COLLECTED_RE_VAR => {
+            let (flags, call) = settled(body)?;
+            let kind = match call {
+                Expr::Builtin(Builtin::SplitRegex(..)) => CollectedCall::Split,
+                Expr::Builtin(Builtin::SplitsFlags(..)) => CollectedCall::Splits,
+                _ => return None,
+            };
+            Some((kind, alloc::vec![expr.as_mut(), flags]))
+        }
+        COLLECTED_VALUES_VAR => {
+            let Expr::Array(inner) = expr.as_mut() else {
+                return None;
+            };
+            let Expr::As { expr: count, .. } = inner.as_mut() else {
+                return None;
+            };
+            matches!(body.as_ref(), Expr::Builtin(Builtin::CombinationsN(_)))
+                .then(|| (CollectedCall::Combinations, alloc::vec![count.as_mut()]))
+        }
+        _ => None,
+    }
+}
+
+/// The call a [`retry_collected_arg`] shape was parsed from, with the program's operands moved
+/// out of the shape into it, or `None` when `expr` is not one. The resolver checks the call as
+/// written, as jq compiles it (its operands are closures), then hands it back to
+/// [`restore_collected_arg_call`]. Moving an operand moves none of the boxes inside it, so every
+/// `def` body keeps its address.
+pub(crate) fn take_collected_arg_call(expr: &mut Expr) -> Option<Expr> {
+    let (call, operands) = collected_arg_operands_mut(expr)?;
+    let mut taken = operands
+        .into_iter()
+        .map(|slot| Box::new(core::mem::replace(slot, Expr::Identity)));
+    let mut next = || taken.next().expect("each shape holds its call's operands");
+    Some(Expr::Builtin(match call {
+        CollectedCall::In => Builtin::In(next()),
+        CollectedCall::Split => Builtin::SplitRegex(next(), next()),
+        CollectedCall::Splits => Builtin::SplitsFlags(next(), next()),
+        CollectedCall::Combinations => Builtin::CombinationsN(next()),
+    }))
+}
+
+/// Puts the operands [`take_collected_arg_call`] moved out of `expr` back, from `call`.
+pub(crate) fn restore_collected_arg_call(expr: &mut Expr, call: Expr) {
+    let operands = match call {
+        Expr::Builtin(Builtin::In(xs) | Builtin::CombinationsN(xs)) => alloc::vec![*xs],
+        Expr::Builtin(Builtin::SplitRegex(re, flags) | Builtin::SplitsFlags(re, flags)) => {
+            alloc::vec![*re, *flags]
+        }
+        // patchcov: coverage tolerate-line reason="unreachable: the resolver hands back the call take_collected_arg_call built, and checking a builtin call leaves its variant (#7558)"
+        _ => unreachable!("a collected-argument call checks as the same builtin"),
+    };
+    let (_, slots) = collected_arg_operands_mut(expr).expect("the shape the call was taken from");
+    for (slot, operand) in slots.into_iter().zip(operands) {
+        *slot = operand;
+    }
 }
 
 /// Whether a builtin argument yields at most one value, for [`bind_value_args`]:
@@ -3008,6 +3361,13 @@ impl<'a> Parser<'a> {
             pattern_computed_keys: 0,
             interp_depth: 0,
             expr_depth: 0,
+            stack_room: if mode == ParserMode::Jq {
+                super::eval::native_stack_room()
+                    .filter(|&room| room / EXPR_LEVEL_STACK > MAX_EXPR_DEPTH)
+            } else {
+                None
+            },
+            chain_links: 0,
             keep_bracket_keys: false,
             call_sites: Vec::new(),
             var_sites: Vec::new(),
@@ -5385,11 +5745,8 @@ impl<'a> Parser<'a> {
     /// their own productions. `--jq-extensions` enables the generic form.
     fn parse_primary(&mut self) -> Result<Expr, ParseError> {
         self.expr_depth += 1;
-        let result = if self.expr_depth > MAX_EXPR_DEPTH {
-            Err(ParseError::new(
-                format!("expression nesting exceeds depth limit of {MAX_EXPR_DEPTH}"),
-                self.pos,
-            ))
+        let result = if self.nesting_exceeded() {
+            Err(self.nesting_error())
         } else {
             self.parse_primary_optional()
         };
@@ -5427,6 +5784,50 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Whether the nesting at the cursor is past the limit: [`MAX_EXPR_DEPTH`] levels, or, under
+    /// [`Self::stack_room`], that room, at [`EXPR_LEVEL_STACK`] a level and [`CHAIN_LINK_STACK`] for
+    /// every chain link of the program read so far (#7435).
+    fn nesting_exceeded(&self) -> bool {
+        match self.stack_room {
+            Some(room) => {
+                self.expr_depth * EXPR_LEVEL_STACK + self.chain_links * CHAIN_LINK_STACK > room
+            }
+            None => self.expr_depth > MAX_EXPR_DEPTH,
+        }
+    }
+
+    /// The refusal of a program nested past [`Self::nesting_exceeded`]'s limit: jq's own words for a
+    /// program too deep for its parser's stack, `memory exhausted`, under the native stack's limit
+    /// (#7435), and the fixed limit's own words under that. Out of line, as a recursive parse
+    /// function raises it.
+    #[cold]
+    #[inline(never)]
+    fn nesting_error(&self) -> ParseError {
+        match self.stack_room {
+            Some(_) => stack_exhausted_error(self.pos),
+            None => ParseError::new(
+                format!("expression nesting exceeds depth limit of {MAX_EXPR_DEPTH}"),
+                self.pos,
+            ),
+        }
+    }
+
+    /// Accounts for the `chain_depth`th link of a binary-operator chain read in a loop (or the
+    /// `chain_depth`th postfix `?` of a term), which wraps the chain so far in another node: against
+    /// [`MAX_EXPR_DEPTH`] on its own ([`Self::check_expr_nesting`]), or under
+    /// [`Self::stack_room`] as one more level of the program's (#7435), so that a jq program's
+    /// `or` chain of a few hundred allow-list terms is read where jq reads it.
+    fn check_chain_link(&mut self, chain_depth: usize) -> Result<(), ParseError> {
+        if self.stack_room.is_none() {
+            return self.check_expr_nesting(chain_depth);
+        }
+        self.chain_links += 1;
+        if self.nesting_exceeded() {
+            return Err(self.nesting_error());
+        }
+        Ok(())
+    }
+
     /// The real `parse_primary` body, entered only through the depth-checked
     /// wrapper above -- every recursive descent goes back through
     /// `self.parse_primary()`, not this function, so the counter sees every
@@ -5441,7 +5842,7 @@ impl<'a> Parser<'a> {
             }
             self.next();
             wraps += 1;
-            self.check_expr_nesting(wraps)?;
+            self.check_chain_link(wraps)?;
             // #3038: this generic `EXPR?` suppression is jq's `Exp: Exp
             // '?'` production, never `Term` -- unlike `.foo?`/`.[0]?`
             // (handled entirely inside `parse_postfix`'s own loop, which
@@ -7531,6 +7932,11 @@ impl<'a> Parser<'a> {
     /// (`needs_path_context`, `owned_identity_step`, `path_context_step_generic`,
     /// ...) has to recognize for no observable benefit outside that one
     /// `def error: .;` construction.
+    ///
+    /// `break $name` is a `Term` in jq's grammar, so a postfix applies to it (#7557): `break
+    /// $f.a`, `break $f[0]` and `break $f.[]` parse, and the postfix never runs. Out of line, so
+    /// the recursive term parser that calls it holds none of this frame (#7069).
+    #[inline(never)]
     fn parse_break_expr(&mut self) -> Result<Expr, ParseError> {
         let keyword_offset = self.pos;
         self.consume_keyword("break");
@@ -7559,11 +7965,12 @@ impl<'a> Parser<'a> {
         });
 
         let node = Expr::Break(name);
-        if self.shadowable_defs.contains("error") {
-            Ok(Self::wrap_shadowable_call("error", node))
+        let term = if self.shadowable_defs.contains("error") {
+            Self::wrap_shadowable_call("error", node)
         } else {
-            Ok(node)
-        }
+            node
+        };
+        self.parse_postfix(term)
     }
 
     /// Parse a `def`'s optional `(PARAMS)` parameter list, one [`Param`]
@@ -11362,7 +11769,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let right = self.parse_operand()?;
             chain_depth += 1;
-            self.check_expr_nesting(chain_depth)?;
+            self.check_chain_link(chain_depth)?;
             left = Expr::Arithmetic {
                 op,
                 left: Box::new(left),
@@ -11403,7 +11810,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let right = self.parse_multiplicative()?;
             chain_depth += 1;
-            self.check_expr_nesting(chain_depth)?;
+            self.check_chain_link(chain_depth)?;
             left = Expr::Arithmetic {
                 op,
                 left: Box::new(left),
@@ -11601,7 +12008,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let right = self.parse_comparison()?;
             chain_depth += 1;
-            self.check_expr_nesting(chain_depth)?;
+            self.check_chain_link(chain_depth)?;
             left = Expr::And(Box::new(left), Box::new(right));
         }
 
@@ -11630,7 +12037,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let right = self.parse_and()?;
             chain_depth += 1;
-            self.check_expr_nesting(chain_depth)?;
+            self.check_chain_link(chain_depth)?;
             left = Expr::Or(Box::new(left), Box::new(right));
         }
 
@@ -11666,7 +12073,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let right = operand(self)?;
             chain_depth += 1;
-            self.check_expr_nesting(chain_depth)?;
+            self.check_chain_link(chain_depth)?;
             left = Expr::Alternative(Box::new(left), Box::new(right));
         }
 
@@ -12522,6 +12929,11 @@ impl<'a> Parser<'a> {
         }
         self.expect('|')?;
         self.skip_ws();
+        // #7475: a binding's body re-enters the whole operator ladder, which the expression depth
+        // limit does not count, so a long chain of bindings is held to the native-stack floor.
+        if super::eval::native_stack_exhausted() {
+            return Err(stack_exhausted_error(self.pos));
+        }
         let body = match self.mode {
             ParserMode::Jq => self.parse_expr()?,
             // The body is a pipe chain, and a pipe binds tighter than `,` and `and`/`or` in yq:
@@ -12681,11 +13093,16 @@ impl<'a> Parser<'a> {
 
         // Collect function definitions at module level
         let mut defs: Vec<(String, Vec<Param>, Expr)> = Vec::new();
+        // #7475: how many this thread's native stack has room for.
+        let room_for = super::eval::native_stack_room().map(|room| room / DEF_CHAIN_LINK_STACK);
 
         // Parse function definitions until we hit something that isn't one
         while self.matches_keyword("def") {
             self.reject_unless_jq_extensions("def")?;
             let offset = self.pos;
+            if room_for.is_some_and(|room_for| defs.len() >= room_for) {
+                return Err(stack_exhausted_error(offset));
+            }
             let (name, params, body) = self.parse_func_def_parts()?;
             self.def_sites.push(DefSite {
                 name: name.clone(),
@@ -13564,6 +13981,60 @@ mod tests {
         );
     }
 
+    /// #7558: `split`/`splits`' flags and `combinations`' count are collected and checked
+    /// ahead of the call when they hold a `?//`, and left in their slot otherwise, where several
+    /// values still land in one array (`split(","; ("g", null))` is one split).
+    #[test]
+    fn test_collected_arg_with_an_alternative_bind_is_settled_first_7558() {
+        for (program, splits) in [
+            (r#"split(","; [1] as $q ?// $b | "g")"#, false),
+            (r#"splits(","; [1] as $q ?// $b | "g")"#, true),
+        ] {
+            let Expr::As { var, body, .. } = parse(program).unwrap() else {
+                panic!("{program}: expected `$re` bound first");
+            };
+            assert_eq!(var, COLLECTED_RE_VAR);
+            let Expr::As { expr, var, body } = *body else {
+                panic!("{program}: expected the flags collected");
+            };
+            assert_eq!(var, COLLECTED_VALUES_VAR);
+            assert!(matches!(*expr, Expr::Array(_)), "{program}: {expr:?}");
+            match (*body, splits) {
+                (Expr::Builtin(Builtin::SplitsFlags(re, _)), true)
+                | (Expr::Builtin(Builtin::SplitRegex(re, _)), false) => {
+                    assert!(matches!(*re, Expr::Var(name) if name == COLLECTED_RE_VAR));
+                }
+                (other, _) => panic!("{program}: {other:?}"),
+            }
+        }
+        let Expr::As { var, body, .. } = parse(r"combinations([1] as $q ?// $b | 2)").unwrap()
+        else {
+            panic!("expected the count collected");
+        };
+        assert_eq!(var, COLLECTED_VALUES_VAR);
+        assert!(matches!(*body, Expr::Builtin(Builtin::CombinationsN(_))));
+        // `in(xs)` is its definition, `. as $x | xs | has($x)`, so the input is bound first.
+        let Expr::As { expr, var, body } = parse(r"in([1] as $q ?// $b | {})").unwrap() else {
+            panic!("expected `in`'s input bound first");
+        };
+        assert_eq!(var, IN_INPUT_VAR);
+        assert!(matches!(*expr, Expr::Identity));
+        assert!(matches!(*body, Expr::Pipe(_)), "{body:?}");
+        assert!(matches!(
+            parse(r#"in({"a": 1})"#).unwrap(),
+            Expr::Builtin(Builtin::In(_))
+        ));
+        // No `?//`: untouched, several values and all.
+        assert!(matches!(
+            parse(r#"split(","; ("g", null))"#).unwrap(),
+            Expr::Builtin(Builtin::SplitRegex(..))
+        ));
+        assert!(matches!(
+            parse("combinations(1, 2)").unwrap(),
+            Expr::Builtin(Builtin::CombinationsN(_))
+        ));
+    }
+
     /// #3487: a builtin whose argument holds a `?//` bind is parsed as `K as $v | B($v)`, so
     /// the evaluators drive the argument through the `as` machinery; one without, and a
     /// closure parameter, are left as written.
@@ -13596,9 +14067,17 @@ mod tests {
             parse(r#"startswith("a")"#).unwrap(),
             Expr::Builtin(Builtin::Startswith(_))
         ));
-        // A closure parameter is not bound once per value.
+        // A closure parameter is not bound once per value: `map(f)` with a `?//` in `f` is jq's
+        // own `def map(f): [.[] | f];`, `f` passed as the closure (#7602).
         assert!(matches!(
             parse("map([1] as $q ?// $b | $b)").unwrap(),
+            Expr::FuncDef { name, then, .. } if name == MAP_DEF && matches!(
+                then.as_ref(),
+                Expr::FuncCall { args, .. } if matches!(args.as_slice(), [Expr::AsPattern { .. }])
+            )
+        ));
+        assert!(matches!(
+            parse("map([1] as $q | $q)").unwrap(),
             Expr::Builtin(Builtin::Map(_))
         ));
         // `error(msg)` is jq's `msg|error`.

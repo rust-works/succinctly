@@ -881,6 +881,8 @@ impl WindowedFile {
                 self.seam_raw = Seam::NONE;
                 self.carry_raw = Vec::new();
             }
+            // The text starts on a later line now, whose reads start at its front (#7569).
+            self.seam.lead = 0;
             self.raw_map.drop_before(self.offset);
         }
     }
@@ -1038,6 +1040,9 @@ impl WindowedFile {
             if bom > 0 {
                 self.buf.drain(..bom);
                 self.offset += bom;
+                // jq's first read holds the mark, so the reads of the first line start before the
+                // text (#7569).
+                self.seam.lead = bom;
                 self.no_break_from = self.no_break_from.saturating_sub(bom);
                 self.front_end = self.front_end.saturating_sub(bom);
             }
@@ -5363,8 +5368,8 @@ mod tests {
 #[cfg(test)]
 mod stream_tests {
     use super::super::{
-        bare_token_lost_to_fault, parse_error_line_after, stitch_json_file_seams,
-        strip_leading_json_bom, utf8_lossy_document, LineCounter,
+        bare_token_lost_to_fault, first_with_bytes_is_a_cut_bom, parse_error_line_after,
+        stitch_json_file_seams, strip_leading_json_bom, utf8_lossy_document, LineCounter,
     };
     use super::*;
     use std::io::{Seek, Write};
@@ -5378,7 +5383,7 @@ mod stream_tests {
         fault: Option<(usize, usize)>,
     }
 
-    /// The seam in the terms a reader of it can tell apart: without `raw_ends`, which the whole-file route
+    /// The seam in the terms a reader of it can tell apart: without `lead` (#7569) and `raw_ends`, which the whole-file route
     /// sets for any substituted file and the windows for one whose front was substituted, and with the
     /// bytes it places clamped to the file's text, as `LineCounter::at_seam` clamps them (a file that
     /// hands its whole text on keeps the place of the bytes as read in the whole-file route).
@@ -5395,14 +5400,19 @@ mod stream_tests {
                     .collect()
             }),
             raw_ends: None,
+            // The BOM's lead counts only on the file's first line, which a window that starts past
+            // dropped blank lines no longer holds: the lines of the documents say whether it counted.
+            lead: 0,
             ..seam.clone()
         }
     }
 
     fn whole_route(files: &[Vec<u8>]) -> Run {
         let mut raws: Vec<Vec<u8>> = files.to_vec();
-        strip_leading_json_bom(raws.iter_mut());
+        let cuts = strip_leading_json_bom(raws.iter_mut());
         let mut seams = stitch_json_file_seams(raws.iter_mut(), false, false);
+        // The mark jq's first read held, as `get_inputs` records it (#7569).
+        super::super::note_bom_leads(&mut seams, &cuts, raws.len());
         let raws: Vec<Vec<u8>> = raws
             .into_iter()
             .enumerate()
@@ -5527,6 +5537,10 @@ mod stream_tests {
     }
 
     fn assert_same(files: &[Vec<u8>], block: usize) {
+        // A list that opens with a mark cut across files is not the windows' to read (#7566).
+        if first_with_bytes_is_a_cut_bom(files) {
+            return;
+        }
         let want = whole_route(files);
         // Held handles, and the same files opened a file at a time by path (#7024).
         assert_same_as(files, block, &want, windowed_route(files, block).0);

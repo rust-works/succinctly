@@ -2696,8 +2696,13 @@ fn add_and_flatten_steps_append_in_place_7564() {
         "if $x | type == \"array\" then . + $x else . + [$x] end",
         ".",
         ". + ($x | length | [.])",
+        ". + {(\"k\\($x)\"): $x}",
+        ". + \"<\\($x)>\"",
     ] {
         assert!(is_append_update(&update(src)), "{src}");
+    }
+    for src in [". + {(\"k\\(.)\"): $x}", ". + \"\\(.a)\""] {
+        assert!(!is_append_update(&update(src)), "{src}");
     }
     for src in [
         ". + [.[0]]",
@@ -2811,6 +2816,58 @@ fn path_answers_long_and_short_paths_7465() {
             r#"{"a":[{"b":1}]}"#,
             "[path(.a[0].b)]",
             ok(&[r#"[["a",0,"b"]]"#]),
+        ),
+    ]);
+}
+
+/// The object and string step's answers, each captured from jq 1.7.1 (jq 1.8.2 agrees): only a
+/// generator's last operand is the next state, `null` and `{}` add nothing (a state the input
+/// shares then stays that value, which `path` sees), an existing key keeps its place, no output
+/// leaves `null`, and an operand of another kind raises with the state as it was (#7610).
+#[test]
+fn the_grow_step_answers_as_jq_7610() {
+    check(&[
+        (
+            "null",
+            "reduce range(3) as $i ({}; . + ({a: $i}, {b: $i}))",
+            ok(&[r#"{"b":2}"#]),
+        ),
+        (
+            r#"[{"b":1,"a":2},{"a":3,"c":4},null,{}]"#,
+            "add",
+            ok(&[r#"{"b":1,"a":3,"c":4}"#]),
+        ),
+        (
+            "null",
+            r#"reduce range(3) as $i ({}; . + {("k\($i)"): $i})"#,
+            ok(&[r#"{"k0":0,"k1":1,"k2":2}"#]),
+        ),
+        ("null", "reduce range(3) as $i ({}; empty)", ok(&["null"])),
+        (
+            "null",
+            "reduce range(2) as $i ({}; . + ({x: 1}, 2))",
+            err(&[], "object ({}) and number (2) cannot be added"),
+        ),
+        (r#"["a","b",null,"",  "c"]"#, "add", ok(&[r#""abc""#])),
+        (
+            "null",
+            r#"reduce range(3) as $i (""; . + ("x", "y\($i)"))"#,
+            ok(&[r#""y0y1y2""#]),
+        ),
+        (
+            "null",
+            r#"reduce (1, 2) as $x ("a"; . + ("b", {}))"#,
+            err(&[], r#"string ("a") and object ({}) cannot be added"#),
+        ),
+        (
+            r#"{"a":{"x":1}}"#,
+            "path(.a | reduce (null, {}) as $x (.; . + $x))",
+            ok(&[r#"["a"]"#]),
+        ),
+        (
+            r#"{"a":"s"}"#,
+            r#"path(.a | reduce ("") as $x (.; . + $x))"#,
+            err(&[], r#"Invalid path expression with result "s""#),
         ),
     ]);
 }

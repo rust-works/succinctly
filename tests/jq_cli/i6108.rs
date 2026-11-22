@@ -3,6 +3,8 @@
 //! at the match offset when the whole match is empty. The `regex` crate compiles `x{0}` to nothing and
 //! lost the group, so the list came out short whenever no later group followed. Every expectation is
 //! what `/usr/bin/jq` 1.7.1 printed for the same program.
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -36,8 +38,11 @@ fn a_zero_count_group_with_no_later_group_has_a_capture_entry() -> Result<()> {
 
 #[test]
 fn a_zero_count_group_in_an_empty_match_is_an_empty_string_at_the_offset() -> Result<()> {
-    assert_eq!(captures("ab", "(a){0}")?, r#"[[[0,""]],[[1,""]],[[2,""]]]"#);
-    assert_eq!(captures("", "(a){0}")?, r#"[[[0,""]]]"#);
+    assert_eq!(
+        captures("ab", "(a){0}")?,
+        r"[[[-1,null]],[[-1,null]],[[-1,null]]]"
+    );
+    assert_eq!(captures("", "(a){0}")?, r"[[[-1,null]]]");
     Ok(())
 }
 
@@ -54,14 +59,14 @@ fn the_zero_spellings_and_the_groups_inside_one_are_counted() -> Result<()> {
     assert_eq!(captures("ab", "(a(b){0}){0}b")?, "[[[-1,null],[-1,null]]]");
     assert_eq!(
         captures("ab", "(a)|(b){0}")?,
-        r#"[[[0,"a"],[-1,null]],[[1,""],[1,""]],[[2,""],[2,""]]]"#
+        r#"[[[0,"a"],[-1,null]],[[-1,null],[-1,null]],[[-1,null],[-1,null]]]"#
     );
     Ok(())
 }
 
 #[test]
 fn capture_and_scan_see_the_group() -> Result<()> {
-    assert_eq!(jq("ab", r#"capture("(?<n>a){0}")"#)?, r#"{"n":""}"#);
+    assert_eq!(jq("ab", r#"capture("(?<n>a){0}")"#)?, r#"{"n":null}"#);
     assert_eq!(jq("ab", r#"capture("(?<n>a){0}b")"#)?, r#"{"n":null}"#);
     assert_eq!(
         jq("ab", r#"capture("(?<n>a){0}(?<m>b)")"#)?,

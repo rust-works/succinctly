@@ -19,6 +19,11 @@ null-input	input	["-n", "1+1"]	-
 raw-input	input	["-R", "."]	"a\nb\n"
 raw-input-no-newline	input	["-R", "."]	"a\nb"
 raw-input-slurp	input	["-R", "-s", "."]	"a\nb\n"
+raw-input-read-boundary	input	["-R", ".[4090:]", "raw-read-boundary.txt"]	-
+raw-input-slurp-read-boundary	input	["-R", "-s", ".[4090:]", "raw-read-boundary.txt"]	-
+raw-input-input-read-boundary	input	["-n", "-R", "input[4090:]", "raw-read-boundary.txt"]	-
+raw-input-inputs-read-boundary	input	["-n", "-R", "-c", "[inputs[4090:]]", "raw-read-boundary.txt"]	-
+rawfile-read-boundary	input	["-n", "--rawfile", "x", "raw-read-boundary.txt", "$x[4090:]"]	-
 slurp	input	["-s", "-c", "."]	"1 2 3"
 slurp-empty	input	["-s", "-c", "."]	""
 slurp-null-input	input	["-n", "-s", "-c", "[inputs]"]	"1 2"
@@ -481,3 +486,6 @@ files-dash-null-input	files	["-n", "-c", "[inputs]", "-"]	"1 2\n"
 files-dash-slurpfile-is-an-error	files	["-n", "-c", "--slurpfile", "x", "-", "$x"]	"1"
 strftime-negative-year-y	time	["-n", "-c", "[-5,0,1,0,0,0,0,0] | strftime(\"%y|%C|%D\")"]	-
 strftime-negative-year-century	time	["-n", "-c", "[-101,0,1,0,0,0,0,0] | strftime(\"%y|%C\")"]	-
+stream-bare-n-after-u	input	["--stream", "-c", "-n", "try ([inputs]) catch ."]	"\"iu\" n"
+stream-errors-bare-n-after-u	input	["--stream-errors", "-c", "."]	"\"iu\" n"
+inputs-bare-n-after-u	input	["-c", "-n", "try ([inputs]) catch ."]	"\"iu\" n"

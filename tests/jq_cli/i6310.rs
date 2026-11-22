@@ -2,6 +2,8 @@
 //! way, as Oniguruma's does (`"ba" | match("(?:b*|(a))+")` is `"b"`), where the `regex` crate
 //! matched `"ba"`. The loop rewrite of #6106 now lists a capture group's ways, and keeps the groups
 //! of the pattern in number and order. Every row was captured from jq 1.7.1 (`/usr/bin/jq -nc`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -26,7 +28,7 @@ fn test_a_loop_with_a_capture_group_in_a_later_way_ends_at_the_empty_way_6310() 
         (r#""ba" | [match("(b*|(a))+") | .string]"#, r#"["b"]"#),
         (
             r#""bab" | [match("(?:b*|(a))+";"g") | [.string, (.captures|map(.string))]]"#,
-            r#"[["b",[null]],["",[""]],["b",[null]],["",[""]]]"#,
+            r#"[["b",[null]],["",[null]],["b",[null]],["",[null]]]"#,
         ),
         (
             r#""ba" | [match("(?<x>b*|(?<y>a))+") | [.string, (.captures|map([.name,.string]))]]"#,
@@ -39,7 +41,7 @@ fn test_a_loop_with_a_capture_group_in_a_later_way_ends_at_the_empty_way_6310() 
         // Two groups, one of them in a group of its own, and a group a later way holds of its own.
         (
             r#""bab" | [match("(?:b*|(a)|(c))*";"g") | [.string, (.captures|map(.string))]]"#,
-            r#"[["b",[null,null]],["",["",""]],["b",[null,null]],["",["",""]]]"#,
+            r#"[["b",[null,null]],["",[null,null]],["b",[null,null]],["",[null,null]]]"#,
         ),
         (
             r#""ba" | [match("(?:b*|((a)))+") | [.string, (.captures|map(.string))]]"#,
@@ -58,7 +60,7 @@ fn test_the_builtins_over_a_loop_with_a_capture_group_agree_with_jq_6310() -> Re
     assert_rows(&[
         (r#""ba" | sub("(?:b*|(a))+"; "X")"#, r#""Xa""#),
         (r#""foo-bar" | gsub("(?:\\w*|(-))+"; "X")"#, r#""XX-XX""#),
-        (r#""ba" | [scan("(?:b*|(a))+")]"#, r#"[[null],[""],[""]]"#),
+        (r#""ba" | [scan("(?:b*|(a))+")]"#, r"[[null],[null],[null]]"),
         (
             r#""BA" | [match("(?:b*|(a))+";"gi") | .string]"#,
             r#"["B","",""]"#,
@@ -75,7 +77,7 @@ fn test_loops_with_a_capture_group_that_already_agreed_still_do_6310() -> Result
     assert_rows(&[
         (
             r#""ba" | [match("(?:|(a))+") | [.string, (.captures|map(.string))]]"#,
-            r#"[["",[""]]]"#,
+            r#"[["",[null]]]"#,
         ),
         (
             r#""ba" | [match("(?:(a)|b*|c)+") | [.string, (.captures|map(.string))]]"#,
@@ -87,11 +89,11 @@ fn test_loops_with_a_capture_group_that_already_agreed_still_do_6310() -> Result
         ),
         (
             r#""bab" | [match("(?:b*|(a)){2,3}?";"g") | [.string, (.captures|map(.string))]]"#,
-            r#"[["b",[null]],["",[""]],["b",[null]],["",[""]]]"#,
+            r#"[["b",[null]],["",[null]],["b",[null]],["",[null]]]"#,
         ),
         (
             r#""ba" | [match("(?:(?:|a)|b?)*(c)?") | [.string, (.captures|map(.string))]]"#,
-            r#"[["",[""]]]"#,
+            r#"[["",[null]]]"#,
         ),
         (
             r#""ac" | [match("((?:|a)|b?)*c") | [.string, (.captures|map(.string))]]"#,

@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+issue = "#7532"
+reason = "`[1,2,3] | todate` is `\"0001-03-03T00:00:00Z\"` in jq 1.8.2 and succinctly, which read a broken-down time shorter than 8 fields with the missing ones 0 (upstream fixes jqlang/jq#3070, #3162); jq 1.7.1 requires all 8 and raises `strftime/1 requires parsed datetime inputs`. docs/compliance/jq/limitations.md, \"A broken-down time is read as jq 1.8.2 reads it\"."

@@ -66,7 +66,7 @@ Errors are jq's three path messages, raised where jq raises them and catchable a
 construct the spike does not implement raises `Unsupported`, which nothing catches. Such a row
 is counted apart and is never read as a verdict.
 
-The dev entry is a hidden `succinctly dev jq-path-spike` (now `dev jq-path-mode`). `succinctly jq` does not change.
+The dev entry is a hidden `succinctly dev jq-path-spike` (now `dev jq-path-mode`). In Phase 0 `succinctly jq` did not change; since the Phase 3 switch it runs a jq-mode program with a dynamic path target through the interpreter (`path_mode::route`, #5233; see the status note above).
 
 ## How it was measured
 
