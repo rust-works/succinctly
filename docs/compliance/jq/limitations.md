@@ -450,6 +450,19 @@ What the same upstream change does not reach here: a text that ends in a fault (
 `succinctly yq` is not changed.
 Pinned by `tests/jq_cli/i7523.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 
+## After the last input has been read to its end, the position is jq 1.7.1's, not jq 1.8.2's (#7607)
+
+jq 1.7.1's `jq_util_input_read_more` (`src/util.c`) forgets the file name and the line count in the call that finds the last file already at end of file, which happens when its last line has no newline, and it reports the run done in that same call.
+So a program that reads every input and then fails names no position: `jq -n -c '[inputs], error("x")' nonl.json`, where `nonl.json` is `[1,2,3]\n[4]` with no newline after `[4]`, prints `jq: error (at <unknown>): x`, and `[inputs] | input_line_number, input_filename` is `0` and `null`.
+The same holds for standard input, `-R`, `--stream`, `-s` and several files (the last one decides), and a directory given last is not reported at all (`jq . a.json dir` prints `1` and exits 2 with nothing on stderr), where a directory given earlier prints `jq: error: Is a directory`.
+jq 1.8.2 keeps the name and the count past the end of the last file and makes one more call, which reports the directory: `(at nonl.json:1)`, `1` and `"nonl.json"`, `(at <stdin>:1)` for standard input, `(at nonl2.json:0)` when the last of several files is `[5]`, and `jq: error: Is a directory` for a last directory too.
+A last line with its newline keeps the position in both releases (`(at nl.json:2)`).
+Both changes come from upstream commit 4e3088f ([jqlang/jq#3279](https://github.com/jqlang/jq/pull/3279), "Fix behavior of `--slurp --stream` when input has no trailing newline character"), which moves the reset of the name and the count to the branch that opens the next file and makes `read_more` report the end only once `current_input` is closed.
+Its message, its PR text and its test name only the `--slurp --stream` fix, which `succinctly jq` follows (#7523, above); neither effect described here is called a bug or a fix upstream, so `succinctly jq` keeps jq 1.7.1's answers, the reference ADR-0018 pins, and the rules modelled on 1.7.1's reader (#2947, #3003, #6146, the directory-last family #6472, #6604, #6625, #6661, #6775, #6789) stand.
+Whether to follow jq 1.8.2 here is a question for the owners (#7607); #7461's true line number and #7472's 64-bit count are unaffected either way.
+`succinctly yq` is not affected: these are jq's reader rules.
+Pinned by `tests/jq_cli/i7607.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`), with jq 1.8.2's (`/opt/homebrew/bin/jq`) answers in its comments.
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.
