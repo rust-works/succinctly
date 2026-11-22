@@ -7551,6 +7551,9 @@ A lone source starts its lazy read on its front since [#6451](https://github.com
 A first document longer than that is read to its end first ([#7447](https://github.com/rust-works/succinctly/issues/7447)), as jq has to read it.
 `--stream` reads a chunk at a time (`ChunkedSources`, [#5498](https://github.com/rust-works/succinctly/issues/5498)).
 Since [#7478](https://github.com/rust-works/succinctly/issues/7478) a lone input named on the command line that gives its bytes once is read the way standard input is: `-`, a FIFO or a socket by its path (`mkfifo`, `<(cmd)`), and `/dev/stdin` or `/dev/fd/N` naming one.
+Since [#7737](https://github.com/rust-works/succinctly/issues/7737) so is every other source that is not a regular file or a directory (`read_as_stream`), named or on standard input: a character device (`/dev/urandom`, a terminal, a serial line) and a block device.
+Until then `-R -n 'input|length' /dev/urandom`, `-c . < /dev/urandom` and `-c halt` over a terminal that kept streaming lines read the device to its end first, growing until killed, where jq answers at once.
+A terminal typed into is a quiet source of this kind: the plain filter and `-R` answer at its `^D` (before it holds a window it is handed to the route that reads it whole), and `-n input` named on it at its `^D` or once 256 KiB are typed, where jq answers each line as it is typed.
 A program that calls `input`/`inputs` starts on its front (`lone_lazy_start`), the plain filter reads it a window at a time once it holds two windows and `-R` once it holds one, so `-n first(inputs)`, `-n input`, `limit`, `halt` and `-R -n input` over a producer that never ends its stream answer at once, as jq does, where each read such a source to its end first (its memory grew until `timeout` killed it).
 Such a source is opened once (the open waits for its writer, as jq's does) and never turned back once read: a pipe that ends before a windowed route would take it hands its bytes to the route that reads it whole (`hand_back_short_pipe`), as standard input's are handed on.
 `--seq` (`--seq -n input <(yes ...)` still waits for the end of the stream) and a list of several files with a pipe among them still read such a source whole; `--stream` and `--stream-errors` read it a chunk at a time, as before.
@@ -7709,7 +7712,7 @@ The route that reads a file whole (a file under 1 MiB under the plain filter or 
 A `--seq` file read a window at a time stops at the length its records were vouched for up to before the run (`Reread::is_plain_seq_records`), since a record read past it would be one no prepass judged; a file a gate of its own reads (one the prepass turned down) reads on as a pipe does.
 A depth refusal names the position from the window's line count; where a window was substituted it is worded from the file read again, as the whole-file route words it from the originals.
 Standard input that is a regular file (`jq … < file`, a here-file, a descriptor a parent opened) takes the same route from its current offset: what a shell or parent has read already is not part of the stream, as on a pipe, and a fault is worded from a duplicate of descriptor 0 read by position.
-A terminal, a standard input under 4 MiB and one the run also writes to (`jq . <> f >&0`: its output would land where the next window is read from) read whole as before, and so does a path that names the stdin descriptor a second time.
+A standard input under 4 MiB (a terminal typed into is one, read since #7737 as a pipe is) and one the run also writes to (`jq . <> f >&0`: its output would land where the next window is read from) read whole as before, and so does a path that names the stdin descriptor a second time.
 A pipe (or a socket) on standard input that holds 4 MiB or more is read a window at a time too (#7024).
 Its length is not known, so the first 4 MiB are read to learn it: a pipe that ends sooner hands what it held to the route that reads it whole, as if that route had read it.
 It cannot be read again for the fault's wording, so its windows are certified before they are handed out, and the first fault is kept (`Certifier`, `src/bin/succinctly/jq_runner/window.rs`).
@@ -7903,7 +7906,7 @@ Release builds with `--features cli` of `main` @ `15dcf4a82`, a second build of 
 
 What the windowed route does not cover, and which still hold the input:
 
-- a terminal on standard input, a pipe under 4 MiB, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error when the run starts: #7024;
+- a pipe (or, since #7737, a terminal or another device) on standard input that holds less than its windows, and a list of files with a path that is not a regular file, that does not open, or that is the run's own standard output or error when the run starts: #7024;
 - programs that call `input`/`inputs` (with or without `-n`), `-R`, `--input-dsv` and `--stream-errors`, which have their own readers: #7023 and #7024 cover the first two over regular files (`input`/`inputs` over up to 32), the rest are not windowed; and `--seq` over a stream that is not RFC 7464's own framing (a pipe is windowed up to its first record that is not, [#7164](https://github.com/rust-works/succinctly/issues/7164), several files up to the first file that is neither that nor opens with an RS, #7221 and #7341), and `--seq -s` (the whole-file route's by design);
 - `-s` and `--validate`, which read the stream whole by design.
 

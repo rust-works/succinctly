@@ -11882,8 +11882,9 @@ fn report_lazy_open_failures(failures: &[InputFileOpenError]) {
 /// be read (a directory) fails here with the message `std::fs::read` gave, and the BOM jq skips at
 /// the front of its input (#5291) is found on the first source that has bytes. The reader opens
 /// each file when it gets to it and drops it when it is read, so a run over many files holds one.
-/// A pipe or socket named by path is the exception (#7295): it cannot be opened again or seeked, so
-/// the probe's handle is kept (until the reader gets to it) and read on from the probe.
+/// A pipe or socket named by path is the exception (#7295), and since #7737 a device (a terminal named
+/// as `/dev/pts/N` or `/dev/stdin`): it cannot be opened again or seeked, so the probe's handle is kept
+/// (until the reader gets to it) and read on from the probe.
 /// Stdin is read for its first bytes and kept.
 ///
 /// Each opener reads its source from its first byte, a BOM included: the last element is how many
@@ -11958,8 +11959,9 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                 Ok((head.len() < 3, keep, file, head))
             })
             .map(|(at_end, keep, file, head)| {
-                // #7295: a pipe or socket named by path (`/dev/stdin`, `/dev/fd/0`, a FIFO) cannot be
-                // seeked, and what the probe read is gone from it: the handle is kept and read on from
+                // #7295: a pipe or socket named by path (`/dev/stdin`, `/dev/fd/0`, a FIFO), and a
+                // device (#7737: a terminal), cannot be seeked, and what the probe read is gone from
+                // it: the handle is kept and read on from
                 // where the probe stopped, unless the probe met the end of it (then the head is all of it).
                 let kept = keep.then_some((!at_end).then_some(file));
                 (head, kept)
@@ -12061,14 +12063,16 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     Ok((opened, openers, tail, tail_is_source, cuts))
 }
 
-/// Whether the probe's handle on a source is the one the reader reads on: a pipe or a socket
-/// (#7295). A regular file, a device and a handle whose type cannot be read are reopened and
-/// seeked, as they always were, and so hold no descriptor between the probe and the read.
+/// Whether the probe's handle on a source is the one the reader reads on: a source that gives its
+/// bytes once ([`read_as_stream`]): a pipe or a socket (#7295), and since #7737 a device too. A
+/// terminal named by its path (`/dev/pts/N`, `/dev/ttysNNN`, or `/dev/stdin` on one) cannot be seeked,
+/// so a reopen lost the bytes the probe read and went on after them. A regular file and a handle
+/// whose type cannot be read are reopened and seeked, as they always were, and so hold no descriptor
+/// between the probe and the read.
 #[cfg(unix)]
 fn probe_keeps_handle(file: &std::fs::File) -> bool {
-    use std::os::unix::fs::FileTypeExt;
     file.metadata()
-        .is_ok_and(|meta| meta.file_type().is_fifo() || meta.file_type().is_socket())
+        .is_ok_and(|meta| read_as_stream(meta.file_type()))
 }
 
 #[cfg(not(unix))]
@@ -12805,19 +12809,19 @@ fn raw_windowed_named_pipe(_args: &JqCommand, _files: &[PathBuf]) -> Option<RawW
 
 /// Standard input for `-R` (#7024) when it is a regular file with [`raw_window_min_bytes`] or more left
 /// from the offset it stands at (`jq -R . < log`), or a pipe or socket that holds a window or more
-/// ([`raw_window_min_pipe_bytes`], `cat log | jq -R .`). A stream of lines has no fault to word, so
+/// ([`raw_window_min_pipe_bytes`], `cat log | jq -R .`), or since #7737 a device that does
+/// ([`read_as_stream`]: `jq -R . < /dev/urandom`, a terminal). A stream of lines has no fault to word, so
 /// neither is read again: a duplicate of descriptor 0 is read from where it stands, and a run that stops
 /// early leaves the descriptor where its last window ended, as jq does. A pipe's length is not known, so
-/// its front is read to learn it ([`probe_stdin_pipe`]). A terminal, a device, and every standard input
-/// [`stdin_to_window`] turns down are left to the route that reads it whole.
+/// its front is read to learn it ([`probe_stdin_pipe`]); one that ends sooner (a terminal's `^D`) is
+/// handed to the route that reads it whole, as is every standard input [`stdin_to_window`] turns down.
 #[cfg(unix)]
 fn raw_windowed_stdin() -> Option<RawWindowed> {
-    use std::os::unix::fs::FileTypeExt;
     let (file, meta) = stdin_to_window()?;
     let kind = meta.file_type();
     if kind.is_file() {
         raw_windowed_regular_stdin(file, &meta, raw_window_min_bytes())
-    } else if kind.is_fifo() || kind.is_socket() {
+    } else if read_as_stream(kind) {
         raw_windowed_pipe(file, raw_window_min_pipe_bytes())
     } else {
         None
@@ -13351,11 +13355,11 @@ fn hand_back_short_pipe(named: Option<&PathBuf>, bytes: Vec<u8>, error: Option<s
 }
 
 /// A lone input named on the command line that gives its bytes once (#7478): a FIFO or a socket by its
-/// path (`mkfifo`, `<(cmd)`), or `/dev/stdin` or `/dev/fd/N` naming one; judged by `stat`, which opens
-/// nothing. `-` is standard input, which each route reads as it reads an unnamed one.
+/// path (`mkfifo`, `<(cmd)`), since #7737 a device (`/dev/urandom`, a terminal, a serial line), or
+/// `/dev/stdin` or `/dev/fd/N` naming one ([`read_as_stream`]); judged by `stat`, which opens nothing.
+/// `-` is standard input, which each route reads as it reads an unnamed one.
 #[cfg(unix)]
 fn named_pipe(files: &[PathBuf]) -> Option<&PathBuf> {
-    use std::os::unix::fs::FileTypeExt;
     let [path] = files else {
         return None;
     };
@@ -13363,7 +13367,19 @@ fn named_pipe(files: &[PathBuf]) -> Option<&PathBuf> {
         return None;
     }
     let kind = std::fs::metadata(path).ok()?.file_type();
-    (kind.is_fifo() || kind.is_socket()).then_some(path)
+    read_as_stream(kind).then_some(path)
+}
+
+/// Whether a source of type `kind` is read as a stream, the way a pipe on standard input is: anything
+/// but a regular file or a directory. A pipe, a FIFO and a socket (#7478) give their bytes once; so does
+/// a character device (#7737: a terminal, `/dev/urandom`, a serial line), which may also never end, and
+/// which jq reads a line at a time as it reads a pipe. A block device can be read again, but has no
+/// length `stat` gives, so it is read as a stream too rather than whole. A directory keeps the routes
+/// that report it. One definition for every route that tells a stream from a file (the windowed gates
+/// for standard input and for a lone named source, the lazy start, and `--stream`'s probe), so none can
+/// judge a source apart from the others.
+fn read_as_stream(kind: std::fs::FileType) -> bool {
+    !kind.is_file() && !kind.is_dir()
 }
 
 /// [`probe_stdin_pipe`] a block at a time (#7260): the probe's bytes as blocks of `block` bytes each,
@@ -13451,15 +13467,15 @@ fn windowed_stdin_file(_min: u64) -> Option<(window::WindowedFiles, std::rc::Rc<
 /// the first two windows are read to find out: a pipe that ends sooner hands
 /// what it held to the route that reads it whole ([`STDIN_PUSHBACK`]), as if it had read it itself. It
 /// cannot be read again for a fault's wording, so its windows are certified as they are read and the
-/// first fault is kept ([`window::WindowedFile::from_pipe`]). A terminal is left to the route that reads
-/// it whole (it is typed into, and seldom holds 4 MiB), and so are a device and every standard input
-/// [`stdin_to_window`] turns down.
+/// first fault is kept ([`window::WindowedFile::from_pipe`]). Since #7737 a device is read so too
+/// ([`read_as_stream`]): `/dev/urandom` never ends, and a terminal that streams lines may not, where the
+/// route that reads it whole never got to the program. A terminal typed into ends at its `^D` before it
+/// holds two windows, and is handed on whole as before. Every standard input [`stdin_to_window`] turns
+/// down is left to that route.
 #[cfg(unix)]
 fn windowed_stdin_pipe() -> Option<WindowedSource> {
-    use std::os::unix::fs::FileTypeExt;
     let (file, meta) = stdin_to_window()?;
-    let kind = meta.file_type();
-    if !(kind.is_fifo() || kind.is_socket()) {
+    if !read_as_stream(meta.file_type()) {
         return None;
     }
     windowed_pipe(file, window::min_windowed_pipe_bytes())
@@ -13532,12 +13548,11 @@ fn windowed_named_pipe(_files: &[PathBuf]) -> Option<WindowedSource> {
 /// read to learn it, and a pipe that ends sooner is the whole-stream route's
 /// ([`probe_stdin_pipe_blocks`]). The rest of a stream that turns out not to be plain is handed to that route
 /// once the windows before it are out ([`hand_on_seq_pipe_tail`]), so there is no fault to word here.
+/// A device on standard input is read so too since #7737 ([`read_as_stream`]).
 #[cfg(unix)]
 fn windowed_seq_pipe() -> Option<WindowedSource> {
-    use std::os::unix::fs::FileTypeExt;
     let (file, meta) = stdin_to_window()?;
-    let kind = meta.file_type();
-    if !(kind.is_fifo() || kind.is_socket()) {
+    if !read_as_stream(meta.file_type()) {
         return None;
     }
     let blocks = probe_stdin_pipe_blocks(
@@ -15732,13 +15747,17 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             // reports it. #7478: a FIFO, a socket or a device (`<(cmd)`, `/dev/stdin` on a pipe) gives
             // its bytes once, so it is read here as standard input is, from the open just made, and
             // never turned back once read: the route that reads it whole read it to its end before the
-            // program started, which never ends over an endless producer.
-            match file
-                .metadata()
-                .map(|meta| (meta.is_file(), meta.is_dir(), usize::try_from(meta.len())))
-            {
+            // program started, which never ends over an endless producer. [`read_as_stream`] is the one
+            // judgement of that the other routes make too (#7737).
+            match file.metadata().map(|meta| {
+                (
+                    meta.is_file(),
+                    read_as_stream(meta.file_type()),
+                    usize::try_from(meta.len()),
+                )
+            }) {
                 Ok((true, _, Ok(len))) if len > front => (Box::new(file), Some(len)),
-                Ok((false, false, _)) => (Box::new(file), None),
+                Ok((_, true, _)) => (Box::new(file), None),
                 _ => return Ok(LoneStart::Declined),
             }
         }
