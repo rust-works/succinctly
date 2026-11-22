@@ -346,8 +346,12 @@ pub(crate) fn jq_negated_literal(repr: NumberRepr, text: &str) -> Option<(Number
         format!("-{magnitude}")
     };
     // The negated text parses to the negated repr (`jq_literal_text_to_f64` is
-    // sign-symmetric), so only `i64::MIN`, whose magnitude no `i64` holds,
-    // needs the parse.
+    // sign-symmetric), except where `i64`'s range is not, so two magnitudes
+    // take the parse: `i64::MIN`, whose magnitude no `i64` holds, and a
+    // `Float` of 2^63, whose negation may be spelled `-9223372036854775808`,
+    // which is `i64::MIN` (#7725: a `Float` there disagreed with a fresh
+    // parse of its own text). `9223372036854775809` rounds to the same
+    // double, and its negation stays a `Float`.
     let repr = match repr {
         NumberRepr::Int(_) if zero => NumberRepr::Int(0),
         NumberRepr::Float(_) if zero => NumberRepr::Float(0.0),
@@ -355,6 +359,9 @@ pub(crate) fn jq_negated_literal(repr: NumberRepr, text: &str) -> Option<(Number
             Some(n) => NumberRepr::Int(n),
             None => parse_i64_or_f64_in::<JqSemantics>(&spelled)?,
         },
+        NumberRepr::Float(f) if f == -(i64::MIN as f64) => {
+            parse_i64_or_f64_in::<JqSemantics>(&spelled)?
+        }
         NumberRepr::Float(f) => NumberRepr::Float(-f),
     };
     Some((repr, spelled))
@@ -7408,6 +7415,14 @@ mod tests {
             "9007199254740993",
             "-9223372036854775808",
             "9223372036854775807",
+            // #7725: 2^63 is a `Float` whose negation is spelled `i64::MIN`.
+            "9223372036854775808",
+            "0009223372036854775808",
+            "9223372036854775809",
+            "-9223372036854775809",
+            "9223372036854775808.0",
+            "9.223372036854775808e18",
+            "18446744073709551616",
             "1e1000",
             "-1E1000",
         ] {
