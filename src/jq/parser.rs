@@ -1921,6 +1921,8 @@ struct Parser<'a> {
     /// jq's `check_object_key` errors (#5510), by position: jq's parser records one and keeps
     /// going, so they are reported together at the end (see [`Self::finish`]). Keyed by the
     /// byte offset so a stretch of text the parser reads twice (it backtracks) counts once.
+    /// A string literal's bad escapes (#7445) and an interpolated import path (#7710) are
+    /// recorded here the same way.
     ///
     /// Nothing returns these on its own: a parse that reaches the end with this non-empty is
     /// only an error through [`Self::finish_all`], so every entry point that builds a `Parser`
@@ -13250,13 +13252,32 @@ impl<'a> Parser<'a> {
 
     /// The path of an `import` or `include`: jq's `ImportFrom`, a constant `String`, which may carry
     /// a format prefix (`import @text "m" as m;`, #7456). The format never runs on a string with
-    /// no interpolation, so the path is the literal; an interpolated one is refused either way.
+    /// no interpolation, so the path is the literal.
+    ///
+    /// An interpolated one (`include "\(1)";`) is read as the `String` it is and then refused as
+    /// jq's `ImportFrom` action refuses it (#7710): `Import path must be constant`, at the start of
+    /// the `String` (its format prefix, when there is one), recorded among the errors the parse
+    /// goes on past, with an empty path in its place. jq reports it when the `String` is reduced,
+    /// so after any error inside the string (`"\q\(1)"` is the bad escape, then this) and before
+    /// any after it: the record is keyed by the closing quote, which no other record can share.
     fn parse_import_path(&mut self) -> Result<String, ParseError> {
-        if self.mode == ParserMode::Jq && self.peek() == Some('@') {
+        if self.mode != ParserMode::Jq {
+            return self.parse_string_literal();
+        }
+        let start = self.pos;
+        if self.peek() == Some('@') {
             self.parse_format_string()?;
             self.skip_ws();
         }
-        self.parse_string_literal()
+        match self.parse_string_or_interpolation()? {
+            Expr::Literal(Literal::String(path)) => Ok(path.to_string()),
+            _ => {
+                self.deferred_key_errors
+                    .entry(self.pos - 1)
+                    .or_insert_with(|| ParseError::new("Import path must be constant", start));
+                Ok(String::new())
+            }
+        }
     }
 
     /// Parse include directive: `include "path";`
