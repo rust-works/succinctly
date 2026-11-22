@@ -30626,7 +30626,7 @@ fn parse_complete_json(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
     if parsed.is_err() && !yq_mode && s.as_bytes().contains(&0) {
         let mut blanked = s.as_bytes().to_vec();
         // Spaces over whole characters: the text stays UTF-8.
-        if super::parse_message::blank_nul_number_tails(&mut blanked, None, 0, &[]) {
+        if super::parse_message::blank_nul_number_tails(&mut blanked, None, 0, &mut []) {
             if let Ok(Ok(value)) = core::str::from_utf8(&blanked)
                 .map(|text| parse_complete_json_after_bom(text, false))
             {

@@ -353,6 +353,8 @@ A chunk that does hold a newline is handed to the parser whole, NULs included, a
 A NUL that starts a token, follows `true`, `false` or `null`, or sits in a string is then an error (`Invalid numeric literal`, `Invalid literal`, or the control-character one).
 One glued to a number is not: `check_literal` hands the number's token to its parser as a C string, which stops at the NUL, so `[1`, a NUL, `x,2]` and a newline is `[1,2]` and the rest of the token is dropped with the NUL (#7437).
 `succinctly jq` reads both the same way, on every route that reads JSON input, and in `fromjson`, which reads its string by its length and so needs no newline (`"[1\u0000,2]" | fromjson` is `[1,2]` in jq 1.7.1 and 1.8.2).
+The token still ends where jq's tokenizer ends it, at the next byte that ends a token, not at the NUL: `[[1]1`, a NUL, `]` is `Expected separator between values` at column 7, and `1`, a NUL, `}` is `Unmatched '}'` with no `1` printed first, in both jq versions and in `succinctly jq` (#7749).
+That includes the front of a lone source the lazy `input`/`inputs` route starts on (#7748).
 
 Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinctly jq`:
 
