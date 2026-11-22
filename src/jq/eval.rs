@@ -15674,6 +15674,279 @@ fn closed_expr_to_owned<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
     Some(value)
 }
 
+/// [`closed_expr_to_owned`], or else, for an operand that reads no input and has no effect
+/// ([`input_free_operand`]), its one value evaluated on `null` (#7451): `[$t | tostring |
+/// split("")]`, `[range(3)]`, `[[$t] | sort]`, the container a fold step appends or stores that the
+/// closed walk has no stage for. Without it the step declined to the evaluator's route, which
+/// evaluates the whole UPDATE on a borrowed state that the fold still holds, so the `+` or the write
+/// copied the accumulator every step: quadratic, where jq is linear.
+///
+/// The operand never reads `.`, so its value on `null` is its value on the state. It has no effect,
+/// so a step that evaluates it here and then declines (the evaluator then evaluates it again) is
+/// unobservable but for the time. An operand that raises, breaks out, or yields other than once
+/// declines, and the evaluator's route gives its answer and its text. jq mode only, and not while the
+/// #2889 embed table is live; [`input_free_operand`] admits no `as` binding's marker, so no node a
+/// binding names reaches the answer.
+#[inline]
+fn closed_operand_to_owned<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
+    closed_expr_to_owned::<S>(expr).or_else(|| input_free_operand_on_null::<S>(expr))
+}
+
+/// [`closed_operand_to_owned`]'s fallback: `expr`'s one value on `null`, through the evaluator.
+/// Out of line, so the callers' frames do not carry the evaluator's.
+#[inline(never)]
+fn input_free_operand_on_null<S: EvalSemantics>(expr: &Expr) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq
+        || !yields_once_whatever_the_demand(expr)
+        || !input_free_operand(expr)
+        || super::eval_generic::embed_table_active()
+    {
+        return None;
+    }
+    let mut answer = None;
+    let mut seen = 0usize;
+    let flow = eval_each_owned::<S>(
+        expr,
+        &OwnedValue::Null,
+        false,
+        Reentry::REBUILT,
+        &mut |value| {
+            seen += 1;
+            if seen > 1 {
+                answer = None;
+                return Demand::Stop;
+            }
+            answer = Some(value);
+            Demand::Continue
+        },
+    );
+    match flow {
+        Flow::Exhausted if seen == 1 => answer,
+        _ => None,
+    }
+}
+
+/// Whether `expr` does all of its work and yields at most one value however its consumer's demand
+/// goes (#7451): a collect `[E]` (which runs `E` to its end in jq too), a literal, a fold's loop
+/// element, and an object, a string interpolation, a pipe or an arithmetic or comparison of these.
+/// [`input_free_operand_on_null`] runs the operand to its end to see that it yields once, where the
+/// evaluator's route might stop it early (`first(foreach ...)` stops after the first UPDATE
+/// output), so a generator such as `(1, (range(1e9) | empty))` is never evaluated there.
+fn yields_once_whatever_the_demand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Array(_) | Expr::Literal(_) => true,
+        Expr::TrackedVar(marker) => marker.fold_share,
+        Expr::Paren(inner) => yields_once_whatever_the_demand(inner),
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => yields_once_whatever_the_demand(inner),
+        }),
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            yields_once_whatever_the_demand(&entry.value)
+                && match &entry.key {
+                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Expr(key) => yields_once_whatever_the_demand(key),
+                    ObjectKey::Bare => false,
+                }
+        }),
+        // A later stage may also be a builtin with no argument that answers any input with one
+        // value or an error (`[$t] | sort`).
+        Expr::Pipe(stages) => stages.split_first().is_some_and(|(head, rest)| {
+            yields_once_whatever_the_demand(head)
+                && rest
+                    .iter()
+                    .all(|stage| yields_once_whatever_the_demand(stage) || one_value_builtin(stage))
+        }),
+        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            yields_once_whatever_the_demand(left) && yields_once_whatever_the_demand(right)
+        }
+        _ => false,
+    }
+}
+
+/// A builtin with no argument that answers any input with exactly one value or an error, for
+/// [`yields_once_whatever_the_demand`]'s pipe stages.
+fn one_value_builtin(stage: &Expr) -> bool {
+    matches!(
+        unwrap_paren(stage),
+        Expr::Builtin(
+            Builtin::Add
+                | Builtin::Min
+                | Builtin::Max
+                | Builtin::Sort
+                | Builtin::Reverse
+                | Builtin::Unique
+                | Builtin::Keys
+                | Builtin::KeysUnsorted
+                | Builtin::Flatten
+                | Builtin::ToEntries
+                | Builtin::FromEntries
+                | Builtin::ToNumber
+                | Builtin::ToJson
+                | Builtin::ToString
+                | Builtin::Length
+                | Builtin::Type
+        )
+    )
+}
+
+/// Whether `expr` reads nothing of its input and has no effect (#7451), checked without evaluating
+/// anything: [`reads_no_input`], and nothing under it that reads or writes outside the value
+/// ([`has_no_effect`]).
+fn input_free_operand(expr: &Expr) -> bool {
+    reads_no_input(expr) && has_no_effect(expr)
+}
+
+/// Whether `expr` is a collect `[E]` that is an [`input_free_operand`] with no `break` under it
+/// (#7451): exactly one value, or an error, whatever `E` yields, and the same whatever `.` is. A
+/// shape [`owned_state_expr_shape`] admits, so a stage or member that builds one (`.a += [[$t] |
+/// sort]` after another write, `[.[0] + [range(3)], .[1] + 1]`) keeps the owned step.
+fn input_free_collect(expr: &Expr) -> bool {
+    matches!(expr, Expr::Array(_))
+        && input_free_operand(expr)
+        && !crate::jq::walk::any_subexpr(expr, &mut |e| matches!(e, Expr::Break(_)))
+}
+
+/// Whether `expr`'s outputs do not depend on its input `.`: a literal, a fold's loop element, a
+/// constructor, operator or `if` of such parts, a pipe whose head is one (the later stages read the
+/// head's value, not `.`), a binding whose source and body are, a `reduce`/`foreach` whose source and
+/// start are, or a generator (`range`, `limit`, `first`, ...) of them. Conservative: anything else,
+/// a builtin or a call included, reads `.` as far as this says. Bounded by the parser's nesting
+/// limit, as [`closed_expr_shape`] is.
+fn reads_no_input(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Loc { .. } | Expr::Env | Expr::Var(_) | Expr::Break(_) => true,
+        Expr::TrackedVar(marker) => marker.fold_share,
+        Expr::Builtin(builtin) => match builtin {
+            Builtin::Empty | Builtin::NullLit | Builtin::Now | Builtin::Env => true,
+            Builtin::Limit(n, inner) => reads_no_input(n) && reads_no_input(inner),
+            Builtin::FirstStream(inner) | Builtin::LastStream(inner) | Builtin::IsEmpty(inner) => {
+                reads_no_input(inner)
+            }
+            Builtin::NthStream(n, inner) => reads_no_input(n) && reads_no_input(inner),
+            _ => false,
+        },
+        Expr::Paren(inner)
+        | Expr::Array(inner)
+        | Expr::Negate(inner)
+        | Expr::Optional(inner)
+        | Expr::FirstExpr(inner)
+        | Expr::LastExpr(inner)
+        | Expr::Label { body: inner, .. } => reads_no_input(inner),
+        Expr::Error(Some(inner)) => reads_no_input(inner),
+        Expr::Comma(items) => items.iter().all(reads_no_input),
+        Expr::Object(entries) => entries.iter().all(|entry| {
+            reads_no_input(&entry.value)
+                && match &entry.key {
+                    ObjectKey::Literal(_) => true,
+                    ObjectKey::Expr(key) => reads_no_input(key),
+                    ObjectKey::Bare => false,
+                }
+        }),
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => reads_no_input(inner),
+        }),
+        Expr::Pipe(stages) => stages.first().is_some_and(reads_no_input),
+        Expr::Compare { left, right, .. }
+        | Expr::Arithmetic { left, right, .. }
+        | Expr::And(left, right)
+        | Expr::Or(left, right)
+        | Expr::Alternative(left, right) => reads_no_input(left) && reads_no_input(right),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => reads_no_input(cond) && reads_no_input(then_branch) && reads_no_input(else_branch),
+        // The handler's input is the error, not `.`.
+        Expr::Try { expr, .. } => reads_no_input(expr),
+        Expr::As { expr, body, .. } => reads_no_input(expr) && reads_no_input(body),
+        // One pattern only: a `?//` chain runs its body again for a later alternative when a
+        // consumer's stop reaches it (#2180), so what it yields depends on who reads it.
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } => {
+            patterns.len() == 1
+                && reads_no_input(expr)
+                && patterns.iter().all(static_pattern)
+                && reads_no_input(body)
+        }
+        // The UPDATE and EXTRACT read the accumulator, not `.`.
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            ..
+        }
+        | Expr::Foreach {
+            input,
+            patterns,
+            init,
+            ..
+        } => reads_no_input(input) && patterns.iter().all(static_pattern) && reads_no_input(init),
+        Expr::Limit { n, expr } | Expr::NthExpr { n, expr } => {
+            reads_no_input(n) && reads_no_input(expr)
+        }
+        Expr::Range { from, to, step } => {
+            reads_no_input(from)
+                && to.as_deref().map_or(true, reads_no_input)
+                && step.as_deref().map_or(true, reads_no_input)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a destructuring pattern names only literal keys, so [`reads_no_input`] need not ask
+/// what a computed key (`{(f): $v}`) reads.
+fn static_pattern(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Var(_) => true,
+        Pattern::Array(items) => items.iter().all(static_pattern),
+        Pattern::Object(entries) => entries.iter().all(|entry| {
+            !matches!(entry.key, ObjectKey::Expr(_)) && static_pattern(&entry.pattern)
+        }),
+    }
+}
+
+/// Whether nothing under `expr` reads input, writes output, stops the run, or calls anything this
+/// cannot see into (#7451): no `input`/`inputs`/`input_line_number`, `debug`, `stderr`, `halt`,
+/// `halt_error`, `system`, `eval`, `load`, `modulemeta` or `shuffle`, no call to a `def`, no `as`
+/// binding's marker or deferred binding, and no `?//` chain, whose body a consumer's stop runs again. Running such an expression twice, or once more than
+/// jq would, is observable only in the time it takes.
+fn has_no_effect(expr: &Expr) -> bool {
+    !crate::jq::walk::any_subexpr(expr, &mut |e| match e {
+        Expr::Builtin(builtin) => matches!(
+            builtin,
+            Builtin::Input
+                | Builtin::Inputs
+                | Builtin::InputLineNumber
+                | Builtin::Debug
+                | Builtin::DebugMsg(_)
+                | Builtin::Stderr
+                | Builtin::Halt
+                | Builtin::HaltError
+                | Builtin::HaltErrorCode(_)
+                | Builtin::System(..)
+                | Builtin::EvalExpr(..)
+                | Builtin::Load(..)
+                | Builtin::ModuleMeta
+                | Builtin::Shuffle
+        ),
+        Expr::TrackedVar(marker) => !marker.fold_share,
+        // A `?//` chain anywhere: a consumer's stop runs its body again (#2180).
+        Expr::AsPattern { patterns, .. } => patterns.len() > 1,
+        Expr::FuncDef { .. }
+        | Expr::FuncCall { .. }
+        | Expr::DefCall { .. }
+        | Expr::NamespacedCall { .. }
+        | Expr::Shared(_)
+        | Expr::DeferredVar(_) => true,
+        _ => false,
+    })
+}
+
 /// [`closed_expr_to_owned`], with a depth guard over the array/object
 /// shapes `owned_to_expr_at_depth` builds.
 ///
@@ -16222,13 +16495,13 @@ fn owned_assign_step<S: EvalSemantics>(
                             op, left, right, ..
                         },
                     ) if matches!(left.as_ref(), Expr::Identity) => {
-                        match closed_expr_to_owned::<S>(right) {
+                        match closed_operand_to_owned::<S>(right) {
                             Some(right) => OwnedAssignRhs::Combine(*op, right),
                             None if owned_state_expr_shape(right) => OwnedAssignRhs::Filter(filter),
                             None => return None,
                         }
                     }
-                    (None, other) => match closed_expr_to_owned::<S>(other) {
+                    (None, other) => match closed_operand_to_owned::<S>(other) {
                         Some(value) => OwnedAssignRhs::Value(value),
                         None if owned_state_expr_shape(other) => OwnedAssignRhs::Filter(other),
                         None => return None,
@@ -16710,12 +16983,15 @@ fn owned_state_expr_shape_in(expr: &Expr, calls: bool) -> bool {
         Expr::Paren(inner) | Expr::Negate(inner) => shape(inner),
         // #6567: `.[K]` of single-output operands is one value (or a raise, which declines).
         Expr::IndexExpr { target, key } => shape(target) && shape(key),
-        // `[]`, `[a, b]` and `[a]`: each element is one value, so the array is one.
-        Expr::Array(inner) => match inner.as_ref() {
-            Expr::Builtin(Builtin::Empty) => true,
-            Expr::Comma(items) => items.iter().all(shape),
-            single => shape(single),
-        },
+        // `[]`, `[a, b]` and `[a]`: each element is one value, so the array is one. #7451: so is a
+        // collect of anything that reads no input ([`input_free_collect`]), `[range(3)]`.
+        Expr::Array(inner) => {
+            (match inner.as_ref() {
+                Expr::Builtin(Builtin::Empty) => true,
+                Expr::Comma(items) => items.iter().all(shape),
+                single => shape(single),
+            }) || input_free_collect(expr)
+        }
         Expr::Object(entries) => entries.iter().all(|entry| {
             shape(&entry.value)
                 && match &entry.key {
@@ -16796,7 +17072,7 @@ fn owned_assign_operand_off_the_tree<S: EvalSemantics>(
     expr: &Expr,
     state: &OwnedValue,
 ) -> Option<OwnedValue> {
-    if let Some(value) = closed_expr_to_owned::<S>(expr) {
+    if let Some(value) = closed_operand_to_owned::<S>(expr) {
         return Some(value);
     }
     if S::TAG != EvalTag::Jq
@@ -92764,7 +93040,7 @@ fn owned_arith_accumulator_shape<S: EvalSemantics>(expr: &Expr) -> Option<(Arith
     // it reads off a literal that is not there is no output, not `null`: `. + [$i.a]` over an
     // absent `a` adds `[]`, not `[null]`. The closed walk then declines and the evaluator answers.
     let _read_only = S::READ_ONLY_ABSENT_KEY_IS_EMPTY.then(yq_read_only_context::enter);
-    Some((*op, closed_expr_to_owned::<S>(right.as_ref())?))
+    Some((*op, closed_operand_to_owned::<S>(right.as_ref())?))
 }
 
 /// `. + a + b - c`: a left-associated chain of arithmetic on the accumulator, each right
@@ -92786,7 +93062,7 @@ fn owned_arith_chain_shape<S: EvalSemantics>(expr: &Expr) -> Option<Vec<(ArithOp
         else {
             return None;
         };
-        links.push((*op, closed_expr_to_owned::<S>(right.as_ref())?));
+        links.push((*op, closed_operand_to_owned::<S>(right.as_ref())?));
         match left.as_ref() {
             Expr::Identity => break,
             next @ Expr::Arithmetic { .. } => at = next,
@@ -94031,7 +94307,7 @@ fn owned_slice_arith_step<S: EvalSemantics>(
     if !matches!(state, OwnedValue::Array(_) | OwnedValue::String(_)) {
         return OwnedStep::Declined(state);
     }
-    let Some(rhs) = closed_expr_to_owned::<S>(right) else {
+    let Some(rhs) = closed_operand_to_owned::<S>(right) else {
         return OwnedStep::Declined(state);
     };
     match try_eval_owned_step::<S>(slice, state) {
@@ -121826,6 +122102,100 @@ mod tests {
                 "{key:?} (yq: {yq}) must stay the evaluator's"
             );
         }
+    }
+
+    /// #7451: an operand that reads no input and has no effect is evaluated on `null`
+    /// ([`closed_operand_to_owned`]), so the owned step answers it and the accumulator's other
+    /// members are not copied. An operand that reads `.`, has an effect, raises, or yields other
+    /// than once still declines to the evaluator, as does yq mode.
+    #[test]
+    fn owned_update_step_takes_an_input_free_operand_7451() {
+        let literal = "x".repeat(100_000);
+        let text_ptr = |state: &OwnedValue| match state {
+            OwnedValue::Array(items) => match items.first() {
+                Some(OwnedValue::String(text)) => text.as_ptr(),
+                other => panic!("missing sibling: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- slot 0 holds the tracked string, which no step below touches (#7451)"
+            },
+            other => panic!("expected array: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every step below keeps the state an array (#7451)"
+        };
+        let start = || OwnedValue::array_from(vec![OwnedValue::string(&literal)]);
+        let step =
+            |src: &str, k: i64| substitute_vars(&parse(src).unwrap(), [("k", &OwnedValue::Int(k))]);
+        for src in [
+            r#". + [$k | tostring | split("")]"#,
+            ".[$k] = [range(3)]",
+            ". + [[$k] | sort]",
+            ". += [[$k, 1] | unique]",
+            ".[$k] |= [range(2)]",
+            ". |= . + [[$k] | reverse]",
+            ". + [[range(2)] as $x | $x | add]",
+            ". + [reduce range(3) as $u (0; . + $u)]",
+            ". + [first(range($k; 10))]",
+        ] {
+            let mut state = start();
+            let before = text_ptr(&state);
+            for k in 1..=40 {
+                state = match owned_update_step::<JqSemantics>(&step(src, k), state) {
+                    OwnedStep::Handled(Ok(next)) => next,
+                    _ => panic!("{src}: step {k} was not handled"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if an input-free operand declined, which is the regression this test pins (#7451)"
+                };
+            }
+            assert_eq!(text_ptr(&state), before, "{src}: the sibling was copied");
+        }
+        for src in [
+            ". + [[.[0]] | sort]",
+            ". + [[$k] | debug]",
+            ". + [[$k] | stderr]",
+            ". + [input]",
+            ". + [error(\"x\")]",
+            ". + [$k | error]",
+            ". + ([1], [2])",
+            ". + empty",
+            ". + [def f: 1; f]",
+        ] {
+            assert!(
+                matches!(
+                    owned_update_step::<JqSemantics>(&step(src, 1), start()),
+                    OwnedStep::Declined(_)
+                ),
+                "{src} must stay the evaluator's"
+            );
+        }
+        assert!(matches!(
+            owned_update_step::<YqSemantics>(&step(". + [[$k] | sort]", 1), start()),
+            OwnedStep::Declined(_)
+        ));
+        assert!(input_free_collect(&parse("[range(3)]").unwrap()));
+        assert!(!input_free_collect(&parse("[range(3), break $x]").unwrap()));
+        assert!(!input_free_collect(&parse("[length]").unwrap()));
+        assert!(!input_free_collect(&parse("1 | [.]").unwrap()));
+        assert!(!input_free_operand(&parse("error").unwrap()));
+        assert!(!yields_once_whatever_the_demand(
+            &parse("1, (range(9) | empty)").unwrap()
+        ));
+        assert!(yields_once_whatever_the_demand(
+            &parse("null | {a: [range(9)]}").unwrap()
+        ));
+        assert!(yields_once_whatever_the_demand(
+            &parse("[3, 1] | sort | tojson").unwrap()
+        ));
+        assert!(!yields_once_whatever_the_demand(
+            &parse("[3, 1] | .[]").unwrap()
+        ));
+        assert!(!input_free_operand(&parse("1 as $x ?// $y | 1").unwrap()));
+        assert!(!input_free_operand(
+            &parse("[1 | (. as $x ?// $y | 1)]").unwrap()
+        ));
+        assert!(input_free_operand(
+            &parse("[1, [2]] as [$a, [$b]] | $a + $b").unwrap()
+        ));
+        assert!(!input_free_operand(
+            &parse("{} as {(.k): $v} | $v").unwrap()
+        ));
+        assert!(!input_free_operand(
+            &parse("reduce ({}) as {(.k): $v} (0; .)").unwrap()
+        ));
+        assert!(input_free_operand(&parse("error(1)").unwrap()));
     }
 
     /// #7563, #7452: a fold step that writes an array slot by a negative index (`.[-$k]`, `.[-1]`)
@@ -183604,6 +183974,31 @@ mod share_audit_2999 {
             "reduce .[] as $r ({}; .[$r.name] = ($r.name != $r.score))",
             &[],
         );
+    }
+
+    /// #7451: a fold step that appends or stores a container built by a builtin or a pipe from
+    /// nothing but the loop variable (`[$t | tostring | split("")]`, `[range(3)]`, `[[$t] |
+    /// sort]`) declined to the evaluator, whose `+` or write on the borrowed state copied the
+    /// accumulator on every step. The operand is now evaluated on `null`, and 1,000 steps force
+    /// no copy.
+    #[test]
+    fn fold_step_storing_an_input_free_operand_copies_nothing_7451() {
+        let json = ints(1000);
+        for filter in [
+            r#"reduce .[] as $t ([]; . + [$t | tostring | split("")])"#,
+            "reduce .[] as $t ([]; .[$t] = [range(3)])",
+            "reduce .[] as $t ([]; . + [[$t] | sort])",
+            "reduce .[] as $t ([]; . += [[$t] | sort])",
+            "reduce .[] as $t ([]; .[length] = [range(2)])",
+            "reduce .[] as $t ([]; setpath([$t]; [range(2)]))",
+            "reduce .[] as $t ({}; .a += [[$t] | sort])",
+            "reduce .[] as $t ({}; .n += 1 | .a += [[$t] | sort])",
+            "reduce .[] as $t ([[], 0]; [.[0] + [[$t] | sort], .[1] + 1])",
+            "reduce .[] as $t ([]; .[$t] = {a: [range(2)]})",
+            "reduce .[] as $t ([]; . + [limit(2; range(5))])",
+        ] {
+            assert_forced(&json, filter, &[]);
+        }
     }
 
     /// #5263: an operand that reads the accumulator -- the counting idiom's
