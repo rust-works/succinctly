@@ -11796,6 +11796,28 @@ $ jq-1.8.2 -n '"x\n" | halt_error(4294967296)'   # aarch64: exit 255
 $ sjq      -n '"x\n" | halt_error(4294967296)'   # exit 255 on every platform
 ```
 
+### `nan | gmtime` and the date builtins that start from it: jq's answer is the CPU's (#7735)
+
+jq converts the seconds `gmtime` and `localtime` are given with `time_t secs = fsecs;` (`f_gmtime` and `f_localtime` in `builtin.c`, unchanged between 1.7.1 and 1.8.2), and that conversion is undefined behaviour in C for NaN.
+On x86_64 it gives `INT64_MIN`, a year `gmtime_r` cannot represent, so jq raises `error converting number of seconds since epoch to datetime`, exit 5, and so does every builtin that starts from it: `localtime`, `todate`, `todateiso8601`, `strftime`, `gmtime | mktime`.
+jq 1.7.1 on x86_64 Linux aborts on `nan | strflocaltime(f)` (an assertion in `jv_array_get`, exit 134), because it reads `localtime`'s error as an array.
+On arm64 the conversion gives 0, and `nan | gmtime` is `[1970,0,1,0,0,null,4,0]`, the seconds slot keeping the NaN (`null` when printed).
+`succinctly jq` answers the arm64 value on every platform, and the builtins that format or convert that array then refuse its NaN field as jq 1.8.2 does (#7532, above): `strftime/1 requires parsed datetime inputs` (`strflocaltime/1`, `mktime` likewise), exit 5.
+Reproducing the x86_64 answer would make the result of one program depend on the CPU it runs on, for no use to a caller; that is a recorded, by-design divergence, as for `halt_error` above (#7561).
+`infinite` and `-infinite` raise `error converting number of seconds since epoch to datetime` in all of them on both architectures, and `-nan` is `nan`.
+
+| program, under `TZ=UTC`                        | jq 1.7.1 x86_64 Linux              | jq 1.7.1 arm64 macOS      | jq 1.8.2 arm64 macOS                                  | `succinctly jq` |
+|------------------------------------------------|------------------------------------|---------------------------|-------------------------------------------------------|-----------------|
+| `nan \| gmtime`, `nan \| localtime`            | `error converting ...`, 5          | `[1970,0,1,0,0,null,4,0]` | `[1970,0,1,0,0,null,4,0]`                             | as arm64        |
+| `nan \| todate`, `nan \| todateiso8601`        | `error converting ...`, 5          | `"1970-01-01T00:00:00Z"`  | `strftime/1 requires parsed datetime inputs`, 5       | as 1.8.2        |
+| `nan \| strftime("%Y")`                        | `error converting ...`, 5          | `"1970"`                  | `strftime/1 requires parsed datetime inputs`, 5       | as 1.8.2        |
+| `nan \| strflocaltime("%Y")`                   | assertion failure, 134             | `"1970"`                  | `strflocaltime/1 requires parsed datetime inputs`, 5  | as 1.8.2        |
+| `nan \| gmtime \| mktime`                      | `error converting ...`, 5          | `0`                       | `mktime requires parsed datetime inputs`, 5           | as 1.8.2        |
+
+The x86_64 column was captured on terminus against jq 1.7.1, the arm64 columns on an Apple M5 Max; jq 1.8.2 was measured on arm64 only, and its `f_gmtime` is unchanged, so on x86_64 it is expected to raise as 1.7.1 does.
+The ledger (`comparison/jq/divergences/`) has no entry for it: no probe of `succinctly dev compare jq` passes NaN to a date builtin, the grammar fuzzer's builtin lists have no date builtin, and the `localtime` sweep's inputs are finite, so the x86_64 Linux differential never reaches it.
+Pinned by `tests/jq_cli/i7735.rs`: every `succinctly jq` row above, and the `infinite` rows that agree everywhere, on every platform.
+
 ### `fromdate` parses exactly `%Y-%m-%dT%H:%M:%SZ`; yq's `to_unix` stays lenient (#4967)
 
 `fromdate`/`fromdateiso8601` run `strptime("%Y-%m-%dT%H:%M:%SZ") | mktime` as jq defines them: a date alone, no `Z`,
@@ -15825,7 +15847,7 @@ jq 1.7.1's `jv2tm` needs all 8 elements, casts each double to `int` unchecked an
 jq 1.8 fixed it: upstream commit bc96146 ("jv2tm: fix UB and accept array inputs with not all the values"), [jqlang/jq#3070](https://github.com/jqlang/jq/pull/3070) ("fix signed integer overflow in jv2tm", labelled `bug`, from an oss-fuzz report) and [jqlang/jq#3162](https://github.com/jqlang/jq/pull/3162) ("mktime/0: remove unnecessary length>=6 input requirement", labelled `bug`), listed in its NEWS.md as "Fix `mktime/0` overflow and allow fewer elements in date-time representation array".
 `succinctly jq` follows jq 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary` (the ledger's `features:todate/0` and `features:todateiso8601/0`, whose probe is `[1,2,3]`):
 
-- **NaN** in any of the first 8 elements is `<name> requires parsed datetime inputs`, and so is a NaN number given to `strftime`, `strflocaltime`, `todate` or `todateiso8601`, because the array `gmtime` makes of it has a NaN seconds slot (`nan | gmtime` is `[1970,0,1,0,0,null,4,0]` in both releases).
+- **NaN** in any of the first 8 elements is `<name> requires parsed datetime inputs`, and so is a NaN number given to `strftime`, `strflocaltime`, `todate` or `todateiso8601`, because the array `gmtime` makes of it has a NaN seconds slot (`nan | gmtime` is `[1970,0,1,0,0,null,4,0]` in both releases on arm64; on x86_64 jq raises in `gmtime` itself, see [#7735's section](#nan--gmtime-and-the-date-builtins-that-start-from-it-jqs-answer-is-the-cpus-7735)).
   jq 1.7.1 read NaN as 0: `[2024,0,1,0,0,nan,0,0] | mktime` is `1704067200` and `nan | todate` is `"1970-01-01T00:00:00Z"`.
   `nan | strftime(1)` still reads the format first and keeps its own message (#7533).
 - **A shorter array** is read with its missing fields 0, so a missing year is 1900: `[2024,0,1] | mktime` is `1704067200`, `[2024] | mktime` is `1703980800` (January 0 is December 31) and `[2024,2,15] | strftime("%Y-%m-%dT%H:%M:%SZ")` is `"2024-03-15T00:00:00Z"`.
