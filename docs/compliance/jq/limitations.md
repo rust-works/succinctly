@@ -685,6 +685,20 @@ anything else at any depth. The `setpath_*` probes added alongside it pin the re
 surface — wrong-key-type on a real container, out-of-bounds negative and NaN indices, and a
 non-array path argument.
 
+## A write past the end of a slice pads with `null`; jq can show the elements the slice dropped (#7574)
+
+A slice in jq is a view: `jv_array_slice` keeps the parent's buffer and moves an offset and a length over it.
+A write past the view's end (`jvp_array_write`, the same in 1.7.1 and 1.8.2) reuses that buffer in place when nothing else holds it and the index fits its allocated capacity, and then pads with `null` only from the end of the *buffer's* elements, so the parent's elements after the slice come back.
+`[1,2,3,4,5,6] | .[:1] | .[3] = 9` over parsed input is `[1,2,3,9]` in jq 1.7.1 and 1.8.2, and `[1,null,null,9]` here.
+The same holds for `setpath`, `|=`, `+=` and `//=` at such an index, for a middle slice (`.[1:2] | .[3] = 9` is `[2,3,4,9]` in jq), for a slice of a slice and for a second write after the first (`.[:1] | .[3] = 9 | .[4] = 8` is `[1,2,3,9,8]` in jq), and the later reads see the same elements (`| .[1]` is `2`, `| add` is `15`).
+jq's answer is not a function of the value.
+It depends on the buffer's capacity, which is 16 for an array built element by element and grows by half each time it fills (`.[:1] | .[15] = 9` shows the parent's elements on a parsed six-element array, `.[:1] | .[16] = 9` pads), and on whether anything still holds the parent at the write: the same array as a program literal (`jq -n '[1,2,3,4,5,6] | .[:1] | .[3] = 9'`), behind `. as $x |`, or used again later (`(.[:1] | .[3] = 9), .`) gives the padded `[1,null,null,9]`.
+`succinctly jq` gives the padded answer everywhere, which is jq's answer whenever the parent is shared, and is what the slice holds: the output never carries an element the program cut away.
+That is ADR-0018's "matching would corrupt data" exception, and reproducing it is also out of reach: it would need jq's allocation capacities for every array and the reference counts of jq's bytecode interpreter at each write (its forks, bindings and stack slots), neither of which this evaluator has, and every slice would have to keep its parent's whole buffer alive.
+Writes inside the slice, `+`, `del`, slice assignment (`.[:1] | .[3:] = [9]`) and a slice of an empty range agree with jq, which builds a new array or writes within the view there.
+`succinctly yq` is not affected: yq pads with `null` (`[1,null,null,9]`), and so does `succinctly yq`.
+Pinned by `tests/jq_cli/i7574.rs`.
+
 ## Dynamic path targets run on the path-mode interpreter (#5223)
 
 Since [#5223](https://github.com/rust-works/succinctly/issues/5223) ([ADR-0026](../../adrs/adr-0026.md)), a jq-mode program whose path target is more than navigation runs whole through the path-mode interpreter (`src/jq/path_mode.rs`), which carries jq 1.7.1's path register `(path, value)` with every output and checks it with `jv_identical` where jq does.
@@ -708,7 +722,8 @@ The interpreter's own recorded divergences:
 
 - **A write to an unshared slice view.** jq's `jvp_array_write` writes a slice in place when nothing else holds it, so the slice keeps its offset into the original buffer.
   The interpreter's write builds a new array at offset 0.
-  The difference is observable only through jq's 65,536-element slice-copy rule: `[range(70003)] | .[60000:] | .[0] = 0 | del(.[6000:] as $x | .[6000:] | $x) | length` is `6000` here and an `Invalid path expression` in jq, whose second slice reaches offset 66,000 and is copied (`test_5118_a_written_view_answers_where_jq_refuses_5223`).
+  A write past the view's end is the other observable effect, on every route, not only this one: jq shows the parent's elements after the slice there, recorded in "A write past the end of a slice pads with `null`" above (#7574).
+  Within the view the difference is observable only through jq's 65,536-element slice-copy rule: `[range(70003)] | .[60000:] | .[0] = 0 | del(.[6000:] as $x | .[6000:] | $x) | length` is `6000` here and an `Invalid path expression` in jq, whose second slice reaches offset 66,000 and is copied (`test_5118_a_written_view_answers_where_jq_refuses_5223`).
 - **A walk jq never finishes raises the existing caps.** `null | [path(recurse(.a))] | length` and `path(recurse(.a?; true))` on `{"a":null}` never return in jq; they raise `recurse: maximum nodes exceeded` here after 2^20 nodes (fewer for a path, which costs more of the cap the longer it is, see "`recurse(f)` raises at 2^20 nodes" below), as the value walker does (the shipped path walker pruned a `null` node's children and answered `1`, #856).
   `until`/`while`, `range` (at `MAX_RANGE_TOTAL`) and `repeat` keep their caps the same way (see the sections on each below).
 - **`del(.[nan])`** loops forever in jq 1.7.1 on an array; here the NaN path names no element and the document comes back unchanged.
