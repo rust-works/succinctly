@@ -1210,6 +1210,12 @@ struct JqCommand {
     /// Show build configuration
     #[arg(long, overrides_with = "build_configuration")]
     build_configuration: bool,
+
+    /// jq's `--run-tests [file...]`, which runs jq's own test files and is not supported here
+    /// (#7715): `run_jq` refuses it, and the words after it are not read, as jq hands them to its
+    /// test runner. Hidden, as jq's own `--help` does not list it.
+    #[arg(long, hide = true)]
+    run_tests: bool,
 }
 
 /// `--on-error` of `succinctly jq` (#5471) and `succinctly yq` (#5507): how an uncaught error
@@ -2161,7 +2167,7 @@ fn read_jq_argv<W: AsRef<std::ffi::OsStr>>(cmd: &clap::Command, argv: &[W]) -> J
     let ends_the_walk = |arg: &clap::Arg| {
         matches!(
             arg.get_id().as_str(),
-            "help" | "version" | "build_configuration"
+            "help" | "version" | "build_configuration" | "run_tests"
         )
     };
     let long_arg = |name: &str| {
