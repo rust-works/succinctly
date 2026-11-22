@@ -1033,7 +1033,10 @@ man-streaming-flag-getpath	manual-io	["-c", "--stream", "-r", "select(length==2)
 man-streaming-reduce-count	manual-io	["-c", "--stream", "-n", "reduce (inputs|select(length==2)) as $e (0;.+1)"]	"[1,[2,3],{\"a\":4}]"
 man-streaming-fromstream-inputs	manual-io	["-c", "--stream", "-n", "fromstream(inputs)"]	"{\"a\":[1,2]} [3]"
 man-streaming-fromstream-1-truncate-inputs	manual-io	["-c", "--stream", "-n", "fromstream(1|truncate_stream(inputs))"]	"{\"a\":[1,2],\"b\":3}"
-man-streaming-errors-example	manual-io	["-c", "--stream-errors", "."]	"[\"a\",n]"
+# The manual's example is `["a",n]`, but jq 1.7.1 classifies a bare `n` by `tokenbuf[1]`, which no earlier token has written there:
+# uninitialised heap, `u` on some runs ("Invalid literal", the manual's own wording) and not on others ("Invalid numeric literal"), so the
+# reference answered differently from run to run (#7391, #7256). The `1` NUL-terminates in place at index 1 first, so the answer is settled.
+man-streaming-errors-example	manual-io	["-c", "--stream-errors", "."]	"[\"a\",1,n]"
 man-streaming-errors-implies-stream	manual-io	["-c", "--stream-errors", "."]	"[1,2]"
 man-streaming-no-errors-without-flag	manual-io	["-c", "--stream", "."]	"[1,2"
 man-streaming-seq-flag	manual-io	["-c", "--stream", "--seq", "."]	"[1]"
