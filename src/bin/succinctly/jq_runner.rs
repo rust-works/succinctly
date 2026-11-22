@@ -12579,11 +12579,25 @@ fn report_input_read_failure(error: &std::io::Error) {
 /// Whether `meta` is the file standard input is open on, which a path names as `/dev/stdin`, a
 /// symlink to it or `/dev/fd/0`. The run would read it again from its start, where a stdin that
 /// something has already read from (or that shares its offset with the path, as on macOS) is
-/// somewhere else, and the fault's wording would cover bytes the run never read.
+/// somewhere else, and the fault's wording would cover bytes the run never read; where the path opens
+/// the file again from its start instead, both tools read it from there ([`shares_stdin`], #7698).
 #[cfg(unix)]
 fn names_stdin(meta: &std::fs::Metadata) -> bool {
     use std::os::fd::AsFd;
     names_descriptor(std::io::stdin().as_fd(), meta)
+}
+
+/// Whether `path`, whose file is `meta`, is the file standard input is open on and a new open of it
+/// shares descriptor 0's offset. A path that names the file and opens it again from its start (Linux's
+/// `/dev/stdin`, `/dev/fd/0` and `/proc/self/fd/0`, which are `/proc/self/fd` links whose `stat` is the
+/// file's own, and the file's own name) is read as any named file is, from its start, and leaves
+/// descriptor 0 alone, as jq's `fopen` of it does (#7698). Decided by how the open behaves, not by the
+/// platform. (macOS's `/dev/stdin` and `/dev/fd/0` do share the offset, but their `stat` names the
+/// descriptor file system's device, so [`names_stdin`] does not match them: they are read from where
+/// the offset stands, as `/dev/fd/7` is, #7446.) The open is made only for a path [`names_stdin`]
+/// already matched, so an ordinary named file costs nothing more.
+fn shares_stdin(path: &Path, meta: &std::fs::Metadata) -> bool {
+    names_stdin(meta) && !super::stdin_offset::opens_apart_from_stdin(path)
 }
 
 /// Whether `meta` is the file descriptor `fd` is open on.
@@ -13205,7 +13219,10 @@ fn regular_file(path: &PathBuf) -> Option<std::fs::Metadata> {
 /// names a descriptor the run holds (`/dev/fd/7 7<f`, `/dev/stdin`) is one: the file it opens may
 /// share that descriptor's offset (macOS duplicates the descriptor), so its windows are read from
 /// where that offset stands ([`lone_windowed_file`]), as jq reads it, and on to the end it has then
-/// (#7446), where the route that reads it whole read it before the program ran.
+/// (#7446), where the route that reads it whole read it before the program ran. A path whose `stat` is
+/// the file standard input is open on (Linux's `/dev/stdin`, `/dev/fd/0` and `/proc/self/fd/0`, or the
+/// file's own name) is one where a new open of it does not share descriptor 0's offset
+/// ([`shares_stdin`], #7698).
 fn lone_regular_file(files: &[PathBuf], min_len: u64) -> Option<(&PathBuf, std::fs::Metadata)> {
     let [path] = files else {
         return None;
@@ -13222,7 +13239,8 @@ fn lone_regular_file(files: &[PathBuf], min_len: u64) -> Option<(&PathBuf, std::
             .filter(std::fs::Metadata::is_file)?,
         None => regular_file(path)?,
     };
-    (meta.len() >= min_len && !names_stdin(&meta) && !names_output(&meta)).then_some((path, meta))
+    (meta.len() >= min_len && !shares_stdin(path, &meta) && !names_output(&meta))
+        .then_some((path, meta))
 }
 
 /// The descriptor a `/dev/fd/N` path names.
