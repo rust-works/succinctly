@@ -15269,6 +15269,17 @@ What follows is the missing-file behaviour of the features that route input diff
   A fault at the end of a `--seq` text is raised there too, and `-R` reports a file that did not open when the line read from past it is reached, after the lines before it (`jq -R -c error ab.txt missing.json` errors for `a`, then reports `missing.json`, then errors for `b` at `missing.json:0`).
   Still named after the last file that opened: a plain `--stream-errors` without `-n`, and the closing event after a missing file in the middle of the list.
 
+### A `--slurpfile` file or data import that ends at a 4,096-byte read boundary keeps its last value (#7664) — deliberate divergence
+
+jq 1.7.1 and 1.8.2 drop the last value of a `--slurpfile` file or a data import (`import "d" as $d;`) when the file ends where one of `jv_load_file`'s 4,096-byte reads ends, or inside the few bytes it reads on to finish a UTF-8 sequence, and read a file that is not JSON in the same place as an empty stream.
+A file of 4,095 spaces and `1` is `[]` there, and so are 4,095 spaces and `[`, 4,096 bytes of `a`, and 4,095 bytes of `a` followed by `\xe2\x82!`; at 4,095 or 4,097 bytes the same files are `[1]` and parse errors.
+The cause is `jv_load_file`'s read loop (`src/jv_file.c`): a read that fills the buffer leaves `feof` unset, so the parser takes that buffer as partial, and the next `fread` returns nothing and leaves the loop without handing the parser its final flag, so the token still pending is neither finished nor reported.
+The main input, `--rawfile`, `-f` and `import ... {raw: true}` are not affected: the first is another reader, and the others read raw.
+Upstream has an open fix, [jqlang/jq#3686](https://github.com/jqlang/jq/pull/3686) ("Finalize slurped JSON files when EOF follows a full read buffer"), not merged as of 2026-11-22.
+`succinctly jq` reads such a file as it reads any other: the last value is kept (`[1]`), and a file that is not JSON is refused (`Bad JSON in --slurpfile ...`, exit 2, or `error loading data file ...`, exit 3).
+Matching jq would discard a value and accept corrupt input without a word, which is the exception to fidelity of [ADR-0018](../../adrs/adr-0018.md), so the divergence is kept.
+Pinned by `tests/jq_cli/i7664.rs` at 4,095, 4,096, 4,097 and 8,192 bytes and on the 4,098-byte file above, through both routes (jq's answers on the same files are in the test).
+
 ## Bare `..`/`recurse` on a `$var` off the register (#3048; its nested-fold residual closed by #4779)
 
 `resolve_node_sink`'s bare-recursion arm (#2761) emits the identity seed of an untracked
