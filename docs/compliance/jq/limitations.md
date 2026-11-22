@@ -9438,6 +9438,8 @@ A bad escape in a program's string literal (`"\q"`, `"\u12"`, `"\ud800"`) is not
 `"ab\q"` is `jq: error: Invalid escape at line 1, column 4 (while parsing '"\q"') at <top-level>, line 1:` in jq 1.7.1, jq 1.8.2 and here, and a `\u12` is `Invalid \uXXXX escape`, a lone high surrogate `Invalid \uXXXX\uXXXX surrogate pair escape`.
 A run is the maximal stretch of escapes (`\n\q` is one, `"\n\q"` quotes both in the message), so literal text and a `\(` interpolation start a new one, and each bad run is an error of its own, counted in the trailer (`"\q\(1)\q"` is `2 compile errors`).
 This holds for every place a string literal is read in jq mode: a plain string, one after an interpolation, a format string (`@base64 "\ud800"`), an object key, a field access (`."\q"`), and the path of an `include` or `import`.
+An interpolated path of an `include` or `import` (`include "\(1)"; 0`) is jq's `Import path must be constant`, at the start of the path's string, reported after any bad escape inside the string and before any error after it, and counted with them (#7710); it used to be read as a bad `\(` escape.
+Inside a module two such paths are still one report, as for the module's other syntax errors (the open item under #5510 above).
 jq 1.8.2 differs from 1.7.1 here only in the error-position suffix (`at <top-level>, line 1, column 2:` and a caret line, jqlang/jq#3257), which is jq 1.8's presentation of every compile error and is not matched.
 A lone low surrogate (`"\udc00"`) is accepted by both versions and becomes U+FFFD, as here.
 `succinctly yq` keeps yq's own reading of a string literal, in which an unknown escape is kept as text.
