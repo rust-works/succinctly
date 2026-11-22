@@ -604,6 +604,15 @@ That is ADR-0018 rule 4(c): matching would take the host process down, because t
 It is the ceiling a long run of `+` already has.
 Pinned by `tests/yq_cli/i5629.rs`.
 
+### A chain of bindings past the native-stack floor — rule 4(c) ([#7475](https://github.com/rust-works/succinctly/issues/7475))
+
+Real yq parses a chain of `E as $x |` bindings of any length: 100,000 of them answer `1`, its Go stack growing on demand.
+`succinctly yq` parses a binding's body by recursion on a fixed native stack, and a chain of about 48,000 overflowed it and aborted the process.
+Since #7475 the body checks ADR-0025's native-stack floor, and a chain past it is refused at parse time: `Error: parse error: parse error at position N: memory exhausted`, exit 1, from about 70,000 bindings in a release build (a yq-mode binding spends less stack than a jq-mode one).
+That is ADR-0018 rule 4(c): matching would take the host process down.
+A chain of 500 still runs.
+Pinned by `tests/yq_cli/i7475.rs`.
+
 ### A JSON integer past 2^53 keeps its exact digits — rule 4(b) ([#3605](https://github.com/rust-works/succinctly/issues/3605))
 
 yq's JSON decoder reads every number through a `float64`, so an integer a document spelled past
@@ -981,6 +990,15 @@ A deeper line under the same header is a different matter: `--- - x: >` / blank 
 
 Representative cases, each live-verified. These are gaps to close, listed here so they are
 not rediscovered from scratch.
+
+### A command-line word that is not UTF-8 is read as its U+FFFD text everywhere ([#7426](https://github.com/rust-works/succinctly/issues/7426))
+
+`succinctly yq` reads every argv word that is not valid UTF-8 as text, each bad byte one U+FFFD, which is what yq's Go decoding makes of a string literal: `yq -n $'"a\xed\xa0\x80" | length'` is 10 in both.
+Before #7426 any such word panicked (exit 101).
+Two places still differ from yq v4.53.3, which keeps the word's bytes there.
+A path key is one: `yq -n $'.k\xff = 1'` fails with `yaml: cannot marshal invalid UTF-8 data as !!str`, where `succinctly yq` prints `k\u{FFFD}: 1`.
+A file name is the other: yq opens `nof\xff` by its bytes and names it so in `open nof\xff: no such file or directory`, where `succinctly yq` opens and names `nof\u{FFFD}` (its message for a missing file differs from yq's wording anyway).
+Reading them as yq does means carrying the raw bytes through `YqCommand`'s `String` fields and the lexer, which `succinctly jq` does for its file names and yq mode does not yet.
 
 ### String style of output — closed on every route (#3575, #3588); the gaps below remain
 

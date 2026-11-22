@@ -356,10 +356,14 @@ fn an_array_pattern_indexes_its_last_element_first_5223() {
     });
 }
 
-/// `DUPN` moves the fold's input out of a slot `INIT`'s fork point shares, so
-/// every `INIT` output after the first runs `SOURCE` on `null`.
+/// `DUPN` moves a `reduce`'s input out of a slot `INIT`'s fork point shares, so
+/// every `INIT` output after the first runs `SOURCE` on `null`, in jq 1.7.1 and
+/// 1.8.2. jq 1.8 dropped `foreach`'s `DUPN` (jqlang/jq#3266, #7519): every one of
+/// its `INIT` outputs runs `SOURCE` on the input, and the `foreach` rows are jq
+/// 1.8.2's (pins moved from 1.7.1's `[[1,1],[null,2],[null,3]]` and its raise on
+/// the second fork).
 #[test]
-fn a_folds_later_init_outputs_see_a_null_source_input_5223() {
+fn a_reduces_later_init_outputs_see_a_null_source_input_5223() {
     on_big_stack(|| {
         check(&[
             (
@@ -370,15 +374,12 @@ fn a_folds_later_init_outputs_see_a_null_source_input_5223() {
             (
                 r#"{"a":1}"#,
                 "[foreach .a as $i ((1,2,3); [$i,.])]",
-                ok(&["[[1,1],[null,2],[null,3]]"]),
+                ok(&["[[1,1],[1,2],[1,3]]"]),
             ),
             (
                 r#"{"a":{"a":null}}"#,
                 "path(foreach .a as $i ((.,.); .; $i))",
-                err(
-                    &[r#"["a"]"#],
-                    r#"Invalid path expression near attempt to access element "a" of null"#,
-                ),
+                ok(&[r#"["a"]"#, r#"["a"]"#]),
             ),
         ]);
     });
@@ -1339,22 +1340,43 @@ fn owned_interpreter_matches_the_sval_reference_5223() {
     });
 }
 
-/// A negative number is `_negate` of a literal, so it is computed and compares
-/// by value, including the spellings the parser folds itself (`-01`, `-00`,
-/// `-01.5`): each row is `[0]` in jq 1.7.1.
+/// A negative number is `_negate` of a literal, which jq 1.8 answers with a
+/// fresh literal (#7453, jqlang/jq#3242): identical to nothing else, so a path
+/// expression ending in one is refused, however it is spelled. A zero negates
+/// to positive zero. Each row is jq 1.8.2's answer (jq 1.7.1 answered `[0]`
+/// for the first five and kept `-0`'s sign in the last three).
 #[test]
-fn a_negative_number_is_computed_however_spelled_5223() {
+fn a_negative_number_is_a_fresh_literal_however_spelled_7453() {
     on_big_stack(|| {
         check(&[
-            ("null", "[-01] | path(.[0] | -01)", ok(&["[0]"])),
-            ("null", "[-1.5e0] | path(.[0] | -01.5)", ok(&["[0]"])),
-            ("null", "[-1] | path(.[0] | -1)", ok(&["[0]"])),
-            ("null", "[-00] | path(.[0] | -00)", ok(&["[0]"])),
-            ("null", "[-0] | path(.[0] | -0)", ok(&["[0]"])),
-            // The sign survives where path mode takes the number as its register value (#6042).
-            ("null", "-0 | del(empty)", ok(&["-0"])),
-            ("null", "[-0 | try path(error) catch .]", ok(&["[-0]"])),
-            ("null", "[-00 | try pick(error) catch .]", ok(&["[-0]"])),
+            (
+                "null",
+                "[-01] | path(.[0] | -01)",
+                err(&[], "Invalid path expression with result -1"),
+            ),
+            (
+                "null",
+                "[-1.5e0] | path(.[0] | -01.5)",
+                err(&[], "Invalid path expression with result -1.5"),
+            ),
+            (
+                "null",
+                "[-1] | path(.[0] | -1)",
+                err(&[], "Invalid path expression with result -1"),
+            ),
+            (
+                "null",
+                "[-00] | path(.[0] | -00)",
+                err(&[], "Invalid path expression with result 0"),
+            ),
+            (
+                "null",
+                "[-0] | path(.[0] | -0)",
+                err(&[], "Invalid path expression with result 0"),
+            ),
+            ("null", "-0 | del(empty)", ok(&["0"])),
+            ("null", "[-0 | try path(error) catch .]", ok(&["[0]"])),
+            ("null", "[-00 | try pick(error) catch .]", ok(&["[0]"])),
         ]);
     });
 }
@@ -2637,4 +2659,179 @@ fn an_object_key_is_one_value_per_object_7401() {
             ),
         ]);
     });
+}
+
+/// The `reduce` update of a prelude definition.
+fn prelude_reduce_update(prelude: &Prelude, name: &str, arity: usize) -> Expr {
+    let Expr::FuncDef { body, .. } = prelude.find(name, arity).expect(name).expr() else {
+        panic!("{name} is a definition");
+    };
+    match &**body {
+        Expr::Reduce { update, .. } => (**update).clone(),
+        other => panic!("{name}'s body is a reduce: {other:?}"),
+    }
+}
+
+/// builtin.jq's `add` and `_flatten` only append to their state, so their steps run in place
+/// (#7564); an update that reads its input, or adds anything but its operand, does not.
+#[test]
+fn add_and_flatten_steps_append_in_place_7564() {
+    with_prelude(|prelude| {
+        assert!(is_append_update(&prelude_reduce_update(
+            prelude, "_sp_add", 0
+        )));
+        assert!(is_append_update(&prelude_reduce_update(
+            prelude,
+            "_sp__flatten",
+            1
+        )));
+    });
+    let update = |src: &str| match parse(&format!("reduce empty as $x ([]; {src})")) {
+        Ok(Expr::Reduce { update, .. }) => *update,
+        other => panic!("{src}: {other:?}"),
+    };
+    for src in [
+        ". + $x",
+        "(. + [$x, {k: $x}])",
+        "if $x | type == \"array\" then . + $x else . + [$x] end",
+        ".",
+        ". + ($x | length | [.])",
+        ". + {(\"k\\($x)\"): $x}",
+        ". + \"<\\($x)>\"",
+    ] {
+        assert!(is_append_update(&update(src)), "{src}");
+    }
+    for src in [". + {(\"k\\(.)\"): $x}", ". + \"\\(.a)\""] {
+        assert!(!is_append_update(&update(src)), "{src}");
+    }
+    for src in [
+        ". + [.[0]]",
+        ". + [length]",
+        "$x + .",
+        ". - $x",
+        "if . == [] then . + $x else . end",
+        ". + f($x)",
+        ". + {a}",
+    ] {
+        assert!(!is_append_update(&update(src)), "{src}");
+    }
+}
+
+/// The in-place step's answers, each captured from jq 1.7.1 (jq 1.8.2 agrees): an operand per
+/// generator output added to the state as it was, `null` and `[]` adding nothing (a state the
+/// input shares then stays that value, which `path` sees), no output leaving `null`, and a
+/// scalar operand raising with the state as it was (#7564).
+#[test]
+fn the_append_step_answers_as_jq_7564() {
+    check(&[
+        (
+            "null",
+            "reduce range(2) as $i ([0]; . + ([$i], [$i*10]))",
+            ok(&["[0,0,10]"]),
+        ),
+        (
+            "null",
+            "reduce (null, [], [1], [[2]]) as $x ([]; . + $x)",
+            ok(&["[1,[2]]"]),
+        ),
+        (
+            "[[1,[2]],[[3,[4]]]]",
+            "flatten, flatten(1)",
+            ok(&["[1,2,3,4]", "[1,[2],[3,[4]]]"]),
+        ),
+        (
+            "null",
+            "reduce range(3) as $i ([]; if $i == 1 then . else . + [$i] end)",
+            ok(&["[0,2]"]),
+        ),
+        ("null", "reduce range(3) as $i ([]; empty)", ok(&["null"])),
+        (
+            "null",
+            "[1] as $a | reduce range(2) as $i ($a; . + (null, [$i]))",
+            ok(&["[1,0,1]"]),
+        ),
+        ("[[1,2],[3],null,[]]", "add", ok(&["[1,2,3]"])),
+        (
+            "null",
+            r#"reduce range(2) as $i ([]; . + ([1], 2, error("x")))"#,
+            err(&[], "array ([]) and number (2) cannot be added"),
+        ),
+        (
+            "null",
+            r#"reduce range(2) as $i ([]; . + ([1], error("x")))"#,
+            err(&[], "x"),
+        ),
+        (
+            "[[1]]",
+            "path(.[0] | reduce (null,[]) as $x (.; . + $x))",
+            ok(&["[0]"]),
+        ),
+        (
+            "[[1]]",
+            "path(.[0] | reduce (1) as $x (.; . + ([2], null)))",
+            ok(&["[0]"]),
+        ),
+        (
+            "[[1]]",
+            "path(.[0] | reduce ([1]) as $x (.; . + $x))",
+            err(&[], "Invalid path expression with result [1,1]"),
+        ),
+        (
+            "[[1],[2]]",
+            "path(add)",
+            err(&[], "Invalid path expression with result [1,2]"),
+        ),
+    ]);
+}
+
+/// The object and string step's answers, each captured from jq 1.7.1 (jq 1.8.2 agrees): only a
+/// generator's last operand is the next state, `null` and `{}` add nothing (a state the input
+/// shares then stays that value, which `path` sees), an existing key keeps its place, no output
+/// leaves `null`, and an operand of another kind raises with the state as it was (#7610).
+#[test]
+fn the_grow_step_answers_as_jq_7610() {
+    check(&[
+        (
+            "null",
+            "reduce range(3) as $i ({}; . + ({a: $i}, {b: $i}))",
+            ok(&[r#"{"b":2}"#]),
+        ),
+        (
+            r#"[{"b":1,"a":2},{"a":3,"c":4},null,{}]"#,
+            "add",
+            ok(&[r#"{"b":1,"a":3,"c":4}"#]),
+        ),
+        (
+            "null",
+            r#"reduce range(3) as $i ({}; . + {("k\($i)"): $i})"#,
+            ok(&[r#"{"k0":0,"k1":1,"k2":2}"#]),
+        ),
+        ("null", "reduce range(3) as $i ({}; empty)", ok(&["null"])),
+        (
+            "null",
+            "reduce range(2) as $i ({}; . + ({x: 1}, 2))",
+            err(&[], "object ({}) and number (2) cannot be added"),
+        ),
+        (r#"["a","b",null,"",  "c"]"#, "add", ok(&[r#""abc""#])),
+        (
+            "null",
+            r#"reduce range(3) as $i (""; . + ("x", "y\($i)"))"#,
+            ok(&[r#""y0y1y2""#]),
+        ),
+        (
+            "null",
+            r#"reduce (1, 2) as $x ("a"; . + ("b", {}))"#,
+            err(&[], r#"string ("a") and object ({}) cannot be added"#),
+        ),
+        (
+            r#"{"a":{"x":1}}"#,
+            "path(.a | reduce (null, {}) as $x (.; . + $x))",
+            ok(&[r#"["a"]"#]),
+        ),
+        (
+            r#"{"a":"s"}"#,
+            r#"path(.a | reduce ("") as $x (.; . + $x))"#,
+            err(&[], r#"Invalid path expression with result "s""#),
+        ),
+    ]);
 }

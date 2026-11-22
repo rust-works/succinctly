@@ -75,7 +75,7 @@ fn test_debug_line_with_flags_keeps_number_spelling_5558() -> Result<()> {
 }
 
 /// A character past the BMP is a surrogate pair under `-a`, a literal past a double keeps its
-/// exponent spelling, and the flags that change only stdout (`-r`, `-j`, `--seq`) leave the
+/// exponent spelling, the program's `-0` is `0` (jq 1.8.2's negation of a literal, #7453), and the flags that change only stdout (`-r`, `-j`, `--seq`) leave the
 /// line alone.
 #[test]
 fn test_debug_line_with_flags_matches_jq_on_wide_input_5558() -> Result<()> {
@@ -83,7 +83,7 @@ fn test_debug_line_with_flags_matches_jq_on_wide_input_5558() -> Result<()> {
     for args in [&["-a"][..], &["-a", "-r"], &["-a", "-j"], &["-a", "--seq"]] {
         assert_eq!(
             debug_stderr(args, program)?,
-            "[\"DEBUG:\",[\"\\ud83d\\ude00\",1E+1000,-0,1E+2,0.10]]\n",
+            "[\"DEBUG:\",[\"\\ud83d\\ude00\",1E+1000,0,1E+2,0.10]]\n",
             "{args:?}"
         );
     }
@@ -104,7 +104,7 @@ fn test_debug_line_with_flags_matches_jq_on_wide_input_5558() -> Result<()> {
     }
     assert_eq!(
         plain,
-        "[\"DEBUG:\",[\"\\ud83d\\ude00\",1E+1000,-0,1E+2,0.10]]\n"
+        "[\"DEBUG:\",[\"\\ud83d\\ude00\",1E+1000,0,1E+2,0.10]]\n"
     );
     Ok(())
 }

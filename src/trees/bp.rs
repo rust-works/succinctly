@@ -1799,7 +1799,6 @@ fn build_bp_index(
         "BalancedParens supports at most u32::MAX (4294967295) bits; got {len}. \
          The rank directory stores absolute cumulative counts as u32 (#188)"
     );
-
     if words.is_empty() || len == 0 {
         return (
             Vec::new(),
@@ -2652,9 +2651,10 @@ impl<W: AsRef<[u64]>, S: SelectSupport> BalancedParens<W, S> {
         // state machine below, which costs ~170 instructions even when its
         // first word scan finds the match at once (#3140).
         //
-        // `get`, not `is_close`: a truncated document can leave `len` past
-        // the last stored word (`[` x 64 gives one word and `len` 128), and
-        // the state machine answers `None` there rather than indexing.
+        // `get`, not `is_close`: a truncated JSON document used to leave
+        // `len` past the last stored word (`[` x 64 gave one word and `len`
+        // 128; its index now stores the missing closes, #7482), and the
+        // state machine answers `None` there rather than indexing.
         //
         // Everything past this probe is out of line (#3344), so this
         // function stays small enough to inline into the sibling walks.
@@ -4546,8 +4546,17 @@ mod tests {
         let bp = BalancedParens::new(vec![u64::MAX], 128);
         assert_eq!(bp.find_close(63), None);
         assert_eq!(bp.next_sibling(63), None);
+        // The JSON index no longer builds that shape (#7482): it stores the
+        // closes a truncated document lacks as zero words, so `[` x 64 closes
+        // its innermost open at bit 64 and the outermost at the end, as `[` x
+        // 10 already did from the padding of its one word.
         let index = crate::json::JsonIndex::build(&[b'['; 64]);
-        assert_eq!(index.bp().find_close(63), None);
+        assert_eq!(index.bp().words().len(), 2);
+        assert_eq!(index.bp().find_close(63), Some(64));
+        assert_eq!(index.bp().find_close(0), Some(127));
+        let index = crate::json::JsonIndex::build(&[b'['; 10]);
+        assert_eq!(index.bp().find_close(9), Some(10));
+        assert_eq!(index.bp().find_close(0), Some(19));
 
         // Leaves and nested nodes mixed over 286 bits (five words), every
         // open checked against the linear scan: "(" + "()((" x 47 +
