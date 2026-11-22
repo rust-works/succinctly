@@ -23160,12 +23160,32 @@ fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
         if let Err(err) = empty_elements_tail_gap_ok(&elements, Some(&cursor)) {
             return GenericResult::Error(err);
         }
+        // #7555: and the gap checks `.[]` makes as it walks
+        // (`each_lazy_array_iterate_sink`): the `,` before each element it
+        // probes, and the one before the `]` once the walk runs out. jq
+        // defines `all(f)` as `all(.[]; f)`, which raised on `[1,]` and
+        // `[1 2]` where this walk answered, reading `2` across the missing
+        // comma. An early decision stops before the rest, as `.[]` does.
         let mut elems = elements;
+        let mut is_first = true;
+        let mut last_cursor = None;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            if !elem_cursor.element_gap_ok(is_first) {
+                let error = Control::Error(elements.malformed_element_error());
+                return counted(matches, Flow::Escaped(error));
+            }
             if let Some(result) = probe(elem_cursor, &mut matches) {
                 return result;
             }
+            is_first = false;
+            last_cursor = Some(elem_cursor);
             elems = rest;
+        }
+        if let Some(last) = last_cursor {
+            if !trailing_element_gap_ok(&last, b']') {
+                let error = Control::Error(elements.malformed_element_error());
+                return counted(matches, Flow::Escaped(error));
+            }
         }
         counted(matches, Flow::Exhausted)
     } else if let Some(fields) = value.as_object() {
@@ -40988,6 +41008,12 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
         if S::TAG == EvalTag::Yq {
             return yq_reject_non_array();
         }
+        // #7555: the zero-member `{,}` the checked walk below cannot see,
+        // which it refuses with a member (`{"a":1,}`) -- the #2594 check the
+        // `cond` forms (`any_all_f_generic`) already make.
+        if let Err(err) = empty_fields_tail_gap_ok(&fields, Some(&cursor)) {
+            return GenericResult::Error(err);
+        }
         match effective_value_cursors_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS, false) {
             Ok(cursors) => {
                 for value_cursor in cursors {
@@ -42327,6 +42353,19 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
+                // #7554: jq defines `first` as `.[0]`, and `Expr::Index`'s
+                // array arm resolves every index through `len_checked` (#2261),
+                // so `.[0]` refuses a stray, doubled or missing `,` anywhere in
+                // the array (`[,1]`, `[1,]`, `[1 2]`). `first` answered from
+                // `get_cursor(0)` alone and printed an element jq never reads,
+                // so it now makes `.[0]`'s walk too, on a format whose index
+                // can hold such a gap; one without delimiter checks (YAML)
+                // keeps the O(1) read, which the walk could not change.
+                if <V::Cursor as DocumentCursor>::HAS_DELIMITER_CHECKS {
+                    if let Err(err) = crate::jq::array_index::len_checked_memoized(&elements) {
+                        return GenericResult::Error(err);
+                    }
+                }
                 match elements.get_cursor(0) {
                     Some(c) => GenericResult::OneCursor(c),
                     None => GenericResult::Owned(OwnedValue::Null),
@@ -42351,12 +42390,11 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
-                // #2261: `len_checked`, not the bare `len()` -- unlike
-                // `Builtin::First` just above (genuinely O(1) via
-                // `get_cursor(0)`, left unchecked per #1629's precedent),
-                // `last` already has to walk the whole array to find its
-                // own length, so the #1677/#2261 gap checks ride along for
-                // free on that same mandatory walk.
+                // #2261: `len_checked`, not the bare `len()` -- `last`
+                // already has to walk the whole array to find its own
+                // length, so the #1677/#2261 gap checks ride along for free
+                // on that same mandatory walk (`Builtin::First` just above
+                // makes the same walk since #7554, as `.[0]` does).
                 let len = match crate::jq::array_index::len_checked_memoized(&elements) {
                     Ok(len) => len,
                     Err(err) => return GenericResult::Error(err),

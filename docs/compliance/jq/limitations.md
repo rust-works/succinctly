@@ -7310,6 +7310,17 @@ beyond switching helpers. Same reachability analysis applies: `succinctly yq`'s 
 site into `eval.rs` only ever sees an already-materialized, pre-validated `OwnedValue`, so
 this remains inert for both CLIs today, same as the rest of #2293's fix.
 
+### A reader raises where the reader jq defines it as raises ([#7554](https://github.com/rust-works/succinctly/issues/7554), [#7555](https://github.com/rust-works/succinctly/issues/7555))
+
+The rule these two follow is consistency between two spellings of one jq definition, not whole-document validation: a reader raises jq's parse error exactly when the reader jq defines it as already raises on the same container.
+Bare `first` is `.[0]` in jq, and `.[0]` resolves its index through the checked length walk (#2261), so `first` makes that walk too: `[,1]`, `[1,]`, `[1 2]` and `[1,,2]` piped to `first` raise as they do for `.[0]`, where `first` printed the element.
+On a YAML document, whose parser validates as it reads, `first` keeps its O(1) read.
+`all(f)` and `any(f)` are `all(.[]; f)` and `any(.[]; f)` in jq, so they check each element's `,` as the walk reaches it and the gap before the `]` when the walk runs out, as `.[]` does: `[1,] | all(. < 5)` and `[1 2] | all(. == 1)` raise, where they answered `true` and `false` (the second from the `2` after the missing comma).
+A decision before the fault stops the walk there, as `.[]` stops under `any(.[]; f)`, so `[1 2] | any(. == 1)` still answers `true` where jq rejects the document (the early-exit trade of #2103).
+Arity-0 `any`/`all` on an array still answer over a gap fault: a truthiness scan reads no element, by design (#2692).
+On an object they resolve its keys, and the zero-member `{,}` now raises there as `{"a":1,}` already did.
+Pinned by `tests/jq_cli/i7554.rs`.
+
 ## Refusing an allocation jq does not survive
 
 `setpath` takes its array index from the document, so the array it pads is sized by the
