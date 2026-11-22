@@ -377,9 +377,15 @@ fn may_stack(pattern: &str, extended: bool) -> bool {
 /// possessive one, whose marker the engines and the scan take for something else; where it ends
 /// in a possessive fixed count of an item that matches in several ways, which the scan reads as the
 /// plain count (#6079); and where it ends in a count of zero, whose capture groups keep their
-/// numbers only once the count is written on them (#6108). A `{1}` is no quantifier, its `+`
-/// included, and counts for none of these.
-fn needs_writing(tokens: &[Token], simple: bool) -> bool {
+/// numbers only once the count is written on them (#6108). A `{1}` is no quantifier, its `+` and
+/// `?` included, and counts for none of these; but a run where such a marked `{1}` stands beside a
+/// real quantifier is written without it (#7689), since the possessive scan does not read a
+/// quantifier after `{1}?` (`(a){1}?++(a)`, which jq reads as `(a)++(a)`, was refused) and read
+/// `(?#c)(a){1}++a` as `(a){1}+a` with its comment left for the `regex` crate, which refused it.
+/// A count of zero is written also before another count, after a `{1}` and after a gap (`gapped`: a blank or comment
+/// between the atom and the run), where `keep_zero_count_groups` in `eval.rs` does not see that
+/// the count is on a group: `(?x)(a?) {0}|b` lost its capture entry (#7689).
+fn needs_writing(tokens: &[Token], simple: bool, gapped: bool) -> bool {
     let counted: Vec<&Token> = tokens
         .iter()
         .filter(|token| !(token.repeat.lower == 1 && token.repeat.upper == 1))
@@ -388,10 +394,30 @@ fn needs_writing(tokens: &[Token], simple: bool) -> bool {
         return false;
     };
     let one_way = simple && rest.iter().all(|token| token.repeat.fixed());
-    rest.iter()
-        .any(|token| !token.repeat.greedy || token.possessive)
+    let marked_one = |token: &Token| {
+        token.repeat.lower == 1
+            && token.repeat.upper == 1
+            && (!token.repeat.greedy || token.possessive)
+    };
+    tokens.iter().any(marked_one)
+        || rest
+            .iter()
+            .any(|token| !token.repeat.greedy || token.possessive)
         || (last.possessive && last.repeat.fixed() && last.repeat.lower > 1 && !one_way)
-        || (last.repeat.upper == 0 && !rest.is_empty())
+        || (counted.iter().any(|token| token.repeat.upper == 0) && (tokens.len() > 1 || gapped))
+}
+
+/// Where the last character of the plain group `chars[start..end]` is, when the group is `(?:`, two
+/// or more letters, digits or dashes, and `)`: the string node Oniguruma's parser makes of it. A
+/// group that holds anything else (an escape, a blank, a class, another group) is a node of
+/// another kind, which a quantifier repeats whole (#7689).
+fn string_group_last(chars: &[char], start: usize, end: usize) -> Option<usize> {
+    let inner = chars.get(start + 3..end.checked_sub(1)?)?;
+    (chars.get(start..start + 3) == Some(&['(', '?', ':'][..])
+        && chars.get(end - 1) == Some(&')')
+        && inner.len() >= 2
+        && inner.iter().all(|c| c.is_alphanumeric() || *c == '-'))
+    .then(|| end - 2)
 }
 
 /// `pattern` with every run of quantifiers that follow a quantifier written as Oniguruma reads it
@@ -429,7 +455,29 @@ pub(crate) fn rewrite(pattern: &str, extended: bool) -> Option<String> {
                 end = after;
             }
             let target = atom.take();
-            if needs_writing(&tokens, target.is_some_and(|(.., simple)| simple)) {
+            // #7689: a `{1}` on a plain group of plain characters (`(?:ab){1}`) leaves Oniguruma's
+            // string node, the group gone, and a quantifier after it repeats its last character:
+            // `"abbbab" | [match("(?:ab){1}*"; "g") | .string]` is `["abbb","ab"]` in jq.
+            let one = |token: &Token| token.repeat.lower == 1 && token.repeat.upper == 1;
+            if let Some((start, atom_end, _)) = target.filter(|_| !unsure && one(&first)) {
+                if let Some(last) = string_group_last(&chars, start, atom_end)
+                    .filter(|_| tokens.iter().any(|token| !one(token)))
+                {
+                    let node = tokens
+                        .iter()
+                        .fold(Node::Atom, |node, &token| apply(node, token));
+                    let (before, after) = write(&node, true, true);
+                    let mut text: String = chars[start + 3..last].iter().collect();
+                    text.push_str(&before);
+                    text.push(chars[last]);
+                    edits.push((start, atom_end, text));
+                    edits.push((atom_end, end, after));
+                    i = end;
+                    continue;
+                }
+            }
+            let gapped = target.is_some_and(|(_, atom_end, _)| atom_end < i);
+            if needs_writing(&tokens, target.is_some_and(|(.., simple)| simple), gapped) {
                 let (start, atom_end, simple) = target.filter(|_| !unsure)?;
                 let node = tokens
                     .iter()
@@ -686,10 +734,26 @@ mod tests {
             ("a{2}?{3}", false, Some("a{6}")),
             ("(a|b){2}+{3}", false, Some("(?>(a|b){2}){3}")),
             ("a{1}*", false, None),
-            ("a{1}?*", false, None),
+            // A `{1}` that a `?` or `+` marks goes beside a real quantifier (#7689).
+            ("a{1}?*", false, Some("a*")),
+            ("(a){1}?++(a)", false, Some("(a)++(a)")),
+            ("(?#c)(a){1}++a", false, Some("(?#c)(a)+a")),
+            ("a{1}+", false, None),
+            ("a{1}?", false, None),
             ("a{2}?++", false, Some("(?:a{2})++")),
-            ("a*+{1}?", false, None),
-            ("(a)*?{1}+", false, None),
+            ("a*+{1}?", false, Some("a*+")),
+            // A `{1}` on a plain group of plain characters leaves the string, whose last character
+            // the next quantifier repeats (#7689).
+            ("(?:ab){1}*", false, Some("ab*")),
+            ("(?:ab){1}?+", false, Some("ab+")),
+            ("(?:ab){1}(?#c)+", false, Some("ab+")),
+            ("(?:ab){1}{0}", false, Some("ab{0}")),
+            ("(?:ab){1}*+b", false, Some("ab*+b")),
+            ("(?:ab){1}+", false, None),
+            ("(ab){1}*", false, None),
+            ("(?:a\\x62){1}*", false, None),
+            ("(?:ab)*{1}?+", false, Some("(?:ab)*")),
+            ("(a)*?{1}+", false, Some("(a)*?")),
             // `(?:a*){n,m}` keeps its least count.
             ("a*{2,3}b", false, None),
             ("a*+*{2,3}b", false, Some("(?:(?>a*)*){2}b")),
@@ -708,6 +772,12 @@ mod tests {
             ("(a)+{0}", false, Some("(a){0}")),
             ("(a)+?{0}*", false, Some("(?:(a){0})*")),
             ("(a){0}", false, None),
+            // A count of zero after a `{1}` or a gap is written on the group (#7689).
+            ("^(a|b){1}{0}+a", false, Some("^(a|b){0}a")),
+            ("(?x)(a?) {0}|b", false, Some("(?x)(a?){0}|b")),
+            ("(a*)#c\n{0}+a", true, Some("(a*){0}a")),
+            ("(a)(?#c){0}", false, Some("(a){0}")),
+            ("(a)?{0}{2}$", false, Some("(a){0}$")),
             ("(a|b){2}++", false, Some("(?>(a|b){2})+")),
             // A possessive fixed count of an item that can match in several ways.
             ("(?:a|){2}+(?=a)", false, Some("(?>(?:a|){2})(?=a)")),
