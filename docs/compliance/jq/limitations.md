@@ -314,25 +314,30 @@ substitution into the more sensible WHATWG-consistent shape. See
 substitution-mechanism history and
 [#1717](https://github.com/rust-works/succinctly/issues/1717) for the algorithm fix itself.
 
-## `-R` replaces a character that straddles jq's 4095-byte read; succinctly keeps it (#5476)
+## A character that straddles jq 1.7.1's 4095-byte `-R` read is kept, as jq 1.8.2 keeps it (#5476)
 
 jq 1.7.1 reads `--raw-input` with `fgets` into a 4096-byte buffer, so it sees a long line in pieces of at most 4095 bytes.
 A multi-byte character that starts before the end of one piece and ends in the next is read as invalid UTF-8 and printed as U+FFFD replacement characters (two or three for a 3-byte character, depending on where it splits).
 `succinctly jq` reads the line whole and keeps the character.
-This is jq corrupting valid text, so the divergence stands under [ADR-0018](../../adrs/adr-0018.md) rather than being matched.
-It reaches `-R`, `-Rs`, `-Rc` and `-nR` with `input`, and a differential sweep of 1,977 real JSON files found it in five of them (language packs with CJK text in a minified line).
+jq 1.8.2 keeps it too: upstream fixed the corruption as a bug (jqlang/jq#3389, "Slurping corrupts multibyte characters that cross a 4095-byte boundary", fixed by jqlang/jq#3421 and listed in the 1.8 NEWS as "Fix raw input flag not to corrupt multi-byte characters").
+So `succinctly jq` follows 1.8.2, as ADR-0018's fork order says for an upstream bug fix, and the difference from the pinned 1.7.1 stands as `newer-than-primary` (the ledger's `cli:raw-input-read-boundary` and its siblings).
+Before 1.8.2 was checked, this page kept the character on a ground that still holds: matching 1.7.1 would corrupt valid text, which [ADR-0018](../../adrs/adr-0018.md) does not ask for.
+It reaches `-R`, `-Rs`, `-Rc`, a file and standard input alike, and `-nR` with `input` and with `inputs`; `--rawfile` reads the file whole in jq 1.7.1 too and never split the character.
+A differential sweep of 1,977 real JSON files found it in five of them (language packs with CJK text in a minified line).
 
 ```bash
-$ python3 -c "import sys; sys.stdout.buffer.write(b'a'*4094 + '主'.encode() + b'b\n')" > t.txt
-$ jq -R length t.txt          # three U+FFFD for the one character
-4098
-$ sjq -R length t.txt
-4096
+$ python3 -c "import sys; sys.stdout.write('a'*4094 + 'é'*3 + '\n')" > t.txt
+$ /usr/bin/jq -R '.[4090:]' t.txt               # jq 1.7.1: the first é is two U+FFFD
+"aaaa��éé"
+$ /opt/homebrew/bin/jq -R '.[4090:]' t.txt      # jq 1.8.2
+"aaaaééé"
+$ sjq -R '.[4090:]' t.txt
+"aaaaééé"
 ```
 
-The offset is the character's first byte within its line: a 3- or 4-byte character at 4093 or 4094, and a 2-byte one at 4094, are replaced.
-One at 4092 or below, or at 4095 or above, is read intact, and `-Rn` with `inputs` agrees with jq on the same line.
-Pinned by `tests/jq_cli/i5476.rs`, which asserts succinctly's side; jq's side was captured from `/usr/bin/jq` 1.7.1.
+In jq 1.7.1 the character is replaced when it starts at or before byte 4094 of its line and ends at or after byte 4095: a 4-byte character at 4092, 4093 or 4094, a 3-byte one at 4093 or 4094, and a 2-byte one at 4094.
+One that starts at 4095 or later, or ends by 4094, is read intact.
+Pinned by `tests/jq_cli/i5476.rs`, which asserts succinctly's side and, for the routes above, the output jq 1.8.2 (`/opt/homebrew/bin/jq`) prints; jq 1.7.1's side was captured from `/usr/bin/jq`.
 
 ## A NUL byte truncates jq's input in a chunk with no newline; succinctly reports it (#5654)
 
