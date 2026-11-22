@@ -140,7 +140,7 @@ impl JqCommand {
     /// from `filter` to `program_file`, so `filter` is then always `None`.
     ///
     /// Only words clap already captured are resequenced. `succinctly jq` and
-    /// `sjq` never give clap a positional word: `walk_jq_argv` (`main.rs`)
+    /// `sjq` never give clap a positional word: `read_jq_argv` (`main.rs`)
     /// reads them as jq does and `set_positional_words` sets them (#7494),
     /// so there is nothing here to resequence. A `JqCommand` clap parsed by
     /// itself (the `Cli` tree, the unit tests below) still arrives with
@@ -7207,6 +7207,51 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     ))
 }
 
+/// jq's refusal of an `--argjson` text or a `--jsonargs` word that is not JSON, with its usage hint:
+/// jq's wording does not name the variable, the value or its position (#3051, #3096).
+fn invalid_json_text_passed_to(flag: &str) -> String {
+    format!(
+        "invalid JSON text passed to --{flag}\n\
+         Use jq --help for help with command-line options,\n\
+         or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
+    )
+}
+
+/// Whether `text` is one JSON text as `--argjson` and `--jsonargs` read it: the check jq's option
+/// loop makes where it reads the word (#7712).
+pub(crate) fn is_json_text(text: &str) -> bool {
+    parse_json_value(text).is_ok()
+}
+
+/// [`invalid_json_text_passed_to`] on standard error, and jq's exit status for it (2), where jq's
+/// option loop stops at the word (#7712).
+pub(crate) fn exit_invalid_json_text(flag: &str) -> ! {
+    report_usage_error_bytes(invalid_json_text_passed_to(flag).as_bytes());
+    std::process::exit(exit_codes::USAGE_ERROR)
+}
+
+/// The error `run_jq` would report binding `args`' named and positional arguments, reported, and
+/// the status to exit with (#7712); `None` when they all bind. `parse_jq` asks it of the options
+/// before the word jq's option loop stops at, which jq reads first.
+pub(crate) fn report_named_argument_error(args: &JqCommand) -> Option<i32> {
+    match build_context(args) {
+        Ok(context) => {
+            // As `run_jq` keeps its context: a `--slurpfile` value is not worth freeing at exit (#5673).
+            std::mem::forget(context);
+            None
+        }
+        Err(BuildContextError::Usage(message)) => {
+            report_usage_error_bytes(&message);
+            Some(exit_codes::USAGE_ERROR)
+        }
+        Err(BuildContextError::Other(e)) => {
+            // As `main` reports an error `run_jq` returns.
+            eprintln!("Error: {e:?}");
+            Some(1)
+        }
+    }
+}
+
 /// Build the evaluation context from command-line arguments.
 fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
     let mut context = EvalContext::default();
@@ -7261,12 +7306,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                 {
                     // jq's own wording doesn't name the flag's variable (`x`) at all.
                     let json_value = parse_json_value(value).map_err(|_| {
-                        BuildContextError::Usage(
-                            "invalid JSON text passed to --argjson\n\
-                             Use jq --help for help with command-line options,\n\
-                             or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
-                                .into(),
-                        )
+                        BuildContextError::Usage(invalid_json_text_passed_to("argjson").into())
                     })?;
                     context.named.insert(name.clone(), json_value);
                 }
@@ -7338,12 +7378,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
             PositionalWord::Json(text) => {
                 // jq's own wording doesn't name the offending value or position.
                 let json_value = parse_json_value(text).map_err(|_| {
-                    BuildContextError::Usage(
-                        "invalid JSON text passed to --jsonargs\n\
-                         Use jq --help for help with command-line options,\n\
-                         or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
-                            .into(),
-                    )
+                    BuildContextError::Usage(invalid_json_text_passed_to("jsonargs").into())
                 })?;
                 context.positional.push(json_value);
             }

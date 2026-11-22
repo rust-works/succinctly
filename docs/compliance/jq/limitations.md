@@ -15835,6 +15835,18 @@ The usage hint after `Unknown option` is 1.7.1's (`online docs  at https://jqlan
 `succinctly dev compare jq` has no probe of these shapes, so the ledger has no entry for them.
 Pinned by `tests/jq_cli/i7438.rs`.
 
+## Option errors are reported in argv order, with two wordings of their own ([#7712](https://github.com/rust-works/succinctly/issues/7712))
+
+jq 1.7.1 and jq 1.8.2 read the command line left to right in one loop and stop at the first word they refuse, and `succinctly jq` reads it the same way (`read_jq_argv`).
+Checked where it stands, so the earliest wins: an unknown option, a missing value of `--arg`, `--argjson`, `--slurpfile`, `--rawfile`, `--indent` or `-L`, a refused `--indent` value, an `--argjson` text or a `--jsonargs` word that is not JSON, and a `--slurpfile` or `--rawfile` file that cannot be read.
+`-h`, `-V` and `--build-configuration` exit only when the loop reaches them, so `jq -n --argjson a '{' -h` is the `--argjson` error, exit 2, and `jq -n -h --argjson a '{'` prints the help, exit 0.
+A name already bound is not read again, so `--arg a 1 --argjson a '{'` and `--arg a 1 --slurpfile a nope.json` are no error.
+The `-f` program file, a missing program, compile errors and the input files are checked after the loop, so any error above comes before them.
+
+A missing value is reported in jq's words (`jq: --arg takes two parameters (e.g. --arg varname value)`, `-L takes a parameter: ...`), with jq 1.7.1's usage hint.
+Two messages stay succinctly's own, with jq's exit status 2 and in jq's order: a refused `--indent` value is clap's `error: invalid value ...` (see the `--indent` section below), and a succinctly-only option without its value, or `--on-error` with a value it does not take, is clap's.
+Pinned by `tests/jq_cli/i7712.rs`, whose rows were captured from jq 1.7.1 and agree with jq 1.8.2.
+
 ## A broken-down time is read as jq 1.8.2 reads it, not as jq 1.7.1 does (#7532)
 
 `mktime`, `strftime`, `strflocaltime`, `todate` and `todateiso8601` take a broken-down time, an array `[year, month, day, hour, minute, second, weekday, yearday]`, which jq's `jv2tm` copies into a C `struct tm`.
