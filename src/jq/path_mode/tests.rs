@@ -506,7 +506,7 @@ fn the_prelude_parses_one_definition_at_a_time_5223() {
 }
 
 /// The most native stack a parse run under `with_native_stack_floor_lifted` may take (#7676), a
-/// prelude definition's or the `_nwise` template's. Measured on an Apple M5 Max as the smallest
+/// prelude definition's or the `_nwise` template's. Measured on aarch64 as the smallest
 /// thread each parses on (the thread's own start included, 36 KiB debug and 12 KiB release): the
 /// deepest definition, `modify`, took 632 KiB in a debug build and 100 KiB in a release one, and the
 /// template 388 KiB and 52 KiB. The bound is about 1.6 and 2.5 times those.

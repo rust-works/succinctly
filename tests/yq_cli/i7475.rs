@@ -16,7 +16,7 @@ fn test_a_long_binding_chain_is_refused_not_an_abort_in_yq_mode_7475() -> Result
     let path = dir.path().join("program.yq");
     // 2,000,000 (20 MB): a yq-mode binding spends less stack than a jq-mode one, and the floor
     // falls with the build's frame sizes. An unoptimised build refuses 400,000, but an
-    // `opt-level=1` build admits that many (it refuses 1,600,000, measured on an Apple M5), and an
+    // `opt-level=1` build admits that many (it refuses 1,600,000, measured on aarch64), and an
     // admitted chain costs time quadratic in its length (yq mode rewrites the rest of the chain at
     // every link): over a minute at 100,000. A refusal costs the same at any length (the parser
     // stops at the floor: about 1.1 GB of stack, under a second).
