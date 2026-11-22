@@ -17470,7 +17470,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // 2-term one, and settling operands that call no `def` loses. Kept as is;
     // the numbers and the evidence are in
     // docs/optimizations/jq-settled-operands.md.
-    if settles_both(left, right) {
+    if operands_settle::<S>(left, right) {
         binary_fanout_each_with::<W, S>(
             settled_operand_strategy(each_operand),
             left,
@@ -118838,6 +118838,26 @@ pub(crate) fn settles_before_consumer(expr: &Expr) -> bool {
 /// question costs, never its answer.
 pub(crate) fn settles_both(left: &Expr, right: &Expr) -> bool {
     settles_both_with(left, right, settle_probe, settles_before_consumer)
+}
+
+/// Whether a binary operator in mode `S` settles its operands before their consumer (#3296):
+/// [`settles_both`], or, in jq mode, both operands are calls that answer at most once by
+/// [`call_head_settles`](super::tail_call::call_head_settles), which also reads a call whose
+/// definition's body uses `try`, `label`, `reduce`, an object, a builtin that answers once or
+/// another def (#7713). A tree recursion over such a body (`count` adding the counts of `.[0]`
+/// and `.[1]`) ran each call inside the other operand's output sink, so every call ever made
+/// held its native frames and depth 13 (8,192 leaves) was refused.
+pub(crate) fn operands_settle<S: EvalSemantics>(left: &Expr, right: &Expr) -> bool {
+    // Only a call, a parenthesis or a pipe can be one (`call_head_settles`): told apart here, so
+    // the operators of a level that are no such thing (`$n == 0`, `$n - 1`) ask nothing more.
+    let may_be_a_call =
+        |e: &Expr| matches!(e, Expr::DefCall { .. } | Expr::Paren(_) | Expr::Pipe(_));
+    settles_both(left, right)
+        || (S::TAG == EvalTag::Jq
+            && may_be_a_call(left)
+            && may_be_a_call(right)
+            && super::tail_call::call_head_settles(left, true)
+            && super::tail_call::call_head_settles(right, true))
 }
 
 /// How many nodes the probe in [`settles_both`] spends on an operand before
