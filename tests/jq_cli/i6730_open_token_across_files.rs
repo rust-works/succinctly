@@ -6,7 +6,8 @@
 //! closes its array at the last. So `ptr pa miss` has the closing event in its array and never meets
 //! the fault (jq's main loop reads no further once a file has failed), where `ptr pa miss miss2` has
 //! the fault in its array too (`-s --stream` says it as a parse error with nothing printed); a program's `input` after the array reads the fault there (jq's main
-//! loop does not). Every row was captured from jq 1.7.1; the rows of `ptr miss`,
+//! loop does not). Every row was captured from jq 1.7.1, except the `--stream-errors` row of `ptr pa`,
+//! whose array follows jq 1.8.2 since #7807 (its comment says why); the rows of `ptr miss`,
 //! `pa ptr miss`, `ptr pa`, `pa dir` and `ptr miss pa dir` do not move.
 
 use anyhow::Result;
@@ -41,7 +42,10 @@ fn a_token_left_open_across_files_meets_its_fault_at_the_read_jq_makes_it_in_673
         (&["-c", "-s", "--stream", "[., input_filename]"][..], &["ptr", "miss", "pa", "dir"][..], "[[[[0],1],[[1,0],1],[[1,0]]],\"@DIR@/dir\"]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["ptr", "miss", "pa", "dir"][..], "[[[[0],1],[[1,0],1],[[1,0]]],\"@DIR@/dir\"]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["pa", "ptr", "miss"][..], "[[[[0],1],[[0]],[[0],1],[\"Unfinished JSON term at EOF at line 1, column 6\",[1]]],\"@DIR@/miss\"]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
-        (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["ptr", "pa"][..], "[[[[0],1],[[1,0],1]],\"@DIR@/pa\"]\n[[[1,0]],null]\n[[\"Unfinished JSON term at EOF at line 1, column 6\",[1]],null]\n", "", 0),
+        // jq 1.7.1 gives `[[1,0]]` out after the array; jq 1.8.2 keeps it in, and `succinctly jq` follows
+        // it (#7807), with 1.7.1's `null` for the closed input the fault event is read at (#7607), where
+        // jq 1.8.2 names `@DIR@/pa`.
+        (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["ptr", "pa"][..], "[[[[0],1],[[1,0],1],[[1,0]]],\"@DIR@/pa\"]\n[[\"Unfinished JSON term at EOF at line 1, column 6\",[1]],null]\n", "", 0),
     ];
     check_rows(&d, &rows)
 }
