@@ -422,6 +422,29 @@ The matches that 1.7.1 repeats at each continuation byte of a multibyte characte
 `succinctly yq` is not changed: Go's `regexp` already reports such a group as unmatched.
 Pinned by `tests/jq_cli/i7520.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 
+## `last(f)` of an `f` that yields nothing yields nothing, as jq 1.8.2 does; jq 1.7.1 answers `null` (#7518)
+
+jq 1.7.1 defines `last(g)` as `reduce g as $item (null; $item)`, and a `reduce` always produces one output, so an `f` with no output answered the seed: `[last(empty)]`, `[last(range(0))]` and `[[] | last(.[])]` were `[null]`, `[last(empty)] == [first(empty)]` was `false`, and `path(last(.[]))` over an empty array raised `Invalid path expression with result null`.
+jq 1.8.2 makes `last(g)` yield no output when `g` yields none, like `first(g)` (jqlang/jq#3179, commit a7b2253 "fix: make last(empty) yield no output values", listed in the 1.8 NEWS under changes to existing functions; it closes the bug reports jqlang/jq#1869 and jqlang/jq#3177).
+`succinctly jq` follows 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary` (ledger entry `syntax:man-last-empty`).
+A non-empty `f` is unchanged, an error after the final value still raises (`last(1, error("x"))` does not answer `1`), and the arity-0 `last` is `.[-1]`, which answers `null` on `[]`, in both versions.
+In `path()` position an `f` that yields nothing now yields no path (`[{"a":[]} | path(last(.a[]))]` is `[]`, and `last(.a[]) = 5` leaves `{"a":[]}`), where 1.7.1 raised.
+`succinctly yq` has no counterpart to compare with, since real yq rejects `last(f)`; behind `--jq-extensions` it follows `succinctly jq`.
+Pinned by `tests/jq_cli/i7518.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
+## `--stream --slurp` keeps the last closing event in the array, as jq 1.8.2 does; jq 1.7.1 gives it out after the array (#7523)
+
+jq 1.7.1's slurp loop stops at the call that reads the last byte of the input, so the closing event of a top-level container that ends the text, which its streaming parser still holds, comes out after the array as a value of its own: `printf '[1][2]' | jq -c -s --stream .` printed `[[[0],1],[[0]],[[0],2]]` and then `[[0]]`, and so did `[1,2]` and `{"a":1}` with no newline after them.
+A byte after the closer, or a closer that ends in a container, kept it in the array.
+jq 1.8.2 reads once more before it closes the array (jqlang/jq#3279, commit 4e3088f, listed in the 1.8 NEWS under CLI changes: "Fix `--slurp --stream` when input has no trailing newline character"), so the array has every event whatever the last byte is: `[[[0],1],[[0]],[[0],2],[[0]]]`.
+`succinctly jq` follows 1.8.2 for `--stream -s` and `--stream-errors -s`, with and without `-n`, over standard input and files, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+This replaces the rule #5548 added, which matched 1.7.1.
+`input_filename` and `input_line_number` read where the array was closed, as they did.
+What the same upstream change does not reach here: a text that ends in a fault (`printf '[1,' | jq -s --stream .`) is raised without the array in 1.8.2, where 1.7.1 printed the array and then raised, and `succinctly jq` still prints the array first; with `--stream-errors -s` the fault event that follows the array reads `input_filename` as the last file in 1.8.2 and as `null` here, and in that case the closing event keeps the 1.7.1 place too.
+`--seq` keeps the 1.7.1 model of the slurp loop, and so do the cases that read a directory in the middle of the file list.
+`succinctly yq` is not changed.
+Pinned by `tests/jq_cli/i7523.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.
@@ -3226,7 +3249,7 @@ is the revert that established what the other one costs.
    **Since [#4795](https://github.com/rust-works/succinctly/issues/4795)** `first(f)`, `limit(n; f)`, `nth(n; f)` and a `select(c)` stage over navigation are read as navigation too (`is_register_navigation`: each hands on some of the navigation's outputs, a node the register is left on), and `last(f)` over navigation is read at the fold's entry (`is_last_of_navigation`: jq defines it over a `reduce`, whose register is back where it entered, so `.c as $x | reduce last(..) as $i (.; FE)` on `{"a":1,"c":null}` raises with a `null` `$x` although the last element is `null`; the mark carries `null`-ness of the entry node, known only when the `reduce` is entered on the register).
    Pinned by `test_caught_foreign_null_marker_behind_first_limit_or_select_source_4795`.
    Over `scripts/jq-fold-body-register-grid-sweep.py --only rd-first-rec,rd-limit1-rec,rd-nth-rec,rd-last-rec,rd-sel-rec,rd-first-nav,rd-last-nav,rd-last-empty` (373,464 rows, eight outers added for this) against `main`: 8,130 ACCEPT_WRONG -> MATCH, 0 lost matches, 0 new ACCEPT_WRONG.
-   Still answered where jq refuses: `last(f)` of an empty `f` (it yields the `reduce`'s `null` seed with the register at entry; `.c as $x | reduce last(empty) as $i (.; FE)` answers `[]`, as on `main`), `first(last(..))` (a `last` nested in another subset is read as computed) and a `last(f)` entered off the register.
+   Still answered where jq refuses: `last(f)` of an empty `f` (jq 1.7.1 yields the `reduce`'s `null` seed with the register at entry, so `.c as $x | reduce last(empty) as $i (.; FE)` answered `[]`; jq 1.8.2 and now `succinctly jq` yield nothing, #7518, so the fold runs no step and answers `.`), `first(last(..))` (a `last` nested in another subset is read as computed) and a `last(f)` entered off the register.
    Still refused where jq answers, as on `main`: a `$x` bound at the entry node itself (`. as $x | reduce last(..) as $i (.; FE)` on `{"a":1,"c":null}` prints `[]` in jq; the element-position mark names the last element, and handing `last` no position instead lost matches on `last(first(..))` rows).
    Over `scripts/jq-fold-body-register-grid-sweep.py --only rd-rec,rd-comma,rd-nav,rd-nava,rd-lit` (207,480 rows, two outers added for this: `..` and a comma source) the candidate against a `main` build: ACCEPT_WRONG 2,958 -> 722, MATCH 197,634 -> 199,870, REFUSE_WRONG 6,888 unchanged, 0 lost matches, 0 timeouts.
    A
@@ -7414,23 +7437,28 @@ against the pinned jq 1.7.1 binary), so refusing with a catchable error is the s
 "would take the host process down" exception as the rest of this entry, not a new kind of
 divergence.
 
-## A document of 4 GiB or more is read without an index (#7425)
+## A document of 4 GiB or more (#7425, #7537)
 
-`succinctly jq` indexes a document before it runs the program on it, and the index holds a text of at most `u32::MAX` bytes ([Input Size Limits](../../reference/limits.md)).
-A document longer than that, a `-s` slurp of a stream that long included, is read into a tree instead, by the one-pass reader of plain JSON (`jq::parse_plain`), and the program runs on the tree with the owned evaluator.
-Before #7425 such a document panicked with exit 101 where jq 1.7.1 (and 1.8.2) answers.
-Measured over a 4,296,011,781-byte array of 4097 strings of 1 MiB and a last `"x"` (Apple M5 Max, against `/usr/bin/jq` 1.7.1): `length` prints `4098` as jq does, named or on a pipe, and so does `-s length` over the same strings one per line; `keys | length`, `.[-1], (.[0] | length)`, `.[1:3] | length` and `-s '.[4097]'` print jq's answers too.
-`length` took 14 s and 8.6 GB at its peak (the text and the tree), where jq took about 60 s and 4.2 GB.
+`succinctly jq` indexes a document before it runs the program on it ([Input Size Limits](../../reference/limits.md)).
+The index's rank directories count its interest bits (one per value, keys included) and its balanced parentheses (two per value) in 32 bits, so it holds a text of any length with at most 2,147,483,647 values.
+A text of at most `u32::MAX` bytes always is; a longer one is unless its values are about two bytes each, as in `[0,0,...]`.
+Before #7537 the index refused every text longer than `u32::MAX` bytes, and before #7425 such a document panicked with exit 101 where jq 1.7.1 (and 1.8.2) answers.
 
-Three cases are refused with an error at exit 5 where jq answers, a known limitation: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
-Lifting it needs an index that holds longer texts (64-bit rank directories), which is a change of its own.
+Measured over a 4,296,011,781-byte array of 4097 strings of 1 MiB and a last `"x"` (AMD Ryzen 9 7950X, Linux, release build, `--features cli`): every program #7537 lists answers, `map(length) | add` with `4295999485` in 4.1 s at 4.99 GB peak RSS (the mapped text and the index).
+`length`, `[.[] | length]`, `[.[] | select(length > 1)]`, `first(.[])`, `[paths]`, `keys`, `.[-1]` and `.[1:3]` take 2.6-4.0 s at the same peak, and `sort`, `to_entries`, `del(.[0])` and `.[0] = 1`, which copy the array, take about 6 s at 9.2 GB; `-s length` takes 6.0 s at 8.4 GB.
+The same array as `"s"` of `{"k":1,"k":2,"s":...}` on a pipe, a document with a repeated key, answers `.s | map(length) | add`, `.k` (`2`) and `keys`, and `at_offset(4296011776)` and `at_position(1; 4296011777)` find the last `"x"`, past the 4 GiB mark.
+jq 1.7.1 prints the same output for each of those programs on the same machine, in 17.7-29.1 s at 4.2 GB.
+The build before #7537 refused `map(length) | add` there at exit 5, after 11 s at 12.6 GB.
 
-- A program the owned evaluator answers only by indexing the whole document (its reindex bridge): `Cannot index a value of N bytes: the index holds at most 4294967295 bytes (4 GiB)`.
-  On the array above this is `map(length) | add`, `[.[] | length]`, `[.[] | select(length > 1)]`, `first(.[])`, `sort`, `to_entries`, `del(.[0])`, `.[0] = 1` and `[paths]`, and any comma or pipe that has one of them as a stage.
+A document past both counts is read into a tree instead, by the one-pass reader of plain JSON (`jq::parse_plain`), and the program runs on the tree with the owned evaluator, as every document of 4 GiB or more was between #7425 and #7537.
+Three cases are refused there with an error at exit 5 where jq answers, a known limitation: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
+Lifting it needs 64-bit rank directories, which double the interest bits' rank array (about 6% of the input) on every document.
+
+- A program the owned evaluator answers only by indexing the whole document (its reindex bridge): `Cannot index a value of N bytes: the index holds at most 2147483647 values`.
   A program that first steps to a smaller value (`.[0]`, `.key`, `.[1:3]`) indexes only that value.
 - A document that is not plain RFC 8259 JSON: a repeated key, a lone low `\u` surrogate escape (jq reads it as U+FFFD), a jq leniency such as `nan` or `007`, or nesting past 128 levels.
   The one-pass reader declines these, and the route that reads them needs the index.
-  The message is `Cannot index a value of N bytes: the index holds at most 4294967295 bytes (4 GiB), and the document is not plain JSON, which is all that is read without an index`.
+  The message is `Cannot index a value of N bytes: the index holds at most 2147483647 values, and the document is not plain JSON, which is all that is read without an index`.
 - `--preserve-input`, which writes such a document out and indexes the text, with the first message.
 
 A malformed document of that length is reported as jq's parser reports it, at exit 5 as jq exits, with one difference: jq's column counter is a 32-bit `int`, so past 4 GiB on one line it wraps (`Expected another array element at line 1, column 1044485` for the array above with its last `]` replaced by `,]`), and succinctly prints the real column, `4296011781`.
@@ -8131,25 +8159,42 @@ Since #6172 the quantifier is written as the atomic group of its atom and quanti
 That includes a repeat after the possessive quantifier (`a?+*`, `a*+*`, `a?+{2}`, `(?:a*+b)*+`), which `fancy-regex` cannot read written out, and an interval (`a{1,2}+*`), which it would read as a repeat of a repeat.
 The scan finds where the atom starts: a group's `(`, a class's `[`, an escape, a character.
 Where it cannot place one, the pattern is refused as before, with `Regex failure: regex parse error: possessive quantifier is not supported` (exit 5): a quantifier on a quoted run (`\Qab\E*+c`), after an escape the scan does not size (`\C-a`), or on a group of flags (`(?i)*+c`), and any pattern with an inline `(?x)`, whose blanks the scan does not model.
-So is a pattern that also holds a lazy quantifier followed by `+` (`c?+a+?+`): jq reads that as a repeat of a repeat, and the second engine reads it otherwise.
+A pattern that also holds a lazy quantifier followed by `+` (`c?+a+?+`) was refused too until [#7682](https://github.com/rust-works/succinctly/issues/7682) wrote such a run as Oniguruma reads it (the section after this one); one on an atom that rewrite cannot place still is.
 A repeat of a repeat that the second engine refuses (`a**+b`, `a{2}+++a`) is an error from it, not a wrong answer.
 As the last character of the pattern, or followed only by closing parentheses (`(?:a++)`), nothing after it can fail, so it is rewritten to the plain quantifier instead (`sub("a*+";"X")`, `gsub("a++";"X")`), and stays on the first engine.
 The flags are checked first, as in jq, so a bad flag string is the error whatever the pattern.
 The scan steps over escapes, classes, `\Q..\E`, `(?#..)` and, under the `x` flag, `#` comments and blanks; an inline `(?x)` is not modelled, and a `*+` in its comments is read as a quantifier.
-What jq itself reads as a repeat of a repeat stays as it was: a lazy quantifier followed by `+` (`a*?+`) and `{n}?+`.
+What jq itself reads as a new quantifier on the quantified atom, a lazy quantifier followed by `+` (`a*?+`) and `{n}?+`, is written out before this scan since #7682.
 Under the `n` flag the end of the pattern is where an empty match fails, so the dropped `+` matters there (#6218).
 A trailing possessive quantifier over an atom that can match nothing on its first try (a lazy quantifier or an alternation inside it: `(?:a??)*+`, `(?:|a)++`) keeps its atomic group, which takes the empty way and fails: `"cabb" | [match("(?:a??)*+"; "gn")]` is `[]` in jq, and was `[{"offset":1,...}]` here.
 An ungrouped lazy quantifier followed by `+` (`a??+`) is written as the group it stands for, `(?:a??)+`, under `n`.
-Over a matrix of 14,280 pattern x text x flag cases (empty-matching atoms, seven possessive forms, six endings, flags `g`, `n`, `gn`, `gln`), the `n` and `gn` answers match jq except `X?++` (`a*?++`, `a+?++`, `a??++`), which stays refused; with `l` (`ln`) the lazy shapes differ whether or not they are possessive (`"cabb" | [match("(?:a??)+"; "ln")]` is `["a"]` in jq and `[]` here), a limit of the longest-match mode.
-A fixed count then `+` over such an atom (`(?:a??){2}+`) is `{2}` here (#6079) and is `[]` under `n` in jq; the rest of 160 edge cases (an escaped `|`, a class holding `|`, a greedy empty-first atom, nested groups) agree.
+Over a matrix of 14,280 pattern x text x flag cases (empty-matching atoms, seven possessive forms, six endings, flags `g`, `n`, `gn`, `gln`), the `n` and `gn` answers match jq except `X?++` (`a*?++`, `a+?++`, `a??++`), which stayed refused until #7682; with `l` (`ln`) the lazy shapes differ whether or not they are possessive (`"cabb" | [match("(?:a??)+"; "ln")]` is `["a"]` in jq and `[]` here), a limit of the longest-match mode.
+A fixed count then `+` over such an atom (`(?:a??){2}+`) was `{2}` here (#6079), where it is `[]` under `n` in jq, until #7682 made it atomic; the rest of 160 edge cases (an escaped `|`, a class holding `|`, a greedy empty-first atom, nested groups) agree.
 Pinned by `tests/jq_cli/i6218.rs`.
 The interval forms follow jq 1.7.1: `{n,}+`, `{n,m}+` and `{,m}+` are possessive.
-A fixed `{n}+` is neither possessive nor a repeat: it is `{n}` (#6079).
+A fixed `{n}+` on an item that matches in one way (a character, a class, `.`) is neither possessive nor a repeat: it is `{n}` (#6079).
+On an item that can match in more than one way it is possessive like the other interval forms, and is written as its atomic group since #7682: `"aaab" | test("^(?:a|aa){2}+b")` is `false` in jq 1.7.1 and 1.8.2, and was `true` here.
 `"aaaa" | match("a{2}+")` is `aa` in jq, since a fixed count has nothing to give back, and this was `aaaa`, the `regex` crate's `(?:a{2})+`.
 The `+` is dropped, and a quantifier after it applies to the `{n}`: `{n}++` repeats it, and `{n}+?` makes it optional (written `{0,1}`, since the crate would read a bare `?` there as lazy).
 A braced escape is not a count: `\x{41}+` and `\p{Lu}+` repeat as before.
 Pinned against jq 1.7.1 on 180 pattern x text x flag rows in `tests/jq_cli/i6079.rs`, and the possessive rewrite on the rows of `tests/jq_cli/i5524.rs`.
 A sweep of generated patterns (atoms, groups, classes, escapes, lookaround, every quantifier with every suffix, three flag sets, 30,000 patterns over 15 texts) went from 2,900 differences per 8,000 patterns, nearly all refusals, to 640, none of which `main` did not already have.
+
+## A quantifier after a quantifier (#7682)
+
+jq compiles its patterns with Oniguruma's `ONIG_SYNTAX_PERL_NG`, whose tokenizer takes only the character right after a quantifier as part of it: a `?` makes it lazy, otherwise a `+` makes it possessive, intervals included.
+Any further `?`, `*`, `+` or interval is a new quantifier on the quantified atom, and so is a quantifier after a blank or a `#` comment under `x`, or after a `(?#..)` comment.
+The parser then reduces the two where it can (`assign_quantifier_body` and `onig_reduce_nested_quantifier` in `regparse.c`): two of `?`, `*`, `+`, `??`, `*?` and `+?` become one by its `ReduceTypeTable` (`a??+` is `a*?`, `a+?*` is `a*`, `a*??` is `a*?`), two fixed counts multiply (`a{2}?{3}` is `a{6}`), a bounded greedy interval over `*` or `+` keeps only its least count, and `{1}` is no quantifier at all, its `+` included.
+A possessive quantifier is the atomic group of the repeat it ends, which a later quantifier repeats without reducing.
+So `(a)??++` is `(?>(a)*?)`, and `"aaa" | [match("(a)??++"; "gn")] | length` is `0` in jq 1.7.1 and 1.8.2: the atomic lazy repeat takes its empty way, which `n` refuses.
+The possessive scan above took the last `+` of `(a)??++` for a possessive marker it could not write, and refused the pattern; `a{2}?++`, `(?:a|){2}?++` and the other lazy and possessive runs were refused or read as another tree.
+Since [#7682](https://github.com/rust-works/succinctly/issues/7682) a run in which a quantifier follows a lazy or a possessive one, one that ends in a possessive fixed count of an item that can match in more than one way, and one that ends in a count of zero is written as the tree Oniguruma builds, before the possessive scan reads it (`src/jq/onig_quantifier.rs`): one quantifier per item, a plain group around a repeat that another repeats, and an atomic group for a possessive quantifier, except a greedy one that ends the run, which the scan reads as it reads any other.
+A run of greedy quantifiers is left as written, since the engines read a repeat of a repeat as the same tree; a run on an atom the rewrite cannot place (after an escape it does not size, on a quoted run, a lookaround or a group it does not know) keeps the pattern as written.
+A count of zero writes only the atom under it, whose groups keep their numbers: `"ab" | [match("(a)+{0}b") | .captures | length]` is `[1]`, as in jq.
+`succinctly yq` is not changed: Go's `regexp` refuses a quantifier after a quantifier (`invalid nested repetition operator`), as yq v4.53.3 does.
+Over 37,067 generated rows (the 24,956 of #7654, #7669 and #7670, and 12,111 of every pair and 4,000 triples of 26 quantifier forms over ten atoms, eight heads, eight tails and the flags none, `g`, `n`, `x`, `l` and `gn`), the rows that differ from jq 1.7.1 went from 2,567 to 1,401, most of the rest being 1.7.1's empty captures (#7520) and the `l` flag's limits.
+Seven rows that matched only by accident now show older faults of the `n` and `l` routes, each of which a pattern without a quantifier run shows too: `"ab" | [match("(a){0}|b"; "n")]` is `[]` here, `"ba" | match("(a?)++$"; "n").captures[0].offset` is `1` (jq `2`), and `"aaa" | match("(a?)+"; "l").captures[0].length` is `3` (jq `0`).
+Pinned by `tests/jq_cli/i7682.rs` and the unit test in `src/jq/onig_quantifier.rs`.
 yq mode is unchanged: Go's `regexp` rejects the form (`invalid nested repetition operator: `*+``), as yq does.
 
 ## Lookaround and backreferences: a second regex engine (#5502)
@@ -8468,6 +8513,7 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
 - **`l` stays a no-op on a pattern with a lazy quantifier.**
   `fancy-regex`'s longest mode returns the lazy match where Oniguruma returns the longest of all the ways to match: `"aa" | match("a*?";"l")` is `"aa"` in jq and `""` here.
   Such a pattern keeps its old route whole, `n` included, because the two flags are not independent (`ln` is the longest non-empty match anywhere).
+  A quantifier after a lazy one keeps the run lazy where Oniguruma does: `"aaaaaa" | [match("b|a{2,}?{2}"; "l") | .length]` is `[6]` in jq 1.7.1 and 1.8.2 and `[4]` here, since `a{2,}?{2}` is the lazy `(?:a{2,}?){2}` in both ([#7682](https://github.com/rust-works/succinctly/issues/7682)), pinned by `tests/jq_cli/i7682.rs`.
   Pinned by `test_regex_l_and_n_keep_their_old_search_where_fancy_regex_disagrees_5530` and `test_l_flag_on_a_lazy_quantifier_is_still_a_no_op_5530`.
 - **`n` backtracks to a non-empty match at the same position.**
   `ONIG_OPTION_FIND_NOT_EMPTY` refuses an empty match and tries another way to match where it stands, which the skip-forward search could not: `"xaab" | gsub("a*?";"X";"gn")` is `"xXXb"` in jq and now here, where it was a no-op.
@@ -8475,7 +8521,9 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   Oniguruma stops a loop after an iteration that matched nothing and keeps that iteration: `"a" | match("(a*)*")` has `[1,0,""]` for group 1, and `"bcba" | match("b(c|(|.))*")` is `"bc"`.
   The `regex` crate kept the last non-empty iteration (`[0,1,"a"]`) until such a loop was rewritten to end with its empty iteration (#6069, the entry below), and with a capture group it still matches `"bcba"` (#6106).
   Without the capture groups the match agrees: `"bcba" | match("b(?:c|(?:|.))*")` is `"bc"` in both since [#6106](#a-loop-ends-at-an-iteration-that-matches-nothing-6106), which leaves a body with a group as written.
-  `fancy-regex` reports the empty iteration as jq does for the captures, so `"a" | match("(a*)*";"n")` now agrees, but it backtracks out of an empty iteration to a longer match, so `"bcba" | match("b(c|(|.))*";"n")` is still `"bcba"`.
+  Under `n` the pattern goes to `fancy-regex`, which kept the last non-empty iteration of such a loop (`"a" | match("(a*)*";"n")` had the group at `[0,1]`); since [#7670](https://github.com/rust-works/succinctly/issues/7670) the capture rewrite of #6069 runs there too, and the group is at `[1,0]` as in jq, unless the engine reads the pattern with an atomic group (a possessive quantifier), which the rewrite cannot read.
+  A bounded repeat is not rewritten, so under `n` it still keeps the last non-empty iteration: `"a" | match("(a??){1,3}b?";"n")` has the group at `[1,0]` in jq and `[0,1]` here.
+  `fancy-regex` also backtracks out of an empty iteration to a longer match, so `"bcba" | match("b(c|(|.))*";"n")` is still `"bcba"`.
   A repeated group with an empty alternative and `n` is another shape: `"ab" | match("(((b)|(|a))){2}";"n")` is `"ab"` in jq, `"a"` here and `"b"` before.
   This predates `l` and `n`, which only move a pattern to the other route.
 - **A search can run out of budget where jq's optimizer does not.**
@@ -11613,7 +11661,7 @@ A number literal of more than 999,999,999 characters (`DEC_MAX_DIGITS`) is `pars
 jq 1.7.1 aborts (SIGABRT, exit 134) on a 2.2 GB string token and reads the 1,000,000,001-digit number (`"number"`).
 `succinctly jq` reads both: `length` of the 2.2 GB string is `2200000000` and `type` of the 1,000,000,001-digit number is `"number"` (1.2 GB resident).
 These rows are the issue's measurements, not re-run here.
-What bounds it: the 4 GiB document limit of the index, beyond which a document is read without one ([A document of 4 GiB or more](#a-document-of-4-gib-or-more-is-read-without-an-index-7425)), and available memory.
+What bounds it: the index's counts, past which a document is read without one ([A document of 4 GiB or more](#a-document-of-4-gib-or-more-7425-7537)), and available memory.
 
 **Function parameters: 4,095 (#7527).**
 jq 1.8.2 refuses a `def` with more than 4,095 parameters (4,096 is refused, 4,095 is accepted) with `jq: error: too many function parameters or local function definitions (max 4095)` and `jq: 1 compile error`, exit 3.
@@ -15261,6 +15309,17 @@ What follows is the missing-file behaviour of the features that route input diff
   A fault at the end of a `--seq` text is raised there too, and `-R` reports a file that did not open when the line read from past it is reached, after the lines before it (`jq -R -c error ab.txt missing.json` errors for `a`, then reports `missing.json`, then errors for `b` at `missing.json:0`).
   Still named after the last file that opened: a plain `--stream-errors` without `-n`, and the closing event after a missing file in the middle of the list.
 
+### A `--slurpfile` file or data import that ends at a 4,096-byte read boundary keeps its last value (#7664) — deliberate divergence
+
+jq 1.7.1 and 1.8.2 drop the last value of a `--slurpfile` file or a data import (`import "d" as $d;`) when the file ends where one of `jv_load_file`'s 4,096-byte reads ends, or inside the few bytes it reads on to finish a UTF-8 sequence, and read a file that is not JSON in the same place as an empty stream.
+A file of 4,095 spaces and `1` is `[]` there, and so are 4,095 spaces and `[`, 4,096 bytes of `a`, and 4,095 bytes of `a` followed by `\xe2\x82!`; at 4,095 or 4,097 bytes the same files are `[1]` and parse errors.
+The cause is `jv_load_file`'s read loop (`src/jv_file.c`): a read that fills the buffer leaves `feof` unset, so the parser takes that buffer as partial, and the next `fread` returns nothing and leaves the loop without handing the parser its final flag, so the token still pending is neither finished nor reported.
+The main input, `--rawfile`, `-f` and `import ... {raw: true}` are not affected: the first is another reader, and the others read raw.
+Upstream has an open fix, [jqlang/jq#3686](https://github.com/jqlang/jq/pull/3686) ("Finalize slurped JSON files when EOF follows a full read buffer"), not merged as of 2026-11-22.
+`succinctly jq` reads such a file as it reads any other: the last value is kept (`[1]`), and a file that is not JSON is refused (`Bad JSON in --slurpfile ...`, exit 2, or `error loading data file ...`, exit 3).
+Matching jq would discard a value and accept corrupt input without a word, which is the exception to fidelity of [ADR-0018](../../adrs/adr-0018.md), so the divergence is kept.
+Pinned by `tests/jq_cli/i7664.rs` at 4,095, 4,096, 4,097 and 8,192 bytes and on the 4,098-byte file above, through both routes (jq's answers on the same files are in the test).
+
 ## Bare `..`/`recurse` on a `$var` off the register (#3048; its nested-fold residual closed by #4779)
 
 `resolve_node_sink`'s bare-recursion arm (#2761) emits the identity seed of an untracked
@@ -15670,6 +15729,35 @@ jq 1.8.2 also passes the array through `timegm` (`mktime` for `strflocaltime`) b
 `succinctly jq` does not follow that change: it formats the fields as given, as jq 1.7.1 does, and a short array is formatted the same way.
 `succinctly yq` is not changed: real yq has none of these builtins, and `--jq-extensions` reaches the jq code above.
 Pinned by `tests/jq_cli/i7532.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`) under `TZ=UTC` and avoid the C library's share (no `%Z`, `%z` or `%s`, no date before 1900, no field the normalisation would move).
+
+## No program with a terminal on both standard input and output is jq's usage error (#7462)
+
+jq's `main.c` takes `.` for a missing program `if (!isatty(STDOUT_FILENO) || !isatty(STDIN_FILENO))`, and prints its usage and exits 2 otherwise.
+So `jq`, `jq -c`, `jq -e`, `jq -n` and `jq --arg x 1` (options, not a program) run with a terminal on both sides print the usage on stderr and exit 2 at once, in jq 1.7.1 and in jq 1.8.2.
+`succinctly jq` waited for input there (and `jq -n` printed `null`); it now prints its short usage text (`jq_short_usage`, which carries this build's version in the first line, as for #7439) and exits 2.
+A pipe or a redirect on either side makes the program `.`, as before: `jq` with a terminal on stdin and a pipe on stdout waits for input, and `jq -n` with a terminal on stdin and a pipe on stdout prints `null`, in all three.
+The usage text itself is succinctly's own, as for `-h` (the `cli/help-exit` ledger entry); the exit status and not waiting are what is matched.
+No test can give the process a terminal, so the decision is a function (`no_program_is_a_usage_error`) with a unit test over every combination, and the run is a manual check.
+Give the binary a pseudo-terminal for both standard input and output:
+
+```console
+$ python3 - <<'PY'
+import pty, os, subprocess, time
+for argv in (["succinctly", "jq"], ["succinctly", "jq", "-c"], ["succinctly", "jq", "-n"]):
+    m, s = pty.openpty()
+    p = subprocess.Popen(argv, stdin=s, stdout=s, stderr=subprocess.PIPE)
+    os.close(s)
+    t = time.time()
+    while p.poll() is None and time.time() - t < 4:
+        time.sleep(0.1)
+    print(argv, p.poll())
+    if p.poll() is None:
+        p.kill()
+PY
+```
+
+Each prints `2`; before the fix the first two were still running after 4 s and the third was `0`.
+Pinned by `tests/jq_cli/i7462.rs` (the pipe sides) and the unit test in `jq_runner.rs`.
 
 ## `@urid`: jq 1.8.2's behaviour for the format, jq 1.7.1's for `format("urid")`
 

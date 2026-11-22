@@ -1600,8 +1600,12 @@ fn nwise_expansion(mut args: Vec<Expr>) -> Expr {
     // `n` and `$n` are jq's own names. An argument expression sits outside the scope of both
     // (`a` of the two-argument form is evaluated under `$__nwise_m` alone).
     const BODY: &str = "def n: if length <= $n then . else .[0:$n] , (.[$n:] | n) end; n";
+    // The template binds `$n` with `as`, whose body the parser refuses at the native-stack floor
+    // (#7475); a program parsed close to the floor reaches this from inside its own parse, so the
+    // template is parsed with the floor lifted, as a fixed, shallow text (#7676).
     let template = |source: String| {
-        parse_with_mode(&source, ParserMode::Jq).expect("jq's _nwise template parses")
+        super::eval::with_native_stack_floor_lifted(|| parse_with_mode(&source, ParserMode::Jq))
+            .expect("jq's _nwise template parses")
     };
     if args.len() == 1 {
         Expr::As {
@@ -18584,6 +18588,26 @@ mod tests {
                 "`{program}` (the `{word}` form) does not parse with --jq-extensions"
             );
         }
+    }
+
+    /// #7676: the `_nwise` template binds `$n` with `as`, whose body the parser refuses at the
+    /// native-stack floor (#7475). A program that reaches the floor in its own parse reaches the
+    /// template there, and its refusal was a panic (`expect`), not the program's refusal: it is
+    /// parsed with the floor lifted. A program with nothing the floor checks before `_nwise`
+    /// stands for that one here, with no stack left.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_nwise_template_parses_at_the_native_stack_floor_7676() {
+        for src in ["[1,2,3] | _nwise(2)", "[1,2,3] | _nwise(.; 2)"] {
+            let at_floor = crate::jq::with_stack_budget(0, || parse(src));
+            assert_eq!(at_floor, parse(src), "{src}");
+        }
+        // The program's own binding is still refused there.
+        let refused = crate::jq::with_stack_budget(0, || parse("1 as $x | [1,2,3] | _nwise(2)"));
+        assert_eq!(
+            refused.map_err(|e| e.message),
+            Err(String::from("memory exhausted"))
+        );
     }
 
     /// #6684: `_nwise(n)` and `_nwise(a; n)` are expanded to jq's definitions at the call site, in

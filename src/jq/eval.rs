@@ -36247,6 +36247,16 @@ fn may_hold_assertion(pattern: &str) -> bool {
             .any(|assertion| pattern.contains(assertion))
 }
 
+/// Whether `pattern` could hold a gap Oniguruma ends a quantifier at (#7654): a `(?#..)` comment,
+/// or, where the `x` flag may be on, a blank or a `#` comment. A pattern with none keeps the
+/// borrowed fast path of [`refuse_possessive_quantifier_for`].
+#[cfg(feature = "regex")]
+fn may_hold_quantifier_gap(pattern: &str, extended: bool) -> bool {
+    pattern.contains("(?#")
+        || ((extended || inline_extended(pattern))
+            && pattern.contains(|c: char| c.is_whitespace() || c == '#'))
+}
+
 /// Whether an inline flag group (`(?x)`, `(?ix:...)`, `(?-x)`) names the extended flag, so the
 /// pattern may hold comments and blanks Oniguruma ignores (#5535).
 #[cfg(feature = "regex")]
@@ -36971,6 +36981,12 @@ fn interval_quantifier_at(chars: &[char], at: usize) -> Option<(usize, bool)> {
 /// Escapes, character classes, `\Q..\E`, `(?#..)` and, under `x`, `#` comments are stepped over.
 /// The `x` flag is the argument's as inline flags change it (`(?x)`, `(?-x)`, `(?x:...)`, #7464),
 /// so a blank and a `#` comment under an inline `(?x)` are stepped over as under the argument.
+/// Such a gap, and a `(?#..)` comment, ends a quantifier in Oniguruma, so a `?` or `+` after one is a
+/// new quantifier on the quantified atom, not its lazy or possessive marker: `a{1,2} ?` under `x` is
+/// written `(?:a{1,2})?` and `(a)? +` is written `(?:(a)?)+` (#7654).
+/// A quantifier after a lazy or a possessive one on an atom the scan can place reaches it already
+/// written out as Oniguruma reads it (`super::onig_quantifier`, #7682), so the refusal of a lazy
+/// quantifier followed by `+` is left for the atoms that rewrite cannot place.
 #[cfg(all(feature = "regex", test))]
 fn refuse_possessive_quantifier(
     pattern: &str,
@@ -36991,11 +37007,13 @@ fn refuse_possessive_quantifier_for(
     extended: bool,
     suppress_empty: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
-    // Cheap exit for the common pattern: a possessive `+` follows a quantifier character.
+    // Cheap exit for the common pattern: a possessive `+` follows a quantifier character, and
+    // nothing could stand between a quantifier and a `?` or `+` that follows it (#7654).
     if !pattern
         .as_bytes()
         .windows(2)
         .any(|pair| pair[1] == b'+' && matches!(pair[0], b'*' | b'+' | b'?' | b'}'))
+        && !may_hold_quantifier_gap(pattern, extended)
     {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
@@ -37039,14 +37057,43 @@ fn refuse_possessive_quantifier_for(
     // A lazy quantifier directly followed by `+` is a repeat of a repeat in jq, and the second
     // engine reads it otherwise, so a pattern with one stays on the first engine.
     let mut lazy_then_plus = false;
-    let mut opens: Vec<usize> = Vec::new();
-    let mut closes: Vec<usize> = Vec::new();
-    // #6218: under `n`, a lazy quantifier followed by `+` is written as the plain group of its atom
-    // and lazy quantifier, `(?:a??)+`, which jq reads it as and the engines answer as jq does.
-    let mut plain_opens: Vec<usize> = Vec::new();
+    // The groups written around an atom and its quantifiers: where each opens and closes, and
+    // whether it is atomic (`(?>`, a possessive quantifier, #6172) or plain (`(?:`). #6218: under
+    // `n`, a lazy quantifier followed by `+` is written as the plain group of its atom and lazy
+    // quantifier, `(?:a??)+`, which jq reads it as and the engines answer as jq does.
+    let mut wraps: Vec<(usize, usize, bool)> = Vec::new();
+    // Whether an atomic group was written, which a lazy quantifier followed by `+` refuses.
+    let mut atomic = false;
+    // #7654: Oniguruma ends a quantifier at a blank or a `#` comment under `x`, and at a `(?#..)`
+    // comment, so a `?` or `+` after one is a new quantifier on the quantified atom
+    // (`a{1,2} ?` is `(?:a{1,2})?`, `(a)? +` is `(?:(a)?)+`), where the crate, which drops the
+    // blank, would read the lazy `a{1,2}?` and the possessive `(a)?+`. Such a quantifier is written
+    // on the plain group of the atom and the quantifiers before it, and the gap is dropped.
+    // Whether the token just read ended a quantifier (a greedy or fixed one, its lazy `?` or its
+    // possessive `+`), and the gap since a quantifier ended: where it ended and where the gap began.
+    let mut quantified = false;
+    let mut gap: Option<(usize, usize)> = None;
     let mut i = 0;
     while i < chars.len() {
         let before = std::mem::replace(&mut last, Last::Other);
+        let after_quantifier = std::mem::take(&mut quantified);
+        let gap_before = gap.take();
+        let in_gap = (x_on && (chars[i].is_whitespace() || chars[i] == '#'))
+            || (chars[i] == '('
+                && chars.get(i + 1) == Some(&'?')
+                && chars.get(i + 2) == Some(&'#'));
+        if in_gap {
+            // A gap after a quantifier is carried until the next token (#7654).
+            gap = gap_before.or_else(|| after_quantifier.then_some((i, i)));
+        } else if let Some((ended, gap_start)) = gap_before {
+            if matches!(chars[i], '?' | '+') {
+                // An atom the scan cannot place keeps the crate's reading, as it always had.
+                if let Some(start) = atom.filter(|_| !unsure) {
+                    wraps.push((start, ended, false));
+                    drops.extend(gap_start..i);
+                }
+            }
+        }
         match chars[i] {
             '\\' if chars.get(i + 1) == Some(&'Q') => {
                 // A quoted run is literal up to `\E`, or to the end. A quantifier after it repeats
@@ -37241,8 +37288,8 @@ fn refuse_possessive_quantifier_for(
                         _ => None,
                     };
                     if let Some(start) = group {
-                        opens.push(start);
-                        closes.push(i + 1);
+                        wraps.push((start, i + 1, true));
+                        atomic = true;
                     }
                     drops.push(i);
                     // Only `)` follows, so there is nothing left to scan.
@@ -37252,9 +37299,10 @@ fn refuse_possessive_quantifier_for(
                     // The group makes the repeat atomic, so the `+` goes, which also spares the
                     // second engine an interval it would read as a repeat of a repeat.
                     Some(start) if !unsure => {
-                        opens.push(start);
-                        closes.push(i + 1);
+                        wraps.push((start, i + 1, true));
+                        atomic = true;
                         drops.push(i);
+                        quantified = true;
                         i += 1;
                     }
                     _ => return Err(refusal()),
@@ -37264,6 +37312,7 @@ fn refuse_possessive_quantifier_for(
             // after it applies to that.
             '+' if before == Last::Fixed => {
                 drops.push(i);
+                quantified = true;
                 i += 1;
                 if chars.get(i) == Some(&'?') {
                     optional.push(i);
@@ -37282,19 +37331,27 @@ fn refuse_possessive_quantifier_for(
                     && !inline_x
                 {
                     if let Some(start) = atom {
-                        plain_opens.push(start);
-                        closes.push(i + 1);
+                        wraps.push((start, i + 1, false));
                     }
                 }
+                quantified = true;
                 i += 1;
             }
             '*' | '+' | '?' => {
                 last = Last::Greedy;
+                quantified = true;
                 i += 1;
             }
             '{' => match interval_quantifier_at(&chars, i) {
+                // #7654: `{,n}` with no lower count is literal text to jq (`"a{,2}" | test("a{,2}")`
+                // is `true`), so a quantifier after it repeats its `}`.
+                Some((end, true)) if !chars.get(i + 1).is_some_and(char::is_ascii_digit) => {
+                    atom = Some(end - 1);
+                    i = end;
+                }
                 Some((end, comma)) => {
                     last = if comma { Last::Greedy } else { Last::Fixed };
+                    quantified = true;
                     i = end;
                 }
                 None => {
@@ -37310,31 +37367,31 @@ fn refuse_possessive_quantifier_for(
             }
         }
     }
-    if lazy_then_plus && !opens.is_empty() {
+    if lazy_then_plus && atomic {
         return Err(refusal());
     }
-    if drops.is_empty() && opens.is_empty() && plain_opens.is_empty() {
+    if drops.is_empty() && wraps.is_empty() {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
-    // Every list is in ascending order once sorted, so each is walked once.
-    opens.sort_unstable();
-    plain_opens.sort_unstable();
+    // Every list is in ascending order once sorted, so each is walked once. Of the groups that open
+    // at one place, the one that closes last opens first, so that each closes where it should
+    // (`a* ?+b` is `(?>(?:a*)?)b`); a wrap is only ever around atoms the scan read whole, so two never
+    // cross.
+    wraps.sort_unstable_by_key(|&(open, close, _)| (open, core::cmp::Reverse(close)));
+    drops.sort_unstable();
+    let mut closes: Vec<usize> = wraps.iter().map(|&(_, close, _)| close).collect();
     closes.sort_unstable();
     let mut dropped = drops.iter().copied().peekable();
     let mut swapped = optional.iter().copied().peekable();
-    let mut opening = opens.iter().copied().peekable();
-    let mut plain_opening = plain_opens.iter().copied().peekable();
+    let mut opening = wraps.iter().copied().peekable();
     let mut closing = closes.iter().copied().peekable();
     let mut rewritten = String::new();
     for at in 0..=chars.len() {
         while closing.next_if_eq(&at).is_some() {
             rewritten.push(')');
         }
-        while opening.next_if_eq(&at).is_some() {
-            rewritten.push_str("(?>");
-        }
-        while plain_opening.next_if_eq(&at).is_some() {
-            rewritten.push_str("(?:");
+        while let Some((_, _, atomic)) = opening.next_if(|&(open, ..)| open == at) {
+            rewritten.push_str(if atomic { "(?>" } else { "(?:" });
         }
         let Some(&c) = chars.get(at) else { break };
         if dropped.next_if_eq(&at).is_some() {
@@ -37598,6 +37655,10 @@ fn build_regex_uncached<S: EvalSemantics>(
         // #6252: the absence operator is written as the loop it is.
         let absence = rewrite_absence_operator(pattern, extended);
         let pattern = absence.as_deref().unwrap_or(pattern);
+        // #7682: a quantifier that follows a quantifier is written as the tree Oniguruma builds
+        // (`a??++` is `(?>a*?)`), one quantifier per item, before the possessive scan reads it.
+        let stacked = super::onig_quantifier::rewrite(pattern, extended);
+        let pattern = stacked.as_deref().unwrap_or(pattern);
         let scanned =
             refuse_possessive_quantifier_for(pattern, extended, n_flag).unwrap_or_else(|refusal| {
                 deferred_refusal.get_or_insert(refusal);
@@ -37766,7 +37827,24 @@ fn build_regex_uncached<S: EvalSemantics>(
                     .as_deref()
                     .and_then(|written| build_fancy_regex_with::<S>(written, modes))
             });
-            if let Some(re) = built {
+            // #7670: under `n` a repeated group that can match empty keeps its last, empty
+            // iteration, as it does without the flag (#6069): the capture rewrite writes that
+            // iteration into the pattern, which the engine then searches in its not-empty mode.
+            // The pattern as written answers a search that exhausts the budget on the rewrite
+            // (#6488), and a pattern the rewrite leaves alone, or whose rewrite the engine refuses,
+            // is searched as written.
+            let rewritten = (modes.not_empty && !modes.longest)
+                .then(|| not_empty_capture_rewrite::<S>(&pattern, modes))
+                .flatten();
+            let engine = match (rewritten, built) {
+                (Some((re, groups)), as_written) => Some(RegexEngine::RewrittenFancy {
+                    re,
+                    groups,
+                    as_written: as_written.map(Box::new),
+                }),
+                (None, built) => built.map(RegexEngine::Fancy),
+            };
+            if let Some(engine) = engine {
                 // #6085: an `l` search with `\K` measures a match from where its attempt began.
                 // Under the `x` flag the closing parenthesis follows a newline, so that a `#`
                 // comment at the end of the pattern cannot swallow it; an inline `(?x)`, a switch
@@ -37783,7 +37861,7 @@ fn build_regex_uncached<S: EvalSemantics>(
                 })
                 .flatten();
                 return Ok(JqRegex {
-                    engine: RegexEngine::Fancy(re),
+                    engine,
                     needs_trailing_nl_check: false,
                     exact_end: None,
                     caret_end: None,
@@ -38417,6 +38495,32 @@ fn rewritten_engine<S: EvalSemantics>(
                 .then_some(RegexEngine::Rewritten { re, groups })
         })
     })
+}
+
+/// The capture rewrite of `pattern` (#6069) on `fancy-regex` with the search policy `modes` sets
+/// (`n`, #7670), or `None` when the rewrite leaves the pattern alone or the engine refuses it.
+///
+/// Not for a pattern the engine reads with an atomic group (a possessive quantifier, which jq's
+/// syntax reads after a lazy one, `(a)??+`): the rewrite reads the pattern with the `regex` crate's
+/// parser, which has none, and would write the repeat without it.
+#[cfg(feature = "regex")]
+fn not_empty_capture_rewrite<S: EvalSemantics>(
+    pattern: &str,
+    modes: FancyModes,
+) -> Option<(fancy_regex::Regex, super::onig_capture_loop::LoopRewrite)> {
+    let (expr, _) = parse_fancy_tree(prepare_fancy_pattern(pattern)?)?;
+    if expr.has_descendant_or_self(|e| matches!(e, fancy_regex::Expr::AtomicGroup(_))) {
+        return None;
+    }
+    let groups = super::onig_capture_loop::rewrite(pattern)?;
+    let re = build_fancy_regex_with::<S>(
+        &groups.pattern,
+        FancyModes {
+            rewritten: true,
+            ..modes
+        },
+    )?;
+    (re.captures_len() == groups.compiled_groups).then_some((re, groups))
 }
 
 /// The engine for `pattern` written by the loop rewrite with its groups copied (#6332), or `None`
@@ -39908,6 +40012,18 @@ fn scan_fancy_pattern(pattern: &str) -> Option<(String, bool)> {
                     };
                     if reversed || chars.get(j + 1) == Some(&'+') {
                         return None;
+                    }
+                    // #7669: a `?` right after a fixed interval makes it reluctant in jq's syntax
+                    // (Perl_NT has no `ONIG_SYN_FIXED_INTERVAL_IS_GREEDY_ONLY`), and a reluctant
+                    // `x{n}` still matches `n` times: `"a" | test("(?>a){2}?a")` is `false`.
+                    // `fancy-regex`'s Oniguruma mode reads it as another quantifier, Ruby's
+                    // `(?:x{n})?`, so the `?` is dropped. A quantifier after it then applies to
+                    // `x{n}` in both (`x{n}??` is `(?:x{n})?`, `x{n}?+` is `(?:x{n})+`).
+                    if hi.is_none() && chars.get(j + 1) == Some(&'?') {
+                        out.extend(&chars[i..=j]);
+                        at_start = false;
+                        i = j + 2;
+                        continue;
                     }
                 }
             }
@@ -62278,10 +62394,10 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // attempt to iterate through [1]" where this resolver answered
         // nothing at exit 0 (`{} | path(last(.[]))` alone raises too, but
         // for a different reason -- `.[]` on the trackable, genuinely empty
-        // `{}` produces zero outputs, so `last` folds to `null`, and jq
-        // rejects that computed `null` as "Invalid path expression with
+        // `{}` produces zero outputs, so 1.7.1's `last` folds to `null`, and
+        // jq rejects that computed `null` as "Invalid path expression with
         // result null", the same boundary `test_argument_navigation_builtins_forward_a_computed_result_2746`
-        // pins).
+        // pins; jq 1.8.2's `last` yields nothing there instead, #7518).
         //
         // All three results are computed values, never a path into the
         // document (like `[f]` just below, unlike `first`/`limit`/`nth`,
@@ -62363,7 +62479,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                     }
                 }
                 Some(branch) => untracked_at_register(branch.value, register),
-                None => untracked_at_register(Cow::Owned(OwnedValue::Null), register),
+                // jq 1.8: an `f` that yields nothing leaves `last(f)` with nothing to emit
+                // (jqlang/jq#3179, #7518); 1.7.1 emitted an untracked `null` here.
+                None => {
+                    return match flow {
+                        ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
+                        ResolveFlow::Exhausted | ResolveFlow::Stopped => ResolveFlow::Exhausted,
+                    };
+                }
             };
             forward_drained_branch(flow, result, sink)
         }
@@ -95238,10 +95361,11 @@ fn eval_owned_many_doors_answer<S: EvalSemantics>(
         }
         Expr::LastExpr(stream) | Expr::Builtin(Builtin::LastStream(stream)) => {
             let items = owned_stream_items(stream, input)?;
-            Some(vec![match items.last() {
-                Some(item) => leave(item)?,
-                None => OwnedValue::Null,
-            }])
+            // jq 1.8: nothing when the stream is empty (jqlang/jq#3179, #7518).
+            Some(match items.last() {
+                Some(item) => vec![leave(item)?],
+                None => vec![],
+            })
         }
         Expr::NthExpr { n, expr: stream } | Expr::Builtin(Builtin::NthStream(n, stream)) => {
             let n = usize::try_from(owned_integer_literal(n)?).ok()?;
@@ -99502,33 +99626,32 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Evaluate `last(expr)` - take last output.
 ///
-/// jq defines `last(f)` as `reduce f as $x (null; $x)`, and `reduce` always
-/// produces exactly one output — so an empty operand answers the *seed*,
-/// `null`, not nothing (#1521). Oracle-confirmed: `jq -n 'last(empty)'` is
-/// `null`, as is `[] | last(.[])`.
-///
-/// `first(f)` is deliberately **not** symmetric and must not be "fixed" to
-/// match: it is `label $out | (f, break $out)`, which simply has nothing to
-/// yield, and `jq -n 'first(empty)'` is genuinely empty. The asymmetry is in
-/// jq's own definitions, so ADR-0018 rule 3 says reproduce it. (The *0-arity*
-/// `first`/`last` are `.[0]`/`.[-1]` and answer `null` on `[]`; that is a
-/// different construct and already correct.)
+/// jq 1.8 yields nothing when `f` yields nothing: `[last(empty)]` and
+/// `[last(range(0))]` are `[]`, like `first(empty)` (jqlang/jq#3179, a fix of
+/// 1.7.1's `reduce f as $x (null; $x)` definition, which answered the seed
+/// `null`; #7518). An error after the final value still raises
+/// (`last(1,error("x"))` does not answer `1`) -- `last` cannot short-circuit.
+/// The *0-arity* `first`/`last` are `.[0]`/`.[-1]` and answer `null` on `[]`;
+/// that is a different construct and unchanged.
 ///
 /// No local `optional` handling is needed for `last(f)?`: post-#693,
 /// `Expr::Optional(inner)` evaluates `inner` with the *ambient* `optional`
 /// (never forced `true`) and catches the resulting `Error`/`Partial(_,
 /// Error)` itself, one layer out, so this function's own `optional`
 /// parameter is always `false` on every dispatch path that can reach it
-/// today. `last(empty)?` still answers `null` and `last(error("x"))?` is
-/// still empty — that split is entirely the outer `Expr::Optional`/
-/// `eval_try` boundary's job, not this function's.
+/// today. `last(error("x"))?` is still empty -- that is entirely the outer
+/// `Expr::Optional`/`eval_try` boundary's job, not this function's.
 fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     if let Some(fold) = last_as_reduce(expr) {
-        return eval_single::<W, S>(&fold, value, optional);
+        // The closing `.[]?` of the fold answers its one value as a collection of one.
+        return match eval_single::<W, S>(&fold, value, optional) {
+            QueryResult::ManyOwned(vs) => owned_vec_to_result(vs),
+            other => other,
+        };
     }
     let result = eval_single::<W, S>(expr, value, optional);
     match result.materialize_cursor() {
@@ -99536,14 +99659,14 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => match vs.into_iter().next_back() {
             Some(last) => QueryResult::One(last),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
         QueryResult::Owned(v) => QueryResult::Owned(v),
         QueryResult::ManyOwned(vs) => match vs.into_iter().next_back() {
             Some(last) => QueryResult::Owned(last),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
-        QueryResult::None => QueryResult::Owned(OwnedValue::Null),
+        QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
@@ -99558,12 +99681,18 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// jq's own definition of `last(f)`, `reduce f as $x (null; $x)`, when `f` makes the values it
-/// emits (#5377). `reduce` holds one value at a time and streams its source, `range` included,
-/// so `last(range(30000000) * 2)` stays flat where collecting the generator first held every
-/// value it made (killed at 3 GB; jq's is 2.5 MB). Whatever `last` does with an empty source, an
-/// error after the final value (`last(1, error("x"))` raises, it does not answer `1`) and a
-/// `break` or `halt` is then `reduce`'s own.
+/// `last(f)` as a fold over `f`'s outputs, when `f` makes the values it emits (#5377). jq's
+/// `reduce` holds one value at a time and streams its source, `range` included, so
+/// `last(range(30000000) * 2)` stays flat where collecting the generator first held every value
+/// it made (killed at 3 GB; jq's is 2.5 MB). An error after the final value
+/// (`last(1, error("x"))` raises, it does not answer `1`) and a `break` or `halt` is then
+/// `reduce`'s own.
+///
+/// jq 1.8 answers nothing for an `f` that yields nothing (#7518, jqlang/jq#3179), which a bare
+/// `reduce f as $x (null; $x)` cannot say: it answers its seed. jq 1.8.2 keeps a flag beside the
+/// last value; here the accumulator is the value boxed in a one-element array (`null` while
+/// nothing arrived), and the closing `.[]?` unboxes it -- or, over the seed `null`, yields
+/// nothing.
 ///
 /// `None` for navigation alone (`.[]`, `.a[] | select(.b)`, `..`): its outputs are nodes of the
 /// document, which a collecting `last` holds as cursors -- a pointer each -- where `reduce` would
@@ -99574,11 +99703,16 @@ pub(crate) fn last_as_reduce(f: &Expr) -> Option<Expr> {
     // `map(g)` is one output, a sequence that stays lazy through `last` (#725); there is nothing
     // to stream.
     let one_lazy_output = matches!(unwrap_paren(f), Expr::Builtin(Builtin::Map(_)));
-    (!is_register_navigation(f) && !one_lazy_output).then(|| Expr::Reduce {
-        input: Box::new(f.clone()),
-        patterns: vec![Pattern::Var(String::from(LAST_VAR))],
-        init: Box::new(Expr::Literal(Literal::Null)),
-        update: Box::new(Expr::Var(String::from(LAST_VAR))),
+    (!is_register_navigation(f) && !one_lazy_output).then(|| {
+        Expr::pipe(vec![
+            Expr::Reduce {
+                input: Box::new(f.clone()),
+                patterns: vec![Pattern::Var(String::from(LAST_VAR))],
+                init: Box::new(Expr::Literal(Literal::Null)),
+                update: Box::new(Expr::Array(Box::new(Expr::Var(String::from(LAST_VAR))))),
+            },
+            Expr::Optional(Box::new(Expr::Iterate)),
+        ])
     })
 }
 
@@ -113475,7 +113609,7 @@ fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: last(expr) - output only the last value from expr (stream version)
 ///
-/// Mirrors [`eval_last_expr`]'s `null`-for-an-empty-stream rule (#1521); see
+/// Mirrors [`eval_last_expr`]'s nothing-for-an-empty-stream rule (#7518); see
 /// its doc comment for the rule and for why no local `optional` handling is
 /// needed here either. Unlike `eval_last_expr`, this function is never
 /// actually reached from parsed `succinctly jq`/`succinctly yq` filter text
@@ -113507,13 +113641,13 @@ fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Owned(v) => QueryResult::Owned(v),
         QueryResult::Many(results) => match results.into_iter().next_back() {
             Some(last) => QueryResult::Owned(to_owned_or_suppress!(&last, optional)),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
         QueryResult::ManyOwned(results) => match results.into_iter().next_back() {
             Some(last) => QueryResult::Owned(last),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
-        QueryResult::None => QueryResult::Owned(OwnedValue::Null),
+        QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
@@ -118334,6 +118468,11 @@ mod native_stack {
         Guard(previous)
     }
 
+    /// Unregister the budget for the caller's scope (#7676); the guard restores it.
+    pub(crate) fn lift() -> Guard {
+        Guard(BUDGET.with(|b| b.replace((0, 0))))
+    }
+
     impl Drop for Guard {
         fn drop(&mut self) {
             BUDGET.with(|b| b.set(self.0));
@@ -118352,6 +118491,10 @@ mod native_stack {
     pub(crate) struct Guard;
 
     pub(crate) fn enter(_here: usize, _reach: usize) -> Guard {
+        Guard
+    }
+
+    pub(crate) fn lift() -> Guard {
         Guard
     }
 }
@@ -118414,6 +118557,19 @@ pub fn with_stack_budget<R>(available: usize, f: impl FnOnce() -> R) -> R {
 pub(crate) fn native_stack_exhausted() -> bool {
     let (origin, reach) = native_stack::budget();
     origin != 0 && origin.abs_diff(stack_address()) > reach
+}
+
+/// Run `f` with this thread's native-stack floor lifted (#7676), for a parse of fixed text the
+/// crate supplies itself: a path-mode prelude definition on its first use, the `_nwise` template.
+/// Either can be reached anywhere, the floor included, and since #7475 the parser refuses there,
+/// but neither has a caller that could take the refusal: it would be a panic. Such a parse is
+/// shallow and bounded (a unit test pins the stack each takes, `TRUSTED_PARSE_STACK` in
+/// `path_mode`'s tests), so the half of the stack below the floor pays for it, as it pays for
+/// every other bounded step taken past the floor (ADR-0025). Never for a program's own text,
+/// which is as deep as it is written.
+pub(crate) fn with_native_stack_floor_lifted<R>(f: impl FnOnce() -> R) -> R {
+    let _lifted = native_stack::lift();
+    f()
 }
 
 /// How many bytes of stack this thread may still spend before [`native_stack_exhausted`] holds,
@@ -125149,6 +125305,62 @@ mod tests {
             );
             // ...so the arm itself refuses the already-bound body.
             refuse();
+        }
+    }
+
+    /// #7676: the path-mode interpreter parses a prelude definition on its first use, wherever
+    /// the evaluation is. Since #7475 the parser refuses at the native-stack floor, and a first use
+    /// there panicked in `PreludeDef::expr` instead of the call refusing. Each program runs on a
+    /// thread of its own, so every definition it calls is parsed there for the first time, with
+    /// no stack left, through both evaluators' entries.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_first_prelude_use_at_the_floor_refuses_7676() {
+        type Entry = fn(&Expr, JsonCursor<'_, Vec<u64>>) -> Result<(), String>;
+        fn refusal(result: QueryResult<'_, Vec<u64>>) -> Result<(), String> {
+            match result {
+                QueryResult::Error(e)
+                    if e.message.ends_with("exceeded maximum recursion depth") =>
+                {
+                    Ok(())
+                }
+                other => Err(format!("expected a refusal, got {other:?}")),
+            }
+        }
+        let entries: [(&str, Entry); 2] = [
+            ("eval_full", |expr, root| {
+                refusal(eval_full::<Vec<u64>, JqSemantics>(expr, root))
+            }),
+            ("eval", |expr, root| {
+                refusal(eval::<Vec<u64>, JqSemantics>(expr, root))
+            }),
+        ];
+        for filter in [
+            "def f: .; [path(.a | to_entries | f)]",
+            "def f: .; [path(.a | map(.) | f)]",
+            "def f: .; [path(.a | select(true) | f)]",
+            "def f: .; [path(.a | paths | f)]",
+            "def f: .; [path(.a | walk(.) | f)]",
+            "def f: .; [path(.a | with_entries(.) | f)]",
+        ] {
+            assert!(
+                matches!(
+                    crate::jq::path_mode::route(&parse(filter).expect("parses")),
+                    crate::jq::path_mode::Route::Interpreter
+                ),
+                "{filter}: runs through the path-mode interpreter"
+            );
+            for (entry, run) in entries {
+                let outcome = std::thread::spawn(move || {
+                    let expr = parse(filter).expect("parses");
+                    let json = br#"{"a":{"b":1}}"#;
+                    let index = JsonIndex::build(json);
+                    with_stack_budget(0, || run(&expr, index.root(json)))
+                })
+                .join()
+                .unwrap_or_else(|_| Err(String::from("panicked")));
+                assert_eq!(outcome, Ok(()), "{entry}: {filter}");
+            }
         }
     }
 
@@ -149517,6 +149729,33 @@ mod tests {
         }
     }
 
+    /// #7669: a `?` right after a fixed interval is the reluctant marker in jq's Perl_NT syntax, and
+    /// a reluctant `x{n}` is `x{n}`; `fancy-regex`'s Oniguruma mode would read it as `(?:x{n})?`. It
+    /// is dropped there, and only there: not after a range, a gap, an escape or inside a class.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_prepare_fancy_pattern_drops_the_lazy_mark_of_a_fixed_interval_7669() {
+        let prepared = |pattern: &str| prepare_fancy_pattern(pattern).expect(pattern);
+        assert_eq!(prepared("(?>a){2}?a"), "(?>a){2}a");
+        assert_eq!(prepared("(?>a){02}?a"), "(?>a){02}a");
+        // A quantifier after the reluctant interval stays, and repeats `x{n}`.
+        assert_eq!(prepared("(?>a){2}??"), "(?>a){2}?");
+        assert_eq!(prepared("(?>a){2}?+a"), "(?>a){2}+a");
+        assert_eq!(prepared("(?=a)a{0}?a{1}?"), "(?=a)a{0}a{1}");
+        for pattern in [
+            "(?=a)a{2,2}?",
+            "(?=a)a{1,2}?",
+            "(?=a)a{2,}?",
+            "(?x)(?=a)a{2} ?",
+            "(?=a)a\\{2}?",
+            "(?=a)[{2}?]",
+            "(?=a)(?#{2}?)",
+        ] {
+            assert_eq!(prepared(pattern), pattern);
+        }
+        assert_eq!(prepared("(?=a)b{,2}?"), "(?=a)b\\{,2}?");
+    }
+
     #[cfg(feature = "regex")]
     #[test]
     fn test_prepare_fancy_pattern_escapes_5502() {
@@ -149552,6 +149791,29 @@ mod tests {
             r"a\",
         ] {
             assert!(prepare_fancy_pattern(pattern).is_none(), "{pattern}");
+        }
+    }
+
+    /// #7670: under `n` a loop whose body can match empty is read through the capture rewrite,
+    /// except where `fancy-regex` reads the pattern with an atomic group (a possessive quantifier).
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_not_empty_capture_rewrite_skips_an_atomic_reading_7670() {
+        let modes = FancyModes {
+            not_empty: true,
+            ..FancyModes::default()
+        };
+        for pattern in ["(a*)*", "(a?)+", "(?:(a?)+)?", "(?:(a)??)+"] {
+            assert!(
+                not_empty_capture_rewrite::<JqSemantics>(pattern, modes).is_some(),
+                "{pattern}"
+            );
+        }
+        for pattern in ["(a)??++", "(?:(a?)+)++", "a*", "(a)"] {
+            assert!(
+                not_empty_capture_rewrite::<JqSemantics>(pattern, modes).is_none(),
+                "{pattern}"
+            );
         }
     }
 
@@ -160306,6 +160568,49 @@ mod tests {
         ] {
             let got = refuse_possessive_quantifier(pattern, extended);
             assert_eq!(got.ok().as_deref(), Some(want), "{pattern} x={extended}");
+        }
+    }
+
+    /// #7654: a blank or `#` comment under `x`, and a `(?#..)` comment, ends a quantifier, so a `?` or
+    /// `+` after one repeats the quantified atom: the gap is dropped and the atom and the quantifiers
+    /// before it are grouped. A gap with no quantifier before it, or none after it, is left alone,
+    /// and so is a blank where `x` is off.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_quantifier_after_a_gap_repeats_the_quantified_atom_7654() {
+        for (pattern, extended, want) in [
+            ("a{1,2} ?$", true, "(?:a{1,2})?$"),
+            ("(a)? +", true, "(?:(a)?)+"),
+            ("a{1,2} #c\n?$", true, "(?:a{1,2})?$"),
+            ("a{1,2}(?#c)?$", false, "(?:a{1,2})?$"),
+            ("(?x)a{2} ?", false, "(?x)(?:a{2})?"),
+            ("(?x:a* +)b", false, "(?x:(?:a*)+)b"),
+            ("a*? +", true, "(?:a*?)+"),
+            ("(a) ? +", true, "(?:(a) ?)+"),
+            // The later quantifier's group opens first: `a* ?+b` is the possessive `(?:a*)?+`.
+            ("a* ?+b", true, "(?>(?:a*)?)b"),
+            ("a* ? ?", true, "(?:(?:a*)?)?"),
+            ("a{2}+ ?", true, "(?:a{2})?"),
+            // `{,n}` is literal text: a quantifier after it repeats its `}`.
+            ("a{,2}+b", false, "a{,2}+b"),
+            ("a{,2} ?", true, "a{,2} ?"),
+        ] {
+            let got = refuse_possessive_quantifier(pattern, extended);
+            assert_eq!(got.ok().as_deref(), Some(want), "{pattern:?} x={extended}");
+        }
+        for (pattern, extended) in [
+            ("a ?", true),
+            ("a* ?", false),
+            ("a* b", true),
+            ("(?-x)a* ?", true),
+            ("a* (?x)?", false),
+        ] {
+            let got = refuse_possessive_quantifier(pattern, extended);
+            assert_eq!(
+                got.ok().as_deref(),
+                Some(pattern),
+                "{pattern:?} x={extended}"
+            );
         }
     }
 
@@ -187691,7 +187996,7 @@ mod never_identical_tests_5176 {
         ] {
             let fold = last_as_reduce(&operand(source));
             assert!(
-                matches!(fold, Some(Expr::Reduce { .. })),
+                matches!(&fold, Some(Expr::Pipe(stages)) if matches!(stages[0], Expr::Reduce { .. })),
                 "{source}: {fold:?}"
             );
         }
