@@ -62,9 +62,9 @@ use super::error::{dump_truncated_with, Control, EvalError};
 use super::eval::{
     apply_compare_op, arith_combine, arith_negate, compare_values, definition_zero_for,
     is_tree_descending_f, native_stack_exhausted, owned_to_string, range_max_exceeded_error,
-    recurse_max_items, recurse_node_cost, recurse_value_size, EvalTag, JqSemantics, LoopCounters,
-    QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_LOOP_ROUNDS, MAX_RANGE,
-    MAX_RANGE_TOTAL, REPEAT_WIDTH_BUDGET,
+    recurse_max_items, recurse_node_cost, recurse_value_size, with_native_stack_floor_lifted,
+    EvalTag, JqSemantics, LoopCounters, QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES,
+    MAX_LOOP_ROUNDS, MAX_RANGE, MAX_RANGE_TOTAL, REPEAT_WIDTH_BUDGET,
 };
 use super::expr::{
     ArithOp, Builtin, CompareOp, Expr, Literal, MergeFlags, NumberKey, ObjectKey, Param, Pattern,
@@ -1012,24 +1012,38 @@ impl PreludeDef {
     /// The definition's `FuncDef`, its chain `rest` an identity.
     ///
     /// The first call of a definition parses it wherever the evaluation is, no
-    /// longer at the top. One definition's parse is shallow (the unit tests parse
-    /// every one on a 2 MiB debug thread), and the native-stack floor
-    /// ([`native_stack_exhausted`]) leaves half of
-    /// the registered stack unspent, so the parse has room at the floor.
+    /// longer at the top. One definition's parse is shallow (a unit test parses
+    /// every one on a thread of `TRUSTED_PARSE_STACK`), and the native-stack floor
+    /// ([`native_stack_exhausted`]) leaves half of the registered stack unspent,
+    /// so the parse has room at the floor. It runs with the floor lifted
+    /// (#7676): since #7475 the parser refuses at the floor, which here was a
+    /// panic, and the call this lookup serves refuses there anyway.
     fn expr(&self) -> &Expr {
-        self.parsed.get_or_init(|| {
-            let src = format!("def {} .", self.source);
-            let def = parse(&src).unwrap_or_else(|e| panic!("prelude: {e:?}"));
-            mark_loadvn(&def)
-        })
+        self.parsed.get_or_init(|| self.parse())
+    }
+
+    /// The definition's `FuncDef`, parsed; out of line, so a first use costs
+    /// [`Self::expr`]'s frame nothing.
+    #[cold]
+    #[inline(never)]
+    fn parse(&self) -> Expr {
+        let src = format!("def {} .", self.source);
+        let def = with_native_stack_floor_lifted(|| parse(&src))
+            .unwrap_or_else(|e| panic!("prelude: {e:?}"));
+        mark_loadvn(&def)
     }
 }
 
 impl Prelude {
     /// Read the prelude's definitions and parse its one-off expressions. Panics
-    /// only if [`PRELUDE`] itself fails to parse, which a unit test pins.
+    /// only if [`PRELUDE`] itself fails to parse, which a unit test pins. A
+    /// thread's first path-mode run builds it, which can be at the native-stack
+    /// floor, so its parses run with the floor lifted too (#7676).
     pub fn new() -> Self {
-        let parse_ok = |src: &str| parse(src).unwrap_or_else(|e| panic!("prelude: {e:?}"));
+        let parse_ok = |src: &str| {
+            with_native_stack_floor_lifted(|| parse(src))
+                .unwrap_or_else(|e| panic!("prelude: {e:?}"))
+        };
         let defs: Vec<PreludeDef> = prelude_definitions().map(PreludeDef::new).collect();
         let index = defs
             .iter()
