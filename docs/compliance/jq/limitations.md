@@ -11973,6 +11973,25 @@ and the `jq-linux-arm64` release binaries):
   (`XXX99`, `XXX-25`; jq applies them as written on macOS and clamped to ±24h on glibc).
 - **`TZ=5` with `%Z`** raises `strflocaltime/1: unknown system failure` in jq (libc's `%Z` is empty
   for a name-less zone); this prints `UTC`.
+- **A POSIX string takes any number of digits in its numbers** (#7783), as tzcode's `getnum` and glibc's `sscanf` read them: an offset's hours (0 to 24), minutes and seconds (0 to 59), and a rule's day numbers and times (hours 0 to 167), so `XYZ5:30:5`, `XYZ1:5`, `XYZ005`, `XYZ+005:00`, `XYZ5:030`, `EST5EDT4:5,M3.2.0,M11.1.0`, `M3.2.0/2:3`, `M03.02.00` and `J060` apply as in jq on macOS and glibc alike.
+  They were UTC here, because jiff's POSIX parser takes exactly two digits for minutes and seconds and at most two for an offset's hours; the string is respelled with two-digit fields before jiff reads it.
+  The forms the two C libraries read differently keep the reading they had, which is POSIX's where POSIX has one (a name of at least three characters) and otherwise one of the two libraries':
+
+  | `TZ`                                    | jq 1.7.1, macOS              | jq 1.7.1, glibc                     | succinctly |
+  |-----------------------------------------|------------------------------|-------------------------------------|------------|
+  | `XY5`, `X5`, `<AB>-5`, `<1>-5`, `<>5`   | the offset                   | UTC                                 | UTC        |
+  | `XYZ5D`, `XYZ5DD`, `XYZ5<D>`            | `-5` and US daylight time    | `-5` all year                       | UTC        |
+  | `XYZ5:60`, `XYZ5:99`                    | UTC                          | `-5:59`                             | UTC        |
+  | `XYZ5:30:60`                            | `-5:31`                      | `-5:30:59`                          | UTC        |
+  | `XYZ5:`, `XYZ5::`, `XYZ5:30:`           | UTC                          | the offset in winter, UTC in summer | UTC        |
+  | `XYZ:5`                                 | `-5`                         | UTC                                 | UTC        |
+  | `XYZ025`                                | `-25`                        | `-24` (clamped, as above)           | UTC        |
+  | `EST5EDT4:60,M3.2.0,M11.1.0`            | UTC                          | `EDT` at `-4:59`                    | UTC        |
+  | `EST5EDT,M3.2.0/-1,M11.1.0`, `/+2`      | UTC                          | the rule                            | the rule   |
+  | `EST5EDT,M3.2.0/168,M11.1.0`, `/2:60`   | UTC                          | the rule                            | UTC        |
+
+  Captured from `localtime` over 70 spellings of `TZ` on jq 1.7.1 (macOS and x86_64 glibc) and jq 1.8.2 (macOS), which agrees with the macOS jq 1.7.1 on every row.
+  `succinctly yq` reads `TZ` through the same code, where real yq reads a POSIX string as UTC (#7618).
 - **A POSIX string with a daylight-time name and no rule** (`EST5EDT`) gets the US rule
   (`M3.2.0,M11.1.0`) when no tz file carries the name, as libc does — newer distributions no
   longer ship `EST5EDT`. For a US-offset name every jq build tried agrees (`XYZ5XYD`); for another
