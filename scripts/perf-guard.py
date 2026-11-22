@@ -595,15 +595,6 @@ DEFAULT_THRESHOLD = 5.0
 # scan and re-render its comment above names. Remove the override once `main` carries the change
 # and the row reads ~0% against a merge-base that includes it.
 #
-# `users_keys_unsorted` / `arrays_first_map_iterate` (#7437) carry overrides of the same one-off
-# kind: the first pass over each source now folds every 128 KiB piece into its smallest and largest
-# byte (`util::simd::nul::min_max`) to find a NUL, and a piece whose largest byte is below 0x80 is
-# ASCII, so it skips the AVX2 UTF-8 validator it ran before. Both rows are whole-file reads whose
-# own query does little, so the skipped validation is a large share of them (-7.2% / -7.4% x86_64,
-# -4.0% / -2.6% ARM64-Linux, where `validate_utf8` is the scalar validator, against the PR's own
-# merge-base; every other row moved by -3.9% to +0.0%). Remove them once `main` carries the change
-# and the rows read ~0% against a merge-base that includes it.
-#
 # `seq_name_bad_last` (#6619) carries a TIGHTER threshold than the default (3.0 against 5.0), the one
 # override here that is not a loosening. #6594 (#6500) converts each record as the queue is read
 # instead of materializing every record first, and what that saves is mostly peak memory (1.1 GB
@@ -623,8 +614,6 @@ QUERY_THRESHOLDS = {
     "users_update_select": 30.0,
     "users_yq_del_select": 15.0,
     "users_compact_latefail": 85.0,
-    "users_keys_unsorted": 10.0,
-    "arrays_first_map_iterate": 10.0,
 }
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
