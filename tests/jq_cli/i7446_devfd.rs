@@ -36,6 +36,20 @@ fn command(program: &[&str], file: std::fs::File) -> Command {
     command
 }
 
+/// Kills the process `pid` unless the returned sender is dropped within two minutes: a run that
+/// blocks fails its test (its pipe closes, or its status is a signal) instead of hanging the suite.
+fn watchdog(pid: u32) -> std::sync::mpsc::Sender<()> {
+    let (done, ended) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            ended.recv_timeout(std::time::Duration::from_secs(120))
+        {
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+        }
+    });
+    done
+}
+
 /// Runs `program` over `path` as descriptor 7 and, once 64 KiB of the output is read, appends
 /// `tail` to the file; the whole output and whether the run succeeded.
 fn run_held(program: &[&str], path: &Path, tail: &[u8]) -> Result<(String, bool)> {
@@ -43,6 +57,7 @@ fn run_held(program: &[&str], path: &Path, tail: &[u8]) -> Result<(String, bool)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
+    let _watchdog = watchdog(child.id());
     let mut stdout = child.stdout.take().expect("piped");
     let mut out = vec![0u8; 65536];
     stdout.read_exact(&mut out)?;
@@ -96,7 +111,13 @@ fn a_descriptor_read_part_way_is_read_from_its_offset_where_the_path_shares_it_7
     let mut file = std::fs::File::open(&path)?;
     let offset = (0..skipped).map(|i| record(i).len()).sum::<usize>();
     file.seek(SeekFrom::Start(offset as u64))?;
-    let out = command(&["-c", ".id"], file).output()?;
+    let child = command(&["-c", ".id"], file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let watchdog = watchdog(child.id());
+    let out = child.wait_with_output()?;
+    drop(watchdog);
     let first = if cfg!(target_os = "macos") {
         skipped
     } else {

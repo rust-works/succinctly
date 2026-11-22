@@ -24202,8 +24202,13 @@ mod tests {
             let held = std::fs::File::open(&big).expect("open");
             let named = format!("/dev/fd/{}", held.as_raw_fd());
             assert!(takes(&["jq", ".", &named]), "{named}");
-            assert!(!takes(&["jq", ".", "/dev/fd/1"]));
-            assert!(!takes(&["jq", ".", "/dev/fd/2"]));
+            // Asked of the lone-file gate itself, not of `takes`: where the test's standard output
+            // or error is a pipe (CI), the gate turning them down hands the run to the named-pipe
+            // route, and on Linux the path opens that pipe's reading end, whose read waits forever
+            // for bytes nobody writes, as jq's would.
+            for fd in ["/dev/fd/1", "/dev/fd/2"] {
+                assert!(lone_regular_file(&[PathBuf::from(fd)], 0).is_none(), "{fd}");
+            }
             assert!(!takes(&["jq", ".", "/dev/fd/x"]));
         }
         // A run that reads the stream whole or otherwise.
