@@ -38,6 +38,7 @@ use crate::cli::output::{
     DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, StreamFault, Terminator,
 };
 
+mod eof_location;
 mod window;
 
 /// One word taken by `--args` (a string) or `--jsonargs` (JSON text), kept
@@ -140,7 +141,7 @@ impl JqCommand {
     /// from `filter` to `program_file`, so `filter` is then always `None`.
     ///
     /// Only words clap already captured are resequenced. `succinctly jq` and
-    /// `sjq` never give clap a positional word: `walk_jq_argv` (`main.rs`)
+    /// `sjq` never give clap a positional word: `read_jq_argv` (`main.rs`)
     /// reads them as jq does and `set_positional_words` sets them (#7494),
     /// so there is nothing here to resequence. A `JqCommand` clap parsed by
     /// itself (the `Cli` tree, the unit tests below) still arrives with
@@ -523,7 +524,7 @@ fn report_syntax_error(errors: &[jq::ParseError], source: &str, location: &str) 
 /// trailer, so a module's syntax error can sit among other entries in one
 /// report (#3573).
 fn print_syntax_error(message: &str, source: &str, offset: usize, location: &str) {
-    let (line_no, line_text, column) = line_at_offset(source, offset);
+    let (line_no, line_text, column) = syntax_error_site(source, offset);
     print_position_error(
         format_args!("{message}"),
         location,
@@ -1236,7 +1237,7 @@ fn module_meta_outcome(
     let program = match jq::parse_program(&contents) {
         Ok(program) => program,
         Err(e) => {
-            let (line_no, line_text, column) = line_at_offset(&contents, e.position);
+            let (line_no, line_text, column) = syntax_error_site(&contents, e.position);
             return LoadFailure(position_error_text(
                 format_args!("{}", e.message),
                 &canonical.display().to_string(),
@@ -1718,9 +1719,10 @@ struct FailureWalk<'a> {
     /// jq's own directory, which a `search` entry's `$ORIGIN/` stands for (#5338).
     jq_origin: &'a Path,
     /// The modules already reached, by canonical file, whether or not they
-    /// failed: jq loads a module once, so a second path to it reports and
+    /// parsed: jq loads a module once, so a second path to it reports and
     /// counts nothing. Recorded when a module is finished, not when it starts,
-    /// so a module still being walked is a cycle, not a repeat.
+    /// so a module still being walked is a cycle, not a repeat. A module that
+    /// could not be read is never recorded, as jq never caches one (#7709).
     visited: BTreeSet<PathBuf>,
     /// The modules whose own directives are being walked, by canonical file.
     chain: Vec<PathBuf>,
@@ -1800,20 +1802,25 @@ impl FailureWalk<'_> {
         if self.visited.contains(&canonical) {
             return 0;
         }
-        let errors = match read_library(file) {
+        match read_library(file) {
             // An unreadable module is counted like a data file that did not
-            // load, and the walk goes on (see [`ReportEntry::Data`]).
+            // load, and the walk goes on (see [`ReportEntry::Data`]). It is not
+            // recorded as reached: jq's `load_library` (1.7.1 and 1.8.2) returns
+            // before it enters a file it could not open in its table, so every
+            // directive that reaches it reports it again (#7709).
             Err(e) => {
                 self.entries.push(ReportEntry::Data(DataFileFailure {
                     detail: library_read_detail(&canonical, &e),
-                    path: canonical.clone(),
+                    path: canonical,
                 }));
                 1
             }
-            Ok(contents) => self.parsed_module(file, &canonical, contents),
-        };
-        self.visited.insert(canonical);
-        errors
+            Ok(contents) => {
+                let errors = self.parsed_module(file, &canonical, contents);
+                self.visited.insert(canonical);
+                errors
+            }
+        }
     }
 
     /// [`Self::module`] for a module whose text was read.
@@ -2663,12 +2670,14 @@ impl ModuleLoader {
     ///   `bad`, `m1`, `1 compile error`, but a *module* that includes `m1`,
     ///   included beside the same data import, is `bad`, `m1`, `2 compile
     ///   errors`);
-    /// - a module is reached **once**, whether or not it failed: a second
+    /// - a module is reached **once**, whether or not it parsed: a second
     ///   `include` of it, or a second path to it, prints nothing and counts
     ///   nothing.
     ///
     /// - a module that exists but cannot be read is printed as `error loading
-    ///   data file` and counted, and the walk goes on, as for a data file.
+    ///   data file` and counted, and the walk goes on, as for a data file --
+    ///   and, as for a data file, at **every** directive that reaches it: jq
+    ///   1.7.1 and 1.8.2 never cache a file they could not open (#7709).
     ///
     /// A module cycle is #2865's divergence (jq runs out of stack). It ends the
     /// walk the way a missing module does, after what jq printed before it
@@ -4147,12 +4156,34 @@ impl std::error::Error for MalformedJsonError {}
 
 /// Adapter to use `std::io::Write` with `core::fmt::Write` methods, for the
 /// M2 fast path's non-`LazySeq` writes (#1576) -- mirrors `yq_runner.rs`'s
-/// identical local type.
-struct FmtWriter<W>(W);
+/// local type, and keeps the write's own error, which `core::fmt::Error` cannot carry.
+struct FmtWriter<W> {
+    out: W,
+    failed: Option<std::io::Error>,
+}
+
+impl<W> FmtWriter<W> {
+    fn new(out: W) -> Self {
+        Self { out, failed: None }
+    }
+}
 
 impl<W: Write> core::fmt::Write for FmtWriter<W> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.0.write_all(s.as_bytes()).map_err(|_| core::fmt::Error)
+        self.out.write_all(s.as_bytes()).map_err(|e| {
+            self.failed = Some(e);
+            core::fmt::Error
+        })
+    }
+}
+
+/// What a formatted write that failed reports: the write's own error when it kept one, so a failed
+/// write to standard output is jq's `writing output failed: <strerror>`, exit 2 (#7214, #7732),
+/// and `write error` otherwise.
+fn formatted_write_failure(failed: Option<std::io::Error>) -> anyhow::Error {
+    match failed {
+        Some(e) => anyhow::Error::new(e),
+        None => anyhow::anyhow!("write error"),
     }
 }
 
@@ -4860,6 +4891,23 @@ fn locate_identifier_from(
     ))
 }
 
+/// [`line_at_offset`] for a syntax error: one the parser found at the end of the text is placed
+/// where jq places it, at the start of its lexer's last match (#7711, see [`eof_location`]), so a
+/// program ending in a newline names the line of its last token or comment, as jq does, and not
+/// the empty line after it.
+fn syntax_error_site(source: &str, offset: usize) -> (usize, String, usize) {
+    let mut offset = if offset >= source.len() {
+        eof_location::last_match_start(source)
+    } else {
+        offset
+    };
+    // jq's lexer matches a stray non-ASCII character a byte at a time; the line is the same.
+    while !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    line_at_offset(source, offset)
+}
+
 /// The 1-based line number, that line's text, and the 0-based column, for a
 /// byte `offset` into `filter` (#2085).
 ///
@@ -5121,6 +5169,10 @@ impl Drop for RunIndex<'_> {
 ///
 /// A value the program builds is bounded by the native-stack floor `main` registered, not by
 /// `MAX_VALUE_TREE_DEPTH`, as jq bounds it by its C stack alone (#5554).
+/// `succinctly jq`'s refusal of jq's `--run-tests` (#7715), after `jq: `.
+const RUN_TESTS_UNSUPPORTED: &str =
+    "--run-tests is not supported: succinctly jq does not run jq's test files";
+
 pub fn run_jq(args: JqCommand) -> Result<i32> {
     let run = jq::with_value_depth_on_stack_floor(|| run_jq_on_stack_floor(args));
     // #7455: a regular file on standard input the run did not read to the end is left where jq's
@@ -5143,7 +5195,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 }
 
 fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
-    super::sigpipe::restore_default();
+    // SIGPIPE as the process inherited it, as jq keeps it (#5547, #7732).
+    super::sigpipe::restore_inherited();
     // A run starts with every file still to open (#6006): a thread that ran jq before must not
     // carry a missing file's stop into this run.
     FIRST_OPEN_FAILURE_AT.with(|first| first.set(None));
@@ -5205,6 +5258,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // allocations) to a process about to end was a quarter of the run (#5673).
     let mut context = std::mem::ManuallyDrop::new(context);
     share_named_strings(&mut context);
+
+    // jq's test-file runner is not implemented (#7715, docs/compliance/jq/limitations.md). jq
+    // reaches the option after the named arguments before it, so their errors come first.
+    if args.run_tests {
+        report_usage_error(RUN_TESTS_UNSUPPORTED);
+        return Ok(exit_codes::USAGE_ERROR);
+    }
 
     // `-f` with no program file is jq 1.8.2's usage error (#7439), reached after the named
     // arguments are read, as jq reads them while it parses argv.
@@ -7199,6 +7259,51 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     ))
 }
 
+/// jq's refusal of an `--argjson` text or a `--jsonargs` word that is not JSON, with its usage hint:
+/// jq's wording does not name the variable, the value or its position (#3051, #3096).
+fn invalid_json_text_passed_to(flag: &str) -> String {
+    format!(
+        "invalid JSON text passed to --{flag}\n\
+         Use jq --help for help with command-line options,\n\
+         or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
+    )
+}
+
+/// Whether `text` is one JSON text as `--argjson` and `--jsonargs` read it: the check jq's option
+/// loop makes where it reads the word (#7712).
+pub(crate) fn is_json_text(text: &str) -> bool {
+    parse_json_value(text).is_ok()
+}
+
+/// [`invalid_json_text_passed_to`] on standard error, and jq's exit status for it (2), where jq's
+/// option loop stops at the word (#7712).
+pub(crate) fn exit_invalid_json_text(flag: &str) -> ! {
+    report_usage_error_bytes(invalid_json_text_passed_to(flag).as_bytes());
+    std::process::exit(exit_codes::USAGE_ERROR)
+}
+
+/// The error `run_jq` would report binding `args`' named and positional arguments, reported, and
+/// the status to exit with (#7712); `None` when they all bind. `parse_jq` asks it of the options
+/// before the word jq's option loop stops at, which jq reads first.
+pub(crate) fn report_named_argument_error(args: &JqCommand) -> Option<i32> {
+    match build_context(args) {
+        Ok(context) => {
+            // As `run_jq` keeps its context: a `--slurpfile` value is not worth freeing at exit (#5673).
+            std::mem::forget(context);
+            None
+        }
+        Err(BuildContextError::Usage(message)) => {
+            report_usage_error_bytes(&message);
+            Some(exit_codes::USAGE_ERROR)
+        }
+        Err(BuildContextError::Other(e)) => {
+            // As `main` reports an error `run_jq` returns.
+            eprintln!("Error: {e:?}");
+            Some(1)
+        }
+    }
+}
+
 /// Build the evaluation context from command-line arguments.
 fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
     let mut context = EvalContext::default();
@@ -7253,12 +7358,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                 {
                     // jq's own wording doesn't name the flag's variable (`x`) at all.
                     let json_value = parse_json_value(value).map_err(|_| {
-                        BuildContextError::Usage(
-                            "invalid JSON text passed to --argjson\n\
-                             Use jq --help for help with command-line options,\n\
-                             or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
-                                .into(),
-                        )
+                        BuildContextError::Usage(invalid_json_text_passed_to("argjson").into())
                     })?;
                     context.named.insert(name.clone(), json_value);
                 }
@@ -7330,12 +7430,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
             PositionalWord::Json(text) => {
                 // jq's own wording doesn't name the offending value or position.
                 let json_value = parse_json_value(text).map_err(|_| {
-                    BuildContextError::Usage(
-                        "invalid JSON text passed to --jsonargs\n\
-                         Use jq --help for help with command-line options,\n\
-                         or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
-                            .into(),
-                    )
+                    BuildContextError::Usage(invalid_json_text_passed_to("jsonargs").into())
                 })?;
                 context.positional.push(json_value);
             }
@@ -12176,28 +12271,42 @@ fn blank_nul_number_tails_in<'a>(
             0
         };
         // The part of the first line the earlier files hold, when the NUL is on that line, behind
-        // the BOM jq skips at the stream's front.
+        // the BOM jq skips at the stream's front: where in each file it starts, last file first.
         let mut head: Vec<u8> = Vec::new();
+        let mut parts: Vec<(usize, usize)> = Vec::new();
         if !raw[..nul].contains(&b'\n') {
             for (index, earlier) in before.iter().enumerate().rev() {
-                if let Some(last) = earlier.iter().rposition(|&b| b == b'\n') {
-                    head.splice(0..0, earlier[last + 1..].iter().copied());
+                let line_break = earlier.iter().rposition(|&b| b == b'\n');
+                let from = match line_break {
+                    Some(last) => last + 1,
+                    None if Some(index) == front => {
+                        crate::cli::front_matter::leading_bom_len(earlier)
+                    }
+                    None => 0,
+                };
+                head.splice(0..0, earlier[from..].iter().copied());
+                parts.push((index, from));
+                if line_break.is_some() {
                     break;
                 }
-                let skip = if Some(index) == front {
-                    crate::cli::front_matter::leading_bom_len(earlier)
-                } else {
-                    0
-                };
-                head.splice(0..0, earlier[skip..].iter().copied());
             }
         }
-        succinctly::jq::blank_nul_number_tails(
+        let rewrote = succinctly::jq::blank_nul_number_tails(
             &mut raw[bom..],
             Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
             bom,
-            &head,
+            &mut head,
         );
+        // #7749: a number that started in the earlier files is rewritten over them too.
+        if rewrote && !head.is_empty() {
+            let mut end = head.len();
+            for &(index, from) in &parts {
+                let earlier = &mut *before[index];
+                let len = earlier.len() - from;
+                earlier[from..].copy_from_slice(&head[end - len..end]);
+                end -= len;
+            }
+        }
     }
 }
 
@@ -13240,6 +13349,9 @@ fn hand_back_short_pipe(named: Option<&PathBuf>, bytes: Vec<u8>, error: Option<s
         None => {
             STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
             STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(bytes));
+            // #7741: the probe met the end (or a failure), which a terminal gives once per `^D`; a
+            // route that reads on after the bytes handed back reads no more, as jq's stdio does not.
+            super::stdin_offset::note_end_of_file();
         }
         // A read of a named pipe that fails after it opened leaves what it read as the pipe's bytes.
         Some(path) => NAMED_PUSHBACK.with(|slot| {
@@ -15711,11 +15823,32 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
         }
         // The scan reads the text after the BOM jq skips (#5291), as `get_inputs` strips it.
         let bom = crate::cli::front_matter::leading_bom_len(&bytes);
+        // The front validated and searched for a NUL in one read of it (#7437).
+        let scan = succinctly::jq::scan_utf8_and_nul(&bytes[bom..]);
+        // #7748: the number tokens' NUL tails of the front, as the route that reads the source whole
+        // rewrites them ([`blank_nul_number_tails_in`]) and as each window after it is
+        // ([`blank_lazy_window_nul_tails`]), before the scan reads it: the text handed to the lazy
+        // route is the front, and only the windows read after it were rewritten. A NUL whose read
+        // has no newline yet is left to the next read, or to the window that brings the newline.
+        // The rewrite writes ASCII over whole tokens, so a UTF-8 front stays UTF-8; one that was not
+        // is validated again below, as the rewrite may have taken its stray byte out of a tail.
+        if scan.nul {
+            succinctly::jq::blank_nul_number_tails(
+                &mut bytes[bom..],
+                Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
+                bom,
+                &mut [],
+            );
+        }
         // Up to the last whole character: the front may end inside one.
-        let valid_end = match std::str::from_utf8(&bytes[bom..]) {
-            Ok(_) => bytes.len(),
-            Err(e) if e.error_len().is_none() => bom + e.valid_up_to(),
-            Err(_) => bom,
+        let valid_end = if scan.utf8 {
+            bytes.len()
+        } else {
+            match std::str::from_utf8(&bytes[bom..]) {
+                Ok(_) => bytes.len(),
+                Err(e) if e.error_len().is_none() => bom + e.valid_up_to(),
+                Err(_) => bom,
+            }
         };
         // The line of a document is jq's count through the read that completes it, which runs to the
         // next newline ([`LineCounter::read_end_line`]): a newline after the chunk's last document
@@ -16016,7 +16149,7 @@ fn blank_lazy_window_nul_tails(text: &mut [u8], kept: usize) {
             &mut text[line_start..],
             Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
             0,
-            &[],
+            &mut [],
         );
     }
 }
@@ -20341,7 +20474,7 @@ fn evaluate_m2_fast_path<W: Write>(
                 numbers,
                 write_result_newline,
             )
-            .map_err(|_| anyhow::anyhow!("write error"))?;
+            .map_err(|_| formatted_write_failure(colored.take_failure()))?;
         if let Some(code) = stats.halt {
             colored.finish()?; // patchcov: coverage tolerate-line reason="unreachable: no M2-streamable program halts, so stats.halt is None here, as in the uncolored arm below (#5415)"
             sink.request_halt(code); // patchcov: coverage tolerate-line reason="unreachable: see the line above (#5415)"
@@ -20355,7 +20488,7 @@ fn evaluate_m2_fast_path<W: Write>(
         record_exit_status(last_output, &stats);
         Ok(true)
     } else {
-        let mut writer = FmtWriter(out);
+        let mut writer = FmtWriter::new(out);
         let stats = result
             .stream_json::<_, JqSemantics>(
                 &mut writer,
@@ -20364,7 +20497,7 @@ fn evaluate_m2_fast_path<W: Write>(
                 numbers,
                 write_result_newline,
             )
-            .map_err(|_| anyhow::anyhow!("write error"))?;
+            .map_err(|_| formatted_write_failure(writer.failed.take()))?;
         if let Some(code) = stats.halt {
             sink.request_halt(code);
             return Ok(true);
@@ -24366,7 +24499,16 @@ mod tests {
         assert!(!takes(&["jq", ".", &missing]));
         // (No path at all reads standard input, which is the test process's own: see
         // `windowed_regular_stdin_takes_only_a_big_regular_file_7024`.)
-        assert!(!takes(&["jq", ".", "-"]));
+        // Standard input, named or not, is asked of the regular-file half of the gate
+        // ([`windowed_source`]), not of `takes`: where the test process's own standard input is a
+        // pipe that nobody closes (`cargo test` from a background shell, #7746), the gate turning it
+        // down hands the run to the pipe route, which reads descriptor 0 for bytes that never come,
+        // as jq's read would.
+        let regular_half = |argv: &[&str]| {
+            let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            windowed_source(&cmd, window::min_windowed_file_bytes()).is_some()
+        };
+        assert!(!regular_half(&["jq", ".", "-"]));
         // #7024: several regular files, 4 MiB or more between them, are one stream read a window at a
         // time; one that is not a regular file, or does not open, leaves the run to the route that
         // reads them whole and says why.
@@ -24399,9 +24541,10 @@ mod tests {
         let mut long_with_directory = with_tinies(40);
         long_with_directory.push(directory.as_str());
         assert!(!takes(&long_with_directory), "one is no regular file");
-        // The test's own standard input, named by path, is no regular file of 1 MiB.
-        assert!(!takes(&["jq", ".", "/dev/stdin"]));
-        assert!(!takes(&["jq", ".", "/dev/fd/0"]));
+        // The test's own standard input, named by path, is no regular file of 1 MiB (and is a file the
+        // run already holds where it is one: never windowed from its start).
+        assert!(!regular_half(&["jq", ".", "/dev/stdin"]));
+        assert!(!regular_half(&["jq", ".", "/dev/fd/0"]));
         // #7446: a descriptor that holds one is, read from where its offset stands; standard output
         // and error are not, whatever they hold.
         #[cfg(unix)]
@@ -24426,6 +24569,43 @@ mod tests {
             argv.extend([".", big.as_str()]);
             assert!(!takes(&argv), "{flags:?}");
         }
+    }
+
+    /// #7746: the test above does not read the process's own standard input. It is run as a child of this
+    /// binary whose standard input is a pipe this test holds open and never writes to, where a read of
+    /// descriptor 0 waits for ever (`cargo test` from a background shell); the child is killed after a
+    /// minute, so a regression fails here instead of hanging the whole run.
+    #[cfg(unix)]
+    #[test]
+    fn the_lone_file_gate_test_ignores_an_open_stdin_pipe_7746() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let mut child = Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "windowed_plain_file_takes_only_regular_files_big_enough_6920_7024",
+                "--test-threads=1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the test binary runs");
+        // Held open: dropping it would end the child's standard input.
+        let _writer = child.stdin.take();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("kill the hung child");
+                child.wait().expect("reaped");
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let status = status.expect("the child read standard input and never returned");
+        assert!(status.success(), "{status}");
     }
 
     /// #7262: a lone `--seq` file the whole-file route could not hold is that route's, which reports it before

@@ -64,6 +64,13 @@ pub(crate) fn at_instant(utc_secs: i64) -> LocalZone {
     backend::at_instant(utc_secs)
 }
 
+/// [`at_instant`] without renaming `tzname`: the zone `mktime` reads a broken-down time in, which
+/// is not a `localtime_r` conversion (#7606: `strflocaltime` of an array leaves `%Z`'s names to
+/// `strptime` alone, in jq 1.8.2 as in jq 1.7.1).
+pub(crate) fn zone_at(utc_secs: i64) -> LocalZone {
+    backend::zone_at(utc_secs)
+}
+
 /// The zone describing a local wall-clock reading given as fields rather than
 /// an instant (`[2024,6,3,18,46,40,3,184] | strflocaltime(...)`). `month` is
 /// 1-12; the fields are as given, may be out of range, and are normalised the
@@ -140,6 +147,10 @@ mod backend_utc {
     use super::LocalZone;
 
     pub(super) fn at_instant(_utc_secs: i64) -> LocalZone {
+        LocalZone::utc()
+    }
+
+    pub(super) fn zone_at(_utc_secs: i64) -> LocalZone {
         LocalZone::utc()
     }
 
@@ -270,6 +281,10 @@ mod backend_jiff {
             offset_secs: i64::from(info.offset().seconds()),
             name: info.abbreviation().to_string(),
         }
+    }
+
+    pub(super) fn zone_at(utc_secs: i64) -> LocalZone {
+        zone_in(system(), utc_secs)
     }
 
     pub(super) fn named_at(name: &str, utc_secs: i64) -> Option<LocalZone> {
@@ -714,6 +729,10 @@ mod backend_posix {
     }
 
     pub(super) fn at_instant(_utc_secs: i64) -> LocalZone {
+        current()
+    }
+
+    pub(super) fn zone_at(_utc_secs: i64) -> LocalZone {
         current()
     }
 

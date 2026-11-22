@@ -90,11 +90,7 @@ fn test_a_possessive_quantifier_followed_by_more_pattern_is_atomic_6172() -> Res
 /// among the atomic rewrites above.
 #[test]
 fn test_a_possessive_quantifier_without_a_known_atom_is_refused_5524() -> Result<()> {
-    for program in [
-        r#"test("\\Qab\\E*+b")"#,
-        r#"test("\\C-a*+b")"#,
-        r#"test("(?i)*+a")"#,
-    ] {
+    for program in [r#"test("\\Qab\\E*+b")"#, r#"test("\\C-a*+b")"#] {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(r#""aab""#))?;
         assert_eq!((stdout.as_str(), code), ("", 5), "{program}: {stderr}");
         assert!(
@@ -102,6 +98,13 @@ fn test_a_possessive_quantifier_without_a_known_atom_is_refused_5524() -> Result
             "{program}: {stderr}"
         );
     }
+    // #7689: a refusal jq makes comes first; jq 1.7.1 and 1.8.2 say so for `(?i)*+a`.
+    let (stdout, stderr, code) = run_jq_full(&["-c", r#"test("(?i)*+a")"#], Some(r#""aab""#))?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "{stderr}");
+    assert!(
+        stderr.contains("target of repeat operator is not specified"),
+        "{stderr}"
+    );
     Ok(())
 }
 

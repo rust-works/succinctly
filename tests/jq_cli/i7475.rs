@@ -52,11 +52,11 @@ fn assert_memory_exhausted(program: &str, (stdout, stderr, code): (String, Strin
 /// Links in each binding chain below: far past the floor of every build the suite runs on. Where
 /// the floor falls depends on the build's frame sizes: an unoptimised build refuses before 100,000
 /// links, but the `opt-level=1` build of CI's x86_64 and macOS `cli-gated` legs admits 150,000 and
-/// refuses 200,000 (measured on an Apple M5), so the issue's 100,000 ran there. A refusal costs the
-/// same whatever the length (the parser stops at the floor: about 1.1 GB of stack, 0.2 s), but an
+/// refuses 200,000 (measured on aarch64), so the issue's 100,000 ran there. A refusal costs the
+/// same whatever the length (the parser stops at the floor: about 1.1 GB of stack, quickly), but an
 /// admitted chain is evaluated by substituting each binding into the rest of the chain, a copy per
-/// link, so its memory grows with the square of its length: 460 MB at 2,000 links, 2.8 GB at
-/// 5,000, and at 100,000 69 GB on the M5 before it was killed and the whole of the 16 GB CI runner.
+/// link, so its memory grows with the square of its length: it exhausted a development laptop and
+/// the whole of the 16 GB CI runner at 100,000 links before the guard existed.
 const LINKS: usize = 1_000_000;
 
 #[test]
