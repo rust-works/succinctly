@@ -5703,22 +5703,22 @@ impl<'a> Parser<'a> {
     ///   (#3038), rejected here on that flag;
     /// - `try`/`label`/`def` are also `Exp`-level in jq's grammar even
     ///   though they can leave the flag `true` (their operands/bodies are
-    ///   Terms), so they are rejected by [`Expr`] variant. That variant test
-    ///   must survive unary `-`: `ExpD`'s own `'-' ExpD` recursion keeps
-    ///   `-try .`, `-label $x | 1`, `-def f: 1; f` inside the value grammar,
-    ///   where real jq 1.7.1 rejects each at compile time, so the check peels
-    ///   [`Expr::Negate`] layers and stops at [`Expr::Paren`] (`{a: -(try .)}`
-    ///   is a legal `Term`). Every other real `Term` shape -- `break $x`,
-    ///   `..`, `.foo?`, `1[0]`, `(if ... end)`, `@fmt`, negative literals --
-    ///   is unaffected.
+    ///   Terms), so they are rejected by the keyword the operand is written
+    ///   with ([`Parser::at_exp_level_keyword`]). That test must survive
+    ///   unary `-`: `ExpD`'s own `'-' ExpD` recursion keeps `-try .`, `-label
+    ///   $x | 1`, `-def f: 1; f` inside the value grammar, where real jq 1.7.1
+    ///   rejects each at compile time, while `{a: -(try .)}` is a legal
+    ///   `Term`. Every other real `Term` shape -- `break $x`, `..`, `.foo?`,
+    ///   `1[0]`, `(if ... end)`, `@fmt`, negative literals -- is unaffected.
     fn parse_expd_term(&mut self) -> Result<Expr, ParseError> {
+        let exp_level_keyword = self.at_exp_level_keyword();
         let outer = core::mem::replace(&mut self.expd_operand, true);
         let term = self.parse_primary();
         self.expd_operand = outer;
         let term = term?;
         self.skip_ws();
 
-        if !self.last_primary_is_term || Self::is_exp_level_shape(&term) {
+        if !self.last_primary_is_term || exp_level_keyword {
             return Err(ParseError::new(
                 "object value after ':' must be a term (parenthesize a full expression)",
                 self.pos,
@@ -5727,17 +5727,28 @@ impl<'a> Parser<'a> {
         Ok(term)
     }
 
-    /// Whether `expr` -- possibly under unary-negation layers -- is an
-    /// `Exp`-level construct that only a full expression may use.
-    fn is_exp_level_shape(expr: &Expr) -> bool {
-        let mut inner = expr;
-        while let Expr::Negate(operand) = inner {
-            inner = operand;
+    /// Whether the text at the cursor -- past whitespace and any unary `-` -- begins with the
+    /// keyword `try`, `label` or `def`: an `Exp`-level construct that only a full expression may
+    /// use ([`Parser::parse_expd_term`]). The cursor is left where it was.
+    ///
+    /// The test reads the source, not the parsed [`Expr`]: a call jq defines in its builtins is a
+    /// `Term` however the parser spells it, and #7602 spells `map(f)`, `with_entries(f)` and
+    /// `walk(f)` with a `?//` in `f` as an [`Expr::FuncDef`], which a variant test refused as if a
+    /// `def` had been written there (#7720).
+    fn at_exp_level_keyword(&mut self) -> bool {
+        let start = self.pos;
+        loop {
+            self.skip_ws();
+            if self.peek() != Some('-') {
+                break;
+            }
+            self.next();
         }
-        matches!(
-            inner,
-            Expr::Try { .. } | Expr::Label { .. } | Expr::FuncDef { .. }
-        )
+        let found = ["try", "label", "def"]
+            .iter()
+            .any(|keyword| self.matches_keyword(keyword));
+        self.pos = start;
+        found
     }
 
     /// Parse a primary expression (atoms and parenthesized expressions), then
