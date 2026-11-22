@@ -119377,6 +119377,16 @@ pub(crate) fn bind_def_call_body(
     // `&def.body` with no clone whatsoever.
     let installed_body = if def.params.is_empty() {
         install_def_calls(&def.body, def, frames + 1, true)
+    } else if binds_by_as_only(def, args) {
+        // #7699: no bare name to substitute and no literal to put in for a `$name`, so
+        // `substitute_params` would only copy the body. Install straight from it, as a
+        // definition with no parameters does, then wrap it in its `as` bindings: each wrapper
+        // is one structural level `install_def_calls` charges a frame for (its `_` arm), so
+        // the body is installed `wrappers` frames deeper, exactly as it was under them.
+        let shared = share_def_call_args(args);
+        let wrappers = def.params.iter().filter(|p| p.is_dollar()).count() as u32;
+        let installed = install_def_calls(&def.body, def, frames + 1 + wrappers, true);
+        bind_dollar_params(installed, &def.params, &shared)
     } else {
         let body = bind_def_call_params(&def.body, &def.params, args);
         // `true`: this is `def`'s own body, the scope that repeats once per
@@ -119385,6 +119395,44 @@ pub(crate) fn bind_def_call_body(
         install_def_calls(&body, def, frames + 1, true)
     };
     Ok(Rc::new(installed_body))
+}
+
+/// Whether binding a call of `def` with `args` substitutes nothing into the body (#7699): no
+/// `$` parameter has a literal argument (#3260 puts the literal in for `$name`), and the body never
+/// reads a parameter by its bare name, so [`substitute_params`] would only copy it. The `$`
+/// parameters are then bound by the `as` wrappers alone.
+///
+/// The bare-name test is remembered on the definition. It is conservative: any zero-argument call
+/// named like a parameter counts as a read, whatever shadows it, outside an [`Expr::Shared`]
+/// (substitution stops there) and outside the bodies of definitions already bound into a
+/// [`Expr::DefCall`] (it does not enter them either; their arguments are searched).
+fn binds_by_as_only(def: &FuncDefData, args: &[Expr]) -> bool {
+    use crate::jq::walk::{search_subexpr, Visit};
+    fn reads_bare(expr: &Expr, params: &[Param]) -> bool {
+        search_subexpr(expr, &mut |e: &Expr| match e {
+            Expr::FuncCall { name, args, .. }
+                if args.is_empty() && params.iter().any(|p| p.name() == name) =>
+            {
+                Visit::Found
+            }
+            Expr::Shared(_) => Visit::Skip,
+            Expr::DefCall { args, .. } => {
+                if args.iter().any(|a| reads_bare(a, params)) {
+                    Visit::Found
+                } else {
+                    Visit::Skip
+                }
+            }
+            _ => Visit::Descend,
+        })
+    }
+    !def.params.iter().zip(args).any(|(param, arg)| {
+        let arg = match arg {
+            Expr::Shared(inner) => inner.expr(),
+            other => other,
+        };
+        param.is_dollar() && matches!(arg, Expr::Literal(_))
+    }) && !def.reads_bare_param_or_init(|body| reads_bare(body, &def.params))
 }
 
 /// Bind every parameter of a `def` call into its own body (#2560, #3149).
@@ -124286,6 +124334,108 @@ mod tests {
                 param_site_reached, !binds_dollar,
                 "substitute_func_param_impl disagrees with params_bind_dollar: {label}"
             );
+        }
+    }
+
+    /// #7699: a definition already bound into the body is read for its arguments only: a bare
+    /// parameter passed to it is a read, and its own body (which may name anything) is not entered.
+    #[test]
+    fn a_bound_definition_in_the_body_is_read_for_its_arguments_7699() {
+        for (src, skips) in [
+            ("def g(x): x; def f($n): [g(n), $n]; f(.)", false),
+            ("def g(x): x; def f($n): [g($n), $n]; f(.)", true),
+            ("def g(n): n; def f($n): [g($n), $n]; f(.)", true),
+        ] {
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = crate::jq::parse(src).expect("parses")
+            else {
+                panic!("a def: {src}");
+            };
+            let g = Rc::new(FuncDefData::new(name, params, *body));
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = install_def_calls(&then, &g, 0, false)
+            else {
+                panic!("an inner def: {src}");
+            };
+            assert!(
+                any_subexpr(&body, &mut |e| matches!(e, Expr::DefCall { .. })),
+                "{src}: g is bound into f's body"
+            );
+            let f = Rc::new(FuncDefData::new(name, params, *body));
+            let Expr::DefCall { args, .. } = install_def_calls(&then, &f, 0, false) else {
+                panic!("a call: {src}");
+            };
+            assert_eq!(binds_by_as_only(&f, &args), skips, "{src}");
+        }
+    }
+
+    /// #7699: a `$`-parameter call whose body reads no parameter by its bare name, with no literal
+    /// argument, is bound without the substitution walk; the bound body must be the one the walk
+    /// built, frame charges included (`install_def_calls` charges each `as` wrapper a frame).
+    #[test]
+    fn a_body_with_nothing_to_substitute_binds_as_the_walk_did_7699() {
+        for (src, skips) in [
+            (
+                "def f($n): if $n == 0 then . + 1 else f($n - 1) | f($n - 1) end; f(.)",
+                true,
+            ),
+            (
+                "def f($m; $i): if $i > $m then . else f($m; $i * 2) | f($m; $i + 1) end; f(.; .)",
+                true,
+            ),
+            (
+                "def f($a; $b; $c): [$a, $b, $c, f($a; $b; $c)]; f(.; .a; .b)",
+                true,
+            ),
+            ("def f($a; $a): $a; f(.a; .b)", true),
+            ("def f($a; b): [$a, f($a; b)]; f(.; .)", false),
+            ("def f($a; b): [$a]; f(.; .)", true),
+            ("def f($n): def g: n; [g, $n]; f(.)", false),
+            ("def f($n): [$n, n]; f(.)", false),
+            (
+                "def f($n): reduce .[] as $x (0; . + $x + $n) | f($n); f(.)",
+                true,
+            ),
+            ("def f($n): def h($n): $n + 1; h($n); f(.)", true),
+            ("def f($n): $n; f(1)", false),
+            ("def f($n; $m): [$n, $m]; f(.; 2)", false),
+            ("def f(x): x; f(.)", false),
+        ] {
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = crate::jq::parse(src).expect("parses")
+            else {
+                panic!("a def: {src}");
+            };
+            let def = Rc::new(FuncDefData::new(name, params, *body));
+            let Expr::DefCall { args, .. } = install_def_calls(&then, &def, 0, false) else {
+                panic!("a call: {src}");
+            };
+            assert_eq!(binds_by_as_only(&def, &args), skips, "{src}");
+            for frames in [0, 7] {
+                let walked = install_def_calls(
+                    &bind_def_call_params(&def.body, &def.params, &args),
+                    &def,
+                    frames + 1,
+                    true,
+                );
+                let bound = bind_def_call_body(&def, &args, frames).expect("binds");
+                assert_eq!(*bound, walked, "{src} at {frames} frames");
+            }
         }
     }
 
