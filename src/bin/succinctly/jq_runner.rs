@@ -4147,12 +4147,34 @@ impl std::error::Error for MalformedJsonError {}
 
 /// Adapter to use `std::io::Write` with `core::fmt::Write` methods, for the
 /// M2 fast path's non-`LazySeq` writes (#1576) -- mirrors `yq_runner.rs`'s
-/// identical local type.
-struct FmtWriter<W>(W);
+/// local type, and keeps the write's own error, which `core::fmt::Error` cannot carry.
+struct FmtWriter<W> {
+    out: W,
+    failed: Option<std::io::Error>,
+}
+
+impl<W> FmtWriter<W> {
+    fn new(out: W) -> Self {
+        Self { out, failed: None }
+    }
+}
 
 impl<W: Write> core::fmt::Write for FmtWriter<W> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.0.write_all(s.as_bytes()).map_err(|_| core::fmt::Error)
+        self.out.write_all(s.as_bytes()).map_err(|e| {
+            self.failed = Some(e);
+            core::fmt::Error
+        })
+    }
+}
+
+/// What a formatted write that failed reports: the write's own error when it kept one, so a failed
+/// write to standard output is jq's `writing output failed: <strerror>`, exit 2 (#7214, #7732),
+/// and `write error` otherwise.
+fn formatted_write_failure(failed: Option<std::io::Error>) -> anyhow::Error {
+    match failed {
+        Some(e) => anyhow::Error::new(e),
+        None => anyhow::anyhow!("write error"),
     }
 }
 
@@ -5143,7 +5165,8 @@ pub fn run_jq(args: JqCommand) -> Result<i32> {
 }
 
 fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
-    super::sigpipe::restore_default();
+    // SIGPIPE as the process inherited it, as jq keeps it (#5547, #7732).
+    super::sigpipe::restore_inherited();
     // A run starts with every file still to open (#6006): a thread that ran jq before must not
     // carry a missing file's stop into this run.
     FIRST_OPEN_FAILURE_AT.with(|first| first.set(None));
@@ -20322,7 +20345,7 @@ fn evaluate_m2_fast_path<W: Write>(
                 numbers,
                 write_result_newline,
             )
-            .map_err(|_| anyhow::anyhow!("write error"))?;
+            .map_err(|_| formatted_write_failure(colored.take_failure()))?;
         if let Some(code) = stats.halt {
             colored.finish()?; // patchcov: coverage tolerate-line reason="unreachable: no M2-streamable program halts, so stats.halt is None here, as in the uncolored arm below (#5415)"
             sink.request_halt(code); // patchcov: coverage tolerate-line reason="unreachable: see the line above (#5415)"
@@ -20336,7 +20359,7 @@ fn evaluate_m2_fast_path<W: Write>(
         record_exit_status(last_output, &stats);
         Ok(true)
     } else {
-        let mut writer = FmtWriter(out);
+        let mut writer = FmtWriter::new(out);
         let stats = result
             .stream_json::<_, JqSemantics>(
                 &mut writer,
@@ -20345,7 +20368,7 @@ fn evaluate_m2_fast_path<W: Write>(
                 numbers,
                 write_result_newline,
             )
-            .map_err(|_| anyhow::anyhow!("write error"))?;
+            .map_err(|_| formatted_write_failure(writer.failed.take()))?;
         if let Some(code) = stats.halt {
             sink.request_halt(code);
             return Ok(true);
