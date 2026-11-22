@@ -40,7 +40,7 @@ use super::eval::{
     bind_def_call, bind_def_call_body, def_call_depth_refusal, pipe_needs_path_context,
     single_valued_pure, yields_at_most_one_value, Flow, PureWalk, MAX_LOOP_ROUNDS,
 };
-use super::expr::{BoundBody, Builtin, Expr, FuncDefData, ObjectKey, PipeStages};
+use super::expr::{BoundBody, Builtin, Expr, FuncDefData, ObjectKey, PipeStages, StringPart};
 use super::resolve::ModuleRun;
 use super::walk::{search_subexpr, Visit};
 
@@ -131,9 +131,21 @@ struct Ctx<'a> {
     /// `label`, a `reduce`, an object, `first`/`last`, a call to another def with arguments, and
     /// a def declared in the body. The tail loop's own question (`wide: false`) is unchanged.
     wide: bool,
-    /// The defs with no parameters declared in the body being walked whose bodies settle (#7713):
-    /// a call to one, by name, settles.
-    settled_locals: &'a [&'a str],
+    /// The defs declared in the body being walked, innermost last, with whether each one's body
+    /// settles (#7713; #7787: with parameters too, in the wide question): a call to one, by name
+    /// and arity, settles when that body does and its arguments do.
+    local_defs: &'a [LocalDef<'a>],
+    /// The bare parameters in scope of the body being walked (#7787, wide only): each reads an
+    /// argument the call that bound it was asked about, so a read of one settles.
+    params: &'a [&'a str],
+}
+
+/// A def declared in a body [`settles`] walks: what a call to it by name settles on.
+#[derive(Clone, Copy)]
+struct LocalDef<'a> {
+    name: &'a str,
+    arity: usize,
+    settles: bool,
 }
 
 /// Whether `expr` yields at most one output and does nothing observable besides
@@ -166,7 +178,8 @@ pub(crate) fn stage_settles(expr: &Expr, jq: bool) -> bool {
             locals: &[],
             own: None,
             wide: false,
-            settled_locals: &[],
+            local_defs: &[],
+            params: &[],
         },
     )
 }
@@ -216,7 +229,7 @@ fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
             if cx.own.is_some_and(|def| {
                 (*name == def.name && args.len() == def.params.len())
                     || (args.is_empty() && def.params.iter().any(|p| p.name() == name))
-            }) =>
+            }) && !shadowed_by_local(cx, name, args.len()) =>
         {
             args.iter().all(|arg| settles(arg, budget, cx))
         }
@@ -233,20 +246,89 @@ fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
         Expr::Builtin(Builtin::GetPath(path) | Builtin::DelPaths(path)) if cx.own.is_some() => {
             settles(path, budget, cx)
         }
-        // #7713: what a recursion's leaves and helpers are written with, each answering at most
-        // once when its parts do: a `try` or `?` (its body's one output, or else its handler's), a
-        // `label` (a `break` only stops it), a `reduce` (one output per output of its initial
-        // value, the rest runs inside it), an object (one per key and value), `first`/`last`
-        // (at most one whatever they read), and a call to another def, which is asked the
-        // question a call at a pipe's head is (its body, remembered on its definition, then its
-        // arguments). Asked only by `call_head_settles`, so the tail loop's question is unchanged.
+        // #7713, #7787: the call-head question (`wide`) reads every form of the language, each by
+        // what it yields: at most one output, and nothing left to run once it has given it but an
+        // `empty`, a `break` or an error (see `comma_settles`). A form that can yield more, or
+        // whose count depends on the values it reads (`.[]`, `..`, `range`, `limit(2; ...)`, the
+        // regex generators), does not settle; nor does a form this walk cannot see into
+        // (a call by namespace). The tail loop's question (`wide: false`) is unchanged.
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Literal(_)
+        | Expr::Var(_)
+        | Expr::TrackedVar(_)
+        | Expr::DeferredVar(_)
+        | Expr::Loc { .. }
+        | Expr::Env
+        | Expr::Not
+        | Expr::Format(_)
+        | Expr::Break(_)
+            if cx.wide =>
+        {
+            true
+        }
+        Expr::Iterate
+        | Expr::RecursiveDescent
+        | Expr::RecursiveDescentWithKeys
+        | Expr::Range { .. }
+        | Expr::Repeat(_)
+        | Expr::While { .. }
+        | Expr::NamespacedCall { .. }
+        | Expr::MetaAssign { .. }
+            if cx.wide =>
+        {
+            false
+        }
+        Expr::Comma(items) if cx.wide => comma_settles(items, budget, cx),
+        // A `try` or `?`: its body's one output, or else its handler's.
         Expr::Try { expr, catch } if cx.wide => {
             settles(expr, budget, cx) && catch.as_deref().map_or(true, |c| settles(c, budget, cx))
         }
+        // A `label` only stops what it holds (a `break` settles, see `comma_settles`).
         Expr::Optional(inner) | Expr::Label { body: inner, .. } if cx.wide => {
             settles(inner, budget, cx)
         }
+        // One output per output of the initial value; the source and the update run inside it.
         Expr::Reduce { init, .. } if cx.wide => settles(init, budget, cx),
+        // One round, for a source and an update that answer once.
+        Expr::Foreach {
+            input,
+            patterns,
+            init,
+            update,
+            extract,
+        } if cx.wide => {
+            patterns.len() == 1
+                && settles(input, budget, cx)
+                && settles(init, budget, cx)
+                && settles(update, budget, cx)
+                && extract.as_deref().map_or(true, |e| settles(e, budget, cx))
+        }
+        // `first`, `last` and `nth(n; f)` answer at most once whatever they read; `limit(n; f)`
+        // does for a literal count of 0 or 1, or for a source that does. (A `?//` that a later
+        // failure retries through them is refused at the question's entry, `call_head_settles`.)
+        Expr::NthExpr { n, .. } if cx.wide => settles(n, budget, cx),
+        Expr::Limit { n, expr } if cx.wide => {
+            limit_settles(n) || (settles(n, budget, cx) && settles(expr, budget, cx))
+        }
+        Expr::Until { cond, update } if cx.wide => {
+            settles(cond, budget, cx) && settles(update, budget, cx)
+        }
+        Expr::As {
+            expr: source, body, ..
+        } if cx.wide => settles(source, budget, cx) && settles(body, budget, cx),
+        // A destructuring bind with one pattern binds once per output of its source; one with
+        // alternatives (`?//`) is retried by a failure raised after it, so it streams.
+        Expr::AsPattern {
+            expr: source,
+            patterns,
+            body,
+        } if cx.wide => {
+            patterns.len() == 1 && settles(source, budget, cx) && settles(body, budget, cx)
+        }
         Expr::Object(entries) if cx.wide => entries.iter().all(|entry| {
             (match &entry.key {
                 ObjectKey::Expr(key) => settles(key, budget, cx),
@@ -258,11 +340,32 @@ fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
         // the streaming route. `last(f)` runs `f` to the end, and jq does not retry through it.
         Expr::FirstExpr(inner) if cx.wide => !super::eval::contains_retrying_pattern_bind(inner),
         Expr::LastExpr(_) if cx.wide => true,
+        Expr::StringInterpolation(parts) if cx.wide => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => settles(inner, budget, cx),
+        }),
+        Expr::IndexExpr { target, key } if cx.wide && cx.jq => {
+            settles(target, budget, cx) && settles(key, budget, cx)
+        }
+        Expr::SliceExpr { target, start, end } if cx.wide && cx.jq => {
+            settles(target, budget, cx)
+                && start.as_deref().map_or(true, |e| settles(e, budget, cx))
+                && end.as_deref().map_or(true, |e| settles(e, budget, cx))
+        }
+        Expr::Error(msg) if cx.wide => msg.as_deref().map_or(true, |m| settles(m, budget, cx)),
+        Expr::Builtin(builtin) if cx.wide => builtin_settles_wide(builtin, budget, cx),
+        // An argument a call captured: caller-scope code, asked the question once (its answer is
+        // remembered on it), so a closure passed down a recursion is not re-walked at each level.
+        Expr::Shared(arg) if cx.wide => arg.settles_or_init(|inner| {
+            let mut fresh = SETTLE_BUDGET;
+            settles(inner, &mut fresh, &Ctx::wide(cx.jq))
+        }),
         Expr::DefCall { .. } if cx.wide => call_head_settles_in(expr, cx.jq, budget),
-        // A def with no parameters declared in the body: its calls settle when its body does. In
-        // both questions: a module's forwarding stub is one (`def g: <link name>;` wrapped into the
-        // body of a def that calls `g`, `jq::ModuleRun`), so a def calling into a module that
-        // reaches a second one kept a tail loop from running in place (#7713).
+        // A def declared in the body: its calls settle when its body does, which is walked with
+        // its own calls taken to settle (induction, as for the definition being asked about) and,
+        // in the wide question, its bare parameters too. In both questions for a def with no
+        // parameters: a module's forwarding stub is one (`def g: <link name>;` wrapped into the
+        // body of a def that calls `g`, `jq::ModuleRun`), #7713.
         Expr::FuncDef {
             name,
             params,
@@ -270,39 +373,67 @@ fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
             then,
             ..
         } => {
-            let body_settles = params.is_empty()
+            let mut inner_defs: Vec<LocalDef<'_>> = cx.local_defs.to_vec();
+            inner_defs.push(LocalDef {
+                name,
+                arity: params.len(),
+                settles: true,
+            });
+            let mut inner_params: Vec<&str> = cx.params.to_vec();
+            if cx.wide {
+                inner_params.extend(params.iter().map(super::expr::Param::name));
+            } else {
+                // The tail loop's question takes no induction step: as before #7787.
+                inner_defs.pop();
+            }
+            let body_settles = (cx.wide || params.is_empty())
                 && settles(
                     body,
                     budget,
                     &Ctx {
-                        own: None,
-                        settled_locals: &[],
+                        // A call from in here to the definition being asked about is still one
+                        // of its recursive calls (wide); the tail loop's question never had one.
+                        own: if cx.wide { cx.own } else { None },
+                        local_defs: &inner_defs,
+                        params: &inner_params,
                         ..*cx
                     },
                 );
-            let mut known: Vec<&str> = cx
-                .settled_locals
-                .iter()
-                .copied()
-                .filter(|local| *local != name.as_str())
-                .collect();
-            if body_settles {
-                known.push(name.as_str());
-            } else if params.is_empty() && cx.settled_locals.contains(&name.as_str()) {
-                // It hides an outer one that settles: a call by the name is now this one.
-                return false;
-            }
+            let mut known: Vec<LocalDef<'_>> = cx.local_defs.to_vec();
+            known.push(LocalDef {
+                name,
+                arity: params.len(),
+                settles: body_settles,
+            });
             settles(
                 then,
                 budget,
                 &Ctx {
-                    settled_locals: &known,
+                    local_defs: &known,
                     ..*cx
                 },
             )
         }
+        // A call by name to a def declared in the body (the innermost of that name and arity),
+        // then a read of a bare parameter in scope.
         Expr::FuncCall { name, args, .. }
-            if args.is_empty() && cx.settled_locals.contains(&name.as_str()) =>
+            if cx
+                .local_defs
+                .iter()
+                .any(|local| local.name == name && local.arity == args.len()) =>
+        {
+            let local = cx
+                .local_defs
+                .iter()
+                .rev()
+                .find(|local| local.name == name && local.arity == args.len())
+                .copied();
+            local.is_some_and(|local| local.settles)
+                && (cx.wide || args.is_empty())
+                && args.iter().all(|arg| settles(arg, budget, cx))
+        }
+        Expr::FuncCall { name, args, .. }
+            if cx.wide && args.is_empty() && cx.params.contains(&name.as_str()) =>
         {
             true
         }
@@ -317,7 +448,8 @@ fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
                         locals: &[],
                         own: None,
                         wide: false,
-                        settled_locals: &[],
+                        local_defs: &[],
+                        params: &[],
                     },
                 )
             }),
@@ -367,69 +499,566 @@ fn builtin_settles(builtin: &Builtin) -> bool {
     )
 }
 
+/// [`settles`] for a builtin, in the wide question (#7787): every builtin of the language, by
+/// what it yields for one input. One value (or an error, or nothing) per input when its arguments
+/// answer once: the scalar and container functions, the type filters, `select`, the path readers
+/// and writers, `test` and `sub`; one value whatever its closure yields: the collectors (`map`,
+/// `sort_by`, `with_entries`, `del`, `pick`, `INDEX`) and the ones that stop at a first output
+/// (`isempty`, `any`, `all`, `IN`, `first(f)`); and an effect before the one output is no
+/// obstacle (`debug`, `stderr`, `input`, `input_line_number`, `halt`), since it happens there on
+/// the streaming route too. The generators (`.[]`-like, `recurse`, `paths`, `tostream`, `inputs`,
+/// `splits`, `scan`, `match`, `capture`, `combinations`) do not, nor do yq's node and document
+/// builtins, which jq mode never reaches. Listed without a wildcard, so a new builtin is a
+/// compile error here rather than an unasked answer.
+fn builtin_settles_wide(builtin: &Builtin, budget: &mut u32, cx: &Ctx<'_>) -> bool {
+    let mut each = |args: &[&Expr]| args.iter().all(|arg| settles(arg, budget, cx));
+    match builtin {
+        Builtin::Type
+        | Builtin::IsNull
+        | Builtin::IsBoolean
+        | Builtin::IsNumber
+        | Builtin::IsString
+        | Builtin::IsArray
+        | Builtin::IsObject
+        | Builtin::Values
+        | Builtin::Nulls
+        | Builtin::Booleans
+        | Builtin::Numbers
+        | Builtin::Strings
+        | Builtin::Arrays
+        | Builtin::Objects
+        | Builtin::Iterables
+        | Builtin::Scalars
+        | Builtin::Normals
+        | Builtin::Finites
+        | Builtin::Length
+        | Builtin::Utf8ByteLength
+        | Builtin::Keys
+        | Builtin::KeysUnsorted
+        | Builtin::Empty
+        | Builtin::Add
+        | Builtin::Any
+        | Builtin::All
+        | Builtin::Min
+        | Builtin::Max
+        | Builtin::AsciiDowncase
+        | Builtin::AsciiUpcase
+        | Builtin::Downcase
+        | Builtin::Upcase
+        | Builtin::First
+        | Builtin::Last
+        | Builtin::Reverse
+        | Builtin::Flatten
+        | Builtin::Unique
+        | Builtin::Sort
+        | Builtin::ToEntries
+        | Builtin::FromEntries
+        | Builtin::ToString
+        | Builtin::ToNumber
+        | Builtin::ToJson
+        | Builtin::FromJson
+        | Builtin::Explode
+        | Builtin::Implode
+        | Builtin::Floor
+        | Builtin::Ceil
+        | Builtin::Round
+        | Builtin::Sqrt
+        | Builtin::Fabs
+        | Builtin::Log
+        | Builtin::Log10
+        | Builtin::Log2
+        | Builtin::Exp
+        | Builtin::Exp10
+        | Builtin::Exp2
+        | Builtin::Sin
+        | Builtin::Cos
+        | Builtin::Tan
+        | Builtin::Asin
+        | Builtin::Acos
+        | Builtin::Atan
+        | Builtin::Sinh
+        | Builtin::Cosh
+        | Builtin::Tanh
+        | Builtin::Asinh
+        | Builtin::Acosh
+        | Builtin::Atanh
+        | Builtin::Libm1(_)
+        | Builtin::Infinite
+        | Builtin::Nan
+        | Builtin::IsInfinite
+        | Builtin::IsNan
+        | Builtin::IsNormal
+        | Builtin::IsFinite
+        | Builtin::Debug
+        | Builtin::Halt
+        | Builtin::Stderr
+        | Builtin::HaltError
+        | Builtin::Env
+        | Builtin::EnvObject(_)
+        | Builtin::StrEnv(_)
+        | Builtin::NullLit
+        | Builtin::Trim
+        | Builtin::Ltrim
+        | Builtin::Rtrim
+        | Builtin::Transpose
+        | Builtin::ModuleMeta
+        | Builtin::Now
+        | Builtin::Input
+        | Builtin::InputLineNumber
+        | Builtin::InputFilename
+        | Builtin::GetSearchList
+        | Builtin::GetJqOrigin
+        | Builtin::GetProgOrigin
+        | Builtin::Abs
+        | Builtin::Builtins
+        | Builtin::Gmtime
+        | Builtin::Localtime
+        | Builtin::Mktime
+        | Builtin::Todate
+        | Builtin::Fromdate
+        | Builtin::Todateiso8601
+        | Builtin::Fromdateiso8601
+        | Builtin::Trunc
+        | Builtin::ToBoolean => true,
+        // Collect every output of their closure, or stop at its first: one value either way.
+        Builtin::Map(_)
+        | Builtin::MapValues(_)
+        | Builtin::WithEntries(_)
+        | Builtin::MinBy(_)
+        | Builtin::MaxBy(_)
+        | Builtin::GroupBy(_)
+        | Builtin::UniqueBy(_)
+        | Builtin::SortBy(_)
+        | Builtin::Del(_)
+        | Builtin::Pick(_)
+        | Builtin::UpperIndex(_)
+        | Builtin::UpperIndexStream(_, _)
+        | Builtin::AnyF(_)
+        | Builtin::AllF(_)
+        | Builtin::AnyCond(_, _)
+        | Builtin::AllCond(_, _)
+        | Builtin::UpperIn(_)
+        | Builtin::UpperInSrc(_, _)
+        | Builtin::IsEmpty(_)
+        | Builtin::FirstStream(_)
+        | Builtin::LastStream(_) => true,
+        Builtin::NthStream(n, _) => each(&[n]),
+        Builtin::Limit(n, f) => limit_settles(n) || each(&[n, f]),
+        // One value per value of their arguments.
+        Builtin::Has(a)
+        | Builtin::In(a)
+        | Builtin::Select(a)
+        | Builtin::Ltrimstr(a)
+        | Builtin::Rtrimstr(a)
+        | Builtin::Startswith(a)
+        | Builtin::Endswith(a)
+        | Builtin::Split(a)
+        | Builtin::Join(a)
+        | Builtin::Contains(a)
+        | Builtin::Inside(a)
+        | Builtin::Nth(a)
+        | Builtin::FlattenDepth(a)
+        | Builtin::Test(a)
+        | Builtin::Indices(a)
+        | Builtin::Index(a)
+        | Builtin::Rindex(a)
+        | Builtin::GetPath(a)
+        | Builtin::Walk(a)
+        | Builtin::IsValid(a)
+        | Builtin::Path(a)
+        | Builtin::DelPaths(a)
+        | Builtin::DebugMsg(a)
+        | Builtin::HaltErrorCode(a)
+        | Builtin::EnvVar(a)
+        | Builtin::BSearch(a)
+        | Builtin::Strftime(a)
+        | Builtin::FormatNamed(a)
+        | Builtin::Strflocaltime(a)
+        | Builtin::Strptime(a)
+        | Builtin::AtOffset(a) => each(&[a]),
+        Builtin::SetPath(a, b)
+        | Builtin::Pow(a, b)
+        | Builtin::Atan2(a, b)
+        | Builtin::Libm2(_, a, b)
+        | Builtin::TestFlags(a, b)
+        | Builtin::Sub(a, b)
+        | Builtin::Gsub(a, b)
+        | Builtin::SplitRegex(a, b)
+        | Builtin::AtPosition(a, b) => each(&[a, b]),
+        Builtin::Libm3(_, a, b, c) | Builtin::SubFlags(a, b, c) | Builtin::GsubFlags(a, b, c) => {
+            each(&[a, b, c])
+        }
+        // Generators, and what jq mode never reaches (yq's node and document builtins).
+        Builtin::ToJsonStream
+        | Builtin::FromJsonStream
+        | Builtin::ToStream
+        | Builtin::FromStream(_)
+        | Builtin::TruncateStream(_)
+        | Builtin::Recurse
+        | Builtin::RecurseF(_)
+        | Builtin::RecurseCond(_, _)
+        | Builtin::RecurseDown
+        | Builtin::PathNoArg
+        | Builtin::Parent
+        | Builtin::ParentN(_)
+        | Builtin::Paths
+        | Builtin::PathsFilter(_)
+        | Builtin::LeafPaths
+        | Builtin::Inputs
+        | Builtin::Match(_)
+        | Builtin::MatchFlags(_, _)
+        | Builtin::Capture(_)
+        | Builtin::CaptureFlags(_, _)
+        | Builtin::Scan(_)
+        | Builtin::ScanFlags(_, _)
+        | Builtin::Splits(_)
+        | Builtin::SplitsFlags(_, _)
+        | Builtin::Combinations
+        | Builtin::CombinationsN(_)
+        | Builtin::Skip(_, _)
+        | Builtin::FromYaml
+        | Builtin::TextCodec(_)
+        | Builtin::Envsubst(_)
+        | Builtin::Filter(_)
+        | Builtin::AnyC(..)
+        | Builtin::AllC(..)
+        | Builtin::Omit(_)
+        | Builtin::Tag
+        | Builtin::Anchor
+        | Builtin::Alias
+        | Builtin::Style
+        | Builtin::Kind
+        | Builtin::Key
+        | Builtin::Line
+        | Builtin::Column
+        | Builtin::DocumentIndex
+        | Builtin::LineComment
+        | Builtin::HeadComment
+        | Builtin::FootComment
+        | Builtin::FileIndex
+        | Builtin::Filename
+        | Builtin::Shuffle
+        | Builtin::Pivot
+        | Builtin::SplitDoc
+        | Builtin::SortKeys(_)
+        | Builtin::SortKeysOneLevel
+        | Builtin::FromUnix
+        | Builtin::ToUnix
+        | Builtin::Tz(_)
+        | Builtin::FormatDatetime(_)
+        | Builtin::WithDtf(_, _)
+        | Builtin::EvalExpr(_, _)
+        | Builtin::Load(_, _)
+        | Builtin::System(_, _) => false,
+    }
+}
+
 /// How many nodes [`call_head_settles`] walks of a call's arguments. Small: they are walked on
 /// every evaluation of the pipe the call leads, and a long one (a lazy argument chain) only keeps the
 /// route the pipe took before.
 const CALL_ARGS_BUDGET: u32 = 128;
 
-/// Whether `expr`, the first stage of a pipe, is a call to a `def` that may be run to its one value
-/// before the rest of the pipe runs on it (#7460), as a tail-call loop runs a stage ahead of its
-/// call ([`stage_settles`]): the call's arguments settle, and so does the definition's body, taking
-/// its own recursive calls and its bare parameters to settle (remembered on the definition).
+/// Whether `expr` may be run to its one value before its consumer runs (#7460, #7713, #7787): a
+/// call to a def that may recurse sits on its spine ([`may_hold_call`], a shape test), and it
+/// answers at most once ([`answers_once`]: every form of the language read by what it yields; a
+/// definition's body is asked once, with its own recursive calls and bare parameters taken to
+/// settle, and remembered on the definition). Asked at a pipe's head, of an `as` source or
+/// argument, of an object's key or value, of a string interpolation's part, and of an operator's
+/// operands.
 ///
 /// A tree recursion that pipes one call into the next, `def f($n): if $n == 0 then . + 1 else
 /// f($n - 1) | f($n - 1) end`, ran the second call inside the first call's output sink, so every
 /// call ever made stayed on the native stack until the outermost one returned: 8,192 calls at
 /// depth 13 spent it, where jq's stack holds only the live calls. Settled, the first call returns
 /// before the second runs, and the stack holds the recursion's depth.
+#[inline(always)]
 pub(crate) fn call_head_settles(expr: &Expr, jq: bool) -> bool {
-    let mut budget = CALL_ARGS_BUDGET;
-    call_head_settles_in(expr, jq, &mut budget)
+    may_hold_call(expr, SPINE_DEPTH) && answers_once(expr, jq)
 }
 
-/// [`call_head_settles`] with the budget its argument (and stage) walks share.
+/// Whether `expr` answers at most once and leaves nothing observable to run after its output
+/// (#7787): the call-head question without its requirement that a def be called, for the other
+/// operand of an operator whose one operand is such a call (`eval::operand_pair_settles`).
+pub(crate) fn answers_once(expr: &Expr, jq: bool) -> bool {
+    let mut budget = CALL_ARGS_BUDGET;
+    !super::eval::contains_retrying_pattern_bind(expr) && settles(expr, &mut budget, &Ctx::wide(jq))
+}
+
+/// How deep [`may_hold_call`] looks along an expression's spine.
+pub(crate) const SPINE_DEPTH: u32 = 4;
+
+/// Whether a call to a `def` sits on `expr`'s spine (#7787): the expression itself, or what a
+/// parenthesis, a pipe, `//`, `first`/`last`/`limit`/`nth`, `try`/`?`, a `label`, an `if`, an
+/// `as`, a `reduce`/`foreach`/`until`, a `,`, an object or a string interpolation holds, to
+/// `depth` levels. The only shapes worth running to their value first: a call there is what
+/// would still hold deep native frames when the expression's output reaches its consumer.
 ///
-/// #7713: also a pipe whose last stage is such a call and whose stages in front of it settle,
-/// which is what an operand that navigates to the value a recursion recurses on looks like
-/// (`(.[0] | count) + (.[1] | count)`). The last stage is asked first, so a pipe that ends in
-/// anything else answers no without walking its stages.
-fn call_head_settles_in(expr: &Expr, jq: bool, budget: &mut u32) -> bool {
-    let wide = Ctx {
-        jq,
-        locals: &[],
-        own: None,
-        wide: true,
-        settled_locals: &[],
-    };
-    let (def, args) = match expr {
-        Expr::Paren(inner) => return call_head_settles_in(inner, jq, budget),
-        Expr::Pipe(stages) => {
-            return match stages.split_last() {
-                Some((last, front)) => {
-                    call_head_settles_in(last, jq, budget)
-                        && front.iter().all(|stage| settles(stage, budget, &wide))
-                }
-                None => false,
-            };
+/// A shape test, not a walk: a leaf, an operator, a builtin or anything else answers no at once,
+/// so the operands of `.age > 30` or `.score + .id` cost one match each, on every evaluation. A
+/// call further down (inside an operator or a builtin's closure) keeps the route it took before;
+/// the operator around it is its own site and settles its operands itself.
+#[inline(always)]
+pub(crate) fn may_hold_call(expr: &Expr, depth: u32) -> bool {
+    // The answer for every leaf, operator and builtin, inline: one discriminant test, so a site
+    // whose operands are `.age` and `30` pays nothing more than that (#7787).
+    could_hold_call(expr) && may_hold_call_on_spine(expr, depth)
+}
+
+/// Whether `expr` is a call or one of the forms [`may_hold_call`] looks through.
+#[inline(always)]
+fn could_hold_call(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::DefCall { .. }
+            | Expr::FuncCall { .. }
+            | Expr::NamespacedCall { .. }
+            | Expr::Paren(_)
+            | Expr::Optional(_)
+            | Expr::FirstExpr(_)
+            | Expr::LastExpr(_)
+            | Expr::Label { .. }
+            | Expr::Try { .. }
+            | Expr::Limit { .. }
+            | Expr::NthExpr { .. }
+            | Expr::Pipe(_)
+            | Expr::Comma(_)
+            | Expr::Alternative(..)
+            | Expr::If { .. }
+            | Expr::As { .. }
+            | Expr::AsPattern { .. }
+            | Expr::Reduce { .. }
+            | Expr::Foreach { .. }
+            | Expr::Until { .. }
+            | Expr::Object(_)
+            | Expr::StringInterpolation(_)
+    )
+}
+
+/// Whether any of `items` holds a call on its spine: a plain loop, so a pipe's stages cost one
+/// inline test each (`(.tags | length)`), with no iterator adapter between them.
+fn any_on(items: &[Expr], depth: u32) -> bool {
+    for item in items {
+        if may_hold_call(item, depth) {
+            return true;
         }
-        Expr::DefCall { def, args, .. } => (def, args),
-        _ => return false,
+    }
+    false
+}
+
+/// Whether a call's arguments hold a call that may recurse (a closure passed down to it).
+#[inline(never)]
+fn args_may_recurse(args: &[Expr]) -> bool {
+    let mut budget = CALL_ARGS_BUDGET;
+    for arg in args {
+        if holds_recursion(arg, &mut budget) {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`may_hold_call`] past its inline test. A call is answered here, in a small frame; the wrappers
+/// out of line.
+fn may_hold_call_on_spine(mut expr: &Expr, mut depth: u32) -> bool {
+    loop {
+        match expr {
+            // A call to a definition that cannot recurse returns before its output reaches the
+            // consumer with nothing deep left on the stack: it is not worth running first.
+            Expr::DefCall { def, args, .. } => {
+                return def_may_recurse(def) || (!args.is_empty() && args_may_recurse(args));
+            }
+            Expr::FuncCall { .. } | Expr::NamespacedCall { .. } => return true,
+            // The two wrappers an operand is most often written with, stepped through here.
+            Expr::Paren(inner) => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+                expr = inner;
+            }
+            Expr::Pipe(stages) => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                return any_on(stages, next);
+            }
+            _ => return may_hold_call_in_wrapper(expr, depth),
+        }
+    }
+}
+
+/// [`may_hold_call_on_spine`] for a form that holds other expressions.
+#[inline(never)]
+fn may_hold_call_in_wrapper(expr: &Expr, depth: u32) -> bool {
+    let Some(depth) = depth.checked_sub(1) else {
+        return false;
     };
+    let on = |e: &Expr| may_hold_call(e, depth);
+    match expr {
+        Expr::Paren(inner)
+        | Expr::Optional(inner)
+        | Expr::FirstExpr(inner)
+        | Expr::LastExpr(inner)
+        | Expr::Label { body: inner, .. }
+        | Expr::Try { expr: inner, .. }
+        | Expr::Limit { expr: inner, .. }
+        | Expr::NthExpr { expr: inner, .. } => on(inner),
+        Expr::Pipe(stages) => any_on(stages, depth),
+        Expr::Comma(items) => any_on(items, depth),
+        Expr::Alternative(left, right) => on(left) || on(right),
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => on(cond) || on(then_branch) || on(else_branch),
+        Expr::As { expr, body, .. } | Expr::AsPattern { expr, body, .. } => on(expr) || on(body),
+        Expr::Reduce { input, init, .. } => on(input) || on(init),
+        Expr::Foreach { input, update, .. } => on(input) || on(update),
+        Expr::Until { cond, update } => on(cond) || on(update),
+        Expr::Object(entries) => entries
+            .iter()
+            .any(|entry| on(&entry.value) || matches!(&entry.key, ObjectKey::Expr(key) if on(key))),
+        Expr::StringInterpolation(parts) => parts
+            .iter()
+            .any(|part| matches!(part, StringPart::Expr(inner) if on(inner))),
+        _ => false,
+    }
+}
+
+/// Whether a call to `def` may recurse (#7787), remembered on the definition: its body calls a def
+/// by name (itself, a def it declares, or a bare parameter, which may be any closure), a def bound
+/// into it that may recurse, or a module's def; or the walk runs out of budget.
+#[inline]
+pub(crate) fn def_may_recurse(def: &FuncDefData) -> bool {
+    def.may_recurse_or_init(|body| {
+        let mut budget = SETTLE_BUDGET;
+        holds_recursion(body, &mut budget)
+    })
+}
+
+/// [`def_may_recurse`]'s walk: whether `expr` holds a call that may recurse, out of `budget`
+/// nodes, answering yes when they run out.
+fn holds_recursion(expr: &Expr, budget: &mut u32) -> bool {
+    let mut out_of_budget = false;
+    let found = search_subexpr(expr, &mut |e: &Expr| {
+        let Some(left) = budget.checked_sub(1) else {
+            out_of_budget = true;
+            return Visit::Found;
+        };
+        *budget = left;
+        match e {
+            Expr::FuncCall { .. } | Expr::NamespacedCall { .. } => Visit::Found,
+            Expr::DefCall { def, args, .. } => {
+                if def_may_recurse(def) || args.iter().any(|arg| holds_recursion(arg, budget)) {
+                    Visit::Found
+                } else {
+                    Visit::Skip
+                }
+            }
+            _ => Visit::Descend,
+        }
+    });
+    found || out_of_budget
+}
+
+/// [`settles`] for a call to `def` with `args` (#7460): the definition's body, taking its own
+/// recursive calls and its bare parameters to settle (remembered on the definition), then the
+/// arguments, out of `budget`.
+fn call_settles(def: &FuncDefData, args: &[Expr], jq: bool, budget: &mut u32) -> bool {
     let body_settles = def.call_settles_or_init(jq, |body| {
         let mut fresh = SETTLE_BUDGET;
         settles(
             body,
             &mut fresh,
             &Ctx {
-                jq,
-                locals: &[],
                 own: Some(def),
-                wide: true,
-                settled_locals: &[],
+                ..Ctx::wide(jq)
             },
         )
     });
-    body_settles && args.iter().all(|arg| settles(arg, budget, &wide))
+    body_settles && args.iter().all(|arg| settles(arg, budget, &Ctx::wide(jq)))
+}
+
+/// The arm of [`settles`] for a bound call (wide question).
+fn call_head_settles_in(expr: &Expr, jq: bool, budget: &mut u32) -> bool {
+    match expr {
+        Expr::DefCall { def, args, .. } => call_settles(def, args, jq, budget),
+        _ => false,
+    }
+}
+
+impl Ctx<'static> {
+    /// The call-head question's context with nothing in scope.
+    const fn wide(jq: bool) -> Self {
+        Self {
+            jq,
+            locals: &[],
+            own: None,
+            wide: true,
+            local_defs: &[],
+            params: &[],
+        }
+    }
+}
+
+/// [`settles`] for `items` joined by `,` (#7787): the items in front of the one that yields
+/// yield nothing (`empty`, an error, a `break`, or a pipe through one of those: they run before
+/// any output, as they would on the streaming route), the one that yields settles, and the items
+/// after it can only end the evaluation (`empty`, a `break`, an error with a constant message):
+/// what runs after the output is nothing that can be observed in a different order, so
+/// `label $f | 1, break $f` and `1, empty` settle and `1, 2` and `1, debug` do not.
+fn comma_settles(items: &[Expr], budget: &mut u32, cx: &Ctx<'_>) -> bool {
+    let mut rest = items.iter();
+    for item in rest.by_ref() {
+        if yields_nothing(item) {
+            continue;
+        }
+        return settles(item, budget, cx) && rest.all(only_ends);
+    }
+    true
+}
+
+/// Whether `expr` never yields an output (#7787): an error, `empty`, a `break`, or a sequence or
+/// pipe made of one.
+fn yields_nothing(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => yields_nothing(inner),
+        Expr::Error(_) | Expr::Break(_) | Expr::Builtin(Builtin::Empty) => true,
+        Expr::Comma(items) => items.iter().all(yields_nothing),
+        Expr::Pipe(stages) => stages.iter().any(yields_nothing),
+        _ => false,
+    }
+}
+
+/// Whether `expr`, run after an output, only ends the evaluation and does nothing that can be
+/// seen (#7787): `empty`, a `break`, or an error whose message is a constant or `.`.
+fn only_ends(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => only_ends(inner),
+        Expr::Break(_) | Expr::Builtin(Builtin::Empty) => true,
+        Expr::Error(msg) => msg.as_deref().map_or(true, |m| {
+            matches!(
+                m,
+                Expr::Literal(_) | Expr::Identity | Expr::Var(_) | Expr::Field(_)
+            )
+        }),
+        Expr::Comma(items) => items.iter().all(only_ends),
+        _ => false,
+    }
+}
+
+/// Whether a def declared in the body being walked hides the call `name/arity` (#7787): the
+/// definition being asked about, or its bare parameter, is then not what the call reaches.
+fn shadowed_by_local(cx: &Ctx<'_>, name: &str, arity: usize) -> bool {
+    cx.local_defs
+        .iter()
+        .any(|local| local.name == name && local.arity == arity)
+}
+
+/// Whether `limit(n; ...)` answers at most once for a constant `n` of 0 or 1 (#7787), whatever
+/// its source yields: it stops the source at its first output.
+fn limit_settles(n: &Expr) -> bool {
+    matches!(super::eval::constant_number(n), Some(c) if c == 0.0 || c == 1.0)
 }
 
 /// Whether a pipe's stages in front of its last are all [`stage_settles`], and
@@ -443,7 +1072,8 @@ pub(crate) fn pipe_settles_before_last(stages: &PipeStages, jq: bool) -> bool {
             locals: &[],
             own: None,
             wide: false,
-            settled_locals: &[],
+            local_defs: &[],
+            params: &[],
         },
     )
 }
@@ -501,7 +1131,8 @@ fn reach<'a>(body: &'a Expr, def: &FuncDefData, jq: bool, locals: &mut Vec<&'a s
                             locals,
                             own: None,
                             wide: false,
-                            settled_locals: &[],
+                            local_defs: &[],
+                            params: &[],
                         },
                     )
                 {
@@ -521,7 +1152,8 @@ fn reach<'a>(body: &'a Expr, def: &FuncDefData, jq: bool, locals: &mut Vec<&'a s
                         locals,
                         own: None,
                         wide: false,
-                        settled_locals: &[],
+                        local_defs: &[],
+                        params: &[],
                     },
                 ) {
                     break false;
@@ -540,7 +1172,8 @@ fn reach<'a>(body: &'a Expr, def: &FuncDefData, jq: bool, locals: &mut Vec<&'a s
                             locals,
                             own: None,
                             wide: false,
-                            settled_locals: &[],
+                            local_defs: &[],
+                            params: &[],
                         },
                     ) =>
                 {
@@ -996,7 +1629,9 @@ mod tests {
         for (def_src, want) in [
             ("def f: first([1] as [$a] ?// $a | $a); f", false),
             ("def f: first([1] as [$a] | $a); f", true),
-            ("def f: last([1] as [$a] ?// $a | $a); f", true),
+            // #7787: a `?//` anywhere keeps the expression streaming (the question's entry),
+            // conservatively, though jq does not retry through `last`.
+            ("def f: last([1] as [$a] ?// $a | $a); f", false),
         ] {
             let Expr::FuncDef {
                 name,
@@ -1010,8 +1645,176 @@ mod tests {
             };
             let def = Rc::new(FuncDefData::new(name, params, *body));
             let call = install_def_calls(&then, &def, 0, false);
-            assert_eq!(call_head_settles(&call, true), want, "`{def_src}`");
+            assert_eq!(answers_once(&call, true), want, "`{def_src}`");
         }
+    }
+
+    /// #7787: the shape test a site asks first: a call to a definition that may recurse on the
+    /// spine; a call to one that cannot, or anything off the spine, answers no without a walk.
+    #[test]
+    fn only_a_call_that_may_recurse_on_the_spine_is_worth_settling_7787() {
+        for (src, want) in [
+            (
+                "def t($n): if $n == 0 then 1 else t($n - 1) + t($n - 1) end; t(3)",
+                true,
+            ),
+            (
+                "def t($n): if $n == 0 then 1 else t($n - 1) end; (t(3) // 0)",
+                true,
+            ),
+            (
+                "def t($n): if $n == 0 then 1 else t($n - 1) end; first(t(3))",
+                true,
+            ),
+            (
+                "def t($n): if $n == 0 then 1 else t($n - 1) end; {a: t(3)}",
+                true,
+            ),
+            (
+                "def t($n): if $n == 0 then 1 else t($n - 1) end; t(3) + 1",
+                false,
+            ),
+            ("def nm: .name; nm", false),
+            ("def old: .age > 30; old", false),
+            ("def k($x): $x * 2; k(.id)", false),
+            ("def k(f): f; k(.id)", true),
+            ("def g: 1; def h: g; h", false),
+            ("def f: def g: f; g; f", true),
+        ] {
+            let mut program = parse(src).expect("parses");
+            // Bind each def over what follows it, as the evaluator does, down to the last one.
+            let mut defs = Vec::new();
+            while let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = program
+            {
+                let body = defs
+                    .iter()
+                    .fold(*body, |e, d| install_def_calls(&e, d, 0, false));
+                defs.push(Rc::new(FuncDefData::new(name, params, body)));
+                program = *then;
+            }
+            let call = defs
+                .iter()
+                .fold(program, |e, d| install_def_calls(&e, d, 0, false));
+            assert_eq!(may_hold_call(&call, SPINE_DEPTH), want, "`{src}`");
+        }
+        // Leaves and operators off the spine answer at once.
+        for src in [".age > 30", ".score + .id", "$n - 1", ".a", "length"] {
+            assert!(
+                !may_hold_call(&parse(src).expect("parses"), SPINE_DEPTH),
+                "`{src}`"
+            );
+        }
+    }
+
+    /// #7787: the wide question over every form, each by what it yields: answers at most once
+    /// and leaves nothing observable to run after the output; a generator, an effect or a second
+    /// output after it, a value-dependent count and a `?//` do not.
+    #[test]
+    fn the_wide_question_reads_every_form_by_what_it_yields_7787() {
+        for (def_src, want) in [
+            // Leaves the hunt found refused.
+            ("def f: [1] | first; f", true),
+            ("def f: [1] | last; f", true),
+            ("def f: limit(1; 1, 2); f", true),
+            ("def f: limit(0; 1, 2); f", true),
+            ("def f: limit(2; 1, 2); f", false),
+            ("def f: limit(2; 1); f", true),
+            ("def f: foreach (1) as $x (0; $x); f", true),
+            ("def f: foreach (1, 2) as $x (0; $x); f", false),
+            ("def f: 0 | until(. >= 1; . + 1); f", true),
+            ("def f: until(true; 1, 2); f", false),
+            ("def f: (label $f | 1, break $f); f", true),
+            ("def f: def k($a): $a; k(1); f", true),
+            ("def f: def k(f): f; k(1); f", true),
+            ("def f: def k(f): f; k(1, 2); f", false),
+            ("def f: env | 1; f", true),
+            ("def f: input_line_number + 1; f", true),
+            ("def f: tojson | fromjson | 1; f", true),
+            ("def f: [1] | IN(.[]; 1); f", true),
+            ("def f: nth(0; 1, 2); f", true),
+            ("def f: isempty(1, 2); f", true),
+            ("def f: {a: 1, (\"b\"): 2} | .a; f", true),
+            ("def f: \"\\(1)-\\(2)\"; f", true),
+            ("def f: \"\\(1, 2)\"; f", false),
+            ("def f: .[1:2] | .[0]; f", true),
+            // A sequence: nothing before the output but what yields nothing, nothing after it but
+            // an end.
+            ("def f: 1, empty; f", true),
+            ("def f: empty, 1; f", true),
+            ("def f: error(\"x\"), 1; f", true),
+            ("def f: 1, error(\"x\"); f", true),
+            ("def f: 1, error(debug); f", false),
+            ("def f: 1, 2; f", false),
+            ("def f: 1, (2 | debug | empty); f", false),
+            ("def f: 1, halt; f", false),
+            // Effects before the output are where they would be anyway.
+            ("def f: debug | input | . + 1; f", true),
+            // Generators, and counts that depend on the value read.
+            ("def f: .[]; f", false),
+            ("def f: .. | 1; f", false),
+            ("def f: range(1); f", false),
+            ("def f: (1, 2) | select(. == 1); f", false),
+            ("def f: [1] | .[] as $v | $v; f", false),
+            ("def f: tostream; f", false),
+            ("def f: splits(\"a\"); f", false),
+            ("def f: repeat(1); f", false),
+            // A destructuring bind: one pattern binds once; alternatives are retried by a later
+            // failure, so they stream.
+            ("def f: [1] as [$x] | $x; f", true),
+            ("def f: [1] as [$x] ?// $x | $x; f", false),
+            // A def declared in the body that recurses into the one asked about, and one that
+            // hides it.
+            (
+                "def f($n): def g: f($n - 1); if $n == 0 then 1 else g + g end; f(3)",
+                true,
+            ),
+            (
+                "def f($n): def f($m): (1, 2); if $n == 0 then 1 else f($n - 1) end; f(3)",
+                false,
+            ),
+        ] {
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = parse(def_src).expect("parses")
+            else {
+                panic!("a def");
+            };
+            let def = Rc::new(FuncDefData::new(name, params, *body));
+            let call = install_def_calls(&then, &def, 0, false);
+            assert_eq!(answers_once(&call, true), want, "`{def_src}`");
+        }
+        // `first` around a `?//`: a failure after the call retries it, so it is not run first.
+        let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            ..
+        } = parse("def f: first([1] as [$a] ?// $a | $a); f").expect("parses")
+        else {
+            panic!("a def");
+        };
+        let def = Rc::new(FuncDefData::new(name, params, *body));
+        crate::jq::eval::note_alternative_bind_parsed();
+        assert!(!call_head_settles(
+            &install_def_calls(&then, &def, 0, false),
+            true
+        ));
+        // Only an expression that calls a def is run first; one that calls nothing answers once
+        // all the same.
+        assert!(!call_head_settles(&parse("1 + 2").expect("parses"), true));
+        assert!(answers_once(&parse("1 + 2").expect("parses"), true));
+        assert!(!answers_once(&parse(".[] + 2").expect("parses"), true));
     }
 
     /// #7713: the shapes a body answers at most once with beyond the tail loop's -- `try`, `?`,
@@ -1036,10 +1839,13 @@ mod tests {
             ("def f: def h: 1; h + h; f", true),
             ("def f: def h: .[]; h; f", false),
             ("def f: def h: 1; def h: .[]; h; f", false),
-            ("def f: def h($x): $x; h(1); f", false),
+            // #7787: a local def with parameters settles when its body does.
+            ("def f: def h($x): $x; h(1); f", true),
             ("def f: .[0] | f; .[1] | f", true),
             ("def f: .[0] | f; .[] | f", false),
-            ("def f: .[0] | f; f | .a", false),
+            // #7787: any expression that calls a def and answers once, not only a pipe ending in
+            // the call.
+            ("def f: .[0] | f; f | .a", true),
         ] {
             let Expr::FuncDef {
                 name,
@@ -1053,7 +1859,7 @@ mod tests {
             };
             let def = Rc::new(FuncDefData::new(name, params, *body));
             let call = install_def_calls(&then, &def, 0, false);
-            assert_eq!(call_head_settles(&call, true), want, "`{def_src}`");
+            assert_eq!(answers_once(&call, true), want, "`{def_src}`");
         }
         // A call with arguments to another def is asked the same question.
         let Expr::FuncDef {
@@ -1078,10 +1884,7 @@ mod tests {
             panic!("an inner def");
         };
         let f = Rc::new(FuncDefData::new(name, params, *body));
-        assert!(call_head_settles(
-            &install_def_calls(&then, &f, 0, false),
-            true
-        ));
+        assert!(answers_once(&install_def_calls(&then, &f, 0, false), true));
         // The tail loop's own question reads a def declared in the body too (a module's
         // forwarding stub), and none of the rest.
         assert!(stage_settles(

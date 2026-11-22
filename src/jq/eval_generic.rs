@@ -24035,8 +24035,12 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
         ),
         ObjectKey::Expr(key_expr) => {
             let escape = StashedEscape::new();
-            let flow =
-                eval_each_generic::<S, V>(key_expr, value.clone(), optional, cursor, &mut |item| {
+            let flow = each_generic_settling::<S, V>(
+                key_expr,
+                value.clone(),
+                optional,
+                cursor,
+                &mut |item| {
                     // #3293: a re-invocation after a stop is a `?//` retry
                     // inside `key_expr`; it supersedes whatever the
                     // retried-past call decided.
@@ -24059,7 +24063,8 @@ fn each_object_entries_generic<S: EvalSemantics, V: DocumentValue>(
                         Flow::Stopped { .. } => Demand::Stop,
                         Flow::Escaped(control) => escape.stop(control),
                     }
-                });
+                },
+            );
             escape.resume(flow, crate::jq::eval::direct_pattern_retry(key_expr))
         }
     }
@@ -24093,7 +24098,7 @@ fn each_object_value_generic<S: EvalSemantics, V: DocumentValue>(
 ) -> Flow {
     let escape = StashedEscape::new();
     let flow =
-        eval_each_generic::<S, V>(value_expr, value.clone(), optional, cursor, &mut |item| {
+        each_generic_settling::<S, V>(value_expr, value.clone(), optional, cursor, &mut |item| {
             // #3293: a re-invocation after a stop is a `?//` retry inside
             // `value_expr`; it supersedes whatever the retried-past call
             // decided.
@@ -27585,7 +27590,7 @@ fn each_string_parts_generic<S: EvalSemantics, V: DocumentValue>(
         StringPart::Expr(expr) => {
             let escape = StashedEscape::new();
             let flow =
-                eval_each_generic::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
+                each_generic_settling::<S, V>(expr, value.clone(), optional, cursor, &mut |item| {
                     // #3293: a re-invocation after a stop is a `?//` retry inside
                     // the driven operand; it supersedes whatever the retried-past
                     // call decided.
@@ -27940,6 +27945,48 @@ fn stream_owned_outputs_generic<S: EvalSemantics, V: DocumentValue>(
 /// output reaches `sink` (#3296) -- so a bound source's consumer, often the
 /// rest of a recursion (`f(n - 1) as $a | f(n - 2) as $b | $a + $b`), does not
 /// run on top of the source's own frames.
+/// [`eval_each_generic`], run to its value first when `expr` calls a def and answers once, jq mode
+/// only (#7787): `eval::eval_each_settling`'s rule, for an object's key or value and a string
+/// interpolation's part.
+///
+/// Inline, with only the shape test (`tail_call::may_hold_call`) in front of the plain evaluation:
+/// a part that holds no call on its spine (`.name`, `.age`) costs one test, and the rest of the
+/// question is asked out of line.
+#[inline(always)]
+fn each_generic_settling<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    use crate::jq::tail_call::{may_hold_call, SPINE_DEPTH};
+    if S::TAG == EvalTag::Jq && may_hold_call(expr, SPINE_DEPTH) {
+        return each_generic_settling_call::<S, V>(expr, value, optional, cursor, sink);
+    }
+    eval_each_generic::<S, V>(expr, value, optional, cursor, sink)
+}
+
+/// [`each_generic_settling`] for a part that holds a call on its spine.
+#[inline(never)]
+fn each_generic_settling_call<S: EvalSemantics, V: DocumentValue>(
+    expr: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    if crate::jq::tail_call::answers_once(expr, true) {
+        return settle_then_replay(
+            |collect| {
+                eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| collect(item))
+            },
+            |item| sink.push(item),
+        );
+    }
+    eval_each_generic::<S, V>(expr, value, optional, cursor, sink)
+}
+
 fn settled_each_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,

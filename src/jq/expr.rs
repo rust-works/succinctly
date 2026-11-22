@@ -1526,6 +1526,9 @@ pub struct SharedArg {
     eager: core::cell::Cell<Option<bool>>,
     needs_path_context: core::cell::Cell<Option<bool>>,
     retrying_bind: core::cell::Cell<Option<bool>>,
+    /// Whether this argument answers at most once (`tail_call::settles`, #7787), remembered so a
+    /// closure passed down a recursion is asked once, not at every level.
+    settles: core::cell::Cell<Option<bool>>,
     /// Whether this is a run of a split tail ([`TailPlan::Split`]), or a link of
     /// the chain of a long pipe ([`PipeStages::chained_tail`], #5679), not an
     /// argument: stages of a pipe, kept as an `Expr::Pipe` of their own (#5441).
@@ -1543,6 +1546,7 @@ impl SharedArg {
             eager: core::cell::Cell::new(None),
             needs_path_context: core::cell::Cell::new(None),
             retrying_bind: core::cell::Cell::new(None),
+            settles: core::cell::Cell::new(None),
             run: false,
         }
     }
@@ -1582,6 +1586,7 @@ impl SharedArg {
         self.eager.set(None);
         self.needs_path_context.set(None);
         self.retrying_bind.set(None);
+        self.settles.set(None);
         &mut self.expr
     }
 
@@ -1602,6 +1607,12 @@ impl SharedArg {
     /// would otherwise re-walk a recursion's whole argument chain each time.
     pub fn retrying_bind_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
         memo(&self.retrying_bind, || classify(&self.expr))
+    }
+
+    /// Whether this argument answers at most once (#7787), computing it with `classify` on the
+    /// first call: asked by the call-head question (jq mode only) of every call it captures.
+    pub(crate) fn settles_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
+        memo(&self.settles, || classify(&self.expr))
     }
 }
 
@@ -1824,6 +1835,13 @@ impl FuncDefData {
 
     /// Whether `body` reads any of the parameters by its bare name, computing it with `classify` on
     /// the first call (#7699): when it does not, binding a call substitutes nothing into it.
+    /// Whether a call to this definition may recurse, computing it with `classify` on the first call
+    /// (#7787): only such a call can hold deep native frames when its output is produced.
+    #[inline]
+    pub(crate) fn may_recurse_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
+        memo(&self.tail.may_recurse, || classify(&self.body))
+    }
+
     pub(crate) fn reads_bare_param_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
         memo(&self.tail.bare_param_read, || classify(&self.body))
     }
@@ -1865,6 +1883,8 @@ struct TailMemo {
     /// (`tail_call::call_head_settles`, #7460), in jq and yq mode.
     call_jq: core::cell::Cell<Option<bool>>,
     call_yq: core::cell::Cell<Option<bool>>,
+    /// Whether a call to the definition may recurse (`tail_call::def_may_recurse`, #7787).
+    may_recurse: core::cell::Cell<Option<bool>>,
     /// Whether the body reads a parameter by its bare name (`eval::bind_def_call_body`, #7699).
     bare_param_read: core::cell::Cell<Option<bool>>,
 }
