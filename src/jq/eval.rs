@@ -17470,7 +17470,7 @@ fn binary_fanout_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // 2-term one, and settling operands that call no `def` loses. Kept as is;
     // the numbers and the evidence are in
     // docs/optimizations/jq-settled-operands.md.
-    if settles_both(left, right) {
+    if operands_settle::<S>(left, right) {
         binary_fanout_each_with::<W, S>(
             settled_operand_strategy(each_operand),
             left,
@@ -22928,7 +22928,9 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     target_truthy: bool,
 ) -> QueryResult<'a, W> {
     match value {
-        StandardJson::Array(elements) => any_all_f_over::<W, S>(cond, elements, target_truthy),
+        StandardJson::Array(elements) => {
+            any_all_f_over::<W, S>(cond, gap_checked_elements(elements), target_truthy)
+        }
         // #2658: the object's *effective* values -- a repeated key collapsed
         // onto its last occurrence, in both modes, as the generic `.[]` arm
         // and `any_all_f_generic` walk them and as real yq's own `.[]`
@@ -22942,7 +22944,7 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // builtins, where yq keeps every occurrence.
         StandardJson::Object(fields) => match effective_fields(&fields, true) {
             Ok(fields) => {
-                any_all_f_over::<W, S>(cond, fields.into_iter().map(|f| f.value), target_truthy)
+                any_all_f_over::<W, S>(cond, fields.into_iter().map(|f| Ok(f.value)), target_truthy)
             }
             // A malformed value a repeated key shadows (#7427).
             Err(e) => QueryResult::Error(e),
@@ -22970,7 +22972,7 @@ fn any_all_f<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// actually gets reached.
 fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
     cond: &Expr,
-    elements: impl Iterator<Item = StandardJson<'a, W>>,
+    elements: impl Iterator<Item = Result<StandardJson<'a, W>, EvalError>>,
     target_truthy: bool,
 ) -> QueryResult<'a, W> {
     // #3819: a count, as in `any_all_gen_cond` -- a `?//` in `cond` that
@@ -22981,6 +22983,10 @@ fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
         counted_bool_flow_to_result(matches, target_truthy, !target_truthy, flow)
     };
     for cursor_elem in elements {
+        let cursor_elem = match cursor_elem {
+            Ok(cursor_elem) => cursor_elem,
+            Err(e) => return counted(matches, Flow::Escaped(Control::Error(e))),
+        };
         let elem = match to_owned::<S, _>(&cursor_elem) {
             Ok(v) => v,
             Err(e) => {
@@ -23008,6 +23014,69 @@ fn any_all_f_over<'a, W: Clone + AsRef<[u64]> + 'a, S: EvalSemantics>(
         }
     }
     counted(matches, Flow::Exhausted)
+}
+
+/// An array's elements as `.[]` walks them (#7555): an `Err` in place of the
+/// element whose leading `,` is missing, doubled or stray, or after the last
+/// one when the gap before the `]` holds a stray `,` -- the checks of
+/// `eval_generic`'s `each_lazy_array_iterate_sink`, made as each element is
+/// pulled, so a consumer that stops early never pays for the rest.
+fn gap_checked_elements<'a, W: Clone + AsRef<[u64]> + 'a>(
+    elements: JsonElements<'a, W>,
+) -> impl Iterator<Item = Result<StandardJson<'a, W>, EvalError>> + 'a {
+    let mut elems = elements;
+    let mut is_first = true;
+    let mut last: Option<JsonCursor<'a, W>> = None;
+    let mut done = false;
+    core::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let Some((cursor, rest)) = elems.uncons_cursor() else {
+            done = true;
+            let last = last?;
+            return (!super::document::trailing_element_gap_ok(&last, b']'))
+                .then(|| Err(elements.malformed_element_error()));
+        };
+        if !cursor.element_gap_ok(is_first) {
+            done = true;
+            return Some(Err(elements.malformed_element_error()));
+        }
+        is_first = false;
+        last = Some(cursor);
+        elems = rest;
+        Some(Ok(cursor.value()))
+    })
+}
+
+#[cfg(test)]
+mod gap_fault_readers_7554 {
+    use super::{eval_single, JqSemantics, QueryResult};
+    use crate::json::JsonIndex;
+
+    fn raises(doc: &str, filter: &str) -> bool {
+        let json = doc.as_bytes();
+        let index = JsonIndex::build(json);
+        let expr = crate::jq::parse(filter).expect("parses");
+        let result = eval_single::<Vec<u64>, JqSemantics>(&expr, index.root(json).value(), false);
+        matches!(result, QueryResult::Error(_))
+    }
+
+    /// This evaluator's own `first` and `all(f)`/`any(f)` arms refuse an array's gap fault as
+    /// its `.[0]` and `.[]` do (#7554, #7555), and still answer on well-formed input.
+    #[test]
+    fn first_and_any_all_f_refuse_gap_faults_7554_7555() {
+        for doc in ["[,1]", "[1,]", "[1 2]", "[1,,2]"] {
+            for filter in ["first", ".[0]", "all(. < 5)", "any(. > 5)"] {
+                assert!(raises(doc, filter), "{doc} | {filter}");
+            }
+        }
+        for filter in ["first", "all(. < 5)", "any(. > 5)", "any(. == 1)"] {
+            assert!(!raises("[1,2]", filter), "[1,2] | {filter}");
+        }
+        // A decision before the fault stops the walk, as `.[]` stops.
+        assert!(!raises("[1 2]", "any(. == 1)"));
+    }
 }
 
 /// Builtin: `any(cond)` - true if cond is truthy for any element of `.[]`.
@@ -24643,11 +24712,19 @@ fn builtin_first<W: Clone + AsRef<[u64]>>(
     optional: bool,
 ) -> QueryResult<'_, W> {
     match value {
-        StandardJson::Array(elements) => match elements.get(0) {
-            Some(v) => QueryResult::One(v),
-            // jq: [] | first => null
-            None => QueryResult::Owned(OwnedValue::Null),
-        },
+        StandardJson::Array(elements) => {
+            // #7554: `.[0]`'s length walk (`get_element_at_index` ->
+            // `count_elements`), so `first` refuses the gap faults `.[0]`
+            // refuses, as jq's `def first: .[0];` does.
+            if let Err(err) = count_elements(elements) {
+                return QueryResult::Error(err);
+            }
+            match elements.get(0) {
+                Some(v) => QueryResult::One(v),
+                // jq: [] | first => null
+                None => QueryResult::Owned(OwnedValue::Null),
+            }
+        }
         // jq: null | first => null
         StandardJson::Null => QueryResult::Owned(OwnedValue::Null),
         // #1755: a decode failure on the scalar itself must raise
@@ -33213,6 +33290,11 @@ fn refuse_unknown_group_option(rest: &[char]) -> Result<(), EvalError> {
         Some('-') if !rest.get(1).is_some_and(char::is_ascii_digit) => {}
         // `(?)`: no option at all.
         Some(')') => return Err(EvalError::new("Regex failure: undefined group option")),
+        // #7689: a sign Oniguruma's Perl syntax opens no group with (`(?}`, `(??`, `(?|`, `(?[`,
+        // `(? `), which the `regex` crate refuses in its own words or reads as something else.
+        Some(c) if " \"$%*+,./;?@[\\]^_`|}".contains(*c) => {
+            return Err(EvalError::new("Regex failure: undefined group option"))
+        }
         _ => return Ok(()),
     }
     if rest.starts_with(&['R', ')']) {
@@ -34031,6 +34113,40 @@ enum PropertyName {
 /// The code points of a block, or all the other scalar values when `negate` (#6228), as inclusive
 /// ranges in order. The surrogates are in neither: the crate refuses `\x{D800}`.
 #[cfg(feature = "regex")]
+/// The complement of the class `[body]`, read without case folding, spelled as a class of positive
+/// ranges (`[\x{0}-\x{40}...]`), for a negated property or POSIX bracket inside a class that `i`
+/// may fold (#7689). Oniguruma negates such an item before it folds the class, so `"A" |
+/// test("[\\P{Lu}]"; "i")` is `true` in jq (`a` is in the complement, and `A` folds with it);
+/// the `regex` crate folds the property first and then negates it, which leaves out every cased
+/// letter. `None` when the crate does not read `body`.
+#[cfg(feature = "regex")]
+fn spelled_complement(body: &str) -> Option<String> {
+    use regex_syntax::hir::{Class, HirKind};
+    let hir = crate::jq::onig_hir_parser()
+        .parse(&alloc::format!("(?-i:[{body}])"))
+        .ok()?;
+    let mut class = match hir.into_kind() {
+        HirKind::Class(Class::Unicode(class)) => class,
+        _ => return None,
+    };
+    class.negate();
+    let mut out = String::from("[");
+    if class.ranges().is_empty() {
+        out.push_str("^\\x{0}-\\x{10FFFF}");
+    }
+    for range in class.ranges() {
+        use std::fmt::Write as _;
+        let _ = write!(
+            out,
+            "\\x{{{:X}}}-\\x{{{:X}}}",
+            u32::from(range.start()),
+            u32::from(range.end())
+        );
+    }
+    out.push(']');
+    Some(out)
+}
+
 fn block_set(ranges: &[(u32, u32)], negate: bool) -> Vec<(u32, u32)> {
     if !negate {
         return ranges.to_vec();
@@ -34456,6 +34572,8 @@ fn translate_posix_brackets_scan(
     // item to jq: a repeat operator after it has nothing to repeat.
     let mut prev_option_group = false;
     let mut group_facts: Option<GroupFacts> = None;
+    // A refusal Oniguruma makes only after reading the whole pattern (#7689).
+    let mut late_refusal: Option<EvalError> = None;
     // The extended mode's ignored blanks are invisible to this scan (`^ *` is a repeated
     // assertion there), so a pattern in that mode is not judged as written: `translate_posix_brackets`
     // runs the scan again over the pattern without the blanks and comments (#6215, #6249) and keeps
@@ -34577,14 +34695,23 @@ fn translate_posix_brackets_scan(
                 ));
             }
             // #6070: the escapes Oniguruma reads that the `regex` crate refuses or reads another way.
-            if let Some((text, used)) = rewrite_onig_escape(
+            // #7689: a backreference to a group the pattern does not have is refused once the
+            // pattern has been read, so an error after it comes first (`\2\` ends at an escape).
+            let escape = match rewrite_onig_escape(
                 &chars,
                 i,
                 depth > 0,
                 class_from,
                 groups_opened,
                 &mut group_facts,
-            )? {
+            ) {
+                Err(refusal) if refusal.to_string().ends_with("invalid backref number/name") => {
+                    late_refusal.get_or_insert(refusal);
+                    None
+                }
+                other => other?,
+            };
+            if let Some((text, used)) = escape {
                 // #6240: a byte run no character has is a member of its own after a `-` that is
                 // itself a member (`[a-c-\xED\xA0\x80]`), which the `regex` crate would read as the
                 // start of a range up to a nested class.
@@ -34666,6 +34793,12 @@ fn translate_posix_brackets_scan(
                         let name = &chars[i + 3..i + 3 + close];
                         let caret = name.first() == Some(&'^');
                         let raw: String = name[usize::from(caret)..].iter().collect();
+                        // #7689: an empty name is refused where it stands, before a later error.
+                        if raw.is_empty() {
+                            return Err(EvalError::new(
+                                "Regex failure: invalid character property name {}",
+                            ));
+                        }
                         match property_name_kind(&raw) {
                             PropertyName::Refused => {
                                 return Err(EvalError::new(format!(
@@ -34726,10 +34859,20 @@ fn translate_posix_brackets_scan(
                             }
                             PropertyName::Other => {}
                         }
+                        // #7689: a negated property in a class that `i` may fold is its complement
+                        // spelled out, which the crate folds as Oniguruma does.
+                        let spelled = (depth > 0
+                            && (kind == 'P') != caret
+                            && (ignore_case || pattern_may_set_ignore_case(pattern)))
+                        .then(|| spelled_complement(&alloc::format!("\\p{{{raw}}}")))
+                        .flatten();
                         if depth == 0 {
                             out.push_str("(?-i:");
                             out.extend(&chars[i..end]);
                             out.push(')');
+                            changed = true;
+                        } else if let Some(spelled) = spelled {
+                            out.push_str(&spelled);
                             changed = true;
                         } else {
                             out.extend(&chars[i..end]);
@@ -34963,6 +35106,54 @@ fn translate_posix_brackets_scan(
                 if wrapped.pop() == Some(true) {
                     out.push(')');
                 }
+            } else if c == ')' {
+                // #7689: Oniguruma refuses a `)` that closes no group where it reads it, before an
+                // error later in the pattern (`)\` ends at an escape, `\2)` names a group the
+                // pattern does not have, which Oniguruma checks once it has read it all). An error
+                // before it that a later pass words (`\k<x>)`, `(*a))`) still comes first.
+                let mut before: String = if extended {
+                    "(?x)".into()
+                } else {
+                    String::new()
+                };
+                before.extend(&chars[..i]);
+                const LATE: [&str; 5] = [
+                    "end pattern with unmatched parenthesis",
+                    "end pattern in group",
+                    "invalid backref number/name",
+                    "undefined group",
+                    "never ending recursion",
+                ];
+                // The text before it is read whole, with the checks that follow this scan (a
+                // repeated assertion, `(?=a)*)`; under `x`, a repeat with no target, `*+)`), then in
+                // the words of the pass after it. A call `\g<x>` is resolved once the pattern has been
+                // read, so its refusal is a late one.
+                let prefix: String = chars[..i].iter().collect();
+                let calls_only = |message: &String| {
+                    message
+                        .strip_prefix("undefined name <")
+                        .is_some_and(|rest| {
+                            let name = rest.split('>').next().unwrap_or_default();
+                            !prefix.contains(&format!("\\k<{name}>"))
+                                && !prefix.contains(&format!("\\k'{name}'"))
+                        })
+                };
+                let earlier = translate_posix_brackets(&prefix, extended, ignore_case)
+                    .err()
+                    .and_then(|refusal| {
+                        refusal
+                            .to_string()
+                            .strip_prefix("Regex failure: ")
+                            .map(String::from)
+                    })
+                    .or_else(|| oniguruma_refusal(&before))
+                    .filter(|message| {
+                        !LATE.iter().any(|late| message.contains(late)) && !calls_only(message)
+                    });
+                return Err(EvalError::new(format!(
+                    "Regex failure: {}",
+                    earlier.as_deref().unwrap_or("unmatched close parenthesis")
+                )));
             }
             // #6068: a `{` that does not open `{n}`, `{n,}` or `{n,m}` is the literal brace in
             // Oniguruma (`a{ 1}`, `a{1 }`, `a{1, 2}`, `a{,2}`); the `regex` crate allows blanks
@@ -34990,12 +35181,21 @@ fn translate_posix_brackets_scan(
                     // Identical in both engines: copied through as written.
                     out.extend(&chars[i..name_end]);
                 } else if let Some(body) = unicode_posix_class(&name) {
-                    out.push('[');
-                    if negated {
-                        out.push('^');
+                    // #7689: under `i` Oniguruma folds the complement (see `spelled_complement`).
+                    let spelled = (negated
+                        && (ignore_case || pattern_may_set_ignore_case(pattern)))
+                    .then(|| spelled_complement(body))
+                    .flatten();
+                    if let Some(spelled) = spelled {
+                        out.push_str(&spelled);
+                    } else {
+                        out.push('[');
+                        if negated {
+                            out.push('^');
+                        }
+                        out.push_str(body);
+                        out.push(']');
                     }
-                    out.push_str(body);
-                    out.push(']');
                     changed = true;
                 } else {
                     return Err(EvalError::new("Regex failure: invalid POSIX bracket type"));
@@ -35068,6 +35268,9 @@ fn translate_posix_brackets_scan(
     // #6229: a class still open at the end of the pattern.
     if depth > 0 {
         return Err(EvalError::new("Regex failure: premature end of char-class"));
+    }
+    if let Some(refusal) = late_refusal {
+        return Err(refusal);
     }
     Ok(if changed {
         std::borrow::Cow::Owned(out)
@@ -37676,9 +37879,12 @@ fn build_regex_uncached<S: EvalSemantics>(
         // (`a??++` is `(?>a*?)`), one quantifier per item, before the possessive scan reads it.
         let stacked = super::onig_quantifier::rewrite(pattern, extended);
         let pattern = stacked.as_deref().unwrap_or(pattern);
+        // #7689: the possessive scan's refusal is succinctly's own, of a pattern jq reads, so an error
+        // jq reports (`*+a` is `target of repeat operator is not specified`) comes before it.
+        let mut possessive_refusal = None;
         let scanned =
             refuse_possessive_quantifier_for(pattern, extended, n_flag).unwrap_or_else(|refusal| {
-                deferred_refusal.get_or_insert(refusal);
+                possessive_refusal = Some(refusal);
                 std::borrow::Cow::Borrowed(pattern)
             });
         let scanned = match escape_class_range_dashes(&scanned, extended) {
@@ -37702,7 +37908,11 @@ fn build_regex_uncached<S: EvalSemantics>(
                 None => scanned,
             }
         };
-        match translate_posix_brackets(&scanned, extended, flags.is_some_and(|f| f.contains('i'))) {
+        let translated = match translate_posix_brackets(
+            &scanned,
+            extended,
+            flags.is_some_and(|f| f.contains('i')),
+        ) {
             // #6108: a group repeated `{0}` keeps its capture slot.
             Ok(translated) => {
                 // #6196: each backreference carries the case mode in force where it stands.
@@ -37723,7 +37933,11 @@ fn build_regex_uncached<S: EvalSemantics>(
                 deferred_refusal.get_or_insert(refusal);
                 String::new()
             }
+        };
+        if let Some(refusal) = possessive_refusal {
+            deferred_refusal.get_or_insert(refusal);
         }
+        translated
     };
 
     // Apply flags
@@ -38210,6 +38424,38 @@ fn oniguruma_refusal(pattern: &str) -> Option<String> {
     oniguruma_refusal_within(pattern, 8)
 }
 
+/// Oniguruma's refusal of the callout whose name starts `rest` (the text after `(*`, #7689): a
+/// name is a letter or `_` and then letters, digits and `_`, closed by `)` or followed by its `[tag]`
+/// or `{args}`. `None` for a name jq knows, whose callout it runs.
+#[cfg(feature = "regex")]
+fn callout_refusal(rest: &str) -> Option<String> {
+    let Some(first) = rest.chars().next() else {
+        return Some("invalid callout pattern".into());
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Some("invalid callout name".into());
+    }
+    let len = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    match rest[len..].chars().next() {
+        None => Some("end pattern in group".into()),
+        Some(')' | '[' | '{') => {
+            const BUILTIN: [&str; 7] = [
+                "FAIL",
+                "MISMATCH",
+                "ERROR",
+                "MAX",
+                "COUNT",
+                "TOTAL_COUNT",
+                "CMP",
+            ];
+            (!BUILTIN.contains(&&rest[..len])).then(|| "undefined callout name".into())
+        }
+        Some(_) => Some("invalid callout name".into()),
+    }
+}
+
 /// [`oniguruma_refusal`], which may read past a construct the crate cannot parse but jq accepts
 /// (a reference to a group the pattern has, a `(?'name'...)` group) by writing it as one the crate
 /// reads and looking again, up to `retries` times, for an error Oniguruma would meet later.
@@ -38242,6 +38488,13 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 }
                 ErrorKind::GroupUnclosed => Some(UNMATCHED_OPEN.into()),
                 ErrorKind::GroupUnopened => Some("unmatched close parenthesis".into()),
+                // #7689: `(*` opens a callout by name in Oniguruma, which the crate reads as a repeat
+                // of nothing. One of jq's builtin callouts (`(*MAX{2})`) has no refusal to word.
+                ErrorKind::RepetitionMissing
+                    if at(start).starts_with('*') && pattern.get(..start)?.ends_with('(') =>
+                {
+                    callout_refusal(at(start + 1))
+                }
                 // jq 1.8.2's parse depth limit, which `ONIG_NEST_LIMIT` is the crate's name for (#7528).
                 ErrorKind::NestLimitExceeded(_) => Some("parse depth limit over".into()),
                 ErrorKind::RepetitionCountInvalid => {
@@ -38284,9 +38537,17 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                         '\''
                     };
                     let Some((name, _)) = at(start + 3).split_once(close) else {
+                        // #7689: `\k<` and `\g<` with nothing after them.
+                        if at(start + 3).is_empty() {
+                            return Some("group name is empty".into());
+                        }
                         // `\k<x`: the name runs to the end of the pattern.
                         return Some(format!("invalid group name <{}>", at(start + 3)));
                     };
+                    // #7689: `\k<>`, `\g<>`, `\k''`.
+                    if name.is_empty() {
+                        return Some("group name is empty".into());
+                    }
                     let end = start + 3 + name.len() + 1;
                     let rewritten = || format!("{}(?:){}", &pattern[..start], at(end));
                     let numbered = name.strip_prefix(['-', '+']).unwrap_or(name);
@@ -38360,6 +38621,8 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 {
                     match at(start + 1).split_once('\'') {
                         Some((name, rest)) => retry(format!("{}<{name}>{rest}", &pattern[..start])),
+                        // #7689: `(?'` with nothing after it.
+                        None if at(start + 1).is_empty() => Some("group name is empty".into()),
                         // The name stops at the group's `)` when it has one (`(?'na)`).
                         None => Some(format!(
                             "invalid group name <{}>",
@@ -38771,25 +39034,40 @@ fn is_fancy_syntax(pattern: &str) -> bool {
 #[cfg(feature = "regex")]
 fn pattern_match_lengths(pattern: &str) -> (bool, Option<usize>) {
     match crate::jq::onig_hir_parser().parse(pattern) {
-        Ok(hir) => {
-            let properties = hir.properties();
-            (
-                properties.minimum_len() == Some(0),
-                properties.maximum_len(),
-            )
-        }
+        Ok(hir) => (hir_can_match_empty(&hir), hir.properties().maximum_len()),
         Err(_) => (true, None),
     }
 }
 
+/// Whether `hir` can match the empty string somewhere (#7689). `regex-syntax` gives a node with a
+/// part that never matches no minimum length, the optional ones included: `[^\s\S]?` (the item
+/// `keep_zero_count_groups` writes for `(a){0}`) has none, though it matches empty, and so has an
+/// alternation of it with `b`. Read as "never empty", such a pattern kept the `regex` crate's route
+/// under `n`, which skips the empty match the first way gives instead of trying the later ways:
+/// `"ab" | [match("(a){0}|b"; "n")]` was `[]`, and is `[{"offset":1,...}]` in jq.
+#[cfg(feature = "regex")]
+fn hir_can_match_empty(hir: &regex_syntax::hir::Hir) -> bool {
+    use regex_syntax::hir::HirKind;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => true,
+        HirKind::Literal(_) | HirKind::Class(_) => false,
+        HirKind::Repetition(rep) => rep.min == 0 || hir_can_match_empty(&rep.sub),
+        HirKind::Capture(cap) => hir_can_match_empty(&cap.sub),
+        HirKind::Concat(items) => items.iter().all(hir_can_match_empty),
+        HirKind::Alternation(ways) => ways.iter().any(hir_can_match_empty),
+    }
+}
+
 /// Whether matches of `pattern` may differ in length. A pattern the `regex` crate cannot parse
-/// (lookaround, a backreference) is taken to.
+/// (lookaround, a backreference) is taken to, and so is one with a part that never matches, to
+/// which `regex-syntax` gives no length at all (#7689, see [`hir_can_match_empty`]).
 #[cfg(feature = "regex")]
 fn pattern_is_variable_length(pattern: &str) -> bool {
     match crate::jq::onig_hir_parser().parse(pattern) {
         Ok(hir) => {
             let properties = hir.properties();
-            properties.minimum_len() != properties.maximum_len()
+            properties.minimum_len().is_none()
+                || properties.minimum_len() != properties.maximum_len()
         }
         Err(_) => true,
     }
@@ -38871,8 +39149,13 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         Some(close) => format!("\\G(?:{pattern}{close})"),
         None => pattern,
     };
+    // #7689: the optimizer merges a repeated group's loop into one span, which these searches
+    // would otherwise report as jq does (see `fancy_has_merged_group_loop`).
+    let keep_tree =
+        (modes.longest || modes.not_empty) && fancy_has_merged_group_loop(&expr, !modes.longest);
     fancy_regex::RegexBuilder::new(&pattern)
         .oniguruma_mode(true)
+        .optimize(!keep_tree)
         .leftmost_longest(modes.longest)
         .find_not_empty(modes.not_empty)
         .backtrack_limit(FANCY_BACKTRACK_LIMIT)
@@ -39350,6 +39633,45 @@ fn group_holds_g(group: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Whether `expr` repeats a capture group whose body is a `?` or `*` repeat (`(a?)+`, `(a*)*`,
+/// `(?:(a*)?)+`), which the optimizer of `fancy-regex` 0.20 merges with the repeat around it
+/// (`optimize_nested_repeats`: `(a?)+` is compiled as `(a*)`, `(a*)*` as `(a*)?`). The group then
+/// spans every iteration instead of the last one, and the empty iteration that ends Oniguruma's
+/// loop is gone: `"aaa" | match("(a?)+"; "l").captures[0]` was at `[0,3]`, a span `(a?)` cannot
+/// match, where jq has `[3,0]` (#7689). The `l` and `n` searches build such a pattern with the
+/// optimizer off, and their engine then keeps that last, empty iteration as jq does. A `+` body
+/// (`(a+)+`) is merged too, and left so: its single greedy iteration is the whole span. A `*` body
+/// counts only when `star`, which the `l` search does not ask for: unmerged, its longest-match
+/// search tries every way to split the run, and `"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!" |
+/// test("(a*)*b"; "l")` ran out of budget where the merged loop answers `false` at once.
+#[cfg(feature = "regex")]
+fn fancy_has_merged_group_loop(expr: &fancy_regex::Expr, star: bool) -> bool {
+    use fancy_regex::Expr;
+    let merged = |e: &Expr| {
+        let Expr::Repeat { child, .. } = e else {
+            return false;
+        };
+        let mut item: &Expr = child;
+        let mut in_group = false;
+        loop {
+            match item {
+                Expr::Group(inner) => {
+                    in_group = true;
+                    item = inner;
+                }
+                Expr::Repeat { child, lo, hi, .. } => {
+                    if in_group && *lo == 0 && (*hi == 1 || (star && *hi == usize::MAX)) {
+                        return true;
+                    }
+                    item = child;
+                }
+                _ => return false,
+            }
+        }
+    };
+    merged(expr) || expr.has_descendant(merged)
 }
 
 /// Whether `expr` holds two greedy `X+` repeats of the same expression with exactly one repeat that
@@ -118931,6 +119253,26 @@ pub(crate) fn settles_both(left: &Expr, right: &Expr) -> bool {
     settles_both_with(left, right, settle_probe, settles_before_consumer)
 }
 
+/// Whether a binary operator in mode `S` settles its operands before their consumer (#3296):
+/// [`settles_both`], or, in jq mode, both operands are calls that answer at most once by
+/// [`call_head_settles`](super::tail_call::call_head_settles), which also reads a call whose
+/// definition's body uses `try`, `label`, `reduce`, an object, a builtin that answers once or
+/// another def (#7713). A tree recursion over such a body (`count` adding the counts of `.[0]`
+/// and `.[1]`) ran each call inside the other operand's output sink, so every call ever made
+/// held its native frames and depth 13 (8,192 leaves) was refused.
+pub(crate) fn operands_settle<S: EvalSemantics>(left: &Expr, right: &Expr) -> bool {
+    // Only a call, a parenthesis or a pipe can be one (`call_head_settles`): told apart here, so
+    // the operators of a level that are no such thing (`$n == 0`, `$n - 1`) ask nothing more.
+    let may_be_a_call =
+        |e: &Expr| matches!(e, Expr::DefCall { .. } | Expr::Paren(_) | Expr::Pipe(_));
+    settles_both(left, right)
+        || (S::TAG == EvalTag::Jq
+            && may_be_a_call(left)
+            && may_be_a_call(right)
+            && super::tail_call::call_head_settles(left, true)
+            && super::tail_call::call_head_settles(right, true))
+}
+
 /// How many nodes the probe in [`settles_both`] spends on an operand before
 /// leaving it to the full [`SETTLE_ANALYSIS_BUDGET`] walk.
 const SETTLE_PROBE_BUDGET: u32 = 8;
@@ -119409,6 +119751,16 @@ pub(crate) fn bind_def_call_body(
     // `&def.body` with no clone whatsoever.
     let installed_body = if def.params.is_empty() {
         install_def_calls(&def.body, def, frames + 1, true)
+    } else if binds_by_as_only(def, args) {
+        // #7699: no bare name to substitute and no literal to put in for a `$name`, so
+        // `substitute_params` would only copy the body. Install straight from it, as a
+        // definition with no parameters does, then wrap it in its `as` bindings: each wrapper
+        // is one structural level `install_def_calls` charges a frame for (its `_` arm), so
+        // the body is installed `wrappers` frames deeper, exactly as it was under them.
+        let shared = share_def_call_args(args);
+        let wrappers = def.params.iter().filter(|p| p.is_dollar()).count() as u32;
+        let installed = install_def_calls(&def.body, def, frames + 1 + wrappers, true);
+        bind_dollar_params(installed, &def.params, &shared)
     } else {
         let body = bind_def_call_params(&def.body, &def.params, args);
         // `true`: this is `def`'s own body, the scope that repeats once per
@@ -119417,6 +119769,44 @@ pub(crate) fn bind_def_call_body(
         install_def_calls(&body, def, frames + 1, true)
     };
     Ok(Rc::new(installed_body))
+}
+
+/// Whether binding a call of `def` with `args` substitutes nothing into the body (#7699): no
+/// `$` parameter has a literal argument (#3260 puts the literal in for `$name`), and the body never
+/// reads a parameter by its bare name, so [`substitute_params`] would only copy it. The `$`
+/// parameters are then bound by the `as` wrappers alone.
+///
+/// The bare-name test is remembered on the definition. It is conservative: any zero-argument call
+/// named like a parameter counts as a read, whatever shadows it, outside an [`Expr::Shared`]
+/// (substitution stops there) and outside the bodies of definitions already bound into a
+/// [`Expr::DefCall`] (it does not enter them either; their arguments are searched).
+fn binds_by_as_only(def: &FuncDefData, args: &[Expr]) -> bool {
+    use crate::jq::walk::{search_subexpr, Visit};
+    fn reads_bare(expr: &Expr, params: &[Param]) -> bool {
+        search_subexpr(expr, &mut |e: &Expr| match e {
+            Expr::FuncCall { name, args, .. }
+                if args.is_empty() && params.iter().any(|p| p.name() == name) =>
+            {
+                Visit::Found
+            }
+            Expr::Shared(_) => Visit::Skip,
+            Expr::DefCall { args, .. } => {
+                if args.iter().any(|a| reads_bare(a, params)) {
+                    Visit::Found
+                } else {
+                    Visit::Skip
+                }
+            }
+            _ => Visit::Descend,
+        })
+    }
+    !def.params.iter().zip(args).any(|(param, arg)| {
+        let arg = match arg {
+            Expr::Shared(inner) => inner.expr(),
+            other => other,
+        };
+        param.is_dollar() && matches!(arg, Expr::Literal(_))
+    }) && !def.reads_bare_param_or_init(|body| reads_bare(body, &def.params))
 }
 
 /// Bind every parameter of a `def` call into its own body (#2560, #3149).
@@ -124318,6 +124708,108 @@ mod tests {
                 param_site_reached, !binds_dollar,
                 "substitute_func_param_impl disagrees with params_bind_dollar: {label}"
             );
+        }
+    }
+
+    /// #7699: a definition already bound into the body is read for its arguments only: a bare
+    /// parameter passed to it is a read, and its own body (which may name anything) is not entered.
+    #[test]
+    fn a_bound_definition_in_the_body_is_read_for_its_arguments_7699() {
+        for (src, skips) in [
+            ("def g(x): x; def f($n): [g(n), $n]; f(.)", false),
+            ("def g(x): x; def f($n): [g($n), $n]; f(.)", true),
+            ("def g(n): n; def f($n): [g($n), $n]; f(.)", true),
+        ] {
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = crate::jq::parse(src).expect("parses")
+            else {
+                panic!("a def: {src}");
+            };
+            let g = Rc::new(FuncDefData::new(name, params, *body));
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = install_def_calls(&then, &g, 0, false)
+            else {
+                panic!("an inner def: {src}");
+            };
+            assert!(
+                any_subexpr(&body, &mut |e| matches!(e, Expr::DefCall { .. })),
+                "{src}: g is bound into f's body"
+            );
+            let f = Rc::new(FuncDefData::new(name, params, *body));
+            let Expr::DefCall { args, .. } = install_def_calls(&then, &f, 0, false) else {
+                panic!("a call: {src}");
+            };
+            assert_eq!(binds_by_as_only(&f, &args), skips, "{src}");
+        }
+    }
+
+    /// #7699: a `$`-parameter call whose body reads no parameter by its bare name, with no literal
+    /// argument, is bound without the substitution walk; the bound body must be the one the walk
+    /// built, frame charges included (`install_def_calls` charges each `as` wrapper a frame).
+    #[test]
+    fn a_body_with_nothing_to_substitute_binds_as_the_walk_did_7699() {
+        for (src, skips) in [
+            (
+                "def f($n): if $n == 0 then . + 1 else f($n - 1) | f($n - 1) end; f(.)",
+                true,
+            ),
+            (
+                "def f($m; $i): if $i > $m then . else f($m; $i * 2) | f($m; $i + 1) end; f(.; .)",
+                true,
+            ),
+            (
+                "def f($a; $b; $c): [$a, $b, $c, f($a; $b; $c)]; f(.; .a; .b)",
+                true,
+            ),
+            ("def f($a; $a): $a; f(.a; .b)", true),
+            ("def f($a; b): [$a, f($a; b)]; f(.; .)", false),
+            ("def f($a; b): [$a]; f(.; .)", true),
+            ("def f($n): def g: n; [g, $n]; f(.)", false),
+            ("def f($n): [$n, n]; f(.)", false),
+            (
+                "def f($n): reduce .[] as $x (0; . + $x + $n) | f($n); f(.)",
+                true,
+            ),
+            ("def f($n): def h($n): $n + 1; h($n); f(.)", true),
+            ("def f($n): $n; f(1)", false),
+            ("def f($n; $m): [$n, $m]; f(.; 2)", false),
+            ("def f(x): x; f(.)", false),
+        ] {
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = crate::jq::parse(src).expect("parses")
+            else {
+                panic!("a def: {src}");
+            };
+            let def = Rc::new(FuncDefData::new(name, params, *body));
+            let Expr::DefCall { args, .. } = install_def_calls(&then, &def, 0, false) else {
+                panic!("a call: {src}");
+            };
+            assert_eq!(binds_by_as_only(&def, &args), skips, "{src}");
+            for frames in [0, 7] {
+                let walked = install_def_calls(
+                    &bind_def_call_params(&def.body, &def.params, &args),
+                    &def,
+                    frames + 1,
+                    true,
+                );
+                let bound = bind_def_call_body(&def, &args, frames).expect("binds");
+                assert_eq!(*bound, walked, "{src} at {frames} frames");
+            }
         }
     }
 
@@ -150024,6 +150516,57 @@ mod tests {
             assert!(
                 not_empty_capture_rewrite::<JqSemantics>(pattern, modes).is_none(),
                 "{pattern}"
+            );
+        }
+    }
+
+    /// #7689: a negated property inside a class is written as its complement's ranges, read
+    /// without case folding.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_spelled_complement_reads_the_property_unfolded_7689() {
+        let lu = spelled_complement(r"\p{Lu}").expect("Lu");
+        assert!(lu.starts_with(r"[\x{0}-\x{40}\x{5B}-"), "{lu}");
+        assert!(lu.ends_with(r"-\x{10FFFF}]"), "{lu}");
+        assert_eq!(
+            spelled_complement(r"\x{0}-\x{10FFFF}").as_deref(),
+            Some(r"[^\x{0}-\x{10FFFF}]")
+        );
+        assert_eq!(spelled_complement(r"\p{NoSuchName}"), None);
+    }
+
+    /// #7689: a part that never matches leaves `regex-syntax` without a minimum length, which is
+    /// not "never empty"; and which repeated groups the `l` and `n` searches build unmerged.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_empty_reach_and_merged_group_loops_7689() {
+        for (pattern, can_be_empty) in [
+            (r"[^\s\S]?|b", true),
+            (r"(?:(a)[^\s\S])?|b", true),
+            (r"x?|b", true),
+            (r"[^\s\S]|b", false),
+            (r"a[^\s\S]?", false),
+            (r"\b", true),
+        ] {
+            assert_eq!(pattern_match_lengths(pattern).0, can_be_empty, "{pattern}");
+        }
+        assert!(pattern_is_variable_length(r"(?:(a)[^\s\S])?|b"));
+        assert!(!pattern_is_variable_length("ab"));
+        let tree = |pattern: &str| parse_fancy_tree(pattern.into()).map(|(expr, _)| expr);
+        for (pattern, star, merged) in [
+            ("(a?)+", false, true),
+            ("(?:(a*)?)+", false, false),
+            ("(?:(a*)?)+", true, true),
+            ("(a*)*", true, true),
+            ("(a+)+", true, false),
+            ("(?:(a)?)+", true, false),
+            ("(a)+", true, false),
+        ] {
+            let expr = tree(pattern).expect(pattern);
+            assert_eq!(
+                fancy_has_merged_group_loop(&expr, star),
+                merged,
+                "{pattern} {star}"
             );
         }
     }

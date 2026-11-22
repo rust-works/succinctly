@@ -140,7 +140,7 @@ impl JqCommand {
     /// from `filter` to `program_file`, so `filter` is then always `None`.
     ///
     /// Only words clap already captured are resequenced. `succinctly jq` and
-    /// `sjq` never give clap a positional word: `walk_jq_argv` (`main.rs`)
+    /// `sjq` never give clap a positional word: `read_jq_argv` (`main.rs`)
     /// reads them as jq does and `set_positional_words` sets them (#7494),
     /// so there is nothing here to resequence. A `JqCommand` clap parsed by
     /// itself (the `Cli` tree, the unit tests below) still arrives with
@@ -1718,9 +1718,10 @@ struct FailureWalk<'a> {
     /// jq's own directory, which a `search` entry's `$ORIGIN/` stands for (#5338).
     jq_origin: &'a Path,
     /// The modules already reached, by canonical file, whether or not they
-    /// failed: jq loads a module once, so a second path to it reports and
+    /// parsed: jq loads a module once, so a second path to it reports and
     /// counts nothing. Recorded when a module is finished, not when it starts,
-    /// so a module still being walked is a cycle, not a repeat.
+    /// so a module still being walked is a cycle, not a repeat. A module that
+    /// could not be read is never recorded, as jq never caches one (#7709).
     visited: BTreeSet<PathBuf>,
     /// The modules whose own directives are being walked, by canonical file.
     chain: Vec<PathBuf>,
@@ -1800,20 +1801,25 @@ impl FailureWalk<'_> {
         if self.visited.contains(&canonical) {
             return 0;
         }
-        let errors = match read_library(file) {
+        match read_library(file) {
             // An unreadable module is counted like a data file that did not
-            // load, and the walk goes on (see [`ReportEntry::Data`]).
+            // load, and the walk goes on (see [`ReportEntry::Data`]). It is not
+            // recorded as reached: jq's `load_library` (1.7.1 and 1.8.2) returns
+            // before it enters a file it could not open in its table, so every
+            // directive that reaches it reports it again (#7709).
             Err(e) => {
                 self.entries.push(ReportEntry::Data(DataFileFailure {
                     detail: library_read_detail(&canonical, &e),
-                    path: canonical.clone(),
+                    path: canonical,
                 }));
                 1
             }
-            Ok(contents) => self.parsed_module(file, &canonical, contents),
-        };
-        self.visited.insert(canonical);
-        errors
+            Ok(contents) => {
+                let errors = self.parsed_module(file, &canonical, contents);
+                self.visited.insert(canonical);
+                errors
+            }
+        }
     }
 
     /// [`Self::module`] for a module whose text was read.
@@ -2663,12 +2669,14 @@ impl ModuleLoader {
     ///   `bad`, `m1`, `1 compile error`, but a *module* that includes `m1`,
     ///   included beside the same data import, is `bad`, `m1`, `2 compile
     ///   errors`);
-    /// - a module is reached **once**, whether or not it failed: a second
+    /// - a module is reached **once**, whether or not it parsed: a second
     ///   `include` of it, or a second path to it, prints nothing and counts
     ///   nothing.
     ///
     /// - a module that exists but cannot be read is printed as `error loading
-    ///   data file` and counted, and the walk goes on, as for a data file.
+    ///   data file` and counted, and the walk goes on, as for a data file --
+    ///   and, as for a data file, at **every** directive that reaches it: jq
+    ///   1.7.1 and 1.8.2 never cache a file they could not open (#7709).
     ///
     /// A module cycle is #2865's divergence (jq runs out of stack). It ends the
     /// walk the way a missing module does, after what jq printed before it
@@ -5835,6 +5843,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             Some(prepared) => prepared,
             None => match seq_windowed.take().or_else(|| windowed_plain_file(&args)) {
                 Some((files, reader, again)) => {
+                    window::note_route(if args.seq { "seq" } else { "plain" });
                     windowed = Some(reader);
                     reread = Some(again);
                     // One empty buffer for each file: the windows are what the loop reads, and the
@@ -7198,6 +7207,51 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     ))
 }
 
+/// jq's refusal of an `--argjson` text or a `--jsonargs` word that is not JSON, with its usage hint:
+/// jq's wording does not name the variable, the value or its position (#3051, #3096).
+fn invalid_json_text_passed_to(flag: &str) -> String {
+    format!(
+        "invalid JSON text passed to --{flag}\n\
+         Use jq --help for help with command-line options,\n\
+         or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
+    )
+}
+
+/// Whether `text` is one JSON text as `--argjson` and `--jsonargs` read it: the check jq's option
+/// loop makes where it reads the word (#7712).
+pub(crate) fn is_json_text(text: &str) -> bool {
+    parse_json_value(text).is_ok()
+}
+
+/// [`invalid_json_text_passed_to`] on standard error, and jq's exit status for it (2), where jq's
+/// option loop stops at the word (#7712).
+pub(crate) fn exit_invalid_json_text(flag: &str) -> ! {
+    report_usage_error_bytes(invalid_json_text_passed_to(flag).as_bytes());
+    std::process::exit(exit_codes::USAGE_ERROR)
+}
+
+/// The error `run_jq` would report binding `args`' named and positional arguments, reported, and
+/// the status to exit with (#7712); `None` when they all bind. `parse_jq` asks it of the options
+/// before the word jq's option loop stops at, which jq reads first.
+pub(crate) fn report_named_argument_error(args: &JqCommand) -> Option<i32> {
+    match build_context(args) {
+        Ok(context) => {
+            // As `run_jq` keeps its context: a `--slurpfile` value is not worth freeing at exit (#5673).
+            std::mem::forget(context);
+            None
+        }
+        Err(BuildContextError::Usage(message)) => {
+            report_usage_error_bytes(&message);
+            Some(exit_codes::USAGE_ERROR)
+        }
+        Err(BuildContextError::Other(e)) => {
+            // As `main` reports an error `run_jq` returns.
+            eprintln!("Error: {e:?}");
+            Some(1)
+        }
+    }
+}
+
 /// Build the evaluation context from command-line arguments.
 fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
     let mut context = EvalContext::default();
@@ -7252,12 +7306,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                 {
                     // jq's own wording doesn't name the flag's variable (`x`) at all.
                     let json_value = parse_json_value(value).map_err(|_| {
-                        BuildContextError::Usage(
-                            "invalid JSON text passed to --argjson\n\
-                             Use jq --help for help with command-line options,\n\
-                             or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
-                                .into(),
-                        )
+                        BuildContextError::Usage(invalid_json_text_passed_to("argjson").into())
                     })?;
                     context.named.insert(name.clone(), json_value);
                 }
@@ -7329,12 +7378,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
             PositionalWord::Json(text) => {
                 // jq's own wording doesn't name the offending value or position.
                 let json_value = parse_json_value(text).map_err(|_| {
-                    BuildContextError::Usage(
-                        "invalid JSON text passed to --jsonargs\n\
-                         Use jq --help for help with command-line options,\n\
-                         or see the jq manpage, or online docs  at https://jqlang.github.io/jq"
-                            .into(),
-                    )
+                    BuildContextError::Usage(invalid_json_text_passed_to("jsonargs").into())
                 })?;
                 context.positional.push(json_value);
             }
@@ -7866,6 +7910,7 @@ fn read_inputs(
     // reads its documents; #7024: so does `-R` over standard input, and over several regular files,
     // each a window at a time and in turn. Anything the gate turns down is read whole below.
     if let Some(sources) = raw_windowed_sources(args, &files) {
+        window::note_route("raw");
         let mut windows: Vec<Option<window::LineWindows>> = sources
             .into_iter()
             .map(|(reader, len, front)| {
@@ -7907,6 +7952,7 @@ fn read_inputs(
     // the stream to the eager reader there, which reads what is left of the files whole
     // ([`hand_off_later_sources`]). Anything the gate turns down is read whole below.
     if let Some(windows) = several_lazy_windowed_files(args, track_eof, &files) {
+        window::note_route("inputs");
         #[cfg(test)]
         SEVERAL_WINDOWED_STARTS.with(|n| n.set(n.get() + 1));
         let sources = windows
@@ -13081,7 +13127,7 @@ fn judge_regular_paths(files: &[PathBuf], min: u64) -> Option<()> {
 /// `/dev/fd/N`), which may share an offset with it. Whether it is one of the run's own descriptors
 /// ([`names_stdin`], [`names_output`]) is left to the caller, which asks once it has a reason to open it.
 fn regular_file(path: &PathBuf) -> Option<std::fs::Metadata> {
-    if is_stdin_dash(path) || path.starts_with("/dev/fd/") {
+    if window::whole_file_forced() || is_stdin_dash(path) || path.starts_with("/dev/fd/") {
         return None;
     }
     let meta = std::fs::metadata(path).ok()?;
@@ -13101,6 +13147,9 @@ fn lone_regular_file(files: &[PathBuf], min_len: u64) -> Option<(&PathBuf, std::
     let [path] = files else {
         return None;
     };
+    if window::whole_file_forced() {
+        return None;
+    }
     let meta = match descriptor_path(path) {
         // Standard output and error, whose `stat` on macOS names the descriptor's own file system and so
         // escapes [`names_output`].
@@ -13160,7 +13209,7 @@ fn not_open_for_reading(error: &std::io::Error) -> bool {
 #[cfg(unix)]
 fn stdin_to_window() -> Option<(std::fs::File, std::fs::Metadata)> {
     use std::os::fd::AsFd;
-    if STDIN_PUSHBACK.with(|slot| slot.borrow().is_some()) {
+    if window::whole_file_forced() || STDIN_PUSHBACK.with(|slot| slot.borrow().is_some()) {
         return None;
     }
     let file = std::fs::File::from(std::io::stdin().as_fd().try_clone_to_owned().ok()?);
@@ -13248,7 +13297,7 @@ fn named_pipe(files: &[PathBuf]) -> Option<&PathBuf> {
     let [path] = files else {
         return None;
     };
-    if is_stdin_dash(path) {
+    if window::whole_file_forced() || is_stdin_dash(path) {
         return None;
     }
     let kind = std::fs::metadata(path).ok()?.file_type();

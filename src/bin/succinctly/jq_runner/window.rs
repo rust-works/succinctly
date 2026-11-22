@@ -139,6 +139,46 @@ pub(super) const fn window_bytes() -> usize {
     WINDOW_BYTES
 }
 
+/// The environment variable that has a run read every input whole (#7688): a regular file, a
+/// descriptor, a pipe, standard input and a named pipe each decline the windowed routes' gates, as
+/// `/dev/fd/N` once did by accident. The differential fuzz (`scripts/jq-windowed-file-fuzz.py`) sets it
+/// on its oracle, so the oracle stays the whole-file route however the gates change; unlike
+/// [`DEBUG_WINDOW_ENV`] it is in a release build too, since the fuzz runs against one. Any non-empty
+/// value but `0` forces it.
+pub(super) const WHOLE_FILE_ENV: &str = "SUCCINCTLY_DEBUG_JQ_WHOLE_FILE";
+
+/// The environment variable naming a file each windowed route a run takes appends its name to, one
+/// line each (#7688): the fuzz reads it to learn that the side under test went windowed and that its
+/// oracle did not, so a case that compares a route with itself is no longer a silent pass.
+pub(super) const ROUTE_LOG_ENV: &str = "SUCCINCTLY_DEBUG_JQ_ROUTE_LOG";
+
+/// Whether `value`, the content of [`WHOLE_FILE_ENV`], forces the whole-file route.
+fn forces_whole_file(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Whether the run reads every input whole ([`WHOLE_FILE_ENV`]). Asked by the gates every windowed
+/// route goes through, which a run that never reaches one does not pay for.
+pub(super) fn whole_file_forced() -> bool {
+    forces_whole_file(std::env::var_os(WHOLE_FILE_ENV).as_deref())
+}
+
+/// Records that the run took the windowed route `route` ([`ROUTE_LOG_ENV`]); nothing when the
+/// variable is not set. A run's routes are decided once, before its first window is read.
+pub(super) fn note_route(route: &str) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os(ROUTE_LOG_ENV) else {
+        return;
+    };
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(log, "{route}");
+    }
+}
+
 /// The smallest file the route reads a window at a time, four windows (1 MiB in every build that
 /// ships, 4 MiB before #7412): below this it is not worth the second route, and the file is read whole
 /// as before.
@@ -3758,6 +3798,22 @@ mod tests {
             fault,
             lines,
         }
+    }
+
+    /// #7688: the switch that has a run read every input whole is any non-empty value but `0`, and
+    /// the route log's name is the one the fuzz script sets.
+    #[test]
+    fn the_whole_file_switch_is_a_non_empty_value_but_zero_7688() {
+        use std::ffi::OsStr;
+        assert!(!forces_whole_file(None));
+        for value in ["", "0"] {
+            assert!(!forces_whole_file(Some(OsStr::new(value))), "{value:?}");
+        }
+        for value in ["1", "true", "yes", "00"] {
+            assert!(forces_whole_file(Some(OsStr::new(value))), "{value:?}");
+        }
+        assert_eq!(WHOLE_FILE_ENV, "SUCCINCTLY_DEBUG_JQ_WHOLE_FILE");
+        assert_eq!(ROUTE_LOG_ENV, "SUCCINCTLY_DEBUG_JQ_ROUTE_LOG");
     }
 
     /// #7312: a `--seq` file is read a megabyte at a time only when its first byte, from where the run
