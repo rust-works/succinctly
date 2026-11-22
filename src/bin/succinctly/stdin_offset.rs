@@ -49,6 +49,8 @@ thread_local! {
     static ORIGIN: Cell<Option<u64>> = const { Cell::new(None) };
     /// The bytes [`Stdin`] read.
     static READ: Cell<u64> = const { Cell::new(0) };
+    /// Whether a read of [`Stdin`] has returned end of file in this run (#7741).
+    static AT_END: Cell<bool> = const { Cell::new(false) };
     /// The inputs the main loop handed to the program, on the routes that do not read them
     /// through the `input` queue.
     static TAKEN: Cell<u64> = const { Cell::new(0) };
@@ -69,6 +71,7 @@ pub(crate) fn start_run() {
     BEFORE.with(|b| b.borrow_mut().clear());
     ORIGIN.with(|o| o.set(None));
     READ.with(|r| r.set(0));
+    AT_END.with(|e| e.set(false));
     TAKEN.with(|t| t.set(0));
     HALTED.with(|h| h.set(false));
     MAIN_FAULT.with(|f| f.set(false));
@@ -214,34 +217,61 @@ pub(crate) fn note_fault_was_taken() {
     FAULT_TAKEN.with(|f| f.set(true));
 }
 
+/// Records that standard input has returned end of file to a read through another handle on descriptor 0
+/// (the probe of a pipe on standard input, which hands its bytes back): [`Stdin`] reads no more in this
+/// run (#7741).
+pub(crate) fn note_end_of_file() {
+    AT_END.with(|e| e.set(true));
+}
+
 /// Standard input, read straight from descriptor 0 with no buffer of its own, so that the bytes it
 /// has read are the bytes the descriptor moved by. A descriptor that was not opened for reading reads
 /// as empty, as Rust's own standard input reads it.
+///
+/// Its end of file is sticky, as stdio's is for jq (#7741): once a read returned no bytes, every later
+/// read in the run returns none without reading the descriptor. A terminal returns end of file once
+/// per `^D` and then reads on, so a reader that asked again after it (`--stream`'s probe of the first
+/// bytes, then the reader chained after them) waited for a second `^D` that jq never needs.
 pub(crate) struct Stdin;
 
 impl std::io::Read for Stdin {
-    #[cfg(unix)]
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // macOS refuses a count above `INT_MAX`, as Rust's own standard input allows for.
-        let len = buf.len().min(i32::MAX as usize - 1);
-        // SAFETY: `buf` is valid for writes of `len` bytes.
-        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), len) };
-        if n < 0 {
-            let error = std::io::Error::last_os_error();
-            return if error.raw_os_error() == Some(libc::EBADF) {
-                Ok(0)
-            } else {
-                Err(error)
-            };
+        if buf.is_empty() {
+            return Ok(0);
         }
-        READ.with(|r| r.set(r.get() + n as u64));
-        Ok(n as usize)
+        if AT_END.with(Cell::get) {
+            return Ok(0);
+        }
+        let n = read_descriptor(buf)?;
+        if n == 0 {
+            AT_END.with(|e| e.set(true));
+        }
+        Ok(n)
     }
+}
 
-    #[cfg(not(unix))]
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        std::io::Read::read(&mut std::io::stdin(), buf)
+/// One read of descriptor 0 into `buf`, counted in [`READ`].
+#[cfg(unix)]
+fn read_descriptor(buf: &mut [u8]) -> std::io::Result<usize> {
+    // macOS refuses a count above `INT_MAX`, as Rust's own standard input allows for.
+    let len = buf.len().min(i32::MAX as usize - 1);
+    // SAFETY: `buf` is valid for writes of `len` bytes.
+    let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), len) };
+    if n < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::EBADF) {
+            Ok(0)
+        } else {
+            Err(error)
+        };
     }
+    READ.with(|r| r.set(r.get() + n as u64));
+    Ok(n as usize)
+}
+
+#[cfg(not(unix))]
+fn read_descriptor(buf: &mut [u8]) -> std::io::Result<usize> {
+    std::io::Read::read(&mut std::io::stdin(), buf)
 }
 
 /// Puts a regular file on standard input back where jq would leave it, if the run stopped before

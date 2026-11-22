@@ -13345,6 +13345,9 @@ fn hand_back_short_pipe(named: Option<&PathBuf>, bytes: Vec<u8>, error: Option<s
         None => {
             STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
             STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(bytes));
+            // #7741: the probe met the end (or a failure), which a terminal gives once per `^D`; a
+            // route that reads on after the bytes handed back reads no more, as jq's stdio does not.
+            super::stdin_offset::note_end_of_file();
         }
         // A read of a named pipe that fails after it opened leaves what it read as the pipe's bytes.
         Some(path) => NAMED_PUSHBACK.with(|slot| {
