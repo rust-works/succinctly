@@ -4,6 +4,8 @@
 //! not depend on where it stands (no assertion); one with `\b`, `^`, `$` or a look-around is
 //! recorded in `docs/compliance/jq/limitations.md`. Every row was captured from jq 1.7.1
 //! (`/usr/bin/jq -nc`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -44,7 +46,7 @@ fn test_a_multibyte_character_gives_an_empty_match_per_continuation_byte_6326() 
         ),
         (
             r#""éé" | [match("(x)?";"g") | [.offset,(.captures|map(.string))]]"#,
-            r#"[[0,[""]],[1,[""]],[1,[""]],[2,[""]],[2,[""]]]"#,
+            r"[[0,[null]],[1,[null]],[1,[null]],[2,[null]],[2,[null]]]",
         ),
         (
             r#""é" | [match("(?<n>x*)";"g") | .captures[0] | [.name,.offset,.string]]"#,

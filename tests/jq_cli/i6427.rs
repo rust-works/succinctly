@@ -1,6 +1,8 @@
 //! #6427: a lazy `*?` or `+?` over a body with a group answers as Oniguruma does, and so does a loop with
 //! groups inside one. An empty iteration leaves `*?`; `+?` over a short body is `X X*?`, the first copy with
 //! no empty check. Every row was captured from jq 1.7.1 (`jq -nc`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -55,22 +57,22 @@ fn a_lazy_star_or_plus_around_groups_answers_as_jq_does_6427() -> Result<()> {
         (
             r"(x?(?:b?|(a|b))+?)+",
             "ba",
-            r#"[[0,"b",["",null]],[1,"",["",""]],[2,"",["",""]]]"#,
+            r#"[[0,"b",["",null]],[1,"",["",null]],[2,"",["",null]]]"#,
         ),
         (
             r"(?:(a)|b*|c)+(?:(?:(x)|y*|z){200}|d)*?",
             "bcab",
-            r#"[[0,"b",[null,null]],[1,"",["",""]],[2,"ab",["a",null]],[4,"",["",""]]]"#,
+            r#"[[0,"b",[null,null]],[1,"",[null,null]],[2,"ab",["a",null]],[4,"",[null,null]]]"#,
         ),
         (
             r"(?:(a)|b*|c)+(?:(?:(x)|y*|z){200}|d)+?",
             "bcab",
-            r#"[[0,"b",[null,null]],[1,"",["",""]],[2,"ab",["a",null]],[4,"",["",""]]]"#,
+            r#"[[0,"b",[null,null]],[1,"",[null,null]],[2,"ab",["a",null]],[4,"",[null,null]]]"#,
         ),
         (
             r"(?:^b*|(?:(a*)|b)+(?:(a)|b?){0,2})+?$",
             "abba",
-            r#"[[0,"abba",["",null]],[4,"",["",""]]]"#,
+            r#"[[0,"abba",["",null]],[4,"",["",null]]]"#,
         ),
         (
             r"(?:(?:(b*)|a)+?|c)+?(b)",

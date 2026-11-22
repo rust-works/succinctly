@@ -358,6 +358,7 @@ pub fn spawn_with_signal_retry(
 ) -> Result<(std::process::Output, i32)> {
     for attempt in 0..MAX_CARGO_RETRIES {
         let mut command = build();
+        pin_c_locale_unless_named(&mut command);
         command
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -400,9 +401,77 @@ pub fn spawn_with_signal_retry(
     unreachable!()
 }
 
+/// The locale variables a child reads for `strftime`'s names and the rest of its locale.
+const LOCALE_VARIABLES: &[&str] = &[
+    "LC_ALL",
+    "LC_TIME",
+    "LC_CTYPE",
+    "LC_NUMERIC",
+    "LC_COLLATE",
+    "LC_MONETARY",
+    "LC_MESSAGES",
+    "LANG",
+];
+
+/// Run `command` in the C locale unless it sets or removes a locale variable itself (#7612).
+///
+/// `succinctly jq` names weekdays and months and formats `%c`, `%x`, `%X` and `%p` in the locale
+/// `LC_ALL`/`LC_TIME`/`LANG` select, as jq does (#5754), and the expectations the tests pin were
+/// captured in the C locale, which is what CI runs in. A child that inherited the host's `LANG`
+/// failed them on a host whose shell sets `LANG=en_AU.UTF-8` (`%c` is `Thu  1 Jan ...` there). A
+/// test that names a locale variable (`i5754.rs` removes `LC_ALL` and sets `LANG` per row) is
+/// testing the locale and keeps exactly the environment it built.
+pub fn pin_c_locale_unless_named(command: &mut std::process::Command) {
+    let named = command.get_envs().any(|(key, _)| {
+        key.to_str()
+            .is_some_and(|key| LOCALE_VARIABLES.contains(&key))
+    });
+    if !named {
+        command.env("LC_ALL", "C");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::spawn_with_signal_retry;
+
+    /// #7612: a command that names no locale variable runs in the C locale, and one that sets or
+    /// removes one keeps its own environment.
+    #[test]
+    fn a_command_naming_no_locale_variable_runs_in_the_c_locale_7612() {
+        /// `LC_ALL` as `command` names it: `"-"` when it is not named, `"removed"`, or `=value`.
+        fn lc_all(command: &std::process::Command) -> String {
+            match command.get_envs().find(|(key, _)| *key == "LC_ALL") {
+                None => "-".to_string(),
+                Some((_, None)) => "removed".to_string(),
+                Some((_, Some(value))) => format!("={}", value.to_string_lossy()),
+            }
+        }
+        let mut bare = std::process::Command::new("true");
+        bare.env("TZ", "UTC");
+        super::pin_c_locale_unless_named(&mut bare);
+        assert_eq!(lc_all(&bare), "=C");
+        for variable in super::LOCALE_VARIABLES {
+            let mut set = std::process::Command::new("true");
+            set.env(variable, "en_AU.UTF-8");
+            super::pin_c_locale_unless_named(&mut set);
+            let expected = if *variable == "LC_ALL" {
+                "=en_AU.UTF-8"
+            } else {
+                "-"
+            };
+            assert_eq!(lc_all(&set), expected, "{variable} set");
+            let mut removed = std::process::Command::new("true");
+            removed.env_remove(variable);
+            super::pin_c_locale_unless_named(&mut removed);
+            let expected = if *variable == "LC_ALL" {
+                "removed"
+            } else {
+                "-"
+            };
+            assert_eq!(lc_all(&removed), expected, "{variable} removed");
+        }
+    }
 
     /// #1891: a `write_all` failure used to `?` out of
     /// `spawn_with_signal_retry` before the child was ever waited on,
