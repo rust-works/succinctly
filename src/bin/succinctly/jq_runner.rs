@@ -1071,6 +1071,14 @@ fn resolve_module_in(search_path: &[PathBuf], module_path: &str) -> Option<PathB
 /// `import "b"`, `p/q/q.jq` for `import "p/q"`), in that order -- confirmed live with
 /// all three present, where `b/jq/main.jq` beat `b/b.jq`, and with one directory
 /// holding `b/b.jq` ahead of a later one holding `b.jq`, where the earlier directory won.
+///
+/// A spelling is found when `stat` finds anything there, as in jq's `find_lib` (#7663): a
+/// directory, or a file that will not open, is the module, and reading it then fails with
+/// `error loading data file <path>: Could not open <path>: It's a directory` (or the open's own
+/// error), never `module not found` or a module further down the path. Only a spelling `stat`
+/// says is absent (`ENOENT`) moves on to the next spelling; any other failure (a symlink loop,
+/// a file where a directory should be) moves on to the next search directory, skipping the
+/// directory-module spellings, as jq does.
 fn resolve_with_suffix(
     search_path: &[PathBuf],
     module_path: &str,
@@ -1091,12 +1099,26 @@ fn resolve_with_suffix(
             // one is `lib//a.jq`, the file system's `lib/a.jq`. `Path::join` would take it as an
             // absolute path and drop the directory.
             let full_path = base.join(spelling.trim_start_matches('/'));
-            if full_path.is_file() {
-                return Some(full_path);
+            match std::fs::metadata(&full_path) {
+                Ok(_) => return Some(full_path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => break,
             }
         }
     }
     None
+}
+
+/// The `<detail>` of jq's `error loading data file <path>: <detail>` for a module or data file
+/// that was found but would not read (#7663): jq's `jv_load_file` says `Could not open <path>:
+/// <reason>`, naming the file by the resolved path the report names it by, with `It's a
+/// directory` for a directory ([`load_file_detail`]).
+fn library_read_detail(canonical: &Path, e: &std::io::Error) -> String {
+    format!(
+        "Could not open {}: {}",
+        canonical.display(),
+        load_file_detail(e)
+    )
 }
 
 /// Resolve a **data** import's path (`{module_path}.json`) against the
@@ -1164,7 +1186,8 @@ fn read_data_file(path: &Path, raw: bool) -> Result<OwnedValue, DataFileFailure>
         path: canonical_or_self(path),
         detail,
     };
-    let bytes = std::fs::read(path).map_err(|e| unreadable(strerror_only(&e)))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| unreadable(library_read_detail(&canonical_or_self(path), &e)))?;
     if raw {
         // `jv_load_file(path, 1)`, as for `--rawfile` (#7645).
         return Ok(OwnedValue::String(jq_raw_file_text(&bytes).into()));
@@ -1203,16 +1226,12 @@ fn module_meta_outcome(
         return Error(module_not_found(name, note));
     };
     let canonical = canonical_or_self(&file);
-    // Lossily, as `import` reads a module (#5351, #7429): jq parses the raw bytes.
-    let contents = match read_library(&file) {
-        Ok(contents) => contents,
-        Err(e) => {
-            return LoadFailure(format!(
-                "jq: error loading data file {}: {}\n\n",
-                canonical.display(),
-                strerror_only(&e)
-            ));
-        }
+    // Lossily, as `import` reads a module (#5351, #7429): jq parses the raw bytes. A module that
+    // was found but will not read (a directory, a file the user cannot open) is `null`, with
+    // nothing on stderr: jq's `load_module_meta` drops the failed `jv_load_file` without a word,
+    // where `import` reports it (#7663, captured from jq 1.7.1 and 1.8.2).
+    let Ok(contents) = read_library(&file) else {
+        return Meta(OwnedValue::Null);
     };
     let program = match jq::parse_program(&contents) {
         Ok(program) => program,
@@ -1786,8 +1805,8 @@ impl FailureWalk<'_> {
             // load, and the walk goes on (see [`ReportEntry::Data`]).
             Err(e) => {
                 self.entries.push(ReportEntry::Data(DataFileFailure {
+                    detail: library_read_detail(&canonical, &e),
                     path: canonical.clone(),
-                    detail: strerror_only(&e),
                 }));
                 1
             }
@@ -2162,8 +2181,8 @@ impl ModuleLoader {
         // Read and parse the module
         let contents = read_library(&file_path).map_err(|e| {
             ModuleLoadError::single(ReportEntry::Data(DataFileFailure {
+                detail: library_read_detail(&canonical, &e),
                 path: canonical.clone(),
-                detail: strerror_only(&e),
             }))
         })?;
 
