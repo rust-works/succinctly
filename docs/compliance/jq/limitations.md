@@ -11705,6 +11705,35 @@ A host with less memory than those rows need is taken to an out-of-memory failur
 The ledger (`comparison/jq/divergences/`) has no entry for these: the probes `succinctly dev compare jq` runs are against jq 1.7.1 and none reaches a 10,001-level walk, a string past 2 GiB, a 1 GiB token, a 4,096-parameter `def` or a repeat count of 2^31.
 Pinned by `tests/jq_cli/i7526.rs` for the rows that are cheap to run: depth 10,001 and 20,000 through `==`, `<`, `sort`, `contains`, `*`, `setpath`, `getpath`, `delpaths` and `tostream`, a `def` of 4,096 and 4,097 parameters, and the refusal of a repeat count of `1e19`, so a later fidelity change cannot add the caps without failing it.
 
+### `halt_error(n)` for an `n` of 2^31 or more, or `infinite`: 255 on every platform, where jq's answer is the CPU's (#7561)
+
+jq reads the exit code of `halt_error(n)` with an implicit double-to-`int` conversion (`ret = jv_number_value(exit_code)` in `main.c`, unchanged between 1.7.1 and 1.8.2).
+That conversion is undefined behaviour in C for a double outside `int`'s range, so jq's status for such an `n` is the compiler's and the CPU's, not a rule of the language.
+On aarch64 (macOS, Linux) the conversion saturates, and every `n` of 2^31 or more, and `infinite`, exits 255.
+On x86_64 Linux it returns `INT_MIN`, whose low byte is 0, and the same values exit 0.
+`succinctly jq` saturates on every platform: it exits 255 for those values, equal to jq on aarch64 and different from jq 1.7.1 on x86_64 Linux.
+Reproducing the x86_64 answer would make the exit status of one program depend on the CPU it runs on, for no use to a caller; that is a recorded, by-design divergence, as for `"x" * n` with an `n` of 2^31 or more (#7500, above).
+Every other argument agrees with jq 1.7.1 and 1.8.2 on both architectures: a non-negative argument below 2^31 exits with its integer part's low byte (`256` exits 0, `257` exits 1, `1.5` exits 1, `2147483647` exits 255), and every negative number, `-infinite` and `nan` exit 0.
+The message on stderr is jq's in every row.
+jq 1.8.2 was measured on aarch64 only (it matches 1.7.1 there in every row below); its source is unchanged, so it is expected to match 1.7.1 on x86_64.
+
+| `halt_error(n)` for `n`                                                            | jq 1.7.1 x86_64 Linux | jq 1.7.1 and 1.8.2 aarch64 | `succinctly jq` |
+|------------------------------------------------------------------------------------|-----------------------|----------------------------|-----------------|
+| `2147483647`                                                                       | 255                   | 255                        | 255             |
+| `2147483648`, `2147483649`, `3000000000`, `4294967295`, `4294967296`, `4294967297` | 0                     | 255                        | 255             |
+| `1e10`, `1e19`, `1e100`, `infinite`                                                | 0                     | 255                        | 255             |
+| `-2147483648`, `-2147483649`, `-1e10`, `-infinite`, `-1`, `nan`, `0.5`, `256`      | 0                     | 0                          | 0               |
+
+The x86_64 Linux column is the issue's measurements, repeated on terminus against jq 1.7.1; the aarch64 and `succinctly jq` columns were captured on an Apple M5 Max.
+The ledger (`comparison/jq/divergences/`) has no entry for it: no probe of `succinctly dev compare jq` and no fuzz dimension passes `halt_error` an argument of 2^31 or more (the probes' `halt_error` rows use 1, 7 and 11), so the x86_64 Linux differential never reaches it.
+Pinned by `tests/jq_cli/i7561.rs`: every row above and the in-range neighbours, on every platform, and the saturated status after output, under `try` and under `-e`.
+
+```console
+$ jq-1.7.1 -n '"x\n" | halt_error(4294967296)'   # x86_64 Linux: exit 0; aarch64: exit 255
+$ jq-1.8.2 -n '"x\n" | halt_error(4294967296)'   # aarch64: exit 255
+$ sjq      -n '"x\n" | halt_error(4294967296)'   # exit 255 on every platform
+```
+
 ### `fromdate` parses exactly `%Y-%m-%dT%H:%M:%SZ`; yq's `to_unix` stays lenient (#4967)
 
 `fromdate`/`fromdateiso8601` run `strptime("%Y-%m-%dT%H:%M:%SZ") | mktime` as jq defines them: a date alone, no `Z`,
