@@ -118406,6 +118406,11 @@ mod native_stack {
         Guard(previous)
     }
 
+    /// Unregister the budget for the caller's scope (#7676); the guard restores it.
+    pub(crate) fn lift() -> Guard {
+        Guard(BUDGET.with(|b| b.replace((0, 0))))
+    }
+
     impl Drop for Guard {
         fn drop(&mut self) {
             BUDGET.with(|b| b.set(self.0));
@@ -118424,6 +118429,10 @@ mod native_stack {
     pub(crate) struct Guard;
 
     pub(crate) fn enter(_here: usize, _reach: usize) -> Guard {
+        Guard
+    }
+
+    pub(crate) fn lift() -> Guard {
         Guard
     }
 }
@@ -118486,6 +118495,19 @@ pub fn with_stack_budget<R>(available: usize, f: impl FnOnce() -> R) -> R {
 pub(crate) fn native_stack_exhausted() -> bool {
     let (origin, reach) = native_stack::budget();
     origin != 0 && origin.abs_diff(stack_address()) > reach
+}
+
+/// Run `f` with this thread's native-stack floor lifted (#7676), for a parse of fixed text the
+/// crate supplies itself: a path-mode prelude definition on its first use, the `_nwise` template.
+/// Either can be reached anywhere, the floor included, and since #7475 the parser refuses there,
+/// but neither has a caller that could take the refusal: it would be a panic. Such a parse is
+/// shallow and bounded (a unit test pins the stack each takes, `TRUSTED_PARSE_STACK` in
+/// `path_mode`'s tests), so the half of the stack below the floor pays for it, as it pays for
+/// every other bounded step taken past the floor (ADR-0025). Never for a program's own text,
+/// which is as deep as it is written.
+pub(crate) fn with_native_stack_floor_lifted<R>(f: impl FnOnce() -> R) -> R {
+    let _lifted = native_stack::lift();
+    f()
 }
 
 /// How many bytes of stack this thread may still spend before [`native_stack_exhausted`] holds,
@@ -125221,6 +125243,62 @@ mod tests {
             );
             // ...so the arm itself refuses the already-bound body.
             refuse();
+        }
+    }
+
+    /// #7676: the path-mode interpreter parses a prelude definition on its first use, wherever
+    /// the evaluation is. Since #7475 the parser refuses at the native-stack floor, and a first use
+    /// there panicked in `PreludeDef::expr` instead of the call refusing. Each program runs on a
+    /// thread of its own, so every definition it calls is parsed there for the first time, with
+    /// no stack left, through both evaluators' entries.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_first_prelude_use_at_the_floor_refuses_7676() {
+        type Entry = fn(&Expr, JsonCursor<'_, Vec<u64>>) -> Result<(), String>;
+        fn refusal(result: QueryResult<'_, Vec<u64>>) -> Result<(), String> {
+            match result {
+                QueryResult::Error(e)
+                    if e.message.ends_with("exceeded maximum recursion depth") =>
+                {
+                    Ok(())
+                }
+                other => Err(format!("expected a refusal, got {other:?}")),
+            }
+        }
+        let entries: [(&str, Entry); 2] = [
+            ("eval_full", |expr, root| {
+                refusal(eval_full::<Vec<u64>, JqSemantics>(expr, root))
+            }),
+            ("eval", |expr, root| {
+                refusal(eval::<Vec<u64>, JqSemantics>(expr, root))
+            }),
+        ];
+        for filter in [
+            "def f: .; [path(.a | to_entries | f)]",
+            "def f: .; [path(.a | map(.) | f)]",
+            "def f: .; [path(.a | select(true) | f)]",
+            "def f: .; [path(.a | paths | f)]",
+            "def f: .; [path(.a | walk(.) | f)]",
+            "def f: .; [path(.a | with_entries(.) | f)]",
+        ] {
+            assert!(
+                matches!(
+                    crate::jq::path_mode::route(&parse(filter).expect("parses")),
+                    crate::jq::path_mode::Route::Interpreter
+                ),
+                "{filter}: runs through the path-mode interpreter"
+            );
+            for (entry, run) in entries {
+                let outcome = std::thread::spawn(move || {
+                    let expr = parse(filter).expect("parses");
+                    let json = br#"{"a":{"b":1}}"#;
+                    let index = JsonIndex::build(json);
+                    with_stack_budget(0, || run(&expr, index.root(json)))
+                })
+                .join()
+                .unwrap_or_else(|_| Err(String::from("panicked")));
+                assert_eq!(outcome, Ok(()), "{entry}: {filter}");
+            }
         }
     }
 

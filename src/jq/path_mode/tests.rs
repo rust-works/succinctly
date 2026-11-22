@@ -482,8 +482,9 @@ fn an_unbound_variable_is_a_compile_error_5223() {
 }
 
 /// The prelude parsed one definition at a time is the chain [`PRELUDE`] spells,
-/// each definition's own `FuncDef` with the rest of the chain cut off; and it
-/// parses on a 2 MiB thread, which the whole chain does not in a debug build.
+/// each definition's own `FuncDef` with the rest of the chain cut off. (Parsed
+/// as one chain it needs more stack than a 2 MiB debug thread has; one
+/// definition at a time it fits the bound the next test pins.)
 #[test]
 fn the_prelude_parses_one_definition_at_a_time_5223() {
     on_big_stack(|| {
@@ -502,17 +503,44 @@ fn the_prelude_parses_one_definition_at_a_time_5223() {
             assert_eq!(parsed, expected);
         }
     });
+}
+
+/// The most native stack a parse run under `with_native_stack_floor_lifted` may take (#7676), a
+/// prelude definition's or the `_nwise` template's. Measured on an Apple M5 Max as the smallest
+/// thread each parses on (the thread's own start included, 36 KiB debug and 12 KiB release): the
+/// deepest definition, `modify`, took 632 KiB in a debug build and 100 KiB in a release one, and the
+/// template 388 KiB and 52 KiB. The bound is about 1.6 and 2.5 times those.
+const TRUSTED_PARSE_STACK: usize = if cfg!(debug_assertions) {
+    1024 * 1024
+} else {
+    256 * 1024
+};
+
+/// #7676: a definition is parsed on its first use, which can be at the native-stack floor, so it
+/// is parsed with the floor lifted, and the stack below the floor pays for it. Every definition
+/// parses there, at the floor, on a thread of `TRUSTED_PARSE_STACK`: the bound the floor's other
+/// half has to cover (ADR-0025). A definition that outgrew it would overflow this thread and abort
+/// the test binary.
+#[cfg(feature = "std")]
+#[test]
+fn every_prelude_definition_parses_at_the_floor_within_its_stack_bound_7676() {
     std::thread::Builder::new()
-        .stack_size(2 << 20)
+        .stack_size(TRUSTED_PARSE_STACK)
         .spawn(|| {
             let prelude = Prelude::new();
-            for def in &prelude.defs {
-                def.expr();
-            }
+            crate::jq::with_stack_budget(0, || {
+                for def in &prelude.defs {
+                    def.expr();
+                }
+            });
+            // The `_nwise` template is the other text parsed with the floor lifted.
+            crate::jq::with_stack_budget(0, || {
+                parse("[1,2,3] | [_nwise(2)], [_nwise(.; 2)]").expect("parses")
+            });
         })
         .expect("spawn")
         .join()
-        .expect("the prelude parses on a 2 MiB thread");
+        .expect("the prelude parses at the floor within the stated bound");
 }
 
 /// A definition's name and arity are read off its source text, so a call finds
