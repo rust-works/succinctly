@@ -9455,6 +9455,13 @@ A lone low surrogate (`"\udc00"`) is accepted by both versions and becomes U+FFF
 `succinctly yq` keeps yq's own reading of a string literal, in which an unknown escape is kept as text.
 Pinned by `tests/jq_cli/i7445.rs`, whose rows are jq 1.7.1's messages (jq 1.8.2 agrees on all of them).
 
+**Closed for the place of a syntax error at the end of the text (#7711).**
+jq's lexer sets the location of every match it makes, whitespace and comments included, and makes no match at the end of the file, so the end-of-file token a syntax error there names keeps the location of the last match: the run of trailing whitespace, which starts right after the last token or comment, or else the last comment or token itself.
+`printf '[1,\n 2,\n\n\n'` as a `-f` file is line 2 with ` 2,` echoed, where `succinctly jq` used to name line 5 and echo an empty line.
+`succinctly jq` now places an error its parser finds at the end of the text there (`jq_runner/eof_location.rs` matches the text as jq 1.7.1's lexer rules do), in the main program, a `-f` file, a module and `modulemeta`, so the line, the echoed line and its padding are jq's and only the wording stays succinctly's own.
+jq 1.8.2 names the same line except where a comment is followed by a newline and more whitespace: its Tcl-style comments (jqlang/jq#2989, listed among the new features of its NEWS.md) end a comment with its newline, so the last whitespace run starts on the next line (`1 + # c` and two newlines is line 1 in jq 1.7.1 and here, line 2 in 1.8.2), and 1.7.1 stays the reference.
+Of 3,000 generated programs (upstream `jq.test` programs cut short, re-spaced and given trailing blank lines and comments), 2,638 are a compile error in both tools, and the first error's line now agrees with jq 1.7.1 in all but 35, none of them a placement at the end: in 33 jq's bison parser and ours stop at different places mid-program, and in 2 jq reads further than our parser does (`. a`, `try . catc`) and stops at the end.
+
 **What remains open, all three narrower than the shape gap:**
 
 - **Message wording is succinctly's own.** A syntax error reads `jq: error: unexpected end of

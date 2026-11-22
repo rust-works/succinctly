@@ -38,6 +38,7 @@ use crate::cli::output::{
     DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, StreamFault, Terminator,
 };
 
+mod eof_location;
 mod window;
 
 /// One word taken by `--args` (a string) or `--jsonargs` (JSON text), kept
@@ -523,7 +524,7 @@ fn report_syntax_error(errors: &[jq::ParseError], source: &str, location: &str) 
 /// trailer, so a module's syntax error can sit among other entries in one
 /// report (#3573).
 fn print_syntax_error(message: &str, source: &str, offset: usize, location: &str) {
-    let (line_no, line_text, column) = line_at_offset(source, offset);
+    let (line_no, line_text, column) = syntax_error_site(source, offset);
     print_position_error(
         format_args!("{message}"),
         location,
@@ -1236,7 +1237,7 @@ fn module_meta_outcome(
     let program = match jq::parse_program(&contents) {
         Ok(program) => program,
         Err(e) => {
-            let (line_no, line_text, column) = line_at_offset(&contents, e.position);
+            let (line_no, line_text, column) = syntax_error_site(&contents, e.position);
             return LoadFailure(position_error_text(
                 format_args!("{}", e.message),
                 &canonical.display().to_string(),
@@ -4866,6 +4867,23 @@ fn locate_identifier_from(
         start - line_start,
         start + name.len(),
     ))
+}
+
+/// [`line_at_offset`] for a syntax error: one the parser found at the end of the text is placed
+/// where jq places it, at the start of its lexer's last match (#7711, see [`eof_location`]), so a
+/// program ending in a newline names the line of its last token or comment, as jq does, and not
+/// the empty line after it.
+fn syntax_error_site(source: &str, offset: usize) -> (usize, String, usize) {
+    let mut offset = if offset >= source.len() {
+        eof_location::last_match_start(source)
+    } else {
+        offset
+    };
+    // jq's lexer matches a stray non-ASCII character a byte at a time; the line is the same.
+    while !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    line_at_offset(source, offset)
 }
 
 /// The 1-based line number, that line's text, and the 0-based column, for a
