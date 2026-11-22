@@ -8281,6 +8281,11 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // collecting builtins read all of it first (2 GB for a 52 MB array, and never an end on
         // an endless pipe).
         Expr::Builtin(Builtin::FromStream(f)) => each_fromstream::<W, S>(f, value, optional, sink),
+        // #7726: `combinations` hands each row on as it is built, so `first(combinations(20))`
+        // builds one row, not 2^20 of them.
+        Expr::Builtin(builtin @ (Builtin::Combinations | Builtin::CombinationsN(_))) => {
+            each_combinations::<W, S>(builtin, value, optional, sink)
+        }
         Expr::Builtin(Builtin::TruncateStream(f)) => {
             each_truncate_stream_of::<W, S>(f, value, optional, sink)
         }
@@ -44228,7 +44233,7 @@ pub(crate) fn index_one_owned_read_of<S: EvalSemantics>(
 /// technique #1612/#1017 already established for this bug class:
 /// `arith_mul`'s string-repeat guard, `pad_with_nulls`'s array-grow
 /// guard). `err` supplies the caller's own `EvalError` message in place of
-/// a hardcoded one -- shared with [`cartesian_product`], whose own call
+/// a hardcoded one -- shared with [`CombinationRows::collect`], whose own call
 /// sites (`combinations`) never index anything, so `cannot_reserve_cross_
 /// product`'s "computed-index expansion" wording would mislead there
 /// (#1721); `factors` there is unrelated to any key/target below.
@@ -44248,11 +44253,11 @@ pub(crate) fn index_one_owned_read_of<S: EvalSemantics>(
 /// key/pair, that single upfront reservation stopped being computable at
 /// all, and each site moved to reserving per-item instead -- removing
 /// `try_reserve_product`'s last caller (#2139) once #2245 had already
-/// removed the other. This function remains for [`cartesian_product`],
+/// removed the other. This function remains for [`CombinationRows::collect`],
 /// whose factors (its own multiple input lists) are still fixed for the
 /// whole call, unlike a per-key target's.
 ///
-/// `cartesian_product`'s own `lens` (each input array's already-known
+/// `CombinationRows::collect`'s own `lens` (each input array's already-known
 /// length) -- and every one of the former call sites' `keys`/`ts`/
 /// `starts`/`ends`/`target_branches` before them -- are already-
 /// materialized `Vec`s by the time any caller runs, so unlike #1612's
@@ -113216,6 +113221,103 @@ fn empty_length_or_index_error<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
+/// The product `combinations`/`combinations(n)` walk once their input has been read (#7726): at
+/// least one position, and a value at every position.
+///
+/// jq's definitions reach every position's error or emptiness on the way down to the first row
+/// (`.[0][] as $x | (.[1:] | combinations) as $w | ..` reads `.[1]` before the first row is out),
+/// so everything decided before this exists is decided before any row, whether the rows are then
+/// streamed ([`each_combinations`]) or collected ([`builtin_combinations`],
+/// [`builtin_combinations_n`]).
+enum CombinationRows {
+    /// Bare `combinations`: one position per input element, holding that element's values.
+    Positions(Vec<Vec<OwnedValue>>),
+    /// `combinations(n)`: the input's values at each of `width` positions.
+    Power { base: Vec<OwnedValue>, width: usize },
+}
+
+impl CombinationRows {
+    /// Hands each row to `emit` in jq's order, the last position turning fastest, until `emit`
+    /// asks for no more; answers `emit`'s last answer.
+    fn each_row(&self, emit: impl FnMut(OwnedValue) -> Demand) -> Demand {
+        match self {
+            Self::Positions(arrays) => mixed_radix_combinations(
+                arrays.len(),
+                |i| arrays[i].len(),
+                |indices| {
+                    arrays
+                        .iter()
+                        .zip(indices)
+                        .map(|(values, &k)| values[k].clone())
+                        .collect()
+                },
+                emit,
+            ),
+            Self::Power { base, width } => mixed_radix_combinations(
+                *width,
+                |_| base.len(),
+                |indices| indices.iter().map(|&k| base[k].clone()).collect(),
+                emit,
+            ),
+        }
+    }
+
+    /// Every row, collected, behind the refusals #1669 put on a product that cannot be held: the
+    /// row width, then the row count.
+    fn collect(&self) -> Result<Vec<OwnedValue>, EvalError> {
+        let mut results = match self {
+            Self::Positions(arrays) => {
+                // Guard the row width (arrays.len()) against the heaviest type that recurs at that
+                // length -- OwnedValue, not usize -- before building anything: many length-1
+                // factor arrays keep the product tiny while the row width stays unbounded (#1669
+                // review).
+                if Vec::<OwnedValue>::new()
+                    .try_reserve_exact(arrays.len())
+                    .is_err()
+                {
+                    return Err(cannot_allocate_combinations_count(arrays.len()));
+                }
+                let lens: Vec<usize> = arrays.iter().map(Vec::len).collect();
+                // `cannot_allocate_cartesian_product`'s own message, not `cannot_
+                // reserve_cross_product`'s: that one names ".[$keys]"-style computed indexing,
+                // which describes none of this builtin's own call sites (#1721).
+                try_reserve_product_labeled(&lens, cannot_allocate_cartesian_product)?
+            }
+            Self::Power { base, width } => {
+                // Two quantities, cheapest first (#1669 review): the row count `base^width` (pure
+                // arithmetic), then the row width, which `checked_combinations_len`'s `base <= 1`
+                // short-circuit leaves unbounded by the count.
+                let Some(total) = checked_combinations_len(base.len(), *width) else {
+                    return Err(cannot_allocate_combinations(base.len(), *width));
+                };
+                if Vec::<OwnedValue>::new().try_reserve_exact(*width).is_err() {
+                    return Err(cannot_allocate_combinations_count(*width));
+                }
+                let mut results = Vec::new();
+                if results.try_reserve_exact(total).is_err() {
+                    return Err(cannot_allocate_combinations(base.len(), *width));
+                }
+                results
+            }
+        };
+        self.each_row(|row| {
+            results.push(row);
+            Demand::Continue
+        });
+        Ok(results)
+    }
+}
+
+/// The widest row `combinations(n)` builds (#7726): `n` past 2^29 is refused before any row.
+///
+/// jq cannot answer such an `n` either: its definition collects `[range(n)]` first, which jq 1.8.2
+/// stops at `INT_MAX >> 2` with an assertion failure (`jv_is_valid(val)` in `stack_push`, captured
+/// for `[range(536870913)]`) and jq 1.7.1 grows without bound, and 1.7.1's recursion is quadratic
+/// in `n` besides (`first(combinations(30000))` on `{"a":[1]}` ran past 30 s and 7 GB). It is the
+/// bound [`MAX_PADDED_ARRAY_LEN`] puts on an index write, for the same reason: succinctly would
+/// write every element of the row.
+const MAX_COMBINATIONS_WIDTH: usize = MAX_PADDED_ARRAY_LEN;
+
 /// The values `.[0][]` iterates for one element of `combinations`' input (#4971): an array's elements or an
 /// object's values, and jq's `Cannot iterate over ..` for anything else.
 fn combinations_row<S: EvalSemantics>(element: &OwnedValue) -> Result<Vec<OwnedValue>, EvalError> {
@@ -113226,68 +113328,64 @@ fn combinations_row<S: EvalSemantics>(element: &OwnedValue) -> Result<Vec<OwnedV
     }
 }
 
-/// Builtin: combinations - generate all combinations from array of arrays
-/// Input: [[1,2], [3,4]] -> outputs [1,3], [1,4], [2,3], [2,4]
-fn builtin_combinations<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    value: StandardJson<'_, W>,
+/// An array's elements, owned, or the answer for one that cannot be decoded (#1755: to_owned, not
+/// to_owned_lossy -- an undecodable element must raise, not silently become "" and take part in the
+/// product; #1953: a non-decode-failure error respects `optional`).
+fn combinations_owned_elements<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    elements: impl Iterator<Item = StandardJson<'a, W>>,
     optional: bool,
-) -> QueryResult<'_, W> {
+) -> Result<OwnedValue, QueryResult<'a, W>> {
+    match elements
+        .map(|v| to_owned::<S, _>(&v))
+        .collect::<Result<Vec<OwnedValue>, EvalError>>()
+    {
+        Ok(items) => Ok(OwnedValue::array_from(items)),
+        Err(e) => Err(suppress_or_raise(e, optional)),
+    }
+}
+
+/// [`CombinationRows`] for bare `combinations` on `value`, or its whole answer when there is no
+/// product to walk.
+fn combinations_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'a, W>,
+    optional: bool,
+) -> Result<CombinationRows, QueryResult<'a, W>> {
     // jq: `def combinations: if length == 0 then [] else .[0][] as $x | (.[1:] | combinations) as $w | [$x] + $w end`.
     // The elements are read in order, and the first one that is empty (no output at all) or not iterable (the
     // error) decides: later elements are never reached (#4971).
-    let arrays = match &value {
-        StandardJson::Array(elements) => {
-            let mut arrays: Vec<Vec<OwnedValue>> = Vec::new();
-            for elem in *elements {
-                // #1755: to_owned, not to_owned_lossy -- an undecodable element must raise, not silently
-                // become "" and take part in the product. #1953: a non-decode-failure error respects `optional`.
-                let owned = match elem {
-                    StandardJson::Array(inner) => {
-                        OwnedValue::array_from(to_owned_vec_or_suppress!(inner, optional))
-                    }
-                    other => to_owned_lossy::<S, _>(&other),
-                };
-                match combinations_row::<S>(&owned) {
-                    Ok(row) if row.is_empty() => return QueryResult::None,
-                    Ok(row) => arrays.push(row),
-                    Err(_) if optional => return QueryResult::None,
-                    Err(e) => return QueryResult::Error(e),
-                }
-            }
-            arrays
+    let StandardJson::Array(elements) = value else {
+        return Err(match empty_length_or_index_error::<W, S>(value) {
+            Ok(()) => QueryResult::Owned(OwnedValue::array()),
+            Err(_) if optional => QueryResult::None,
+            Err(e) => QueryResult::Error(e),
+        });
+    };
+    let mut arrays: Vec<Vec<OwnedValue>> = Vec::new();
+    for elem in *elements {
+        let owned = match elem {
+            StandardJson::Array(inner) => combinations_owned_elements::<W, S>(inner, optional)?,
+            other => to_owned_lossy::<S, _>(&other),
+        };
+        match combinations_row::<S>(&owned) {
+            Ok(row) if row.is_empty() => return Err(QueryResult::None),
+            Ok(row) => arrays.push(row),
+            Err(_) if optional => return Err(QueryResult::None),
+            Err(e) => return Err(QueryResult::Error(e)),
         }
-        _ => match empty_length_or_index_error::<W, S>(&value) {
-            Ok(()) => return QueryResult::Owned(OwnedValue::array()),
-            Err(_) if optional => return QueryResult::None,
-            Err(e) => return QueryResult::Error(e),
-        },
-    };
-
-    // If any array is empty, return no results
-    if arrays.iter().any(alloc::vec::Vec::is_empty) {
-        return QueryResult::None;
     }
-
-    // If no arrays, return empty array
     if arrays.is_empty() {
-        return QueryResult::Owned(OwnedValue::array());
+        return Err(QueryResult::Owned(OwnedValue::array()));
     }
-
-    // Generate Cartesian product
-    let results = match cartesian_product(&arrays) {
-        Ok(results) => results,
-        Err(e) => return QueryResult::Error(e),
-    };
-    QueryResult::ManyOwned(results)
+    Ok(CombinationRows::Positions(arrays))
 }
 
-/// Builtin: combinations(n) - generate n-way combinations (Cartesian product with itself n times)
-/// Input with n=2: [1,2] -> outputs [1,1], [1,2], [2,1], [2,2]
-fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+/// [`CombinationRows`] for `combinations(n)` on `value`, or its whole answer when there is no
+/// product to walk.
+fn combinations_n_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     n_expr: &Expr,
-    value: StandardJson<'a, W>,
+    value: &StandardJson<'a, W>,
     optional: bool,
-) -> QueryResult<'a, W> {
+) -> Result<CombinationRows, QueryResult<'a, W>> {
     // `combinations(n)` is the one builtin in this family that must NOT fan
     // out (#1279). jq defines it as
     //
@@ -113308,6 +113406,8 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // is #1408's own requirement for this builtin, subsumed here rather than
     // dropped: it is the array constructor's answer, not the `x as $x |`
     // zero-fanout "produce nothing" every other builtin in this family gets.
+    // Only `[range(n)]` is collected: the product after it streams in jq, and
+    // does here (#7726).
     // #2196: `stream_outputs`, not the bare unchecked twin -- the
     // last document-value-fed `stream_outputs_lossy` call site in this file left
     // over after #1989 converted `fanout_two_args`'s two and
@@ -113329,7 +113429,7 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // nothing in jq. That is why this fires *before* the arity is used,
     // unlike `fanout_arg`'s "run the loop, then escape".
     if let Some(control) = trailing {
-        return partial(Vec::new(), control);
+        return Err(partial(Vec::new(), control));
     }
 
     // The arity *is* `[range(n)] | length`, so this reuses `range_num`, the
@@ -113345,23 +113445,22 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(RangeNum::Int(i)) => i.max(0) as usize,
             Ok(RangeNum::Float(f)) if f > 0.0 => f.ceil() as usize,
             Ok(RangeNum::Float(_)) => 0,
-            Err(_) if optional => return QueryResult::None,
-            Err(e) => return QueryResult::Error(e),
+            Err(_) if optional => return Err(QueryResult::None),
+            Err(e) => return Err(QueryResult::Error(e)),
         };
         // #1720: two or more large per-output arities can overflow this
         // running sum before `n` itself is even fully computed -- a
-        // different failure point from the allocation guards below, which
-        // all assume an already-valid `n`. `EvalError::new` (not gated by
-        // the local `optional` flag, same as the allocation guards below):
-        // confirmed live that a trailing `?` at the call site still catches
-        // it, matching those guards' own catchable behavior -- `optional`
-        // only short-circuits `range_num`'s own type-check errors above,
-        // not a capacity failure like this one. Real jq hangs indefinitely
-        // on this exact shape rather than erroring (confirmed live,
-        // ADR-0018) -- raising here instead is the documented "would take
-        // the host process down" exception.
+        // different failure point from the allocation guards, which all
+        // assume an already-valid `n`. `EvalError::new` (not gated by the
+        // local `optional` flag, same as the allocation guards): confirmed
+        // live that a trailing `?` at the call site still catches it --
+        // `optional` only short-circuits `range_num`'s own type-check errors
+        // above, not a capacity failure like this one. Real jq hangs
+        // indefinitely on this exact shape rather than erroring (confirmed
+        // live, ADR-0018) -- raising here instead is the documented "would
+        // take the host process down" exception.
         let Some(next) = n.checked_add(arity) else {
-            return QueryResult::Error(combinations_arity_overflow());
+            return Err(QueryResult::Error(combinations_arity_overflow()));
         };
         n = next;
     }
@@ -113369,116 +113468,129 @@ fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // `. as $dot | [range(n)] | map($dot) | combinations`: with `n == 0` that is `[] | combinations`, which is `[]`
     // for any `$dot`; otherwise `$dot` is each element, and `.[0][]` iterates an array's elements or an object's
     // values and raises on anything else (#4971).
-    // #1755: to_owned, not to_owned_lossy -- an undecodable element must raise, not silently become "" and take
-    // part in the product.
-    let base_array: Vec<OwnedValue> = if n == 0 {
-        Vec::new()
-    } else {
-        let owned = match &value {
-            StandardJson::Array(elements) => {
-                // #1953: a non-decode-failure error respects `optional`, the same as the arm below.
-                OwnedValue::array_from(to_owned_vec_or_suppress!(*elements, optional))
-            }
-            other => to_owned_lossy::<S, _>(other),
-        };
-        match combinations_row::<S>(&owned) {
-            Ok(row) => row,
-            Err(_) if optional => return QueryResult::None,
-            Err(e) => return QueryResult::Error(e),
-        }
-    };
-
-    // n=0 returns single empty array
     if n == 0 {
-        return QueryResult::Owned(OwnedValue::array());
+        return Err(QueryResult::Owned(OwnedValue::array()));
     }
-
-    // If base array is empty and n > 0, return no results
-    if base_array.is_empty() {
-        return QueryResult::None;
-    }
-
-    // Compute the n-fold Cartesian power of base_array directly against a
-    // shared reference, rather than the tempting `(0..n).map(|_|
-    // base_array.clone()).collect()` -- that route needs two independent
-    // guards of its own (n alone drove a huge outer Vec::<Vec<_>> straight
-    // to the allocator before this fix, confirmed live: `[1] |
-    // combinations(288230376151711744)` aborted the process; and even a
-    // guarded n could still pair with a large base_array to exhaust memory
-    // one real clone at a time, since neither guard bounds *that* product)
-    // where indexing into one shared `base_array` needs neither.
-    //
-    // Two independent quantities need guarding here, cheapest first so a
-    // request that fails a cheap check never pays for a more expensive one
-    // first (#1669 review -- an earlier version of this fix committed
-    // `indices`' real memory via `resize` before ever running the O(log n),
-    // no-allocation-at-all check below that could reject the whole call):
-    //
-    // 1. base_array.len().pow(n), the actual output row *count* -- pure
-    //    arithmetic, no allocation.
-    // 2. n itself as a row *width*: every combination is n elements of
-    //    OwnedValue, rebuilt fresh each iteration, independent of how many
-    //    rows there are -- `checked_combinations_len`'s own `base <= 1`
-    //    short-circuit makes the row count permanently 1 regardless of n,
-    //    so that guard alone never bounds this. `OwnedValue` is a larger
-    //    type than the `usize` counter `mixed_radix_combinations` builds
-    //    internally, so a `Vec<OwnedValue>`-sized probe for this exact `n`
-    //    subsumes that counter's own allocation (a smaller request for the
-    //    same length) rather than needing a second, separate guard for it.
-    let Some(total) = checked_combinations_len(base_array.len(), n) else {
-        return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
+    let owned = match value {
+        StandardJson::Array(elements) => combinations_owned_elements::<W, S>(*elements, optional)?,
+        other => to_owned_lossy::<S, _>(other),
     };
-    if Vec::<OwnedValue>::new().try_reserve_exact(n).is_err() {
-        return QueryResult::Error(cannot_allocate_combinations_count(n));
+    let base = match combinations_row::<S>(&owned) {
+        Ok(row) => row,
+        Err(_) if optional => return Err(QueryResult::None),
+        Err(e) => return Err(QueryResult::Error(e)),
+    };
+    // An empty base and `n > 0`: no row at all.
+    if base.is_empty() {
+        return Err(QueryResult::None);
     }
-    let mut results = Vec::new();
-    if results.try_reserve_exact(total).is_err() {
-        return QueryResult::Error(cannot_allocate_combinations(base_array.len(), n));
+    if n > MAX_COMBINATIONS_WIDTH {
+        return Err(QueryResult::Error(cannot_allocate_combinations_count(n)));
     }
-
-    mixed_radix_combinations(
-        n,
-        &mut results,
-        |_| base_array.len(),
-        |_, idx| base_array[idx].clone(),
-    );
-
-    QueryResult::ManyOwned(results)
+    // Every row indexes this one shared `base` rather than `n` clones of it: a moderate `n` with a
+    // large base would otherwise reach the allocator one clone at a time (#1669 review).
+    Ok(CombinationRows::Power { base, width: n })
 }
 
-/// The mixed-radix counting walk shared by [`cartesian_product`] and
-/// `builtin_combinations_n` (#1721): both build every combination of `width`
-/// positions by treating `indices` as a mixed-radix counter and carrying
-/// into the next position once the current one wraps, differing only in
-/// whether a position's own length is looked up per-position (independent
-/// arrays) or is one constant repeated `width` times (`combinations(n)`'s
-/// single array raised to itself). `len_at`/`value_at` abstract over that
-/// one difference; everything else -- the counter, the carry propagation,
-/// the termination check -- was previously hand-duplicated in both
-/// callers, ~30 lines apart, and had to be kept in sync by eye.
+/// Builtin: combinations - generate all combinations from array of arrays
+/// Input: [[1,2], [3,4]] -> outputs [1,3], [1,4], [2,3], [2,4]
 ///
-/// `results` must already be reserved for the caller's own already-guarded
-/// total capacity -- this only walks and pushes, it never sizes or grows
-/// the backing allocation itself, so it carries none of either caller's
-/// crash-prevention guards and must not be called before them. Both
-/// callers also guarantee `len_at(i) >= 1` for every `i` in `0..width`
-/// before calling in (an empty position would make `value_at(i, 0)`
-/// index out of bounds on the very first row, before any carry/bounds
-/// check runs) -- `builtin_combinations_n` via its own `n == 0`/
-/// `base_array.is_empty()` checks, `cartesian_product` via its own
-/// `arrays.is_empty()`/per-element emptiness checks.
-#[inline]
+/// Every row collected; [`each_combinations`] streams them for a consumer that may stop.
+fn builtin_combinations<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: StandardJson<'_, W>,
+    optional: bool,
+) -> QueryResult<'_, W> {
+    match combinations_rows::<W, S>(&value, optional) {
+        Ok(rows) => collected_combinations(&rows),
+        Err(answer) => answer,
+    }
+}
+
+/// Builtin: combinations(n) - generate n-way combinations (Cartesian product with itself n times)
+/// Input with n=2: [1,2] -> outputs [1,1], [1,2], [2,1], [2,2]
+///
+/// Every row collected; [`each_combinations`] streams them for a consumer that may stop.
+fn builtin_combinations_n<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    n_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    match combinations_n_rows::<W, S>(n_expr, &value, optional) {
+        Ok(rows) => collected_combinations(&rows),
+        Err(answer) => answer,
+    }
+}
+
+fn collected_combinations<'a, W: Clone + AsRef<[u64]>>(
+    rows: &CombinationRows,
+) -> QueryResult<'a, W> {
+    match rows.collect() {
+        Ok(results) => QueryResult::ManyOwned(results),
+        Err(e) => QueryResult::Error(e),
+    }
+}
+
+/// `combinations` or `combinations(n)` with each row handed to `sink` as it is built (#7726), as
+/// jq's recursive definitions emit them: a consumer that stops (`first`, `limit`, `label`/`break`,
+/// `isempty`) stops the walk, so `first(combinations(1000))` on `[1,2]` builds one row of a
+/// product it could never hold. Collecting every row, where the product is refused when it cannot
+/// be held, is [`builtin_combinations`]'s and [`builtin_combinations_n`]'s.
+// Out of line, as `each_fromstream` is: `eval_each`'s frame is what a deep recursion's stack depth
+// is made of.
+#[inline(never)]
+fn each_combinations<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    builtin: &Builtin,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    // An undecodable input raises as `eval_builtin` raises it.
+    if matches!(value, StandardJson::Error(_)) {
+        return drain_result(eval_builtin::<W, S>(builtin, value, optional), sink);
+    }
+    let rows = match builtin {
+        Builtin::CombinationsN(n_expr) => combinations_n_rows::<W, S>(n_expr, &value, optional),
+        _ => combinations_rows::<W, S>(&value, optional),
+    };
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(answer) => return drain_result(answer, sink),
+    };
+    match rows.each_row(|row| sink(Item::Owned(row))) {
+        Demand::Stop => Flow::Stopped { pending: None },
+        Demand::Continue => Flow::Exhausted,
+    }
+}
+
+/// The mixed-radix counting walk behind both arities of `combinations` (#1721, #7726): every
+/// combination of `width` positions, `indices` read as a mixed-radix counter whose last position
+/// turns fastest -- jq's recursion order -- carrying into the position before it once it wraps.
+/// `len_at` says how many values each position holds and `row_at` builds the row the counter
+/// names: independent arrays for bare `combinations`, one array repeated `width` times for
+/// `combinations(n)`. Each row goes to `emit` as it is built,
+/// and the walk ends when `emit` answers [`Demand::Stop`] or the counter has wrapped all the way
+/// round; the answer is `emit`'s last.
+///
+/// Every caller guarantees `width >= 1` and `len_at(i) >= 1` for every `i` in `0..width` (an empty
+/// position would make `row_at` index out of bounds on the very first row): [`CombinationRows`] is
+/// built only for such a product.
+// Out of line, and each row built by zipping the counter with the positions: inlined into
+// `CombinationRows::collect` and indexing position `i` per element, the copy of a row compiled to
+// three or four more instructions per element on arm64 than the per-builtin loops this replaced
+// had (+0.5% on `[combinations(18)] | length` and on its bare twin).
+#[inline(never)]
 fn mixed_radix_combinations(
     width: usize,
-    results: &mut Vec<OwnedValue>,
     len_at: impl Fn(usize) -> usize,
-    value_at: impl Fn(usize, usize) -> OwnedValue,
-) {
+    row_at: impl Fn(&[usize]) -> Vec<OwnedValue>,
+    mut emit: impl FnMut(OwnedValue) -> Demand,
+) -> Demand {
     let mut indices = vec![0usize; width];
 
     loop {
-        let combination: Vec<OwnedValue> = (0..width).map(|i| value_at(i, indices[i])).collect();
-        results.push(OwnedValue::array_from(combination));
+        if emit(OwnedValue::array_from(row_at(&indices))) == Demand::Stop {
+            return Demand::Stop;
+        }
 
         // Increment indices (like counting in mixed radix).
         let mut carry = true;
@@ -113495,58 +113607,14 @@ fn mixed_radix_combinations(
 
         // If we carried all the way through, we're done.
         if carry {
-            break;
+            return Demand::Continue;
         }
     }
 }
 
-/// Compute the Cartesian product of a list of arrays.
-///
-/// The result has one entry per combination -- `arrays.iter().map(Vec::len)`'s
-/// product -- so that product is exactly what the guard below checks before
-/// the walk grows `results` one push at a time: without this, `results`
-/// grows via ordinary `Vec` doubling with no upfront size check at all, the
-/// identical missed guard #1612/#1634 already closed for other
-/// generator-controlled cross products (#1669).
-fn cartesian_product(arrays: &[Vec<OwnedValue>]) -> Result<Vec<OwnedValue>, EvalError> {
-    if arrays.is_empty() {
-        return Ok(vec![OwnedValue::array()]); // patchcov: coverage tolerate-line reason="unreachable from `combinations`, whose own empty-input return runs first; pre-existing zero-hit line; #2999 changed only how its array payload is constructed"
-    }
-
-    // Guard the row width (arrays.len()) against the heaviest type that
-    // recurs at that length -- OwnedValue, not usize -- before building
-    // anything: `lens` below is also arrays.len() elements long, but of
-    // the smaller `usize`, so this subsumes its own allocation cost.
-    // Independent of `results`' own length-*product* guard just below:
-    // many length-1 factor arrays keep that product tiny while the row
-    // width (arrays.len() itself) stays unbounded (#1669 review).
-    if Vec::<OwnedValue>::new()
-        .try_reserve_exact(arrays.len())
-        .is_err()
-    {
-        return Err(cannot_allocate_combinations_count(arrays.len()));
-    }
-
-    let lens: Vec<usize> = arrays.iter().map(Vec::len).collect();
-    // `cannot_allocate_cartesian_product`'s own message, not `cannot_
-    // reserve_cross_product`'s: that one names ".[$keys]"-style computed
-    // indexing, which describes none of this builtin's own call sites
-    // (#1721) -- `combinations` never indexes anything.
-    let mut results = try_reserve_product_labeled(&lens, cannot_allocate_cartesian_product)?;
-
-    mixed_radix_combinations(
-        arrays.len(),
-        &mut results,
-        |i| lens[i],
-        |i, idx| arrays[i][idx].clone(),
-    );
-
-    Ok(results)
-}
-
 /// Distinct from [`cannot_allocate_combinations`]/[`cannot_allocate_combinations_count`]
 /// (`combinations(n)`'s own guards): this one backs bare `combinations`
-/// (`cartesian_product`), whose factors are independent arrays' lengths
+/// ([`CombinationRows::Positions`]), whose factors are independent arrays' lengths
 /// rather than one base raised to a power, so it names the product
 /// directly instead of `base^n`.
 fn cannot_allocate_cartesian_product(lens: &[usize]) -> EvalError {
@@ -140962,7 +141030,7 @@ mod tests {
     /// per-key/per-pair scheme by #2139/#2245 respectively, at which point
     /// the thin `try_reserve_product` wrapper these tests originally called
     /// had no remaining production caller and was removed, leaving
-    /// `try_reserve_product_labeled` (still used by `cartesian_product`,
+    /// `try_reserve_product_labeled` (still used by `CombinationRows::collect`,
     /// whose own factors genuinely are fixed for the whole call) as the
     /// sole surviving general implementation these tests now call
     /// directly. Coverage for the guard's *reachability* now lives in the
