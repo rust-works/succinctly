@@ -51469,12 +51469,13 @@ fn strflocaltime_matches_jq_3046() -> Result<()> {
             "jq: error (at <unknown>): strflocaltime/1 requires parsed datetime inputs\n",
             5,
         ),
+        // A shorter array has its missing fields 0, as in jq 1.8.2 (#7532; jq 1.7.1 refused it).
         (
             "UTC",
             "[1970,0,1] | strflocaltime(\"%Y\")",
+            "\"1970\"\n",
             "",
-            "jq: error (at <unknown>): strflocaltime/1 requires parsed datetime inputs\n",
-            5,
+            0,
         ),
         (
             "UTC",
