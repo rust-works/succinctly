@@ -16096,7 +16096,8 @@ fn closed_pipe_to_owned<S: EvalSemantics>(
                 None if S::TAG == EvalTag::Jq => {
                     let stage = unwrap_paren(stage);
                     eval_owned_string_door::<S>(stage, current)
-                        .or_else(|| eval_owned_def_call_count::<S>(stage, current))?
+                        .or_else(|| eval_owned_def_call_count::<S>(stage, current))
+                        .or_else(|| closed_read_stage::<S>(stage, current, depth, escaped))?
                 }
                 None => return None,
             },
@@ -16104,6 +16105,39 @@ fn closed_pipe_to_owned<S: EvalSemantics>(
         value = Some(next);
     }
     value
+}
+
+/// [`closed_pipe_to_owned`]'s read stages over a bound value: `getpath(P)` (#7721) and
+/// `contains(C)` (#7785), the argument closed. `getpath` walks the value so far by
+/// [`owned_getpath_walk`] and `contains` asks [`owned_contains_verdict`], the reads the evaluator's own
+/// builtins make of an owned value, which the read doors ([`eval_owned_getpath_door`],
+/// [`eval_owned_contains_door`]) share. Without them `$a | getpath([$i])` and `$a | contains([$i])` in
+/// a fold step declined to the evaluator's route, which re-indexed the bound container `$a` for one
+/// read of it: linear per step, quadratic over the fold, where jq reads the element in place (and
+/// `contains` stops at its first match). An argument that is not closed, a path that is not an
+/// array, a walk that raises and a `contains` of mismatched kinds decline and keep the evaluator's
+/// route and text. The argument's own nodes never reach the answer (the walk reads only its keys, and
+/// `contains` answers a boolean), so an `escaped` mark it sets is dropped, as
+/// [`closed_if_to_owned`] drops the condition's: `escaped` follows the value read. jq mode only, like
+/// the rest of the stage chain. Its own function, not inline in the stage loop, for the reason
+/// [`closed_index_expr`] gives.
+#[inline(never)]
+fn closed_read_stage<S: EvalSemantics>(
+    stage: &Expr,
+    input: &OwnedValue,
+    depth: usize,
+    escaped: &mut bool,
+) -> Option<OwnedValue> {
+    let Expr::Builtin(Builtin::GetPath(arg) | Builtin::Contains(arg)) = stage else {
+        return None;
+    };
+    let before = *escaped;
+    let arg_value = closed_expr_to_owned_at_depth::<S>(arg, depth + 1, escaped)?;
+    *escaped = before;
+    match stage {
+        Expr::Builtin(Builtin::GetPath(_)) => owned_getpath_walk::<S>(arg_value, input),
+        _ => owned_contains_verdict::<S>(input, &arg_value),
+    }
 }
 
 /// A string's `length` as an owned stage (#6534): the count of the string, in the unit the mode
@@ -95751,6 +95785,10 @@ fn eval_owned_read_door_stage<S: EvalSemantics>(
         Expr::Builtin(Builtin::First | Builtin::Last | Builtin::Nth(_)) => {
             eval_owned_first_last_nth::<S>(shape, input)
         }
+        // #7721: `getpath(P)` of a closed path, the element read in place.
+        Expr::Builtin(Builtin::GetPath(path)) => eval_owned_getpath_door::<S>(path, input),
+        // #7785: `contains(C)` of a closed needle, searched in place.
+        Expr::Builtin(Builtin::Contains(needle)) => eval_owned_contains_door::<S>(needle, input),
         Expr::Slice { .. }
         | Expr::SliceExpr { .. }
         | Expr::Try { catch: None, .. }
@@ -95920,6 +95958,74 @@ fn eval_owned_first_last_nth<S: EvalSemantics>(
         Ok(Some(element)) => owned_door_answer_may_leave(element),
         _ => None,
     }
+}
+
+/// `getpath(P)` of an owned input whose path `P` is closed ([`closed_expr_to_owned`]: it never reads
+/// `.`, so its one value is the same whatever the input is), walked by [`owned_getpath_walk`] (#7721).
+/// `$a | getpath([$i])` over a bound array re-indexed the array for every read without it: linear per
+/// read, where jq reads the element in place, and quadratic over a `limit`, `range` or `recurse` body
+/// that reads once per output. The answer leaves under [`owned_door_answer_may_leave`], as the
+/// `first`/`last`/`nth` door's does, and a path that is not closed, is not an array, or whose walk
+/// raises declines, so the error, its text and `?` stay the bridge's. jq mode only: yq's lexer
+/// rejects `getpath` (gated by `--jq-extensions`, #1512), and its walk differs.
+#[inline(never)]
+fn eval_owned_getpath_door<S: EvalSemantics>(
+    path: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    owned_door_answer_may_leave(owned_getpath_walk::<S>(
+        closed_expr_to_owned::<S>(path)?,
+        input,
+    )?)
+}
+
+/// `getpath`'s walk of `path` over an owned `input`, through [`getpath_walk_owned_segments`], the
+/// walk the evaluator's own `getpath` of an owned value takes, so the two cannot drift (#7721).
+/// `None` for a path that is not an array and for a walk that raises.
+fn owned_getpath_walk<S: EvalSemantics>(
+    path: OwnedValue,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    let OwnedValue::Array(path) = path else {
+        return None;
+    };
+    match getpath_walk_owned_segments::<Vec<u64>, S>(input, &path, false) {
+        QueryResult::Owned(value) => Some(value),
+        _ => None,
+    }
+}
+
+/// `contains(C)` of an owned input whose needle `C` is closed ([`closed_expr_to_owned`]), answered by
+/// [`owned_contains_verdict`] (#7785). `$a | contains([$i])` over a bound array re-indexed the array for
+/// every call without it, where jq searches it in place and stops at the first match. A needle that is
+/// not closed, and one of another kind than the input (the containment error), decline, so the error,
+/// its text and `?` stay the bridge's. jq mode only, like [`eval_owned_getpath_door`].
+#[inline(never)]
+fn eval_owned_contains_door<S: EvalSemantics>(
+    needle: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    owned_contains_verdict::<S>(input, &closed_expr_to_owned::<S>(needle)?)
+}
+
+/// `input | contains(needle)` as the evaluator's `contains` answers it ([`builtin_contains`]): the
+/// kind check of [`containment_kind_mismatch_should_error`], then [`owned_contains`], the bridge's own
+/// search, so the doors and the bridge cannot drift (#7785). `None` where the bridge raises (a kind
+/// mismatch), and in yq mode, whose rules the bridge keeps.
+fn owned_contains_verdict<S: EvalSemantics>(
+    input: &OwnedValue,
+    needle: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq || containment_kind_mismatch_should_error::<S>(input, needle) {
+        return None;
+    }
+    Some(OwnedValue::Bool(owned_contains::<S>(input, needle)))
 }
 
 /// Whether a value a door read off an owned input may leave as the stage's own answer (#7132): the
@@ -122920,6 +123026,104 @@ mod tests {
             &parse("reduce ({}) as {(.k): $v} (0; .)").unwrap()
         ));
         assert!(input_free_operand(&parse("error(1)").unwrap()));
+    }
+
+    /// #7721: `$a | getpath(P)` with a closed path reads the element off the bound value, in a fold
+    /// step (the closed pipe's stage) and in a body that reads once per output (the read door), where
+    /// it wrote the whole bound array out and indexed it again for every read: linear per read,
+    /// quadratic over the run. `reindex_count` counts every serialize-and-index of an `OwnedValue`. A
+    /// path that raises still takes the bridge once per read, so the counter is not one that reads
+    /// zero for everything.
+    #[test]
+    fn getpath_of_a_bound_container_reads_in_place_7721() {
+        use crate::jq::value::reindex_count;
+        fn run(filter: &str) -> (String, usize) {
+            let expr = parse(filter).expect("filter parses");
+            let doc = alloc::rc::Rc::new(
+                OwnedValue::Null
+                    .reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
+            );
+            let before = reindex_count::get();
+            let answer = eval::<Vec<u64>, JqSemantics>(&expr, doc.root())
+                .collect_owned::<JqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ");
+            (answer, reindex_count::get() - before)
+        }
+        let n = 400;
+        for (filter, expected) in [
+            (format!("[range({n})] as $a | reduce range({n}) as $i (0; . + ($a | getpath([$i])))"), "79800"),
+            (format!("[range({n})] as $a | reduce range({n}) as $i ([]; . + [$a | getpath([$i])]) | length"), "400"),
+            (format!(r#"{{k: [range({n})]}} as $o | reduce range({n}) as $i (0; . + ($o | getpath(["k", $i])))"#), "79800"),
+            (format!("[range({n})] as $a | [foreach range({n}) as $i (0; . + ($a | getpath([$i])))] | length"), "400"),
+            (format!("[range({n})] as $a | [range({n}) as $i | $a | getpath([$i])] | add"), "79800"),
+            (format!("[range({n})] as $a | [limit({n}; range({n}) as $i | $a | getpath([-1 - $i]))] | add"), "79800"),
+            (format!("[range({n})] as $a | [range({n}) as $i | $a | getpath([$i]) | . + 1] | add"), "80200"),
+        ] {
+            let (answer, reindexes) = run(&filter);
+            assert_eq!(answer, expected, "{filter}");
+            assert!(reindexes < 10, "{filter}: {reindexes} re-indexes, the bound array was read through the bridge");
+        }
+        // A path whose walk raises declines to the bridge, which keeps its error (here swallowed).
+        let (answer, reindexes) =
+            run(r#"[range(40)] as $a | [range(40) as $i | $a | getpath([$i, "x"])?] | length"#);
+        assert_eq!(answer, "0");
+        assert!(
+            reindexes >= 40,
+            "the declining path should bridge per read: {reindexes}"
+        );
+    }
+
+    /// #7785: `$a | contains(C)` with a closed needle searches the bound value in place, in a fold
+    /// step (the closed pipe's read stage) and in a body that asks once per output (the read door),
+    /// where it wrote the whole bound value out and indexed it again for every call. `reindex_count`
+    /// counts every serialize-and-index of an `OwnedValue`. A needle of another kind (the containment
+    /// error) still takes the bridge once per call, so the counter is not one that reads zero for
+    /// everything.
+    #[test]
+    fn contains_of_a_bound_container_reads_in_place_7785() {
+        use crate::jq::value::reindex_count;
+        fn run(filter: &str) -> (String, usize) {
+            let expr = parse(filter).expect("filter parses");
+            let doc = alloc::rc::Rc::new(
+                OwnedValue::Null
+                    .reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
+            );
+            let before = reindex_count::get();
+            let answer = eval::<Vec<u64>, JqSemantics>(&expr, doc.root())
+                .collect_owned::<JqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ");
+            (answer, reindex_count::get() - before)
+        }
+        let n = 400;
+        for (filter, expected) in [
+            (format!("[range({n})] as $a | reduce range({n}) as $i (0; if $a | contains([$i]) then . + 1 else . end)"), "400"),
+            (format!("[range({n})] as $a | reduce range({n}) as $i ([]; . + [$a | contains([$i, $i + {n}])]) | length"), "400"),
+            (format!("{{k: [range({n})]}} as $o | reduce range({n}) as $i (0; if $o | contains({{k: [$i]}}) then . + 1 else . end)"), "400"),
+            (format!("[range({n})] as $a | [foreach range({n}) as $i (0; if $a | contains([$i]) then . + 1 else . end)] | length"), "400"),
+            (format!("[range({n})] as $a | [range({n}) as $i | $a | contains([$i])] | length"), "400"),
+            (format!("[range({n})] as $a | [limit({n}; range({n}) as $i | $a | contains([[$i]]))] | length"), "400"),
+            (format!(r#"([range({n})] | tojson) as $s | [range({n}) as $i | $s | contains("\($i)")] | length"#), "400"),
+        ] {
+            let (answer, reindexes) = run(&filter);
+            assert_eq!(answer, expected, "{filter}");
+            assert!(reindexes < 10, "{filter}: {reindexes} re-indexes, the bound value was searched through the bridge");
+        }
+        // A needle of another kind declines to the bridge, which keeps its error (here swallowed).
+        let (answer, reindexes) =
+            run(r#"[range(40)] as $a | [range(40) as $i | $a | contains("x")?] | length"#);
+        assert_eq!(answer, "0");
+        assert!(
+            reindexes >= 40,
+            "the declining needle should bridge per call: {reindexes}"
+        );
     }
 
     /// #7563, #7452: a fold step that writes an array slot by a negative index (`.[-$k]`, `.[-1]`)
@@ -184912,6 +185116,40 @@ mod share_audit_2999 {
             "reduce .[] as $t ([[], 0]; [.[0] + [[$t] | sort], .[1] + 1])",
             "reduce .[] as $t ([]; .[$t] = {a: [range(2)]})",
             "reduce .[] as $t ([]; . + [limit(2; range(5))])",
+        ] {
+            assert_forced(&json, filter, &[]);
+        }
+    }
+
+    /// #7721: a fold step that stores an element read off a bound container with `getpath`
+    /// declined the in-place step, because the closed pipe had no `getpath` stage, and the
+    /// evaluator's `+` or write on the borrowed state copied the accumulator on every step. The
+    /// stage now walks the bound value, and 1,000 steps force no copy.
+    #[test]
+    fn fold_step_storing_a_getpath_read_copies_nothing_7721() {
+        let json = ints(1000);
+        for filter in [
+            ". as $a | reduce range(length) as $i ([]; . + [$a | getpath([$i])])",
+            r#". as $a | reduce range(length) as $i ({}; .["\($i)"] = ($a | getpath([$i])))"#,
+            r#"{k: .} as $o | reduce range(length) as $i ([]; . + [$o | getpath(["k", $i])])"#,
+            ". as $a | reduce range(length) as $i ([]; .[$i] = ($a | getpath([-1 - $i])))",
+            ". as $a | [foreach range(length) as $i ([]; . + [$a | getpath([$i])]; length)] | length",
+        ] {
+            assert_forced(&json, filter, &[]);
+        }
+    }
+
+    /// #7785: the same for a fold step that stores a `contains` answer over a bound container: the
+    /// closed pipe had no `contains` stage, the step declined, and the evaluator's `+` or write on
+    /// the borrowed state copied the accumulator on every step. 1,000 steps now force no copy.
+    #[test]
+    fn fold_step_storing_a_contains_answer_copies_nothing_7785() {
+        let json = ints(1000);
+        for filter in [
+            ". as $a | reduce range(length) as $i ([]; . + [$a | contains([$i])])",
+            r#". as $a | reduce range(length) as $i ({}; .["\($i)"] = ($a | contains([$i, 1])))"#,
+            "{k: .} as $o | reduce range(length) as $i ([]; . + [$o | contains({k: [$i]})])",
+            ". as $a | [foreach range(length) as $i ([]; . + [$a | contains([$i])]; length)] | length",
         ] {
             assert_forced(&json, filter, &[]);
         }
