@@ -20310,9 +20310,17 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // sees both occurrences of a mapping key; `each_paths_filter_generic`
         // keeps the demand-forwarding and sends only a live `input`/`inputs`
         // queue to the bridge below, which every jq-mode call still takes.
-        Expr::Builtin(Builtin::PathsFilter(_)) => {
-            each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink)
-        }
+        //
+        // #7726: `combinations` takes the same bridge, in both modes: it
+        // streams its rows from `eval_each` (`each_combinations`), so a
+        // consumer that stops after one row stops the walk, where the wildcard
+        // below collected the whole product first (`first(combinations(20))`
+        // on `[1,2]` built 2^20 rows). It shares this arm rather than taking
+        // one of its own, which grew this frame and took `r(12000; 7)` in
+        // `test_literal_dollar_argument_matches_jq_3260` past the depth limit.
+        Expr::Builtin(
+            Builtin::PathsFilter(_) | Builtin::Combinations | Builtin::CombinationsN(_),
+        ) => each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink),
 
         // #3448: jq's `=`/`op=`/`//=` run their right side as the outer
         // generator, so a consumer that stops after one document must stop
@@ -31377,6 +31385,7 @@ fn each_paths_filter_generic<S: EvalSemantics, V: DocumentValue>(
 
 /// Which producer `paths(f)` takes in `eval_each_generic` (#1342): the walk
 /// where duplicate keys survive, the owned bridge where they collapse anyway.
+/// `combinations` and `combinations(n)` always take the bridge (#7726).
 /// A function of its own, with the same arguments the single bridge call it
 /// replaced took, so `eval_each_generic`'s native frame -- the one the
 /// recursion floor is read against -- is the size it was.

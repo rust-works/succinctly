@@ -7462,10 +7462,10 @@ a catchable error uniformly in both modes, with no cap-specific divergence to re
 [yq Limitations](../yq/limitations.md).
 
 `combinations`/`combinations(n)` (#1669) have the identical shape a third time, at three
-independent sites: `builtin_combinations_n`'s own `n`-sized bookkeeping (both the `indices`
+independent sites (`CombinationRows::collect` in `src/jq/eval.rs`): `combinations(n)`'s `n`-sized bookkeeping (both the `indices`
 array and, independently, each combination row it builds — `checked_combinations_len`'s
 `base <= 1` short-circuit makes the output *count* permanently `1` regardless of `n`, so
-that alone never bounds the row width), `cartesian_product`'s own row width
+that alone never bounds the row width), bare `combinations`' row width
 (`arrays.len()`, unbounded by its length-*product* guard whenever many factor arrays are
 length 1), and the actual combinatorial output count (`base_array.len().pow(n)` for
 `combinations(n)`, or the product of every input array's length for bare `combinations`).
@@ -7474,27 +7474,16 @@ process (SIGABRT), not a catchable error. succinctly now refuses with a `Cannot 
 ...` message via the same `Vec::try_reserve_exact` technique as the cases above, whichever
 site first detects the excess.
 
-The two arities diverge from real jq differently. Bare `combinations` matches the
-`.[$keys]` cross-product case above exactly: confirmed live against the pinned jq 1.7.1
-binary, `[range(100000)] as $a | first([$a,$a,$a,$a,$a] | combinations)` returns instantly
-rather than erroring or hanging — jq streams results one at a time instead of
-pre-allocating, so succinctly's eager refusal is a real behavioural divergence for this
-arity, not just a difference in wording. `combinations(n)` does not get the same lazy
-treatment in jq's own standard-library definition (`def combinations(n): . as $dot |
-[range(n)] | map($dot) | combinations;`): `[range(n)]` eagerly materializes an
-`n`-element array *before* the lazy recursive `combinations` is ever reached, so jq itself
-pays the same eager cost succinctly does — confirmed live, `[1] | first(combinations(
-288230376151711744))` does not return within 6 seconds against the pinned jq 1.7.1 binary
-either, rather than the instant response the bare-`combinations` case gets. succinctly's
-guard makes this fail fast with a catchable error instead of hanging (and eventually
-exhausting memory) the way jq's own definition does — an improvement in kind, not just a
-faster failure, but still the "would take the host process down" exception ADR-0018
-carves out, since jq's own hang is exactly the failure mode being prevented, just reached
-by resource exhaustion rather than a clean abort. Every combination count that fits in
-memory is still produced in full for both arities, so ordinary uses of both builtins are
-unaffected. This guard is symmetric across jq and yq mode (yq reaches it only behind
-`--jq-extensions`, per #1650), with no additional yq-specific cap to record in
-[yq Limitations](../yq/limitations.md).
+Both arities stream their rows, as jq's recursive definitions do (#7726), so a consumer that stops (`first`, `limit`, `nth`, `label`/`break`, `isempty`, `any`) builds only the rows it reads.
+`[range(100000)] as $a | first([$a,$a,$a,$a,$a] | combinations)` and `[1,2] | [limit(3; combinations(1000))]` answer at once, as in jq 1.7.1 and 1.8.2.
+Until #7726 succinctly built the whole product first, refusing the first of those and taking 1.2 GB for `[1,2] | first(combinations(20))`.
+This paragraph then also said jq's `combinations(n)` was eager too, which is true only of `[range(n)]`, collected before the product starts, not of the product.
+The guards above now fire only where jq cannot answer either.
+A product collected whole (`[combinations(63)]`) is refused when it cannot be held, where jq runs until its memory is exhausted; the same product streamed prints for as long as jq's would.
+`combinations(n)` with `n` past 2^29 (the bound `MAX_PADDED_ARRAY_LEN` puts on an index write) is refused before the first row, even when one row is all that is read (`{"a":[1]} | first(combinations(4294967297))`).
+jq 1.8.2 aborts with an assertion failure (`jv_is_valid(val)` in `stack_push`) collecting `[range(n)]` past `INT_MAX >> 2`, and jq 1.7.1 grows without bound collecting it and is quadratic in `n` after that (`{"a":[1]} | first(combinations(30000))` ran past 30 s and 7 GB).
+Below the bound each row costs time and memory linear in `n`, so succinctly answers rows jq 1.7.1 does not reach in practice (`[1] | first(combinations(1000000)) | length`).
+This guard is symmetric across jq and yq mode (yq reaches it only behind `--jq-extensions`, per #1650), with no additional yq-specific cap to record in [yq Limitations](../yq/limitations.md).
 
 `combinations(n)` has a fourth, independent overflow site (#1720), found reviewing #1669's
 own fix: a multi-output `n` expression (e.g. `combinations((a, b, c))`) sums each output's

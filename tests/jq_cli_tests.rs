@@ -49351,10 +49351,14 @@ fn test_jq_combinations_n_huge_count_does_not_abort_1669() -> Result<()> {
 /// size `base_array.len().pow(n)` can overflow independently of `n` alone
 /// being perfectly reasonable (`n=10` is trivial by itself; `1000^10` is
 /// not), a completely different quantity from the row-width guard on `n`.
+///
+/// The rows are collected (`[...]`): since #7726 they stream as jq's do, so
+/// `combinations | length` prints for as long as jq would; collecting a
+/// product that cannot be held is what is refused.
 #[test]
 fn test_jq_combinations_n_small_n_huge_base_power_does_not_abort_1669() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
-        &["-n", "-c", "[range(1000)] | combinations(10) | length"],
+        &["-n", "-c", "[range(1000)] | [combinations(10)] | length"],
         None,
     )?;
     assert_eq!(stdout, "");
@@ -49418,11 +49422,15 @@ fn test_jq_combinations_n_row_width_guard_independent_of_output_count_1669() -> 
 /// overflows `usize`. Deterministic and fast: the allocator's capacity
 /// check rejects this on arithmetic grounds alone, without attempting any
 /// real allocation.
+///
+/// The rows are collected (`[...]`): since #7726 they stream as jq's do, so
+/// `combinations | length` prints for as long as jq would; collecting a
+/// product that cannot be held is what is refused.
 #[test]
 fn test_jq_combinations_n_reserve_exact_failure_after_pow_succeeds_does_not_abort_1669(
 ) -> Result<()> {
     let (stdout, stderr, code) =
-        run_jq_full(&["-n", "-c", "[1,2] | combinations(63) | length"], None)?;
+        run_jq_full(&["-n", "-c", "[1,2] | [combinations(63)] | length"], None)?;
     assert_eq!(stdout, "");
     assert!(
         !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
@@ -49447,13 +49455,17 @@ fn test_jq_combinations_n_reserve_exact_failure_after_pow_succeeds_does_not_abor
 /// its own) combined with a 100,000-element `base_array` must still be
 /// refused up front, without ever touching the per-element cost that used
 /// to slip through here.
+///
+/// The rows are collected (`[...]`): since #7726 they stream as jq's do, so
+/// `combinations | length` prints for as long as jq would; collecting a
+/// product that cannot be held is what is refused.
 #[test]
 fn test_jq_combinations_n_moderate_n_large_base_array_does_not_abort_1669() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-n",
             "-c",
-            "[range(100000)] | combinations(1000000) | length",
+            "[range(100000)] | [combinations(1000000)] | length",
         ],
         None,
     )?;
@@ -49555,12 +49567,16 @@ fn test_jq_combinations_bare_multi_output_matches_real_jq() -> Result<()> {
 /// identical missed guard. Five 100000-element arrays make the product
 /// overflow `usize` by the fourth factor, so this must fail fast rather
 /// than attempt to enumerate any of the 10^25 combinations.
+///
+/// The rows are collected (`[...]`): since #7726 they stream as jq's do, so
+/// `combinations | length` prints for as long as jq would; collecting a
+/// product that cannot be held is what is refused.
 #[test]
 fn test_jq_combinations_cartesian_product_length_overflow_does_not_abort_1669() -> Result<()> {
     let (stdout, stderr, code) = run_jq_full(
         &[
             "-c",
-            "[range(100000)] as $a | [$a,$a,$a,$a,$a] | combinations | length",
+            "[range(100000)] as $a | [$a,$a,$a,$a,$a] | [combinations] | length",
         ],
         Some("{}"),
     )?;
