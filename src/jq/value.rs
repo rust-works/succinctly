@@ -4648,16 +4648,35 @@ impl OwnedValue {
     /// `jv`, so two reads of one key are identical, and the reader's sharing
     /// of one key among sibling records (#7260) would make keys of two
     /// objects identical where jq's parser allocated each.
-    pub(crate) fn promote_identities(&mut self) {
+    ///
+    /// With `keys` false the keys are left as they were read: for a run that
+    /// can never hand a key out as a value, where no key's identity can be
+    /// asked, so that storage would only cost an allocation per key (#7489).
+    pub(crate) fn promote_identities(&mut self, keys: bool) {
+        if keys {
+            self.promote_identities_in::<true>();
+        } else {
+            self.promote_identities_in::<false>();
+        }
+    }
+
+    /// [`promote_identities`](Self::promote_identities) with the choice made
+    /// once per walk, not per object.
+    fn promote_identities_in<const KEYS: bool>(&mut self) {
         match self {
             Self::String(s) => s.promote(),
             Self::NumberLiteral(_, spelling) | Self::SpelledScalar(_, spelling) => {
                 spelling.promote();
             }
-            Self::Array(items) => items.iter_mut().for_each(Self::promote_identities),
+            Self::Array(items) => items
+                .iter_mut()
+                .for_each(Self::promote_identities_in::<KEYS>),
             Self::Object(map) => {
-                map.own_keys();
-                map.values_mut().for_each(Self::promote_identities);
+                if KEYS {
+                    map.own_keys();
+                }
+                map.values_mut()
+                    .for_each(Self::promote_identities_in::<KEYS>);
             }
             Self::Null | Self::Bool(_) | Self::Int(_) | Self::Float(_) => {}
         }
@@ -5672,11 +5691,11 @@ impl OwnedValue {
                 reindex_count::bump_string(text.len());
             }
         }
-        Ok(ReindexedDoc::new(
-            indexable_bridge_text(self.to_json_for_reindex::<S>()?)?,
+        ReindexedDoc::new(
+            self.to_json_for_reindex::<S>()?,
             S::REINDEX_BRIDGE_KEEPS_IDENTITY.then_some(self),
             self.is_scalar_root(),
-        ))
+        )
     }
 
     /// [`reindexed`](Self::reindexed)'s document, spelled as `S` spells it but
@@ -5691,10 +5710,10 @@ impl OwnedValue {
         #[cfg(test)]
         reindex_count::bump();
         let mut doc = ReindexedDoc::new(
-            indexable_bridge_text(self.to_json_for_reindex::<S>()?)?,
+            self.to_json_for_reindex::<S>()?,
             None,
             self.is_scalar_root(),
-        );
+        )?;
         if matches!(self, Self::String(_)) {
             doc.root_string = Some(self.clone());
         }
@@ -5707,8 +5726,7 @@ impl OwnedValue {
     pub fn try_input_bridge_doc(&self) -> Result<ReindexedDoc, EvalError> {
         #[cfg(test)]
         reindex_count::bump();
-        let text = indexable_bridge_text(self.to_json_input_bridge())?;
-        Ok(ReindexedDoc::new(text, None, self.is_scalar_root()))
+        ReindexedDoc::new(self.to_json_input_bridge(), None, self.is_scalar_root())
     }
 
     /// [`to_json_input_bridge`](Self::to_json_input_bridge)'s text, indexed
@@ -5717,10 +5735,16 @@ impl OwnedValue {
     /// the input queue rather than for a round trip, so the rule that makes
     /// handing back the source sound (`reindex_bridge_is_identity`) was
     /// never shown to hold for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a value no index holds (#7425, #7537): [`try_input_bridge_doc`](Self::try_input_bridge_doc)
+    /// returns its error instead.
     pub fn input_bridge_doc(&self) -> ReindexedDoc {
         #[cfg(test)]
         reindex_count::bump();
         ReindexedDoc::new(self.to_json_input_bridge(), None, self.is_scalar_root())
+            .unwrap_or_else(|error| panic!("{}", error.message))
     }
 
     /// Whether the bridge writes this value as one scalar token (#4154): every
@@ -5730,24 +5754,16 @@ impl OwnedValue {
     }
 }
 
-/// `text` if a [`JsonIndex`](crate::json::JsonIndex) can hold it; otherwise the bridge's refusal
-/// (#7425), a resource limit like the bridge's depth refusal, since jq has no ceiling here: a value
-/// of 4 GiB or more is one only a document that large (or a program building one) gives.
-fn indexable_bridge_text(text: String) -> Result<String, EvalError> {
-    if crate::json::JsonIndex::can_index(text.len()) {
-        Ok(text)
-    } else {
-        Err(EvalError::resource_limit(index_ceiling_message(text.len())))
-    }
-}
-
 /// The refusal of a value or document of `len` bytes that no [`JsonIndex`](crate::json::JsonIndex)
-/// can hold, for the reindex bridge and for the CLI's reader of such a document (#7425).
+/// can hold, for the reindex bridge and for the CLI's reader of such a document (#7425): one of
+/// more than 4 GiB whose interest bits or balanced parentheses pass
+/// [`JsonIndex::MAX_COUNT`](crate::json::JsonIndex::MAX_COUNT), two parentheses a value (#7537). A
+/// resource limit like the bridge's depth refusal, since jq has no ceiling here.
 #[must_use]
 pub(crate) fn index_ceiling_message(len: usize) -> String {
     alloc::format!(
-        "Cannot index a value of {len} bytes: the index holds at most {} bytes (4 GiB)",
-        crate::json::JsonIndex::MAX_TEXT_LEN
+        "Cannot index a value of {len} bytes: the index holds at most {} values",
+        crate::json::JsonIndex::MAX_COUNT / 2
     )
 }
 
@@ -5809,7 +5825,12 @@ pub struct ReindexedDoc {
 }
 
 impl ReindexedDoc {
-    fn new(text: String, source: Option<&OwnedValue>, scalar_root: bool) -> Self {
+    /// The document of `text`, or the bridge's refusal of a text no index holds (#7425, #7537).
+    fn new(
+        text: String,
+        source: Option<&OwnedValue>,
+        scalar_root: bool,
+    ) -> Result<Self, EvalError> {
         // #4154: a one-token document's index follows from its length alone,
         // so it skips the scanner and the directory build the general
         // constructor pays for.
@@ -5823,8 +5844,12 @@ impl ReindexedDoc {
         );
         let index = if scalar_root {
             crate::json::JsonIndex::build_reindex_scalar_from(text.len(), scalar_index_pool::take())
-        } else {
+        } else if crate::json::JsonIndex::can_index(text.len()) {
+            // Built in place: every text shorter than 4 GiB is held (#7537).
             crate::json::JsonIndex::build_reindex(text.as_bytes())
+        } else {
+            crate::json::JsonIndex::try_build_reindex(text.as_bytes())
+                .ok_or_else(|| EvalError::resource_limit(index_ceiling_message(text.len())))?
         };
         // Only a container has storage to share. The key is the text's heap
         // buffer, which -- unlike the index's own address, the
@@ -5836,13 +5861,13 @@ impl ReindexedDoc {
             }
             _ => false,
         };
-        Self {
+        Ok(Self {
             text,
             index,
             registered,
             scalar_root,
             root_string: None,
-        }
+        })
     }
 
     /// The root cursor over the bridge text.
@@ -7715,7 +7740,7 @@ mod tests {
         .expect("a valid document");
         let before = doc.to_json_jq_preserve();
         let e_storage = doc.as_object().expect("an object")["e"].clone();
-        doc.promote_identities();
+        doc.promote_identities(true);
         assert_eq!(doc.to_json_jq_preserve(), before);
 
         let map = doc.as_object().expect("an object");
@@ -7752,7 +7777,7 @@ mod tests {
         assert!(first.ptr_eq(&second), "the reader shares a sibling's key");
 
         let before = doc.to_json_jq_preserve();
-        doc.promote_identities();
+        doc.promote_identities(true);
         assert_eq!(doc.to_json_jq_preserve(), before);
         let records = doc.as_array().expect("an array");
         let keys: Vec<&SharableString> = records

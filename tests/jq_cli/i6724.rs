@@ -32,7 +32,7 @@ fn a_slurp_is_read_at_a_last_file_that_did_not_open_6724() -> Result<()> {
         (&["-c", "-s", "--stream-errors", "[., input_line_number]"][..], &["two", "miss"][..], "[[[\"Invalid numeric literal at line 2, column 0\",[]]],0]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "-s", "--stream-errors", "[., input_filename]"][..], &["ptr", "dir", "miss"][..], "[[[[0],1],[\"Unfinished JSON term at EOF at line 1, column 3\",[1]]],\"@DIR@/miss\"]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "-s", "--stream", "[., input_filename]"][..], &["empty", "miss"][..], "[[],\"@DIR@/miss\"]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
-        (&["-c", "-s", "--stream", "[., input_filename]"][..], &["nors", "plain"][..], "[[[[0],1],[[0]],[[],1],[[0],2]],\"@DIR@/plain\"]\n[[[0]],null]\n", "", 0),
+        (&["-c", "-s", "--stream", "[., input_filename]"][..], &["nors", "plain"][..], "[[[[0],1],[[0]],[[],1],[[0],2],[[0]]],\"@DIR@/plain\"]\n", "", 0),
         (&["-c", "-s", "--stream-errors", "[., input_line_number]"][..], &["nors", "two"][..], "[[[[0],1],[[0]],[\"Invalid numeric literal at line 3, column 0\",[]]],1]\n", "", 0),
         (&["-c", "-s", "--stream", "[., input_filename]"][..], &["p3", "miss"][..], "[[[[],3]],\"@DIR@/miss\"]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),
         (&["-c", "-s", "--stream", "[., input_line_number]"][..], &["nors", "miss"][..], "[[[[0],1],[[0]]],0]\n", "jq: error: Could not open file @DIR@/miss: No such file or directory\n", 2),

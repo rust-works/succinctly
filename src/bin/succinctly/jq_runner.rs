@@ -1071,6 +1071,14 @@ fn resolve_module_in(search_path: &[PathBuf], module_path: &str) -> Option<PathB
 /// `import "b"`, `p/q/q.jq` for `import "p/q"`), in that order -- confirmed live with
 /// all three present, where `b/jq/main.jq` beat `b/b.jq`, and with one directory
 /// holding `b/b.jq` ahead of a later one holding `b.jq`, where the earlier directory won.
+///
+/// A spelling is found when `stat` finds anything there, as in jq's `find_lib` (#7663): a
+/// directory, or a file that will not open, is the module, and reading it then fails with
+/// `error loading data file <path>: Could not open <path>: It's a directory` (or the open's own
+/// error), never `module not found` or a module further down the path. Only a spelling `stat`
+/// says is absent (`ENOENT`) moves on to the next spelling; any other failure (a symlink loop,
+/// a file where a directory should be) moves on to the next search directory, skipping the
+/// directory-module spellings, as jq does.
 fn resolve_with_suffix(
     search_path: &[PathBuf],
     module_path: &str,
@@ -1091,12 +1099,26 @@ fn resolve_with_suffix(
             // one is `lib//a.jq`, the file system's `lib/a.jq`. `Path::join` would take it as an
             // absolute path and drop the directory.
             let full_path = base.join(spelling.trim_start_matches('/'));
-            if full_path.is_file() {
-                return Some(full_path);
+            match std::fs::metadata(&full_path) {
+                Ok(_) => return Some(full_path),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => break,
             }
         }
     }
     None
+}
+
+/// The `<detail>` of jq's `error loading data file <path>: <detail>` for a module or data file
+/// that was found but would not read (#7663): jq's `jv_load_file` says `Could not open <path>:
+/// <reason>`, naming the file by the resolved path the report names it by, with `It's a
+/// directory` for a directory ([`load_file_detail`]).
+fn library_read_detail(canonical: &Path, e: &std::io::Error) -> String {
+    format!(
+        "Could not open {}: {}",
+        canonical.display(),
+        load_file_detail(e)
+    )
 }
 
 /// Resolve a **data** import's path (`{module_path}.json`) against the
@@ -1164,7 +1186,8 @@ fn read_data_file(path: &Path, raw: bool) -> Result<OwnedValue, DataFileFailure>
         path: canonical_or_self(path),
         detail,
     };
-    let bytes = std::fs::read(path).map_err(|e| unreadable(strerror_only(&e)))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| unreadable(library_read_detail(&canonical_or_self(path), &e)))?;
     if raw {
         // `jv_load_file(path, 1)`, as for `--rawfile` (#7645).
         return Ok(OwnedValue::String(jq_raw_file_text(&bytes).into()));
@@ -1203,16 +1226,12 @@ fn module_meta_outcome(
         return Error(module_not_found(name, note));
     };
     let canonical = canonical_or_self(&file);
-    // Lossily, as `import` reads a module (#5351, #7429): jq parses the raw bytes.
-    let contents = match read_library(&file) {
-        Ok(contents) => contents,
-        Err(e) => {
-            return LoadFailure(format!(
-                "jq: error loading data file {}: {}\n\n",
-                canonical.display(),
-                strerror_only(&e)
-            ));
-        }
+    // Lossily, as `import` reads a module (#5351, #7429): jq parses the raw bytes. A module that
+    // was found but will not read (a directory, a file the user cannot open) is `null`, with
+    // nothing on stderr: jq's `load_module_meta` drops the failed `jv_load_file` without a word,
+    // where `import` reports it (#7663, captured from jq 1.7.1 and 1.8.2).
+    let Ok(contents) = read_library(&file) else {
+        return Meta(OwnedValue::Null);
     };
     let program = match jq::parse_program(&contents) {
         Ok(program) => program,
@@ -1786,8 +1805,8 @@ impl FailureWalk<'_> {
             // load, and the walk goes on (see [`ReportEntry::Data`]).
             Err(e) => {
                 self.entries.push(ReportEntry::Data(DataFileFailure {
+                    detail: library_read_detail(&canonical, &e),
                     path: canonical.clone(),
-                    detail: strerror_only(&e),
                 }));
                 1
             }
@@ -2162,8 +2181,8 @@ impl ModuleLoader {
         // Read and parse the module
         let contents = read_library(&file_path).map_err(|e| {
             ModuleLoadError::single(ReportEntry::Data(DataFileFailure {
+                detail: library_read_detail(&canonical, &e),
                 path: canonical.clone(),
-                detail: strerror_only(&e),
             }))
         })?;
 
@@ -5058,6 +5077,21 @@ impl<'a> RunIndex<'a> {
             hold_in: last_of_its_run_or_window.then_some(held),
         }
     }
+
+    /// [`build`](Self::build) for an index the caller built already, with
+    /// [`JsonIndex::try_build`]: a document of 4 GiB or more (#7537), whose caller has given
+    /// `held` back first. Every other document takes `build`, which writes the index in place.
+    fn of_built(
+        index: JsonIndex,
+        held: &'a mut Option<JsonIndex>,
+        last_of_its_run_or_window: bool,
+    ) -> Self {
+        *held = None;
+        Self {
+            index: Some(index),
+            hold_in: last_of_its_run_or_window.then_some(held),
+        }
+    }
 }
 
 impl core::ops::Deref for RunIndex<'_> {
@@ -5175,6 +5209,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // `-f` with no program file is jq 1.8.2's usage error (#7439), reached after the named
     // arguments are read, as jq reads them while it parses argv.
     if args.from_file && args.program_file.is_none() {
+        eprint!("{}", jq_short_usage());
+        return Ok(exit_codes::USAGE_ERROR);
+    }
+
+    // jq's `main.c` takes `.` for a missing program unless standard input and output are both
+    // terminals, where it prints its usage and exits 2 instead of waiting for input there (#7462).
+    if no_program_is_a_usage_error(
+        args.filter.is_some() || args.program_file.is_some(),
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) {
         eprint!("{}", jq_short_usage());
         return Ok(exit_codes::USAGE_ERROR);
     }
@@ -6197,9 +6242,19 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     continue;
                 }
 
-                // #7425: a document no index can hold (4 GiB or more, a slurp of that much
-                // included) is read into a tree without one, and the program runs on the tree.
-                if !JsonIndex::can_index(json_bytes.len()) {
+                // #7537: a document of 4 GiB or more (a slurp of that much included) is indexed
+                // like any other unless it holds more than 2^31 values; #7425: one no index can
+                // hold is read into a tree without one, and the program runs on the tree. Its
+                // index is boxed, so every other document carries a pointer here and builds its
+                // own in place below.
+                let long_index = if JsonIndex::can_index(json_bytes.len()) {
+                    None
+                } else {
+                    // A previous window's last index is given back before this one is built.
+                    held_index = None;
+                    Some(JsonIndex::try_build(json_bytes).map(Box::new))
+                };
+                if let Some(None) = long_index {
                     let at = ErrorAt::Fixed(locator.at(end));
                     evaluate_unindexable_document(
                         json_bytes,
@@ -6234,7 +6289,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
 
                 // Slow path: build index and evaluate expression
-                let index = RunIndex::build(json_bytes, &mut held_index, is_last_value);
+                let index = match long_index.flatten() {
+                    None => RunIndex::build(json_bytes, &mut held_index, is_last_value),
+                    Some(index) => RunIndex::of_built(*index, &mut held_index, is_last_value),
+                };
                 // #5497: jq's parser refuses a document past its depth limit before any filter
                 // runs, and reads nothing after it, this file or any later one.
                 let source = if slurped.is_some() {
@@ -7481,6 +7539,18 @@ fn should_force_read_under_null_input(
     uses_input_builtins && !(null_input && no_files_given && stdin_is_terminal)
 }
 
+/// Whether a run with no program is jq's usage error: jq's `main.c` defaults the program to `.`
+/// `if (!isatty(STDOUT_FILENO) || !isatty(STDIN_FILENO))` and prints its usage (exit 2) otherwise, so
+/// only a run with a terminal on both sides refuses (#7462). jq 1.7.1 and 1.8.2 agree, whatever the
+/// options (`-n`, `-c`, `-e`, `--arg x 1` are all options, not a program).
+fn no_program_is_a_usage_error(
+    has_program: bool,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> bool {
+    !has_program && stdin_is_terminal && stdout_is_terminal
+}
+
 /// A parse error that ended a JSON input stream after a clean prefix of
 /// documents (#2961): the error, and the `(source, line)` jq's marker names
 /// once its parser has stopped there.
@@ -8724,7 +8794,10 @@ fn read_inputs(
         // faults the slurp loop meets come first, one per call, then the array, then whatever the
         // loop left for the calls after it. A program that never asks for one prints its result.
         if args.slurp && args.null_input && stream_by_reader {
-            let read = crate::cli::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
+            let read = crate::cli::jq_stream_errors::read_for_deferred_slurp(
+                &raw_bytes,
+                !any_open_failure,
+            );
             let place = |at| stream_location(&raw_bytes, at);
             let fault = |message: String, at: (usize, usize)| {
                 let (source, line) = place(at);
@@ -8784,7 +8857,10 @@ fn read_inputs(
             // reader places the fault itself: before the array's last call it is the whole result,
             // and after it (behind a closing event the file before the failure held back) it is not.
             if args.slurp {
-                let deferred = crate::cli::jq_stream_errors::read_for_deferred_slurp(&raw_bytes);
+                let deferred = crate::cli::jq_stream_errors::read_for_deferred_slurp(
+                    &raw_bytes,
+                    !any_open_failure,
+                );
                 if deferred.before.is_empty() {
                     let place = |at| stream_location(&raw_bytes, at);
                     let (array_source, array_line) = place(deferred.slurp_at);
@@ -8835,9 +8911,28 @@ fn read_inputs(
         let mut value_locations = read.locations;
         // `--slurp` closes its array at the call that empties jq's buffer, so what that call left
         // behind comes out after the array as inputs of their own.
+        //
+        // jq 1.8 reads once more after the last byte before it closes the array (jqlang/jq#3279,
+        // #7523), so the closing event of a top-level container that ends the text, which 1.7.1's
+        // parser still held at that point and gave out after the array, is in the array: `printf
+        // '[1,2]' | jq -c -s --stream .` is one array of all three events. That is `--stream -s`
+        // and `--stream-errors -s`. `--seq` keeps the 1.7.1 model of the loop, and so does a run
+        // with a file that did not open and one whose text ends in a fault, which jq 1.8.2 reads
+        // differently too (an uncaught fault, a closed input's name), unchecked here.
+        let inside = if (args.stream || args.stream_errors) && !args.seq && !any_open_failure {
+            read.inside
+                + usize::from(
+                    values.len() == read.inside + 1
+                        && values
+                            .get(read.inside)
+                            .is_some_and(crate::cli::jq_stream_errors::is_closing_event),
+                )
+        } else {
+            read.inside
+        };
         let after_array = args.slurp.then(|| {
-            let outside = values.split_off(read.inside);
-            let outside_locations = value_locations.split_off(read.inside - read.locations_from);
+            let outside = values.split_off(inside);
+            let outside_locations = value_locations.split_off(inside - read.locations_from);
             let (source, line) = read.slurp_at;
             values = vec![OwnedValue::array_from(std::mem::take(&mut values))];
             value_locations = vec![(source, line)];
@@ -19490,13 +19585,17 @@ fn evaluate_input_streaming_via(
         }
         let doc = if preserve {
             let text = input.to_json_jq_preserve();
-            // #7425: no index holds a text of 4 GiB or more.
-            if !JsonIndex::can_index(text.len()) {
+            // #7425, #7537: no index holds a text of 4 GiB or more with more than 2^31 values.
+            // Every shorter one is built in place (`JsonIndex::try_build`).
+            let index = if JsonIndex::can_index(text.len()) {
+                JsonIndex::build(text.as_bytes())
+            } else if let Some(index) = JsonIndex::try_build(text.as_bytes()) {
+                index
+            } else {
                 return Some(jq::Control::Error(EvalError::resource_limit(
                     jq::index_ceiling_message(text.len()),
                 )));
-            }
-            let index = JsonIndex::build(text.as_bytes());
+            };
             InputDoc::Preserve(text, index)
         } else {
             match bridge_doc_of(input) {
@@ -21559,10 +21658,15 @@ fn json_document_to_owned_value(
     at: Option<&dyn Fn() -> (usize, usize)>,
     delimiters: Delimiters,
 ) -> core::result::Result<OwnedValue, EvalError> {
-    if !JsonIndex::can_index(bytes.len()) {
+    // #7537: a document of 4 GiB or more is indexed unless it holds more than 2^31 values.
+    // Every shorter one is built in place (`JsonIndex::try_build`).
+    let index = if JsonIndex::can_index(bytes.len()) {
+        JsonIndex::build(bytes)
+    } else if let Some(index) = JsonIndex::try_build(bytes) {
+        index
+    } else {
         return unindexable_document_value(bytes);
-    }
-    let index = JsonIndex::build(bytes);
+    };
     if let Some(at) = at {
         if let Some(message) =
             jq::jq_input_depth_fault(bytes, index.bp(), jq::InputSource::Stream, at)
@@ -27682,6 +27786,35 @@ mod tests {
         assert!(!should_force_read_under_null_input(true, true, true, true));
     }
 
+    /// #7462: a run with no program is jq's usage error only when stdin and stdout are both
+    /// terminals, which `cargo test` never has. A real terminal on each side needs a pty:
+    /// `python3 - <<'PY'` with `pty.openpty()` as both stdin and stdout of
+    /// `succinctly jq`, `succinctly jq -c` and `succinctly jq -n` must exit 2 at once with the
+    /// usage on stderr, as jq 1.7.1 and 1.8.2 do (the manual check recorded in
+    /// `docs/compliance/jq/limitations.md`).
+    #[test]
+    fn test_no_program_is_a_usage_error_only_on_two_terminals_7462() {
+        // (has a program, stdin is a terminal, stdout is a terminal, refused)
+        for (has_program, stdin, stdout, refused) in [
+            (false, true, true, true),
+            // A pipe on either side makes the program `.`.
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, false),
+            // A program is never missing.
+            (true, true, true, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, false),
+        ] {
+            assert_eq!(
+                no_program_is_a_usage_error(has_program, stdin, stdout),
+                refused,
+                "program {has_program}, stdin terminal {stdin}, stdout terminal {stdout}"
+            );
+        }
+    }
+
     /// #1371: `rewrite_namespaced_calls` runs once, on the freshly parsed
     /// program, strictly before evaluation ever builds an `Expr::Shared` or
     /// `Expr::DefCall` -- so this pass can never actually receive one from
@@ -30737,9 +30870,9 @@ mod tests {
             assert_eq!(
                 error.message,
                 format!(
-                    "Cannot index a value of {} bytes: the index holds at most 4294967295 bytes \
-                     (4 GiB), and the document is not plain JSON, which is all that is read \
-                     without an index",
+                    "Cannot index a value of {} bytes: the index holds at most 2147483647 values, \
+                     and the document is not plain JSON, which is all that is read without an \
+                     index",
                     unread.len()
                 ),
                 "{unread:.20}"

@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+reason = "`last(f)` of an `f` that yields nothing yields nothing in jq 1.8 (jqlang/jq#3179, a fix of the 1.7.1 `reduce f as $x (null; $x)` definition); jq 1.7.1 answers its `null` seed, so `[last(empty)]` is `[null]` there. succinctly follows 1.8.2 (#7518)."
+issue = "#7518"
