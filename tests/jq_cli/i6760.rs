@@ -10,6 +10,10 @@
 //! jq 1.7.1 (`/usr/bin/jq`); `short`, `long` and `two` are rows that never moved. The `gone` and `dir`
 //! rows after a full file are the ones `closing_event_lags` judged by the bytes alone, which put the
 //! held-back closer at the failed file's read although the file's own extra read had delivered it.
+//!
+//! Since #7718 `succinctly jq` reads `--seq` past the last bytes as jq 1.8.2 does (jqlang/jq#3279), so
+//! the rows that read differently there are jq 1.8.2's (`/opt/homebrew/bin/jq`), with jq 1.7.1's
+//! position after the last input (#7607) and its reads past a last directory.
 
 use anyhow::Result;
 
@@ -47,14 +51,23 @@ fn a_last_read_that_fills_the_buffer_is_followed_by_an_empty_read_6760() -> Resu
     assert_eq!(std::fs::metadata(dir.path().join("full.json"))?.len(), 4095);
     #[rustfmt::skip]
     let rows: [Row<'_>; 18] = [
-        (&["-c", "--seq", "--stream", "."][..], &["full.seq", "arr"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
-        (&["-c", "--seq", "--stream-errors", "."][..], &["full.seq", "arr"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
-        (&["-c", "--seq", "--stream", "[., input_filename]"][..], &["full.seq", "arr"][..], "\u{1e}[[[0],1],\"@DIR@/full.seq\"]\n\u{1e}[[[0]],\"@DIR@/full.seq\"]\n", "", 0),
-        (&["-c", "--seq", "--stream", "[., input]"][..], &["full.seq", "arr"][..], "\u{1e}[[[0],1],[[0]]]\n", "", 0),
+        (&["-c", "--seq", "--stream", "."][..], &["full.seq", "arr"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
+        (&["-c", "--seq", "--stream-errors", "."][..], &["full.seq", "arr"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
+        // 1.7.1 ended the stream at `arr`'s RS (#2998); 1.8.2 reads it and names `arr` for its
+        // closer, which `succinctly jq` gives out after the input is closed (`null`, 1.7.1's rule for
+        // what the call after a returning last read yields, #7607). Neither release's answer.
+        (&["-c", "--seq", "--stream", "[., input_filename]"][..], &["full.seq", "arr"][..], "\u{1e}[[[0],1],\"@DIR@/full.seq\"]\n\u{1e}[[[0]],\"@DIR@/full.seq\"]\n\u{1e}[[[0],1],\"@DIR@/arr\"]\n\u{1e}[[[0]],null]\n", "", 0),
+        (&["-c", "--seq", "--stream", "[., input]"][..], &["full.seq", "arr"][..], "\u{1e}[[[0],1],[[0]]]\n\u{1e}[[[0],1],[[0]]]\n", "", 0),
         (&["-c", "--stream", "[., input_filename]"][..], &["full.json", "p.json"][..], "[[[0],1],\"@DIR@/full.json\"]\n[[[0]],\"@DIR@/full.json\"]\n[[[0],7],\"@DIR@/p.json\"]\n[[[0]],null]\n", "", 0),
-        (&["-c", "--seq", "--stream", "."][..], &["late.seq", "arr"][..], "\u{1e}[[],7]\n\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
-        (&["-c", "--seq", "--stream", "."][..], &["full.seq", "dir", "arr"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "jq: error: Is a directory\n", 2),
-        (&["-c", "--seq", "--stream", "[., input_filename]"][..], &["full.seq", "dir", "arr"][..], "\u{1e}[[[0],1],\"@DIR@/full.seq\"]\n\u{1e}[[[0]],\"@DIR@/full.seq\"]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--seq", "--stream", "."][..], &["late.seq", "arr"][..], "\u{1e}[[],7]\n\u{1e}[[0],1]\n\u{1e}[[0]]\n\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
+        // jq 1.7.1 and 1.8.2 both stop after `full.seq`'s two events, for different reasons: 1.7.1
+        // ended the stream at the RS that opens `arr` (#2998), and 1.8.2 reads in 4,091-byte chunks
+        // (jqlang/jq#3421), so `full.seq`'s closer comes with the read of `dir`, where its main loop
+        // stops. `succinctly jq` reads past the RS as 1.8.2 does (#7718) with 1.7.1's 4,095-byte
+        // chunks, whose closer comes with `full.seq`'s own empty read (above), so it reads `arr`'s
+        // first event before it stops.
+        (&["-c", "--seq", "--stream", "."][..], &["full.seq", "dir", "arr"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n\u{1e}[[0],1]\n", "jq: error: Is a directory\n", 2),
+        (&["-c", "--seq", "--stream", "[., input_filename]"][..], &["full.seq", "dir", "arr"][..], "\u{1e}[[[0],1],\"@DIR@/full.seq\"]\n\u{1e}[[[0]],\"@DIR@/full.seq\"]\n\u{1e}[[[0],1],\"@DIR@/arr\"]\n", "jq: error: Is a directory\n", 2),
         (&["-c", "--seq", "--stream", "."][..], &["short.seq", "arr"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
         (&["-c", "--seq", "--stream", "."][..], &["long.seq", "arr"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
         (&["-c", "--seq", "--stream", "."][..], &["full.seq", "two"][..], "\u{1e}[[0],1]\n\u{1e}[[0]]\n\u{1e}[[],2]\n", "", 0),

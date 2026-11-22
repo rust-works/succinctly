@@ -210,8 +210,8 @@ fn a_seq_file_with_a_cut_record_first_or_last_7262() -> Result<()> {
 
 /// What the records before the turn leave in jq's reader decides how the turn reads: a bare `n` after a
 /// token whose second byte is `u` took the keyword path ("Invalid literal") in jq 1.7.1, which read the
-/// stale byte; jq 1.8.2 does not (#7525), so a bare `n` is the number path after any token; a file that ends in an RS straight after its last record ends there (#2998). jq 1.8.2's
-/// output for each.
+/// stale byte; jq 1.8.2 does not (#7525), so a bare `n` is the number path after any token; a record after the last newline is read, as jq 1.8.2 reads it (#7718: jq 1.7.1 ended the
+/// file at its RS, #2998). jq 1.8.2's output for each.
 #[test]
 fn a_seq_file_turns_with_what_its_records_left_7262() -> Result<()> {
     let head = records(0..RECORDS);
@@ -220,11 +220,16 @@ fn a_seq_file_turns_with_what_its_records_left_7262() -> Result<()> {
     let numeric = format!(
         "jq: ignoring parse error: Invalid numeric literal at line {line}, column 0 (need RS to resync)\n"
     );
+    // `12.5` is the line after the records, and the EOF branch reports it.
+    let truncated = format!(
+        "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line {}, column 5\n",
+        RECORDS + 1
+    );
     let cases: [(&str, &str, &str); 4] = [
         ("\x1e[\"x\\u0075\"]\n\x1en\n", "\x1e[\"xu\"]\n", &numeric),
         ("\x1enull\n\x1en\n", "\x1enull\n", &numeric),
         ("\x1e7\n\x1en\n", "\x1e7\n", &numeric),
-        ("\x1e12.5", "", ""),
+        ("\x1e12.5", "", &truncated),
     ];
     for (turn, last, err) in cases {
         let stream = format!("{head}{turn}").into_bytes();

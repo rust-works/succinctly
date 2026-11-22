@@ -5,6 +5,10 @@
 //! directory is the read jq itself leaves `<unknown>` at, a plain `.` says the warning with no
 //! position, and a fault that is not the one at the end of the text keeps its own (`bad`, a lone `}`),
 //! so those rows were right and still are. Every row was captured from jq 1.7.1.
+//!
+//! Since #7718 `succinctly jq` reads `--seq` past the last bytes as jq 1.8.2 does (jqlang/jq#3279), so
+//! the rows that read differently there are jq 1.8.2's (`/opt/homebrew/bin/jq`), with jq 1.7.1's
+//! position after the last input (#7607) and its reads past a last directory.
 
 use anyhow::Result;
 
@@ -39,7 +43,8 @@ fn the_fault_a_program_takes_is_at_the_last_file_that_did_not_open_6788() -> Res
         (&["-c", "--seq", "-s", "--stream", "[input_filename, input_line_number, (try input catch .), input_filename, input_line_number]"][..], &["trunc", "pa", "missing"][..], "\u{1e}[\"@DIR@/missing\",0,\"Unfinished JSON term at EOF at line 1, column 7\",\"@DIR@/missing\",0]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
         (&["-c", "--seq", "-s", "--stream", "."][..], &["trunc", "pa", "missing"][..], "\u{1e}[[[0],1],[[1,0],1],[[1,0]]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
         (&["-c", "--seq", "-s", "--stream", "input"][..], &["trunc", "pa", "dir"][..], "", "jq: error: Is a directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 7\n", 2),
-        (&["-c", "--seq", "-s", "--stream", "input"][..], &["trunc", "pa"][..], "\u{1e}[[1,0]]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 7\n", 0),
+        // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
+        (&["-c", "--seq", "-s", "--stream", "input"][..], &["trunc", "pa"][..], "", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 7\n", 5),
         (&["-c", "--seq", "-s", "--stream-errors", "input"][..], &["trunc", "pa", "missing"][..], "\u{1e}[\"Unfinished JSON term at EOF at line 1, column 7\",[1]]\n", "jq: error: Could not open file @DIR@/missing: No such file or directory\n", 2),
         (&["-c", "--seq", "-n", "-s", "--stream", "[inputs]"][..], &["trunc", "pa", "dir"][..], "", "jq: error: Is a directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 7\n", 2),
         (&["-c", "--seq", "-s", "--stream", "input"][..], &["badtr", "pa", "missing"][..], "", "jq: ignoring parse error: Unmatched '}' at the top-level at line 1, column 2 (need RS to resync)\njq: error: Could not open file @DIR@/missing: No such file or directory\njq: error (at @DIR@/missing:0): Unfinished JSON term at EOF at line 1, column 9\n", 2),

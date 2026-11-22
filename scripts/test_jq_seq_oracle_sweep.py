@@ -99,6 +99,44 @@ class UnwrittenTokenbufTests(unittest.TestCase):
         self.assertFalse(sweep.artifact(b"\x1enan n\n"))
 
 
+class ReadsPastLastBufferTests(unittest.TestCase):
+    """#7718: jq 1.8.2 reads one more, empty, buffer after the last bytes, and `succinctly jq` follows
+    it, so against the pinned 1.7.1 the sweep skips the streams 1.7.1 reads in its last buffer: an
+    RS scanned there without `-s` (its end-of-stream drop, #2998), and a byte-order mark that breaks
+    off (whose EOF report 1.8.2 wipes)."""
+
+    def test_the_issue_rows_are_skipped(self):
+        for data in (b'\x1e"a"\n\x1e"b"', b"\x1e[1]\n\x1e[2]", b"\x1e1\n\x1etrue", b"\x1e\x1etrue"):
+            self.assertTrue(sweep.reads_past_last_buffer(data, False), data)
+            self.assertTrue(sweep.artifact(data), data)
+
+    def test_a_last_buffer_that_is_empty_reads_alike(self):
+        # (The last of these has data in its last buffer, and no RS there.)
+        for data in (b"\x1e1\n\x1etrue\n", b"\x1e1\n", b"\x1e1\n" + b" " * 4094):
+            self.assertFalse(sweep.reads_past_last_buffer(data, False), data)
+        # A chunk that fills jq's 4095-byte buffer is followed by an empty read in 1.7.1 too.
+        self.assertFalse(sweep.reads_past_last_buffer(b"\x1e1" + b" " * 4093, False))
+
+    def test_the_first_rs_of_the_stream_only_opens_a_record(self):
+        self.assertFalse(sweep.reads_past_last_buffer(b"\x1e1 2", False))
+        self.assertFalse(sweep.reads_past_last_buffer(b"\x1e[1,", False))
+
+    def test_slurp_never_dropped(self):
+        self.assertFalse(sweep.reads_past_last_buffer(b"\x1e1\n\x1etrue", True))
+        self.assertFalse(sweep.artifact(b"\x1e1\n\x1e2{", slurp=True))
+
+    def test_a_mark_that_breaks_off_is_skipped_in_both_modes(self):
+        for slurp in (False, True):
+            self.assertTrue(sweep.reads_past_last_buffer(b"\xef\xbb1 2", slurp))
+            self.assertFalse(sweep.reads_past_last_buffer(b"\xef\xbb1 2\n", slurp))
+
+    def test_the_last_buffer_is_what_the_parser_sees(self):
+        # A chunk with no newline ends at its first NUL (#7340), and an RS past it is never scanned.
+        self.assertFalse(sweep.reads_past_last_buffer(b"\x1e1\n\x002\x1e3", False))
+        self.assertEqual(sweep.final_buffer(b"\x1e1\nab"), (3, b"ab"))
+        self.assertEqual(sweep.final_buffer(b"\x1e1\nab\n"), (6, b""))
+
+
 class ProbeInputsTests(unittest.TestCase):
     """#7391: `comparison/jq/probes/*.tsv` feeds the same jq 1.7.1 parser, so a probe whose stdin has a bare
     `n` before any token has written `tokenbuf[1]` makes the reference answer from uninitialised heap: the

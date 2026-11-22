@@ -2,11 +2,11 @@
 //! reports a failure when it reaches that file, so a warning met in a file before it comes first.
 //! Its main loop reads the whole slurp in one call, and stops at the first warning met once a file
 //! has failed: the array is then lost, and nothing after that warning is read or reported. A
-//! warning before every failure keeps the array, and so does a run whose only warning is the EOF
-//! report jq defers past the array (which the main loop then never reads, though `input` does). A
-//! last file that did not open is the empty buffer the stream ends in, so its EOF report is not
-//! deferred. `-s` with a program that reads `input` tripped a debug assertion over a lost array.
-//! Every row was captured from jq 1.7.1.
+//! warning before every failure keeps the array. jq 1.7.1 also kept it when the only warning was
+//! the EOF report it deferred past the array; jq 1.8.2 reports that warning while it reads, so the
+//! array is lost there too, and `succinctly jq` follows 1.8.2 since #7718 (the two `gone`, `defer`
+//! rows are 1.8.2's). `-s` with a program that reads `input` tripped a debug assertion over a lost
+//! array. Every other row was captured from jq 1.7.1, which jq 1.8.2 agrees with.
 
 use anyhow::Result;
 
@@ -38,8 +38,8 @@ fn a_seq_slurp_reports_an_unopened_file_where_its_reader_reaches_it_6589() -> Re
         ("input_filename", &["bad", "gone"][..], "\u{1e}\"@DIR@/gone.json\"\n", "jq: ignoring parse error: Truncated value at line 3, column 1\njq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         ("input", &["gone", "bad"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Truncated value at line 3, column 1\n", 2),
         (".", &["defer", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
-        (".", &["gone", "defer"][..], "\u{1e}[1]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
-        ("input", &["gone", "defer"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 3\n", 2),
+        (".", &["gone", "defer"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
+        ("input", &["gone", "defer"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
         // A fault met at the first byte of the file after the missing one comes after its failure,
         // and one met at the last byte of the file before it comes first.
         (".", &["trunc", "gone", "s2"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Truncated value at line 2, column 1\n", 2),
