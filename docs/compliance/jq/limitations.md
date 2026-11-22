@@ -14690,6 +14690,32 @@ in `tests/jq_cli_tests.rs`, `test_type_selectors_keep_what_the_owned_round_trip_
 `tests/yq_cli_tests.rs`, and `test_type_selectors_do_not_reindex_3690` in
 `src/jq/eval_generic.rs`.
 
+### A program that can see jq's label values runs on the path-mode interpreter; the rest keep a `break` that a `catch` sees as `null` (#7719, #7724, #7736)
+
+jq implements `break $x` as raising the error `{"__jq":N}` and `label $x | BODY` as `try BODY catch if . == $x then empty else error end` (`gen_label` in `compile.c`), where `$x` is the value `GENLABEL` made when that label instance was entered: `{"__jq":N}`, `N` read from one counter that jq creates once per run (`jq_init`) and never resets between inputs.
+So a `try` between a `break` and its label catches that object (`[label $f | try break $f catch .]` is `[{"__jq":0}]`), a handler that re-raises it is stopped by the label (`label $f | try (1, break $f) catch error` prints `1` and exits 0), a hand-made `error({"__jq":0})` is the break of the label numbered 0 (`_equal` compares, so `{"__jq":0.0}` matches and `{"__jq":0,"x":1}` does not), and a `break` is bound to the label instance in scope where it is written, not to the innermost active label of its name.
+The labels jq's `builtin.jq` enters advance the same counter: `first/1`, `limit/2` (a positive count only), `isempty`, `all`/`any`, `nth/2`, `IN`, and `_modify` once per path, so every `|=`, arithmetic update-assignment, `//=` and `map_values` (`[first(1), (label $f | try break $f catch .)]` is `[1,{"__jq":1}]`; `{a:1,b:2} | .[] |= 1` enters two).
+jq 1.7.1 and 1.8.2 agree on every row captured for #7719 (198 programs and input shapes), except `limit` with a negative count, which 1.8.2 refuses (the pinned 1.7.1 answer is kept, as elsewhere).
+
+The shipped evaluator unwinds a `break` by name to the innermost active `label` of that name and hands a `catch` `null` for it; that costs nothing on the programs that cannot tell the difference, which is almost all of them.
+Since [#7719](https://github.com/rust-works/succinctly/issues/7719) `path_mode::route` sends a jq-mode program that can tell to the path-mode interpreter, which runs `label` and `break` as jq compiles them and the jq-defined builtins from `builtin.jq` (ADR-0026), the route a program with a dynamic path target already takes.
+A program goes there when it spells `__jq` in a string, key or field name, or holds a `label` and a `break` and also one of: a `try` whose handler is not a literal or `empty` around a `break` or a call; a label nested inside another of the same name; or a `break` passed as an argument while some definition holds a label (a recursive call's label is then not the one the `break` names, #7724).
+A `?//` destructuring alternation is the other place a caught `break` shows ([#7736](https://github.com/rust-works/succinctly/issues/7736)): jq's `DESTRUCTURE_ALT` retries the next alternative on any error raised after it, so a `break` of a label outside the binding runs the other alternatives too (`[1] | [limit(3; while(. as [$x] ?// $x | $x; .))]` is six `[1]`s in jq 1.7.1 and 1.8.2).
+The shipped evaluator already retries a `?//` after the stop of its native `first`, `limit`, `nth`, `isempty`, `any`/`all` and `IN` (#1519), except through the loop of a `while` or `repeat`, where it gave three `[1]`s; a program with such a builtin over a `while` or `repeat` holding a `?//` now takes the interpreter.
+On the interpreter such a `while` runs jq's own recursive `_while`, which stops at the interpreter's recursion limit (`_while/0 exceeded maximum recursion depth`, exit 5) somewhere between 1,000 and 10,000 rounds, where jq runs on in constant stack; the shipped evaluator answered the loop wrongly at every length (half of jq's outputs, and it ran on to its loop cap).
+A `?//` in the update of `|=` (and of `map_values` and `walk`, which are `|=` in jq) stays on the shipped route, which answers most such updates as jq does in linear time, where jq's retry through `_modify`'s label makes jq and the interpreter quadratic in the number of paths.
+Its remaining difference is recorded: `{"a":[1],"b":2} | .[] |= select((. as [$x] ?// $x | $x) != null)` and the same `select` in `walk` are `{"a":[1]}` in jq 1.7.1 and 1.8.2 and still raise `Paths must be specified as an array` (exit 5) here.
+Every other program walks the same route as before.
+The CLI decides the route once per program and pins it for the run (`path_mode::pin_route`), so a stream of records pays one pointer compare per record and no walk of the program; a library caller that does not pin walks the program per document, as before, plus the checks above.
+The counter is kept per thread for the documents of one program (`LabelNumbers`), so `[label $f | try break $f catch .]` over `1 2 3` is `[{"__jq":0}]`, `[{"__jq":1}]`, `[{"__jq":2}]`, as in jq; a `no_std` build has no thread-local and numbers each document from 0.
+
+What stays on the shipped route answers as before:
+- a sentinel the program does not spell, built from data or computed (`{"__jq":0}` as the input of `[label $f | 1, error(.), 2]`, or `{("__" + "jq"): 0}`): jq's label stops on it, succinctly raises it (exit 5);
+- a program that also uses a succinctly extension the interpreter declines (`key`, `file_index`, `line`, `at_offset`, ...), whose caught `break` is still `null`;
+- a `break` shadowed by a `def error:`, whose handler sees the ambient value (the section below): the interpreter receives that program as the call it was rewritten into, and runs it the same way.
+
+Pinned by `tests/jq_cli/i7719.rs` and `tests/jq_cli/i7736.rs` (every row against jq 1.7.1) and `route_takes_programs_that_observe_label_values_7719` in `src/jq/path_mode/tests.rs` (which programs take which route).
+
 ### `break $x` shadowed by a `def error:` observes arbitrary ambient pipe state, not jq's own context-independent `{"__jq":N}` sentinel (#2687, #2840)
 
 [#2687](https://github.com/rust-works/succinctly/issues/2687): real jq does not treat `break`
@@ -14759,6 +14785,7 @@ declines `Halt`/uncatchable errors, in every arm that walks `Expr::Label`.
 already documents for a *directly* shadowed `break $x` applies identically to a break
 intercepted through #2840's re-raise (`def error: .; label $a | (def f: break $a; label $b | f)`
 sees `null` where jq sees the sentinel) — the same #562 choice, not a new divergence.
+An unshadowed `break` that a `catch` reads is jq's `{"__jq":N}` since #7719 (the section above); a shadowed one still sees what this section describes, on either route.
 
 **A narrower gap found while fixing #2840 — closed by #2964 meanwhile.** With `error` in
 scope at `f`'s own lexical position rather than only at the label's, #2687's shadowing

@@ -5410,6 +5410,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         eprintln!("jq: 1 compile error");
         return Ok(exit_codes::COMPILE_ERROR);
     }
+    // #7719: the evaluator entries ask for the program's route once per document; decide it once
+    // for the run. `expr` stays where it is until this function returns.
+    let _route_pin = jq::path_mode::pin_route(&expr);
 
     // Whether the filter references `input`/`inputs`/`input_line_number`
     // (#723), which decides below whether the shared input queue gets seeded
