@@ -6966,6 +6966,8 @@ Measured against the pinned `/usr/bin/jq` on the scalar documents `"\x"`, `"\ud8
 | `succinctly json validate`                                         | (not applicable)    | rejects with a located diagnostic, exit 1                           |
 
 Inside a container the filter has to reach the string to be affected: over `["\x"]` or `{"a":"\ud800"}`, `length` and `type` answer (`1`, `"array"`), `.[]` forwards the string, and `tostring` raises.
+`-e` reads nothing of an output but whether it is truthy, so it forwards the string as the run without it does and exits 0 for it ([#7757](https://github.com/rust-works/succinctly/issues/7757)).
+Before #7757 it materialized every output to learn that, which raised here (`jq: parse error: Invalid escape ...`, exit 5): jq's answer, but one the same program without `-e` did not give.
 A lone *low* surrogate is not part of this: jq accepts it and substitutes U+FFFD, and so does succinctly ([#2008](https://github.com/rust-works/succinctly/issues/2008)).
 
 This is recorded on the same footing as the #2103 entry above, and adds no reasoning of its own.
@@ -11147,9 +11149,10 @@ that half.)
 The `-n`/`input` bridge stays materializing — `input` must hand the evaluator an owned
 value it can return from a builtin by construction, so validating what it materializes there
 is the rule working as intended, not an accident left to close. (`-s` was the other route
-left behind here; #2847's paragraph just below moves it.) `-e` streams like the default but materializes each *output* to decide the exit
-status, so `-e '.,.'` on `{"\ud800":1,"\ud800":2}` still raises the collision where `-c
-'.,.'` echoes — unaffected by this change, `-e` was never one of the routes being moved.
+left behind here; #2847's paragraph just below moves it.) `-e` streams like the default and
+reads only whether each *output* is truthy (#7757), so `-e '.,.'` on `{"\ud800":1,"\ud800":2}`
+echoes as `-c '.,.'` does; before #7757 it materialized each output to decide the exit status
+and raised the collision.
 Pinned by `test_materializing_flag_routes_still_validate_2103` (rewritten for the new
 `-S`/`-a`/`-C` behavior, then for `-s`; the `-n` rows are unchanged).
 
@@ -14122,8 +14125,8 @@ Reading it behaves as an array's does, with these specifics. `.k`, a chain that 
 contents, and a member that is a node comes back as the node (`{a: .bad} | .a | length` counts its
 members, `| tojson` raises). Printing, `tojson`, `to_entries`, `has`, an index key or slice bound
 (`.u[{a: .bad}:]`) and every other consumer read the whole object and raise on a node that fails
-to decode, writing nothing; `-e`, `-S`, `-a` and `-C` materialize it first, as they do an
-array. Any stage after the object that is not one of those reads takes the object as the owned
+to decode, writing nothing; `-S`, `-a` and `-C` materialize it first, as they do an
+array (`-e` reads only whether it is truthy, #7757). Any stage after the object that is not one of those reads takes the object as the owned
 value it stands for, through the arm that has always handled one, so a `?//` retry, a bounded
 consumer and a generator after it behave as they did. `try`/`?`, `isempty`, `skip` and `isvalid`
 do not read the object (they do not read an array's nodes either, but they force a `LazySeq`), so
