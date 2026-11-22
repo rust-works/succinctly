@@ -534,6 +534,9 @@ use super::value::{
     ObjectMapOf, OwnedValue, ScalarKind,
 };
 
+// #7483: a call, a pipe a call leads and an `if` over an owned value, run on the tree.
+mod owned_call;
+
 /// Which binary operator an operand that produced *zero outputs* is being
 /// combined under, for [`yq_empty_operand_output`].
 ///
@@ -13968,6 +13971,11 @@ impl RestCopy {
     }
 
     /// The owned pipe over `stages`, built on the first call.
+    ///
+    /// `inline(always)`: [`RestPipe::run_owned_past_front_doors`], on the path of every owned rest,
+    /// had it inlined until #7483's `run_moved` became a second caller, and the call it then made
+    /// cost 19 instructions per rest (`map(length) | .[]`, +0.2%).
+    #[inline(always)]
     fn owned_pipe<S: EvalSemantics>(
         &mut self,
         stages: &[Expr],
@@ -13987,7 +13995,9 @@ impl RestCopy {
         })
     }
 
-    /// The owned pipe, from `build` on the first call and kept after.
+    /// The owned pipe, from `build` on the first call and kept after. `inline(always)` for the
+    /// reason [`Self::owned_pipe`] is.
+    #[inline(always)]
     fn pipe_of(&mut self, build: impl FnOnce() -> PipeStages) -> &Expr {
         if !matches!(self, Self::Owned(_)) {
             *self = Self::Owned(Expr::Pipe(build()));
@@ -14445,6 +14455,30 @@ fn eval_each_owned_past_front_doors_in<S: EvalSemantics>(
     if let Some(declined) = declined {
         declined.set(true);
         return Flow::Exhausted;
+    }
+    owned_bridge::<S>(expr, input, optional, reentry, sink)
+}
+
+/// The re-index bridge of [`eval_each_owned_past_front_doors_in`], once every door above it has
+/// declined: `input` written out and indexed, and `expr` run on that document.
+///
+/// Its own function since #7483, which tries its door for a call, a pipe a call leads and an `if`
+/// first, so that a recursion threading a state through its calls does not write the state out
+/// at each call: inside the function that tried every door, that check moved the code and the
+/// registers of the paths the doors answer, which are most of its calls (+25 instructions per
+/// element of `map(length) | .[]`).
+#[inline(never)]
+fn owned_bridge<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    if owned_call::door_candidate(expr) {
+        if let Some(flow) = owned_call::door_borrowed::<S>(expr, input, optional, reentry, sink) {
+            return flow;
+        }
     }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
@@ -120521,6 +120555,16 @@ fn is_static_dollar(params: &[Param], shared: &[Rc<SharedArg>], i: usize) -> boo
     params[i].is_dollar() && matches!(shared[i].expr(), Expr::Literal(_))
 }
 
+/// What a statically bound `$` parameter's `$name` is replaced with (#3260): the literal its
+/// argument is, as itself (#7483). A literal holds no variable for a later substitution to reach
+/// and evaluates to itself, so the `Shared` around it hid nothing, but it hid the literal from the
+/// owned evaluator's closed and pure grammars: `def f($n): if $n == 0 then ... end; f(12)` read its
+/// condition through the re-index bridge. A string literal is cloned per occurrence, where the
+/// `Shared` was a reference count, as an `as`-bound value's literal is.
+fn static_dollar_arg(arg: &Rc<SharedArg>) -> Expr {
+    arg.expr().clone()
+}
+
 /// Whether `$name` in the body resolves to `params[i]`: it is `$`-style and
 /// no later `$` parameter shares its name.
 fn is_last_dollar(params: &[Param], i: usize) -> bool {
@@ -120576,7 +120620,7 @@ fn substitute_params(body: &Expr, params: &[Param], shared: &[Rc<SharedArg>]) ->
         if is_static_dollar(params, shared, i) && is_last_dollar(params, i) {
             subs.push(ParamSubst {
                 name: param.name(),
-                arg: Expr::Shared(Rc::clone(arg)),
+                arg: static_dollar_arg(arg),
                 scope: DOLLAR_NAMESPACE_ONLY,
             });
         }
@@ -120645,7 +120689,7 @@ fn sequential_substitution(body: &Expr, params: &[Param], shared: &[Rc<SharedArg
             result = Some(substitute_func_param_impl(
                 result.as_ref().unwrap_or(body),
                 param.name(),
-                &Expr::Shared(Rc::clone(arg)),
+                &static_dollar_arg(arg),
                 DOLLAR_NAMESPACE_ONLY,
             ));
         }
@@ -120673,7 +120717,7 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 frames,
                 cache,
                 body,
-                value,
+                TailValue::Borrowed(value),
                 optional,
                 &mut |item| {
                     items.push(item);
@@ -120708,9 +120752,15 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     match bind_def_call(def, args, frames, bound) {
-        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
-            each_def_tail_loop::<W, S>(def, frames, bound, body, value, optional, sink)
-        }
+        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => each_def_tail_loop::<W, S>(
+            def,
+            frames,
+            bound,
+            body,
+            TailValue::Borrowed(value),
+            optional,
+            sink,
+        ),
         Ok(body) => match enter_def_call(def, frames, bound) {
             Ok(_guard) => eval_each::<W, S>(&body, value, optional, sink),
             Err(e) => Flow::Escaped(Control::Error(e)),
@@ -120763,9 +120813,48 @@ fn tail_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cur: &TailValue<'a, W>,
     optional: bool,
 ) -> Result<Option<TailValue<'a, W>>, Flow> {
+    tail_one_of::<W>(|sink| tail_each::<W, S>(expr, cur, optional, sink))
+}
+
+/// [`tail_each`] for the last use of `cur` (#7483): a value the loop built is handed down to
+/// `expr` ([`owned_call::eval_moved`]), so an assignment writes into its storage instead of a copy
+/// of every container on its path. jq mode; a borrowed value and yq mode take [`tail_each`].
+fn tail_each_moved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    cur: TailValue<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match cur {
+        TailValue::Owned(value) if S::TAG == EvalTag::Jq => {
+            owned_call::eval_moved::<S>(expr, value, optional, &mut |o| sink(Item::Owned(o)))
+        }
+        cur => tail_each::<W, S>(expr, &cur, optional, sink),
+    }
+}
+
+/// [`tail_one`] for a stage whose answer replaces `cur` (#7483): a value the loop built is handed
+/// to the stage ([`tail_each_moved`]), leaving `null` in `cur` until the caller stores the answer.
+/// Every caller replaces `cur` with the answer or ends the round on what this returns otherwise.
+fn tail_one_moved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    cur: &mut TailValue<'a, W>,
+    optional: bool,
+) -> Result<Option<TailValue<'a, W>>, Flow> {
+    if S::TAG != EvalTag::Jq || !matches!(cur, TailValue::Owned(_)) {
+        return tail_one::<W, S>(expr, cur, optional);
+    }
+    let taken = core::mem::replace(cur, TailValue::Owned(OwnedValue::Null));
+    tail_one_of::<W>(|sink| tail_each_moved::<W, S>(expr, taken, optional, sink))
+}
+
+/// The one value `run` hands its sink, as [`tail_one`] reads it.
+fn tail_one_of<'a, W: Clone + AsRef<[u64]>>(
+    run: impl FnOnce(&mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
+) -> Result<Option<TailValue<'a, W>>, Flow> {
     let mut out: Option<TailValue<'a, W>> = None;
     let mut more = false;
-    let flow = tail_each::<W, S>(expr, cur, optional, &mut |item| {
+    let flow = run(&mut |item| {
         if out.is_some() {
             more = true;
         } else {
@@ -120907,7 +120996,9 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     return Tail::Rest(expr);
                 };
                 for stage in before {
-                    match tail_one::<W, S>(stage, cur, optional) {
+                    // #7483: `cur` is replaced by what the stage answers, so a built value is
+                    // handed to the stage and an assignment writes into it rather than a copy.
+                    match tail_one_moved::<W, S>(stage, cur, optional) {
                         Ok(Some(next)) => *cur = next,
                         Ok(None) => return Tail::Done(Flow::Exhausted),
                         Err(flow) => return Tail::Done(flow),
@@ -120957,7 +121048,7 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     frames: u32,
     bound: &BoundBody,
     body: Rc<Expr>,
-    value: StandardJson<'a, W>,
+    start: TailValue<'a, W>,
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
@@ -120971,7 +121062,7 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut hot = bound.is_hot();
     // Whether `body` can be run again as it is, asked at the first hop back to it.
     let mut reusable: Option<bool> = None;
-    let mut cur = TailValue::Borrowed(value);
+    let mut cur = start;
     loop {
         let _round = match enter_def_call_in(&callee, body_frames, hot) {
             Ok(guard) => guard,
@@ -121012,7 +121103,8 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 }
                 Tail::Bound(then) => walked = then,
-                Tail::Rest(rest) => return tail_each::<W, S>(rest, &cur, optional, sink),
+                // #7483: the rest is the round's last use of `cur`, so a built value is handed down.
+                Tail::Rest(rest) => return tail_each_moved::<W, S>(rest, cur, optional, sink),
                 Tail::Done(flow) => return flow,
             }
         };
@@ -121626,12 +121718,14 @@ impl ScopeMask {
         // (review) -- it is a property of the slice, and every entry point
         // builds its mask through this function, so checking it once per
         // bind replaces an O(subs.len()) scan at *every node* of the
-        // recursion.
+        // recursion. A literal (a statically bound `$` parameter's argument, #7483) is the one
+        // unwrapped argument allowed: it holds no variable or call a binder could recapture.
         debug_assert!(
-            subs.iter().all(|s| matches!(s.arg, Expr::Shared(_))),
+            subs.iter()
+                .all(|s| matches!(s.arg, Expr::Shared(_) | Expr::Literal(_))),
             "substitute_func_param's capture-hygiene argument (#2096) requires every `arg` to \
-             be Expr::Shared-wrapped -- an unwrapped `arg` can be recaptured by a same-named \
-             binder in `expr` (#2077)"
+             be Expr::Shared-wrapped (or a literal) -- an unwrapped `arg` can be recaptured by a \
+             same-named binder in `expr` (#2077)"
         );
         let mut mask = Self { dollar: 0, bare: 0 };
         for (i, sub) in subs.iter().enumerate() {
@@ -125931,14 +126025,15 @@ mod tests {
         };
         let pair = |a: Expr, b: Expr| Expr::Array(Box::new(Expr::Comma(vec![a, b])));
 
-        // `def f($a): [$a, a]; f(1)`: both namespaces substituted, no `as`.
+        // `def f($a): [$a, a]; f(1)`: both namespaces substituted, no `as`. `$a` reads the
+        // literal itself (#7483, `static_dollar_arg`); the bare `a` is the closure, a `Shared`.
         assert_eq!(
             bind_def_call_params(
                 &pair(dollar_ref("a"), bare_ref("a")),
                 &[dollar("a")],
                 &[lit(1)]
             ),
-            pair(shared_lit(1), shared_lit(1)),
+            pair(lit(1), shared_lit(1)),
         );
         // `def f($a; $a): $a; f(1; 2)`: the last `$a` wins, the shadowed
         // literal one is dropped.
@@ -125948,7 +126043,7 @@ mod tests {
                 &[dollar("a"), dollar("a")],
                 &[lit(1), lit(2)]
             ),
-            shared_lit(2),
+            lit(2),
         );
         // `def f($a; $a): $a; f(.x; 2)`: the shadowed non-literal one keeps
         // its `as`, so it still iterates (and can raise) as jq's does.
@@ -125961,7 +126056,7 @@ mod tests {
             Expr::As {
                 expr: Box::new(Expr::shared(Expr::Field("x".into()))),
                 var: "a".into(),
-                body: Box::new(shared_lit(2)),
+                body: Box::new(lit(2)),
             },
         );
         // `def f($a; $b): [$a, $b]; f(.x; 2)`: only the literal one is static.
@@ -125974,7 +126069,7 @@ mod tests {
             Expr::As {
                 expr: Box::new(Expr::shared(Expr::Field("x".into()))),
                 var: "a".into(),
-                body: Box::new(pair(dollar_ref("a"), shared_lit(2))),
+                body: Box::new(pair(dollar_ref("a"), lit(2))),
             },
         );
         // `def f(a; $a): [$a, a]; f(1; 2)`: a bare parameter never binds `$a`.
@@ -125984,7 +126079,7 @@ mod tests {
                 &[bare("a"), dollar("a")],
                 &[lit(1), lit(2)]
             ),
-            pair(shared_lit(2), shared_lit(2)),
+            pair(lit(2), shared_lit(2)),
         );
         // `def f($a): 5 as $a | $a; f(1)`: an inner binder shadows the static
         // substitution exactly as it shadowed the `as`.

@@ -621,6 +621,7 @@ succinctly::jq::resolve::permute_spans
 <succinctly::json::light::ChunkedWrite<succinctly::cli::jq_runner::FmtWriter<&mut succinctly::cli::output::LoudFlushWriter<succinctly::cli::output::JqStdout>>>>::finish
 succinctly::jq::eval::projection_peel::<succinctly::jq::eval::JqSemantics>
 succinctly::jq::eval::eval_each_owned_past_front_doors_in::<succinctly::jq::eval::JqSemantics>
+succinctly::jq::eval::owned_bridge::<succinctly::jq::eval::JqSemantics>
 succinctly::jq::eval::owned_answers_nothing
 succinctly::jq::eval::eval_owned_many_doors::<succinctly::jq::eval::JqSemantics>
 succinctly::jq::eval::embed_peel_step::<succinctly::jq::eval::JqSemantics>
@@ -715,7 +716,7 @@ succinctly::json::light::pairwise_overflow
 <succinctly::jq::parser::Parser>::parse_string_or_interpolation
 succinctly::cli::jq_runner::seed_input_queue
 succinctly::cli::jq_runner::windowed_seq_file
-succinctly::jq::eval::eval_each_owned_past_front_doors_in::<succinctly::jq::eval::JqSemantics>::{closure#0}
+succinctly::jq::eval::owned_bridge::<succinctly::jq::eval::JqSemantics>::{closure#0}
 <succinctly::jq::resolve::CheckCtx>::mark
 succinctly::jq::eval_generic::finish_computed_run::<succinctly::jq::eval::JqSemantics, succinctly::json::light::StandardJson>
 core::ptr::drop_glue::<alloc::vec::Vec<succinctly::jq::expr::StringPart>>
