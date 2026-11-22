@@ -422,6 +422,16 @@ The matches that 1.7.1 repeats at each continuation byte of a multibyte characte
 `succinctly yq` is not changed: Go's `regexp` already reports such a group as unmatched.
 Pinned by `tests/jq_cli/i7520.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 
+## `last(f)` of an `f` that yields nothing yields nothing, as jq 1.8.2 does; jq 1.7.1 answers `null` (#7518)
+
+jq 1.7.1 defines `last(g)` as `reduce g as $item (null; $item)`, and a `reduce` always produces one output, so an `f` with no output answered the seed: `[last(empty)]`, `[last(range(0))]` and `[[] | last(.[])]` were `[null]`, `[last(empty)] == [first(empty)]` was `false`, and `path(last(.[]))` over an empty array raised `Invalid path expression with result null`.
+jq 1.8.2 makes `last(g)` yield no output when `g` yields none, like `first(g)` (jqlang/jq#3179, commit a7b2253 "fix: make last(empty) yield no output values", listed in the 1.8 NEWS under changes to existing functions; it closes the bug reports jqlang/jq#1869 and jqlang/jq#3177).
+`succinctly jq` follows 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary` (ledger entry `syntax:man-last-empty`).
+A non-empty `f` is unchanged, an error after the final value still raises (`last(1, error("x"))` does not answer `1`), and the arity-0 `last` is `.[-1]`, which answers `null` on `[]`, in both versions.
+In `path()` position an `f` that yields nothing now yields no path (`[{"a":[]} | path(last(.a[]))]` is `[]`, and `last(.a[]) = 5` leaves `{"a":[]}`), where 1.7.1 raised.
+`succinctly yq` has no counterpart to compare with, since real yq rejects `last(f)`; behind `--jq-extensions` it follows `succinctly jq`.
+Pinned by `tests/jq_cli/i7518.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
 A standard input that cannot be read is an empty one in jq 1.7.1, which counts the failed read and exits 2 once the run is over, whatever the program left (`-e`'s 4, `input`'s 5), and for a plain read without a word on stderr.
@@ -3226,7 +3236,7 @@ is the revert that established what the other one costs.
    **Since [#4795](https://github.com/rust-works/succinctly/issues/4795)** `first(f)`, `limit(n; f)`, `nth(n; f)` and a `select(c)` stage over navigation are read as navigation too (`is_register_navigation`: each hands on some of the navigation's outputs, a node the register is left on), and `last(f)` over navigation is read at the fold's entry (`is_last_of_navigation`: jq defines it over a `reduce`, whose register is back where it entered, so `.c as $x | reduce last(..) as $i (.; FE)` on `{"a":1,"c":null}` raises with a `null` `$x` although the last element is `null`; the mark carries `null`-ness of the entry node, known only when the `reduce` is entered on the register).
    Pinned by `test_caught_foreign_null_marker_behind_first_limit_or_select_source_4795`.
    Over `scripts/jq-fold-body-register-grid-sweep.py --only rd-first-rec,rd-limit1-rec,rd-nth-rec,rd-last-rec,rd-sel-rec,rd-first-nav,rd-last-nav,rd-last-empty` (373,464 rows, eight outers added for this) against `main`: 8,130 ACCEPT_WRONG -> MATCH, 0 lost matches, 0 new ACCEPT_WRONG.
-   Still answered where jq refuses: `last(f)` of an empty `f` (it yields the `reduce`'s `null` seed with the register at entry; `.c as $x | reduce last(empty) as $i (.; FE)` answers `[]`, as on `main`), `first(last(..))` (a `last` nested in another subset is read as computed) and a `last(f)` entered off the register.
+   Still answered where jq refuses: `last(f)` of an empty `f` (jq 1.7.1 yields the `reduce`'s `null` seed with the register at entry, so `.c as $x | reduce last(empty) as $i (.; FE)` answered `[]`; jq 1.8.2 and now `succinctly jq` yield nothing, #7518, so the fold runs no step and answers `.`), `first(last(..))` (a `last` nested in another subset is read as computed) and a `last(f)` entered off the register.
    Still refused where jq answers, as on `main`: a `$x` bound at the entry node itself (`. as $x | reduce last(..) as $i (.; FE)` on `{"a":1,"c":null}` prints `[]` in jq; the element-position mark names the last element, and handing `last` no position instead lost matches on `last(first(..))` rows).
    Over `scripts/jq-fold-body-register-grid-sweep.py --only rd-rec,rd-comma,rd-nav,rd-nava,rd-lit` (207,480 rows, two outers added for this: `..` and a comma source) the candidate against a `main` build: ACCEPT_WRONG 2,958 -> 722, MATCH 197,634 -> 199,870, REFUSE_WRONG 6,888 unchanged, 0 lost matches, 0 timeouts.
    A

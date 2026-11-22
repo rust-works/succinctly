@@ -1,6 +1,7 @@
-//! #5377: `last(f)` runs as the `reduce f as $x (null; $x)` jq defines it by unless `f` is
+//! #5377: `last(f)` runs as a `reduce` over `f`, as jq defines it, unless `f` is
 //! navigation alone, so it holds one value at a time: `last(range(30000000) * 2)` was killed at
-//! 3 GB where jq stays at 2.5 MB. The rows are what jq 1.7.1 prints, for the computed generators
+//! 3 GB where jq stays at 2.5 MB. The rows are what jq prints (1.7.1, except the three whose `f`
+//! yields nothing: jq 1.8.2's answer, #7518), for the computed generators
 //! that take the `reduce` route, the navigations that keep the collecting one, and `last(f)` in
 //! path position.
 
@@ -11,11 +12,11 @@ use crate::run_jq_full;
 /// (input, filter, expected `-c` output, exit code).
 const ROWS: &[(&str, &str, &str, i32)] = &[
     ("null", "last(range(5))", "4\n", 0),
-    ("null", "last(range(0))", "null\n", 0),
+    ("null", "last(range(0))", "", 0),
     ("null", "last(range(0;10;3))", "9\n", 0),
     ("null", "last(range(5;0;-2))", "1\n", 0),
     ("null", "last(range(3) * 2)", "4\n", 0),
-    ("null", "last(range(3) | select(. > 100))", "null\n", 0),
+    ("null", "last(range(3) | select(. > 100))", "", 0),
     ("null", "[last(range(3), 7)]", "[7]\n", 0),
     ("null", "last(range(2), error(\"x\"))", "", 5),
     (
@@ -52,7 +53,7 @@ const ROWS: &[(&str, &str, &str, i32)] = &[
     ("null", "def g: range(5); last(g)", "4\n", 0),
     ("null", "last(\"abab\" | splits(\"a\"))", "\"b\"\n", 0),
     ("null", "last(1, 2, 3)", "3\n", 0),
-    ("null", "last(empty, empty)", "null\n", 0),
+    ("null", "last(empty, empty)", "", 0),
     ("null", "last((1,2) as $x | $x * 10)", "20\n", 0),
     ("[1,2,3]", "last(.[] | range(2))", "1\n", 0),
     ("[1,2,3]", "last(.[])", "3\n", 0),

@@ -62278,10 +62278,10 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // attempt to iterate through [1]" where this resolver answered
         // nothing at exit 0 (`{} | path(last(.[]))` alone raises too, but
         // for a different reason -- `.[]` on the trackable, genuinely empty
-        // `{}` produces zero outputs, so `last` folds to `null`, and jq
-        // rejects that computed `null` as "Invalid path expression with
+        // `{}` produces zero outputs, so 1.7.1's `last` folds to `null`, and
+        // jq rejects that computed `null` as "Invalid path expression with
         // result null", the same boundary `test_argument_navigation_builtins_forward_a_computed_result_2746`
-        // pins).
+        // pins; jq 1.8.2's `last` yields nothing there instead, #7518).
         //
         // All three results are computed values, never a path into the
         // document (like `[f]` just below, unlike `first`/`limit`/`nth`,
@@ -62363,7 +62363,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                     }
                 }
                 Some(branch) => untracked_at_register(branch.value, register),
-                None => untracked_at_register(Cow::Owned(OwnedValue::Null), register),
+                // jq 1.8: an `f` that yields nothing leaves `last(f)` with nothing to emit
+                // (jqlang/jq#3179, #7518); 1.7.1 emitted an untracked `null` here.
+                None => {
+                    return match flow {
+                        ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
+                        ResolveFlow::Exhausted | ResolveFlow::Stopped => ResolveFlow::Exhausted,
+                    };
+                }
             };
             forward_drained_branch(flow, result, sink)
         }
@@ -95238,10 +95245,11 @@ fn eval_owned_many_doors_answer<S: EvalSemantics>(
         }
         Expr::LastExpr(stream) | Expr::Builtin(Builtin::LastStream(stream)) => {
             let items = owned_stream_items(stream, input)?;
-            Some(vec![match items.last() {
-                Some(item) => leave(item)?,
-                None => OwnedValue::Null,
-            }])
+            // jq 1.8: nothing when the stream is empty (jqlang/jq#3179, #7518).
+            Some(match items.last() {
+                Some(item) => vec![leave(item)?],
+                None => vec![],
+            })
         }
         Expr::NthExpr { n, expr: stream } | Expr::Builtin(Builtin::NthStream(n, stream)) => {
             let n = usize::try_from(owned_integer_literal(n)?).ok()?;
@@ -99502,33 +99510,32 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Evaluate `last(expr)` - take last output.
 ///
-/// jq defines `last(f)` as `reduce f as $x (null; $x)`, and `reduce` always
-/// produces exactly one output — so an empty operand answers the *seed*,
-/// `null`, not nothing (#1521). Oracle-confirmed: `jq -n 'last(empty)'` is
-/// `null`, as is `[] | last(.[])`.
-///
-/// `first(f)` is deliberately **not** symmetric and must not be "fixed" to
-/// match: it is `label $out | (f, break $out)`, which simply has nothing to
-/// yield, and `jq -n 'first(empty)'` is genuinely empty. The asymmetry is in
-/// jq's own definitions, so ADR-0018 rule 3 says reproduce it. (The *0-arity*
-/// `first`/`last` are `.[0]`/`.[-1]` and answer `null` on `[]`; that is a
-/// different construct and already correct.)
+/// jq 1.8 yields nothing when `f` yields nothing: `[last(empty)]` and
+/// `[last(range(0))]` are `[]`, like `first(empty)` (jqlang/jq#3179, a fix of
+/// 1.7.1's `reduce f as $x (null; $x)` definition, which answered the seed
+/// `null`; #7518). An error after the final value still raises
+/// (`last(1,error("x"))` does not answer `1`) -- `last` cannot short-circuit.
+/// The *0-arity* `first`/`last` are `.[0]`/`.[-1]` and answer `null` on `[]`;
+/// that is a different construct and unchanged.
 ///
 /// No local `optional` handling is needed for `last(f)?`: post-#693,
 /// `Expr::Optional(inner)` evaluates `inner` with the *ambient* `optional`
 /// (never forced `true`) and catches the resulting `Error`/`Partial(_,
 /// Error)` itself, one layer out, so this function's own `optional`
 /// parameter is always `false` on every dispatch path that can reach it
-/// today. `last(empty)?` still answers `null` and `last(error("x"))?` is
-/// still empty — that split is entirely the outer `Expr::Optional`/
-/// `eval_try` boundary's job, not this function's.
+/// today. `last(error("x"))?` is still empty -- that is entirely the outer
+/// `Expr::Optional`/`eval_try` boundary's job, not this function's.
 fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     if let Some(fold) = last_as_reduce(expr) {
-        return eval_single::<W, S>(&fold, value, optional);
+        // The closing `.[]?` of the fold answers its one value as a collection of one.
+        return match eval_single::<W, S>(&fold, value, optional) {
+            QueryResult::ManyOwned(vs) => owned_vec_to_result(vs),
+            other => other,
+        };
     }
     let result = eval_single::<W, S>(expr, value, optional);
     match result.materialize_cursor() {
@@ -99536,14 +99543,14 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => match vs.into_iter().next_back() {
             Some(last) => QueryResult::One(last),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
         QueryResult::Owned(v) => QueryResult::Owned(v),
         QueryResult::ManyOwned(vs) => match vs.into_iter().next_back() {
             Some(last) => QueryResult::Owned(last),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
-        QueryResult::None => QueryResult::Owned(OwnedValue::Null),
+        QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
@@ -99558,12 +99565,18 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// jq's own definition of `last(f)`, `reduce f as $x (null; $x)`, when `f` makes the values it
-/// emits (#5377). `reduce` holds one value at a time and streams its source, `range` included,
-/// so `last(range(30000000) * 2)` stays flat where collecting the generator first held every
-/// value it made (killed at 3 GB; jq's is 2.5 MB). Whatever `last` does with an empty source, an
-/// error after the final value (`last(1, error("x"))` raises, it does not answer `1`) and a
-/// `break` or `halt` is then `reduce`'s own.
+/// `last(f)` as a fold over `f`'s outputs, when `f` makes the values it emits (#5377). jq's
+/// `reduce` holds one value at a time and streams its source, `range` included, so
+/// `last(range(30000000) * 2)` stays flat where collecting the generator first held every value
+/// it made (killed at 3 GB; jq's is 2.5 MB). An error after the final value
+/// (`last(1, error("x"))` raises, it does not answer `1`) and a `break` or `halt` is then
+/// `reduce`'s own.
+///
+/// jq 1.8 answers nothing for an `f` that yields nothing (#7518, jqlang/jq#3179), which a bare
+/// `reduce f as $x (null; $x)` cannot say: it answers its seed. jq 1.8.2 keeps a flag beside the
+/// last value; here the accumulator is the value boxed in a one-element array (`null` while
+/// nothing arrived), and the closing `.[]?` unboxes it -- or, over the seed `null`, yields
+/// nothing.
 ///
 /// `None` for navigation alone (`.[]`, `.a[] | select(.b)`, `..`): its outputs are nodes of the
 /// document, which a collecting `last` holds as cursors -- a pointer each -- where `reduce` would
@@ -99574,11 +99587,16 @@ pub(crate) fn last_as_reduce(f: &Expr) -> Option<Expr> {
     // `map(g)` is one output, a sequence that stays lazy through `last` (#725); there is nothing
     // to stream.
     let one_lazy_output = matches!(unwrap_paren(f), Expr::Builtin(Builtin::Map(_)));
-    (!is_register_navigation(f) && !one_lazy_output).then(|| Expr::Reduce {
-        input: Box::new(f.clone()),
-        patterns: vec![Pattern::Var(String::from(LAST_VAR))],
-        init: Box::new(Expr::Literal(Literal::Null)),
-        update: Box::new(Expr::Var(String::from(LAST_VAR))),
+    (!is_register_navigation(f) && !one_lazy_output).then(|| {
+        Expr::pipe(vec![
+            Expr::Reduce {
+                input: Box::new(f.clone()),
+                patterns: vec![Pattern::Var(String::from(LAST_VAR))],
+                init: Box::new(Expr::Literal(Literal::Null)),
+                update: Box::new(Expr::Array(Box::new(Expr::Var(String::from(LAST_VAR))))),
+            },
+            Expr::Optional(Box::new(Expr::Iterate)),
+        ])
     })
 }
 
@@ -113475,7 +113493,7 @@ fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: last(expr) - output only the last value from expr (stream version)
 ///
-/// Mirrors [`eval_last_expr`]'s `null`-for-an-empty-stream rule (#1521); see
+/// Mirrors [`eval_last_expr`]'s nothing-for-an-empty-stream rule (#7518); see
 /// its doc comment for the rule and for why no local `optional` handling is
 /// needed here either. Unlike `eval_last_expr`, this function is never
 /// actually reached from parsed `succinctly jq`/`succinctly yq` filter text
@@ -113507,13 +113525,13 @@ fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Owned(v) => QueryResult::Owned(v),
         QueryResult::Many(results) => match results.into_iter().next_back() {
             Some(last) => QueryResult::Owned(to_owned_or_suppress!(&last, optional)),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
         QueryResult::ManyOwned(results) => match results.into_iter().next_back() {
             Some(last) => QueryResult::Owned(last),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
-        QueryResult::None => QueryResult::Owned(OwnedValue::Null),
+        QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
@@ -187691,7 +187709,7 @@ mod never_identical_tests_5176 {
         ] {
             let fold = last_as_reduce(&operand(source));
             assert!(
-                matches!(fold, Some(Expr::Reduce { .. })),
+                matches!(&fold, Some(Expr::Pipe(stages)) if matches!(stages[0], Expr::Reduce { .. })),
                 "{source}: {fold:?}"
             );
         }
