@@ -179,6 +179,9 @@ lexer has no such format (#5444).
 `\(E)` slot through the format before splicing it in — jq's own `gen_format` desugar,
 `@base64 "v=\(1)"` => `"v=MQ=="` — while the literal text passes through unchanged. A
 literal with no interpolation never runs the format at all (`@base64 "abc"` => `"abc"`).
+Such a string goes wherever jq takes a plain one: as a field step after `.` (`.@base64 "x"`
+is `.x`, `.a.@json "k\(1)"` is `.a["k1"]`), an object key or shorthand, an object-pattern key
+(`. as {@base64 "c": $c}`) and an `import`/`include` path (#7456).
 yq's lexer rejects a format followed by a string outright, and `succinctly yq` matches
 that unchanged (#3316).
 
@@ -415,10 +418,9 @@ modules costs memory linear in its total source (#2955). See
 [jq Limitations](../compliance/jq/limitations.md#seven-module-scoping-rules-that-are-matched-and-read-as-bugs-2865)
 for the full table and the two scoping gaps that remain open.
 
-An `include` cycle is reported as `module cycle detected: a -> b -> a`
-(exit 3) — a deliberate ADR-0018 rule-4 divergence, since real jq
-segfaults instead; see
-[jq Limitations](../compliance/jq/limitations.md#a-module-include-cycle-is-a-compile-error-where-jq-segfaults--accepted-divergence-adr-0018-rule-4-2865).
+A module cycle (`include` or `import`) is reported as `circular import of <path of the module re-entered>`
+(exit 3), as jq 1.8.2 words it; jq 1.7.1 segfaults instead; see
+[jq Limitations](../compliance/jq/limitations.md#a-module-cycle-is-circular-import-of-path-as-jq-182-words-it-jq-171-segfaults-2865-7530).
 
 ### Succinctly Extensions
 These are succinctly-specific extensions not available in standard jq or yq:

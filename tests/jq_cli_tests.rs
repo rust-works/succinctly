@@ -1308,19 +1308,15 @@ fn test_bad_argjson_slurpfile_rawfile_exit_2_not_1_3051() -> Result<()> {
         "stderr: {stderr:?}"
     );
 
-    // --rawfile: a file that exists and reads, but isn't valid UTF-8 --
-    // `strerror_only`'s `None` arm, the one `std::io::Error` shape with no
-    // `" (os error N)"` suffix for it to strip (`ErrorKind::InvalidData` is
-    // constructed from a plain string, not an OS errno).
+    // --rawfile: a file that exists and reads, but isn't valid UTF-8, is read with U+FFFD, as
+    // jq 1.7.1 reads it (#7436; it was refused here, exit 2).
     let mut file = NamedTempFile::new()?;
     file.write_all(&[0xff, 0xfe, b' ', b'x'])?;
     let path = file.path().to_str().unwrap().to_string();
-    let (stdout, stderr, code) = run_jq_full(&["-nc", "1", "--rawfile", "x", &path], None)?;
-    assert_eq!(code, 2, "stdout: {stdout:?} stderr: {stderr:?}");
-    assert_eq!(stdout, "");
+    let (stdout, stderr, code) = run_jq_full(&["-nc", "1, $x", "--rawfile", "x", &path], None)?;
     assert_eq!(
-        stderr,
-        format!("jq: Bad JSON in --rawfile x {path}: Could not open {path}: stream did not contain valid UTF-8\n")
+        (stdout.as_str(), stderr.as_str(), code),
+        ("1\n\"\u{fffd}\u{fffd} x\"\n", "", 0)
     );
 
     Ok(())
@@ -1592,10 +1588,10 @@ fn test_jq_number_spellings_every_input_path_2877() -> Result<()> {
         ("nAn", "null"),
         ("-nan", "null"),
         ("+nan", "null"),
-        ("nan1", "null"),
-        ("nan0012", "null"),
+        ("nan0", "null"),
+        ("nan000", "null"),
         ("sNaN", "null"),
-        ("SNAN12", "null"),
+        ("SNAN0", "null"),
         ("-sNaN", "null"),
         ("inf", "1.7976931348623157e+308"),
         ("INF", "1.7976931348623157e+308"),
@@ -1844,7 +1840,7 @@ fn test_bridge_tokens_still_round_trip_computed_values_3034() -> Result<()> {
 fn test_jq_number_spellings_builtins_2877() -> Result<()> {
     for (input, filter, expected) in [
         (
-            "[SNAN,+Infinity,NaN5,-Inf,+.5e1,+1.50,-snan00]",
+            "[SNAN,+Infinity,NaN0,-Inf,+.5e1,+1.50,-snan00]",
             "., map(type)",
             "[null,1.7976931348623157e+308,null,-1.7976931348623157e+308,5,1.50,null]\n\
              [\"number\",\"number\",\"number\",\"number\",\"number\",\"number\",\"number\"]",
@@ -2061,7 +2057,7 @@ fn test_jq_number_spellings_preserve_input_echoes_verbatim_2877() -> Result<()> 
 fn test_tonumber_reads_decnumber_specials_2877() -> Result<()> {
     for (input, expected) in [
         (r#""sNaN""#, "null"),
-        (r#""nan12""#, "null"),
+        (r#""nan00""#, "null"),
         (r#""-sNaN00""#, "null"),
         (r#""NaN""#, "null"),
         (r#""Infinity""#, "1.7976931348623157e+308"),
@@ -2077,7 +2073,15 @@ fn test_tonumber_reads_decnumber_specials_2877() -> Result<()> {
     )?;
     assert_eq!(code, 0);
     assert_eq!(stdout.trim_end(), r#"["number",true]"#);
-    for input in [r#""nanx""#, r#""nan1.5""#, r#""inf1""#, r#""+-1""#] {
+    for input in [
+        r#""nanx""#,
+        r#""nan1.5""#,
+        r#""inf1""#,
+        r#""+-1""#,
+        // #7522: a payload is refused, as in jq 1.8.
+        r#""nan12""#,
+        r#""-sNaN10""#,
+    ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", "tonumber"], Some(input))?;
         assert_eq!(code, 5, "{input}: {stdout:?}");
         assert!(
@@ -2614,10 +2618,11 @@ fn test_negative_filter_program_accepted_without_dashdash_3389() -> Result<()> {
     // A genuine unknown flag must keep erroring, never silently become the
     // filter -- this is the reason `allow_hyphen_values` alone isn't the
     // fix (it can't tell `-x` apart from `-1`, both being "hyphen values").
+    // It is jq's own refusal since #7438.
     let (stdout, stderr, code) = run_jq_full(&["-c", "-x"], Some("[1]"))?;
-    assert_ne!(code, 0, "stdout: {stdout:?}");
+    assert_eq!((stdout.as_str(), code), ("", 2));
     assert!(
-        stderr.contains("unexpected argument") || stderr.contains("unrecognized"),
+        stderr.starts_with("jq: Unknown option -x\n"),
         "stderr: {stderr:?}"
     );
 
@@ -2697,14 +2702,14 @@ fn test_negative_filter_boundary_characters_3389() -> Result<()> {
         "stderr: {stderr:?}"
     );
 
-    // Still rejected: second character is a letter or another `-`, so
-    // clap's own short-flag-bundle parsing (or long-flag matching) is
-    // exactly right here and must be left alone.
-    for filter in ["-x", "-n1", "--bogus"] {
+    // Still rejected: second character is a letter or another `-`, so the
+    // word is an option, and jq names the first letter it does not define
+    // (jq 1.8.2's in-order bundle parser, #7438).
+    for (filter, named) in [("-x", "-x"), ("-n1", "-1"), ("--bogus", "--bogus")] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some("null"))?;
-        assert_ne!(code, 0, "`{filter}`: stdout={stdout:?}");
+        assert_eq!((stdout.as_str(), code), ("", 2), "`{filter}`");
         assert!(
-            stderr.contains("unexpected argument"),
+            stderr.starts_with(&format!("jq: Unknown option {named}\n")),
             "`{filter}`: stderr={stderr:?}"
         );
     }
@@ -2726,10 +2731,9 @@ fn test_negative_filter_unary_minus_as_binding_matches_jq_3397() -> Result<()> {
 }
 
 /// #3389's fix has two call sites: `succinctly jq`'s own subcommand
-/// dispatch (`parse_cli_allowing_negative_filter`, exercised by every test
-/// above) and the `sjq`/`jq` multi-call alias dispatch
-/// (`parse_allowing_negative_filter`, reached only when argv[0]'s file name
-/// is `sjq` or `jq` -- `try_multicall`). A symlink named `sjq` pointing at
+/// dispatch (exercised by every test above) and the `sjq`/`jq` multi-call
+/// alias dispatch (reached only when argv[0]'s file name is `sjq` or `jq` --
+/// `try_multicall`); both read argv through `walk_jq_argv` since #7438. A symlink named `sjq` pointing at
 /// the built binary reproduces that argv[0] the same way
 /// `install-aliases` does for real users.
 #[test]
@@ -2775,8 +2779,11 @@ fn test_negative_filter_accepted_via_sjq_multicall_alias_3389() -> Result<()> {
         Some(b"[1]"),
     )?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert_ne!(code, 0);
-    assert!(stderr.contains("unexpected argument"), "stderr: {stderr:?}");
+    assert_eq!(code, 2);
+    assert!(
+        stderr.starts_with("jq: Unknown option -x\n"),
+        "stderr: {stderr:?}"
+    );
     Ok(())
 }
 
@@ -4219,6 +4226,24 @@ fn test_select_passes_through_corruption_it_only_tests_1645_2692() -> Result<()>
     ];
 
     for (label, doc, tests_only, materializes, now_answers, want_stderr) in cases {
+        // #7449: a token the index could not read (`xyz123`), tested directly,
+        // has no truthiness, so testing it reads it: every filter here
+        // raises. A string with a bad escape is still truthy whatever its
+        // escapes spell (#5308), and a container whatever it holds (#2692).
+        if *label == "structural error, tested directly" {
+            for filter in [*tests_only, *materializes, *now_answers] {
+                let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))?;
+                assert_eq!(
+                    code, 5,
+                    "[{label}] `{filter}` reads the token and must raise\nstdout: {stdout:?}"
+                );
+                assert!(
+                    names_fault(&stderr, want_stderr),
+                    "[{label}] `{filter}`: stderr {stderr:?} lacks {want_stderr:?}"
+                );
+            }
+            continue;
+        }
         let (stdout, stderr, code) = run_jq_full(&["-c", tests_only], Some(doc))?;
         assert_eq!(
             code, 0,
@@ -4454,14 +4479,28 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
             doc,
             r#"["bad"]"#,
         );
-        assert_jq_answers(
-            label,
-            "select(.bad) | .keep",
-            &["-c"],
-            "select(.bad) | .keep",
-            doc,
-            "5",
-        );
+        // #7449: except where `.bad` *is* the malformed token -- a token the
+        // index could not read has no truthiness, so testing it reads it.
+        if label == "structural error, top level" {
+            assert_jq_raises(
+                label,
+                "select(.bad) | .keep",
+                &["-c"],
+                "select(.bad) | .keep",
+                doc,
+                5,
+                expect_stderr,
+            );
+        } else {
+            assert_jq_answers(
+                label,
+                "select(.bad) | .keep",
+                &["-c"],
+                "select(.bad) | .keep",
+                doc,
+                "5",
+            );
+        }
     }
     Ok(())
 }
@@ -4693,7 +4732,14 @@ proptest! {
         // reached a shape the hand-written tests did not. `select`'s row is
         // here to do the same job for #2692's move.
         assert_jq_answers(&label, "path(.bad)", &["-c"], "path(.bad)", &doc, r#"["bad"]"#);
-        assert_jq_answers(&label, "select(.bad) | .keep", &["-c"], "select(.bad) | .keep", &doc, "5");
+        // #7449: except at depth 0 of a structural error, where `.bad` *is*
+        // the token the index could not read: it has no truthiness, so
+        // testing it reads it.
+        if path.is_empty() && matches!(malformation, FuzzMalformation::StructuralError) {
+            assert_jq_raises(&label, "select(.bad) | .keep", &["-c"], "select(.bad) | .keep", &doc, 5, expect_stderr);
+        } else {
+            assert_jq_answers(&label, "select(.bad) | .keep", &["-c"], "select(.bad) | .keep", &doc, "5");
+        }
     }
 }
 
@@ -9156,8 +9202,14 @@ fn test_range_int_from_keeps_negative_zero_literal_spelling_3103() -> Result<()>
     // `-0` is the one integer spelling that diverges from its own canonical
     // `i64` print (no leading zeros/`+`/underscores are legal JSON/jq number
     // syntax otherwise, so this is the sole int-side case #3103 also covers).
-    // jq 1.7.1: `[range(-0;3)]` => `[-0,1,2]`, not `[0,1,2]`.
+    // jq 1.7.1: `[range(-0;3)]` => `[-0,1,2]`, not `[0,1,2]`. Since #7453 a
+    // program's `-0` is jq 1.8's negation of the literal `0`, which is `0`
+    // (jqlang/jq#3242), so the spelling that still carries the sign is a
+    // document `-0`.
     let (output, code) = run_jq_null("[range(-0; 3)]", &["-c"])?;
+    assert_eq!(code, 0);
+    assert_eq!(output.trim(), "[0,1,2]");
+    let (output, code) = run_jq_stdin("[range(.; 3)]", "-0", &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(output.trim(), "[-0,1,2]");
     Ok(())
@@ -29004,7 +29056,7 @@ fn failure_kinds_3573(stderr: &str) -> String {
             kinds.push(format!("D:{}", file_name(&rest[..end])));
         } else if let Some(module) = line.strip_prefix("jq: error: module not found: ") {
             kinds.push(format!("M:{module}"));
-        } else if line.starts_with("jq: error: module cycle detected: ") {
+        } else if line.starts_with("jq: error: circular import of ") {
             kinds.push("C".to_string());
         } else if let Some((_, rest)) = line
             .strip_prefix("jq: error: ")
@@ -29224,27 +29276,30 @@ fn test_directive_failures_are_reported_in_jqs_walk_order_3573() -> Result<()> {
     )
 }
 
-/// #3573: a module cycle is #2865's divergence -- real jq runs out of stack
-/// (exit 139) and prints only what its walk reached first -- so succinctly
-/// ends its walk at the cycle the way a missing module does: what jq printed
-/// before it died, in jq's order, then the cycle and `1 compile error`. The
-/// row `include "cyc1"; import "bad" as $d; $d` prints jq's `bad` first (jq's
-/// own output, before the crash), `include "cyc1"; include "synerr"; 1` jq's
-/// `synerr`, and a cycle with nothing before it prints the cycle alone, as it
-/// always did.
+/// #3573, #7530: a module cycle stops its level and returns `1` for it, as a
+/// missing module does, and the levels above go on (jq 1.8.2's
+/// `process_dependencies` answers `circular import of <path>` and `return 1`;
+/// jq 1.7.1 recursed until SIGSEGV, so there is no 1.7.1 output). Every row was
+/// captured from jq 1.8.2: the cycle counts once, and what the walk reaches
+/// after it is still reported (`include "cyc1"; import "bad" as $d; $d` prints
+/// `bad` first, the later-declared import, then the cycle, `2 compile errors`;
+/// `import "bad" as $d; include "cyc1"; $d` the other way round).
 #[test]
-fn test_a_module_cycle_ends_the_walk_after_what_jq_printed_first_3573() -> Result<()> {
+fn test_a_module_cycle_ends_its_level_and_the_walk_goes_on_3573() -> Result<()> {
     assert_directive_rows_3573(
         &[
             (r#"include "cyc1"; 1"#, "C T:1"),
-            (r#"import "bad" as $d; include "cyc1"; $d"#, "C T:1"),
+            (
+                r#"import "bad" as $d; include "cyc1"; $d"#,
+                "C D:bad.json T:2",
+            ),
             (
                 r#"include "cyc1"; import "bad" as $d; $d"#,
-                "D:bad.json C T:1",
+                "D:bad.json C T:2",
             ),
             (
                 r#"include "cyc1"; include "synerr"; 1"#,
-                "S:synerr.jq C T:1",
+                "S:synerr.jq C T:2",
             ),
         ],
         3,
@@ -29323,15 +29378,13 @@ fn test_an_unreadable_module_is_counted_and_the_walk_goes_on_3573() -> Result<()
     Ok(())
 }
 
-/// #3573: which cycle is named follows jq's walk order, last-declared first.
-/// `twoself.jq` includes two modules that each include themselves; jq would
-/// recurse into the *last-declared* one first, so that is the cycle reported
-/// (`self2 -> self2`). The loader's own first-declared order used to name
-/// `self1 -> self1`. jq crashes on a cycle, so this is the walk's order
-/// applied, not a captured answer; the chain text is pinned so the choice is
-/// deliberate.
+/// #3573, #7530: cycles are reported in jq's walk order, last-declared first.
+/// `twoself.jq` includes two modules that each include themselves; jq reaches
+/// the *last-declared* one first, so `self2.jq` is named before `self1.jq`, and
+/// both are reported (`2 compile errors`: each cycle returns `1` for its own
+/// level). Captured from jq 1.8.2.
 #[test]
-fn test_the_cycle_named_is_the_first_in_jqs_walk_order_3573() -> Result<()> {
+fn test_cycles_are_named_in_jqs_walk_order_3573() -> Result<()> {
     let temp_dir = tempfile::tempdir()?;
     write_directive_fixtures_3573(temp_dir.path())?;
     let (output, code) = spawn_with_signal_retry(
@@ -29347,10 +29400,17 @@ fn test_the_cycle_named_is_the_first_in_jqs_walk_order_3573() -> Result<()> {
     )?;
     let stderr = String::from_utf8(output.stderr)?;
     assert_eq!(code, 3, "stderr {stderr:?}");
-    assert_eq!(
-        stderr,
-        "jq: error: module cycle detected: self2 -> self2\n\njq: 1 compile error\n"
-    );
+    let (first, rest) = stderr
+        .split_once("\n\n")
+        .expect("blank line after an entry");
+    let (second, tail) = rest.split_once("\n\n").expect("blank line after an entry");
+    let named = |line: &str, file: &str| {
+        line.strip_prefix("jq: error: circular import of /")
+            .is_some_and(|path| path.ends_with(&format!("/{file}")))
+    };
+    assert!(named(first, "self2.jq"), "stderr {stderr:?}");
+    assert!(named(second, "self1.jq"), "stderr {stderr:?}");
+    assert_eq!(tail, "jq: 2 compile errors\n", "stderr {stderr:?}");
     Ok(())
 }
 
@@ -30097,40 +30157,37 @@ fn test_transitive_include_chain_and_diamond_2865() -> Result<()> {
     Ok(())
 }
 
-/// #2865: a module cycle is reported and terminates.
+/// #2865, #7530: a module cycle is reported and terminates.
 ///
-/// **A deliberate ADR-0018 rule-4 divergence**, under the explicit "matching
-/// would take the host process down" carve-out: real jq 1.7.1 does not
-/// diagnose this at all, it recurses until it dies --
+/// jq 1.7.1 does not diagnose it, it recurses until it dies --
 /// `jq -L . -n 'include "ca"; a'` exits **139** (SIGSEGV) with nothing on
-/// either stream, and a self-including module does the same. So there is no
-/// reference output to match; what this test pins is that succinctly leaves
-/// through the same exit-3 `jq: 1 compile error` door as the other two
-/// compile-error kinds, and that it leaves at all.
+/// either stream -- so the output is jq 1.8.2's (CVE-2026-44777):
+/// `jq: error: circular import of <absolute path of the re-entered module>`,
+/// a blank line, `jq: 1 compile error`, exit 3.
 ///
 /// The third row is why detection keys on the *resolved* file rather than the
 /// module path as written: `alia.jq` including `"./alia"` is the same cycle
-/// under two spellings.
+/// under two spellings, and the message names the resolved file.
 #[test]
 fn test_module_cycle_is_a_compile_error_not_a_hang_2865() -> Result<()> {
-    for (modules, filter, want_chain) in [
+    for (modules, filter, want_file) in [
         (
             vec![
                 ("ca", "include \"cb\";\ndef a: 1;\n"),
                 ("cb", "include \"ca\";\ndef b: 2;\n"),
             ],
             r#"include "ca"; a"#,
-            "ca -> cb -> ca",
+            "ca.jq",
         ),
         (
             vec![("selfinc", "include \"selfinc\";\ndef s: 5;\n")],
             r#"include "selfinc"; s"#,
-            "selfinc -> selfinc",
+            "selfinc.jq",
         ),
         (
             vec![("alia", "include \"./alia\";\ndef q: 3;\n")],
             r#"include "alia"; q"#,
-            "alia -> ./alia",
+            "alia.jq",
         ),
         (
             vec![
@@ -30138,20 +30195,22 @@ fn test_module_cycle_is_a_compile_error_not_a_hang_2865() -> Result<()> {
                 ("ib", "import \"ia\" as a;\ndef y: 2;\n"),
             ],
             r#"include "ia"; x"#,
-            "ia -> ib -> ia",
+            "ia.jq",
         ),
     ] {
         let (stdout, stderr, code) = run_jq_with_modules(&modules, &["-nc", filter])?;
         assert_eq!(code, 3, "{filter}: stderr: {stderr:?}");
         assert_eq!(stdout, "", "{filter}");
+        let (first, tail) = stderr
+            .split_once("\n\n")
+            .unwrap_or_else(|| panic!("{filter}: stderr: {stderr:?}"));
         assert!(
-            stderr.contains(&format!("module cycle detected: {want_chain}")),
+            first
+                .strip_prefix("jq: error: circular import of /")
+                .is_some_and(|path| path.ends_with(&format!("/{want_file}"))),
             "{filter}: stderr: {stderr:?}"
         );
-        assert!(
-            stderr.contains("jq: 1 compile error"),
-            "{filter}: stderr: {stderr:?}"
-        );
+        assert_eq!(tail, "jq: 1 compile error\n", "{filter}");
     }
     Ok(())
 }
@@ -30307,10 +30366,8 @@ fn test_home_jq_def_does_not_seed_a_modules_own_shadow_candidates_2950() -> Resu
 /// `module_dep_defs`'s own `deps` result rather than a second, independent
 /// traversal (an earlier version of this fix took the second-traversal
 /// shape; see `test_module_cycle_chain_stays_linear_cost_2950` below for
-/// why that was reverted). `ca`/`cb` include each other; real jq hangs on
-/// this input (confirmed live, not asserted here), so this pins
-/// succinctly's own clean-refusal behavior instead of a byte-for-byte
-/// oracle match.
+/// why that was reverted). `ca`/`cb` include each other; jq 1.7.1 crashes on
+/// this input, so this pins the `circular import of` refusal of jq 1.8.2 (#7530).
 #[test]
 fn test_module_cycle_reached_through_discovery_pass_still_detected_2950() -> Result<()> {
     let (stdout, stderr, code) = run_jq_with_modules(
@@ -30323,7 +30380,7 @@ fn test_module_cycle_reached_through_discovery_pass_still_detected_2950() -> Res
     assert_eq!(code, 3, "stdout: {stdout:?} stderr: {stderr:?}");
     assert!(stdout.is_empty(), "{stdout:?}");
     assert!(
-        stderr.contains("module cycle detected"),
+        stderr.contains("jq: error: circular import of "),
         "stderr: {stderr:?}"
     );
     Ok(())
@@ -30407,7 +30464,7 @@ fn test_module_cycle_chain_stays_linear_cost_2950() -> Result<()> {
     );
     assert_eq!(code, 3, "stderr: {stderr:?}");
     assert!(
-        stderr.contains("module cycle detected"),
+        stderr.contains("jq: error: circular import of "),
         "stderr: {stderr:?}"
     );
 
@@ -30510,16 +30567,15 @@ fn test_exported_module_def_carries_its_own_siblings_2865() -> Result<()> {
     Ok(())
 }
 
-/// #2865 (PR review): the reported cycle chain starts at the repeat, not at
-/// the bottom of the load stack.
+/// #2865 (PR review), #7530: the cycle names the module that is re-entered, not
+/// the one that led to it.
 ///
-/// A module that merely *leads* to a cycle is not part of it: loading `x`,
-/// which includes `ca`, which includes `cb`, which includes `ca`, reports
-/// `ca -> cb -> ca` and not `x -> ca -> cb -> ca`. The existing cycle test
-/// only covers cycles rooted at the first module loaded, where the two spell
-/// the same thing.
+/// Loading `x`, which includes `ca`, which includes `cb`, which includes `ca`,
+/// reports `circular import of .../ca.jq` and never names `x` (jq 1.8.2 does
+/// the same). The existing cycle test only covers cycles rooted at the first
+/// module loaded, where the two are the same module.
 #[test]
-fn test_cycle_chain_starts_at_the_repeat_not_the_stack_bottom_2865() -> Result<()> {
+fn test_cycle_names_the_reentered_module_not_the_stack_bottom_2865() -> Result<()> {
     let (_, stderr, code) = run_jq_with_modules(
         &[
             ("x", "include \"ca\";\ndef xx: 1;\n"),
@@ -30529,13 +30585,14 @@ fn test_cycle_chain_starts_at_the_repeat_not_the_stack_bottom_2865() -> Result<(
         &["-nc", r#"include "x"; xx"#],
     )?;
     assert_eq!(code, 3, "stderr: {stderr:?}");
+    let first = stderr.lines().next().unwrap_or_default();
     assert!(
-        stderr.contains("module cycle detected: ca -> cb -> ca"),
+        first.starts_with("jq: error: circular import of /") && first.ends_with("/ca.jq"),
         "stderr: {stderr:?}"
     );
     assert!(
-        !stderr.contains("x -> ca"),
-        "chain must not name modules outside the cycle: {stderr:?}"
+        !stderr.contains("/x.jq"),
+        "the cycle must not name a module outside it: {stderr:?}"
     );
     Ok(())
 }
@@ -32184,15 +32241,8 @@ fn test_def_param_shadow_scoping_2723() -> Result<()> {
         ("def f(a; length; b): [a,length,b]; f(1;2;3)", "[1,2,3]"),
         // A comment between the parameter name and `)` still counts.
         ("def f(#c\nlength): length; f(1)", "1"),
-        // `,` is accepted as a parameter separator alongside `;`, matching
-        // `Parser::parse_func_params`'s own grammar (a succinctly
-        // extension -- real jq rejects a comma-separated def parameter
-        // list outright, confirmed live). A first cut of this scan split
-        // only on `;`, silently dropping a comma-separated parameter from
-        // the shadow set the same way the original #2723 bug dropped an
-        // unscanned one (#2805 review; confirmed live pre-fix: `def f(a,
-        // length): length; f(1;2)` answered `0`, not `2`).
-        ("def f(a, length): length; f(1;2)", "2"),
+        // A comma between parameters is a syntax error in jq (#7457,
+        // `tests/jq_cli/i7457.rs`), so no program of that shape is here.
         // #2805 review: a `#`-comment *inside* the parameter list can
         // contain a `)` or `;` of its own -- a naive `find(')')`/
         // `split(';')` over the raw text is fooled by either, mistaking
@@ -42255,12 +42305,11 @@ fn test_jq_raw_input_line_number_unterminated_single_file_1809() -> Result<()> {
 /// `numeric_key_to_index` and emit a bare integer. Every expectation here is
 /// pinned jq 1.7.1's own output.
 ///
-/// The `path(.[-1.0])` → `[-1]` case is not an index-specific asymmetry, and
-/// is here to keep anyone from "fixing" it into `[-1.0]`: jq's unary minus
-/// destroys number-literal preservation (`jq -n '-1.0'` is already `-1`), so
-/// the negated key is a plain double before indexing happens at all. The
-/// `from-data` case is the control that proves it — a negative float that
-/// never passes through unary minus *does* keep its spelling.
+/// The negated keys follow jq 1.8.2 since #7453: jq 1.8's unary minus keeps a
+/// literal a literal (jqlang/jq#3242), so `path(.[-1.0])` is `[-1.0]`, where
+/// jq 1.7.1 turned the key into a double first (`[-1]`). The `from-data` case
+/// is the control: a negative float that never passes through unary minus
+/// keeps its spelling in both versions.
 #[test]
 fn test_1088_path_reports_float_index_as_written() {
     let arr = Some("[1,2,3,4,5]");
@@ -42274,11 +42323,11 @@ fn test_1088_path_reports_float_index_as_written() {
         // An integer-spelled key is unchanged — nothing to preserve.
         ("path(.[2])", "[2]\n"),
         ("path(.[-1])", "[-1]\n"),
-        // Negated literals: jq's own unary minus already collapsed them.
-        ("path(.[-1.0])", "[-1]\n"),
+        // Negated literals keep their spelling, as in jq 1.8.2 (#7453).
+        ("path(.[-1.0])", "[-1.0]\n"),
         ("path(.[-2.5])", "[-2.5]\n"),
-        ("path(.[-1e10])", "[-10000000000]\n"),
-        ("path(.[-0.0])", "[-0]\n"),
+        ("path(.[-1e10])", "[-1E+10]\n"),
+        ("path(.[-0.0])", "[0.0]\n"),
         // A dynamic key resolves through `key_to_path_component`, not the
         // parser's constant fold — both had to be fixed.
         ("(2.0) as $x | path(.[$x])", "[2.0]\n"),
@@ -48300,17 +48349,23 @@ fn test_decode_failure_not_caught_by_try_catch_1620() {
 /// `eval_generic.rs` bridge (`bridge_to_full_evaluator`/
 /// `bridge_to_each_owned_flow`) materializes the input one layer before any
 /// of `in`/`IN`/`contains`'s own `eval.rs` argument-vs-input ordering can
-/// run, so all three raise the identical decode failure from `succinctly
-/// jq` -- including `contains`, whose #1800 deferral only wins on the
-/// library route (see `test_contains_defers_past_decode_failure_unlike_in_2202`
-/// in `src/jq/eval.rs`).
+/// run, so these raise the identical decode failure from `succinctly
+/// jq`. `contains(error("boom"), 1)` is no longer one of them since #7474: its
+/// generator argument is bound first (`(error("boom"), 1) as $v | contains($v)`),
+/// so it raises `boom` as that spelling always did and as the library route's
+/// #1800 deferral does (`test_contains_defers_past_decode_failure_unlike_in_2202`
+/// in `src/jq/eval.rs`). jq has no answer for either: it rejects the document.
 #[test]
 fn test_in_upper_in_contains_all_raise_decode_failure_from_cli_2202() {
     let doc = r#""\ud800""#;
+    let (_, stderr, code) = run_jq_full(&["-c", r#"contains(error("boom"), 1)"#], Some(doc))
+        .unwrap_or_else(|e| panic!("contains failed to run: {e}"));
+    assert_eq!(code, 5, "stderr: {stderr}");
+    assert!(stderr.contains("boom"), "stderr: {stderr}");
     for filter in [
         r#"in(error("boom"), {"a":1})"#,
         r#"IN(error("boom"), {"a":1})"#,
-        r#"contains(error("boom"), 1)"#,
+        "contains(1)",
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(doc))
             .unwrap_or_else(|e| panic!("`{filter}` failed to run: {e}"));
@@ -51408,12 +51463,13 @@ fn strflocaltime_matches_jq_3046() -> Result<()> {
             "jq: error (at <unknown>): strflocaltime/1 requires parsed datetime inputs\n",
             5,
         ),
+        // A shorter array has its missing fields 0, as in jq 1.8.2 (#7532; jq 1.7.1 refused it).
         (
             "UTC",
             "[1970,0,1] | strflocaltime(\"%Y\")",
+            "\"1970\"\n",
             "",
-            "jq: error (at <unknown>): strflocaltime/1 requires parsed datetime inputs\n",
-            5,
+            0,
         ),
         (
             "UTC",
@@ -52051,7 +52107,10 @@ fn test_todate_non_number_matches_strftime_wording_3068() -> Result<()> {
 /// keeps its own literal spelling instead of being recomputed through
 /// `f64`, and `null`/`false`/`true` (which sort *below* every number) raise
 /// through `-.`'s own "cannot be negated" error. Every row confirmed live
-/// against jq 1.7.1.
+/// against jq 1.7.1, except a negative literal's `abs`: since #7453 `-.`
+/// keeps a literal a literal, as jq 1.8 does (jqlang/jq#3242), so
+/// `(-1.50) | abs` is `1.50` and `(-0.0) | abs` is `0.0` (jq 1.7.1: `1.5`,
+/// `-0`), as in jq 1.8.2.
 #[test]
 fn test_abs_matches_jq_total_ordering_semantics_3041() -> Result<()> {
     for (filter, want) in [
@@ -52059,10 +52118,10 @@ fn test_abs_matches_jq_total_ordering_semantics_3041() -> Result<()> {
         ("[1,2] | abs", "[1,2]"),
         ("{} | abs", "{}"),
         ("1.50 | abs", "1.50"),
-        ("(-1.50) | abs", "1.5"),
+        ("(-1.50) | abs", "1.50"),
         ("(-1) | abs", "1"),
         ("0 | abs", "0"),
-        ("(-0.0) | abs", "-0"),
+        ("(-0.0) | abs", "0.0"),
         ("nan | abs", "null"),
         ("infinite | abs", "1.7976931348623157e+308"),
     ] {
@@ -68488,19 +68547,26 @@ fn test_range_i64_overflow_keeps_exact_prefix_2219() -> Result<()> {
 /// consistent exception. Fixed by routing a literal-adjacent `-` through
 /// the same `-1 * <literal>` split the float/exponent case already used
 /// (`parser.rs`) and closing the same gap in `arith_negate` for the
-/// parenthesized/piped spellings (`eval.rs`). `-1.10` is the
-/// magnitude-specific control: below `2^53`, `double` holds the value
-/// exactly either way, so this was never observable there.
+/// parenthesized/piped spellings (`eval.rs`).
+///
+/// #7453 superseded that with jq 1.8's rule, which upstream fixed as a bug
+/// (jqlang/jq#3242, jqlang/jq#2704): unary minus negates a literal to a
+/// literal, so every literal row below keeps its digits, and only a
+/// computed operand rounds.
 #[test]
 fn test_unary_minus_matches_jq_past_2_53_3044() -> Result<()> {
     for (filter, want) in [
-        ("-9223372036854775758", "-9223372036854776000"),
-        ("-9007199254740993", "-9007199254740992"),
-        ("-(9223372036854775758)", "-9223372036854776000"),
-        ("9223372036854775758 | -.", "-9223372036854776000"),
-        ("-9223372036854775808", "-9223372036854776000"), // i64::MIN
-        ("-1.10", "-1.1"),
-        ("-123", "-123"), // below 2^53: unaffected, still exact
+        // #7453: a negated literal keeps every digit, as in jq 1.8.2; jq
+        // 1.7.1 answers `-9223372036854776000`, `-9007199254740992` and `-1.1`.
+        ("-9223372036854775758", "-9223372036854775758"),
+        ("-9007199254740993", "-9007199254740993"),
+        ("-(9223372036854775758)", "-9223372036854775758"),
+        ("9223372036854775758 | -.", "-9223372036854775758"),
+        ("-9223372036854775808", "-9223372036854775808"), // i64::MIN
+        ("-1.10", "-1.10"),
+        ("-123", "-123"),
+        // A computed operand still negates as a double.
+        ("-(9223372036854775758 + 0)", "-9223372036854776000"),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", "--", filter], None)?;
         assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
@@ -68524,19 +68590,22 @@ fn test_unary_minus_matches_jq_past_2_53_3044() -> Result<()> {
 /// or slice bound kept the divergence
 /// `test_unary_minus_matches_jq_past_2_53_3044` just closed for every other
 /// spelling -- `path(.[-869389897822472004])` stayed `[-869389897822472004]`
-/// where jq gives `[-869389897822472000]`. A magnitude within range
-/// (`.[-1]`) must keep folding exactly, unaffected.
+/// where jq 1.7.1 gives `[-869389897822472000]`. A magnitude within range
+/// (`.[-1]`) must keep folding exactly, unaffected. Since #7453 the jq 1.8.2
+/// answer is the pin: a negated literal keeps its digits (jqlang/jq#3242).
 #[test]
 fn test_unary_minus_matches_jq_in_index_and_slice_bounds_3044() -> Result<()> {
     for (filter, want) in [
-        ("path(.[-869389897822472004])", "[-869389897822472000]"),
+        // #7453: the negated literal keeps its digits, as in jq 1.8.2 (jq
+        // 1.7.1: `-869389897822472000`).
+        ("path(.[-869389897822472004])", "[-869389897822472004]"),
         (
             "path(.[-869389897822472004:])",
-            r#"[{"start":-869389897822472000,"end":null}]"#,
+            r#"[{"start":-869389897822472004,"end":null}]"#,
         ),
         (
             "path(.[:-869389897822472004])",
-            r#"[{"start":null,"end":-869389897822472000}]"#,
+            r#"[{"start":null,"end":-869389897822472004}]"#,
         ),
         ("[1,2,3] | .[-1]", "3"),
         ("path(.[-123])", "[-123]"),
@@ -80350,16 +80419,16 @@ fn test_foreach_over_the_register_binds_it_as_a_path_3790() -> Result<()> {
         (
             r#"{"a":1}"#,
             r"[path(foreach . as $k ((0,1); $k; .))]",
+            "[[],[]]\n",
             "",
-            r"Invalid path expression with result null",
-            5,
+            0,
         ),
         (
             r#"{"a":1}"#,
             r"[path(foreach . as $k ((0,1); .; $k))]",
+            "[[],[]]\n",
             "",
-            r"Invalid path expression with result null",
-            5,
+            0,
         ),
         (
             r#"{"a":1}"#,
@@ -95375,93 +95444,95 @@ fn test_map_path_context_scalar_target_still_raises_in_jq_mode_2375() -> Result<
     }
     Ok(())
 }
-/// #2388: a fold's SOURCE is re-run once per INIT fork, and **only the first
-/// fork sees the fold's own input** -- every later fork sees `null`, because
-/// jq's `DUPN` hands a stack slot that is still retained for backtracking
-/// back as `jv_null()`. Confirmed live against jq 1.7.1 on `{"a":1,"c":2}`:
+/// #2388: a fold's SOURCE is re-run once per INIT fork. In jq 1.7.1 **only the
+/// first fork saw the fold's own input** -- every later fork saw `null`, because
+/// jq's `DUPN` hands a stack slot that is still retained for backtracking back as
+/// `jv_null()` -- so a navigating SOURCE in `path()` raised on the second fork
+/// (`path(foreach (.a) as $k ((0,1); $k))` on `{"a":1,"c":2}` printed `["a"]` and
+/// then `Invalid path expression near attempt to access element "a" of null`).
 ///
-/// ```console
-/// $ jq -c '[foreach (.) as $k ((0,1,2); [$k,.])]'
-/// [[{"a":1,"c":2},0],[null,1],[null,2]]
-/// ```
+/// #7519: jq 1.8 fixed that for `foreach` (jqlang/jq#3266), and these rows now pin
+/// jq 1.8.2 (`/opt/homebrew/bin/jq`; pins moved from 1.7.1's raise on the second
+/// fork): every fork's SOURCE reads the document, so a non-navigating INIT answers
+/// one path per fork, and a navigating one (`(0,.c)`) raises on its fork with the
+/// *document* as the operand, since `.c` moved the register off it -- the
+/// first-fork rule of `test_fold_init_fork_unchanged_rows_2388`, on every fork.
 ///
-/// In `path()` context that makes a *navigating* SOURCE raise on the second
-/// fork where it resolved cleanly on the first: `null` is not the value jq's
-/// path register holds, so its per-navigation `jv_identical` check fails.
-/// Before this fix succinctly re-ran SOURCE against the document on every
-/// fork and **fabricated** a second (third, ...) copy of the first fork's
-/// path instead:
-///
-/// ```console
-/// $ echo '{"a":1,"c":2}' | jq -c 'path(foreach (.a) as $k ((0,1); $k))'
-/// jq: error (at <stdin>:1): Invalid path expression near attempt to access element "a" of null
-/// ["a"]                                     # exit 5
-/// $ echo '{"a":1,"c":2}' | succinctly jq -c 'path(foreach (.a) as $k ((0,1); $k))'
-/// ["a"]
-/// ["a"]                                     # exit 0  <- fabricated
-/// ```
-///
-/// #2031's `FoldRegister::branch_provenance` restriction already rejected a
-/// *navigating* second fork (`(0,.c)`); this is the non-navigating one it
-/// could not see, since the register never moved.
-///
-/// The partial-output shape is pinned too, and it differs between the two
-/// constructs: `foreach` streams the first fork's outputs *before* raising,
-/// `reduce` emits nothing (its own final-emission check raises on the first
-/// fork already, before the second is ever entered).
+/// `reduce` keeps 1.7.1's `null` forks in jq 1.8.2, but never reaches the second
+/// fork here: its own final-emission check raises on the first one.
 #[test]
 fn test_foreach_init_fork_source_sees_null_ambient_2388() -> Result<()> {
     const DOC: &str = r#"{"a":1,"c":2}"#;
-    // (filter, stdout jq streams before raising) -- every row captured from
-    // /usr/bin/jq 1.7.1 on DOC, all exit 5 with
-    // `Invalid path expression near attempt to access element "a" of null`.
+    // (filter, stdout) -- every row captured from jq 1.8.2 on DOC, exit 0.
     let cases: &[(&str, &str)] = &[
-        // Two forks, neither navigating -- the headline repro.
-        ("path(foreach (.a) as $k ((0,1); $k))", "[\"a\"]\n"),
-        // Identical INIT values: it is the *fork count*, not the values.
-        ("path(foreach (.a) as $k ((0,0); $k))", "[\"a\"]\n"),
-        // Three forks still raise exactly once, on the second.
-        ("path(foreach (.a) as $k ((0,1,2); $k))", "[\"a\"]\n"),
-        // A `null` first fork is no different -- the register holds the
-        // *document*, not INIT's own value.
-        ("path(foreach (.a) as $k ((null,1); $k))", "[\"a\"]\n"),
-        // A navigating second fork raises for the same reason (#2031 already
-        // rejected this one, but its operand wording was wrong -- see below).
-        ("path(foreach (.a) as $k ((0,.c); $k))", "[\"a\"]\n"),
-        // A multi-element SOURCE streams the whole first fork first.
+        ("path(foreach (.a) as $k ((0,1); $k))", "[\"a\"]\n[\"a\"]\n"),
+        ("path(foreach (.a) as $k ((0,0); $k))", "[\"a\"]\n[\"a\"]\n"),
+        (
+            "path(foreach (.a) as $k ((0,1,2); $k))",
+            "[\"a\"]\n[\"a\"]\n[\"a\"]\n",
+        ),
+        (
+            "path(foreach (.a) as $k ((null,1); $k))",
+            "[\"a\"]\n[\"a\"]\n",
+        ),
         (
             "path(foreach (.a,.c) as $k ((0,1); $k))",
-            "[\"a\"]\n[\"c\"]\n",
+            "[\"a\"]\n[\"c\"]\n[\"a\"]\n[\"c\"]\n",
         ),
         (
             "path(foreach (.a,.c) as $k ((0,1,2); $k))",
-            "[\"a\"]\n[\"c\"]\n",
+            "[\"a\"]\n[\"c\"]\n[\"a\"]\n[\"c\"]\n[\"a\"]\n[\"c\"]\n",
         ),
-        // Collected into an array, jq emits nothing at all: the array
-        // constructor never completes.
-        ("[path(foreach (.a) as $k ((0,1); $k))]", ""),
-        ("[path(foreach (.a) as $k ((0,0); $k))]", ""),
-        ("[path(foreach (.a) as $k ((0,1,2); $k))]", ""),
-        ("[path(foreach (.a) as $k ((null,1); $k))]", ""),
-        ("[path(foreach (.a) as $k ((0,.c); $k))]", ""),
-        ("[path(foreach (.a,.c) as $k ((0,1); $k))]", ""),
+        (
+            "[path(foreach (.a) as $k ((0,1); $k))]",
+            "[[\"a\"],[\"a\"]]\n",
+        ),
+        (
+            "[path(foreach (.a) as $k ((0,0); $k))]",
+            "[[\"a\"],[\"a\"]]\n",
+        ),
+        (
+            "[path(foreach (.a) as $k ((0,1,2); $k))]",
+            "[[\"a\"],[\"a\"],[\"a\"]]\n",
+        ),
+        (
+            "[path(foreach (.a) as $k ((null,1); $k))]",
+            "[[\"a\"],[\"a\"]]\n",
+        ),
+        (
+            "[path(foreach (.a,.c) as $k ((0,1); $k))]",
+            "[[\"a\"],[\"c\"],[\"a\"],[\"c\"]]\n",
+        ),
     ];
     for (filter, want_stdout) in cases {
         let (stdout, stderr, code) = run_jq_stdin_streams(filter, DOC, &["-c"])?;
-        assert_eq!(code, 5, "`{filter}` should exit 5; stderr: {stderr:?}");
         assert_eq!(
-            stdout, *want_stdout,
-            "`{filter}` streamed the wrong prefix before raising"
+            (stdout.as_str(), code),
+            (*want_stdout, 0),
+            "`{filter}`: stderr {stderr:?}"
+        );
+    }
+    // A navigating later fork raises, with the document as the operand.
+    for (filter, want_stdout) in [
+        ("path(foreach (.a) as $k ((0,.c); $k))", "[\"a\"]\n"),
+        ("[path(foreach (.a) as $k ((0,.c); $k))]", ""),
+    ] {
+        let (stdout, stderr, code) = run_jq_stdin_streams(filter, DOC, &["-c"])?;
+        assert_eq!(
+            (stdout.as_str(), code),
+            (want_stdout, 5),
+            "`{filter}`: stderr {stderr:?}"
         );
         assert!(
-            stderr
-                .contains(r#"Invalid path expression near attempt to access element "a" of null"#),
-            "`{filter}`: wanted jq's `... of null` operand, got {stderr:?}"
+            stderr.contains(
+                r#"Invalid path expression near attempt to access element "a" of {"a":1,"c":2}"#
+            ),
+            "`{filter}`: wanted the document as the operand, got {stderr:?}"
         );
     }
 
     // `reduce` never reaches the second fork: its own exit-boundary re-check
-    // raises on the first one. Captured from jq 1.7.1, same DOC.
+    // raises on the first one. Captured from jq 1.7.1, same DOC (1.8.2 agrees).
     let reduce_cases: &[(&str, &str)] = &[
         ("path(reduce (.a) as $k ((0,1); $k))", "with result 1"),
         ("path(reduce (.a) as $k ((0,1,2); $k))", "with result 1"),
@@ -95485,19 +95556,20 @@ fn test_foreach_init_fork_source_sees_null_ambient_2388() -> Result<()> {
 }
 
 /// #2388, the secondary half: the error's *operand*. jq names the ambient
-/// input the failed navigation was attempted on, and on a later INIT fork
-/// that input is `null`, not the document. Succinctly used to name the
-/// document, because it re-ran SOURCE against it:
+/// input the failed navigation was attempted on. In jq 1.7.1 a later INIT fork's
+/// input was `null`, so `path(foreach (.a) as $k ((0,.c); $k))` named `null`;
+/// in jq 1.8.2 (#7519, jqlang/jq#3266) every `foreach` fork reads the document,
+/// and the navigating second fork names the document (pin moved from 1.7.1's
+/// `of null`):
 ///
 /// ```console
 /// $ echo '{"a":1,"c":2}' | jq -c 'path(foreach (.a) as $k ((0,.c); $k))'
-/// jq: error (at <stdin>:1): Invalid path expression near attempt to access element "a" of null
-/// # succinctly, before #2388: `... element "a" of {"a":1,"c":2}`
+/// ["a"]
+/// jq: error (at <stdin>:1): Invalid path expression near attempt to access element "a" of {"a":1,"c":2}
 /// ```
 ///
-/// Pinned separately from the case list above because it is the one row whose
-/// *exit code and stdout were already right* -- only the wording moved, so a
-/// test that checked exit codes alone would not have caught it.
+/// Its exit code and stdout are the same in both versions: only the operand
+/// moved, so a test that checked exit codes alone would not catch it.
 #[test]
 fn test_foreach_init_fork_error_operand_is_null_2388() -> Result<()> {
     let (stdout, stderr, code) = run_jq_stdin_streams(
@@ -95508,12 +95580,8 @@ fn test_foreach_init_fork_error_operand_is_null_2388() -> Result<()> {
     assert_eq!(code, 5, "stderr: {stderr:?}");
     assert_eq!(stdout, "[\"a\"]\n");
     assert!(
-        stderr.contains(r#"element "a" of null"#),
-        "wanted jq's `of null` operand: {stderr:?}"
-    );
-    assert!(
-        !stderr.contains(r#"of {"a":1,"c":2}"#),
-        "the document must not be named as the operand: {stderr:?}"
+        stderr.contains(r#"element "a" of {"a":1,"c":2}"#),
+        "wanted jq 1.8.2's document operand: {stderr:?}"
     );
     Ok(())
 }
@@ -95578,52 +95646,47 @@ fn test_fold_init_fork_unchanged_rows_2388() -> Result<()> {
     Ok(())
 }
 
-/// #2388: a `null` ambient is not automatically *untrackable* -- jq's
-/// register comparison is kind-based for `null`/`bool`
-/// (`register_identical`), so a later fork resolves cleanly whenever the
-/// register itself holds a `null`. Both directions captured live from
-/// /usr/bin/jq 1.7.1:
+/// #2388: in jq 1.7.1 a later fork's `null` ambient was not automatically
+/// *untrackable* -- jq's register comparison is kind-based for `null`/`bool`
+/// (`register_identical`), so a later fork resolved cleanly whenever the register
+/// itself held a `null`. Since #7519 every `foreach` fork reads the document, as jq
+/// 1.8.2's does (jqlang/jq#3266), and these rows pin jq 1.8.2 (pins moved from
+/// 1.7.1's `["a"]`, `["c","a"]` on `{"c":null}` and its raise on `{"a":null}`):
 ///
 /// ```console
 /// $ echo 'null'       | jq -c 'path(foreach (.a) as $k ((0,1);  $k))'   # ["a"] ["a"], exit 0
-/// $ echo '{"c":null}' | jq -c 'path(foreach (.a) as $k ((0,.c); $k))'   # ["a"] ["c","a"], exit 0
-/// $ echo '{"a":null}' | jq -c 'path(foreach (.a) as $k ((0,1);  $k))'   # ["a"] then raises
+/// $ echo '{"c":null}' | jq -c 'path(foreach (.a) as $k ((0,.c); $k))'   # ["a"], then raises (of {"c":null})
+/// $ echo '{"a":null}' | jq -c 'path(foreach (.a) as $k ((0,1);  $k))'   # ["a"] ["a"], exit 0
 /// ```
 ///
-/// The middle row is the one that needs the register's own path rebased onto
-/// SOURCE's result: that fork's INIT navigated to `["c"]`, so SOURCE's own
-/// `["a"]` is relative to it. Without the rebase it would answer `["a"]`
-/// twice -- the same fabrication class, one level down. The third row is the
-/// near-miss control: a `null` *somewhere in* the document is not the same as
-/// a `null` at the register.
+/// The middle row raises because the second fork's INIT moved the register to
+/// `["c"]`, and SOURCE navigates the document, which is not there.
 #[test]
 fn test_foreach_init_fork_null_register_still_tracks_2388() -> Result<()> {
-    // Register is the document root, and the document is `null`.
     let (stdout, stderr, code) =
         run_jq_stdin_streams("path(foreach (.a) as $k ((0,1); $k))", "null", &["-c"])?;
     assert_eq!(code, 0, "stderr: {stderr:?}");
     assert_eq!(stdout, "[\"a\"]\n[\"a\"]\n");
 
-    // Register moved to `["c"]` by INIT, and `.c` is `null`: the second
-    // fork's own path is rebased onto it.
     let (stdout, stderr, code) = run_jq_stdin_streams(
         "path(foreach (.a) as $k ((0,.c); $k))",
         r#"{"c":null}"#,
         &["-c"],
     )?;
-    assert_eq!(code, 0, "stderr: {stderr:?}");
-    assert_eq!(stdout, "[\"a\"]\n[\"c\",\"a\"]\n");
+    assert_eq!(code, 5, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n");
+    assert!(
+        stderr.contains(r#"element "a" of {"c":null}"#),
+        "{stderr:?}"
+    );
 
-    // Control: a `null` elsewhere in the document does not make the ambient
-    // `null` match the register.
     let (stdout, stderr, code) = run_jq_stdin_streams(
         "path(foreach (.a) as $k ((0,1); $k))",
         r#"{"a":null}"#,
         &["-c"],
     )?;
-    assert_eq!(code, 5, "stderr: {stderr:?}");
-    assert_eq!(stdout, "[\"a\"]\n");
-    assert!(stderr.contains(r#"element "a" of null"#), "{stderr:?}");
+    assert_eq!(code, 0, "stderr: {stderr:?}");
+    assert_eq!(stdout, "[\"a\"]\n[\"a\"]\n");
     Ok(())
 }
 
@@ -98756,13 +98819,15 @@ fn test_any_all_no_longer_reject_a_malformed_array_2692() -> Result<()> {
 /// `null` roots, where `any`/`all` raise a *type* error of their own; and its
 /// object rows reach `any`/`all`'s own object arm, which is the one place
 /// these builtins genuinely read rather than test. Every row here is
-/// therefore a container, and every row but one answers.
+/// therefore a container, and every row but two answers.
 ///
 /// The exception is the point of the test. `{123: 1}` still raises, because
 /// jq iterates an *object's values* (#422) under its own last-occurrence
 /// duplicate-key rule, so `effective_fields_checked` has to resolve the keys
-/// -- and resolving a key reads it. Every array row answers, because scanning
-/// elements for truthiness reads none of them. That is the whole of #2692's
+/// -- and resolving a key reads it. Every other array row answers, because
+/// scanning elements for truthiness reads none of them; `[xyz123]` raises,
+/// because an element the index could not read has no truthiness (#7449).
+/// That is the whole of #2692's
 /// rule applied inside a single builtin, which is why it is worth pinning
 /// here rather than only in the arm's own focused test.
 ///
@@ -98776,7 +98841,9 @@ fn test_any_all_validate_only_the_keys_they_resolve_2476_2692() -> Result<()> {
         // The one raising row: an object, so the keys are resolved.
         ("#1194 non-string key", "{123: 1}", 5),
         ("decode failure, in array", r#"["\x"]"#, 0),
-        ("structural error, in array", "[xyz123]", 0),
+        // #7449: an element the index could not read has no truthiness, so
+        // scanning for it reads it.
+        ("structural error, in array", "[xyz123]", 5),
         (
             "#1642 colliding undecodable keys",
             r#"{"\ud800":1,"\ud800":2}"#,
@@ -106245,21 +106312,27 @@ fn test_tracked_var_in_evaluator_routes_keep_accepting_3036() -> Result<()> {
     Ok(())
 }
 
-/// #3895: jq 1.7.1 evaluates a fold's SOURCE against `null` on every INIT fork
+/// #3895: jq evaluates a `reduce`'s SOURCE against `null` on every INIT fork
 /// after the first (`DUPN` leaves `null` in the slot the next fork resumes
 /// from), so a source that reads `.` sees the real input once and `null` after.
-/// A source that does not read `.` is unaffected.
+/// A source that does not read `.` is unaffected. jq 1.7.1's `foreach` did the
+/// same; jq 1.8 fixed it (jqlang/jq#3266), and since #7519 the `foreach` rows
+/// pin 1.8.2's answer, every fork reading the real input (pins moved from 1.7.1).
 ///
 /// Every row runs on both routes -- stdin through the generic evaluator and
 /// `-n 'input | ...'` through `eval.rs`'s owned fold -- and every expected value
-/// is captured from `/usr/bin/jq` 1.7.1 on `{"a":1}`. The `first(repeat(.))`
+/// is captured on `{"a":1}` from `/usr/bin/jq` 1.7.1 (`reduce`, which 1.8.2
+/// answers alike) or `/opt/homebrew/bin/jq` 1.8.2 (`foreach`). The `first(repeat(.))`
 /// rows reach the eager (unbounded-stream) drive, the `limit`/`first`/`isempty`
 /// rows the demand-driven one.
 #[test]
 fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()> {
     let rows = [
         (r"[reduce (.) as $x ((.,.); $x)]", r#"[{"a":1},null]"#),
-        (r"[foreach (.) as $x ((.,.); $x; .)]", r#"[{"a":1},null]"#),
+        (
+            r"[foreach (.) as $x ((.,.); $x; .)]",
+            r#"[{"a":1},{"a":1}]"#,
+        ),
         // The third fork is `null` too, not just the second.
         (
             r"[reduce (.,.) as $x ((.,.,.); $x)]",
@@ -106267,12 +106340,12 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
         ),
         (
             r"[foreach (.,.) as $x ((.,.); $x)]",
-            r#"[{"a":1},{"a":1},null,null]"#,
+            r#"[{"a":1},{"a":1},{"a":1},{"a":1}]"#,
         ),
         (r"[reduce (.a, .a) as $x ((0,0); . + $x)]", "[2,0]"),
         (
             r"[foreach (.a) as $x ((0,0); . + $x; ., 10)]",
-            "[1,10,0,10]",
+            "[1,10,1,10]",
         ),
         (
             r"[reduce (.a) as $x ((.,.); . + {n:$x})]",
@@ -106280,7 +106353,7 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
         ),
         (
             r"[foreach (.,.) as $x ((.,.); $x; [., $x])]",
-            r#"[[{"a":1},{"a":1}],[{"a":1},{"a":1}],[null,null],[null,null]]"#,
+            r#"[[{"a":1},{"a":1}],[{"a":1},{"a":1}],[{"a":1},{"a":1}],[{"a":1},{"a":1}]]"#,
         ),
         // The source's own generator and bind forms read `.` the same way.
         (
@@ -106308,7 +106381,7 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
         ),
         (
             r"[limit(2; foreach (.) as $x ((.,.); $x; .))]",
-            r#"[{"a":1},null]"#,
+            r#"[{"a":1},{"a":1}]"#,
         ),
         (r"[isempty(reduce (.) as $x ((.,.); $x))]", "[false]"),
         // The unbounded-stream fallback drives the same way.
@@ -106318,7 +106391,7 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
         ),
         (
             r"[foreach (first(repeat(.))) as $x ((.,.); $x)]",
-            r#"[{"a":1},null]"#,
+            r#"[{"a":1},{"a":1}]"#,
         ),
         (
             r"[reduce (.) as $x ((first(repeat(.)),.); $x)]",
@@ -106336,7 +106409,7 @@ fn test_fold_source_runs_against_null_after_first_init_fork_3895() -> Result<()>
             assert_eq!(
                 (stdout.trim(), code),
                 (want, 0),
-                "#3895: `{program}` ({args:?}) must answer as jq 1.7.1 does; stderr={stderr:?}"
+                "#3895/#7519: `{program}` ({args:?}) must answer as jq does; stderr={stderr:?}"
             );
         }
     }
@@ -106519,6 +106592,11 @@ fn test_fold_loop_variable_in_path_position_3329() -> Result<()> {
         // Destructured loop variables hold the same node.
         (r"reduce ([.]) as [$x] (.; ($x.a) = 9)", r#"{"a":9}"#),
         (r"reduce ({k:.}) as {k:$x} (.; ($x.a) = 9)", r#"{"a":9}"#),
+        // #7519: every INIT fork of a `foreach` writes through `$x`, as in jq 1.8.2.
+        (
+            r"foreach (.) as $x ((.,.); ($x.a) = 9; .)",
+            "{\"a\":9}\n{\"a\":9}",
+        ),
     ];
     for (filter, want) in answering {
         for (args, program) in [
@@ -106531,7 +106609,7 @@ fn test_fold_loop_variable_in_path_position_3329() -> Result<()> {
             assert_eq!(
                 (stdout.trim(), code),
                 (want, 0),
-                "#3329: `{program}` ({args:?}) must answer as jq 1.7.1 does; stderr={stderr:?}"
+                "#3329: `{program}` ({args:?}) must answer as jq does; stderr={stderr:?}"
             );
         }
     }
@@ -106567,14 +106645,13 @@ fn test_fold_loop_variable_in_path_position_3329() -> Result<()> {
             );
         }
     }
-    // Only the first INIT fork's loop variable can be the accumulator: jq 1.7.1
-    // evaluates SOURCE against `null` on every later fork, so a write through
-    // `$x` answers once and then refuses. Marking the later forks would answer
-    // them too.
-    for filter in [
-        r"reduce (.) as $x ((.,.); ($x.a) = 9)",
-        r"foreach (.) as $x ((.,.); ($x.a) = 9; .)",
-    ] {
+    // Only a `reduce`'s first INIT fork's loop variable can be the accumulator:
+    // jq evaluates its SOURCE against `null` on every later fork, so a write
+    // through `$x` answers once and then refuses. Marking the later forks would
+    // answer them too. A `foreach`'s later forks read the real input in jq 1.8.2
+    // (#7519, jqlang/jq#3266): `foreach (.) as $x ((.,.); ($x.a) = 9; .)` writes on
+    // both, pinned below (moved from 1.7.1's `{"a":9}` then a refusal).
+    for filter in [r"reduce (.) as $x ((.,.); ($x.a) = 9)"] {
         for (args, program) in [
             (&["-c"][..], filter.to_string()),
             (&["-n", "-c"][..], format!("input | {filter}")),
@@ -110413,7 +110490,8 @@ fn test_large_int_literal_rounds_to_17_digits_in_comparisons_2906() -> Result<()
 fn test_large_int_literal_gaps_characterize_preexisting_bug_2906() -> Result<()> {
     for (filter, jq_says) in [
         ("869389897822472004 | floor", "869389897822472000"),
-        ("869389897822472004 | length", "869389897822472000"),
+        // jq 1.8.2 keeps the literal (jqlang/jq#3275, #7534); jq 1.7.1 printed the double.
+        ("869389897822472004 | length", "869389897822472004"),
     ] {
         let (output, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");
@@ -110534,9 +110612,11 @@ fn test_float_literal_rounding_reaches_every_reader_2936() -> Result<()> {
             "1",
         ),
         ("2.7293109604053567083 | sqrt", "1.6520626381603563"),
-        ("2.7293109604053567083 | length", "2.7293109604053565"),
+        // jq 1.8.2 keeps the literal (jqlang/jq#3275, #7534); jq 1.7.1 printed the double.
+        ("2.7293109604053567083 | length", "2.7293109604053567083"),
         ("2.7293109604053567083 | fabs", "2.7293109604053565"),
-        ("2.7293109604053567083 | -.", "-2.7293109604053565"),
+        // `-.` keeps a literal a literal since #7453, as in jq 1.8.2 (jq 1.7.1 rounded it).
+        ("2.7293109604053567083 | -.", "-2.7293109604053567083"),
         ("2.7293109604053567083 * 1", "2.7293109604053565"),
         // the overflow boundary: 17 digits round *down* to DBL_MAX
         ("1.797693134862315808e308 | isinfinite", "false"),
@@ -110734,10 +110814,11 @@ fn test_large_int_literal_rounds_to_17_digits_from_input_sources_2906() -> Resul
 /// #2906 must-not-regress companion: a literal that is only *displayed*
 /// keeps its exact spelling, 17-or-fewer-digit literals are unchanged (the
 /// rounding is the identity below 10^17), genuine `i64` overflow still goes
-/// through the pre-existing float path, and (#3044, superseding the former
-/// #2357 divergence this row used to pin the opposite way) a negative
-/// literal past `2^53` now rounds the same as every other operator. jq's
-/// answers captured live against `/usr/bin/jq` 1.7.1 except where noted.
+/// through the pre-existing float path, and a negative literal past `2^53`
+/// keeps its digits: jq 1.8 negates a literal to a literal (jqlang/jq#3242),
+/// which `succinctly jq` follows since #7453 (#3044 had rounded it as jq
+/// 1.7.1 does). jq's answers captured live against `/usr/bin/jq` 1.7.1,
+/// except that row, which is jq 1.8.2's.
 #[test]
 fn test_large_int_literal_rounding_leaves_display_and_small_ints_alone_2906() -> Result<()> {
     for (filter, want) in [
@@ -110752,7 +110833,7 @@ fn test_large_int_literal_rounding_leaves_display_and_small_ints_alone_2906() ->
             "9223372036854775807 + 9223372036854775807",
             "18446744073709552000",
         ),
-        ("0 | -869389897822472004", "-869389897822472000"),
+        ("0 | -869389897822472004", "-869389897822472004"),
     ] {
         let (output, code) = run_jq_null(filter, &["-c"])?;
         assert_eq!(code, 0, "`{filter}`");
@@ -113689,6 +113770,13 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
         "try (.[0] | .x) catch \"caught\"",
         "try (.[0] | type) catch \"caught\"",
         "[.[] | tostring?]",
+        // #7449: branching on the value reads it.
+        ".[0] | not",
+        ".[0] | if . then 1 else 2 end",
+        ".[0] | . and true",
+        ".[0] | select(.) | 1",
+        "[.[] | select(.)] | length",
+        ".[0] | (. // 1) | 2",
     ];
     for doc in ["[1.2.3,2]", "[1ee5,2]", "[9e999e999,2]", "[+1.2.3,2]"] {
         for filter in READERS {
@@ -113709,12 +113797,6 @@ fn test_malformed_number_route_sweep_3222() -> Result<()> {
         "length",
         "keys",
         "[paths]",
-        ".[0] | not",
-        ".[0] | if . then 1 else 2 end",
-        ".[0] | . and true",
-        ".[0] | select(.) | 1",
-        "[.[] | select(.)] | length",
-        ".[0] | (. // 1) | 2",
         ".[0] | [.] | length",
         ".[0] | path(.)",
         ".[0] | empty",
@@ -114061,7 +114143,8 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
         ),
         (&["-c"], "[1.2.3]", ".[0] | path(.)", "[]\n", 0),
         (&["-c"], "[tru]", ".[0] | [paths]", "[]\n", 0),
-        (&["-c"], "[1.2.3]", ".[0] | getpath([]) | not", "false\n", 0),
+        // #7449: branching on the value reads it.
+        (&["-c"], "[1.2.3]", ".[0] | getpath([]) | not", "", 5),
         (&["-c"], OBJ, ".[0] | path(.a)", "[\"a\"]\n", 0),
         (&["-c"], OBJ, ".[0] | [paths] | length", "2\n", 0),
         (
@@ -114182,7 +114265,8 @@ fn test_unreadable_value_collection_split_3266() -> Result<()> {
             "1\n",
             0,
         ),
-        (&["-c"], OBJ, ".[0] | [.b // 1] | length", "1\n", 0),
+        // #7449: `//` branches on `.b`, so it reads it.
+        (&["-c"], OBJ, ".[0] | [.b // 1] | length", "", 5),
         (&["-c"], OBJ, ".[0] | [try .b] | length", "1\n", 0),
         (&["-c"], OBJ, ".[0] | path(.a), input_line_number", "", 5),
         // #2847: `-s` is the default route's own reads over one more array
@@ -116289,11 +116373,14 @@ fn test_fold_container_loop_variable_identity_through_document_input_3896() -> R
             "",
             5,
         ),
+        // #7519: a `foreach`'s later fork reads the real input in jq 1.8.2
+        // (jqlang/jq#3266), so the write lands on every fork (pin moved from
+        // 1.7.1's refusal on the second).
         (
             "{\"a\":1}",
             "[foreach (.) as $x ((.,.); ($x.a) = 9; . == $x)]",
-            "",
-            5,
+            "[false,false]",
+            0,
         ),
         (
             "{\"a\":1}",
@@ -122492,22 +122579,25 @@ fn test_error_message_is_not_evaluated_past_its_first_output_in_yq_mode_3636() -
 }
 
 /// #3293 slice 4 and #2163: a `?//` retry that supersedes a consumer's stop
-/// lets the fold go on to its next INIT fork, and there the source runs
-/// against `null`, as jq's does (#3895 closed #2163's divergence here). The
-/// answers are jq 1.7.1's: `[1,3]`, `[[1]]`, and an `E2` error.
+/// lets the fold go on to its next INIT fork. There a `reduce`'s source runs
+/// against `null`, as jq's does (#3895 closed #2163's divergence here), and a
+/// `foreach`'s against the real input, as jq 1.8.2's does (#7519: jqlang/jq#3266;
+/// jq 1.7.1 answered `[1,3]` and `[[1]]`, the pins moved from those). The
+/// answers are jq 1.8.2's: `[1,3,101,103]`, `[[1],[1]]`, and an `E2` error
+/// (jq 1.7.1's too).
 #[test]
 fn test_fold_second_fork_source_reads_null_after_retry_2163_3293() -> Result<()> {
     for (input, filter, expected, want_code) in [
         (
             r#"{"starts":[0,100],"items":[{"a":1},{"a":2}]}"#,
             r"[first(foreach (.items[]? as {a: $v} ?// $v | $v | numbers) as $x (.starts[]; . + $x))]",
-            "[1,3]\n",
+            "[1,3,101,103]\n",
             0,
         ),
         (
             "[[1]]",
             r"[first(foreach (. as [$a] ?// [[$b]] | $a // empty) as $x ((0,100); $x; .))]",
-            "[[1]]\n",
+            "[[1],[1]]\n",
             0,
         ),
         (
@@ -125738,7 +125828,9 @@ const AS_BINDING_GUARD_ROWS_3397: &[(&str, &str, &str, i32)] = &[
     (r"[4]", r"[1 and 2 as $x | $x]", "[true]\n", 0),
     (r"[4]", r"1 == 1 as $x | $x", "true\n", 0),
     (r"[4]", r"-reduce (1,2) as $i (0; .+$i) as $z | $z", "", 3),
-    (r"[4]", r"[-1e2 as $x | $x]", "[-100]\n", 0),
+    // `-(1e2 as $x | $x)`: the negated literal keeps its spelling since #7453, as in jq 1.8.2
+    // (jq 1.7.1: `[-100]`).
+    (r"[4]", r"[-1e2 as $x | $x]", "[-1E+2]\n", 0),
     (r"[4]", r"[.[-1] as $x | $x]", "[4]\n", 0),
     (r"[4]", r"[.[] as $x | $x * 2]", "[8]\n", 0),
     (r"[4]", r"[reduce .[] as $x (0; . + $x)]", "[4]\n", 0),
@@ -145774,9 +145866,9 @@ fn test_destructure_bind_refusal_survives_try_and_fold_init_4150() -> Result<()>
         (
             r#"{"a":true,"c":null}"#,
             r"path(foreach (.a) as $k ((0,.c); $k))",
-            "[\"a\"]\n[\"c\",\"a\"]\n",
-            "",
-            0,
+            "[\"a\"]\n",
+            "Invalid path expression near attempt to access element \"a\" of {\"a\":true,\"c\":null}",
+            5,
         ),
         (
             r#"{"a":true}"#,

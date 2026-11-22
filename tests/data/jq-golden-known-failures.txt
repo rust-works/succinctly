@@ -209,3 +209,19 @@
 # shape it caught stays caught. See
 # tests/data/jq-path-context-sweep-known-divergences.txt for the sweep's own
 # class-level manifest.
+#
+# #7453: the owner chose jq 1.8.2's negation of a number literal (jqlang/jq#3242, fixing
+# jqlang/jq#2704): a negated literal stays a literal and a negated zero is `0`. These goldens
+# hold jq 1.7.1's answers, so the rows a program's `-0` or a negated literal reaches differ:
+# `cbrt`/`frexp`/`modf`/`significand`/`copysign`/`fmod` of `-0`, `floor` of `-0`, and the
+# spelling of a negated index. Each differing value is jq 1.8.2's (docs/compliance/jq/limitations.md).
+math_libm_family  newer_than_primary  a program `-0` is the literal `0` in jq 1.8, so the `-0` rows answer `0` (jq 1.8.2) where jq 1.7.1 answers `-0` — #7453
+math_operand_widening_2937  newer_than_primary  `floor_family_neg_zero`'s program `-0` is the literal `0` in jq 1.8, so it floors to `0` (jq 1.8.2) — #7453; and `length_widening`'s `869389897822472004|length` keeps the literal, `[869389897822472004,false,true]` (jq 1.8.2's `length`, jqlang/jq#3275) — #7534
+path_float_index_negated  newer_than_primary  a negated literal keeps its spelling in jq 1.8: `path(.[-1.0])` is `[-1.0]`, `path(.[-1e10])` `[-1E+10]`, `path(.[-0.0])` `[0.0]` (jq 1.8.2) — #7453
+#
+# #7520: an optional group that takes no part in an empty match is unmatched in jq 1.8
+# (jqlang/jq#3238, a bug fix), `{"offset":-1,"string":null,...}`, where jq 1.7.1 reports an empty
+# string at the match's offset. The golden holds jq 1.7.1's answer; succinctly gives jq 1.8.2's
+# (the `newer-than-primary` entry comparison/jq/divergences/upstream-onig.test/2.toml,
+# docs/compliance/jq/limitations.md), which tests/jq_cli/i7520.rs pins.
+regex_match_g_zero_width  newer_than_primary  the empty match's unmatched `( )*` group is `{"offset":-1,"string":null,"length":0,"name":null}` (jq 1.8.2, jqlang/jq#3238) where jq 1.7.1 answers `{"offset":2,"string":"",...}` — #7520

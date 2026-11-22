@@ -78,6 +78,8 @@ pub mod document;
 mod element_run;
 // Only the `std` build reads the environment; a `no_std` build parses the builtin and refuses it.
 mod encoder_comments;
+#[cfg(all(unix, feature = "std"))]
+mod environ;
 #[cfg_attr(not(feature = "std"), allow(dead_code))]
 mod envsubst;
 mod error;
@@ -122,6 +124,39 @@ mod parse_message;
 mod parser;
 #[cfg(feature = "regex")]
 mod regex_blocks;
+
+/// How deeply a jq pattern may nest groups: 511, the most jq 1.8.2 answers (a pattern with 512
+/// nested groups, capturing, `(?:` or a look-ahead alike, is `Regex failure: parse depth limit
+/// over`, where jq 1.7.1 accepts up to 2,047 and the `regex` crate stops at 250 nested AST nodes by
+/// default, #7528). jq counts groups only, so a concatenation, an alternation or a repeat between
+/// two of them does not count, where the crate's own limit counts every node: the nesting is counted
+/// by `exceeds_onig_parse_depth` (in `eval.rs`), and [`ONIG_NEST_LIMIT`] is only the crate's.
+#[cfg(feature = "regex")]
+pub(crate) const ONIG_PARSE_DEPTH_LIMIT: usize = 511;
+
+/// The nesting the `regex` crate and `regex-syntax` are allowed to read in a jq pattern: as many AST
+/// nodes as [`ONIG_PARSE_DEPTH_LIMIT`] nested groups can come to (a group, its alternation, one of the
+/// alternation's concatenations and a repeat per level) and a little over. Every parser and builder
+/// that reads a jq pattern takes it, so that the passes that rewrite it for Oniguruma's semantics and
+/// the engine that compiles it agree on what is too deep.
+#[cfg(feature = "regex")]
+pub(crate) const ONIG_NEST_LIMIT: u32 = 4 * ONIG_PARSE_DEPTH_LIMIT as u32 + 64;
+
+/// The `regex-syntax` AST parser for a jq pattern, with [`ONIG_NEST_LIMIT`].
+#[cfg(feature = "regex")]
+pub(crate) fn onig_ast_parser() -> regex_syntax::ast::parse::Parser {
+    regex_syntax::ast::parse::ParserBuilder::new()
+        .nest_limit(ONIG_NEST_LIMIT)
+        .build()
+}
+
+/// The `regex-syntax` parser (AST and HIR) for a jq pattern, with [`ONIG_NEST_LIMIT`].
+#[cfg(feature = "regex")]
+pub(crate) fn onig_hir_parser() -> regex_syntax::Parser {
+    regex_syntax::ParserBuilder::new()
+        .nest_limit(ONIG_NEST_LIMIT)
+        .build()
+}
 // #5223: the register-carrying path-mode interpreter, reachable only from
 // `succinctly dev jq-path-mode` and its own tests.
 #[doc(hidden)]
@@ -145,6 +180,7 @@ mod yq_datetime;
 mod yq_xml;
 
 pub use error::{BinOp, Control, ErrorKind, EvalError, EvalErrorPayload};
+pub(crate) use eval::json_truthiness;
 pub(crate) use eval::last_as_reduce;
 pub(crate) use eval::nonfinite_yaml_spelling;
 #[cfg(feature = "std")]
@@ -186,10 +222,10 @@ pub use eval::snapshot_environment;
 // stream" to seed under a `no_std` embedding with no CLI driver anyway).
 #[cfg(feature = "std")]
 pub use eval::{
-    count_reads_past_end, current_input_location, hold_reads_past_end, pop_input,
-    pop_remaining_input, seed_remaining_inputs, seed_remaining_inputs_from,
+    clear_input_reads, count_reads_past_end, current_input_location, hold_reads_past_end,
+    input_reads, pop_input, pop_remaining_input, seed_remaining_inputs, seed_remaining_inputs_from,
     seed_remaining_inputs_with_error, seed_remaining_inputs_with_errors, set_input_read_hook,
-    InputPop, InputProducer, ProducedInput, UNKNOWN_INPUT_LINE,
+    InputPop, InputProducer, InputReads, ProducedInput, UNKNOWN_INPUT_LINE,
 };
 // `input_queue_is_active` exists under both gates (a `const fn` returning
 // `false` without `std`), so `eval_generic` can consult it unconditionally.
@@ -217,8 +253,8 @@ pub use lazy::JqValue;
 #[doc(hidden)]
 pub use parse_message::{
     is_jq_depth_fault, jq_depth_fault_offset, jq_input_depth_fault, jq_stream_fault,
-    jq_stream_fault_chunk, jq_stream_fault_end, jq_stream_prefix_fault, InputSource,
-    JQ_MAX_PARSING_DEPTH,
+    jq_stream_fault_chunk, jq_stream_fault_end, jq_stream_fault_offset, jq_stream_prefix_fault,
+    InputSource, JqStreamFaults, JQ_MAX_PARSING_DEPTH,
 };
 pub use parser::{
     collect_break_sites, collect_call_sites, collect_def_sites, collect_var_sites, parse,

@@ -99,7 +99,13 @@ const ROWS: &[(&str, &str, &str, &str)] = &[
         "strftime(\"%S\") == (gmtime | strftime(\"%S\"))",
         "true\n",
     ),
-    ("UTC", "nan", "strftime(\"%S\")", "\"00\"\n"),
+    // jq 1.7.1 read the NaN seconds slot as 0 (`"00"`); jq 1.8.2 refuses it (#7532).
+    (
+        "UTC",
+        "nan",
+        "try strftime(\"%S\") catch .",
+        "\"strftime/1 requires parsed datetime inputs\"\n",
+    ),
     (
         "UTC",
         "-1e-17",

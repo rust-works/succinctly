@@ -621,7 +621,7 @@ fn tune_shadow(pattern: &str, shadow: &OnigurumaShadow) -> Vec<Tuned> {
     if shadow.text.len() != pattern.len() {
         return Vec::new();
     }
-    let Ok(tree) = ast::parse::Parser::new().parse(&shadow.text) else {
+    let Ok(tree) = super::onig_ast_parser().parse(&shadow.text) else {
         return Vec::new();
     };
     let is_behind = |at: usize| {

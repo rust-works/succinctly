@@ -83,11 +83,11 @@ pub(crate) fn rewrite(pattern: &str) -> Option<String> {
     // A pattern with Oniguruma syntax only `fancy-regex` reads is parsed through a copy that
     // writes that syntax plainly at the same offsets (see `onig_loop`).
     let shadow;
-    let (ast, opaque) = match ast::parse::Parser::new().parse(pattern) {
+    let (ast, opaque) = match super::onig_ast_parser().parse(pattern) {
         Ok(ast) => (ast, &[][..]),
         Err(_) => {
             shadow = super::eval::oniguruma_shadow(pattern)?;
-            let ast = ast::parse::Parser::new().parse(&shadow.text).ok()?;
+            let ast = super::onig_ast_parser().parse(&shadow.text).ok()?;
             (ast, shadow.opaque.as_slice())
         }
     };

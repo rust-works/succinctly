@@ -53,12 +53,28 @@ fn interpreter(script: &str) -> Result<Vec<String>> {
     )
 }
 
-/// `{subject}` and `{jq}` in an argument or variable, replaced by the two binaries.
+/// `{subject}` and `{jq}` in an argument or variable, replaced by the two binaries, and
+/// `{jq_secondary}` by the secondary reference (jq 1.8.2), for a sweep whose rows follow a jq 1.8
+/// bug fix (#7519). A sweep that names it when that jq is not built is an error, not a pass.
 // The placeholders are the manifest's own syntax, not format arguments.
 #[allow(clippy::literal_string_with_formatting_args)]
-fn expand(text: &str, reference: &Tool, subject: &Tool) -> String {
-    text.replace("{subject}", &subject.program)
-        .replace("{jq}", &reference.program)
+fn expand(
+    text: &str,
+    reference: &Tool,
+    secondary: Option<&Tool>,
+    subject: &Tool,
+) -> Result<String> {
+    const SECONDARY: &str = "{jq_secondary}";
+    let text = text
+        .replace("{subject}", &subject.program)
+        .replace("{jq}", &reference.program);
+    if !text.contains(SECONDARY) {
+        return Ok(text);
+    }
+    match secondary {
+        Some(jq) => Ok(text.replace(SECONDARY, &jq.program)),
+        None => bail!("`{text}` names {SECONDARY}, and the secondary jq is not available"),
+    }
 }
 
 fn last_lines(out: &[u8], err: &[u8]) -> Vec<String> {
@@ -76,13 +92,21 @@ fn last_lines(out: &[u8], err: &[u8]) -> Vec<String> {
 
 /// Run one sweep. Exit 0 agrees and exit 1 diverges; any other exit, a signal or the deadline
 /// is an error carrying the output's tail, never a clean run.
-pub fn run_one(root: &Path, cfg: &Sweep, reference: &Tool, subject: &Tool) -> Result<Run> {
+pub fn run_one(
+    root: &Path,
+    cfg: &Sweep,
+    reference: &Tool,
+    secondary: Option<&Tool>,
+    subject: &Tool,
+) -> Result<Run> {
     if !reference.prefix.is_empty() || subject.prefix != ["jq"] {
         bail!("a sweep runs `<jq> ...` against `<succinctly> jq ...`");
     }
     let mut argv = interpreter(&cfg.script)?;
     argv.push(root.join(&cfg.script).to_string_lossy().into());
-    argv.extend(cfg.args.iter().map(|a| expand(a, reference, subject)));
+    for a in &cfg.args {
+        argv.push(expand(a, reference, secondary, subject)?);
+    }
     let tool = Tool {
         name: cfg.id.clone(),
         program: argv.remove(0),
@@ -93,11 +117,9 @@ pub fn run_one(root: &Path, cfg: &Sweep, reference: &Tool, subject: &Tool) -> Re
         ("JQ_ORACLE".to_string(), reference.program.clone()),
         ("JQ".to_string(), reference.program.clone()),
     ];
-    env.extend(
-        cfg.env
-            .iter()
-            .map(|(k, v)| (k.clone(), expand(v, reference, subject))),
-    );
+    for (k, v) in &cfg.env {
+        env.push((k.clone(), expand(v, reference, secondary, subject)?));
+    }
     let start = Instant::now();
     let e = exec_with(
         &tool,
@@ -141,6 +163,7 @@ pub fn run(
     root: &Path,
     sweeps: &[Sweep],
     reference: &Tool,
+    secondary: Option<&Tool>,
     subject: &Tool,
     only: Option<&BTreeSet<String>>,
 ) -> Result<Vec<Run>> {
@@ -148,7 +171,7 @@ pub fn run(
         .iter()
         // `map_or(true, ..)`: clippy's `msrv` (clippy.toml) predates `Option::is_none_or`.
         .filter(|s| only.map_or(true, |ids| ids.contains(&s.id)))
-        .map(|s| run_one(root, s, reference, subject))
+        .map(|s| run_one(root, s, reference, secondary, subject))
         .collect()
 }
 
@@ -191,9 +214,27 @@ mod tests {
     fn placeholders_name_the_two_binaries() {
         let (r, s) = tools();
         assert_eq!(
-            expand("--bin={subject} --jq {jq}", &r, &s),
+            expand("--bin={subject} --jq {jq}", &r, None, &s).unwrap(),
             "--bin=/opt/succinctly --jq /opt/jq"
         );
+    }
+
+    /// #7519: `{jq_secondary}` is the secondary reference, and naming it without one fails.
+    #[test]
+    fn the_secondary_placeholder_names_jq_1_8_or_fails() {
+        let (r, s) = tools();
+        let secondary = Tool {
+            name: "jq-1.8.2".into(),
+            program: "/opt/jq-1.8.2".into(),
+            prefix: vec![],
+        };
+        assert_eq!(
+            expand("--jq-latest {jq_secondary}", &r, Some(&secondary), &s).unwrap(),
+            "--jq-latest /opt/jq-1.8.2"
+        );
+        assert_eq!(expand("{jq}", &r, None, &s).unwrap(), "/opt/jq");
+        let err = expand("--jq-latest {jq_secondary}", &r, None, &s).unwrap_err();
+        assert!(err.to_string().contains("not available"), "{err}");
     }
 
     #[test]
@@ -227,9 +268,9 @@ mod tests {
         let mut cfg = sweep("s", "s.sh", &["--bin", "{subject}"]);
         cfg.env.insert("X".into(), "{jq}".into());
         cfg.env.insert("CODE".into(), "0".into());
-        let ok = run_one(&d, &cfg, &r, &s).unwrap();
+        let ok = run_one(&d, &cfg, &r, None, &s).unwrap();
         cfg.env.insert("CODE".into(), "1".into());
-        let bad = run_one(&d, &cfg, &r, &s).unwrap();
+        let bad = run_one(&d, &cfg, &r, None, &s).unwrap();
         let _ = std::fs::remove_dir_all(&d);
         assert!(!ok.diverges && bad.diverges);
         assert_eq!(bad.ledger_id(), "sweep:s");
@@ -251,15 +292,15 @@ mod tests {
         )
         .unwrap();
         let (r, s) = tools();
-        let crash = run_one(&d, &sweep("c", "crash.sh", &[]), &r, &s)
+        let crash = run_one(&d, &sweep("c", "crash.sh", &[]), &r, None, &s)
             .unwrap_err()
             .to_string();
-        let raised = run_one(&d, &sweep("r", "raise.sh", &[]), &r, &s)
+        let raised = run_one(&d, &sweep("r", "raise.sh", &[]), &r, None, &s)
             .unwrap_err()
             .to_string();
         let mut hang = sweep("h", "hang.sh", &[]);
         hang.timeout_s = 1;
-        let hang = run_one(&d, &hang, &r, &s).unwrap_err().to_string();
+        let hang = run_one(&d, &hang, &r, None, &s).unwrap_err().to_string();
         let _ = std::fs::remove_dir_all(&d);
         assert!(
             crash.contains("exited Some(2)") && crash.contains("boom"),
@@ -280,8 +321,8 @@ mod tests {
         let (r, s) = tools();
         let all = [sweep("a", "ok.sh", &[]), sweep("b", "ok.sh", &[])];
         let only: BTreeSet<String> = ["b".to_string()].into();
-        let ran = run(&d, &all, &r, &s, Some(&only)).unwrap();
-        let every = run(&d, &all, &r, &s, None).unwrap();
+        let ran = run(&d, &all, &r, None, &s, Some(&only)).unwrap();
+        let every = run(&d, &all, &r, None, &s, None).unwrap();
         let _ = std::fs::remove_dir_all(&d);
         assert_eq!(ran.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(), ["b"]);
         assert_eq!(every.len(), 2);
@@ -291,6 +332,6 @@ mod tests {
     fn a_subject_that_is_not_succinctly_jq_is_refused() {
         let (r, mut s) = tools();
         s.prefix = vec![];
-        assert!(run_one(Path::new("."), &sweep("a", "a.sh", &[]), &r, &s).is_err());
+        assert!(run_one(Path::new("."), &sweep("a", "a.sh", &[]), &r, None, &s).is_err());
     }
 }

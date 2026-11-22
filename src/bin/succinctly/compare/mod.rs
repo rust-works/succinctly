@@ -532,6 +532,12 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
     } else if want(Dimension::Features)
         || want(Dimension::Performance)
         || want(Dimension::Operational)
+        // #7519: a sweep may judge rows that follow a jq 1.8 fix against it (`{jq_secondary}`).
+        || (want(Dimension::Sweeps)
+            && manifest
+                .sweeps
+                .iter()
+                .any(|s| s.args.iter().any(|a| a.contains("{jq_secondary}"))))
         || (want(Dimension::Differential)
             && manifest
                 .suites
@@ -738,6 +744,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
                 &root,
                 &manifest.sweeps,
                 &reference,
+                secondary.as_ref().ok(),
                 &subject,
                 only("sweep").as_ref(),
             )?;

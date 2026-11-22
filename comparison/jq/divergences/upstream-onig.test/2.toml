@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+reason = "jq 1.7.1's own test `[match(\"( )*\"; \"g\")]` on `\"abc\"` expects each empty match's capture to be `{\"offset\":0,\"string\":\"\",...}` (the match's offset). jq 1.8 reports an optional group that takes no part in an empty match as unmatched (jqlang/jq#3238, a bug fix), `{\"offset\":-1,\"string\":null,\"length\":0,\"name\":null}`, and its own onig.test expects that; succinctly follows 1.8 (#7520, docs/compliance/jq/limitations.md)."
+issue = "7520"
