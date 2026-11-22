@@ -8165,6 +8165,10 @@ The three surrogate blocks hold no scalar value, so they match nothing.
 The table (`src/jq/regex_blocks.rs`, 328 blocks) is read from the pinned `/usr/bin/jq` by `scripts/jq-regex-block-table.py`, which also checks it (`--check`), so it is the Unicode version that Oniguruma links (15.0, which includes Kawi and Nag Mundari), not that of `Blocks.txt` or of the `regex` crate.
 A jq built with an older Oniguruma lacks the newest blocks, and answers `invalid character property name` for them.
 Inside a class a negated block is spelled as its complement, since under `i` Oniguruma folds the complement and the crate folds the block before it negates.
+So is any other negated property and a negated POSIX bracket inside a class where `i` may be on (the flag or an inline `(?i)`): `"A" | test("[\\P{Lu}]"; "i")` and `"a" | test("[[:^upper:]]"; "i")` are `true` in jq 1.7.1 and 1.8.2, and were `false` here, and `"a" | test("[^\\P{Lu}]"; "i")` is `false` in jq and was `true` (found by the wider regex fuzz of [#7689](https://github.com/rust-works/succinctly/issues/7689)).
+The complement is read off the crate's own table of the property, without case folding, and written as ranges, which the crate then folds as Oniguruma does.
+Outside a class a property is not folded at all, as before (#6068).
+Pinned by `tests/jq_cli/i7689_fold.rs`.
 Over every block in three spellings, the nine forms, with and without `i` (17,712 cases), the answers match jq.
 `scripts/jq-regex-property-name-sweep.py` regenerates the sweep from the `regex-syntax` version `Cargo.lock` pins, so a release that adds a name Oniguruma lacks shows up there.
 Pinned by `tests/jq_cli/i6217.rs` and `tests/jq_cli/i6228.rs`.
