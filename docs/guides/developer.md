@@ -210,6 +210,17 @@ some on purpose: `i6920`, `i7023`, `i7024`, `i7024_files`, `i7024_pipe`, `i7024_
 `i7322` and `i7341` among them still run the 1 MiB window in a debug build, so `cargo test` runs
 each route's shipped constants end to end.
 
+The windowed routes' differential fuzz, `scripts/jq-windowed-file-fuzz.py`, needs an oracle that reads the
+input whole however the gates change, so `SUCCINCTLY_DEBUG_JQ_WHOLE_FILE=1` (any non-empty value but `0`) has
+a run decline every windowed gate (a regular file, a `/dev/fd/N` descriptor, standard input as a file or a pipe,
+a named pipe) and `SUCCINCTLY_DEBUG_JQ_ROUTE_LOG=<file>` has it append the name of each windowed route it takes
+(`plain`, `seq`, `raw`, `inputs`), one per line (#7688).
+Unlike the window knob both are in a release build, which is what the fuzz runs against, and neither is a
+feature: the script fails when its oracle takes a windowed route or when no case took one on the side under
+test, and `tests/jq_cli/i7688.rs` pins both over every source the script reads.
+A new windowed route needs its gate to ask `window::whole_file_forced()` and its start to call
+`window::note_route`, or the fuzz reports that no case took it.
+
 ### Differential sweeps against jq
 
 A change to the jq evaluator, the path register above all, is judged against `/usr/bin/jq` (1.7.1) over a

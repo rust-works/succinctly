@@ -2,38 +2,46 @@
 """Differential fuzz of the windowed plain route of `succinctly jq` against its whole-file route (#6920, #7048, #7024).
 
 A plain filter (no `-n`, nothing that reads `input`) over regular files of 4 MiB or more between them is read a
-window at a time (`WindowedFiles`, `src/bin/succinctly/jq_runner/window.rs`); the same files given as `/dev/fd/N`
-(which the route declines) are read whole. Each case here builds a random stream of 4.3 to 7.5 MiB, cuts it into
+window at a time (`WindowedFiles`, `src/bin/succinctly/jq_runner/window.rs`); the same run under the oracle switch
+(below) reads them whole. Each case here builds a random stream of 4.3 to 7.5 MiB, cuts it into
 `--files` files at random bytes (anywhere in a token as often as not, so a document is open where a file ends),
 runs one random program over the files both ways, and compares stdout, stderr (the files' names replaced by
 `<file N>`) and the exit status. The two routes are one implementation of jq's answer, so any difference is a
-bug in the window. A regular file on standard input is windowed too since #7059, so it is no longer the whole-file
-side. The programs avoid `input_line_number` and `input`, which leave the route: the line a document was read on
+bug in the window. The programs avoid `input_line_number` and `input`, which leave the route: the line a document was read on
 shows in the `(at <file N>:LINE)` of a runtime error. `--pipe` feeds each stream on a pipe on standard input
-instead, which is windowed too (#7024) and words its first fault as it reads, against the same pipe
-named `/dev/stdin`, which is read whole. `--raw` runs `-R` programs over the same streams read as lines
+instead, which is windowed too (#7024) and words its first fault as it reads, against the same pipe read whole. `--raw` runs `-R` programs over the same streams read as lines
 (#7024): with `--pipe` on a pipe, and without it as a regular file on standard input (`jq -R . < file`),
-at offset 0 or at a random one, each against the bytes from there on a pipe named `/dev/stdin`; with
-`--files K` the stream is cut into K files, as for the plain filter, against the same files as descriptors
+at offset 0 or at a random one, each against the same file from the same offset read whole; with
+`--files K` the stream is cut into K files, as for the plain filter, against the same files read whole
 (for K past 32 each file is opened as the run reaches it). A stream of
 lines has no fault, so these cases test where windows cut lines: invalid UTF-8, NULs, a lone CR, a BOM,
 very long lines and no final line break. `--inputs` runs programs that read `input`/`inputs` over `--files`
 files (2 to 32), which their own reader takes a window at a time, one file after another (#7024), against the
-same files as `/dev/fd/N`: those print `input_line_number`, `input_filename` and `$__loc__`, and read past
+same files read whole: those print `input_line_number`, `input_filename` and `$__loc__`, and read past
 faults. `--seq --files K` cuts the `--seq` stream into K files (2 to 512), most cuts at a record's start so the
 files are plain records and the route reads them a window at a time (#7218), the rest anywhere, which leaves the
-run to the whole-file route, against the same files as descriptors. Past 32 files each is opened and judged as
+run to the whole-file route, against the same files read whole. Past 32 files each is opened and judged as
 the run reaches it, and the files from the first that is not plain records are handed to the whole-file route
 (#7221), so most of those cases test that hand-over at a file's start. `--pipe --seq` feeds a `--seq` stream on the pipe (#7164): mostly records of RFC 7464's own framing
 (`RS value LF`), which the route reads a window at a time, with a turn or two at a random record (often one by
 a window's end, the 4 MiB probe's or the stream's): a record jq's reader warns about, an RS with nothing in it,
 text before an RS, a value with two documents, a bare `n` after a token that left a `u` in jq's token buffer,
 a stream that ends without its line break. From the first turn on the route reads the stream whole, so these
-cases test that hand-over, against the same bytes on a pipe named `-` (`/dev/stdin` reads a `--seq` stream
-that starts with a BOM as no records). `--seq` alone runs the same streams from one regular file (#7262), named
-(against the file as a descriptor) or on standard input from an offset (against the bytes from there on a pipe
-named `-`): a file the prepass cannot vouch for is read as the pipe is, up to its first record that is not plain. (The seeds of #7048's runs do not reproduce: the generator
+cases test that hand-over, against the same bytes on a pipe read whole. `--seq` alone runs the same streams from one regular file (#7262), named
+(against the file read whole) or on standard input from an offset (against the same file from the same offset
+read whole): a file the prepass cannot vouch for is read as the pipe is, up to its first record that is not plain. (The seeds of #7048's runs do not reproduce: the generator
 now cuts the stream into files and picks among more programs.)
+
+The oracle (#7688) is the same command with `SUCCINCTLY_DEBUG_JQ_WHOLE_FILE=1` in its environment, which has the
+binary decline every windowed route's gate (a regular file, a descriptor, standard input as a file or a pipe, a
+named pipe), so it reads whole whatever the input is and however the gates change. It used to be a spelling
+the gates declined (`/dev/fd/N`, a pipe named `/dev/stdin`), and two of them (`--files 1`, `--pipe`) became
+windowed routes themselves, so those modes compared a route with itself and a zero-difference result was not
+evidence. Every run also names `SUCCINCTLY_DEBUG_JQ_ROUTE_LOG`, where the binary notes the windowed routes it
+takes, which is the script's self-check: a case on which the oracle took one is a difference, and a run on which
+no case took one on the side under test fails (its summary line says how many did). A binary built before the
+two variables existed fails that way. Both variables are in a release build (`window::WHOLE_FILE_ENV`,
+`window::ROUTE_LOG_ENV`); `tests/jq_cli/i7688.rs` pins them over every source these modes read.
 
 The streams mix the shapes that decide where a window ends: documents of every kind, pretty-printed ones that
 span lines, two on a line with no separator, blank lines, CRLF and ` \\n` separators, a document bigger than a
@@ -72,6 +80,8 @@ import time
 
 MIN_BYTES = 4 * 1024 * 1024
 TIMED_OUT = b"<timed out after 300s>"
+WHOLE_ENV = "SUCCINCTLY_DEBUG_JQ_WHOLE_FILE"
+ROUTE_ENV = "SUCCINCTLY_DEBUG_JQ_ROUTE_LOG"
 
 # The programs: identity (the raw-bytes fast path), a field read, a scalar pass-through, a select, a walk,
 # an exit-status filter and a field length. Each is "plain": none reads `input`.
@@ -94,7 +104,7 @@ FILE_PROGRAMS = [
 ]
 
 # `-R` programs (#7024): each line is a string, so a line's bytes, its number and the count of lines are the
-# answer. `input_filename` is left out: the whole side names its pipe `/dev/stdin`, where a stdin has none.
+# answer. `input_filename` is left out: a pipe has no file name.
 RAW_PROGRAMS = [
     ["-R", "."],
     ["-R", "length"],
@@ -322,15 +332,31 @@ def cap(megabytes):
     return limit
 
 
-def run(binary, args, megabytes, stdin=None, pass_fds=(), feed=None):
-    """stdout, stderr and the exit status of one run, with `feed` written to it on a pipe if given; a run
-    that hangs is reported as one that did."""
+def run(binary, args, megabytes, stdin=None, feed=None, whole=False):
+    """stdout, stderr, the exit status and the windowed routes taken (#7688) of one run, with `feed` written to
+    it on a pipe if given; a run that hangs is reported as one that did. `whole` runs the oracle: the binary's
+    `SUCCINCTLY_DEBUG_JQ_WHOLE_FILE` has it read every input whole, whatever the input is, so the oracle
+    cannot become a windowed route by a spelling the gates come to take. Every run names a log in
+    `SUCCINCTLY_DEBUG_JQ_ROUTE_LOG`, where the binary notes each windowed route it takes."""
+    env = dict(os.environ)
+    env.pop(WHOLE_ENV, None)
+    if whole:
+        env[WHOLE_ENV] = "1"
+    handle, log = tempfile.mkstemp(prefix="windowed-fuzz-route-")
+    os.close(handle)
+    env[ROUTE_ENV] = log
     try:
         done = subprocess.run([binary, "jq"] + args, stdin=stdin, input=feed, capture_output=True,
-                              timeout=300, preexec_fn=cap(megabytes), pass_fds=pass_fds)
+                              timeout=300, preexec_fn=cap(megabytes), env=env)
+        result = (done.stdout, done.stderr, done.returncode)
     except subprocess.TimeoutExpired:
-        return b"", TIMED_OUT, -9
-    return done.stdout, done.stderr, done.returncode
+        result = (b"", TIMED_OUT, -9)
+    try:
+        with open(log) as routes:
+            taken = routes.read().split()
+    finally:
+        os.unlink(log)
+    return result + (taken,)
 
 
 def cut_into_files(rng, data, count, line_starts=0.25, record_starts=0.0):
@@ -354,16 +380,15 @@ def cut_into_files(rng, data, count, line_starts=0.25, record_starts=0.0):
     return [data[a:b] for a, b in zip(edges, edges[1:])]
 
 
-def named(output, names, descriptors):
-    """`output` with each file's path, or its `/dev/fd/N`, replaced by `<file N>`."""
+def named(output, names):
+    """`output` with each file's path replaced by `<file N>`."""
     for n, name in enumerate(names):
         output = output.replace(name.encode(), b"<file %d>" % n)
-    by_fd = {fd: n for n, fd in enumerate(descriptors)}
-    return re.sub(rb"/dev/fd/(\d+)", lambda m: b"<file %d>" % by_fd.get(int(m.group(1)), -1), output)
+    return output
 
 
 def run_files(args, rng, data, case, program, work, seed):
-    """One case over several files: windowed (as paths) and whole (as descriptors), compared."""
+    """One case over several files: windowed (as paths) and whole (the same paths under the oracle switch), compared."""
     # #7221: a long list is cut at records' starts more often, so that some cases are plain records to the
     # end and the others still stop at a file of their own.
     pieces = cut_into_files(rng, data, args.files, 0.75 if args.inputs else 0.25,
@@ -374,25 +399,16 @@ def run_files(args, rng, data, case, program, work, seed):
         with open(name, "wb") as handle:
             handle.write(piece)
         names.append(name)
-    handles = [open(name, "rb") for name in names]
-    try:
-        descriptors = [handle.fileno() for handle in handles]
-        for handle in handles:
-            os.set_inheritable(handle.fileno(), True)
-        windowed = run(args.bin, program + names, args.cap_mb)
-        whole = run(args.bin, program + ["/dev/fd/%d" % fd for fd in descriptors], args.cap_mb,
-                    pass_fds=descriptors)
-    finally:
-        for handle in handles:
-            handle.close()
-    windowed = (named(windowed[0], names, descriptors), named(windowed[1], names, descriptors), windowed[2])
-    whole = (named(whole[0], names, descriptors), named(whole[1], names, descriptors), whole[2])
+    windowed = run(args.bin, program + names, args.cap_mb)
+    whole = run(args.bin, program + names, args.cap_mb, whole=True)
+    windowed = (named(windowed[0], names), named(windowed[1], names), windowed[2], windowed[3])
+    whole = (named(whole[0], names), named(whole[1], names), whole[2], whole[3])
     return windowed, whole, names, [len(piece) for piece in pieces]
 
 
 def run_stdin_file(args, rng, data, program, work, seed):
     """One `-R` case on a regular file on standard input (#7024): windowed (the file, from an offset) and
-    whole (the bytes from there on a pipe named `/dev/stdin`, or `-` under `--seq`, #7262), compared."""
+    whole (the same file from the same offset under the oracle switch, #7688), compared."""
     # Any offset that leaves the minimum to read, so the windowed side stays windowed; a `--seq` stream from
     # an offset at a record's start (#7262) as often as not, so that it can still be plain records.
     offset = 0 if rng.random() < 0.6 else rng.randrange(len(data) - MIN_BYTES + 1)
@@ -402,20 +418,19 @@ def run_stdin_file(args, rng, data, program, work, seed):
     name = os.path.join(work, "windowed-fuzz-%d-stdin.json" % seed)
     with open(name, "wb") as handle:
         handle.write(data)
-    with open(name, "rb") as handle:
-        handle.seek(offset)
-        windowed = run(args.bin, program, args.cap_mb, stdin=handle)
-    whole = run(args.bin, program + ["-" if args.seq else "/dev/stdin"], args.cap_mb, feed=data[offset:])
-    whole = tuple(part.replace(b"/dev/stdin", b"<stdin>") if isinstance(part, bytes) else part for part in whole)
-    return windowed, whole, ["<stdin from %d>" % offset], [len(data) - offset]
+    results = []
+    for whole in (False, True):
+        with open(name, "rb") as handle:
+            handle.seek(offset)
+            results.append(run(args.bin, program, args.cap_mb, stdin=handle, whole=whole))
+    return results[0], results[1], ["<stdin from %d>" % offset], [len(data) - offset]
 
 
 def run_pipe(args, data, program):
-    """One case on a pipe (#7024): windowed (the pipe on standard input) and whole (the same pipe named
-    `/dev/stdin`, or `-` under `--seq`, which the windowed routes decline), compared."""
+    """One case on a pipe (#7024): windowed (the pipe on standard input) and whole (the same pipe under the
+    oracle switch, #7688), compared."""
     windowed = run(args.bin, program, args.cap_mb, feed=data)
-    whole = run(args.bin, program + ["-" if args.seq else "/dev/stdin"], args.cap_mb, feed=data)
-    whole = tuple(part.replace(b"/dev/stdin", b"<stdin>") if isinstance(part, bytes) else part for part in whole)
+    whole = run(args.bin, program, args.cap_mb, feed=data, whole=True)
     return windowed, whole, ["<stdin>"], [len(data)]
 
 
@@ -457,12 +472,11 @@ def main():
     work = os.path.abspath(args.work or tempfile.mkdtemp(prefix="windowed-fuzz-"))
     os.makedirs(work, exist_ok=True)
     rng = random.Random(args.seed)
-    differences, started = 0, time.time()
+    differences, started, took_window = 0, time.time(), 0
     for case in range(args.n):
         data, notes = build_seq(rng) if args.seq else build(rng)
         if len(data) < MIN_BYTES:
             sys.exit("generator bug: case %d is %d bytes, under the windowed route's minimum" % (case, len(data)))
-        # A pipe has no file name, and `/dev/stdin` has one: `input_filename` would tell them apart.
         if args.seq:
             program = rng.choice(SEQ_PROGRAMS)
         elif args.raw:
@@ -487,7 +501,11 @@ def main():
                   % (case, program, notes, error, kept))
             continue
         hung = TIMED_OUT in (windowed[1], whole[1])
-        if hung or windowed != whole:
+        # #7688: the oracle reads every input whole, and a case on which it still reports a windowed route
+        # compares a route with itself.
+        oracle_windowed = bool(whole[3])
+        took_window += bool(windowed[3])
+        if hung or oracle_windowed or windowed[:3] != whole[:3]:
             differences += 1
             kept = [os.path.join(work, "windowed-fuzz-%d-%d-%d.json" % (args.seed, case, n))
                     for n in range(len(names))]
@@ -504,10 +522,19 @@ def main():
             print("DIFFERENCE case=%d program=%s mutations=%s sources=%s sizes=%s exit=%d/%d stdout_differs_at=%s kept=%s"
                   % (case, program, notes, names, sizes, windowed[2], whole[2],
                      first if windowed[0] != whole[0] else "-", kept))
+            if oracle_windowed:
+                print("  the oracle took a windowed route (%s): not a whole-file oracle" % " ".join(whole[3]))
             if windowed[1] != whole[1]:
                 print("  windowed:", windowed[1][:300])
                 print("  whole   :", whole[1][:300])
-    print("%d cases, %d differences, seed %d, %.0fs" % (args.n, differences, args.seed, time.time() - started))
+    print("%d cases, %d differences, seed %d, %.0fs; the side under test took a windowed route in %d"
+          % (args.n, differences, args.seed, time.time() - started, took_window))
+    if args.n and not took_window:
+        # A run that never reached the route compares whole with whole, which proves nothing; so does a
+        # binary built before the oracle switch existed (its oracle is windowed too).
+        print("SELF-CHECK FAILED: no case took a windowed route on the side under test: the binary lacks "
+              "%s / %s, or the inputs never reach the route (#7688)" % (WHOLE_ENV, ROUTE_ENV))
+        sys.exit(1)
     sys.exit(1 if differences else 0)
 
 
