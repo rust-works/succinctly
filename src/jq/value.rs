@@ -4648,16 +4648,35 @@ impl OwnedValue {
     /// `jv`, so two reads of one key are identical, and the reader's sharing
     /// of one key among sibling records (#7260) would make keys of two
     /// objects identical where jq's parser allocated each.
-    pub(crate) fn promote_identities(&mut self) {
+    ///
+    /// With `keys` false the keys are left as they were read: for a run that
+    /// can never hand a key out as a value, where no key's identity can be
+    /// asked, so that storage would only cost an allocation per key (#7489).
+    pub(crate) fn promote_identities(&mut self, keys: bool) {
+        if keys {
+            self.promote_identities_in::<true>();
+        } else {
+            self.promote_identities_in::<false>();
+        }
+    }
+
+    /// [`promote_identities`](Self::promote_identities) with the choice made
+    /// once per walk, not per object.
+    fn promote_identities_in<const KEYS: bool>(&mut self) {
         match self {
             Self::String(s) => s.promote(),
             Self::NumberLiteral(_, spelling) | Self::SpelledScalar(_, spelling) => {
                 spelling.promote();
             }
-            Self::Array(items) => items.iter_mut().for_each(Self::promote_identities),
+            Self::Array(items) => items
+                .iter_mut()
+                .for_each(Self::promote_identities_in::<KEYS>),
             Self::Object(map) => {
-                map.own_keys();
-                map.values_mut().for_each(Self::promote_identities);
+                if KEYS {
+                    map.own_keys();
+                }
+                map.values_mut()
+                    .for_each(Self::promote_identities_in::<KEYS>);
             }
             Self::Null | Self::Bool(_) | Self::Int(_) | Self::Float(_) => {}
         }
@@ -7715,7 +7734,7 @@ mod tests {
         .expect("a valid document");
         let before = doc.to_json_jq_preserve();
         let e_storage = doc.as_object().expect("an object")["e"].clone();
-        doc.promote_identities();
+        doc.promote_identities(true);
         assert_eq!(doc.to_json_jq_preserve(), before);
 
         let map = doc.as_object().expect("an object");
@@ -7752,7 +7771,7 @@ mod tests {
         assert!(first.ptr_eq(&second), "the reader shares a sibling's key");
 
         let before = doc.to_json_jq_preserve();
-        doc.promote_identities();
+        doc.promote_identities(true);
         assert_eq!(doc.to_json_jq_preserve(), before);
         let records = doc.as_array().expect("an array");
         let keys: Vec<&SharableString> = records
