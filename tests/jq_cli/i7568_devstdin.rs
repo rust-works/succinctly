@@ -2,13 +2,16 @@
 //! descriptor 0 itself, sharing its offset, so a run that stops early leaves a regular file on
 //! standard input where jq's stdio puts it back, as it does for `-`: at the end of the chunk that
 //! completed the last item the program took. It was left at the end of the file. On Linux the path
-//! opens the file again, and neither tool moves descriptor 0. And `--stream` over such a path probed
-//! its first bytes through that shared offset and then read the stream from past them (`Invalid
-//! numeric literal at line 1, column 2`).
+//! opens the file again from its start, and descriptor 0 moves only when a `-` after it is read: the
+//! restore read such a path again by its name only on macOS's terms and gave up on it, leaving the
+//! file at its end. And `--stream` over such a path probed its first bytes through that shared offset
+//! and then read the stream from past them (`Invalid numeric literal at line 1, column 2`).
 //!
 //! The macOS offsets were captured from `/usr/bin/jq` 1.7.1, reading the shared descriptor's offset
 //! back after the run (jq 1.8.2 agrees on every row); standard input holds three lines `{"id":N}`,
-//! and `F` is a file holding `{"a":1}` and a newline.
+//! and `F` is a file holding `{"a":1}` and a newline. No Linux machine was at hand: the Linux offsets
+//! were captured from `/usr/bin/jq` 1.7.1 and 1.8.2 on macOS with the path replaced by the file's own
+//! name, which opens it again from its start as Linux's `/proc/self/fd` links do.
 
 #![cfg(unix)]
 
@@ -17,25 +20,35 @@ use std::process::{Command, Stdio};
 
 const STDIN: &[u8] = b"{\"id\":0}\n{\"id\":1}\n{\"id\":2}\n";
 
-/// (offset standard input starts at, arguments with `D` for the path, offset jq leaves on macOS).
-const ROWS: &[(u64, &[&str], u64)] = &[
-    (0, &["-c", "-n", "input", "D"], 9),
-    (0, &["-c", "-n", "first(inputs)", "D"], 9),
-    (0, &["-c", "-n", "[limit(2; inputs)]", "D"], 18),
-    (0, &["-c", "-n", "[limit(4; inputs)]", "D"], 27),
-    (0, &["-c", "halt", "D"], 9),
-    (0, &["-c", "--stream", "-n", "[limit(3; inputs)]", "D"], 18),
-    (0, &["-c", "-R", "-n", "input", "D"], 9),
-    (0, &["-c", "-R", "halt", "D"], 9),
-    (0, &["-c", "-n", "input", "F", "D"], 0),
-    (0, &["-c", "-n", "[limit(2; inputs)]", "F", "D"], 9),
-    (0, &["-c", "-n", "input", "D", "F"], 9),
-    (0, &["-c", "-n", "input", "D", "D"], 9),
-    (0, &["-c", "-n", "input", "D", "-"], 9),
-    (0, &["-c", ".", "D"], 27),
-    (9, &["-c", "-n", "input", "D"], 18),
-    (9, &["-c", "halt", "D"], 18),
-    (9, &["-c", "-n", "input", "F", "D"], 9),
+/// (offset standard input starts at, arguments with `D` for the path, offset jq leaves on macOS, offset
+/// it leaves where the path opens the file again: the start, unless a `-` after it is read).
+const ROWS: &[(u64, &[&str], u64, u64)] = &[
+    (0, &["-c", "-n", "input", "D"], 9, 0),
+    (0, &["-c", "-n", "first(inputs)", "D"], 9, 0),
+    (0, &["-c", "-n", "[limit(2; inputs)]", "D"], 18, 0),
+    (0, &["-c", "-n", "[limit(4; inputs)]", "D"], 27, 0),
+    (0, &["-c", "halt", "D"], 9, 0),
+    (
+        0,
+        &["-c", "--stream", "-n", "[limit(3; inputs)]", "D"],
+        18,
+        0,
+    ),
+    (0, &["-c", "-R", "-n", "input", "D"], 9, 0),
+    (0, &["-c", "-R", "halt", "D"], 9, 0),
+    (0, &["-c", "-n", "input", "F", "D"], 0, 0),
+    (0, &["-c", "-n", "[limit(2; inputs)]", "F", "D"], 9, 0),
+    (0, &["-c", "-n", "input", "D", "F"], 9, 0),
+    (0, &["-c", "-n", "input", "D", "D"], 9, 0),
+    (0, &["-c", "-n", "input", "D", "-"], 9, 0),
+    (0, &["-c", ".", "D"], 27, 0),
+    (9, &["-c", "-n", "input", "D"], 18, 9),
+    (9, &["-c", "halt", "D"], 18, 9),
+    (9, &["-c", "-n", "input", "F", "D"], 9, 9),
+    (0, &["-c", "-n", "[limit(2; inputs)]", "D", "-"], 18, 0),
+    (0, &["-c", "-n", "[limit(4; inputs)]", "D", "-"], 27, 9),
+    (9, &["-c", "-n", "[limit(4; inputs)]", "D", "-"], 27, 18),
+    (0, &["-c", "-n", "[limit(5; inputs)]", "F", "D", "-"], 27, 9),
 ];
 
 /// Runs `succinctly jq args` with `D` replaced by `path`, over a temporary file holding [`STDIN`] on
@@ -69,12 +82,8 @@ fn run(offset: u64, path: &str, args: &[&str]) -> (u64, String, i32) {
 fn dev_stdin_named_as_an_input_file_leaves_stdin_where_jq_does_7568() {
     let mut failures = Vec::new();
     for path in ["/dev/stdin", "/dev/fd/0"] {
-        for &(start, args, mac) in ROWS {
-            let want = if cfg!(target_os = "macos") {
-                mac
-            } else {
-                start
-            };
+        for &(start, args, mac, anew) in ROWS {
+            let want = if cfg!(target_os = "macos") { mac } else { anew };
             let (at, _, status) = run(start, path, args);
             if (at, status) != (want, 0) {
                 failures.push(format!(
@@ -91,7 +100,7 @@ fn dev_stdin_named_as_an_input_file_leaves_stdin_where_jq_does_7568() {
 #[test]
 fn stream_reads_dev_stdin_from_its_offset_7568() {
     for path in ["/dev/stdin", "/dev/fd/0"] {
-        let (_, out, status) = run(0, path, &["-c", "--stream", "."]);
+        let (_, out, status) = run(0, path, &["-c", "--stream", ".", "D"]);
         assert_eq!(
             (out.as_str(), status),
             (
@@ -100,7 +109,7 @@ fn stream_reads_dev_stdin_from_its_offset_7568() {
             ),
             "{path}"
         );
-        let (_, out, status) = run(9, path, &["-c", "--stream", "-n", "input"]);
+        let (_, out, status) = run(9, path, &["-c", "--stream", "-n", "input", "D"]);
         let want = if cfg!(target_os = "macos") {
             "[[\"id\"],1]\n"
         } else {
