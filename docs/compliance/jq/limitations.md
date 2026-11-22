@@ -6967,6 +6967,8 @@ Measured against the pinned `/usr/bin/jq` on the scalar documents `"\x"`, `"\ud8
 
 Inside a container the filter has to reach the string to be affected: over `["\x"]` or `{"a":"\ud800"}`, `length` and `type` answer (`1`, `"array"`), `.[]` forwards the string, and `tostring` raises.
 A lone *low* surrogate is not part of this: jq accepts it and substitutes U+FFFD, and so does succinctly ([#2008](https://github.com/rust-works/succinctly/issues/2008)).
+The documents `input` and `inputs` read, and the files `--slurpfile` reads, are not part of it either: those routes convert each document whole, so an escape jq refuses, in a string or in a key, is refused as jq refuses it, with jq's message and position ([#7758](https://github.com/rust-works/succinctly/issues/7758)).
+Under `input` and `inputs` it is the error of the read that reaches the document, which `try` and `?` catch, and the reads after it go on with the next document, as in jq; before #7758 a high surrogate there raised `invalid unicode escape sequence`, which nothing could catch, and an undecodable key went through as its source text.
 
 This is recorded on the same footing as the #2103 entry above, and adds no reasoning of its own.
 It is a divergence from a reference that rejects, not a licence: [ADR-0018](../../adrs/adr-0018.md)'s decision order still applies, and the cost argument (always-on validation is two thirds of a cheap navigation query) is context, not a condition it accepts.
