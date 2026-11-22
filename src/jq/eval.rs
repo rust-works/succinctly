@@ -34031,6 +34031,40 @@ enum PropertyName {
 /// The code points of a block, or all the other scalar values when `negate` (#6228), as inclusive
 /// ranges in order. The surrogates are in neither: the crate refuses `\x{D800}`.
 #[cfg(feature = "regex")]
+/// The complement of the class `[body]`, read without case folding, spelled as a class of positive
+/// ranges (`[\x{0}-\x{40}...]`), for a negated property or POSIX bracket inside a class that `i`
+/// may fold (#7689). Oniguruma negates such an item before it folds the class, so `"A" |
+/// test("[\\P{Lu}]"; "i")` is `true` in jq (`a` is in the complement, and `A` folds with it);
+/// the `regex` crate folds the property first and then negates it, which leaves out every cased
+/// letter. `None` when the crate does not read `body`.
+#[cfg(feature = "regex")]
+fn spelled_complement(body: &str) -> Option<String> {
+    use regex_syntax::hir::{Class, HirKind};
+    let hir = crate::jq::onig_hir_parser()
+        .parse(&alloc::format!("(?-i:[{body}])"))
+        .ok()?;
+    let mut class = match hir.into_kind() {
+        HirKind::Class(Class::Unicode(class)) => class,
+        _ => return None,
+    };
+    class.negate();
+    let mut out = String::from("[");
+    if class.ranges().is_empty() {
+        out.push_str("^\\x{0}-\\x{10FFFF}");
+    }
+    for range in class.ranges() {
+        use std::fmt::Write as _;
+        let _ = write!(
+            out,
+            "\\x{{{:X}}}-\\x{{{:X}}}",
+            u32::from(range.start()),
+            u32::from(range.end())
+        );
+    }
+    out.push(']');
+    Some(out)
+}
+
 fn block_set(ranges: &[(u32, u32)], negate: bool) -> Vec<(u32, u32)> {
     if !negate {
         return ranges.to_vec();
@@ -34726,10 +34760,20 @@ fn translate_posix_brackets_scan(
                             }
                             PropertyName::Other => {}
                         }
+                        // #7689: a negated property in a class that `i` may fold is its complement
+                        // spelled out, which the crate folds as Oniguruma does.
+                        let spelled = (depth > 0
+                            && (kind == 'P') != caret
+                            && (ignore_case || pattern_may_set_ignore_case(pattern)))
+                        .then(|| spelled_complement(&alloc::format!("\\p{{{raw}}}")))
+                        .flatten();
                         if depth == 0 {
                             out.push_str("(?-i:");
                             out.extend(&chars[i..end]);
                             out.push(')');
+                            changed = true;
+                        } else if let Some(spelled) = spelled {
+                            out.push_str(&spelled);
                             changed = true;
                         } else {
                             out.extend(&chars[i..end]);
@@ -34990,12 +35034,21 @@ fn translate_posix_brackets_scan(
                     // Identical in both engines: copied through as written.
                     out.extend(&chars[i..name_end]);
                 } else if let Some(body) = unicode_posix_class(&name) {
-                    out.push('[');
-                    if negated {
-                        out.push('^');
+                    // #7689: under `i` Oniguruma folds the complement (see `spelled_complement`).
+                    let spelled = (negated
+                        && (ignore_case || pattern_may_set_ignore_case(pattern)))
+                    .then(|| spelled_complement(body))
+                    .flatten();
+                    if let Some(spelled) = spelled {
+                        out.push_str(&spelled);
+                    } else {
+                        out.push('[');
+                        if negated {
+                            out.push('^');
+                        }
+                        out.push_str(body);
+                        out.push(']');
                     }
-                    out.push_str(body);
-                    out.push(']');
                     changed = true;
                 } else {
                     return Err(EvalError::new("Regex failure: invalid POSIX bracket type"));
@@ -149935,6 +149988,21 @@ mod tests {
                 "{pattern}"
             );
         }
+    }
+
+    /// #7689: a negated property inside a class is written as its complement's ranges, read
+    /// without case folding.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_spelled_complement_reads_the_property_unfolded_7689() {
+        let lu = spelled_complement(r"\p{Lu}").expect("Lu");
+        assert!(lu.starts_with(r"[\x{0}-\x{40}\x{5B}-"), "{lu}");
+        assert!(lu.ends_with(r"-\x{10FFFF}]"), "{lu}");
+        assert_eq!(
+            spelled_complement(r"\x{0}-\x{10FFFF}").as_deref(),
+            Some(r"[^\x{0}-\x{10FFFF}]")
+        );
+        assert_eq!(spelled_complement(r"\p{NoSuchName}"), None);
     }
 
     #[cfg(feature = "regex")]
