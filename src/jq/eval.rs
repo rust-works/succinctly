@@ -36984,6 +36984,9 @@ fn interval_quantifier_at(chars: &[char], at: usize) -> Option<(usize, bool)> {
 /// Such a gap, and a `(?#..)` comment, ends a quantifier in Oniguruma, so a `?` or `+` after one is a
 /// new quantifier on the quantified atom, not its lazy or possessive marker: `a{1,2} ?` under `x` is
 /// written `(?:a{1,2})?` and `(a)? +` is written `(?:(a)?)+` (#7654).
+/// A quantifier after a lazy or a possessive one on an atom the scan can place reaches it already
+/// written out as Oniguruma reads it (`super::onig_quantifier`, #7682), so the refusal of a lazy
+/// quantifier followed by `+` is left for the atoms that rewrite cannot place.
 #[cfg(all(feature = "regex", test))]
 fn refuse_possessive_quantifier(
     pattern: &str,
@@ -37652,6 +37655,10 @@ fn build_regex_uncached<S: EvalSemantics>(
         // #6252: the absence operator is written as the loop it is.
         let absence = rewrite_absence_operator(pattern, extended);
         let pattern = absence.as_deref().unwrap_or(pattern);
+        // #7682: a quantifier that follows a quantifier is written as the tree Oniguruma builds
+        // (`a??++` is `(?>a*?)`), one quantifier per item, before the possessive scan reads it.
+        let stacked = super::onig_quantifier::rewrite(pattern, extended);
+        let pattern = stacked.as_deref().unwrap_or(pattern);
         let scanned =
             refuse_possessive_quantifier_for(pattern, extended, n_flag).unwrap_or_else(|refusal| {
                 deferred_refusal.get_or_insert(refusal);
