@@ -32630,18 +32630,22 @@ impl<'h> RegexCaptures<'h> {
         }
     }
 
-    /// Group `i` as jq reports it (jq-1.7.1's `f_match`): when the overall match is empty, every
-    /// group is an empty match at its position, whatever it captured or whether it took part at
-    /// all. Without lookaround a group inside an empty match can only be empty there anyway, so
-    /// this differs from [`get`](Self::get) only for a group that took no part
-    /// (`"b" | capture("(?<x>a)?")` is `{"x": ""}`) and for one inside a lookahead
-    /// (`"abc" | match("(?=(b))").captures[0].string` is `""`, not `"b"`, #5502).
+    /// Group `i` as jq reports it (jq 1.8's `f_match`): when the overall match is empty, a group
+    /// that took part is an empty match at the overall match's position, whatever it captured,
+    /// and a group that took no part is absent. Without lookaround a group inside an empty match
+    /// can only be empty there anyway, so this differs from [`get`](Self::get) only for a group
+    /// inside a lookahead (`"abc" | match("(?=(b))").captures[0].string` is `""`, not `"b"`,
+    /// #5502).
+    ///
+    /// jq 1.7.1 reported every group of an empty match as an empty match, including one that took
+    /// no part (`"b" | capture("(?<x>a)?")` was `{"x": ""}`); jq 1.8.2 reports it as unmatched,
+    /// offset -1 and `null` (jqlang/jq#3238, #7520).
     fn jq_group(&self, i: usize) -> Option<RegexMatch<'h>> {
         let m0 = self
             .get(0)
             .expect("capture group 0 is always present on a match");
         if m0.is_empty() {
-            Some(m0)
+            self.get(i).map(|_| m0)
         } else {
             self.get(i)
         }
@@ -40515,21 +40519,29 @@ fn global_captures<'h, S: EvalSemantics>(
                 S::TAG == EvalTag::Yq && is_empty_match && repeats_previous_match_end;
             if !go_style_skip {
                 last_match_end = Some(m_end);
-                results.push(caps);
                 // #6326: jq steps one byte after an empty match, so the continuation bytes of a
                 // multibyte character each give an empty match, reported where the next
-                // character starts.
-                if is_empty_match && re.empty_steps_bytes {
-                    if let Some(c) = input[m_start..].chars().next() {
+                // character starts. A group that took no part in the match stays unmatched in
+                // them (jq 1.8.2, #7520).
+                let continuation = if is_empty_match && re.empty_steps_bytes {
+                    input[m_start..].chars().next().map(|c| {
                         let resume = m_start + c.len_utf8();
                         let at = RegexMatch {
                             text: &input[resume..resume],
                             start: resume,
                         };
-                        let step = vec![Some(at); re.captures_len()];
-                        for _ in 1..c.len_utf8() {
-                            results.push(RegexCaptures::Mapped(step.clone()));
-                        }
+                        let step: Vec<Option<RegexMatch<'_>>> = (0..re.captures_len())
+                            .map(|i| caps.get(i).map(|_| at))
+                            .collect();
+                        (step, c.len_utf8())
+                    })
+                } else {
+                    None
+                };
+                results.push(caps);
+                if let Some((step, width)) = continuation {
+                    for _ in 1..width {
+                        results.push(RegexCaptures::Mapped(step.clone()));
                     }
                 }
             }
@@ -40676,12 +40688,10 @@ fn build_match_object<S: EvalSemantics>(
         // "length" whenever a capture's own length is 0 — whether it
         // matched empty or didn't participate at all. A group that never
         // participated (e.g. a `?`/`*`-quantified group that ran zero times)
-        // reports offset -1, string null — *unless* the overall match itself
-        // is zero-length, in which case jq reports every group as an empty
-        // match at the overall match's own position ([`RegexCaptures::jq_group`]).
-        // Verified with 6 independent probes, e.g. `(a)(b)*` on "a" (nonzero
-        // match) -> group 2 offset -1, but `(a)*` on "" (zero-length match) ->
-        // group 1 offset 0, string "".
+        // reports offset -1, string null. When the overall match is zero-length, a group that
+        // took part is an empty match at the overall match's own position
+        // ([`RegexCaptures::jq_group`]): `(a)*` on "" leaves group 1 unmatched (jq 1.8.2; jq
+        // 1.7.1 reported it as an empty match at offset 0, #7520).
         match caps.jq_group(i) {
             Some(m) if !m.is_empty() => {
                 cap_obj.insert(
@@ -41494,8 +41504,9 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// with a `null` value, as in jq (#5363); unnamed groups are not part of the object.
 ///
 /// jq's `capture` is `match`'s `captures` folded into an object, so in jq mode an empty overall
-/// match reports every group as `""` ([`RegexCaptures::jq_group`]): `"b" | capture("(?<x>a)?")`
-/// is `{"x": ""}` (#5502). yq's is Go's: such a group stays `null`.
+/// match reports a group that took part as `""` ([`RegexCaptures::jq_group`]): `"b" |
+/// capture("(?<x>a)?")` is `{"x": null}` in jq 1.8.2 and was `{"x": ""}` in 1.7.1 (#7520).
+/// yq's is Go's: such a group stays `null`.
 #[cfg(feature = "regex")]
 fn capture_object<S: EvalSemantics>(re: &JqRegex, caps: &RegexCaptures) -> OwnedValue {
     let mut entries = FieldMap::new();
@@ -42225,8 +42236,9 @@ fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut captured = Vec::new();
             for i in 1..capture_count {
                 // #5363: a group that took no part in the match is `null` in its place. jq's
-                // `scan` reads `match`'s captures, so an empty match makes every group `""`
-                // (#5502); yq has no `scan`, and its extension keeps Go's `null`.
+                // `scan` reads `match`'s captures, so an empty match makes a group that took part
+                // `""` (#5502) and leaves one that did not `null` (#7520); yq has no `scan`, and
+                // its extension keeps Go's `null`.
                 let group = if S::TAG == EvalTag::Yq {
                     caps.get(i)
                 } else {

@@ -2,6 +2,8 @@
 //! does (`"ba" | match("(b*|a)+")` is `"b"`), where the `regex` crate matched `"ba"`. The capture
 //! rewrite of #6069 leaves the repeated group's own loop as a plain `(?:X)*`, and the loop rewrite of
 //! #6106 reads that. Every row was captured from jq 1.7.1 (`/usr/bin/jq -nc`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -113,7 +115,7 @@ fn test_other_repeat_spellings_and_a_plain_loop_beside_it_6305() -> Result<()> {
         ),
         (
             r#""ba" | [match("(?<y>c)?(?<x>b*|a)+z?";"g") | [.string, (.captures|map([.name,.string]))]]"#,
-            r#"[["b",[["y",null],["x",""]]],["",[["y",""],["x",""]]],["",[["y",""],["x",""]]]]"#,
+            r#"[["b",[["y",null],["x",""]]],["",[["y",null],["x",""]]],["",[["y",null],["x",""]]]]"#,
         ),
         (
             r#""ba" | [match("(b*|a)+";"gl") | .string]"#,
