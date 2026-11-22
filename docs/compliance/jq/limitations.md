@@ -12090,19 +12090,26 @@ What differs from jq 1.7.1:
   Every other specifier ignores them, including `%y %Y %C %g %G`, where a glibc `jq` pads and strips as well.
   `%E` and `%O` modifiers pass through for every specifier, and a flag may stand before or after one (`%-Ed` and `%E_d`); a second modifier or flag is a character that names nothing, and a flag or modifier that ends the format is printed as itself.
   `%+` is `%a %b %e %H:%M:%S %Z %Y` and `%v` is `%e-%b-%Y`, as the pinned libc has them.
+  On macOS `%+` is the locale's own `date_fmt` under any other locale (#7784), as jq prints it there: `LC_ALL=de_DE.UTF-8 TZ=Europe/Berlin`, `1700000000 | strflocaltime("%+")` is `"Di. 14 Nov. 2023 23:13:20 CET"`, and `ja_JP.UTF-8` prints `"2023年 11月14日 火曜日 23時13分20秒 CET"`.
+  `%v` takes the locale's month abbreviation there too (`de_DE`: `" 1-Jan.-1970"`, `cs_CZ`: `" 1-led-1970"`).
+  glibc has neither: a glibc jq prints `%+` and `%v` as written (`"%+"`) under every locale, and cannot read `%+` back; `succinctly jq` prints the C layouts there, as the pinned macOS libc does in C.
   A NUL in the format ends it, as it ends a C string (`"a\u0000b"` formats as `a`), and the buffer limit is measured on the part before it.
   A character after `%` that names nothing is printed bare, with the flag before it dropped: `%Q` is `Q`, `%5Y` is `5Y` and `%^a` is `^a`, where a glibc `jq` honours `^`, `#` and a width and prints `%Q` as written.
 - **`strptime` reads the locale's names and layouts.**
   `%a %A %b %B %h %p` take the names `strftime` prints in the process locale: a day's or month's full name, else its abbreviation, ASCII-case-insensitively and every other character exactly (`märz` matches `März`, `MÄRZ` does not).
   `%c %x %X %r` stand for the locale's layouts (`nl_langinfo_l`'s `D_T_FMT`, `D_FMT`, `T_FMT` and `T_FMT_AMPM`), C's `%a %b %e %H:%M:%S %Y`, `%m/%d/%y`, `%H:%M:%S` and `%I:%M:%S %p` without one, and are read as if the format spelled them out.
+  `%+` is read the same way (#7784): as C's `%a %b %e %H:%M:%S %Z %Y`, and on macOS under another locale as the locale's `date_fmt`, which `nl_langinfo` does not report and macOS's libc reads from line 44 of the locale's `LC_TIME` file (`%a %e %b %Y %X %Z` under `de_DE`), so `0 | strftime("%+") | strptime("%+") | mktime` is `0`, as in jq on macOS.
+  It never matched before.
+  A glibc jq cannot read `%+` (`date "Thu Jan  1 00:00:00 UTC 1970" does not match format "%+"`); `succinctly jq` reads the C layout there.
   A layout the library holds empty is empty: macOS prints and reads nothing for `%r` under `de_DE`, though `nl_langinfo` reports a layout there, so `"11:53:41 " | strptime("%r")` is an error.
   A layout holding a specifier `strptime` does not read here (a `_` or `-` flag, `%k`, `%l`) fails on text that has it.
   macOS fails the same way for `ja_JP`'s `%c`, which holds `%_m`; glibc may read such a layout, so a glibc `jq` can accept text this rejects.
   `%E*` and `%O*` modifiers (`%Ex`, `%Ec`, `%Oy`) are read by `strptime` as the plain specifier, as jq reads them (`"03/05/15" | strptime("%Ex")`).
   Only a specifier can follow a modifier: `%E%`, `%EE` and a bare `%E` are no match.
-  A `%` specifier is no match straight after a modifier or a `+` flag (`%+%`, `%E%`, `%E+%`, `%4E%`) and reads after a width (`%5%`, `%+0%`, `%E4%`, `%E+0%`), as in jq.
+  A `%` specifier is no match straight after a modifier (`%E%`, `%4E%`) and reads after a width (`%5%`, `%+0%`, `%E4%`, `%E+0%`), as in jq; `%+%` and `%E+%` are the `%+` conversion followed by a lone `%`, which is no match too.
   Between the `%` and the specifier `strptime` also reads what the pin's libc does (#5989): one `E` or `O` before or after the rest, a `+` flag at the start or straight after the modifier, and a decimal width.
-  `%++Y`, `%4+Y` and `%0+Y` are no match, a second modifier is no match, and `_` and `-` stay no match, as in jq.
+  A `+` is that flag only when a specifier follows it; followed by the end of the format, a `%` or white space, and anywhere a flag cannot stand, it is the `%+` conversion (#7784), as Apple's `strptime` decides: `%+ x`, `%+%%` and `%E+` read the `date_fmt` layout, and `%++Y`, `%4+Y` and `%0+Y` read it and then a `Y`.
+  A second modifier is no match, and `_` and `-` stay no match, as in jq.
   The width is the most digits a numeric field takes: `"012" | strptime("%3m")` is month 12, `"31" | strptime("%1d")` leaves the `1` behind and is no match.
   A `0` before the digits belongs to the width (`%04Y` is 4, `%40Y` is 40), a width of 0 is the field's own (`%0d` is `%d`), and a year's sign counts in it (`"-2015" | strptime("%5Y")` is year -2015).
   A modifier ends a run of digits, so `%4E5Y` is a width of 5, but a run of 0 changes nothing (`%4E0Y` is 4).
