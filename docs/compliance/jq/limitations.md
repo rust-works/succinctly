@@ -15920,6 +15920,18 @@ Also fixed with it, where both releases agree: `strflocaltime`'s `%s` of a readi
 `succinctly yq` is not changed: real yq has none of these builtins, and `--jq-extensions` reaches the jq code above.
 Pinned by `tests/jq_cli/i7606.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`) on macOS, with jq 1.7.1's (`/usr/bin/jq`) answers in its comments where they differ.
 
+## `mktime` near the C `int` limits: what jq decides is matched, what macOS's `timegm` decides is not (#7722, #7723)
+
+jq's `f_mktime` (`src/builtin.c`, both releases) checks two results of `timegm`: `-1` is `invalid gmtime representation` and `-2` is `mktime not supported on this platform`, the value its `my_mktime` returns where there is no `timegm`.
+So the real instants -1 and -2 are refused: `[1969,11,31,23,59,58,0,0] | mktime` and `"1969-12-31T23:59:58Z" | fromdate` are `mktime not supported on this platform` in jq 1.7.1 and 1.8.2, and `succinctly jq` now raises it too (#7722; it answered `-2`), while `strftime("%s")` prints `-2` in all three.
+Two upstream pull requests to accept both instants ([jqlang/jq#3708](https://github.com/jqlang/jq/pull/3708), [#3710](https://github.com/jqlang/jq/pull/3710)) were closed unmerged.
+`timegm` also stores the normalised fields back into the `struct tm`, so it fails when the normalised year less 1900 leaves C's `int`: `[2147485547,12,1,0,0,0,0,0] | mktime` (month 12 carries the saturated year past it) and `[253402300800,100] | mktime` are `invalid gmtime representation` in jq 1.8.2 and now here (#7723), `strftime("%s")` prints `-1` for them, and `strftime`/`todate` format their fields as given (#7606).
+jq 1.7.1 reads those years differently (#7532) and answers `67767976233532800` and `mktime requires parsed datetime inputs`.
+What macOS's `timegm` (tzcode's `time2sub`) refuses beyond that is the C library's, not jq's, and is not matched: it carries minutes into hours and hours into days in C `int` and fails when a carry overflows, so `[1970,0,1,2147483647,2147483647,0,0,0] | mktime`, `[1970,0,1,2147483647,60,0,0,0] | mktime` and `[1970,0,2147483647,24,0,0,0,0] | mktime` are `invalid gmtime representation` in both macOS releases, where `succinctly jq` answers `7859790148020`, `7730941132800` and `185542587100800` (the instant, by 64-bit arithmetic), and `strftime`/`todate` normalise those fields where the macOS jq 1.8.2 formats them as given.
+It adds the seconds separately, so `[2147485547,11,31,23,59,60,0,0] | mktime` is `67768036191590400` in the macOS jq 1.8.2 (below the `:59` reading's `67768036191676800`), where the carry into the next year makes it `invalid gmtime representation` here.
+glibc's `timegm` does its arithmetic in a wider type and was not captured, so what a Linux jq answers for these rows is unverified.
+Pinned by `tests/jq_cli/i7722.rs` and `tests/jq_cli/i7723.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`) and jq 1.8.2 (`/opt/homebrew/bin/jq`) on macOS.
+
 ## No program with a terminal on both standard input and output is jq's usage error (#7462)
 
 jq's `main.c` takes `.` for a missing program `if (!isatty(STDOUT_FILENO) || !isatty(STDIN_FILENO))`, and prints its usage and exits 2 otherwise.
