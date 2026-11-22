@@ -5213,6 +5213,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         return Ok(exit_codes::USAGE_ERROR);
     }
 
+    // jq's `main.c` takes `.` for a missing program unless standard input and output are both
+    // terminals, where it prints its usage and exits 2 instead of waiting for input there (#7462).
+    if no_program_is_a_usage_error(
+        args.filter.is_some() || args.program_file.is_some(),
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) {
+        eprint!("{}", jq_short_usage());
+        return Ok(exit_codes::USAGE_ERROR);
+    }
+
     // Get the filter expression. An unreadable `-f`/`--from-file` file is
     // jq's own usage error (exit 2), so it gets the same two-arm treatment
     // as the build_context failure above -- mirror that match, don't drift
@@ -7526,6 +7537,18 @@ fn should_force_read_under_null_input(
     stdin_is_terminal: bool,
 ) -> bool {
     uses_input_builtins && !(null_input && no_files_given && stdin_is_terminal)
+}
+
+/// Whether a run with no program is jq's usage error: jq's `main.c` defaults the program to `.`
+/// `if (!isatty(STDOUT_FILENO) || !isatty(STDIN_FILENO))` and prints its usage (exit 2) otherwise, so
+/// only a run with a terminal on both sides refuses (#7462). jq 1.7.1 and 1.8.2 agree, whatever the
+/// options (`-n`, `-c`, `-e`, `--arg x 1` are all options, not a program).
+fn no_program_is_a_usage_error(
+    has_program: bool,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> bool {
+    !has_program && stdin_is_terminal && stdout_is_terminal
 }
 
 /// A parse error that ended a JSON input stream after a clean prefix of
@@ -27761,6 +27784,35 @@ mod tests {
 
         // The one suppressed combination: -n, no files, interactive stdin.
         assert!(!should_force_read_under_null_input(true, true, true, true));
+    }
+
+    /// #7462: a run with no program is jq's usage error only when stdin and stdout are both
+    /// terminals, which `cargo test` never has. A real terminal on each side needs a pty:
+    /// `python3 - <<'PY'` with `pty.openpty()` as both stdin and stdout of
+    /// `succinctly jq`, `succinctly jq -c` and `succinctly jq -n` must exit 2 at once with the
+    /// usage on stderr, as jq 1.7.1 and 1.8.2 do (the manual check recorded in
+    /// `docs/compliance/jq/limitations.md`).
+    #[test]
+    fn test_no_program_is_a_usage_error_only_on_two_terminals_7462() {
+        // (has a program, stdin is a terminal, stdout is a terminal, refused)
+        for (has_program, stdin, stdout, refused) in [
+            (false, true, true, true),
+            // A pipe on either side makes the program `.`.
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, false),
+            // A program is never missing.
+            (true, true, true, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (true, false, false, false),
+        ] {
+            assert_eq!(
+                no_program_is_a_usage_error(has_program, stdin, stdout),
+                refused,
+                "program {has_program}, stdin terminal {stdin}, stdout terminal {stdout}"
+            );
+        }
     }
 
     /// #1371: `rewrite_namespaced_calls` runs once, on the freshly parsed

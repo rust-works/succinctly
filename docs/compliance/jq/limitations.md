@@ -15710,6 +15710,35 @@ jq 1.8.2 also passes the array through `timegm` (`mktime` for `strflocaltime`) b
 `succinctly yq` is not changed: real yq has none of these builtins, and `--jq-extensions` reaches the jq code above.
 Pinned by `tests/jq_cli/i7532.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`) under `TZ=UTC` and avoid the C library's share (no `%Z`, `%z` or `%s`, no date before 1900, no field the normalisation would move).
 
+## No program with a terminal on both standard input and output is jq's usage error (#7462)
+
+jq's `main.c` takes `.` for a missing program `if (!isatty(STDOUT_FILENO) || !isatty(STDIN_FILENO))`, and prints its usage and exits 2 otherwise.
+So `jq`, `jq -c`, `jq -e`, `jq -n` and `jq --arg x 1` (options, not a program) run with a terminal on both sides print the usage on stderr and exit 2 at once, in jq 1.7.1 and in jq 1.8.2.
+`succinctly jq` waited for input there (and `jq -n` printed `null`); it now prints its short usage text (`jq_short_usage`, which carries this build's version in the first line, as for #7439) and exits 2.
+A pipe or a redirect on either side makes the program `.`, as before: `jq` with a terminal on stdin and a pipe on stdout waits for input, and `jq -n` with a terminal on stdin and a pipe on stdout prints `null`, in all three.
+The usage text itself is succinctly's own, as for `-h` (the `cli/help-exit` ledger entry); the exit status and not waiting are what is matched.
+No test can give the process a terminal, so the decision is a function (`no_program_is_a_usage_error`) with a unit test over every combination, and the run is a manual check.
+Give the binary a pseudo-terminal for both standard input and output:
+
+```console
+$ python3 - <<'PY'
+import pty, os, subprocess, time
+for argv in (["succinctly", "jq"], ["succinctly", "jq", "-c"], ["succinctly", "jq", "-n"]):
+    m, s = pty.openpty()
+    p = subprocess.Popen(argv, stdin=s, stdout=s, stderr=subprocess.PIPE)
+    os.close(s)
+    t = time.time()
+    while p.poll() is None and time.time() - t < 4:
+        time.sleep(0.1)
+    print(argv, p.poll())
+    if p.poll() is None:
+        p.kill()
+PY
+```
+
+Each prints `2`; before the fix the first two were still running after 4 s and the third was `0`.
+Pinned by `tests/jq_cli/i7462.rs` (the pipe sides) and the unit test in `jq_runner.rs`.
+
 ## `@urid`: jq 1.8.2's behaviour for the format, jq 1.7.1's for `format("urid")`
 
 `@urid` is new in jq 1.8, so the pinned jq 1.7.1 answers `urid is not a valid format` (the `str-format-urid` ledger entry).
