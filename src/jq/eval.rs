@@ -36247,6 +36247,16 @@ fn may_hold_assertion(pattern: &str) -> bool {
             .any(|assertion| pattern.contains(assertion))
 }
 
+/// Whether `pattern` could hold a gap Oniguruma ends a quantifier at (#7654): a `(?#..)` comment,
+/// or, where the `x` flag may be on, a blank or a `#` comment. A pattern with none keeps the
+/// borrowed fast path of [`refuse_possessive_quantifier_for`].
+#[cfg(feature = "regex")]
+fn may_hold_quantifier_gap(pattern: &str, extended: bool) -> bool {
+    pattern.contains("(?#")
+        || ((extended || inline_extended(pattern))
+            && pattern.contains(|c: char| c.is_whitespace() || c == '#'))
+}
+
 /// Whether an inline flag group (`(?x)`, `(?ix:...)`, `(?-x)`) names the extended flag, so the
 /// pattern may hold comments and blanks Oniguruma ignores (#5535).
 #[cfg(feature = "regex")]
@@ -36971,6 +36981,9 @@ fn interval_quantifier_at(chars: &[char], at: usize) -> Option<(usize, bool)> {
 /// Escapes, character classes, `\Q..\E`, `(?#..)` and, under `x`, `#` comments are stepped over.
 /// The `x` flag is the argument's as inline flags change it (`(?x)`, `(?-x)`, `(?x:...)`, #7464),
 /// so a blank and a `#` comment under an inline `(?x)` are stepped over as under the argument.
+/// Such a gap, and a `(?#..)` comment, ends a quantifier in Oniguruma, so a `?` or `+` after one is a
+/// new quantifier on the quantified atom, not its lazy or possessive marker: `a{1,2} ?` under `x` is
+/// written `(?:a{1,2})?` and `(a)? +` is written `(?:(a)?)+` (#7654).
 #[cfg(all(feature = "regex", test))]
 fn refuse_possessive_quantifier(
     pattern: &str,
@@ -36991,11 +37004,13 @@ fn refuse_possessive_quantifier_for(
     extended: bool,
     suppress_empty: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
-    // Cheap exit for the common pattern: a possessive `+` follows a quantifier character.
+    // Cheap exit for the common pattern: a possessive `+` follows a quantifier character, and
+    // nothing could stand between a quantifier and a `?` or `+` that follows it (#7654).
     if !pattern
         .as_bytes()
         .windows(2)
         .any(|pair| pair[1] == b'+' && matches!(pair[0], b'*' | b'+' | b'?' | b'}'))
+        && !may_hold_quantifier_gap(pattern, extended)
     {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
@@ -37039,14 +37054,43 @@ fn refuse_possessive_quantifier_for(
     // A lazy quantifier directly followed by `+` is a repeat of a repeat in jq, and the second
     // engine reads it otherwise, so a pattern with one stays on the first engine.
     let mut lazy_then_plus = false;
-    let mut opens: Vec<usize> = Vec::new();
-    let mut closes: Vec<usize> = Vec::new();
-    // #6218: under `n`, a lazy quantifier followed by `+` is written as the plain group of its atom
-    // and lazy quantifier, `(?:a??)+`, which jq reads it as and the engines answer as jq does.
-    let mut plain_opens: Vec<usize> = Vec::new();
+    // The groups written around an atom and its quantifiers: where each opens and closes, and
+    // whether it is atomic (`(?>`, a possessive quantifier, #6172) or plain (`(?:`). #6218: under
+    // `n`, a lazy quantifier followed by `+` is written as the plain group of its atom and lazy
+    // quantifier, `(?:a??)+`, which jq reads it as and the engines answer as jq does.
+    let mut wraps: Vec<(usize, usize, bool)> = Vec::new();
+    // Whether an atomic group was written, which a lazy quantifier followed by `+` refuses.
+    let mut atomic = false;
+    // #7654: Oniguruma ends a quantifier at a blank or a `#` comment under `x`, and at a `(?#..)`
+    // comment, so a `?` or `+` after one is a new quantifier on the quantified atom
+    // (`a{1,2} ?` is `(?:a{1,2})?`, `(a)? +` is `(?:(a)?)+`), where the crate, which drops the
+    // blank, would read the lazy `a{1,2}?` and the possessive `(a)?+`. Such a quantifier is written
+    // on the plain group of the atom and the quantifiers before it, and the gap is dropped.
+    // Whether the token just read ended a quantifier (a greedy or fixed one, its lazy `?` or its
+    // possessive `+`), and the gap since a quantifier ended: where it ended and where the gap began.
+    let mut quantified = false;
+    let mut gap: Option<(usize, usize)> = None;
     let mut i = 0;
     while i < chars.len() {
         let before = std::mem::replace(&mut last, Last::Other);
+        let after_quantifier = std::mem::take(&mut quantified);
+        let gap_before = gap.take();
+        let in_gap = (x_on && (chars[i].is_whitespace() || chars[i] == '#'))
+            || (chars[i] == '('
+                && chars.get(i + 1) == Some(&'?')
+                && chars.get(i + 2) == Some(&'#'));
+        if in_gap {
+            // A gap after a quantifier is carried until the next token (#7654).
+            gap = gap_before.or_else(|| after_quantifier.then_some((i, i)));
+        } else if let Some((ended, gap_start)) = gap_before {
+            if matches!(chars[i], '?' | '+') {
+                // An atom the scan cannot place keeps the crate's reading, as it always had.
+                if let Some(start) = atom.filter(|_| !unsure) {
+                    wraps.push((start, ended, false));
+                    drops.extend(gap_start..i);
+                }
+            }
+        }
         match chars[i] {
             '\\' if chars.get(i + 1) == Some(&'Q') => {
                 // A quoted run is literal up to `\E`, or to the end. A quantifier after it repeats
@@ -37241,8 +37285,8 @@ fn refuse_possessive_quantifier_for(
                         _ => None,
                     };
                     if let Some(start) = group {
-                        opens.push(start);
-                        closes.push(i + 1);
+                        wraps.push((start, i + 1, true));
+                        atomic = true;
                     }
                     drops.push(i);
                     // Only `)` follows, so there is nothing left to scan.
@@ -37252,9 +37296,10 @@ fn refuse_possessive_quantifier_for(
                     // The group makes the repeat atomic, so the `+` goes, which also spares the
                     // second engine an interval it would read as a repeat of a repeat.
                     Some(start) if !unsure => {
-                        opens.push(start);
-                        closes.push(i + 1);
+                        wraps.push((start, i + 1, true));
+                        atomic = true;
                         drops.push(i);
+                        quantified = true;
                         i += 1;
                     }
                     _ => return Err(refusal()),
@@ -37264,6 +37309,7 @@ fn refuse_possessive_quantifier_for(
             // after it applies to that.
             '+' if before == Last::Fixed => {
                 drops.push(i);
+                quantified = true;
                 i += 1;
                 if chars.get(i) == Some(&'?') {
                     optional.push(i);
@@ -37282,19 +37328,27 @@ fn refuse_possessive_quantifier_for(
                     && !inline_x
                 {
                     if let Some(start) = atom {
-                        plain_opens.push(start);
-                        closes.push(i + 1);
+                        wraps.push((start, i + 1, false));
                     }
                 }
+                quantified = true;
                 i += 1;
             }
             '*' | '+' | '?' => {
                 last = Last::Greedy;
+                quantified = true;
                 i += 1;
             }
             '{' => match interval_quantifier_at(&chars, i) {
+                // #7654: `{,n}` with no lower count is literal text to jq (`"a{,2}" | test("a{,2}")`
+                // is `true`), so a quantifier after it repeats its `}`.
+                Some((end, true)) if !chars.get(i + 1).is_some_and(char::is_ascii_digit) => {
+                    atom = Some(end - 1);
+                    i = end;
+                }
                 Some((end, comma)) => {
                     last = if comma { Last::Greedy } else { Last::Fixed };
+                    quantified = true;
                     i = end;
                 }
                 None => {
@@ -37310,31 +37364,31 @@ fn refuse_possessive_quantifier_for(
             }
         }
     }
-    if lazy_then_plus && !opens.is_empty() {
+    if lazy_then_plus && atomic {
         return Err(refusal());
     }
-    if drops.is_empty() && opens.is_empty() && plain_opens.is_empty() {
+    if drops.is_empty() && wraps.is_empty() {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
-    // Every list is in ascending order once sorted, so each is walked once.
-    opens.sort_unstable();
-    plain_opens.sort_unstable();
+    // Every list is in ascending order once sorted, so each is walked once. Of the groups that open
+    // at one place, the one that closes last opens first, so that each closes where it should
+    // (`a* ?+b` is `(?>(?:a*)?)b`); a wrap is only ever around atoms the scan read whole, so two never
+    // cross.
+    wraps.sort_unstable_by_key(|&(open, close, _)| (open, core::cmp::Reverse(close)));
+    drops.sort_unstable();
+    let mut closes: Vec<usize> = wraps.iter().map(|&(_, close, _)| close).collect();
     closes.sort_unstable();
     let mut dropped = drops.iter().copied().peekable();
     let mut swapped = optional.iter().copied().peekable();
-    let mut opening = opens.iter().copied().peekable();
-    let mut plain_opening = plain_opens.iter().copied().peekable();
+    let mut opening = wraps.iter().copied().peekable();
     let mut closing = closes.iter().copied().peekable();
     let mut rewritten = String::new();
     for at in 0..=chars.len() {
         while closing.next_if_eq(&at).is_some() {
             rewritten.push(')');
         }
-        while opening.next_if_eq(&at).is_some() {
-            rewritten.push_str("(?>");
-        }
-        while plain_opening.next_if_eq(&at).is_some() {
-            rewritten.push_str("(?:");
+        while let Some((_, _, atomic)) = opening.next_if(|&(open, ..)| open == at) {
+            rewritten.push_str(if atomic { "(?>" } else { "(?:" });
         }
         let Some(&c) = chars.get(at) else { break };
         if dropped.next_if_eq(&at).is_some() {
@@ -160306,6 +160360,49 @@ mod tests {
         ] {
             let got = refuse_possessive_quantifier(pattern, extended);
             assert_eq!(got.ok().as_deref(), Some(want), "{pattern} x={extended}");
+        }
+    }
+
+    /// #7654: a blank or `#` comment under `x`, and a `(?#..)` comment, ends a quantifier, so a `?` or
+    /// `+` after one repeats the quantified atom: the gap is dropped and the atom and the quantifiers
+    /// before it are grouped. A gap with no quantifier before it, or none after it, is left alone,
+    /// and so is a blank where `x` is off.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_quantifier_after_a_gap_repeats_the_quantified_atom_7654() {
+        for (pattern, extended, want) in [
+            ("a{1,2} ?$", true, "(?:a{1,2})?$"),
+            ("(a)? +", true, "(?:(a)?)+"),
+            ("a{1,2} #c\n?$", true, "(?:a{1,2})?$"),
+            ("a{1,2}(?#c)?$", false, "(?:a{1,2})?$"),
+            ("(?x)a{2} ?", false, "(?x)(?:a{2})?"),
+            ("(?x:a* +)b", false, "(?x:(?:a*)+)b"),
+            ("a*? +", true, "(?:a*?)+"),
+            ("(a) ? +", true, "(?:(a) ?)+"),
+            // The later quantifier's group opens first: `a* ?+b` is the possessive `(?:a*)?+`.
+            ("a* ?+b", true, "(?>(?:a*)?)b"),
+            ("a* ? ?", true, "(?:(?:a*)?)?"),
+            ("a{2}+ ?", true, "(?:a{2})?"),
+            // `{,n}` is literal text: a quantifier after it repeats its `}`.
+            ("a{,2}+b", false, "a{,2}+b"),
+            ("a{,2} ?", true, "a{,2} ?"),
+        ] {
+            let got = refuse_possessive_quantifier(pattern, extended);
+            assert_eq!(got.ok().as_deref(), Some(want), "{pattern:?} x={extended}");
+        }
+        for (pattern, extended) in [
+            ("a ?", true),
+            ("a* ?", false),
+            ("a* b", true),
+            ("(?-x)a* ?", true),
+            ("a* (?x)?", false),
+        ] {
+            let got = refuse_possessive_quantifier(pattern, extended);
+            assert_eq!(
+                got.ok().as_deref(),
+                Some(pattern),
+                "{pattern:?} x={extended}"
+            );
         }
     }
 
