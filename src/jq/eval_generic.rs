@@ -27128,7 +27128,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                 ) =>
             {
                 // #5292: handed over a batch at a time, as `each_range` does.
-                let end = each_range_batches(
+                let end = each_range_batches::<S>(
                     from_val,
                     to_val,
                     step_val,
