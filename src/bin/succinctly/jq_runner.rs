@@ -24401,7 +24401,16 @@ mod tests {
         assert!(!takes(&["jq", ".", &missing]));
         // (No path at all reads standard input, which is the test process's own: see
         // `windowed_regular_stdin_takes_only_a_big_regular_file_7024`.)
-        assert!(!takes(&["jq", ".", "-"]));
+        // Standard input, named or not, is asked of the regular-file half of the gate
+        // ([`windowed_source`]), not of `takes`: where the test process's own standard input is a
+        // pipe that nobody closes (`cargo test` from a background shell, #7746), the gate turning it
+        // down hands the run to the pipe route, which reads descriptor 0 for bytes that never come,
+        // as jq's read would.
+        let regular_half = |argv: &[&str]| {
+            let cmd = JqCommand::try_parse_from(argv.iter().copied()).unwrap();
+            windowed_source(&cmd, window::min_windowed_file_bytes()).is_some()
+        };
+        assert!(!regular_half(&["jq", ".", "-"]));
         // #7024: several regular files, 4 MiB or more between them, are one stream read a window at a
         // time; one that is not a regular file, or does not open, leaves the run to the route that
         // reads them whole and says why.
@@ -24434,9 +24443,10 @@ mod tests {
         let mut long_with_directory = with_tinies(40);
         long_with_directory.push(directory.as_str());
         assert!(!takes(&long_with_directory), "one is no regular file");
-        // The test's own standard input, named by path, is no regular file of 1 MiB.
-        assert!(!takes(&["jq", ".", "/dev/stdin"]));
-        assert!(!takes(&["jq", ".", "/dev/fd/0"]));
+        // The test's own standard input, named by path, is no regular file of 1 MiB (and is a file the
+        // run already holds where it is one: never windowed from its start).
+        assert!(!regular_half(&["jq", ".", "/dev/stdin"]));
+        assert!(!regular_half(&["jq", ".", "/dev/fd/0"]));
         // #7446: a descriptor that holds one is, read from where its offset stands; standard output
         // and error are not, whatever they hold.
         #[cfg(unix)]
@@ -24461,6 +24471,43 @@ mod tests {
             argv.extend([".", big.as_str()]);
             assert!(!takes(&argv), "{flags:?}");
         }
+    }
+
+    /// #7746: the test above does not read the process's own standard input. It is run as a child of this
+    /// binary whose standard input is a pipe this test holds open and never writes to, where a read of
+    /// descriptor 0 waits for ever (`cargo test` from a background shell); the child is killed after a
+    /// minute, so a regression fails here instead of hanging the whole run.
+    #[cfg(unix)]
+    #[test]
+    fn the_lone_file_gate_test_ignores_an_open_stdin_pipe_7746() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let mut child = Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "windowed_plain_file_takes_only_regular_files_big_enough_6920_7024",
+                "--test-threads=1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("the test binary runs");
+        // Held open: dropping it would end the child's standard input.
+        let _writer = child.stdin.take();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("kill the hung child");
+                child.wait().expect("reaped");
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let status = status.expect("the child read standard input and never returned");
+        assert!(status.success(), "{status}");
     }
 
     /// #7262: a lone `--seq` file the whole-file route could not hold is that route's, which reports it before
