@@ -3089,6 +3089,21 @@ fn last_line_break(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// One read of `reader` onto the end of `bytes`, of at most `n` bytes (and at most 64 KiB, more than a
+/// terminal's line holds): what a terminal gives a read is the line typed (#7742).
+fn read_once(reader: &mut dyn Read, bytes: &mut Vec<u8>, n: usize) -> io::Result<usize> {
+    let start = bytes.len();
+    bytes.resize(start + n.min(64 << 10), 0);
+    let read = loop {
+        match reader.read(&mut bytes[start..]) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            read => break read,
+        }
+    };
+    bytes.truncate(start + *read.as_ref().unwrap_or(&0));
+    read
+}
+
 /// A source read as whole lines, a window at a time (#7023): `-R`'s file, and the rest of a lone source
 /// the lazy `inputs` route started on the front of. A line is no more than a line break away from its
 /// end, so there is nothing to scan and nothing to carry across a window but the bytes after its last
@@ -3110,6 +3125,10 @@ pub(super) struct LineWindows {
     /// The most the next window reads, once (#7264): a source started on a few KiB reads up to where
     /// a start on the whole front would have ended, so its windows then fall where they always did.
     first_ask: Option<usize>,
+    /// A terminal, typed into a line at a time ([`typed_into`](Self::typed_into), #7742).
+    typed: bool,
+    /// The terminal has not been read yet: a BOM at the front of its first line is the one jq skips.
+    typed_front: bool,
 }
 
 impl LineWindows {
@@ -3128,7 +3147,20 @@ impl LineWindows {
             carried,
             eof: false,
             first_ask: None,
+            typed: false,
+            typed_front: false,
         }
+    }
+
+    /// The source is a terminal (#7742): a window ends at the first line break a read brings, so each line
+    /// is handed on as it is typed, where a window of a block would wait for a block's worth of lines or
+    /// for the end of the input. A read of no bytes is the end (a `^D`), and nothing is read after it. A
+    /// BOM at the front of the first line is dropped, as jq's parser skips it: nothing was read of the
+    /// terminal to find it before the run started.
+    pub(super) fn typed_into(mut self) -> Self {
+        self.typed = true;
+        self.typed_front = true;
+        self
     }
 
     /// The first window reads no more than `bytes`.
@@ -3230,7 +3262,22 @@ impl LineWindows {
                 continue;
             }
             // patchcov: coverage end
-            match self.reader.by_ref().take(n as u64).read_to_end(&mut bytes) {
+            let read = if self.typed {
+                read_once(self.reader.as_mut(), &mut bytes, n)
+            } else {
+                self.reader.by_ref().take(n as u64).read_to_end(&mut bytes)
+            };
+            match read {
+                // A terminal ends at a read of nothing; what it gave before is a line, or the text of
+                // one a `^D` handed on without its line break.
+                Ok(0) if self.typed => self.eof = true,
+                Ok(_) if self.typed => {
+                    if std::mem::take(&mut self.typed_front)
+                        && bytes[before..].starts_with(b"\xEF\xBB\xBF")
+                    {
+                        bytes.drain(before..before + 3);
+                    }
+                }
                 // A short read is the end: a source of unknown length, or a file that shrank.
                 Ok(read) if read < n => self.eof = true,
                 Ok(read) => {

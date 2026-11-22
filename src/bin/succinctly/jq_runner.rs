@@ -6771,25 +6771,14 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // path's own fidelity (verified separately, not by that test) is
         // what makes the routing change itself a non-issue either way.
         //
-        // `force_read_under_null_input` narrows `uses_input_builtins` by one
-        // safety check: never force a real read under `-n` when stdin is an
-        // interactive terminal with no files given. Since #1309 the check
-        // itself is exact -- an AST walk, not the substring scan that used to
-        // fire on a `.input` field -- so this narrowing no longer exists to
-        // contain false positives. It covers the genuine case: `-n 'inputs'`
-        // typed at a bare prompt would otherwise block reading a TTY the user
-        // may not have meant to feed. `input`/`inputs` then correctly report
-        // exhausted against an empty queue instead of hanging; the only data
-        // lost is data the user intended to type in live rather than
-        // pipe/redirect, an already-unusual way to invoke `-n`.
-        // #6464: under `-n` it is `input`/`inputs` that ask jq for a file; `input_line_number`
-        // alone leaves the files unopened, so a missing one is not reported.
-        let force_read_under_null_input = should_force_read_under_null_input(
-            uses_input_builtins && (!args.null_input || jq::walk::pulls_inputs(&expr)),
-            args.null_input,
-            get_input_files(&args).is_empty(),
-            std::io::stdin().is_terminal(),
-        );
+        // `force_read_under_null_input`: under `-n` the inputs are read only when the program asks
+        // for them. #6464: under `-n` it is `input`/`inputs` that ask jq for a file;
+        // `input_line_number` alone leaves the files unopened, so a missing one is not reported.
+        // #7742: a terminal on standard input is read too, as jq reads it. It was left unread (#723),
+        // so `input`/`inputs` saw an empty stream, for fear of blocking on a terminal the program never
+        // reads: the lazy route reads nothing of a terminal until `input` asks (`lone_lazy_start`).
+        let force_read_under_null_input =
+            uses_input_builtins && (!args.null_input || jq::walk::pulls_inputs(&expr));
         let mut opened = Vec::new();
         let (inputs, locations, trailing_error, resumed_errors) = match get_inputs(
             &args,
@@ -6870,8 +6859,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // read the real documents instead of faking `[null]`, precisely
             // so they're available here.
             //
-            // `!force_read_under_null_input` (TTY-safety suppressed the real
-            // read) is the one case where `inputs` isn't real data -- it's
+            // `!force_read_under_null_input` (under `-n`, a program that reads
+            // only `input_line_number`, #6464) is the one case where `inputs` isn't real data -- it's
             // `get_inputs`'s own `[null]` placeholder for plain `-n`
             // (review catch: seeding straight from `inputs` unconditionally
             // fed that placeholder into the queue as if it were a genuine
@@ -7632,28 +7621,6 @@ fn stdin_items(args: &JqCommand) -> Option<super::stdin_offset::Items> {
     } else {
         Items::Values
     })
-}
-
-/// Whether to force a real read under `-n` for `input`/`inputs`/
-/// `input_line_number` (#723), given whether the filter actually references
-/// one of them (`jq::walk::uses_input_builtins`, exact since #1309).
-/// Narrowed by one safety check, pulled out as a pure function so it's
-/// unit-testable without a real terminal: never force the read when `-n` is
-/// set, no files were given, and stdin is an interactive terminal -- that
-/// would block on a TTY the user may not have meant to feed.
-///
-/// Four bools, each independently meaningful and named at every call site
-/// (no adjacent pair is ever confusable) -- a two-variant-enum refactor
-/// would add ceremony without adding clarity for this single-call-site,
-/// private helper.
-#[allow(clippy::fn_params_excessive_bools)]
-fn should_force_read_under_null_input(
-    uses_input_builtins: bool,
-    null_input: bool,
-    no_files_given: bool,
-    stdin_is_terminal: bool,
-) -> bool {
-    uses_input_builtins && !(null_input && no_files_given && stdin_is_terminal)
 }
 
 /// Whether a run with no program is jq's usage error: jq's `main.c` defaults the program to `.`
@@ -15733,6 +15700,8 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     // A regular file's length, which a read whole of it is sized for; `None` for standard input and for
     // a pipe named on the command line (#7478), which are read as a stream.
     let dash = files.first().is_some_and(|path| is_stdin_dash(path));
+    // Whether the source is a terminal (#7742), asked only of a source read as a stream.
+    let mut terminal = false;
     let (mut reader, len): (Box<dyn std::io::Read>, Option<usize>) = match files.first() {
         // #7478: `-` is standard input, read below as an unnamed one is (named `<stdin>`), unless a
         // route before has read it whole already.
@@ -15757,7 +15726,10 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                 )
             }) {
                 Ok((true, _, Ok(len))) if len > front => (Box::new(file), Some(len)),
-                Ok((_, true, _)) => (Box::new(file), None),
+                Ok((_, true, _)) => {
+                    terminal = file.is_terminal();
+                    (Box::new(file), None)
+                }
                 _ => return Ok(LoneStart::Declined),
             }
         }
@@ -15768,11 +15740,28 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                 note_stdin_read_failed();
                 return Ok(LoneStart::Read(Vec::new()));
             }
+            // A terminal a probe has read from hands its lines back, and is read on as a stream.
+            terminal = pushed_back.is_none() && std::io::stdin().is_terminal();
             let stdin = std::io::Cursor::new(pushed_back.unwrap_or_default())
                 .chain(super::stdin_offset::Stdin);
             (Box::new(stdin), None)
         }
     };
+    // #7742: a terminal is typed into, so nothing of it is read until the program asks for its first
+    // input, and then a line at a time, as jq's `fgets` reads it: `-n input` answers the first line as it
+    // is typed, and a program that never gets to `input` never waits for the terminal. A front of 256 KiB
+    // waited for that much typing or for a `^D` before the program ran.
+    if terminal {
+        return Ok(LoneStart::Lazy {
+            text: String::new(),
+            spans: Vec::new(),
+            rest: LazyRest {
+                windows: window::LineWindows::new(reader, None, lazy_window_bytes(), Vec::new())
+                    .typed_into(),
+            },
+            lead: 0,
+        });
+    }
     let from_stdin = files.is_empty() || dash;
     // Standard input or a named stream: its length is not known, and what is read of it is not read
     // again, so a read past the front is never turned down.
@@ -28150,41 +28139,6 @@ mod tests {
             }
             assert_eq!(position(&[]), None);
         }
-    }
-
-    /// #723: direct unit coverage for the TTY-safety narrowing, independent
-    /// of a real terminal (which `cargo test` never has one of anyway).
-    /// Only the exact combination -- `-n`, no files, an interactive stdin --
-    /// should suppress the forced real read; every other combination (any
-    /// one of the three false) must force it whenever `uses_input_builtins`
-    /// says the filter might need it.
-    #[test]
-    fn test_should_force_read_under_null_input_723() {
-        // Never forces anything when the filter doesn't reference these
-        // builtins at all, regardless of the other three inputs.
-        assert!(!should_force_read_under_null_input(false, true, true, true));
-        assert!(!should_force_read_under_null_input(
-            false, false, false, false
-        ));
-
-        // Not under -n at all: always forces (there's no hang risk --
-        // non-null-input mode already reads stdin/files unconditionally).
-        assert!(should_force_read_under_null_input(true, false, true, true));
-        assert!(should_force_read_under_null_input(
-            true, false, false, false
-        ));
-
-        // Under -n with files given: forces (files can't block like a bare
-        // TTY read can).
-        assert!(should_force_read_under_null_input(true, true, false, true));
-
-        // Under -n with no files but stdin isn't a terminal (piped/redirected):
-        // forces -- this is the canonical `jq -n 'reduce inputs as $x (...)'`
-        // streaming-aggregation case.
-        assert!(should_force_read_under_null_input(true, true, true, false));
-
-        // The one suppressed combination: -n, no files, interactive stdin.
-        assert!(!should_force_read_under_null_input(true, true, true, true));
     }
 
     /// #7462: a run with no program is jq's usage error only when stdin and stdout are both
