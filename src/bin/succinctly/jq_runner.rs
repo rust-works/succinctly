@@ -14841,7 +14841,23 @@ fn bare_token_at_end(raw: &[u8], last: Option<(usize, usize)>) -> Option<usize> 
 /// Whether `tail`, which starts at the first byte of a token the splitter could not finish,
 /// is cut off by the end of the file rather than malformed: an unclosed container or string,
 /// or a bare token with no byte after it to end it.
+///
+/// #7750: a container or string is cut off only if jq's parser, reading it, meets no fault before
+/// the end. The brackets and quotes alone cannot tell: in `[x"]` + `1\n2\n` the stray quote looks
+/// like a string the next file goes on with, but jq's parser stops at the `x`, drops the rest of its
+/// read and parses on from the next line of this file. Carried onto the next file, the fault and the
+/// values after it were read there, so `input_filename` named that file (#7751), a file that did not
+/// open between the two was met before the fault (#7753), and a program reading past the fault ran
+/// into the failure and stopped (#7750). The brackets are checked first, so only a text that ends
+/// inside a container or string pays for the parser.
 fn token_runs_to_end(tail: &[u8]) -> bool {
+    brackets_run_to_end(tail)
+        && (!matches!(tail.first(), Some(b'{' | b'[' | b'"'))
+            || jq::jq_stream_fault_offset(tail).is_none())
+}
+
+/// [`token_runs_to_end`] by the brackets and quotes alone.
+fn brackets_run_to_end(tail: &[u8]) -> bool {
     match tail.first() {
         Some(b'{' | b'[') => {
             let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
