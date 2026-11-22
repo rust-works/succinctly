@@ -62,7 +62,8 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use succinctly::jq::utf8_document::{original_offset, SubstitutionEdit};
 
 use super::{
-    advance_position, count_newlines, open_tail_after_split, split_json_values, Seam, SeamStitcher,
+    advance_position, count_newlines, open_tail_after_split_reading, split_json_values, Seam,
+    SeamStitcher,
 };
 
 /// How much of the file one window reads, and so about how much memory the route holds besides a
@@ -329,6 +330,10 @@ pub(super) struct Place {
     /// An invalid byte was substituted in an earlier file: the position jq's parser names is counted
     /// over the bytes as read, so a message that names one is worded from the files read again.
     pub substituted: bool,
+    /// The carry is text the file before validated whole, with nothing substituted and no NUL in it
+    /// (#7750, #7792): it is not validated again, which for one value spread over many files was every
+    /// byte before each file boundary again.
+    pub carry_validated: bool,
 }
 
 impl Place {
@@ -342,6 +347,7 @@ impl Place {
             strip_bom: true,
             origin: (1, 0),
             substituted: false,
+            carry_validated: false,
         }
     }
 }
@@ -538,6 +544,16 @@ pub(super) struct WindowedFile {
     /// The bytes the splitter has scanned, rescans of a document not yet whole included.
     #[cfg(test)]
     split_bytes: usize,
+    /// jq's parser after reading the carry on the front of `buf`, one container or string the files
+    /// before left open (#7750), and how far into `buf` it has read: while the value stays open, the
+    /// text is not split again from its first byte at each read and at each file boundary.
+    tail_reader: Option<succinctly::jq::JqOpenTail>,
+    tail_read_to: usize,
+    /// A NUL was found in the text validated so far (#7437), which the validation changed.
+    nul_seen: bool,
+    /// How much of the front was validated before the file was read: a carry the file before
+    /// validated whole ([`Place::carry_validated`]), or 0.
+    front_validated: usize,
     #[cfg(test)]
     bytes_read: u64,
 }
@@ -553,6 +569,7 @@ impl WindowedFile {
     pub(super) fn in_stream(file: Rc<File>, len: u64, block: usize, place: Place) -> Self {
         let carry_len = place.carry.len();
         let track_raw = place.hold_tail || carry_len > 0;
+        let carry_validated = if place.carry_validated { carry_len } else { 0 };
         Self {
             file,
             remaining: if len == 0 { u64::MAX } else { len },
@@ -563,7 +580,7 @@ impl WindowedFile {
             // so the first region the text is judged in covers all of it.
             carry_raw: Vec::new(),
             buf: place.carry,
-            validated: 0,
+            validated: carry_validated,
             no_break_from: carry_len,
             skip: 0,
             consumed: 0,
@@ -601,6 +618,10 @@ impl WindowedFile {
             break_search_bytes: 0,
             #[cfg(test)]
             split_bytes: 0,
+            tail_reader: None,
+            tail_read_to: 0,
+            nul_seen: false,
+            front_validated: carry_validated,
             #[cfg(test)]
             bytes_read: 0,
         }
@@ -678,11 +699,18 @@ impl WindowedFile {
             }
             first = false;
             let from = self.skip;
+            // #7750: a value the files before left open, still open after what this read added, is no
+            // document yet, as the splitter would find of it from its first byte.
+            let carried_open = self.carried_value_open(from);
             #[cfg(test)]
-            {
+            if !carried_open {
                 self.split_bytes += self.validated - from;
             }
-            let (mut values, split_error) = split_json_values(&self.buf[from..self.validated]);
+            let (mut values, split_error) = if carried_open {
+                (Vec::new(), Some(0))
+            } else {
+                split_json_values(&self.buf[from..self.validated])
+            };
             for span in &mut values {
                 span.0 += from;
                 span.1 += from;
@@ -694,12 +722,16 @@ impl WindowedFile {
             if self.eof && self.hold_tail && self.read_error.is_none() {
                 // What `open_tail_start` finds of a file's text, from the split this scan made.
                 let text = &self.buf[..self.validated];
-                if let Some(start) =
-                    open_tail_after_split(text, split_error, values.last().copied())
-                {
+                let tail = if carried_open {
+                    Some((from, self.tail_reader.take()))
+                } else {
+                    open_tail_after_split_reading(text, split_error, values.last().copied())
+                };
+                if let Some((start, reader)) = tail {
                     values.retain(|&(_, end)| end <= start);
                     split_error = None;
                     tail_start = Some(start);
+                    stitcher.reader = reader;
                 }
             }
             // A fault before the end of the file is only one when no byte that follows can change
@@ -755,7 +787,17 @@ impl WindowedFile {
                         0
                     };
                     let mut moved = self.seam_raw.clone();
+                    // #7750, #7792: text that needs nothing done to it is the next file's front as is.
+                    // Only a container or string jq's parser reads on (`stitcher.reader`): the split
+                    // waits for it to close, where a bare number or literal on its own would be split
+                    // as a whole value before the next file's bytes that go on with it are read.
+                    let validated = self.raw_map.regions.is_empty()
+                        && !self.nul_seen
+                        && !self.blank_rs
+                        && self.seq_gate.is_none()
+                        && stitcher.reader.is_some();
                     stitcher.move_tail(self.index, &mut moved, start_raw, tail, &[], false);
+                    stitcher.carry_validated = validated;
                     seam.moved_len = moved.moved_len;
                     seam.moved_newline = moved.moved_newline;
                 }
@@ -819,6 +861,39 @@ impl WindowedFile {
                 self.drop_consumed();
             }
         }
+    }
+
+    /// Whether the carry on the front of `buf`, a container or string the files before left open, is
+    /// still open once jq's parser has read the bytes validated since it last read (#7750). The carry
+    /// is where the text starts (`from` is 0), and no byte of the text was substituted, so the parser's
+    /// position is the buffer's. Once the value closes or faults, or the text no longer is that, the
+    /// reader is dropped and the text is split from its front as before, once. The last file of the
+    /// list does not read on with it: nothing follows to hand a tail to.
+    fn carried_value_open(&mut self, from: usize) -> bool {
+        let Some(reader) = self.tail_reader.as_mut() else {
+            return false;
+        };
+        // The last file hands nothing on: its text is split as it is read, which it must be anyway.
+        if from != 0
+            || !self.hold_tail
+            || !self.raw_map.regions.is_empty()
+            || self.tail_read_to > self.validated
+        {
+            self.tail_reader = None;
+            return false;
+        }
+        let read = reader.read(&self.buf[..self.validated], self.tail_read_to);
+        self.tail_read_to = self.validated;
+        if read == succinctly::jq::TailRead::Open {
+            debug_assert!(
+                self.validated > 1 << 20
+                    || split_json_values(&self.buf[..self.validated]) == (Vec::new(), Some(0)),
+                "the reader of a carried value answers as the splitter does from its front"
+            );
+            return true;
+        }
+        self.tail_reader = None;
+        false
     }
 
     /// #7412: a file of a known length under [`MAX_READ_WHOLE_WINDOWS`] windows whose window ends inside
@@ -957,6 +1032,11 @@ impl WindowedFile {
     fn raw_tail(&mut self, start: usize) -> Vec<u8> {
         let at = self.offset + start;
         if !self.raw_map.changes_from(at) {
+            // #7750, #7792: the whole text is the tail (one value goes on into the next file), which
+            // is handed on as it is, not copied: copied, every file boundary copied the value so far.
+            if start == 0 && self.validated == self.buf.len() && self.held.is_none() {
+                return std::mem::take(&mut self.buf);
+            }
             return self.buf[start..self.validated].to_vec();
         }
         let raw_at = self.raw_map.raw_of(at);
@@ -1181,9 +1261,15 @@ impl WindowedFile {
                 nul: false,
             }
         };
+        self.nul_seen |= scan.nul;
         if scan.utf8 {
             self.validated = end;
         } else {
+            // The first region after a carry that was not validated again: the substitution moves the
+            // carry's seam over the whole front, so it is made over that, as for any other carry.
+            if self.front_validated > 0 && self.validated == self.front_validated {
+                self.validated = 0;
+            }
             self.substitute_region(end);
         }
         if self.blank_rs {
@@ -2989,6 +3075,8 @@ impl WindowedFiles {
                             SeqGate::for_file_after(Rc::clone(slot), *lines, check.token_byte)
                         })
                     });
+                    let carry_validated =
+                        std::mem::take(&mut self.stitcher.carry_validated) && !carry.is_empty();
                     let place = Place {
                         index,
                         carry,
@@ -2997,13 +3085,18 @@ impl WindowedFiles {
                         strip_bom: self.only_empty,
                         origin: self.end_origin,
                         substituted: self.substituted,
+                        carry_validated,
                     };
                     let block = if gate.is_some() {
                         window_bytes()
                     } else {
                         self.block
                     };
+                    let carry_len = place.carry.len();
                     let mut opened = WindowedFile::in_stream(file, len, block, place);
+                    // #7750: the parser that read the carry goes on with this file.
+                    opened.tail_reader = self.stitcher.take_reader().filter(|_| carry_len > 0);
+                    opened.tail_read_to = carry_len;
                     opened.blank_rs = self.blank_rs;
                     // #7446: a `--seq` file read with no gate of its own was vouched for up to its
                     // length, so that is where it ends; a gate certifies whatever it reads.

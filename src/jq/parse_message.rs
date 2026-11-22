@@ -822,6 +822,367 @@ impl Default for JqStreamFaults {
     }
 }
 
+/// What [`JqOpenTail::read`] found in the bytes it was given.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailRead {
+    /// The value is still open after the last byte, with no fault met: the next file goes on with it.
+    Open,
+    /// jq's parser refused a byte.
+    Fault,
+    /// The value closed, at the byte the offset names; what follows it is not this reader's.
+    Closed(usize),
+}
+
+/// jq's parser reading the one value a file ends inside, a piece at a time (#7750): whether it meets a
+/// fault, closes the value, or is still inside it once the piece is read. The state is kept between
+/// pieces, so a value spread over many files is read once in all, each piece where its file is
+/// reached, and not again from the value's first byte at every file boundary.
+///
+/// The verdicts are [`jq_stream_fault_offset`]'s over the same bytes fed from the value's first byte.
+/// Two readers give them. A plain JSON value (RFC 8259, no `\u` escape, nested less than a hundred
+/// deep), the text nearly every value spread over files is, is read by a scan that knows only that
+/// grammar and costs a few instructions a byte; jq's parser accepts every such prefix and closes such
+/// a value on the same byte. At the first byte that scan cannot vouch for (anything outside that
+/// grammar, a fault included) the reader turns to jq's parser itself and reads the value again from
+/// its first byte, once, and goes on with that parser from then on. That parser keeps no line or
+/// column, which only a message would name, and steps over the plain bytes of a string (not `"`, `\`
+/// or a control character, and not within the escape a `\` starts) without storing them: they decide
+/// nothing in jq's check of the string.
+#[doc(hidden)]
+pub struct JqOpenTail {
+    plain: Option<PlainScan>,
+    parser: Parser,
+    /// The bytes after a `\` still read one at a time: the escape, up to four hex digits, and the
+    /// next six bytes, which the check of a high surrogate reads for its low half.
+    escape_tail: u8,
+}
+
+/// Where [`PlainScan`] stands between two bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlainExpect {
+    /// A value, or a container's close right after its opener (`[]`, `{}`).
+    ValueOrClose,
+    /// A value (after `,` in an array, or `:`).
+    Value,
+    /// A key, or the close right after `{`.
+    KeyOrClose,
+    /// A key (after `,` in an object).
+    Key,
+    /// The `:` after a key.
+    Colon,
+    /// A `,` or the close of the container a value ended in.
+    CommaOrClose,
+}
+
+/// The scan of a plain JSON value [`JqOpenTail`] tries first.
+struct PlainScan {
+    /// The open containers, `[` or `{`.
+    stack: Vec<u8>,
+    expect: PlainExpect,
+    /// 0 outside a string, 1 inside, 2 after a `\`.
+    string: u8,
+    /// The string open is a key.
+    key: bool,
+    /// A number or literal not yet ended (it may go on in the next piece).
+    token: Vec<u8>,
+}
+
+/// What [`PlainScan::read`] found.
+enum PlainRead {
+    Open,
+    Closed(usize),
+    /// A byte the scan cannot vouch for: jq's parser decides.
+    Unsure,
+}
+
+impl PlainScan {
+    fn new() -> Self {
+        Self {
+            stack: Vec::new(),
+            expect: PlainExpect::Value,
+            string: 0,
+            key: false,
+            token: Vec::new(),
+        }
+    }
+
+    /// A value has ended: what may come next, or `None` when it was the top-level one.
+    fn value_done(&mut self) -> Option<()> {
+        match self.stack.last() {
+            None => None,
+            Some(_) => {
+                self.expect = PlainExpect::CommaOrClose;
+                Some(())
+            }
+        }
+    }
+
+    /// Whether `token` is a JSON number or `true`, `false`, `null`.
+    fn plain_token(token: &[u8]) -> bool {
+        if matches!(token, b"true" | b"false" | b"null") {
+            return true;
+        }
+        let mut at = usize::from(token.first() == Some(&b'-'));
+        let digits = |at: &mut usize| {
+            let from = *at;
+            while token.get(*at).is_some_and(u8::is_ascii_digit) {
+                *at += 1;
+            }
+            *at - from
+        };
+        match token.get(at) {
+            Some(b'0') => at += 1,
+            Some(b'1'..=b'9') => {
+                digits(&mut at);
+            }
+            _ => return false,
+        }
+        if token.get(at) == Some(&b'.') {
+            at += 1;
+            if digits(&mut at) == 0 {
+                return false;
+            }
+        }
+        if matches!(token.get(at), Some(b'e' | b'E')) {
+            at += 1;
+            if matches!(token.get(at), Some(b'+' | b'-')) {
+                at += 1;
+            }
+            if digits(&mut at) == 0 {
+                return false;
+            }
+        }
+        at == token.len()
+    }
+
+    fn read(&mut self, bytes: &[u8]) -> PlainRead {
+        use PlainExpect::{Colon, CommaOrClose, Key, KeyOrClose, Value, ValueOrClose};
+        let mut at = 0;
+        while at < bytes.len() {
+            if self.string == 1 {
+                at += plain_string_run(&bytes[at..]);
+                let Some(&byte) = bytes.get(at) else {
+                    break;
+                };
+                at += 1;
+                match byte {
+                    b'"' => {
+                        self.string = 0;
+                        if self.key {
+                            self.key = false;
+                            self.expect = Colon;
+                        } else if self.value_done().is_none() {
+                            return PlainRead::Closed(at);
+                        }
+                    }
+                    b'\\' => self.string = 2,
+                    _ => return PlainRead::Unsure,
+                }
+                continue;
+            }
+            let byte = bytes[at];
+            if self.string == 2 {
+                if !matches!(byte, b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') {
+                    return PlainRead::Unsure;
+                }
+                self.string = 1;
+                at += 1;
+                continue;
+            }
+            let delimiter = matches!(
+                byte,
+                b' ' | b'\t' | b'\r' | b'\n' | b'[' | b'{' | b']' | b'}' | b',' | b':' | b'"'
+            );
+            if !delimiter {
+                // A number or literal: read to its end as one run.
+                if self.token.is_empty() && !matches!(self.expect, Value | ValueOrClose) {
+                    return PlainRead::Unsure;
+                }
+                let from = at;
+                while bytes.get(at).is_some_and(|&b| {
+                    !matches!(
+                        b,
+                        b' ' | b'\t'
+                            | b'\r'
+                            | b'\n'
+                            | b'['
+                            | b'{'
+                            | b']'
+                            | b'}'
+                            | b','
+                            | b':'
+                            | b'"'
+                    )
+                }) {
+                    at += 1;
+                }
+                if at == bytes.len() {
+                    // It may go on in the next piece.
+                    self.token.extend_from_slice(&bytes[from..]);
+                    break;
+                }
+                let plain = if self.token.is_empty() {
+                    Self::plain_token(&bytes[from..at])
+                } else {
+                    self.token.extend_from_slice(&bytes[from..at]);
+                    let plain = Self::plain_token(&self.token);
+                    self.token.clear();
+                    plain
+                };
+                if !plain {
+                    return PlainRead::Unsure;
+                }
+                // A token is never the top-level value here: the scan starts at `[`, `{` or `"`.
+                self.expect = CommaOrClose;
+                continue;
+            }
+            if !self.token.is_empty() {
+                // A token the last piece ended in, ended by this piece's first byte.
+                if !Self::plain_token(&self.token) {
+                    return PlainRead::Unsure;
+                }
+                self.token.clear();
+                self.expect = CommaOrClose;
+            }
+            at += 1;
+            match (byte, self.expect) {
+                (b' ' | b'\t' | b'\r' | b'\n', _) => {}
+                (b'"', Value | ValueOrClose) => self.string = 1,
+                (b'"', Key | KeyOrClose) => {
+                    self.string = 1;
+                    self.key = true;
+                }
+                (b'[' | b'{', Value | ValueOrClose) => {
+                    if self.stack.len() >= 100 {
+                        return PlainRead::Unsure;
+                    }
+                    self.stack.push(byte);
+                    self.expect = if byte == b'[' {
+                        ValueOrClose
+                    } else {
+                        KeyOrClose
+                    };
+                }
+                (b':', Colon) => self.expect = Value,
+                (b',', CommaOrClose) => {
+                    self.expect = if self.stack.last() == Some(&b'[') {
+                        Value
+                    } else {
+                        Key
+                    };
+                }
+                (b']', CommaOrClose | ValueOrClose) if self.stack.last() == Some(&b'[') => {
+                    self.stack.pop();
+                    if self.value_done().is_none() {
+                        return PlainRead::Closed(at);
+                    }
+                }
+                (b'}', CommaOrClose | KeyOrClose) if self.stack.last() == Some(&b'{') => {
+                    self.stack.pop();
+                    if self.value_done().is_none() {
+                        return PlainRead::Closed(at);
+                    }
+                }
+                _ => return PlainRead::Unsure,
+            }
+        }
+        PlainRead::Open
+    }
+}
+
+impl JqOpenTail {
+    /// A reader at the first byte of a value.
+    pub fn new() -> Self {
+        let mut parser = Parser::new(1, 0, JQ_MAX_PARSING_DEPTH);
+        parser.multi = true;
+        Self {
+            plain: Some(PlainScan::new()),
+            parser,
+            escape_tail: 0,
+        }
+    }
+
+    /// Reads `text[from..]`: `text` is the value from its first byte, of which the reader has read
+    /// `text[..from]` already. The verdict's offset is in `text`.
+    pub fn read(&mut self, text: &[u8], from: usize) -> TailRead {
+        if let Some(plain) = self.plain.as_mut() {
+            match plain.read(&text[from..]) {
+                PlainRead::Open => return TailRead::Open,
+                PlainRead::Closed(at) => return TailRead::Closed(from + at),
+                PlainRead::Unsure => {
+                    // jq's parser decides, from the value's first byte.
+                    self.plain = None;
+                    return self.read_by_parser(text, 0);
+                }
+            }
+        }
+        self.read_by_parser(text, from)
+    }
+
+    fn read_by_parser(&mut self, text: &[u8], mut at: usize) -> TailRead {
+        let bytes = text;
+        while at < bytes.len() {
+            if self.parser.string_state == 1 && self.escape_tail == 0 {
+                at += plain_string_run(&bytes[at..]);
+                if at == bytes.len() {
+                    break;
+                }
+            }
+            let byte = bytes[at];
+            if self.parser.string_state != 0 {
+                if self.parser.string_state == 2 {
+                    self.escape_tail = 11;
+                } else if self.escape_tail > 0 {
+                    self.escape_tail -= 1;
+                }
+            } else {
+                self.escape_tail = 0;
+            }
+            if self.parser.feed(byte).is_err() {
+                return TailRead::Fault;
+            }
+            at += 1;
+            if self.parser.emitted > 0 {
+                return TailRead::Closed(at);
+            }
+        }
+        TailRead::Open
+    }
+}
+
+impl Default for JqOpenTail {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How many leading bytes of `bytes`, inside a string, are plain: not `"`, `\` and not below `0x20`.
+/// Eight bytes at a time, as a word: a byte below `0x20`, or one equal to either mark, sets the high
+/// bit of its lane in the test.
+fn plain_string_run(bytes: &[u8]) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    let special = |word: u64| {
+        let below = word.wrapping_sub(ONES * 0x20) & !word;
+        let quote = word ^ (ONES * u64::from(b'"'));
+        let slash = word ^ (ONES * u64::from(b'\\'));
+        (below | (quote.wrapping_sub(ONES) & !quote) | (slash.wrapping_sub(ONES) & !slash)) & HIGHS
+    };
+    let mut at = 0;
+    while at + 8 <= bytes.len() {
+        let word = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
+        if special(word) != 0 {
+            break;
+        }
+        at += 8;
+    }
+    while at < bytes.len() && !matches!(bytes[at], b'"' | b'\\' | 0..=0x1f) {
+        at += 1;
+    }
+    at
+}
+
 /// jq's parser reading `chunks` from `(line, column)` without reaching the end of the text (#7024): the
 /// first fault it meets in them (worded as [`jq_stream_fault`] words it), or whether it stands at a
 /// boundary between top-level values once they are read (no container, string, token or value
@@ -980,6 +1341,104 @@ pub fn jq_input_depth_fault<W: AsRef<[u64]>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #7750: [`JqOpenTail`] gives jq's parser's verdict on a value read a piece at a time: the fault,
+    /// the byte the value closes on, or still open, as one parser fed every byte from the first
+    /// answers, over random texts cut into random pieces, both of its readers included.
+    #[test]
+    fn open_tail_reads_pieces_as_jq_parser_reads_the_whole_7750() {
+        fn reference(text: &[u8]) -> TailRead {
+            let mut parser = Parser::new(1, 0, JQ_MAX_PARSING_DEPTH);
+            parser.multi = true;
+            for (at, &byte) in text.iter().enumerate() {
+                if parser.feed(byte).is_err() {
+                    return TailRead::Fault;
+                }
+                if parser.emitted > 0 {
+                    return TailRead::Closed(at + 1);
+                }
+            }
+            TailRead::Open
+        }
+        let atoms: [&[u8]; 34] = [
+            b"[",
+            b"]",
+            b"{",
+            b"}",
+            b",",
+            b":",
+            b" ",
+            b"\n",
+            b"\t",
+            b"\"",
+            b"\\",
+            b"a",
+            b"1",
+            b"-",
+            b"0",
+            b".",
+            b"e",
+            b"+",
+            b"true",
+            b"null",
+            b"fals",
+            b"nan",
+            b"\\u",
+            b"d83d",
+            b"dc00",
+            b"\x01",
+            b"\xc3\xa9",
+            b"\xff",
+            b"\"k\"",
+            b"\"v\"",
+            b"12.5e3",
+            b"[1,2]",
+            b"{\"a\":1}",
+            b"x",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for round in 0..60_000 {
+            let mut text = vec![b"[{\""[round % 3]];
+            if round % 3 == 1 && next(2) == 0 {
+                text.extend_from_slice(b"\"k\":");
+            }
+            for _ in 0..next(14) {
+                // Mostly well-formed: the plain reader's ground, with a stray atom now and then.
+                let atom = if next(4) == 0 {
+                    atoms[next(atoms.len())]
+                } else {
+                    [
+                        &b"1,"[..],
+                        b"\"s\",",
+                        b"[2],",
+                        b"{\"q\":3},",
+                        b"true,",
+                        b" ",
+                    ][next(6)]
+                };
+                text.extend_from_slice(atom);
+            }
+            let want = reference(&text);
+            let mut reader = JqOpenTail::new();
+            let mut from = 0;
+            let mut got = TailRead::Open;
+            while from < text.len() {
+                let to = (from + 1 + next(6)).min(text.len());
+                got = reader.read(&text[..to], from);
+                if got != TailRead::Open {
+                    break;
+                }
+                from = to;
+            }
+            assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&text));
+        }
+    }
 
     /// #7024: the prefix reader stops at the first fault, worded as the whole-stream reader words it,
     /// and otherwise says whether it ends between top-level values.
