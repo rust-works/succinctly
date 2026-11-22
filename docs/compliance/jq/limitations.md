@@ -9457,6 +9457,19 @@ jq's lexer sets the location of every match it makes, whitespace and comments in
 jq 1.8.2 names the same line except where a comment is followed by a newline and more whitespace: its Tcl-style comments (jqlang/jq#2989, listed among the new features of its NEWS.md) end a comment with its newline, so the last whitespace run starts on the next line (`1 + # c` and two newlines is line 1 in jq 1.7.1 and here, line 2 in 1.8.2), and 1.7.1 stays the reference.
 Of 3,000 generated programs (upstream `jq.test` programs cut short, re-spaced and given trailing blank lines and comments), 2,638 are a compile error in both tools, and the first error's line now agrees with jq 1.7.1 in all but 35, none of them a placement at the end: in 33 jq's bison parser and ours stop at different places mid-program, and in 2 jq reads further than our parser does (`. a`, `try . catc`) and stops at the end.
 
+**Closed for a malformed object key (#7716).**
+jq's grammar recovers from a syntax error in an object construction's entry with rules of its own (`MkDictPair: error ':' ExpD`, `MkDict: error ',' MkDict`, `Term: '{' error '}'`), and from one in a destructuring pattern's key with `ObjPat: error ':' Pattern`.
+Bison drops the tokens after the error up to the first one such a rule accepts: at a `:` it reads the value and then fails with `May need parentheses around object key expression`, so `{1+2:3}`, `{.a:1}`, `{a.b:1}`, `{"a"+"b":1}` and `. as {1:$a} | $a` are two errors, the syntax error and that hint.
+`succinctly jq` stopped at the syntax error; it now recovers the same way (`recover_object_entry` in `src/jq/parser.rs`) and parses on, so the errors after it are reported and counted too: `{1:3, 2:4}` is four, `{1} | {2:3}` three, `{1:2} 3` three.
+Bison also reports no syntax error until it has shifted three tokens past the one it resumed at, and that is followed: `{1:}`, `{1}` and `{a:1, 2}` are one error, `{1:2 3}` and `{1:{2:3}}` have no second syntax error (the second has a second hint).
+The syntax errors keep succinctly's wording (the first bullet below); the hint is jq's, on the line of the entry it names.
+A recovery never goes past the parser running out of room: `memory exhausted` ends the parse and is reported whatever recovery is under way, as bison's is (jq 1.7.1 runs out at a few thousand nested objects, this parser where it did before).
+A constant non-string key's error (`Cannot use number (1) as object key`, #5510) is the pair's action in jq too, so it now comes after the errors in the pair's value and is not raised when the value fails: `{(1):{,}}` is the syntax error then the key's, `{(1):}` the syntax error alone.
+What is not followed: an error inside a pair's value that jq recovers from at a bracket of its own (`{1:[2:3]}` is three errors in jq, two here: the value's syntax error stops the parse), or at one of its other recovery rules (`if`, `try`, `.`, `break`), and an error this parser meets inside one of jq's tokens after a value jq has finished (`{..:"s" ..:"s"}`, where `"s" ..` is read as a field access that fails at the second `.`; jq finishes `"s"`, reports its hint, then fails at `..`).
+Over 4,000 generated programs of nested malformed objects, keys and patterns, the errors and their count now agree with jq 1.7.1 on all but 80 (they differed on 2,643 before), and those are of the shapes above.
+jq 1.8.2's parser differs on six of the pinned programs: it reports a hint where 1.7.1 does not in `{1, a:2}` and `{a:1, 2, b:3}`, an extra error in `{1: 2+3 4}` and `{1:2,, a:3}`, and words the syntax error differently in `{a: 1 + 2: 3}` and `{1:[2:3]}`; 1.7.1 stays the reference.
+Pinned by `tests/jq_cli/i7716.rs`, whose rows are jq 1.7.1's errors in order and their lines.
+
 **What remains open, all three narrower than the shape gap:**
 
 - **Message wording is succinctly's own.** A syntax error reads `jq: error: unexpected end of
@@ -9480,8 +9493,11 @@ Of 3,000 generated programs (upstream `jq.test` programs cut short, re-spaced an
   `1 2`, `if then`, `?` gives no consistent rule); the reporter points at the error column
   instead, so where the two differ it is only in trailing whitespace.
 - **jq can report *multiple* compile errors from one malformed filter** (e.g. `if 1 then`
-  → 2 errors); succinctly's parser returns a single `Result<_, ParseError>` and has no
-  architecture for accumulating more than one — a separate, larger gap than the wording.
+  → 2 errors); succinctly's parser stops at the first syntax error, except in an object
+  construction or pattern entry (#7716, above), where it recovers as jq's grammar does. jq's
+  other recovery rules (`'(' error ')'`, `'[' error ']'`, `"if" Exp "then" error` with its
+  `Possibly unterminated 'if' statement`, `"try" Exp "catch" error`, `'.' error`, `BREAK
+  error`) are not followed — a separate, larger gap than the wording.
 
 All four paths now share the same `jq: error:` prefix, the same `jq: N compile error(s)`
 trailer discriminator, and exit 3, so a script that greps or counts `compile error` to tell
