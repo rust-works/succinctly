@@ -11178,6 +11178,10 @@ reads) plus two consequences of the route:
   the member lives in an earlier file**: `-sc '.[0]' bad.json ok.json` names `ok.json`), where
   it used to be the document parser's at `<file>:0`. jq itself has no per-member position
   here: it fails at parse time, with no file in its message.
+  Since [#7754](https://github.com/rust-works/succinctly/issues/7754) a slurp with a file that did not open reports a malformed member it does not read, as jq does.
+  The text is then scanned for jq's first fault anyway, to place the failures (#6485), and a fault before the end of the text is reported as jq's main loop reports it, `jq: parse error: ...`, after the failures before it, without running the program: exit 5, or 2 when a failure came first.
+  Before, `-sc length c.json missing.json one.json` over `[1,x]` printed `2` and exited 0 with nothing on stderr, and a directory in the list (a source with no bytes) made the slurp report a member past it in the evaluator's words or a later fault than jq's first ([#7755](https://github.com/rust-works/succinctly/issues/7755)).
+  With every file open there is no scan, and `-sc length` over `[1,x]` still answers `2`.
 - What the splitter cannot delimit is **unchanged** and still all-or-nothing under `-s` — a
   truncated container or string, a byte that starts no token, a raw control character in a
   string — and `--validate` still checks each file in order first. `1 2 }` and `[1,2` exit 5

@@ -5872,10 +5872,30 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // until the run is past them.
         let mut noted: Vec<(usize, InputFileOpenError)> = Vec::new();
         if args.slurp {
-            report_open_failures(
-                open_failures_reached(&failures, &raw_inputs, &args, false),
-                &mut open_failed,
-            );
+            // #7754, #7755: jq's slurp ends at the first fault of the text, which its main loop
+            // reports as a parse error, after the files its reader met before it: the program
+            // never runs. The scan that places the failures has found that fault, so it is
+            // reported as jq reports it, whatever the program would have read of the array (the
+            // lazy slurp of #2847 reads only that, so `-s length` printed `2` and exited 0 with a
+            // file that did not open after `[1,x]`, and a directory in the list read the members
+            // a fault after it as its own error). A fault at the end of the text is the slurp's
+            // own (#6004), and a run with no failure is not scanned (#7176).
+            // `--seq` reads its records with its own reader, and `--validate` checks each file.
+            let scanned = !failures.is_empty() && !args.validate && !args.seq;
+            let fault = scanned.then(|| first_stream_fault(&raw_inputs)).flatten();
+            // The failures [`open_failures_reached`] names, from the one scan.
+            let reached = match fault {
+                Some((file, false)) => failures.iter().take_while(|&&(at, _)| at <= file).count(),
+                _ if scanned => failures.len(),
+                _ => open_failures_reached(&failures, &raw_inputs, &args, false).len(),
+            };
+            report_open_failures(&failures[..reached], &mut open_failed);
+            if let Some((_, false)) = fault {
+                if let Some(message) = jq::jq_stream_fault(past_stream_bom(&raw_inputs), 1, 0) {
+                    sink.report_parse_error(&message);
+                    return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
+                }
+            }
         }
         let mut next_failure = if args.slurp { failures.len() } else { 0 };
         let mut run_stopped = false;
