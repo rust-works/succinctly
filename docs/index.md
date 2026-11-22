@@ -107,6 +107,7 @@ asserted:
 
 - [compliance/jq/limitations.md](compliance/jq/limitations.md) — jq error-message conformance measured against pinned jq, and the behaviour gaps behind the probes that do not match
 - [compare/jq.md](compare/jq.md) — the generated jq comparison per platform: builtins, CLI probes, jq's own test files, robustness and timings against pinned jq 1.7.1 and 1.8.2 ([how to reproduce it](guides/reproducing-the-jq-comparison.md))
+- [guides/bug-hunting.md](guides/bug-hunting.md) — how to hunt for unknown divergences: what counts as a finding, the known-set check, the differential strategies and their yield, the coverage map of what has been fuzzed clean, and the path from a finding to a merged fix
 - [compliance/yq/limitations.md](compliance/yq/limitations.md) — yq behavioural conformance measured against pinned yq: the deliberate divergences, the open ones, and where the two modes differ on purpose
 - [compliance/yaml/limitations.md](compliance/yaml/limitations.md) — YAML Test Suite conformance (402 cases), unsupported features, and why validation is opt-in
 - [compliance/yaml/1.2.md](compliance/yaml/1.2.md) — YAML 1.2 scalar type resolution: the Norway problem, booleans, quoted numbers
