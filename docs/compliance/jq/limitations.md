@@ -8231,6 +8231,16 @@ A count of zero writes only the atom under it, whose groups keep their numbers: 
 Over 37,067 generated rows (the 24,956 of #7654, #7669 and #7670, and 12,111 of every pair and 4,000 triples of 26 quantifier forms over ten atoms, eight heads, eight tails and the flags none, `g`, `n`, `x`, `l` and `gn`), the rows that differ from jq 1.7.1 went from 2,567 to 1,401, most of the rest being 1.7.1's empty captures (#7520) and the `l` flag's limits.
 Seven rows that matched only by accident now show older faults of the `n` and `l` routes, each of which a pattern without a quantifier run shows too: `"ab" | [match("(a){0}|b"; "n")]` is `[]` here, `"ba" | match("(a?)++$"; "n").captures[0].offset` is `1` (jq `2`), and `"aaa" | match("(a?)+"; "l").captures[0].length` is `3` (jq `0`).
 Pinned by `tests/jq_cli/i7682.rs` and the unit test in `src/jq/onig_quantifier.rs`.
+Since [#7689](https://github.com/rust-works/succinctly/issues/7689) the three answer as in jq: `regex-syntax` gives no minimum length to a pattern with a part that never matches (`[^\s\S]?`, which `(a){0}` is written as), so `n` took `(a){0}|b` for a pattern that cannot match empty, and `fancy-regex`'s optimizer merged `(a?)+` into `(a*)` (see "Regex flags `l` and `n`").
+#7689 also writes three more runs.
+A `{1}` marked lazy or possessive beside another quantifier is dropped with its marker: `(a){1}?++(a)` is `(a)++(a)` as in jq, where the possessive scan refused it, and `(?#c)(a){1}++a` reached the `regex` crate with its comment, which refused it.
+A count of zero after a gap, after a `{1}` or before another count is written on the atom, whose groups keep their capture entries (`(?x)(a?) {0}|b`, `(a|b){1}{0}+a`, `(a)?{0}{2}`).
+A `{1}` on a plain group of characters leaves Oniguruma's string node, the group gone, and a quantifier after it repeats the last character: `"abbbab" | [match("(?:ab){1}*"; "g") | .string]` is `["abbb","ab"]` in jq 1.7.1 and 1.8.2, and was `["ab","","","ab",""]`.
+Only a group of letters, digits and dashes is read so; one with a blank under `x` is a string node to Oniguruma too and keeps the pattern as written: `"abbbab" | [match("(?:a b){1}*"; "gx") | .string]` is `["abbb","ab"]` in jq and `["ab","","","ab",""]` here.
+The #7682 harness was not kept, so #7689 regenerated a net of 34,308 rows (pairs and triples of 26 quantifier forms over 13 atoms, eight heads, ten tails, blank and comment gaps and ten flag sets): the rows that differ from jq 1.7.1 went from 767 to 629, 139 fixed.
+One row that matched by accident now shows the merged `*` loop of the `l` flag: `"aab" | match("(a*){1}?(?#c)+|b"; "ln")` is `(a*)+|b` in jq as here, whose group is at `[2,0]` in jq and at `[0,2]` here, as it was for `(a*)+|b` before.
+Of the 629, 491 are the `l` flag on a lazy quantifier and most of the rest are a group's last iteration on the second engine, both recorded below.
+Pinned by `tests/jq_cli/i7689.rs`.
 yq mode is unchanged: Go's `regexp` rejects the form (`invalid nested repetition operator: `*+``), as yq does.
 
 ## Lookaround and backreferences: a second regex engine (#5502)
@@ -8546,6 +8556,9 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   Without `\K` the one-pass index of [#5563](https://github.com/rust-works/succinctly/issues/5563) is kept.
   The `x` flag works: the anchored copy closes its group on a new line, so that a `#` comment cannot swallow the parenthesis.
   An inline `(?x)` or a flag switched off inside the pattern (`(?-x)`) keeps the search that measures the span `\K` keeps.
+- **`l` reads past an atomic group's first way.**
+  A possessive repeat is an atomic group, and `fancy-regex`'s longest mode does not stop at the way the group commits to: `"aaab" | match("a(|a){1,2}+"; "l")` is `"a"` in jq 1.7.1 and 1.8.2 (the group's first iteration matches empty and ends its loop) and `"aaa"` here ([#7689](https://github.com/rust-works/succinctly/issues/7689)).
+  Pinned by `tests/jq_cli/i7689.rs`.
 - **`l` stays a no-op on a pattern with a lazy quantifier.**
   `fancy-regex`'s longest mode returns the lazy match where Oniguruma returns the longest of all the ways to match: `"aa" | match("a*?";"l")` is `"aa"` in jq and `""` here.
   Such a pattern keeps its old route whole, `n` included, because the two flags are not independent (`ln` is the longest non-empty match anywhere).
@@ -8558,10 +8571,21 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   The `regex` crate kept the last non-empty iteration (`[0,1,"a"]`) until such a loop was rewritten to end with its empty iteration (#6069, the entry below), and with a capture group it still matches `"bcba"` (#6106).
   Without the capture groups the match agrees: `"bcba" | match("b(?:c|(?:|.))*")` is `"bc"` in both since [#6106](#a-loop-ends-at-an-iteration-that-matches-nothing-6106), which leaves a body with a group as written.
   Under `n` the pattern goes to `fancy-regex`, which kept the last non-empty iteration of such a loop (`"a" | match("(a*)*";"n")` had the group at `[0,1]`); since [#7670](https://github.com/rust-works/succinctly/issues/7670) the capture rewrite of #6069 runs there too, and the group is at `[1,0]` as in jq, unless the engine reads the pattern with an atomic group (a possessive quantifier), which the rewrite cannot read.
+  Since [#7689](https://github.com/rust-works/succinctly/issues/7689) a possessive repeat of such a group (`(a?)++`) keeps the empty iteration under `n` too, by the bullet on the optimizer below: `"ba" | match("(a?)++$"; "n").captures[0]` is at `[2,0]`, as in jq.
   A bounded repeat is not rewritten, so under `n` it still keeps the last non-empty iteration: `"a" | match("(a??){1,3}b?";"n")` has the group at `[1,0]` in jq and `[0,1]` here.
   `fancy-regex` also backtracks out of an empty iteration to a longer match, so `"bcba" | match("b(c|(|.))*";"n")` is still `"bcba"`.
   A repeated group with an empty alternative and `n` is another shape: `"ab" | match("(((b)|(|a))){2}";"n")` is `"ab"` in jq, `"a"` here and `"b"` before.
   This predates `l` and `n`, which only move a pattern to the other route.
+- **`fancy-regex`'s optimizer merges a repeated group with the repeat in its body ([#7689](https://github.com/rust-works/succinctly/issues/7689)).**
+  `optimize_nested_repeats` compiles `(a?)+` as `(a*)` and `(a*)*` as `(a*)?`, so the group spans every iteration: `"aaa" | match("(a?)+"; "l").captures[0]` was at `[0,3]`, a span `(a?)` cannot match, where jq 1.7.1 and 1.8.2 have `[3,0]`.
+  The `l` and `n` searches build a pattern that repeats a group whose body is a `?` repeat, and under `n` alone a `*` repeat, with the optimizer off (`fancy_has_merged_group_loop`), and their engine then ends the loop with the empty iteration jq keeps.
+  Under `l` a `*` body keeps the merged loop: unmerged, the longest-match search tries every split of the run, and `("a" * 31 + "!") | test("(a*)*b"; "l")` ran out of budget where jq answers `false`.
+  So `"aaa" | match("(a*)*"; "l").captures[0]` is still at `[0,3]` (jq: `[3,0]`), the last non-empty iteration of the #6069 entry below.
+  A `+` body (`(a+)+`) is merged too and left so, since its one greedy iteration is the whole run.
+  Pinned by `tests/jq_cli/i7689.rs` and `test_empty_reach_and_merged_group_loops_7689`.
+- **`n` reads a pattern with a part that never matches as one that can match empty ([#7689](https://github.com/rust-works/succinctly/issues/7689)).**
+  `regex-syntax` gives such a pattern no minimum length, `[^\s\S]?|b` included, which the `n` route took for one that never matches empty, and the `regex` crate's search then stopped at the first way's empty match: `"ab" | [match("(a){0}|b"; "n")]` was `[]`, where jq finds `b`.
+  Whether a pattern can match empty is now read off its tree.
 - **A search can run out of budget where jq's optimizer does not.**
   `l` and `n` run the backtracking engine on patterns the `regex` crate used to answer in one pass, so a pathological pattern that Oniguruma settles at once can raise `Regex failure: retry-limit-in-match over` here, the budget of the lookaround route (above).
   As in Oniguruma, each start position an `l` search tries has a budget of its own.
@@ -8600,6 +8624,7 @@ What still differs:
 - **A pattern on the `fancy-regex` route.**
   A lookaround, a backreference, the `l` flag, or `$` together with `\z` sends the pattern to `fancy-regex`, which keeps the last non-empty iteration for some of these bodies: `"ab" | match("(?=)(a*)*b")` and `"ab" | match("(a*)*b"; "l")` have `[0,1,"a"]` here, and so does `"ab" | match("(?=)(a?)*b")`, though `"ab" | match("(a?)*b"; "l")` agrees.
   So does the `fancy-regex` reading that settles a tie between the two views of a text that ends in `\n` (#5572, the next entry).
+  A possessive repeat is an atomic group, which sends the pattern there as well, so without `l` or `n` its group keeps the last non-empty iteration: `"aa" | match("(a*)*+$").captures[0]` is at `[0,2]` here and `[2,0]` in jq 1.7.1 and 1.8.2 ([#7689](https://github.com/rust-works/succinctly/issues/7689), pinned by `tests/jq_cli/i7689.rs`; under `l` and `n` it agrees, see "Regex flags `l` and `n`").
   `onig` and `pcre2`, which would end the loop as jq does, fail the portability bar ([ADR-0019](../../adrs/adr-0019.md)'s candidates table).
 - **A body that matches empty only where an assertion holds.**
   `(a|$)*` is not rewritten, because a copy of it could fail where Oniguruma's loop simply stops.
@@ -8627,6 +8652,8 @@ A differential against jq 1.7.1 over 160,000 cases (5,000 generated capture-free
 
 These keep their loop as written, and still match longer than jq where the shape occurs:
 
+- **A loop inside a possessive repeat** ([#7689](https://github.com/rust-works/succinctly/issues/7689)): the atomic group the possessive scan writes is not read by the rewrite, and `fancy-regex` tries the loop's later ways inside it, so `"ba" | match("(?:b|)(b*|a)++$")` is `"ba"` at offset 0 here and the empty match at offset 2 in jq 1.7.1 and 1.8.2, where the first iteration of `b*` that matches nothing ends the loop and the group commits to it.
+  Pinned by `tests/jq_cli/i7689.rs`.
 - **A body with a capture group inside it** is rewritten with the group copied ([#6310](https://github.com/rust-works/succinctly/issues/6310), [#6332](https://github.com/rust-works/succinctly/issues/6332)): `"ba" | [match("(?:b*|(a))+") | .string]` is `["b"]`, as in jq, and so is `"abca" | [match("(?:(a)|b*|c)+") | .string]` (`["ab","","a",""]`).
   So is `"ba" | [match("(b*|(a))+") | .string]`, whose repeated group the capture rewrite of #6069 first writes as a plain loop over the body.
   The rewrite writes the consuming ways before the empty one twice, so a group in one has two copies, and a counted repeat writes its body again for each count.
