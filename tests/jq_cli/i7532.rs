@@ -9,7 +9,7 @@
 //! Every row was captured from jq 1.8.2 (`/opt/homebrew/bin/jq`) on macOS under `TZ=UTC`. The rows
 //! avoid what the C library decides there: no `%Z`/`%z`/`%s`, no date before 1900 (macOS's
 //! `timegm` refuses one, glibc's converts it), and no field that jq 1.8.2's normalising `timegm`
-//! call (jqlang/jq#3203, which succinctly does not follow) would move: every date given is a real
+//! call (jqlang/jq#3203, followed since #7606, `i7606.rs`) would move: every date given is a real
 //! one, and `%a`/`%j` are not printed.
 
 use std::process::Command;

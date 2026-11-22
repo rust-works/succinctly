@@ -4,7 +4,8 @@
 //! or under `--stream-errors` an event `[message, path]`. Before this the flags were ignored under
 //! `--seq`, and the program read the records as documents. A program that reads inputs gets a fault
 //! as the error `input` raises, and `-s` closes its array where jq does. Every expectation was
-//! captured from jq 1.7.1 (`/usr/bin/jq`).
+//! captured from jq 1.7.1 (`/usr/bin/jq`), except where jq 1.8.2 reads past the last newline
+//! (#7718), whose rows are 1.8.2's (`/opt/homebrew/bin/jq`).
 
 use anyhow::Result;
 
@@ -38,13 +39,13 @@ const ROWS: &[Row] = &[
     ("null", &["-c", "--seq", "--stream"], ".", "", "jq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 4\n", 0),
     ("\u{1e}12", &["-c", "--seq", "--stream"], ".", "\u{1e}[[],12]\n", "", 0),
     ("\u{1e}[1]\n\u{1e}\u{1e}[2]\n", &["-c", "--seq", "--stream"], ".", "\u{1e}[[0],1]\n\u{1e}[[0]]\n\u{1e}[[0],2]\n\u{1e}[[0]]\n", "", 0),
-    ("\u{1e}[1]\n\u{1e}[2", &["-c", "--seq", "--stream"], ".", "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
+    ("\u{1e}[1]\n\u{1e}[2", &["-c", "--seq", "--stream"], ".", "\x1e[[0],1]\n\x1e[[0]]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 3\n", 0),
     ("null", &["-c", "--seq", "--stream-errors"], ".", "\u{1e}[\"Unfinished abandoned text at EOF at line 1, column 4\",[]]\n", "", 0),
     ("\u{1e}[1,]\n\u{1e}[2]\n", &["-c", "--seq", "--stream-errors"], ".", "\u{1e}[[0],1]\n\u{1e}[\"Expected another array element at line 1, column 5 (need RS to resync)\",[1]]\n\u{1e}[[0],2]\n\u{1e}[[0]]\n", "", 0),
     ("\u{1e}[1,2\u{1e}[3]\n", &["-c", "--seq", "--stream-errors"], ".", "\u{1e}[[0],1]\n\u{1e}[\"Truncated value at line 1, column 6\",[1]]\n\u{1e}[[0],3]\n\u{1e}[[0]]\n", "", 0),
     ("\u{1e}[1,\n\u{1e}{\"a\":2}\n", &["-c", "--seq", "--stream-errors", "-s"], "length", "\u{1e}4\n", "", 0),
     ("\u{1e}[1,]\n\u{1e}[2]\n", &["-c", "--seq", "--stream-errors", "-s"], ".", "\u{1e}[[[0],1],[\"Expected another array element at line 1, column 5 (need RS to resync)\",[1]],[[0],2],[[0]]]\n", "", 0),
-    ("\u{1e}[1]\n\u{1e}[2", &["-c", "--seq", "--stream-errors"], ".", "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
+    ("\u{1e}[1]\n\u{1e}[2", &["-c", "--seq", "--stream-errors"], ".", "\x1e[[0],1]\n\x1e[[0]]\n\x1e[\"Unfinished JSON term at EOF at line 2, column 3\",[0]]\n", "", 0),
     ("\u{1e}[1]\n\u{1e}[2\n", &["-c", "--seq", "--stream-errors"], ".", "\u{1e}[[0],1]\n\u{1e}[[0]]\n\u{1e}[\"Unfinished JSON term at EOF at line 3, column 0\",[0]]\n", "", 0),
     ("\u{1e}[1,]\n\u{1e}[2]\n", &["-c", "--seq", "--stream", "-n"], "[inputs]", "", "jq: error (at <stdin>:1): Expected another array element at line 1, column 5 (need RS to resync)\n", 5),
     ("\u{1e}[1,]\n\u{1e}[2]\n", &["-c", "--seq", "--stream", "-n"], "try input catch .", "\u{1e}[[0],1]\n", "", 0),
@@ -56,9 +57,10 @@ const ROWS: &[Row] = &[
     ("\u{1e}[1]\n\u{1e}[2", &["-c", "--seq", "--stream", "-s"], ".", "\u{1e}[[[0],1],[[0]]]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 3\n", 0),
     ("\u{1e}[1]\n\u{1e}[2]\n", &["-c", "--seq", "--stream", "-s"], "input_line_number", "\u{1e}2\n", "", 0),
     ("\u{1e}1.5x}[1]", &["-c", "--seq", "--stream", "-s"], "length", "\u{1e}2\n", "jq: ignoring parse error: Invalid numeric literal at line 1, column 6 (need RS to resync)\n", 0),
-    ("\u{1e}[1,2]", &["-c", "--seq", "--stream", "-s"], ".", "\u{1e}[[[0],1],[[1],2]]\n\u{1e}[[1]]\n", "", 0),
+    ("\u{1e}[1,2]", &["-c", "--seq", "--stream", "-s"], ".", "\x1e[[[0],1],[[1],2],[[1]]]\n", "", 0),
     ("\u{1e}[1,", &["-c", "--seq", "--stream", "-s"], ".", "\u{1e}[[[0],1]]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 4\n", 0),
-    ("\u{1e}[1,", &["-c", "--seq", "--stream", "-s"], "error", "", "jq: error (at <stdin>:0) (not a string): [[[0],1]]\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 4\n", 5),
+    // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
+    ("\u{1e}[1,", &["-c", "--seq", "--stream", "-s"], "error", "", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 4\njq: error (at <stdin>:0) (not a string): [[[0],1]]\n", 5),
     ("\u{1e}[1]\u{1e}", &["-c", "--seq", "--stream"], ".", "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "", 0),
     ("\u{1e}\"ab\u{1e}[1]\n", &["-c", "--seq", "--stream"], ".", "\u{1e}[[0],1]\n\u{1e}[[0]]\n", "jq: ignoring parse error: Invalid numeric literal at line 1, column 5\n", 0),
     ("\u{1e}[\"ab\u{1e}1]\n", &["-c", "--seq", "--stream"], ".", "", "jq: ignoring parse error: Truncated value at line 1, column 6\njq: ignoring parse error: Unmatched ']' at the top-level at line 1, column 8 (need RS to resync)\n", 0),
@@ -86,7 +88,9 @@ const BOM_ROWS: &[(&[u8], &[&str], &str, &str)] = &[
     (b"\xef\xbb\xbf\x1e[1]\n", &["-c", "--seq", "--stream", "."], "\u{1e}[[0],1]\n\u{1e}[[0]]\n", ""),
     (b"\xef\xbb\x1e[1]\n", &["-c", "--seq", "--stream", "."], "\u{1e}[[0],1]\n", ""),
     (b"\xef\x1e[1]\n\x1e[2]\n", &["-c", "--seq", "--stream", "."], "\u{1e}[[0],1]\n\u{1e}[[0],2]\n", ""),
-    (b"\xef\xbb1 2", &["-c", "--seq", "--stream", "."], "\u{1e}[[],1]\n\u{1e}[[],2]\n", ""),
+    // jq 1.8.2's empty last call wipes the `2` still waiting for the byte after it (#7718); jq 1.7.1
+    // gave it out.
+    (b"\xef\xbb1 2", &["-c", "--seq", "--stream", "."], "\u{1e}[[],1]\n", ""),
     (b"\xef\xbb\x1e[1]\n\x1e[2]\n", &["-c", "--seq", "--stream-errors", "-s", "."], "\u{1e}[[[0],1],[[0],2]]\n", ""),
     (b"\xef\xbb1.5r[]]:\xef\xbbtrx][][ \n", &["-c", "--seq", "--stream", "-s", "length"], "\u{1e}1\n", "jq: ignoring parse error: Invalid numeric literal at line 1, column 5 (need RS to resync)\njq: ignoring parse error: Unmatched ']' at the top-level at line 1, column 6 (need RS to resync)\njq: ignoring parse error: Unmatched ']' at the top-level at line 1, column 7 (need RS to resync)\njq: ignoring parse error: ':' not as part of an object at line 1, column 8 (need RS to resync)\njq: ignoring parse error: Invalid numeric literal at line 1, column 14 (need RS to resync)\n"),
 ];

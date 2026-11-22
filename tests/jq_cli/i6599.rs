@@ -3,7 +3,10 @@
 //! met in a file before it stops the program first (exit 5, the failure never reported). A fault
 //! names the file it was met in, and one at the end of the text is raised at a last file that did not
 //! open. No main loop reads the stream under `-n`, so no failure loses the array: a fault the slurp's
-//! own call did not meet comes after it. Every row was captured from jq 1.7.1.
+//! own call did not meet comes after it. Every row was captured from jq 1.7.1, which jq 1.8.2
+//! agrees with, except the three over `defer` (`\x1e1{`): jq 1.7.1 raised its EOF report after the
+//! array, jq 1.8.2 before it, as its slurp reads to the end first, and `succinctly jq` follows 1.8.2
+//! since #7718 (those rows are 1.8.2's).
 
 use anyhow::Result;
 
@@ -100,9 +103,9 @@ fn a_fault_at_the_end_of_the_text_is_raised_at_a_missing_last_file_6599() -> Res
 #[test]
 fn no_failure_loses_the_array_under_null_input_6599() -> Result<()> {
     check(&[
-        (FOUR, &["gone", "defer"], "\u{1e}[[1],\"Unfinished JSON term at EOF at line 1, column 3\",\"break\",\"break\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
-        (FOUR, &["s2", "gone", "defer"], "\u{1e}[[[1],[2],1],\"Unfinished JSON term at EOF at line 3, column 3\",\"break\",\"break\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
-        (FOUR, &["defer"], "\u{1e}[[1],\"Unfinished JSON term at EOF at line 1, column 3\",\"break\",\"break\"]\n", "", 0),
+        (FOUR, &["gone", "defer"], "\u{1e}[\"Unfinished JSON term at EOF at line 1, column 3\",[1],\"break\",\"break\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (FOUR, &["s2", "gone", "defer"], "\u{1e}[\"Unfinished JSON term at EOF at line 3, column 3\",[[1],[2],1],\"break\",\"break\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
+        (FOUR, &["defer"], "\u{1e}[\"Unfinished JSON term at EOF at line 1, column 3\",[1],\"break\",\"break\"]\n", "", 0),
         (FOUR, &["s2", "defer", "gone"], "\u{1e}[\"Unfinished JSON term at EOF at line 3, column 3\",[[1],[2],1],\"break\",\"break\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (FOUR, &["trunc", "gone", "s2"], "\u{1e}[\"Truncated value at line 2, column 1\",[[1],[2]],\"break\",\"break\"]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
     ])
