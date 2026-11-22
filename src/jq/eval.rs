@@ -6253,6 +6253,25 @@ pub(crate) fn streams_escaped_generator_prefix<S: EvalSemantics>() -> bool {
     S::TAG != EvalTag::Yq
 }
 
+/// Whether the eager `E[K]` (`eval_index_expr`, both evaluators) runs its target depth-first
+/// through the demand-driven `each_index_expr` instead (#7572): jq mode, a target that can fan
+/// out, and one with an effect or a read of the input state ([`stage_may_have_effect`], the
+/// pipe's #4293 rule). `inputs[.]` then indexes each input as it is read, as jq does, so an index
+/// error names the line of the input it raised on and leaves the rest unread. Every other target
+/// keeps the eager fold, which keeps a document's nodes borrowed; `repeat` keeps it too, for the
+/// iteration cap only that route has ([`streams_unbounded`]).
+///
+/// `S::TAG == EvalTag::Jq` is the condition under which `each_index_expr` (and its generic twin)
+/// pulls a fanning target itself rather than calling back into `eval_index_expr`, so the two
+/// cannot recurse into each other.
+pub(crate) fn index_target_runs_depth_first<S: EvalSemantics>(target: &Expr) -> bool {
+    S::TAG == EvalTag::Jq
+        && S::PIPE_EFFECTS_RUN_DEPTH_FIRST
+        && !yields_at_most_one_value(target)
+        && !streams_unbounded(target)
+        && stage_may_have_effect(target)
+}
+
 /// The one definition of the four-step tail every indexing-like construct's
 /// *target* `Partial` arm runs: gate on [`streams_escaped_generator_prefix`]
 /// (yq escapes immediately, discarding the prefix), promote the running
@@ -8255,6 +8274,14 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Builtin(Builtin::PathsFilter(f)) => {
             each_paths_filter::<W, S>(f, value, optional, sink)
         }
+        // #7463: `fromstream` and `truncate_stream` hand each value on as its events arrive, so
+        // `first(fromstream(inputs))` stops reading the input at the first value, where the
+        // collecting builtins read all of it first (2 GB for a 52 MB array, and never an end on
+        // an endless pipe).
+        Expr::Builtin(Builtin::FromStream(f)) => each_fromstream::<W, S>(f, value, optional, sink),
+        Expr::Builtin(Builtin::TruncateStream(f)) => {
+            each_truncate_stream_of::<W, S>(f, value, optional, sink)
+        }
         // #1459 (Stage 4): the demand-aware twin of `eval_compare`'s fanout.
         // [`binary_fanout_each`] owns the loop order; passing `eval_each` as
         // the operand strategy is what makes the *right* operand — jq's outer
@@ -8941,6 +8968,8 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut bound_any = false;
     let previous = yq_read_only_context::active();
     let source_scope = yq_as_source_scope::<S>();
+    // #7471: a body that does not read `$var` is evaluated as it is.
+    let reads_var = as_body_reads_var(body, var);
     let flow = fanout_arg_each_with_origin::<W, S, _>(
         expr,
         value.clone(),
@@ -8959,6 +8988,9 @@ fn each_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `break` included.
             let _embed =
                 super::eval_generic::embed_table_push::<S>(origin.as_ref(), &mut bound_val);
+            if !reads_var.reads {
+                return eval_each::<W, S>(body, value.clone(), optional, sink);
+            }
             let substituted_body =
                 substitute_bound_var_from::<S>(expr, body, var, &bound_val, origin);
             eval_each::<W, S>(&substituted_body, value.clone(), optional, sink)
@@ -9954,7 +9986,11 @@ where
     // recursion, as in `f(n - 1) as $a | f(n - 2) as $b | $a + $b` -- does
     // not run on top of the source's own frames. See
     // `settles_before_consumer`.
-    let flow = if settles_before_consumer(arg_expr) {
+    // #7460: so is a call whose body answers once (`tail_call::call_head_settles`), which reaches
+    // the shapes a recursion threads its state through (`Q(n - 1) as $q1 | ...`).
+    let flow = if settles_before_consumer(arg_expr)
+        || (S::TAG == EvalTag::Jq && super::tail_call::call_head_settles(arg_expr, true))
+    {
         settle_then_replay(
             |collect| eval_each::<W, S>(arg_expr, value, optional, collect),
             &mut on_item,
@@ -11233,7 +11269,16 @@ fn eval_each_pipe<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 }
             }
         };
-        eval_each::<W, S>(first, value, optional, &mut driver)
+        // #7460: a call that settles runs to its one value before the rest of the pipe runs on it,
+        // so a recursion piping one call into the next holds its depth on the stack, not its calls.
+        if S::TAG == EvalTag::Jq && super::tail_call::call_head_settles(first, true) {
+            settle_then_replay(
+                |collect| eval_each::<W, S>(first, value, optional, collect),
+                &mut driver,
+            )
+        } else {
+            eval_each::<W, S>(first, value, optional, &mut driver)
+        }
     };
 
     pipe_terminal_after_retry(
@@ -15569,6 +15614,8 @@ fn closed_expr_shape(expr: &Expr) -> bool {
         | Expr::And(left, right)
         | Expr::Or(left, right)
         | Expr::Alternative(left, right) => closed_expr_shape(left) && closed_expr_shape(right),
+        // #7563: `-$i`, its operand closed.
+        Expr::Negate(inner) => closed_expr_shape(inner),
         // #6574: `if C then A else B end`, all three closed (an `elif` is a nested `if`).
         Expr::If {
             cond,
@@ -15696,6 +15743,25 @@ fn closed_if_to_owned<S: EvalSemantics>(
         else_branch
     };
     closed_expr_to_owned_at_depth::<S>(branch, depth + 1, escaped)
+}
+
+/// [`closed_expr_to_owned_node`]'s `Negate` arm (#7563): `-E` of a closed `E` is [`arith_negate`]
+/// of its one value, the evaluator's own negation. A fold that writes `.[-$i]` reads its key here:
+/// without the arm the key was evaluated on a re-indexed copy of the whole accumulator, twice per
+/// step. An operand that is not a number raises, which declines to the evaluator's route and text.
+/// Its own function, not inline in the arm, for the reason [`closed_index_expr`] gives.
+#[inline(never)]
+fn closed_negate_to_owned<S: EvalSemantics>(
+    inner: &Expr,
+    depth: usize,
+    escaped: &mut bool,
+) -> Option<OwnedValue> {
+    arith_negate::<S>(closed_expr_to_owned_at_depth::<S>(
+        inner,
+        depth + 1,
+        escaped,
+    )?)
+    .ok()
 }
 
 /// [`closed_expr_to_owned_node`]'s `Pipe` arm: a closed head, then each later stage answered
@@ -15882,6 +15948,10 @@ fn closed_expr_to_owned_node<S: EvalSemantics>(
             else_branch,
         } if S::TAG == EvalTag::Jq => {
             closed_if_to_owned::<S>(cond, then_branch, else_branch, depth, escaped)
+        }
+        // #7563: `-$i` with `$i` spliced in; see [`closed_negate_to_owned`]. jq mode only.
+        Expr::Negate(inner) if S::TAG == EvalTag::Jq => {
+            closed_negate_to_owned::<S>(inner, depth, escaped)
         }
         // `[$x]` is a *bare* element inside `Expr::Array`: the parser only
         // adds `Expr::Comma` when a `,` is present (#2152).
@@ -16220,8 +16290,8 @@ fn owned_assign_step<S: EvalSemantics>(
     // `.i += 1` loop ~6% of its instructions.
     match owned_assign_single_step::<S>(path, state) {
         SingleStep::Unclosed => None,
-        SingleStep::Step(key) => {
-            let old = owned_assign_step_child(&key, state)?;
+        SingleStep::Step(mut key) => {
+            let old = owned_write_child::<S>(&mut key, state)?;
             // #5273: `+` onto a container the slot holds, with the slot's own handle, so the
             // array, object or string grows where it is instead of being copied.
             if S::TAG == EvalTag::Jq && owned_grows_in_place(old, &rhs) {
@@ -16259,8 +16329,8 @@ fn owned_assign_step<S: EvalSemantics>(
                 return None;
             }
             let mut old: &OwnedValue = state;
-            for step in &steps {
-                old = owned_assign_step_child(step, old)?;
+            for step in &mut steps {
+                old = owned_write_child::<S>(step, old)?;
             }
             if S::TAG == EvalTag::Jq && owned_grows_in_place(old, &rhs) {
                 let (OwnedAssignRhs::Combine(_, right) | OwnedAssignRhs::DefaultCombine(_, right)) =
@@ -16664,6 +16734,11 @@ fn owned_state_expr_shape_in(expr: &Expr, calls: bool) -> bool {
             else_branch,
         } => shape(cond) && shape(then_branch) && shape(else_branch),
         Expr::Builtin(Builtin::ToString | Builtin::Type) => true,
+        // #7473: `"k\(.i)"`, each slot one value, so the string is one.
+        Expr::StringInterpolation(parts) => parts.iter().all(|part| match part {
+            StringPart::Literal(_) => true,
+            StringPart::Expr(inner) => shape(inner),
+        }),
         // #6122: `map(.a)`, `map(.a.b)`, `map(.[0])` is one array and no effect: one output per
         // element from static steps, which [`eval_owned_map_projection`] reads off the tree, or
         // raises on, and a raise declines the write to the evaluator's own route and text.
@@ -16823,8 +16898,79 @@ fn owned_state_scalar_direct<S: EvalSemantics>(
     if let Some(length) = owned_state_length_direct::<S>(expr, state) {
         return Some(length);
     }
+    if is_state_text_shape(expr) {
+        return owned_state_text_direct::<S>(expr, state);
+    }
     let value = eval_owned_pure::<S>(expr, state, ResultPosition::Operand)?.ok()?;
     owned_scalar_spelled_the_same(&value).then_some(value)
+}
+
+/// A string built from scalars read off the state (#7473), for [`owned_state_scalar_direct`]: a
+/// string interpolation whose every slot is such a scalar (`"k\(.i)"`, `"\(.a)-\(.b + 1)"`), or
+/// `READ | tostring` of one (`.i | tostring`). Each slot is rendered by [`owned_to_string`] and
+/// `tostring` by [`tostring_text`], the texts the evaluator's own interpolation and `tostring` make
+/// of a scalar. A loop that keys its state by one (`until(..; .p["k\(.i)"] = 1 | .i += 1)`,
+/// `(.i | tostring) as $k | .p[$k] = ..`) read the key on a re-indexed copy of the whole state,
+/// or declined the round to the evaluator's route, every round: quadratic in the rounds where jq
+/// is linear. Asked only of an [`is_state_text_shape`] expression; `None` is a slot or a read that
+/// is not such a scalar (a container, a read that raises), which declines to the caller's route.
+fn owned_state_text_direct<S: EvalSemantics>(
+    expr: &Expr,
+    state: &OwnedValue,
+) -> Option<OwnedValue> {
+    match unwrap_paren(expr) {
+        Expr::StringInterpolation(parts) => owned_state_interpolation_direct::<S>(parts, state),
+        Expr::Pipe(stages) => match stages.split_last() {
+            Some((_, reads)) => {
+                // A read of static steps is borrowed off the tree, as `length`'s is
+                // ([`owned_state_length_direct`]); a lone computed read is a scalar of its own.
+                let borrowed = reads.iter().try_fold(state, |at, read| {
+                    owned_assign_step_child(&static_step(unwrap_paren(read))?, at)
+                });
+                let value = match (borrowed, reads) {
+                    (Some(value), _) => owned_scalar_spelled_the_same(value).then(|| value.clone()),
+                    (None, [read]) => owned_state_scalar_direct::<S>(read, state),
+                    (None, _) => None,
+                };
+                value.map(|value| match value {
+                    OwnedValue::String(_) => value,
+                    other => OwnedValue::String(tostring_text::<S>(&other, false).into()),
+                })
+            }
+            None => None,
+        },
+        _ => None,
+    }
+}
+
+/// The shapes [`owned_state_text_direct`] answers: a string interpolation, or a pipe of one or more
+/// reads ending in `tostring`.
+fn is_state_text_shape(expr: &Expr) -> bool {
+    match unwrap_paren(expr) {
+        Expr::StringInterpolation(_) => true,
+        Expr::Pipe(stages) => stages.split_last().is_some_and(|(last, reads)| {
+            !reads.is_empty() && matches!(unwrap_paren(last), Expr::Builtin(Builtin::ToString))
+        }),
+        _ => false,
+    }
+}
+
+/// [`owned_state_text_direct`]'s string interpolation: each slot a scalar read off the state, or
+/// `None`.
+fn owned_state_interpolation_direct<S: EvalSemantics>(
+    parts: &[StringPart],
+    state: &OwnedValue,
+) -> Option<OwnedValue> {
+    let mut text = String::new();
+    for part in parts {
+        match part {
+            StringPart::Literal(literal) => text.push_str(literal),
+            StringPart::Expr(inner) => text.push_str(&owned_to_string::<S>(
+                &owned_state_scalar_direct::<S>(inner, state)?,
+            )),
+        }
+    }
+    Some(OwnedValue::String(text.into()))
 }
 
 /// `length`, or `READ | length` with `READ` a pure read ([`eval_owned_pure`]), of a container, a
@@ -16970,6 +17116,47 @@ fn owned_assign_step_child<'v>(
         (StepKey::Index(idx), OwnedValue::Array(items)) => {
             let idx = usize::try_from(*idx).ok()?;
             (idx <= items.len()).then(|| items.get(idx).unwrap_or(&OwnedValue::Null))
+        }
+        _ => None,
+    }
+}
+
+/// [`owned_assign_step_child`] for the step a write takes, widened in jq mode to the two index
+/// steps jq resolves rather than refuses (#7563, #7452): a negative index into an array, which
+/// counts back from its end, and an index past the end of an array or into `null`, which pads
+/// with `null`s. The write itself is [`set_index`]/[`set_path`]'s, which resolve and pad exactly
+/// so (both are [`write_index`]); declining them sent every fold step that wrote one
+/// (`reduce .. ([range(n)]; .[-$i] = $i)`, `reduce .. ([]; .[$t][799] = 1)`) through the
+/// re-index bridge, which copied the whole accumulator, so the fold was quadratic.
+///
+/// A negative `step` is rewritten to the index it names (`len + idx`), so that every later use of
+/// it -- the slot a `+` grows ([`owned_slot_mut`]) and the write -- names that same slot. An index
+/// still negative after counting back is jq's `Out of bounds negative array index`, a negative
+/// index into `null` is too, and a padding index that would grow an array past
+/// [`MAX_PADDED_ARRAY_LEN`] is refused by the write: each declines, so the evaluator raises it
+/// with its own rules (`?` does not suppress the first). jq reads `null` at a slot a write pads
+/// to, which is what `|=`, `+=` and `//=` see as the old value there. yq mode keeps the narrow
+/// gate: its index writes are the evaluator's (see [`owned_assign_new_value`]).
+fn owned_write_child<'v, S: EvalSemantics>(
+    step: &mut StepKey<'_>,
+    container: &'v OwnedValue,
+) -> Option<&'v OwnedValue> {
+    if let Some(child) = owned_assign_step_child(step, container) {
+        return Some(child);
+    }
+    let (EvalTag::Jq, StepKey::Index(idx)) = (S::TAG, &mut *step) else {
+        return None;
+    };
+    match container {
+        OwnedValue::Array(items) if *idx < 0 => {
+            let at = usize::try_from(items.len() as i64 + *idx).ok()?;
+            *idx = at as i64;
+            items.get(at)
+        }
+        OwnedValue::Array(_) | OwnedValue::Null
+            if usize::try_from(*idx).is_ok_and(|at| at < MAX_PADDED_ARRAY_LEN) =>
+        {
+            Some(&OwnedValue::Null)
         }
         _ => None,
     }
@@ -21329,7 +21516,7 @@ fn eval_builtin<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Builtin::Trunc => builtin_trunc::<W, S>(value, optional),
 
         // Phase 19: Type conversion
-        Builtin::ToBoolean => builtin_toboolean::<W>(value, optional),
+        Builtin::ToBoolean => builtin_toboolean::<W, S>(value, optional),
 
         // Phase 20: Iteration control extension
         Builtin::Skip(n_expr, expr) => builtin_skip::<W, S>(n_expr, expr, value, optional),
@@ -21434,6 +21621,11 @@ fn builtin_length<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     (None, None) => String::from_utf8_lossy(n.raw_bytes()).chars().count(),
                 };
                 QueryResult::Owned(OwnedValue::Int(width as i64))
+            } else if let Some(length) = (S::TAG == EvalTag::Jq)
+                .then(|| jq_literal_length(OwnedValue::from_json_number::<S>(n)))
+                .flatten()
+            {
+                QueryResult::Owned(length)
             } else if let Ok(i) = n.as_i64() {
                 QueryResult::Owned(numeric_length_owned::<S>(OwnedValue::Int(i)))
             } else if let Ok(f) = json_number_f64::<S>(n) {
@@ -21773,16 +21965,15 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // the full argument, including what deferring this would also require
     // of `eval_as`.
     let key_owned = to_owned_or_suppress!(&value, optional);
-    let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
-    // `key_owned` doesn't change across `candidates`, so this is computed
+    // `key_owned` doesn't change across the candidates, so this is computed
     // once rather than once per candidate (#909 review). Semantics-aware --
     // see `numeric_key_to_array_index`'s own doc comment for why yq mode
     // doesn't just truncate a Float key the way jq does.
     let key_idx = numeric_key_to_array_index::<S>(&key_owned);
 
-    let mut results: Vec<OwnedValue> = vec_with_capacity(candidates.len());
+    let mut results: Vec<OwnedValue> = Vec::new();
     let mut check_escape: Option<EvalEscape> = None;
-    for obj_owned in candidates {
+    let mut check = |obj_owned: OwnedValue| -> Demand {
         match (&key_owned, &obj_owned) {
             (OwnedValue::String(key), OwnedValue::Object(fields)) => {
                 results.push(OwnedValue::Bool(fields.keys().any(|k| k == key)));
@@ -21823,10 +22014,30 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     obj_owned.type_name(),
                     key_owned.type_name(),
                 )));
+                return Demand::Stop;
+            }
+        }
+        Demand::Continue
+    };
+    // #7572: jq mode checks each candidate as `xs` produces it, as jq's `. as $x | xs | has($x)`
+    // pipe does, so a mismatch stops `xs` there: collecting every candidate first ran
+    // `in(inputs)` over the whole input before its first check raised. yq mode keeps the
+    // collected candidates, as its pipes do (`PIPE_EFFECTS_RUN_DEPTH_FIRST`).
+    let xs_escape = if S::PIPE_EFFECTS_RUN_DEPTH_FIRST {
+        match eval_each_owned::<S>(obj_expr, &key_owned, false, Reentry::REBUILT, &mut check) {
+            // A stop is the check's own escape, which `check_escape` holds and which comes first.
+            Flow::Exhausted | Flow::Stopped { .. } => None,
+            Flow::Escaped(control) => Some(EvalEscape::from(control)),
+        }
+    } else {
+        let (candidates, xs_escape) = eval_owned_multi_keep_partial::<S>(obj_expr, &key_owned);
+        for candidate in candidates {
+            if check(candidate) == Demand::Stop {
                 break;
             }
         }
-    }
+        xs_escape
+    };
 
     // `check_escape` (a type mismatch on an already-produced candidate)
     // always precedes `xs_escape` (whatever ended `xs`'s own stream after
@@ -24579,7 +24790,14 @@ fn builtin_reverse<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// so the two cannot drift on what "empty" means (`0` and `0.0` both are;
 /// jq's `length` of a number is its absolute value, so `-0` is too).
 pub(crate) fn reverse_length_is_empty(length: &OwnedValue) -> bool {
-    matches!(length, OwnedValue::Int(0)) || matches!(length, OwnedValue::Float(f) if *f == 0.0)
+    // #7534: `length` of a literal is a literal (`0.0 | length` is the literal `0.0`, `1e-400 |
+    // length` the literal `1E-400`), and `range(0;length)` reads its double.
+    match length {
+        OwnedValue::Int(0) => true,
+        OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f == 0.0,
+        OwnedValue::NumberLiteral(NumberRepr::Int(0), _) => true,
+        _ => false,
+    }
 }
 
 /// jq's own `length`, computed directly on an already-materialized
@@ -26198,6 +26416,35 @@ fn bridge_integral_float_rendering(text: &[u8]) -> bool {
         let digits = number.strip_prefix(b"-").unwrap_or(number);
         digits.len() > 16 && digits.iter().all(u8::is_ascii_digit)
     })
+}
+
+/// jq 1.8.2's `length` of a number that still carries its literal (#7534): `decNumberAbs` of the
+/// decimal, so the literal keeps every digit (`-100000000000000000001 | length` is
+/// `100000000000000000001`, `1E-400 | length` is `1E-400`, `1.50 | length` is `1.50`), and a zero
+/// of either sign is a positive zero with its spelling otherwise kept (`-0.0 | length` is `0.0`).
+/// jq 1.7.1 took `fabs` of the double (`1e+20`, `0`, `1.5`); upstream fixed that in jqlang/jq#3275
+/// ("Preserve numerical precision on `length/0`"), the `length` half of the #3242 fix that
+/// [`arith_negate`] follows for unary minus (#7453). `None` for a number with no literal (a
+/// computed one, which keeps [`numeric_length_owned`]'s double) and for a NaN. jq mode only: yq's
+/// `length` of a number measures its text.
+pub(crate) fn jq_literal_length(number: OwnedValue) -> Option<OwnedValue> {
+    let OwnedValue::NumberLiteral(repr, text) = number else {
+        return None;
+    };
+    match repr {
+        NumberRepr::Float(f) if f.is_nan() => return None,
+        // An integer a double holds exactly prints the same either way (`007` and `-00` print as
+        // `7` and `0` as literals too), so it stays the plain `Int` the double's rule gives.
+        NumberRepr::Int(i) if jq_int_within_exact_f64_range(i) => {
+            return Some(OwnedValue::Int(i.abs()));
+        }
+        _ => {}
+    }
+    if !text.starts_with('-') {
+        return Some(OwnedValue::NumberLiteral(repr, text));
+    }
+    let (repr, text) = crate::jq::value::jq_negated_literal(repr, &text)?;
+    Some(OwnedValue::NumberLiteral(repr, text.into()))
 }
 
 /// `Builtin::Length` of a materialized (cursor-less) number: jq's own
@@ -29200,8 +29447,9 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // a doubled one, or one behind whitespace, is refused. The errors below still name `s`, BOM
     // and all, as jq does.
     //
-    // `tonumber` passes jq's parser a C string, so a NUL ends the text it sees (`"1\u00002" |
-    // tonumber` is 1); `fromjson`, which passes a length, does not (#5309).
+    // jq 1.7.1 passes its parser a C string, so a NUL ended the text it saw (`"1\u00002" |
+    // tonumber` was 1); jq 1.8.2 refuses a string with a NUL in it (jqlang/jq#3496, #7521).
+    // `fromjson`, which passes a length, never stopped there (#5309).
     // yq reads the text with `parseInt64` and keeps it as the node's value: `"0x10" | tonumber`
     // prints `0x10` and `"007"` `007`, while the JSON writers print the number (#1356).
     if yq_mode {
@@ -29216,19 +29464,18 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
             return Ok(OwnedValue::NumberLiteral(NumberRepr::Float(f), s.into()));
         }
     }
-    let c_text = if yq_mode {
-        s
-    } else {
-        s.split('\0').next().unwrap_or(s)
-    };
+    if !yq_mode && s.contains('\0') {
+        return Err(EvalError::cannot_parse_as_number(&OwnedValue::String(
+            s.to_string().into(),
+        )));
+    }
     let trimmed = if yq_mode {
         s
     } else {
         // jq's parser skips only space, tab, CR and LF, not the Unicode whitespace `trim`
         // knows (`"\u000b1" | tonumber` is refused).
-        c_text
-            .strip_prefix('\u{feff}')
-            .unwrap_or(c_text)
+        s.strip_prefix('\u{feff}')
+            .unwrap_or(s)
             .trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
     };
     // jq reads a bare trailing dot as the integer (`"99999999999999999." | tonumber` is
@@ -29382,11 +29629,12 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
     // returned above with its own grammar (#2960).
     // A NaN is a new parse instance (#3309): `"NaN" | tonumber as $x |
     // $x == $x` is `true` in jq, while two `tonumber` runs never agree.
+    // An infinity is a literal too (#7469): `"Infinity" | tonumber > 1e1000` is `true` in jq.
     if let Some(f) = crate::json::validate::jq_special_number(trimmed.as_bytes()) {
         return Ok(if f.is_nan() {
             OwnedValue::fresh_nan_instance(f.is_sign_negative())
         } else {
-            OwnedValue::Float(f)
+            OwnedValue::parsed_infinity(f.is_sign_negative())
         });
     }
     // What reaches here is a spelling jq's decNumber reader accepts but whose text is not
@@ -29408,7 +29656,7 @@ pub(super) fn tonumber_from_str(s: &str, yq_mode: bool) -> Result<OwnedValue, Ev
             s.to_string().into(),
         )))
     } else {
-        Err(EvalError::json_parse_failure(c_text))
+        Err(EvalError::json_parse_failure(s))
     }
 }
 
@@ -29736,7 +29984,7 @@ fn bn_to_decimal_string(bn: &[u8]) -> String {
 
 /// Builtin: toboolean - convert to boolean
 /// Accepts: true, false, "true", "false"
-fn builtin_toboolean<W: Clone + AsRef<[u64]>>(
+fn builtin_toboolean<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'_, W>,
     optional: bool,
 ) -> QueryResult<'_, W> {
@@ -29747,16 +29995,17 @@ fn builtin_toboolean<W: Clone + AsRef<[u64]>>(
                 "true" => QueryResult::Owned(OwnedValue::Bool(true)),
                 "false" => QueryResult::Owned(OwnedValue::Bool(false)),
                 _ if optional => QueryResult::None,
-                other => QueryResult::Error(EvalError::new(format!(
-                    "string ({other:?}) cannot be parsed as a boolean"
-                ))),
+                // jq's own wording (`jv_dump_string_trunc` of the string: JSON escapes, #7529).
+                other => QueryResult::Error(EvalError::cannot_parse_as_boolean(
+                    &OwnedValue::String(other.into()),
+                )),
             },
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new(format!(
-            "{} cannot be parsed as a boolean",
-            type_name(&value)
+        // `null (null) cannot be parsed as a boolean`: the value is named, as for every jq type error.
+        _ => QueryResult::Error(EvalError::cannot_parse_as_boolean(&to_owned_lossy::<S, _>(
+            &value,
         ))),
     }
 }
@@ -32381,18 +32630,22 @@ impl<'h> RegexCaptures<'h> {
         }
     }
 
-    /// Group `i` as jq reports it (jq-1.7.1's `f_match`): when the overall match is empty, every
-    /// group is an empty match at its position, whatever it captured or whether it took part at
-    /// all. Without lookaround a group inside an empty match can only be empty there anyway, so
-    /// this differs from [`get`](Self::get) only for a group that took no part
-    /// (`"b" | capture("(?<x>a)?")` is `{"x": ""}`) and for one inside a lookahead
-    /// (`"abc" | match("(?=(b))").captures[0].string` is `""`, not `"b"`, #5502).
+    /// Group `i` as jq reports it (jq 1.8's `f_match`): when the overall match is empty, a group
+    /// that took part is an empty match at the overall match's position, whatever it captured,
+    /// and a group that took no part is absent. Without lookaround a group inside an empty match
+    /// can only be empty there anyway, so this differs from [`get`](Self::get) only for a group
+    /// inside a lookahead (`"abc" | match("(?=(b))").captures[0].string` is `""`, not `"b"`,
+    /// #5502).
+    ///
+    /// jq 1.7.1 reported every group of an empty match as an empty match, including one that took
+    /// no part (`"b" | capture("(?<x>a)?")` was `{"x": ""}`); jq 1.8.2 reports it as unmatched,
+    /// offset -1 and `null` (jqlang/jq#3238, #7520).
     fn jq_group(&self, i: usize) -> Option<RegexMatch<'h>> {
         let m0 = self
             .get(0)
             .expect("capture group 0 is always present on a match");
         if m0.is_empty() {
-            Some(m0)
+            self.get(i).map(|_| m0)
         } else {
             self.get(i)
         }
@@ -33843,7 +34096,7 @@ fn look_behind_alternatives_differ(pattern: &str) -> bool {
 /// `sized`: [`super::onig_look_behind`] has sized those (#6519) and its verdict is the one that counts.
 #[cfg(feature = "regex")]
 fn look_behind_alternatives_differ_but(pattern: &str, sized: &[usize]) -> bool {
-    use regex_syntax::ast::{self, Ast, RepetitionKind, RepetitionRange};
+    use regex_syntax::ast::{Ast, RepetitionKind, RepetitionRange};
 
     /// The one width `ast` can match, if it has one and this can tell.
     fn fixed(ast: &Ast, opaque: &[usize], behind: &[usize]) -> Option<usize> {
@@ -34036,7 +34289,7 @@ fn look_behind_alternatives_differ_but(pattern: &str, sized: &[usize]) -> bool {
     let Some(shadow) = oniguruma_shadow(pattern) else {
         return false;
     };
-    let Ok(ast) = ast::parse::Parser::new().parse(&shadow.text) else {
+    let Ok(ast) = crate::jq::onig_ast_parser().parse(&shadow.text) else {
         return false;
     };
     // The look-behind groups are among the opaque offsets; their bodies are read.
@@ -35994,6 +36247,16 @@ fn may_hold_assertion(pattern: &str) -> bool {
             .any(|assertion| pattern.contains(assertion))
 }
 
+/// Whether `pattern` could hold a gap Oniguruma ends a quantifier at (#7654): a `(?#..)` comment,
+/// or, where the `x` flag may be on, a blank or a `#` comment. A pattern with none keeps the
+/// borrowed fast path of [`refuse_possessive_quantifier_for`].
+#[cfg(feature = "regex")]
+fn may_hold_quantifier_gap(pattern: &str, extended: bool) -> bool {
+    pattern.contains("(?#")
+        || ((extended || inline_extended(pattern))
+            && pattern.contains(|c: char| c.is_whitespace() || c == '#'))
+}
+
 /// Whether an inline flag group (`(?x)`, `(?ix:...)`, `(?-x)`) names the extended flag, so the
 /// pattern may hold comments and blanks Oniguruma ignores (#5535).
 #[cfg(feature = "regex")]
@@ -36715,8 +36978,12 @@ fn interval_quantifier_at(chars: &[char], at: usize) -> Option<(usize, bool)> {
 /// bare `?` there as lazy, so it is written `{0,1}`). A lazy quantifier followed by `+` (`a*?+`)
 /// and `{n}?+` are a repeat of a repeat in jq as well and are left alone, as is a `+` that
 /// whitespace separates from its quantifier under the `x` flag (`a* +`).
-/// Escapes, character classes, `\Q..\E`, `(?#..)` and, under `x`, `#` comments are stepped over;
-/// an inline `(?x)` is not modelled, so a `#` comment under it is read as pattern.
+/// Escapes, character classes, `\Q..\E`, `(?#..)` and, under `x`, `#` comments are stepped over.
+/// The `x` flag is the argument's as inline flags change it (`(?x)`, `(?-x)`, `(?x:...)`, #7464),
+/// so a blank and a `#` comment under an inline `(?x)` are stepped over as under the argument.
+/// Such a gap, and a `(?#..)` comment, ends a quantifier in Oniguruma, so a `?` or `+` after one is a
+/// new quantifier on the quantified atom, not its lazy or possessive marker: `a{1,2} ?` under `x` is
+/// written `(?:a{1,2})?` and `(a)? +` is written `(?:(a)?)+` (#7654).
 #[cfg(all(feature = "regex", test))]
 fn refuse_possessive_quantifier(
     pattern: &str,
@@ -36737,11 +37004,13 @@ fn refuse_possessive_quantifier_for(
     extended: bool,
     suppress_empty: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
-    // Cheap exit for the common pattern: a possessive `+` follows a quantifier character.
+    // Cheap exit for the common pattern: a possessive `+` follows a quantifier character, and
+    // nothing could stand between a quantifier and a `?` or `+` that follows it (#7654).
     if !pattern
         .as_bytes()
         .windows(2)
         .any(|pair| pair[1] == b'+' && matches!(pair[0], b'*' | b'+' | b'?' | b'}'))
+        && !may_hold_quantifier_gap(pattern, extended)
     {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
@@ -36768,23 +37037,60 @@ fn refuse_possessive_quantifier_for(
     // last saw one begin (a group's `(`, a class's `[`, an escape, a character), and the group
     // opens there and closes after the `+`.
     let mut atom: Option<usize> = None;
-    // The `(` of each group still open, and whether it only sets flags (`(?i)`), which is no atom.
-    let mut open_groups: Vec<(usize, bool)> = Vec::new();
+    // The `(` of each group still open, whether it only sets flags (`(?i)`), which is no atom, and
+    // whether the `x` flag was on where it opened.
+    let mut open_groups: Vec<(usize, bool, bool)> = Vec::new();
+    // Whether the `x` flag is on here (#7464): the argument's, then as inline flags set it. A flag
+    // group of its own (`(?x:...)`) sets it for its body; a switch (`(?x)`, `(?-x)`) sets it to the
+    // end of the group it stands in, alternatives included, as Oniguruma parses the rest of that
+    // group as the switch's body.
+    let mut x_on = extended;
     // An escape the scan does not size (`\x41`, `\1`, `\k<n>`) leaves the atoms after it unknown.
     let mut unsure = false;
-    // An inline `(?x)` is not modelled: the blank before a quantifier would be taken for the atom.
+    // Whether an inline flag group names `x`. The `n`-flag rewrites below (#6218) stay off under one,
+    // as they were before the flag was modelled (#7464): turning them on there reaches the refusal
+    // of a lazy quantifier followed by `++`, which the old reach answered.
     let inline_x = inline_extended(pattern);
     // A lazy quantifier directly followed by `+` is a repeat of a repeat in jq, and the second
     // engine reads it otherwise, so a pattern with one stays on the first engine.
     let mut lazy_then_plus = false;
-    let mut opens: Vec<usize> = Vec::new();
-    let mut closes: Vec<usize> = Vec::new();
-    // #6218: under `n`, a lazy quantifier followed by `+` is written as the plain group of its atom
-    // and lazy quantifier, `(?:a??)+`, which jq reads it as and the engines answer as jq does.
-    let mut plain_opens: Vec<usize> = Vec::new();
+    // The groups written around an atom and its quantifiers: where each opens and closes, and
+    // whether it is atomic (`(?>`, a possessive quantifier, #6172) or plain (`(?:`). #6218: under
+    // `n`, a lazy quantifier followed by `+` is written as the plain group of its atom and lazy
+    // quantifier, `(?:a??)+`, which jq reads it as and the engines answer as jq does.
+    let mut wraps: Vec<(usize, usize, bool)> = Vec::new();
+    // Whether an atomic group was written, which a lazy quantifier followed by `+` refuses.
+    let mut atomic = false;
+    // #7654: Oniguruma ends a quantifier at a blank or a `#` comment under `x`, and at a `(?#..)`
+    // comment, so a `?` or `+` after one is a new quantifier on the quantified atom
+    // (`a{1,2} ?` is `(?:a{1,2})?`, `(a)? +` is `(?:(a)?)+`), where the crate, which drops the
+    // blank, would read the lazy `a{1,2}?` and the possessive `(a)?+`. Such a quantifier is written
+    // on the plain group of the atom and the quantifiers before it, and the gap is dropped.
+    // Whether the token just read ended a quantifier (a greedy or fixed one, its lazy `?` or its
+    // possessive `+`), and the gap since a quantifier ended: where it ended and where the gap began.
+    let mut quantified = false;
+    let mut gap: Option<(usize, usize)> = None;
     let mut i = 0;
     while i < chars.len() {
         let before = std::mem::replace(&mut last, Last::Other);
+        let after_quantifier = std::mem::take(&mut quantified);
+        let gap_before = gap.take();
+        let in_gap = (x_on && (chars[i].is_whitespace() || chars[i] == '#'))
+            || (chars[i] == '('
+                && chars.get(i + 1) == Some(&'?')
+                && chars.get(i + 2) == Some(&'#'));
+        if in_gap {
+            // A gap after a quantifier is carried until the next token (#7654).
+            gap = gap_before.or_else(|| after_quantifier.then_some((i, i)));
+        } else if let Some((ended, gap_start)) = gap_before {
+            if matches!(chars[i], '?' | '+') {
+                // An atom the scan cannot place keeps the crate's reading, as it always had.
+                if let Some(start) = atom.filter(|_| !unsure) {
+                    wraps.push((start, ended, false));
+                    drops.extend(gap_start..i);
+                }
+            }
+        }
         match chars[i] {
             '\\' if chars.get(i + 1) == Some(&'Q') => {
                 // A quoted run is literal up to `\E`, or to the end. A quantifier after it repeats
@@ -36878,6 +37184,7 @@ fn refuse_possessive_quantifier_for(
                 let start = i;
                 i += 1;
                 let mut flags_only = false;
+                let outer_x = x_on;
                 if chars.get(i) == Some(&'?') {
                     i += 1;
                     match chars.get(i) {
@@ -36893,10 +37200,16 @@ fn refuse_possessive_quantifier_for(
                         }
                         _ => {
                             // Flags, then `:` for a group of its own or `)` for a switch.
-                            while chars
+                            let mut off = false;
+                            while let Some(&c) = chars
                                 .get(i)
-                                .is_some_and(|c| c.is_ascii_alphabetic() || *c == '-')
+                                .filter(|c| c.is_ascii_alphabetic() || **c == '-')
                             {
+                                match c {
+                                    '-' => off = true,
+                                    'x' => x_on = !off,
+                                    _ => {}
+                                }
                                 i += 1;
                             }
                             if chars.get(i) == Some(&':') {
@@ -36907,12 +37220,16 @@ fn refuse_possessive_quantifier_for(
                         }
                     }
                 }
-                open_groups.push((start, flags_only));
+                open_groups.push((start, flags_only, outer_x));
                 atom = None;
             }
             ')' => {
                 atom = match open_groups.pop() {
-                    Some((start, false)) => Some(start),
+                    Some((start, false, outer_x)) => {
+                        x_on = outer_x;
+                        Some(start)
+                    }
+                    // A switch's `)` keeps the flag it set.
                     _ => None,
                 };
                 i += 1;
@@ -36921,7 +37238,7 @@ fn refuse_possessive_quantifier_for(
                 atom = None;
                 i += 1;
             }
-            '#' if extended => {
+            '#' if x_on => {
                 while i < chars.len() && chars[i] != '\n' {
                     i += 1;
                 }
@@ -36968,8 +37285,8 @@ fn refuse_possessive_quantifier_for(
                         _ => None,
                     };
                     if let Some(start) = group {
-                        opens.push(start);
-                        closes.push(i + 1);
+                        wraps.push((start, i + 1, true));
+                        atomic = true;
                     }
                     drops.push(i);
                     // Only `)` follows, so there is nothing left to scan.
@@ -36978,10 +37295,11 @@ fn refuse_possessive_quantifier_for(
                 match atom {
                     // The group makes the repeat atomic, so the `+` goes, which also spares the
                     // second engine an interval it would read as a repeat of a repeat.
-                    Some(start) if !unsure && !inline_x => {
-                        opens.push(start);
-                        closes.push(i + 1);
+                    Some(start) if !unsure => {
+                        wraps.push((start, i + 1, true));
+                        atomic = true;
                         drops.push(i);
+                        quantified = true;
                         i += 1;
                     }
                     _ => return Err(refusal()),
@@ -36991,6 +37309,7 @@ fn refuse_possessive_quantifier_for(
             // after it applies to that.
             '+' if before == Last::Fixed => {
                 drops.push(i);
+                quantified = true;
                 i += 1;
                 if chars.get(i) == Some(&'?') {
                     optional.push(i);
@@ -37009,19 +37328,27 @@ fn refuse_possessive_quantifier_for(
                     && !inline_x
                 {
                     if let Some(start) = atom {
-                        plain_opens.push(start);
-                        closes.push(i + 1);
+                        wraps.push((start, i + 1, false));
                     }
                 }
+                quantified = true;
                 i += 1;
             }
             '*' | '+' | '?' => {
                 last = Last::Greedy;
+                quantified = true;
                 i += 1;
             }
             '{' => match interval_quantifier_at(&chars, i) {
+                // #7654: `{,n}` with no lower count is literal text to jq (`"a{,2}" | test("a{,2}")`
+                // is `true`), so a quantifier after it repeats its `}`.
+                Some((end, true)) if !chars.get(i + 1).is_some_and(char::is_ascii_digit) => {
+                    atom = Some(end - 1);
+                    i = end;
+                }
                 Some((end, comma)) => {
                     last = if comma { Last::Greedy } else { Last::Fixed };
+                    quantified = true;
                     i = end;
                 }
                 None => {
@@ -37030,38 +37357,38 @@ fn refuse_possessive_quantifier_for(
                 }
             },
             // Under `x` a blank between an atom and its quantifier is ignored.
-            c if extended && c.is_whitespace() => i += 1,
+            c if x_on && c.is_whitespace() => i += 1,
             _ => {
                 atom = Some(i);
                 i += 1;
             }
         }
     }
-    if lazy_then_plus && !opens.is_empty() {
+    if lazy_then_plus && atomic {
         return Err(refusal());
     }
-    if drops.is_empty() && opens.is_empty() && plain_opens.is_empty() {
+    if drops.is_empty() && wraps.is_empty() {
         return Ok(std::borrow::Cow::Borrowed(pattern));
     }
-    // Every list is in ascending order once sorted, so each is walked once.
-    opens.sort_unstable();
-    plain_opens.sort_unstable();
+    // Every list is in ascending order once sorted, so each is walked once. Of the groups that open
+    // at one place, the one that closes last opens first, so that each closes where it should
+    // (`a* ?+b` is `(?>(?:a*)?)b`); a wrap is only ever around atoms the scan read whole, so two never
+    // cross.
+    wraps.sort_unstable_by_key(|&(open, close, _)| (open, core::cmp::Reverse(close)));
+    drops.sort_unstable();
+    let mut closes: Vec<usize> = wraps.iter().map(|&(_, close, _)| close).collect();
     closes.sort_unstable();
     let mut dropped = drops.iter().copied().peekable();
     let mut swapped = optional.iter().copied().peekable();
-    let mut opening = opens.iter().copied().peekable();
-    let mut plain_opening = plain_opens.iter().copied().peekable();
+    let mut opening = wraps.iter().copied().peekable();
     let mut closing = closes.iter().copied().peekable();
     let mut rewritten = String::new();
     for at in 0..=chars.len() {
         while closing.next_if_eq(&at).is_some() {
             rewritten.push(')');
         }
-        while opening.next_if_eq(&at).is_some() {
-            rewritten.push_str("(?>");
-        }
-        while plain_opening.next_if_eq(&at).is_some() {
-            rewritten.push_str("(?:");
+        while let Some((_, _, atomic)) = opening.next_if(|&(open, ..)| open == at) {
+            rewritten.push_str(if atomic { "(?>" } else { "(?:" });
         }
         let Some(&c) = chars.get(at) else { break };
         if dropped.next_if_eq(&at).is_some() {
@@ -37315,6 +37642,12 @@ fn build_regex_uncached<S: EvalSemantics>(
                 }
                 _ => EvalError::new("Regex failure: too big number for repeat range"),
             });
+        }
+        // #7528: jq 1.8.2 refuses a pattern that nests groups more than 511 deep; the engines'
+        // own limit is higher (and counts other nodes), so it is checked here. As the count past
+        // an interval, it waits for the flags to be read.
+        if deferred_refusal.is_none() && exceeds_onig_parse_depth(pattern, extended) {
+            deferred_refusal = Some(EvalError::new("Regex failure: parse depth limit over"));
         }
         // #6252: the absence operator is written as the loop it is.
         let absence = rewrite_absence_operator(pattern, extended);
@@ -37841,7 +38174,7 @@ fn oniguruma_refusal(pattern: &str) -> Option<String> {
 /// reads and looking again, up to `retries` times, for an error Oniguruma would meet later.
 #[cfg(feature = "regex")]
 fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
-    use regex_syntax::ast::{self, ErrorKind};
+    use regex_syntax::ast::ErrorKind;
     let retry = |rewritten: String| {
         retries
             .checked_sub(1)
@@ -37857,7 +38190,7 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
     };
     const UNMATCHED_OPEN: &str = "end pattern with unmatched parenthesis";
     let at = |offset: usize| pattern.get(offset..).unwrap_or_default();
-    match ast::parse::Parser::new().parse(pattern) {
+    match crate::jq::onig_ast_parser().parse(pattern) {
         Err(error) => {
             let start = error.span().start.offset;
             match error.kind() {
@@ -37868,6 +38201,8 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 }
                 ErrorKind::GroupUnclosed => Some(UNMATCHED_OPEN.into()),
                 ErrorKind::GroupUnopened => Some("unmatched close parenthesis".into()),
+                // jq 1.8.2's parse depth limit, which `ONIG_NEST_LIMIT` is the crate's name for (#7528).
+                ErrorKind::NestLimitExceeded(_) => Some("parse depth limit over".into()),
                 ErrorKind::RepetitionCountInvalid => {
                     Some("upper is smaller than lower in repeat range".into())
                 }
@@ -38010,7 +38345,7 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 _ => None,
             }
         }
-        Ok(_) => match regex_syntax::Parser::new().parse(pattern) {
+        Ok(_) => match crate::jq::onig_hir_parser().parse(pattern) {
             Err(regex_syntax::Error::Translate(error))
                 if matches!(
                     error.kind(),
@@ -38035,7 +38370,7 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
 /// (look-around, a back-reference, `\K`) is not one.
 #[cfg(feature = "regex")]
 fn empty_match_is_position_free(pattern: &str) -> bool {
-    use regex_syntax::ast::{self, Ast};
+    use regex_syntax::ast::Ast;
     fn assertion_free(ast: &Ast) -> bool {
         match ast {
             Ast::Assertion(_) => false,
@@ -38046,7 +38381,7 @@ fn empty_match_is_position_free(pattern: &str) -> bool {
             _ => true,
         }
     }
-    ast::parse::Parser::new()
+    crate::jq::onig_ast_parser()
         .parse(pattern)
         .is_ok_and(|ast| assertion_free(&ast))
 }
@@ -38225,10 +38560,71 @@ fn compose_group_copies(
     })
 }
 
+/// Whether `pattern` nests groups deeper than jq 1.8.2 reads ([`ONIG_PARSE_DEPTH_LIMIT`], #7528): at
+/// most that many groups open at once. `(?i)` and the like are flags, not groups; `(?i:` and `(?:`
+/// are groups. A pattern the crate's parser cannot read (a look-around, an atomic group) is not
+/// counted: it goes to `fancy-regex`, whose own limit is much lower (`limitations.md`).
+///
+/// Reads the pattern's AST with a visitor that keeps its own stack, so a deep pattern costs no
+/// native stack here, and returns before parsing for one too short to hold that many groups.
+#[cfg(feature = "regex")]
+fn exceeds_onig_parse_depth(pattern: &str, extended: bool) -> bool {
+    use super::ONIG_PARSE_DEPTH_LIMIT;
+    use regex_syntax::ast::{self, Ast};
+    // Each group is at least a `(` and a `)`.
+    if pattern.len() <= 2 * ONIG_PARSE_DEPTH_LIMIT {
+        return false;
+    }
+    struct GroupDepth {
+        open: usize,
+        deepest: usize,
+    }
+    impl ast::Visitor for GroupDepth {
+        type Output = usize;
+        type Err = core::convert::Infallible;
+        fn finish(self) -> Result<usize, Self::Err> {
+            Ok(self.deepest)
+        }
+        fn visit_pre(&mut self, node: &Ast) -> Result<(), Self::Err> {
+            if matches!(node, Ast::Group(_)) {
+                self.open += 1;
+                self.deepest = self.deepest.max(self.open);
+            }
+            Ok(())
+        }
+        fn visit_post(&mut self, node: &Ast) -> Result<(), Self::Err> {
+            if matches!(node, Ast::Group(_)) {
+                self.open -= 1;
+            }
+            Ok(())
+        }
+    }
+    // The `x` flag is the argument's, so a `#` comment in the pattern is only one with it written in.
+    let text;
+    let source = if extended {
+        text = format!("(?x){pattern}");
+        text.as_str()
+    } else {
+        pattern
+    };
+    let Ok(tree) = super::onig_ast_parser().parse(source) else {
+        return false;
+    };
+    let Ok(deepest) = ast::visit(
+        &tree,
+        GroupDepth {
+            open: 0,
+            deepest: 0,
+        },
+    );
+    deepest > ONIG_PARSE_DEPTH_LIMIT
+}
+
 /// The `regex` crate's compilation of `pattern` as given, within [`STD_REGEX_SIZE_LIMIT`] (#6439).
 #[cfg(feature = "regex")]
 fn compile_std(pattern: &str) -> Result<regex::Regex, regex::Error> {
     regex::RegexBuilder::new(pattern)
+        .nest_limit(crate::jq::ONIG_NEST_LIMIT)
         .size_limit(STD_REGEX_SIZE_LIMIT)
         .dfa_size_limit(STD_REGEX_SIZE_LIMIT)
         .build()
@@ -38298,9 +38694,7 @@ impl FancyModes {
 /// `regex` crate's parser refuses.
 #[cfg(feature = "regex")]
 fn is_fancy_syntax(pattern: &str) -> bool {
-    regex_syntax::ast::parse::Parser::new()
-        .parse(pattern)
-        .is_err()
+    crate::jq::onig_ast_parser().parse(pattern).is_err()
 }
 
 /// What bounds the length of a match of `pattern`: whether some input may make it empty (so `n`
@@ -38309,7 +38703,7 @@ fn is_fancy_syntax(pattern: &str) -> bool {
 /// bound.
 #[cfg(feature = "regex")]
 fn pattern_match_lengths(pattern: &str) -> (bool, Option<usize>) {
-    match regex_syntax::Parser::new().parse(pattern) {
+    match crate::jq::onig_hir_parser().parse(pattern) {
         Ok(hir) => {
             let properties = hir.properties();
             (
@@ -38325,7 +38719,7 @@ fn pattern_match_lengths(pattern: &str) -> (bool, Option<usize>) {
 /// (lookaround, a backreference) is taken to.
 #[cfg(feature = "regex")]
 fn pattern_is_variable_length(pattern: &str) -> bool {
-    match regex_syntax::Parser::new().parse(pattern) {
+    match crate::jq::onig_hir_parser().parse(pattern) {
         Ok(hir) => {
             let properties = hir.properties();
             properties.minimum_len() != properties.maximum_len()
@@ -40199,21 +40593,29 @@ fn global_captures<'h, S: EvalSemantics>(
                 S::TAG == EvalTag::Yq && is_empty_match && repeats_previous_match_end;
             if !go_style_skip {
                 last_match_end = Some(m_end);
-                results.push(caps);
                 // #6326: jq steps one byte after an empty match, so the continuation bytes of a
                 // multibyte character each give an empty match, reported where the next
-                // character starts.
-                if is_empty_match && re.empty_steps_bytes {
-                    if let Some(c) = input[m_start..].chars().next() {
+                // character starts. A group that took no part in the match stays unmatched in
+                // them (jq 1.8.2, #7520).
+                let continuation = if is_empty_match && re.empty_steps_bytes {
+                    input[m_start..].chars().next().map(|c| {
                         let resume = m_start + c.len_utf8();
                         let at = RegexMatch {
                             text: &input[resume..resume],
                             start: resume,
                         };
-                        let step = vec![Some(at); re.captures_len()];
-                        for _ in 1..c.len_utf8() {
-                            results.push(RegexCaptures::Mapped(step.clone()));
-                        }
+                        let step: Vec<Option<RegexMatch<'_>>> = (0..re.captures_len())
+                            .map(|i| caps.get(i).map(|_| at))
+                            .collect();
+                        (step, c.len_utf8())
+                    })
+                } else {
+                    None
+                };
+                results.push(caps);
+                if let Some((step, width)) = continuation {
+                    for _ in 1..width {
+                        results.push(RegexCaptures::Mapped(step.clone()));
                     }
                 }
             }
@@ -40360,12 +40762,10 @@ fn build_match_object<S: EvalSemantics>(
         // "length" whenever a capture's own length is 0 — whether it
         // matched empty or didn't participate at all. A group that never
         // participated (e.g. a `?`/`*`-quantified group that ran zero times)
-        // reports offset -1, string null — *unless* the overall match itself
-        // is zero-length, in which case jq reports every group as an empty
-        // match at the overall match's own position ([`RegexCaptures::jq_group`]).
-        // Verified with 6 independent probes, e.g. `(a)(b)*` on "a" (nonzero
-        // match) -> group 2 offset -1, but `(a)*` on "" (zero-length match) ->
-        // group 1 offset 0, string "".
+        // reports offset -1, string null. When the overall match is zero-length, a group that
+        // took part is an empty match at the overall match's own position
+        // ([`RegexCaptures::jq_group`]): `(a)*` on "" leaves group 1 unmatched (jq 1.8.2; jq
+        // 1.7.1 reported it as an empty match at offset 0, #7520).
         match caps.jq_group(i) {
             Some(m) if !m.is_empty() => {
                 cap_obj.insert(
@@ -41178,8 +41578,9 @@ fn builtin_capture_with_flags<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// with a `null` value, as in jq (#5363); unnamed groups are not part of the object.
 ///
 /// jq's `capture` is `match`'s `captures` folded into an object, so in jq mode an empty overall
-/// match reports every group as `""` ([`RegexCaptures::jq_group`]): `"b" | capture("(?<x>a)?")`
-/// is `{"x": ""}` (#5502). yq's is Go's: such a group stays `null`.
+/// match reports a group that took part as `""` ([`RegexCaptures::jq_group`]): `"b" |
+/// capture("(?<x>a)?")` is `{"x": null}` in jq 1.8.2 and was `{"x": ""}` in 1.7.1 (#7520).
+/// yq's is Go's: such a group stays `null`.
 #[cfg(feature = "regex")]
 fn capture_object<S: EvalSemantics>(re: &JqRegex, caps: &RegexCaptures) -> OwnedValue {
     let mut entries = FieldMap::new();
@@ -41909,8 +42310,9 @@ fn scan_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             let mut captured = Vec::new();
             for i in 1..capture_count {
                 // #5363: a group that took no part in the match is `null` in its place. jq's
-                // `scan` reads `match`'s captures, so an empty match makes every group `""`
-                // (#5502); yq has no `scan`, and its extension keeps Go's `null`.
+                // `scan` reads `match`'s captures, so an empty match makes a group that took part
+                // `""` (#5502) and leaves one that did not `null` (#7520); yq has no `scan`, and
+                // its extension keeps Go's `null`.
                 let group = if S::TAG == EvalTag::Yq {
                     caps.get(i)
                 } else {
@@ -43908,6 +44310,29 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #7572: a target with an effect is run depth-first, as jq's `E | .[$k]` runs it and as a pipe
+    // with an effect before its last stage is run (#4293): collecting every output of `inputs`
+    // before indexing the first read the whole input, so an index error named the end of the
+    // input (`<unknown>`) and the inputs jq leaves for the main loop were gone.
+    if index_target_runs_depth_first::<S>(target) {
+        let mut outputs = Vec::new();
+        let mut conversion_error = None;
+        let flow = each_index_expr::<W, S>(target, key, value, optional, &mut |item| match item
+            .into_owned::<S>()
+        {
+            Ok(item) => {
+                outputs.push(item);
+                Demand::Continue
+            }
+            Err(error) => stop_with_escape(&mut conversion_error, Control::Error(error)),
+        });
+        // Not `finish_fork_from_flow`: `.[k]?` covers the index step alone, which
+        // `each_index_expr` has already applied, so a target's error is raised either way.
+        return match resume_from_escape(conversion_error, flow) {
+            Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
+            Flow::Escaped(control) => partial(outputs, control),
+        };
+    }
     let sum_or_merge = yq_sum_or_merge_read::<S>(target);
     // (3) Keys first: an empty key stream must not evaluate the target.
     //
@@ -50432,7 +50857,7 @@ fn autovivify_array(root: &mut OwnedValue) {
 fn write_index(arr: &mut ArrayVec, idx: i64, yq_mode: bool) -> Result<&mut OwnedValue, EvalError> {
     let actual_idx = resolve_setpath_index(&OwnedValue::Int(idx), arr.len(), yq_mode)?;
     if actual_idx >= arr.len() {
-        pad_with_nulls(&mut arr.make_vec(), actual_idx)?;
+        pad_with_nulls(&mut arr.make_vec(), actual_idx, yq_mode)?;
     }
     Ok(&mut arr[actual_idx])
 }
@@ -50860,6 +51285,47 @@ fn iterate_suffix_len(steps: &[Expr]) -> usize {
         .map_or(usize::MAX, |at| steps.len() - at)
 }
 
+/// Whether the index `idx` is still negative after counting back from the end of an array of
+/// `len` elements: a position no element can stand at, which jq reads as `null` and refuses to
+/// write (`resolve_setpath_index`).
+fn negative_index_names_no_element(idx: i64, len: usize) -> bool {
+    idx < 0 && (len as i64).saturating_add(idx) < 0
+}
+
+/// `=` through a negative index that names no element, with path left after it that holds an
+/// `.[]` (#7559): [`set_path_steps`]'s only frame that reaches this is one whose `rest` does.
+///
+/// jq's `=` is `reduce path(P) as $p (.; setpath($p; $v))`, so the write-time refusal
+/// (`Out of bounds negative array index`) needs a path, and the path is collected first. `path`
+/// reads `.[-2]` of `[1]` as the `null` there, so the rest of the path runs against that `null`,
+/// and an `.[]` over it either raises (`Cannot iterate over null (null)`, the error jq reports for
+/// `.[-2][] = 0`) or, under `?`, yields no path at all (`.[-2][]? = 0` is the input unchanged).
+/// So the rest is walked over a detached `null`: an error there is the path's, and a walk that
+/// leaves it untouched named no path, so nothing is written. One that does write (no shape is
+/// known to: an `.[]` over the `null` has no element) named a path, and the refusal stands.
+fn set_path_past_absent_negative_index<S: EvalSemantics>(
+    rest: &[Expr],
+    new_value: OwnedValue,
+    scalar_noop: ScalarNoop,
+    container_noop: bool,
+    iterate_suffix: usize,
+) -> Result<(), EvalError> {
+    let mut absent = OwnedValue::Null;
+    set_path_steps::<S>(
+        &mut absent,
+        rest,
+        new_value,
+        scalar_noop,
+        container_noop,
+        iterate_suffix,
+    )?;
+    match absent {
+        OwnedValue::Null => Ok(()),
+        // patchcov: coverage tolerate-line reason="unreachable: rest holds an .[] (the caller's frame exists only then), and an .[] over the detached null writes nothing; kept so a path that does reach a write keeps jq's refusal (#7559)"
+        _ => Err(EvalError::out_of_bounds_negative_index()),
+    }
+}
+
 /// Walk a *flat* list of atomic path components, peeling one per call, and
 /// write `new_value` at the end (#1429).
 ///
@@ -51117,6 +51583,19 @@ fn set_path_steps<S: EvalSemantics>(
             autovivify_array(root);
             if let OwnedValue::Array(arr) = root {
                 let original_len = arr.len();
+                if S::TAG == EvalTag::Jq && negative_index_names_no_element(*idx, original_len) {
+                    let result = set_path_past_absent_negative_index::<S>(
+                        rest,
+                        new_value,
+                        scalar_noop,
+                        container_noop,
+                        iterate_suffix,
+                    );
+                    if result.is_ok() && root_was_null && arr.is_empty() {
+                        *root = OwnedValue::Null;
+                    }
+                    return result;
+                }
                 let (result, stranded) = {
                     // A still-negative index after counting back from the
                     // end is jq's write-time bounds check, which `?` never
@@ -52296,6 +52775,35 @@ mod deferred_update_delete_path_tests {
         .unwrap_err();
         assert!(format!("{error:?}").contains("Cannot index array with string"));
     }
+
+    // #7562: an array key the filter deletes is queued, and `delpaths` refuses it at the end,
+    // so a later path's error can come first; with no queue it is refused at once.
+    #[test]
+    fn an_array_key_deletion_is_queued_and_refused_at_the_end_7562() {
+        let key = Expr::ArrayKey(Box::new(parse_complete_json("[1]", false).unwrap()));
+        let empty = parse("empty").unwrap();
+        let mut root = parse_complete_json("[1,2]", false).unwrap();
+        let mut deletes = DeferredUpdateDeletes::default();
+        let wrote = update_path_with_deletes::<JqSemantics>(
+            &mut root,
+            &key,
+            &empty,
+            false,
+            ScalarNoop::Off,
+            None,
+            Some(&mut deletes),
+        );
+        assert!(matches!(wrote, Ok(false)));
+        assert_eq!(root.to_json(), "[1,2]");
+        let error = finish_deferred_update_deletes::<JqSemantics>(root, deletes).unwrap_err();
+        assert!(format!("{error:?}").contains("Cannot delete array element of array"));
+
+        let mut root = parse_complete_json("[1,2]", false).unwrap();
+        let error =
+            update_path::<JqSemantics>(&mut root, &key, &empty, false, ScalarNoop::Off, None)
+                .unwrap_err();
+        assert!(format!("{error:?}").contains("Cannot delete array element of array"));
+    }
 }
 
 fn update_delete_component(expr: &Expr) -> Option<OwnedValue> {
@@ -52897,6 +53405,15 @@ fn update_path_with_deletes<S: EvalSemantics>(
             // jq's `delpaths` leaves a `null` or absent parent as it is (`{"c":null} | .c[nan] |=
             // empty`), and never returns on an array. The document stays as it is.
             if !wrote && is_nan_index_key(key) {
+                return Ok(false);
+            }
+            // #7562: with several paths, `_modify` queues the deletion and runs one `delpaths`
+            // once every path is collected, so a later path's error comes first and this key's
+            // refusal is `delpaths`' own, raised at the end.
+            if let (false, Some(deletes)) = (wrote, deletes) {
+                deletes.enter(OwnedValue::clone(key));
+                deletes.record();
+                deletes.leave();
                 return Ok(false);
             }
             Err(array_key_write_error(
@@ -53842,7 +54359,10 @@ fn pattern_is_plain(pattern: &Pattern) -> bool {
 /// is not the container it names, so a pattern bind (the `foreach` source's or its own) is read only
 /// `caught`, inside a `try`/`?` that swallows the raise; a `$name` pattern never raises, and a pattern
 /// with a computed key is never read (its key is an expression of its own).
-fn expr_is_inert(e: &Expr, caught: bool) -> bool {
+///
+/// Also the test `eval_generic`'s lazy `map` chain applies before it fuses a `map(g)` onto the stages already on
+/// it (#7565): fusing runs the stages element by element, which is unobservable only when one side is inert.
+pub(crate) fn expr_is_inert(e: &Expr, caught: bool) -> bool {
     fn patterns_are_inert(patterns: &[Pattern], caught: bool) -> bool {
         patterns.iter().all(|pattern| {
             matches!(pattern, Pattern::Var(_)) || caught && pattern_is_plain(pattern)
@@ -61812,10 +62332,10 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
         // attempt to iterate through [1]" where this resolver answered
         // nothing at exit 0 (`{} | path(last(.[]))` alone raises too, but
         // for a different reason -- `.[]` on the trackable, genuinely empty
-        // `{}` produces zero outputs, so `last` folds to `null`, and jq
-        // rejects that computed `null` as "Invalid path expression with
+        // `{}` produces zero outputs, so 1.7.1's `last` folds to `null`, and
+        // jq rejects that computed `null` as "Invalid path expression with
         // result null", the same boundary `test_argument_navigation_builtins_forward_a_computed_result_2746`
-        // pins).
+        // pins; jq 1.8.2's `last` yields nothing there instead, #7518).
         //
         // All three results are computed values, never a path into the
         // document (like `[f]` just below, unlike `first`/`limit`/`nth`,
@@ -61897,7 +62417,14 @@ fn resolve_node_sink<'a, S: EvalSemantics>(
                     }
                 }
                 Some(branch) => untracked_at_register(branch.value, register),
-                None => untracked_at_register(Cow::Owned(OwnedValue::Null), register),
+                // jq 1.8: an `f` that yields nothing leaves `last(f)` with nothing to emit
+                // (jqlang/jq#3179, #7518); 1.7.1 emitted an untracked `null` here.
+                None => {
+                    return match flow {
+                        ResolveFlow::Escaped(escape) => ResolveFlow::Escaped(escape),
+                        ResolveFlow::Exhausted | ResolveFlow::Stopped => ResolveFlow::Exhausted,
+                    };
+                }
             };
             forward_drained_branch(flow, result, sink)
         }
@@ -82169,8 +82696,11 @@ fn resolve_foreach<'a, S: EvalSemantics>(
         // SOURCE's own ambient value, trackability and snapshot mark are
         // all recomputed per INIT fork from wherever that fork's own
         // register stands after INIT ran.
+        // #7519: but every `foreach` fork reads the document, as the first does: jq 1.8 runs each
+        // fork's SOURCE on the fold's real input (jqlang/jq#3266), so the ambient is the first
+        // fork's (`path(foreach (.a) as $k ((0,1); $k))` is `["a"]` twice in jq 1.8.2).
         let ambient = fold_source_ambient::<S>(
-            fork_index,
+            0,
             &reg,
             value,
             &null_ambient,
@@ -90532,6 +91062,8 @@ pub(crate) fn substitute_bound_var_from<S: EvalSemantics>(
     bound: &OwnedValue,
     node: Option<BindOrigin>,
 ) -> Expr {
+    #[cfg(test)]
+    BOUND_BODY_COPIES.with(|n| n.set(n.get() + 1));
     substitute_bound_var_at(
         bind_expr,
         body,
@@ -90543,6 +91075,174 @@ pub(crate) fn substitute_bound_var_from<S: EvalSemantics>(
         S::TAG == EvalTag::Jq,
         S::EQUALITY_SHORT_CIRCUITS_ON_IDENTITY,
     )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// How many bodies [`substitute_bound_var_from`] copied on this thread (#7471): what a test
+    /// reads to tell a chain whose unread links run as they are from one that copied the rest of
+    /// the chain at every link.
+    static BOUND_BODY_COPIES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Whether the body of an `as` that binds `$var` reads it: whether substituting a bound value
+/// changes the body at all (#7471). When it does not, a bind site evaluates `body` itself rather
+/// than the copy [`substitute_bound_var_from`] would make of it, the rule #3856's deferred bind
+/// already applies (`deferred_bind::mentions_var`): the only node a substitution rewrites is a
+/// `$var` ([`holds_var`]).
+///
+/// The answer is shadow-aware along a chain `E1 as $x1 | E2 as $x2 | ... | B`, as
+/// [`substitute_var_with`]'s `Expr::As` arm is (`$x` is read when a source names it, or when the
+/// last body does and no link binds `$x` again first), and conservative below it: a source or
+/// last body that names `$x` anywhere reads it.
+///
+/// A body that does not read the variable is evaluated as it is, so each link of the chain below
+/// is asked the same question of a node of the same tree. Those answers are worked out here in one
+/// walk and kept, keyed by each link's body, while the returned [`AsBodyReads`] is held, which is
+/// while the caller evaluates `body` (borrowed for that long, so the keys are live nodes of it).
+/// Asking each link afresh walked the rest of the chain at every link, and the copies made of it
+/// cost `n^2` memory (470 MB at 2,000 links). A body that does read the variable is copied by the
+/// substitution anyway, so nothing is kept for it, and the first link of the copy asks again.
+pub(crate) fn as_body_reads_var(body: &Expr, var: &str) -> AsBodyReads {
+    #[cfg(feature = "std")]
+    if let Some(reads) = as_chain_reads::lookup(body, var) {
+        return AsBodyReads {
+            reads,
+            #[cfg(feature = "std")]
+            _kept: None,
+        };
+    }
+    let reads = chain_reads_var(body, var);
+    AsBodyReads {
+        reads,
+        #[cfg(feature = "std")]
+        _kept: (!reads && matches!(body, Expr::As { .. }))
+            .then(|| as_chain_reads::keep(chain_link_reads(body))),
+    }
+}
+
+/// [`as_body_reads_var`]'s answer, walked: along the chain of links `body` starts, until one names
+/// `var` in its source (read) or binds it again (not read), then in the last body.
+fn chain_reads_var(body: &Expr, var: &str) -> bool {
+    let mut at = body;
+    while let Expr::As {
+        expr,
+        var: link,
+        body,
+    } = at
+    {
+        if super::deferred_bind::mentions_var(expr, var) {
+            return true;
+        }
+        if link == var {
+            return false;
+        }
+        at = body;
+    }
+    super::deferred_bind::mentions_var(at, var)
+}
+
+/// For each link of the chain `body` starts, its body, its variable and whether that body reads
+/// it, from one walk up the chain from its last body: the variables free in a link's body are
+/// those its source names, and those free in the next link's body but its variable.
+#[cfg(feature = "std")]
+fn chain_link_reads(body: &Expr) -> Vec<(&Expr, &str, bool)> {
+    let mut links = Vec::new();
+    let mut at = body;
+    while let Expr::As { expr, var, body } = at {
+        links.push((expr.as_ref(), var.as_str(), body.as_ref()));
+        at = body;
+    }
+    let mut free = alloc::collections::BTreeSet::new();
+    collect_var_names(at, &mut free);
+    let mut answers = vec_with_capacity(links.len());
+    for &(source, link_var, link_body) in links.iter().rev() {
+        answers.push((link_body, link_var, free.contains(link_var)));
+        free.remove(link_var);
+        collect_var_names(source, &mut free);
+    }
+    answers
+}
+
+/// Every variable `expr` names, bound inside it or not (a superset of the ones free in it).
+#[cfg(feature = "std")]
+fn collect_var_names(expr: &Expr, names: &mut alloc::collections::BTreeSet<String>) {
+    use crate::jq::walk::{search_subexpr, Visit};
+    search_subexpr(expr, &mut |e| {
+        if let Expr::Var(name) = e {
+            if !names.contains(name.as_str()) {
+                names.insert(name.clone());
+            }
+        }
+        Visit::Descend
+    });
+}
+
+/// [`as_body_reads_var`]'s answer, and the answers it keeps for the links of the chain below.
+pub(crate) struct AsBodyReads {
+    /// Whether the body reads the variable.
+    pub(crate) reads: bool,
+    #[cfg(feature = "std")]
+    _kept: Option<as_chain_reads::Kept>,
+}
+
+/// The answers [`as_body_reads_var`] keeps for the links of a chain it walked (#7471), by the
+/// address of each link's body, with the address of the link's variable name: a bind site asks of
+/// an `as` node's own body and variable, so an answer is only ever read back for the link it was
+/// worked out for. `std` only: a `no_std` embedding walks each link's body itself.
+#[cfg(feature = "std")]
+mod as_chain_reads {
+    use super::{expr_key as key, Expr};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static READS: RefCell<HashMap<usize, (usize, bool)>> = RefCell::new(HashMap::new());
+    }
+
+    /// The answer kept for the link whose body is `body` and whose variable is `var`, if one is.
+    pub(super) fn lookup(body: &Expr, var: &str) -> Option<bool> {
+        READS.with(|reads| match reads.borrow().get(&key(body)) {
+            Some(&(name, read)) if name == var.as_ptr() as usize => Some(read),
+            _ => None,
+        })
+    }
+
+    /// Keeps `answers` until the returned guard drops. A body already answered (the same chain
+    /// re-entered through a recursive `def`) keeps its answer and its owner.
+    pub(super) fn keep(answers: Vec<(&Expr, &str, bool)>) -> Kept {
+        READS.with(|reads| {
+            let mut reads = reads.borrow_mut();
+            let keys = answers
+                .into_iter()
+                .filter_map(|(body, var, read)| {
+                    let key = key(body);
+                    match reads.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert((var.as_ptr() as usize, read));
+                            Some(key)
+                        }
+                        std::collections::hash_map::Entry::Occupied(_) => None,
+                    }
+                })
+                .collect();
+            Kept(keys)
+        })
+    }
+
+    /// Drops the answers it kept.
+    pub(super) struct Kept(Vec<usize>);
+
+    impl Drop for Kept {
+        fn drop(&mut self) {
+            READS.with(|reads| {
+                let mut reads = reads.borrow_mut();
+                for key in &self.0 {
+                    reads.remove(key);
+                }
+            });
+        }
+    }
 }
 
 /// The [`Origin`] an identity-passthrough bind source freezes `.` with,
@@ -91283,12 +91983,20 @@ fn eval_as<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return eval_single::<W, S>(body, value, optional);
     }
 
+    // #7471: a body that does not read `$var` is evaluated as it is.
+    let reads_var = as_body_reads_var(body, var);
     for (i, mut bound_val) in bound_values.into_iter().enumerate() {
         let origin = bound_origins.get(i).cloned().flatten();
         // #2889 Stage B: same registration, same bind-scoped guard, as
         // `each_as`/`each_as_generic` -- see `eval_generic::embed_table`.
         let _embed = super::eval_generic::embed_table_push::<S>(origin.as_ref(), &mut bound_val);
-        let substituted_body = substitute_bound_var_from::<S>(expr, body, var, &bound_val, origin);
+        let substituted_body = if reads_var.reads {
+            Cow::Owned(substitute_bound_var_from::<S>(
+                expr, body, var, &bound_val, origin,
+            ))
+        } else {
+            Cow::Borrowed(body)
+        };
         let body_result = eval_single::<W, S>(&substituted_body, value.clone(), optional);
         // The outputs already produced no longer vanish (#400, #494).
         if let Some(control) = push_owned_values::<_, S>(body_result, &mut all_results) {
@@ -94591,10 +95299,11 @@ fn eval_owned_many_doors_answer<S: EvalSemantics>(
         }
         Expr::LastExpr(stream) | Expr::Builtin(Builtin::LastStream(stream)) => {
             let items = owned_stream_items(stream, input)?;
-            Some(vec![match items.last() {
-                Some(item) => leave(item)?,
-                None => OwnedValue::Null,
-            }])
+            // jq 1.8: nothing when the stream is empty (jqlang/jq#3179, #7518).
+            Some(match items.last() {
+                Some(item) => vec![leave(item)?],
+                None => vec![],
+            })
         }
         Expr::NthExpr { n, expr: stream } | Expr::Builtin(Builtin::NthStream(n, stream)) => {
             let n = usize::try_from(owned_integer_literal(n)?).ok()?;
@@ -97882,11 +98591,14 @@ pub(crate) type ForeachElementSink<'a> = &'a mut dyn FnMut(OwnedValue) -> Demand
 
 /// What a fold's SOURCE is evaluated against for one INIT fork (#3895).
 ///
-/// jq 1.7.1 hands the *first* fork the fold's real input and every later fork
-/// `null`: `reduce`/`foreach` duplicate the input with `DUPN`, which leaves
-/// `null` behind in the slot the next INIT output resumes from, so
-/// `[reduce (.) as $x ((.,.); $x)]` on `{"a":1}` is `[{"a":1},null]`. A source
-/// that does not read `.` (`range(3)`, a literal) cannot tell the two apart.
+/// jq hands a `reduce`'s *first* fork the fold's real input and every later fork
+/// `null`: `reduce` duplicates the input with `DUPN`, which leaves `null` behind
+/// in the slot the next INIT output resumes from, so
+/// `[reduce (.) as $x ((.,.); $x)]` on `{"a":1}` is `[{"a":1},null]` in jq 1.7.1
+/// and 1.8.2. A source that does not read `.` (`range(3)`, a literal) cannot
+/// tell the two apart. jq 1.7.1's `foreach` did the same; jq 1.8 dropped its
+/// `DUPN` (jqlang/jq#3266, a bug fix), so [`foreach_forks`] reads `Real` on
+/// every fork (#7519).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SourceInput {
     /// The fold's own input: the first INIT fork.
@@ -98016,12 +98728,12 @@ impl FoldDirectRetry {
 /// memory for the duration of a fold whose entire point is not to do that,
 /// even in the overwhelmingly common single-INIT case.
 ///
-/// **Every fork after the first drives it against `null`** (#3895): jq 1.7.1
-/// hands only INIT's first output the fold's real input
-/// (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so `drive_source` is
-/// told which input the fork reads ([`SourceInput`]) and each caller runs a
-/// later fork's as-written source against `null` -- [`source_value`] on this
-/// evaluator, [`drive_source_against_null`] on the generic one.
+/// **Every fork drives it against the fold's real input** (#7519): jq 1.7.1
+/// handed only INIT's first output the real input and every later one `null`
+/// (#3895), which jq 1.8 fixed for `foreach` (jqlang/jq#3266:
+/// `[1, 2] | [foreach .[] as $x (0, 1; . + $x)]` is `[1,3,2,4]`), so
+/// `drive_source` is always told [`SourceInput::Real`]. [`reduce_forks`] keeps
+/// the `null` forks, as jq 1.8.2 does.
 ///
 /// The step's own verdict outranks the source's, and a *fork's* own verdict
 /// (which folds in the step's) outranks INIT's own: a step or fork that
@@ -98068,10 +98780,8 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
     // written. #3181: a step whose accumulator still is one takes the
     // as-written operand instead (see [`FoldOperand`]).
     // #3329: the loop variables are marked only where the as-written UPDATE or
-    // EXTRACT reads one as a path step, and only for the first INIT fork -- jq
-    // 1.7.1 evaluates SOURCE against `null` on every later fork
-    // (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through
-    // `$x` there refuses in jq where marking it would answer.
+    // EXTRACT reads one as a path step -- on every INIT fork, since every fork's
+    // SOURCE reads the real input (#7519; `reduce_forks` marks the first only).
     let mark_loop_vars = retry.marks;
     let share_loop_vars = retry.shares;
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
@@ -98113,13 +98823,10 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // never the accumulator's, so it certifies no write jq refuses
         // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
         // multi-fork rows).
-        let mark = LoopVarSplice::of(mark_loop_vars && first, share_loop_vars);
-        // #3895: jq runs every later fork's SOURCE against `null`.
-        let source_input = if first {
-            SourceInput::Real
-        } else {
-            SourceInput::Null
-        };
+        // #7519: every `foreach` fork reads the real input (jq 1.8's jqlang/jq#3266, below), so
+        // the marking holds on every fork too: `[foreach (.) as $x ((.,.); ($x.a) = 9)]` is
+        // `[{"a":9},{"a":9}]` in jq 1.8.2.
+        let mark = LoopVarSplice::of(mark_loop_vars, share_loop_vars);
         let all_var_names =
             all_var_names.get_or_insert_with(|| pattern_alternatives_var_names(patterns));
         let (update, extract) = *inert_operands.get_or_insert_with(|| {
@@ -98147,7 +98854,9 @@ pub(crate) fn foreach_forks<S: EvalSemantics>(
         // the retry generation (#3293).
         let ended = StashedVerdict::<Flow>::new();
 
-        let flow = drive_source(source_input, &mut |input_val| {
+        // #7519: unlike `reduce_forks`, every fork's SOURCE reads the fold's real input, as jq
+        // 1.8 runs it (jqlang/jq#3266, a fix of 1.7.1's `DUPN` handing later forks `null`).
+        let flow = drive_source(SourceInput::Real, &mut |input_val| {
             ended.begin();
             // Substituted per element as it arrives: the demand-driven path
             // sees one element at a time and can never hoist a whole matrix
@@ -98249,7 +98958,10 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
     // (see `fold_step_each`); the fold's own callers pass it in as written.
     // #3181: a step whose accumulator still is one takes the as-written
     // UPDATE instead (see [`FoldOperand`]).
-    // #3329: see `foreach_forks`.
+    // #3329: see `foreach_forks`; here only for the first INIT fork -- jq
+    // evaluates a `reduce`'s SOURCE against `null` on every later fork
+    // (`[reduce (.) as $x ((.,.); $x)]` is `[{"a":1},null]`), so a write through
+    // `$x` there refuses in jq where marking it would answer.
     let mark_loop_vars = retry.marks;
     let share_loop_vars = retry.shares;
     let hoisted_update = demote_for_reentry(update, &RootWitness::Owned);
@@ -98279,7 +98991,8 @@ pub(crate) fn reduce_forks<S: EvalSemantics>(
         // (`test_fold_container_loop_variable_identity_through_document_input_3896`'s
         // multi-fork rows).
         let mark = LoopVarSplice::of(mark_loop_vars && first, share_loop_vars);
-        // #3895: jq runs every later fork's SOURCE against `null`.
+        // #3895: jq runs every later fork's SOURCE against `null` (still in 1.8.2, unlike
+        // `foreach`'s, #7519).
         let source_input = if first {
             SourceInput::Real
         } else {
@@ -98851,33 +99564,32 @@ fn eval_first_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Evaluate `last(expr)` - take last output.
 ///
-/// jq defines `last(f)` as `reduce f as $x (null; $x)`, and `reduce` always
-/// produces exactly one output — so an empty operand answers the *seed*,
-/// `null`, not nothing (#1521). Oracle-confirmed: `jq -n 'last(empty)'` is
-/// `null`, as is `[] | last(.[])`.
-///
-/// `first(f)` is deliberately **not** symmetric and must not be "fixed" to
-/// match: it is `label $out | (f, break $out)`, which simply has nothing to
-/// yield, and `jq -n 'first(empty)'` is genuinely empty. The asymmetry is in
-/// jq's own definitions, so ADR-0018 rule 3 says reproduce it. (The *0-arity*
-/// `first`/`last` are `.[0]`/`.[-1]` and answer `null` on `[]`; that is a
-/// different construct and already correct.)
+/// jq 1.8 yields nothing when `f` yields nothing: `[last(empty)]` and
+/// `[last(range(0))]` are `[]`, like `first(empty)` (jqlang/jq#3179, a fix of
+/// 1.7.1's `reduce f as $x (null; $x)` definition, which answered the seed
+/// `null`; #7518). An error after the final value still raises
+/// (`last(1,error("x"))` does not answer `1`) -- `last` cannot short-circuit.
+/// The *0-arity* `first`/`last` are `.[0]`/`.[-1]` and answer `null` on `[]`;
+/// that is a different construct and unchanged.
 ///
 /// No local `optional` handling is needed for `last(f)?`: post-#693,
 /// `Expr::Optional(inner)` evaluates `inner` with the *ambient* `optional`
 /// (never forced `true`) and catches the resulting `Error`/`Partial(_,
 /// Error)` itself, one layer out, so this function's own `optional`
 /// parameter is always `false` on every dispatch path that can reach it
-/// today. `last(empty)?` still answers `null` and `last(error("x"))?` is
-/// still empty — that split is entirely the outer `Expr::Optional`/
-/// `eval_try` boundary's job, not this function's.
+/// today. `last(error("x"))?` is still empty -- that is entirely the outer
+/// `Expr::Optional`/`eval_try` boundary's job, not this function's.
 fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     expr: &Expr,
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
     if let Some(fold) = last_as_reduce(expr) {
-        return eval_single::<W, S>(&fold, value, optional);
+        // The closing `.[]?` of the fold answers its one value as a collection of one.
+        return match eval_single::<W, S>(&fold, value, optional) {
+            QueryResult::ManyOwned(vs) => owned_vec_to_result(vs),
+            other => other,
+        };
     }
     let result = eval_single::<W, S>(expr, value, optional);
     match result.materialize_cursor() {
@@ -98885,14 +99597,14 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::OneCursor(_) => unreachable!(),
         QueryResult::Many(vs) => match vs.into_iter().next_back() {
             Some(last) => QueryResult::One(last),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
         QueryResult::Owned(v) => QueryResult::Owned(v),
         QueryResult::ManyOwned(vs) => match vs.into_iter().next_back() {
             Some(last) => QueryResult::Owned(last),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
-        QueryResult::None => QueryResult::Owned(OwnedValue::Null),
+        QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
@@ -98907,12 +99619,18 @@ fn eval_last_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     }
 }
 
-/// jq's own definition of `last(f)`, `reduce f as $x (null; $x)`, when `f` makes the values it
-/// emits (#5377). `reduce` holds one value at a time and streams its source, `range` included,
-/// so `last(range(30000000) * 2)` stays flat where collecting the generator first held every
-/// value it made (killed at 3 GB; jq's is 2.5 MB). Whatever `last` does with an empty source, an
-/// error after the final value (`last(1, error("x"))` raises, it does not answer `1`) and a
-/// `break` or `halt` is then `reduce`'s own.
+/// `last(f)` as a fold over `f`'s outputs, when `f` makes the values it emits (#5377). jq's
+/// `reduce` holds one value at a time and streams its source, `range` included, so
+/// `last(range(30000000) * 2)` stays flat where collecting the generator first held every value
+/// it made (killed at 3 GB; jq's is 2.5 MB). An error after the final value
+/// (`last(1, error("x"))` raises, it does not answer `1`) and a `break` or `halt` is then
+/// `reduce`'s own.
+///
+/// jq 1.8 answers nothing for an `f` that yields nothing (#7518, jqlang/jq#3179), which a bare
+/// `reduce f as $x (null; $x)` cannot say: it answers its seed. jq 1.8.2 keeps a flag beside the
+/// last value; here the accumulator is the value boxed in a one-element array (`null` while
+/// nothing arrived), and the closing `.[]?` unboxes it -- or, over the seed `null`, yields
+/// nothing.
 ///
 /// `None` for navigation alone (`.[]`, `.a[] | select(.b)`, `..`): its outputs are nodes of the
 /// document, which a collecting `last` holds as cursors -- a pointer each -- where `reduce` would
@@ -98923,11 +99641,16 @@ pub(crate) fn last_as_reduce(f: &Expr) -> Option<Expr> {
     // `map(g)` is one output, a sequence that stays lazy through `last` (#725); there is nothing
     // to stream.
     let one_lazy_output = matches!(unwrap_paren(f), Expr::Builtin(Builtin::Map(_)));
-    (!is_register_navigation(f) && !one_lazy_output).then(|| Expr::Reduce {
-        input: Box::new(f.clone()),
-        patterns: vec![Pattern::Var(String::from(LAST_VAR))],
-        init: Box::new(Expr::Literal(Literal::Null)),
-        update: Box::new(Expr::Var(String::from(LAST_VAR))),
+    (!is_register_navigation(f) && !one_lazy_output).then(|| {
+        Expr::pipe(vec![
+            Expr::Reduce {
+                input: Box::new(f.clone()),
+                patterns: vec![Pattern::Var(String::from(LAST_VAR))],
+                init: Box::new(Expr::Literal(Literal::Null)),
+                update: Box::new(Expr::Array(Box::new(Expr::Var(String::from(LAST_VAR))))),
+            },
+            Expr::Optional(Box::new(Expr::Iterate)),
+        ])
     })
 }
 
@@ -102155,38 +102878,51 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // prefix of events is processed below like any other, and the control
     // is re-attached to whatever it produced via `partial()` at the end,
     // instead of being silently dropped.
-    let (events, control) = match eval_single::<W, S>(f, value, optional) {
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        QueryResult::Break(label) => return QueryResult::Break(label),
-        // A bare halt has no prior events to fall back to, unlike a
-        // `Partial`'s trailing control below — falling into
-        // `result.collect_owned::<S>()` would silently treat it as "zero events"
-        // instead of halting (#791).
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        QueryResult::Partial(vs, control) => (vs, Some(control)),
-        // #2188: `stream_outputs`, not bare `collect_owned` --
-        // `collect_owned`'s `One`/`Many` arms use unchecked `to_owned_lossy`,
-        // silently substituting `""` for an undecodable event leaf instead
-        // of raising, the same #1746-shaped bug this whole family has
-        // already been fixed for elsewhere. `stream_outputs` gives
-        // the identical `(Vec<OwnedValue>, Option<Control>)` shape this
-        // match already destructures into, so no call-site restructuring is
-        // needed -- its own `Error`/`Break`/`Halt`/`Partial` arms are simply
-        // unreachable here, since this match's own arms above already
-        // intercept those variants before `result` can carry one.
-        result => stream_outputs::<_, S>(result),
-    };
-
+    //
+    // #7572: `f` is pulled one event at a time, each event folded in as it arrives, as jq's
+    // `foreach f as $i` runs it: collecting every event first read the whole input under
+    // `fromstream(inputs)` before the first event was looked at, so an error on an early event
+    // named the end of the input, and the inputs jq leaves unread for the main loop were gone.
+    // #2188: an event is decoded with `into_owned`, which raises on an undecodable leaf rather
+    // than substituting `""`.
     let mut outputs = Vec::new();
+    let flow = each_fromstream::<W, S>(f, value, optional, &mut |item| {
+        outputs.push(item.into_owned_from_owned_producer::<S>());
+        Demand::Continue
+    });
+    match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
+        Flow::Escaped(control) => partial(outputs, control),
+    }
+}
+
+/// `fromstream(f)` with each value handed to `sink` as the event that completes it arrives (#7463),
+/// as jq's `foreach f as $i (...; ...; if .e then .x else empty end)` emits it: a consumer that
+/// stops (`first(fromstream(inputs))`) stops `f`, so the inputs after that event are not read, and
+/// a program reading the input state after a value (`input_line_number`) reads it where that
+/// value's last event left it. [`builtin_fromstream`] collects it.
+// Out of line: `eval_each` is on every recursion's path, and its frame is what a deep recursion's
+// stack depth is made of (a frame grown by an inlined arm took `r(12000; 7)` past the depth limit).
+#[inline(never)]
+fn each_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
     let mut x = OwnedValue::Null;
     let mut e = false;
-
-    for event in events {
+    let mut raised = None;
+    let mut fold = |item: Item<'a, W>| {
+        let event = match item.into_owned::<S>() {
+            Ok(event) => event,
+            Err(err) => return stop_with_escape(&mut raised, Control::Error(err)),
+        };
         if e {
             x = OwnedValue::Null;
         }
         // jq's own definition, event by event (#4971).
-        match fromstream_generic_event::<S>(x, &event) {
+        match fromstream_generic_event::<S>(core::mem::replace(&mut x, OwnedValue::Null), &event) {
             Ok((next, ended)) => {
                 x = next;
                 e = ended;
@@ -102194,17 +102930,22 @@ fn builtin_fromstream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // The values completed before a malformed event are emitted first, then the error is
             // raised, as jq's lazy `foreach` does (#5489); `try`/`?` keep them too. With none
             // completed `partial` is the bare error.
-            Err(err) => return partial(outputs, Control::Error(err)),
+            Err(err) => return stop_with_escape(&mut raised, Control::Error(err)),
         }
         if e {
-            outputs.push(x.clone());
+            // The next event starts a fresh value, so the completed one is handed on, not copied.
+            return sink(Item::Owned(core::mem::replace(&mut x, OwnedValue::Null)));
         }
-    }
-
-    match control {
-        Some(control) => partial(outputs, control),
-        None => owned_vec_to_result(outputs),
-    }
+        Demand::Continue
+    };
+    // `repeat` keeps the eager route, whose iteration cap the demand-driven one does not have
+    // ([`streams_unbounded`]).
+    let flow = if streams_unbounded(f) {
+        drain_result(eval_single::<W, S>(f, value, optional), &mut fold)
+    } else {
+        eval_each::<W, S>(f, value, optional, &mut fold)
+    };
+    resume_from_escape(raised, flow)
 }
 
 /// Builtin: truncate_stream(stream) - drop the leading `.` path components
@@ -102239,75 +102980,95 @@ fn builtin_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // for a *container* `depth` that merely contains an undecodable
     // string, where jq would just proceed unaffected.
     let depth = to_owned_lossy::<S, _>(&value);
-
-    // A `Partial`'s trailing control is not intercepted here (#694): its
-    // prefix of events is processed below like any other, and the control
-    // is re-attached to whatever it produced via `partial()` at the end,
-    // instead of being silently dropped.
-    // #4971: jq 1.7.1 defines it as `. as $n | null | stream | ..`, so `stream` runs on `null`, not on the depth.
-    let (events, control) = match eval_single::<W, S>(stream_expr, StandardJson::Null, optional) {
-        QueryResult::Error(e) => return QueryResult::Error(e),
-        QueryResult::Break(label) => return QueryResult::Break(label),
-        // See the matching arm in `builtin_fromstream`.
-        QueryResult::Halt(code) => return QueryResult::Halt(code),
-        QueryResult::Partial(vs, control) => (vs, Some(control)),
-        // #2188 audit: unlike `builtin_fromstream`'s identical shape, bare
-        // `collect_owned` here is safe by construction, not just untested --
-        // `stream_expr` is evaluated against this same `value`, which also
-        // becomes `depth` a few lines up. `value` itself being an undecodable
-        // `String` is not `depth`'s only non-scalar-in-effect case either:
-        // whether `value` is a container reachable via a nested field/index,
-        // or is directly the undecodable string, `depth` ends up either a
-        // container or a `String` -- and a `String`/container both always
-        // sort above any `Int` path length in jq's ordering (`compare_values`
-        // just below) -- so `path_len > depth` is provably false for every
-        // event whenever `depth` is non-numeric, meaning every event is
-        // dropped before an undecodable leaf's silently-substituted `""`
-        // could ever reach `outputs`. `stream_expr` has no other source of
-        // document-backed (as opposed to literal/computed) content to draw
-        // an undecodable value from, so this holds for any `stream_expr`,
-        // not just one that reads `value` directly.
-        result => (result.collect_owned::<S>(), None),
-    };
-
-    // `if (.[0]|length) > $n then setpath([0]; .[0][$n:]) else empty end` over every event (#4971).
-    let null = OwnedValue::Null;
     let mut outputs = Vec::new();
-    for event in events {
+    let flow = each_truncate_stream::<W, S>(stream_expr, &depth, optional, &mut |item| {
+        outputs.push(item.into_owned_from_owned_producer::<S>());
+        Demand::Continue
+    });
+    match flow {
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
+        Flow::Escaped(control) => partial(outputs, control),
+    }
+}
+
+/// `truncate_stream(stream)` at depth `depth` with each kept event handed to `sink` as `stream`
+/// produces it (#7463), as jq's `. as $n | null | stream | ...` pipe runs it: a consumer that stops
+/// (`first(1|truncate_stream(inputs))`) stops `stream`, so the inputs after that event are not
+/// read. [`builtin_truncate_stream`] collects it. The events before one that raises are handed on
+/// first, as jq emits them.
+/// [`each_truncate_stream`] at the depth `value` holds, for `eval_each`; out of line, as
+/// [`each_fromstream`] is.
+#[inline(never)]
+fn each_truncate_stream_of<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    stream_expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let depth = to_owned_lossy::<S, _>(&value);
+    each_truncate_stream::<W, S>(stream_expr, &depth, optional, sink)
+}
+
+#[inline(never)]
+fn each_truncate_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    stream_expr: &Expr,
+    depth: &OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    // #2188 audit: the lossy materialization of an event is safe by construction, not just
+    // untested -- `stream_expr` runs on `null` (#4971: jq 1.7.1 defines it as
+    // `. as $n | null | stream | ..`), so it has no document-backed content to draw an
+    // undecodable value from but what it reads itself, and an event's path length is compared
+    // against `depth` before anything of it is kept.
+    let null = OwnedValue::Null;
+    let mut raised = None;
+    let mut keep = |item: Item<'a, W>| {
+        let event = item.into_owned_lossy::<S>();
+        // `if (.[0]|length) > $n then setpath([0]; .[0][$n:]) else empty end` (#4971).
         let first = match &event {
             OwnedValue::Array(items) => items.first().unwrap_or(&null),
             OwnedValue::Null => &null,
             other => {
-                return QueryResult::Error(EvalError::cannot_index_with_type(
-                    other.type_name(),
-                    "number",
-                ))
+                return stop_with_escape(
+                    &mut raised,
+                    Control::Error(EvalError::cannot_index_with_type(
+                        other.type_name(),
+                        "number",
+                    )),
+                )
             }
         };
         let path_len = match jq_length_of::<S>(first) {
             Ok(n) => OwnedValue::Float(n),
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return stop_with_escape(&mut raised, Control::Error(e)),
         };
-        if compare_values::<S>(&path_len, &depth) != core::cmp::Ordering::Greater {
-            continue;
+        if compare_values::<S>(&path_len, depth) != core::cmp::Ordering::Greater {
+            return Demand::Continue;
         }
-        let sliced = match jq_slice_from(first, &depth) {
+        let sliced = match jq_slice_from(first, depth) {
             Ok(v) => v,
-            Err(e) => return QueryResult::Error(e),
+            Err(e) => return stop_with_escape(&mut raised, Control::Error(e)),
         };
-        outputs.push(match event {
+        sink(Item::Owned(match event {
             OwnedValue::Array(mut parts) if !parts.is_empty() => {
                 parts[0] = sliced;
                 OwnedValue::Array(parts)
             }
             _ => OwnedValue::array_from(vec![sliced]),
-        });
-    }
-
-    match control {
-        Some(control) => partial(outputs, control),
-        None => owned_vec_to_result(outputs),
-    }
+        }))
+    };
+    // `repeat` keeps the eager route, whose iteration cap the demand-driven one does not have
+    // ([`streams_unbounded`]), as in [`each_fromstream`].
+    let flow = if streams_unbounded(stream_expr) {
+        drain_result(
+            eval_single::<W, S>(stream_expr, StandardJson::Null, optional),
+            &mut keep,
+        )
+    } else {
+        eval_each::<W, S>(stream_expr, StandardJson::Null, optional, &mut keep)
+    };
+    resume_from_escape(raised, flow)
 }
 
 /// Builtin: paths - all paths to values (excluding empty paths)
@@ -102671,16 +103432,32 @@ fn resolve_setpath_index(key: &OwnedValue, len: usize, yq_mode: bool) -> Result<
     // Still fallible on a 32-bit target, where a large positive index does not
     // fit a `usize`. That is the same refusal as `pad_with_nulls`', not a
     // negative index, so it must not borrow the sentence above.
-    usize::try_from(resolved).map_err(|_| cannot_grow_array(resolved as u64 + 1))
+    usize::try_from(resolved).map_err(|_| array_too_large(resolved as u64 + 1, yq_mode))
 }
 
 /// Refusal for an array length that cannot be allocated.
 ///
 /// Not a jq sentence: jq does not survive the filters that reach this (it dies
 /// on the allocation), so there is no wording to reproduce — see
-/// `docs/compliance/jq/limitations.md`.
+/// `docs/compliance/jq/limitations.md`. It is also what `succinctly yq` says for
+/// a length past [`MAX_PADDED_ARRAY_LEN`] ([`array_too_large`]): yq has no
+/// sentence either.
 fn cannot_grow_array(len: u64) -> EvalError {
     EvalError::new(format!("Cannot grow array to {len} elements"))
+}
+
+/// The refusal for an index write past [`MAX_PADDED_ARRAY_LEN`] (a length of `len`).
+///
+/// `succinctly jq` words it as jq 1.8.2 does, `Array index too large` (CVE-2024-23337: 1.8
+/// bounds `jv_array_set` and answers that sentence; 1.7.1 has no bound and dies, #7536).
+/// `succinctly yq` keeps [`cannot_grow_array`]: the mode decides, and yq has no sentence to
+/// copy.
+fn array_too_large(len: u64, yq_mode: bool) -> EvalError {
+    if yq_mode {
+        cannot_grow_array(len)
+    } else {
+        EvalError::new("Array index too large")
+    }
 }
 
 /// The longest array an index write grows one to: 2^29 elements, so index
@@ -102697,9 +103474,9 @@ pub(crate) const MAX_PADDED_ARRAY_LEN: usize = 536_870_912;
 
 /// The refusal for a write that would grow an array to `len` elements, before
 /// anything is reserved.
-fn check_paddable_len(len: usize) -> Result<(), EvalError> {
+fn check_paddable_len(len: usize, yq_mode: bool) -> Result<(), EvalError> {
     if len > MAX_PADDED_ARRAY_LEN {
-        Err(cannot_grow_array(len as u64))
+        Err(array_too_large(len as u64, yq_mode))
     } else {
         Ok(())
     }
@@ -102714,7 +103491,8 @@ fn check_paddable_len(len: usize) -> Result<(), EvalError> {
 /// which for a library means taking the embedder down with it: `null |
 /// setpath([1e30]; 9)` wants 9.2e18 elements. jq has no sentence to reproduce
 /// here because jq does not survive the same filter either (it dies on the
-/// allocation), so this is succinctly's own wording.
+/// allocation), so this is succinctly's own wording, except for a length past the bound,
+/// which `succinctly jq` words as jq 1.8.2 does ([`array_too_large`]).
 ///
 /// Only the impossible and the absurd are refused: a length past
 /// [`MAX_PADDED_ARRAY_LEN`], or one that does not fit in memory. Every shorter
@@ -102723,16 +103501,17 @@ fn check_paddable_len(len: usize) -> Result<(), EvalError> {
 fn pad_with_nulls(
     arr: &mut crate::jq::ArrayVecMut<'_, OwnedValue>,
     index: usize,
+    yq_mode: bool,
 ) -> Result<(), EvalError> {
     // `index + 1` is only an overflow on a 32-bit target, where `usize::MAX`
     // is a reachable index; the refusal is the same either way.
     let len = index
         .checked_add(1)
-        .ok_or_else(|| cannot_grow_array(index as u64 + 1))?;
+        .ok_or_else(|| array_too_large(index as u64 + 1, yq_mode))?;
     // `try_reserve` alone does not stop `.[1e12] = 1`: the address space it
     // asks for is reservable on a 64-bit target, and `resize` then spends its
     // time (or the host's memory) writing 1e12 nulls (#5500).
-    check_paddable_len(len)?;
+    check_paddable_len(len, yq_mode)?;
     arr.try_reserve(len - arr.len())
         .map_err(|_| cannot_grow_array(len as u64))?;
     // #1670: already guarded -- `try_reserve` above already proved the
@@ -102768,7 +103547,7 @@ fn extend_array_with_nulls_for_delete(
     if target_len <= arr.len() {
         return Ok(());
     }
-    pad_with_nulls(arr, target_len - 1)
+    pad_with_nulls(arr, target_len - 1, true)
 }
 
 /// The text an integer path component names a mapping member by in yq mode (#2801): `path`
@@ -102878,7 +103657,7 @@ fn set_value_at_path_impl<S: EvalSemantics, const YQ_SETPATH: bool>(
             }
             let index = resolve_setpath_index(key, arr.len(), S::TAG == EvalTag::Yq)?;
             if index >= arr.len() {
-                pad_with_nulls(&mut arr.make_vec(), index)?;
+                pad_with_nulls(&mut arr.make_vec(), index, S::TAG == EvalTag::Yq)?;
             }
             let old = core::mem::replace(&mut arr[index], OwnedValue::Null);
             arr[index] = set_value_at_path_impl::<S, YQ_SETPATH>(old, rest, new_val)?;
@@ -103487,7 +104266,7 @@ fn delete_paths_under<S: EvalSemantics>(
                         arr[index] = delete_paths_sorted::<S>(old, paths, start)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                        pad_with_nulls(&mut arr.make_vec(), index)?;
+                        pad_with_nulls(&mut arr.make_vec(), index, true)?;
                         arr[index] = delete_paths_sorted::<S>(OwnedValue::Null, paths, start)?;
                     }
                     DeleteIndexResolution::PositiveOutOfRange(_) | DeleteIndexResolution::Skip => {}
@@ -103592,7 +104371,7 @@ fn yq_delete_index_sequence(
     let mut nodes: Vec<usize> = vec_with_capacity(steps.len());
     for &step in steps {
         if step >= 0 {
-            let index = usize::try_from(step).map_err(|_| cannot_grow_array(step as u64))?;
+            let index = usize::try_from(step).map_err(|_| array_too_large(step as u64, true))?;
             len = len.max(index.saturating_add(1));
             nodes.push(index);
         } else {
@@ -103603,7 +104382,7 @@ fn yq_delete_index_sequence(
         }
     }
     if len > arr.len() {
-        pad_with_nulls(arr, len - 1)?;
+        pad_with_nulls(arr, len - 1, true)?;
     }
     let mut keep = vec![true; len];
     let mut repeated = false;
@@ -105097,7 +105876,7 @@ fn delete_trie_array(
                             *target = delete_trie_apply(old, trie, child, yq_mode)?;
                         }
                         DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                            pad_with_nulls(&mut arr.make_vec(), index)?;
+                            pad_with_nulls(&mut arr.make_vec(), index, true)?;
                             let target = &mut arr[index];
                             let old = core::mem::replace(target, OwnedValue::Null);
                             *target = delete_trie_apply(old, trie, child, yq_mode)?;
@@ -107204,7 +107983,7 @@ fn delete_path_steps(
                         // one. Confirmed live (yq v4.53.3): `[1,2] |
                         // del(.[5].a)` is `[1,2,null,null,null,null]`.
                         DeleteIndexResolution::PositiveOutOfRange(index) if yq_mode => {
-                            pad_with_nulls(&mut arr.make_vec(), index)?;
+                            pad_with_nulls(&mut arr.make_vec(), index, true)?;
                             // The freshly padded slot is `null`; whatever
                             // `rest` does with it next (including `.[]`
                             // vivifying it to `[]`, #2323) is handled
@@ -107527,6 +108306,13 @@ fn delete_path_steps(
 
 // Phase 12: Additional builtins
 
+/// jq's `now` reading of a clock: `tv_sec + tv_usec / 1000000.0` from `gettimeofday`, so whole microseconds on every
+/// platform. `Duration::as_secs_f64` keeps the nanoseconds a Linux clock has, which jq never prints (#7484).
+#[cfg(feature = "std")]
+fn unix_seconds_in_microseconds(since_epoch: std::time::Duration) -> f64 {
+    since_epoch.as_secs() as f64 + f64::from(since_epoch.subsec_micros()) / 1_000_000.0
+}
+
 /// Builtin: now - current Unix timestamp
 ///
 /// yq's `now` is a `!!timestamp`: RFC 3339 text in the local zone, with no fraction (#5863).
@@ -107538,7 +108324,9 @@ fn builtin_now<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>() -> QueryResult<'
             Ok(duration) if S::TAG == EvalTag::Yq => QueryResult::Owned(OwnedValue::String(
                 super::yq_datetime::now(duration.as_nanos() as i128).into(),
             )),
-            Ok(duration) => QueryResult::Owned(OwnedValue::Float(duration.as_secs_f64())),
+            Ok(duration) => {
+                QueryResult::Owned(OwnedValue::Float(unix_seconds_in_microseconds(duration)))
+            }
             Err(_) => QueryResult::Error(EvalError::new("failed to get current time")),
         }
     }
@@ -107658,15 +108446,15 @@ mod remaining_inputs {
         pub documents: u64,
         /// Whether a read found the stream at its end.
         pub past_end: bool,
-        /// Whether a read was of a parse error.
-        pub fault: bool,
+        /// How many reads were of a parse error (#7575: a `try` can catch one and read on).
+        pub faults: u64,
     }
 
     impl Reads {
         const NONE: Self = Self {
             documents: 0,
             past_end: false,
-            fault: false,
+            faults: 0,
         };
     }
 
@@ -107685,7 +108473,7 @@ mod remaining_inputs {
             let mut reads = r.get();
             match pop {
                 Pop::Document(_) => reads.documents += 1,
-                Pop::ParseError(_) => reads.fault = true,
+                Pop::ParseError(_) => reads.faults += 1,
                 Pop::Exhausted => reads.past_end = true,
             }
             r.set(reads);
@@ -108779,14 +109567,6 @@ fn jq_tm_field(value: i64) -> i64 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX))
 }
 
-// `tm_year` stores the year relative to 1900. jq subtracts the offset in a
-// 32-bit field, so years from i32::MIN through i32::MIN + 1899 wrap into
-// positive years when the formatter adds 1900 back (#3083).
-fn jq_tm_year(value: i64) -> i64 {
-    let tm_year = (jq_tm_field(value) as i32).wrapping_sub(1900);
-    i64::from(tm_year) + 1900
-}
-
 /// jq's month is 0-indexed in the array; C increments the 32-bit field
 /// before formatting or converting it. The increment wraps at `i32::MAX`.
 fn jq_month_index(month: i64) -> i64 {
@@ -108830,19 +109610,43 @@ fn jq_timegm_secs(
 }
 
 /// The 8 fields of a broken-down-time array (`year, month, day, hour, minute,
-/// second, weekday, yearday`) truncated to integers as jq's `jv2tm` reads
-/// them, or `None` when the array has fewer than 8 elements or a non-number
-/// among its first 8 (#5301). Elements past the 8th are never read.
+/// second, weekday, yearday`) as jq 1.8.2's `jv2tm` reads them into a C
+/// `struct tm` (#7532, upstream fixes jqlang/jq#3070 and #3162), or `None`
+/// for a non-number or NaN among the first 8 elements (#5301). Elements past
+/// the 8th are never read.
+///
+/// - A shorter array is accepted: `jv2tm` stops at its end and a missing field
+///   stays 0 in the zeroed `struct tm`, so a missing year is `tm_year` 0, the
+///   year 1900 (`[] | strftime("%Y")` is `"1900"`).
+/// - Each double is truncated and saturated to C `int` bounds, the year after
+///   1900 has been subtracted from it, so the year saturates at
+///   `i32::MAX + 1900` and never wraps (`[1e20,0,1,0,0,0,0,0] | strftime("%Y")`
+///   is `"2147485547"`, `[1899.5,0,1] | strftime("%Y")` is `"1900"`).
+///
+/// jq 1.7.1 required all 8 elements, cast each double to `int` unchecked (C
+/// undefined behaviour; it saturates on arm64 and the year then wrapped,
+/// #3083) and read NaN as 0. The first field returned is the civil year
+/// (`tm_year + 1900`); the others are the `struct tm` fields as stored.
 fn broken_down_array_fields(arr: &[OwnedValue]) -> Option<[i64; 8]> {
     let mut fields = [0i64; 8];
-    for (slot, element) in fields.iter_mut().zip(arr) {
+    for (i, (slot, element)) in fields.iter_mut().zip(arr).enumerate() {
+        let offset = if i == 0 { 1900 } else { 0 };
         *slot = match element {
-            OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => *n,
-            OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => *f as i64,
+            OwnedValue::Int(n) | OwnedValue::NumberLiteral(NumberRepr::Int(n), _) => {
+                jq_tm_field(n.saturating_sub(offset))
+            }
+            OwnedValue::Float(f) | OwnedValue::NumberLiteral(NumberRepr::Float(f), _) => {
+                if f.is_nan() {
+                    return None;
+                }
+                // `as` truncates toward zero and saturates, as the C clamp does.
+                jq_tm_field((*f - offset as f64) as i64)
+            }
             _ => return None,
         };
     }
-    (arr.len() >= 8).then_some(fields)
+    fields[0] += 1900;
+    Some(fields)
 }
 
 /// Builtin: mktime - convert broken-down time to Unix timestamp
@@ -108869,9 +109673,9 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         _ => return QueryResult::Error(EvalError::mktime_requires_array()),
     };
 
-    // #5301: jq's `jv2tm` reads all 8 fields -- weekday and yearday included --
-    // and raises one wording for a short array and for a non-number among them
-    // alike, extra elements past the 8th being ignored.
+    // #5301, #7532: jq's `jv2tm` reads up to 8 fields -- weekday and yearday
+    // included -- and raises one wording for a non-number or NaN among them,
+    // extra elements past the 8th being ignored.
     let Some(fields) = broken_down_array_fields(&arr) else {
         if optional {
             return QueryResult::None;
@@ -108879,12 +109683,8 @@ fn builtin_mktime<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         return QueryResult::Error(EvalError::mktime_requires_parsed_datetime());
     };
 
-    let year = jq_tm_year(fields[0]);
     let month = jq_month_index(fields[1]); // jq uses 0-indexed months
-    let day = jq_tm_field(fields[2]);
-    let hour = jq_tm_field(fields[3]);
-    let minute = jq_tm_field(fields[4]);
-    let second = jq_tm_field(fields[5]);
+    let [year, _, day, hour, minute, second, ..] = fields;
 
     let timestamp = match jq_timegm_secs(year, month, day, hour, minute, second) {
         Ok(Some(t)) => t,
@@ -109040,8 +109840,8 @@ fn builtin_strflocaltime<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// Parse a value into broken-down-time fields (`year, month, day, hour,
 /// minute, second, weekday, yearday`), accepting either a raw Unix
 /// timestamp number (auto-converted the same way `gmtime`/`localtime`
-/// convert one, shifted into the local zone when `local`) or an 8-element
-/// broken-down-time array -- the two input shapes `strftime` itself
+/// convert one, shifted into the local zone when `local`) or a
+/// broken-down-time array of up to 8 fields -- the two input shapes `strftime` itself
 /// accepts. Shared by `strftime_in_zone` and `builtin_todate` (#3068):
 /// `todate`/`todateiso8601` are literally `strftime(fixed fmt)` in jq, so
 /// they take the identical two input shapes and the identical
@@ -109106,11 +109906,17 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // `int` (`jv2tm`). For a negative timestamp a hair below a whole second that sum rounds
             // up to the next integer: `-1e-17` is second `01` where its truncated second is `00`,
             // and `-1.0000000000000002` is `59 + 0.9999999999999998`, so second `60`
-            // (`23:59:60`), both as in jq. A NaN timestamp keeps the second it has, as jq's does
-            // (an infinite one was refused as out of range above).
-            if !timestamp.is_nan() {
-                t.second = jq_tm_field(broken_down_seconds(t.second, timestamp) as i64);
+            // (`23:59:60`), both as in jq. A NaN timestamp converts (an infinite one was refused as
+            // out of range above), but its seconds slot is NaN, which jq 1.8.2's `jv2tm` refuses
+            // (#7532, jqlang/jq#3070; jq 1.7.1 read it as 0).
+            if timestamp.is_nan() {
+                return Err(if optional {
+                    QueryResult::None // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the array arms below (#3068)"
+                } else {
+                    QueryResult::Error(EvalError::requires_parsed_datetime_inputs(name))
+                });
             }
+            t.second = jq_tm_field(broken_down_seconds(t.second, timestamp) as i64);
             Ok((t, zone))
         }
         // #1820: `scalar_decode_failure` first, same shape as
@@ -109126,18 +109932,9 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             }
             match to_owned_lossy::<S, _>(value) {
                 OwnedValue::Array(arr) => {
-                    // Real jq requires the full 8-element array — weekday and
-                    // yearday included — not just the 6 fields mktime needs, and
-                    // a number in each of them (#5301): `jv2tm` fails on an
-                    // element that is missing or not a number, with this one
-                    // wording. Confirmed empirically: `[2024,0,15,0,0,0] |
-                    // strftime(...)` errors in real jq for every length 1-7,
-                    // only succeeding at 8, as does `["a",0,15,0,0,0,0,0]`.
-                    // Below 8, this codebase used to default weekday/yearday
-                    // to 0 instead of erroring, which was harmless before this
-                    // PR added specifiers that read those fields (#760) — now it
-                    // would silently produce a wrong date instead of matching
-                    // jq's error.
+                    // `jv2tm` fails on an element that is not a number (#5301)
+                    // or is NaN, with this one wording; a missing one is 0
+                    // (#7532: jq 1.8.2, where 1.7.1 required all 8).
                     let Some(fields) = broken_down_array_fields(&arr) else {
                         if optional {
                             return Err(QueryResult::None); // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function -- confirmed live (`eprintln!` probe): `[1,2,3] | todate?` reaches `builtin_todate` with `optional=false`, same as bare `todate`. `?`'s suppression happens entirely outside builtin dispatch here, the same 'optional is never true here' shape eval.rs already documents elsewhere for a different function (#2180's Expr::Object tolerate-line note, ~line 7334) (#3068)"
@@ -109149,15 +109946,16 @@ fn broken_down_time_fields<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
                     let month = jq_month_index(fields[1]);
 
+                    let [year, _, day, hour, minute, second, weekday, yearday] = fields;
                     let t = BrokenDownTime {
-                        year: jq_tm_year(fields[0]),
+                        year,
                         month,
-                        day: jq_tm_field(fields[2]),
-                        hour: jq_tm_field(fields[3]),
-                        minute: jq_tm_field(fields[4]),
-                        second: jq_tm_field(fields[5]),
-                        weekday: jq_tm_field(fields[6]),
-                        yearday: jq_tm_field(fields[7]),
+                        day,
+                        hour,
+                        minute,
+                        second,
+                        weekday,
+                        yearday,
                     };
                     // The fields already are local wall-clock time; the zone
                     // only labels them (`%z`, `%Z`, `%s`). `jq_month_for_time`:
@@ -109245,7 +110043,9 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             };
             // jq hands the libc a buffer of `strlen(fmt) + 100` bytes and fails when `strftime`
             // returns 0: an empty result, or one that does not fit with its terminator (#5754).
-            if result.is_empty() || result.len() >= fmt.len() + 100 {
+            // jq 1.8 no longer fails on an empty *format*, whose empty result is the answer
+            // (`(n == 0 && *fmt) || n > max_size`, jqlang/jq#3271, #7542): 1.7.1 raised there too.
+            if (result.is_empty() && !fmt.is_empty()) || result.len() >= fmt.len() + 100 {
                 return if optional {
                     QueryResult::None // patchcov: coverage tolerate-line reason="`optional` is never true through either caller of this function, same as the arms above (#3068); a trailing ? is caught by the enclosing try"
                 } else {
@@ -109261,8 +110061,8 @@ fn strftime_in_zone<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ///
 /// jq tests the input before it reads the format: a number is converted first and a failed
 /// conversion is the error, a non-array is not a datetime, and only an array gets to `requires a
-/// string format`. A number that converts then meets a format `jv_string_value` aborts on (#3046),
-/// which raises here. Out of line and cold so the builtin's hot path keeps its shape.
+/// string format`. A number that converts then meets a format that jq 1.7.1 aborts on (#3046) and
+/// jq 1.8.2 refuses with the same `requires a string format` (#7533). Out of line and cold so the builtin's hot path keeps its shape.
 #[cold]
 #[inline(never)]
 fn strftime_format_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -109276,13 +110076,14 @@ fn strftime_format_error<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
     match value {
-        StandardJson::Number(_) => {
-            // `optional` is false here: the caller took that arm first.
+        StandardJson::Number(n) => {
+            // `optional` is false here: the caller took that arm first. A NaN converts; jq 1.8.2
+            // refuses its NaN seconds slot only after it has read the format (#7532).
+            let is_nan = n.bridge_nonfinite().is_some_and(f64::is_nan);
             match broken_down_time_fields::<W, S>(value, false, local, false, name) {
-                Err(r) => r,
-                Ok(_) => {
-                    QueryResult::Error(EvalError::type_error("string", &format!("{name} format")))
-                }
+                Err(r) if !is_nan => r,
+                // jq 1.8.2 words it as the array case (#7533); 1.7.1 aborted on an assertion (#3046).
+                _ => QueryResult::Error(EvalError::requires_string_format(name)),
             }
         }
         StandardJson::Array(_) => QueryResult::Error(EvalError::requires_string_format(name)),
@@ -110793,8 +111594,8 @@ fn builtin_todate<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'_, W> {
     // #3068: `todate`/`todateiso8601` are literally `def todate:
     // strftime("%Y-%m-%dT%H:%M:%SZ")` in jq, so they accept the identical
-    // two input shapes `strftime` does (a raw Unix timestamp number, or an
-    // 8-element broken-down-time array) and raise the identical
+    // two input shapes `strftime` does (a raw Unix timestamp number, or a
+    // broken-down-time array) and raise the identical
     // `<name>/1 requires parsed datetime inputs` error on anything else --
     // `broken_down_time_fields` is the one shared implementation of that,
     // also used by `strftime_in_zone`. `S` still threads through to it: its
@@ -110987,7 +111788,7 @@ fn parse_iso8601(input: &str) -> Result<f64, String> {
 ///
 /// #3068 review: this used to delegate straight to `builtin_todate`, which
 /// was harmless while `todate` was numeric-only -- but `todate` now also
-/// accepts an 8-element broken-down-time array and raises jq's own
+/// accepts a broken-down-time array and raises jq's own
 /// `strftime/1 requires parsed datetime inputs` on anything else, and real
 /// yq's `from_unix` does neither: it rejects an array the same as any other
 /// non-number (confirmed live against yq v4.53.3: `[1970,0,1,0,0,0,4,0] |
@@ -112746,7 +113547,7 @@ fn builtin_first_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// Builtin: last(expr) - output only the last value from expr (stream version)
 ///
-/// Mirrors [`eval_last_expr`]'s `null`-for-an-empty-stream rule (#1521); see
+/// Mirrors [`eval_last_expr`]'s nothing-for-an-empty-stream rule (#7518); see
 /// its doc comment for the rule and for why no local `optional` handling is
 /// needed here either. Unlike `eval_last_expr`, this function is never
 /// actually reached from parsed `succinctly jq`/`succinctly yq` filter text
@@ -112778,13 +113579,13 @@ fn builtin_last_stream<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         QueryResult::Owned(v) => QueryResult::Owned(v),
         QueryResult::Many(results) => match results.into_iter().next_back() {
             Some(last) => QueryResult::Owned(to_owned_or_suppress!(&last, optional)),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
         QueryResult::ManyOwned(results) => match results.into_iter().next_back() {
             Some(last) => QueryResult::Owned(last),
-            None => QueryResult::Owned(OwnedValue::Null),
+            None => QueryResult::None,
         },
-        QueryResult::None => QueryResult::Owned(OwnedValue::Null),
+        QueryResult::None => QueryResult::None,
         QueryResult::Error(e) => QueryResult::Error(e),
         QueryResult::Break(label) => QueryResult::Break(label),
         QueryResult::Halt(code) => QueryResult::Halt(code),
@@ -114634,8 +115435,25 @@ fn environment_object() -> OwnedValue {
 fn environment_object_in(snapshot: bool) -> OwnedValue {
     fn build() -> OwnedValue {
         let mut env_obj = FieldMap::new();
+        // jq splits every `environ` string at its first `=`; `std` skips a name that is empty and
+        // reads `=X=1` as `X`, so Unix reads the strings themselves (#7487). An entry with no `=`
+        // is no variable, as in jq.
+        #[cfg(unix)]
+        for entry in super::environ::entries() {
+            use std::os::unix::ffi::OsStrExt;
+            let Some(eq) = entry.iter().position(|&b| b == b'=') else {
+                continue;
+            };
+            env_obj.insert(
+                environment_text(std::ffi::OsStr::from_bytes(&entry[..eq])),
+                OwnedValue::String(
+                    environment_text(std::ffi::OsStr::from_bytes(&entry[eq + 1..])).into(),
+                ),
+            );
+        }
         // `vars_os`, not `vars`: `vars` panics on the first name or value that is not UTF-8
         // (#6564); jq substitutes it instead.
+        #[cfg(not(unix))]
         for (key, value) in std::env::vars_os() {
             env_obj.insert(
                 environment_text(&key),
@@ -114881,7 +115699,7 @@ fn builtin_trim<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("trim requires string")),
+        _ => QueryResult::Error(EvalError::new("trim input must be a string")),
     }
 }
 
@@ -114897,7 +115715,7 @@ fn builtin_ltrim<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("ltrim requires string")),
+        _ => QueryResult::Error(EvalError::new("trim input must be a string")),
     }
 }
 
@@ -114913,7 +115731,7 @@ fn builtin_rtrim<W: Clone + AsRef<[u64]>>(
             Err(e) => QueryResult::Error(EvalError::decode_failure(e.message())),
         },
         _ if optional => QueryResult::None,
-        _ => QueryResult::Error(EvalError::new("rtrim requires string")),
+        _ => QueryResult::Error(EvalError::new("trim input must be a string")),
     }
 }
 
@@ -117588,6 +118406,11 @@ mod native_stack {
         Guard(previous)
     }
 
+    /// Unregister the budget for the caller's scope (#7676); the guard restores it.
+    pub(crate) fn lift() -> Guard {
+        Guard(BUDGET.with(|b| b.replace((0, 0))))
+    }
+
     impl Drop for Guard {
         fn drop(&mut self) {
             BUDGET.with(|b| b.set(self.0));
@@ -117606,6 +118429,10 @@ mod native_stack {
     pub(crate) struct Guard;
 
     pub(crate) fn enter(_here: usize, _reach: usize) -> Guard {
+        Guard
+    }
+
+    pub(crate) fn lift() -> Guard {
         Guard
     }
 }
@@ -117668,6 +118495,28 @@ pub fn with_stack_budget<R>(available: usize, f: impl FnOnce() -> R) -> R {
 pub(crate) fn native_stack_exhausted() -> bool {
     let (origin, reach) = native_stack::budget();
     origin != 0 && origin.abs_diff(stack_address()) > reach
+}
+
+/// Run `f` with this thread's native-stack floor lifted (#7676), for a parse of fixed text the
+/// crate supplies itself: a path-mode prelude definition on its first use, the `_nwise` template.
+/// Either can be reached anywhere, the floor included, and since #7475 the parser refuses there,
+/// but neither has a caller that could take the refusal: it would be a panic. Such a parse is
+/// shallow and bounded (a unit test pins the stack each takes, `TRUSTED_PARSE_STACK` in
+/// `path_mode`'s tests), so the half of the stack below the floor pays for it, as it pays for
+/// every other bounded step taken past the floor (ADR-0025). Never for a program's own text,
+/// which is as deep as it is written.
+pub(crate) fn with_native_stack_floor_lifted<R>(f: impl FnOnce() -> R) -> R {
+    let _lifted = native_stack::lift();
+    f()
+}
+
+/// How many bytes of stack this thread may still spend before [`native_stack_exhausted`] holds,
+/// or `None` when no budget is registered (#7475). For the parser, which builds a chain of
+/// definitions in a loop and so spends no stack on its length, while every walk of the program
+/// after it recurses once per link.
+pub(crate) fn native_stack_room() -> Option<usize> {
+    let (origin, reach) = native_stack::budget();
+    (origin != 0).then(|| reach.saturating_sub(origin.abs_diff(stack_address())))
 }
 
 /// Whether values on this thread are bounded by the native-stack floor instead of
@@ -120539,6 +121388,16 @@ mod tests {
             // produces a `StepKey::Index`, exercising `StepKey::
             // into_component`'s `Index` arm.
             (".a[0] = 1", with_empty_array.clone()),
+            // #7563, #7452: an index jq counts back from the end, or pads to, is the same write.
+            (".[-1] = 1", array.clone()),
+            (".[-2] |= . + 1", array.clone()),
+            (".[5] = 1", array.clone()),
+            (".[1] = 1", OwnedValue::Null),
+            (".a[3] = 1", with_empty_array.clone()),
+            (
+                ".[-1][2] = 1",
+                OwnedValue::array_from(vec![OwnedValue::Null]),
+            ),
         ];
         for (src, input) in handled {
             let expr = subst(src);
@@ -120571,9 +121430,8 @@ mod tests {
             (".[$r.name] = 1", array.clone()),       // string key into an array
             (".[$r.id] = 1", object.clone()),        // number key into an object
             (".[$r.tag] = 1", object.clone()),       // null key
-            (".[-1] = 1", array.clone()),            // negative index
-            (".[5] = 1", array.clone()),             // padding index
-            (".[1] = 1", OwnedValue::Null),          // padding from null
+            (".[-3] = 1", array.clone()),            // negative past the start: raises
+            (".[-1] = 1", OwnedValue::Null),         // negative into null: raises
             (".[1.5] = 1", array.clone()),           // float key
             (".a[$r.name] = 1", object.clone()),     // through a boolean
             (".[$r.name] -= \"s\"", object.clone()), // combine fails
@@ -120793,7 +121651,7 @@ mod tests {
             };
             assert_eq!(items.len(), 64, "{src}");
         }
-        // `-0.0` is index 0; `5.0` into a three-element array pads, which is the evaluator's.
+        // `-0.0` is index 0; `-1.0` counts back from the end and `5.0` pads (#7563, #7452).
         let three = || OwnedValue::array_from(vec![OwnedValue::Int(1); 3]);
         let step = |src: &str, key: OwnedValue, state: OwnedValue, yq: bool| {
             let expr = substitute_vars(&parse(src).unwrap(), [("k", &key)]);
@@ -120816,6 +121674,29 @@ mod tests {
                 OwnedValue::Int(1)
             ])
         );
+        let one = OwnedValue::Int(1);
+        let nine = OwnedValue::Int(9);
+        for (key, want) in [
+            (-1.0, vec![one.clone(), one.clone(), nine.clone()]),
+            (
+                5.0,
+                vec![
+                    one.clone(),
+                    one.clone(),
+                    one,
+                    OwnedValue::Null,
+                    OwnedValue::Null,
+                    nine,
+                ],
+            ),
+        ] {
+            let OwnedStep::Handled(Ok(written)) =
+                step(".[$k] = 9", OwnedValue::Float(key), three(), false)
+            else {
+                panic!("{key} is a whole key jq resolves"); // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- fires only if a negative or padding whole float key declined again (#7563)"
+            };
+            assert_eq!(written, OwnedValue::array_from(want), "{key}");
+        }
         let object = || OwnedValue::object_from([("a".to_string(), OwnedValue::Int(1))]);
         for (key, state, yq) in [
             (OwnedValue::Float(1.5), three(), false),
@@ -120825,8 +121706,7 @@ mod tests {
             (OwnedValue::Float(f64::NEG_INFINITY), three(), false),
             (OwnedValue::Float(1e300), three(), false),
             (OwnedValue::Float(9_007_199_254_740_994.0), three(), false),
-            (OwnedValue::Float(-1.0), three(), false),
-            (OwnedValue::Float(5.0), three(), false),
+            (OwnedValue::Float(-4.0), three(), false),
             (OwnedValue::Float(0.0), object(), false),
             (OwnedValue::Float(1.0), three(), true),
         ] {
@@ -120836,6 +121716,86 @@ mod tests {
                     OwnedStep::Declined(_)
                 ),
                 "{key:?} (yq: {yq}) must stay the evaluator's"
+            );
+        }
+    }
+
+    /// #7563, #7452: a fold step that writes an array slot by a negative index (`.[-$k]`, `.[-1]`)
+    /// or by one that pads (`.[$k][5]` into the new row, `.[$k * 2]`) is answered in place. Both
+    /// declined, and the evaluator's route re-indexed and rebuilt the whole accumulator every step:
+    /// `reduce range(1;n) as $i ([range(n)]; .[-$i] = $i)` and `reduce range(n) as $t ([];
+    /// .[$t][799] = 1)` were quadratic. A sibling string the writes never touch being the same
+    /// allocation after every step is the in-place proof, and no step may re-index the state (the
+    /// `-$k` key included, which was evaluated on a rebuilt copy of the state). An index still
+    /// negative after counting back, a negative index into `null`, and yq mode still decline.
+    #[test]
+    fn owned_assign_step_takes_negative_and_padding_indexes_in_place_7563() {
+        let literal = "x".repeat(100_000);
+        let text_ptr = |state: &OwnedValue| match state {
+            OwnedValue::Array(items) => match items.first() {
+                Some(OwnedValue::String(text)) => text.as_ptr(),
+                other => panic!("missing sibling: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- slot 0 holds the tracked string, which no write below touches (#7563)"
+            },
+            other => panic!("expected array: {other:?}"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- every write below keeps the state an array (#7563)"
+        };
+        let negative = |len: usize| {
+            let mut items = vec![OwnedValue::string(&literal)];
+            items.extend((1..len as i64).map(OwnedValue::Int));
+            OwnedValue::array_from(items)
+        };
+        let padding = || OwnedValue::array_from(vec![OwnedValue::string(&literal)]);
+        // (step, state, rounds, final length): `$k` is the round, 1-based.
+        let rows: [(&str, OwnedValue, i64, usize); 9] = [
+            (".[-$k] = $k", negative(64), 63, 64),
+            (".[-$k] |= 7", negative(64), 63, 64),
+            (".[-$k] += 1", negative(64), 63, 64),
+            (".[-$k] //= 1", negative(64), 63, 64),
+            (".[-1] = $k", negative(64), 63, 64),
+            (".[$k][5] = 1", padding(), 63, 64),
+            (".[$k][$k] = 1", padding(), 63, 64),
+            (".[$k].a[3] = 1", padding(), 63, 64),
+            (".[$k * 2] = $k", padding(), 31, 63),
+        ];
+        for (src, start, rounds, len) in rows {
+            let before = text_ptr(&start);
+            let mut state = start;
+            let reindexed = crate::jq::value::reindex_count::get();
+            for k in 1..=rounds {
+                let expr = substitute_vars(&parse(src).unwrap(), [("k", &OwnedValue::Int(k))]);
+                state = match try_eval_owned_step::<JqSemantics>(&expr, state) {
+                    OwnedStep::Handled(Ok(next)) => next,
+                    _ => panic!("{src}: step {k} was not handled"), // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- this panic only fires if a negative or padding index declined, which is the regression this test pins (#7563)"
+                };
+            }
+            assert_eq!(text_ptr(&state), before, "{src}: the sibling was copied");
+            assert_eq!(
+                crate::jq::value::reindex_count::get(),
+                reindexed,
+                "{src}: a step re-indexed the state"
+            );
+            let OwnedValue::Array(items) = &state else {
+                unreachable!() // patchcov: coverage tolerate-line reason="unreachable in a passing suite by design -- text_ptr above already proved the state is an array (#7563)"
+            };
+            assert_eq!(items.len(), len, "{src}");
+        }
+        let three = || OwnedValue::array_from(vec![OwnedValue::Int(1); 3]);
+        for (src, state, yq) in [
+            (".[-4] = 9", three(), false),
+            (".[-$k] = 9", three(), false),
+            (".[-1] = 9", OwnedValue::Null, false),
+            (".[0][-1] = 9", OwnedValue::Null, false),
+            (".[-1] = 9", three(), true),
+            (".[5] = 9", three(), true),
+        ] {
+            let expr = substitute_vars(&parse(src).unwrap(), [("k", &OwnedValue::Int(4))]);
+            let declined = if yq {
+                try_eval_owned_step::<YqSemantics>(&expr, state)
+            } else {
+                try_eval_owned_step::<JqSemantics>(&expr, state)
+            };
+            assert!(
+                matches!(declined, OwnedStep::Declined(_)),
+                "{src} (yq: {yq}) must stay the evaluator's"
             );
         }
     }
@@ -122810,6 +123770,121 @@ mod tests {
         }
     }
 
+    /// #7471: a chain copies a body only at a link whose variable is read. Before, every link
+    /// copied the rest of the chain: 200 copies for 200 links, `n^2` nodes in all.
+    #[test]
+    fn as_chain_copies_only_the_bodies_that_read_their_variable_7471() {
+        // Debug-build parser and evaluator frames overflow a test thread's default stack here.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                let links = |tail: &str| {
+                    (0..200)
+                        .map(|i| alloc::format!("1 as $x{i} | "))
+                        .collect::<String>()
+                        + tail
+                };
+                let repeated = (0..200)
+                    .map(|i| alloc::format!("{i} as $x | "))
+                    .collect::<String>()
+                    + "$x";
+                for (filter, want, copies) in [
+                    (links("$x0"), "1", 1),
+                    (links("1"), "1", 0),
+                    (links("[$x0, $x199]"), "[1,1]", 2),
+                    (repeated, "199", 1),
+                ] {
+                    BOUND_BODY_COPIES.with(|n| n.set(0));
+                    let got = outputs(b"null", &filter);
+                    assert_eq!(
+                        got,
+                        alloc::vec![want.to_string()],
+                        "{}",
+                        &filter[filter.len() - 12..]
+                    );
+                    assert_eq!(
+                        BOUND_BODY_COPIES.with(core::cell::Cell::get),
+                        copies,
+                        "{}",
+                        &filter[filter.len() - 12..]
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// #7471: one walk answers every link of a chain, shadow-aware along it, and keeps the
+    /// answers for the links below exactly as long as the first answer is held.
+    #[test]
+    fn as_chain_answers_every_link_from_one_walk_7471() {
+        let var = |name: &str| Expr::Var(name.to_string());
+        let bind = |expr: Expr, name: &str, body: Expr| Expr::As {
+            expr: Box::new(expr),
+            var: name.to_string(),
+            body: Box::new(body),
+        };
+        let one = || Expr::Literal(Literal::Int(1));
+        // `$a` is read only below the link that binds it again, `$b` not at all, and the
+        // inner `$a` by the last body: `1 as $b | 1 as $a | [$a, $c]` is the body of an
+        // outer `as $a`.
+        let tail = Expr::Array(Box::new(Expr::Comma(vec![var("a"), var("c")])));
+        let body = bind(one(), "b", bind(one(), "a", tail));
+        let reads = as_body_reads_var(&body, "a");
+        assert!(!reads.reads, "the outer `$a` is shadowed before it is read");
+        let Expr::As {
+            body: b_body,
+            var: b_var,
+            ..
+        } = &body
+        else {
+            unreachable!("built above"); // patchcov: coverage tolerate-line reason="the chain is built just above"
+        };
+        let Expr::As {
+            body: a_body,
+            var: a_var,
+            ..
+        } = b_body.as_ref()
+        else {
+            unreachable!("built above"); // patchcov: coverage tolerate-line reason="the chain is built just above"
+        };
+        #[cfg(feature = "std")]
+        assert_eq!(
+            (
+                as_chain_reads::lookup(b_body, b_var),
+                as_chain_reads::lookup(a_body, a_var)
+            ),
+            (Some(false), Some(true)),
+            "kept: `$b` is not read, the inner `$a` is"
+        );
+        // Asked again of a link it kept, it answers from what was kept and keeps nothing; asked
+        // with a name that is not the link's own, it walks instead (`$b` is not read below).
+        assert!(!as_body_reads_var(b_body, b_var).reads);
+        assert!(as_body_reads_var(a_body, a_var).reads);
+        #[cfg(feature = "std")]
+        assert_eq!(as_chain_reads::lookup(b_body, "b"), None);
+        assert!(!as_body_reads_var(b_body, "b").reads);
+        drop(reads);
+        #[cfg(feature = "std")]
+        assert_eq!(
+            (
+                as_chain_reads::lookup(b_body, b_var),
+                as_chain_reads::lookup(a_body, a_var)
+            ),
+            (None, None),
+            "dropped with the answer"
+        );
+        // A source that names the variable reads it, and a free variable of the last body
+        // that no link binds (`$c`) is read wherever it is asked.
+        let reading_source = bind(var("a"), "b", bind(one(), "x", one()));
+        assert!(as_body_reads_var(&reading_source, "a").reads);
+        assert!(as_body_reads_var(&body, "c").reads);
+        // One bind, not a chain: the body is searched as it is.
+        assert!(as_body_reads_var(&var("a"), "a").reads);
+        assert!(!as_body_reads_var(&one(), "a").reads);
+    }
+
     /// #2402 review finding: `wrap_shadowable_call` (`parser.rs`) isn't
     /// gated on `ParserMode::Jq`, so a yq-mode-parsed `Expr` using a
     /// jq-extension special form under `--jq-extensions` can carry an
@@ -124168,6 +125243,62 @@ mod tests {
             );
             // ...so the arm itself refuses the already-bound body.
             refuse();
+        }
+    }
+
+    /// #7676: the path-mode interpreter parses a prelude definition on its first use, wherever
+    /// the evaluation is. Since #7475 the parser refuses at the native-stack floor, and a first use
+    /// there panicked in `PreludeDef::expr` instead of the call refusing. Each program runs on a
+    /// thread of its own, so every definition it calls is parsed there for the first time, with
+    /// no stack left, through both evaluators' entries.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_first_prelude_use_at_the_floor_refuses_7676() {
+        type Entry = fn(&Expr, JsonCursor<'_, Vec<u64>>) -> Result<(), String>;
+        fn refusal(result: QueryResult<'_, Vec<u64>>) -> Result<(), String> {
+            match result {
+                QueryResult::Error(e)
+                    if e.message.ends_with("exceeded maximum recursion depth") =>
+                {
+                    Ok(())
+                }
+                other => Err(format!("expected a refusal, got {other:?}")),
+            }
+        }
+        let entries: [(&str, Entry); 2] = [
+            ("eval_full", |expr, root| {
+                refusal(eval_full::<Vec<u64>, JqSemantics>(expr, root))
+            }),
+            ("eval", |expr, root| {
+                refusal(eval::<Vec<u64>, JqSemantics>(expr, root))
+            }),
+        ];
+        for filter in [
+            "def f: .; [path(.a | to_entries | f)]",
+            "def f: .; [path(.a | map(.) | f)]",
+            "def f: .; [path(.a | select(true) | f)]",
+            "def f: .; [path(.a | paths | f)]",
+            "def f: .; [path(.a | walk(.) | f)]",
+            "def f: .; [path(.a | with_entries(.) | f)]",
+        ] {
+            assert!(
+                matches!(
+                    crate::jq::path_mode::route(&parse(filter).expect("parses")),
+                    crate::jq::path_mode::Route::Interpreter
+                ),
+                "{filter}: runs through the path-mode interpreter"
+            );
+            for (entry, run) in entries {
+                let outcome = std::thread::spawn(move || {
+                    let expr = parse(filter).expect("parses");
+                    let json = br#"{"a":{"b":1}}"#;
+                    let index = JsonIndex::build(json);
+                    with_stack_budget(0, || run(&expr, index.root(json)))
+                })
+                .join()
+                .unwrap_or_else(|_| Err(String::from("panicked")));
+                assert_eq!(outcome, Ok(()), "{entry}: {filter}");
+            }
         }
     }
 
@@ -149501,8 +150632,11 @@ mod tests {
     }
 
     /// #6106: a loop rewritten for Oniguruma's empty-iteration exit is what the `regex` crate
-    /// compiles, and a rewrite the crate refuses (here, nested past its limit) falls back to the
-    /// pattern as written instead of becoming an error.
+    /// compiles. A rewrite nests deeper than the pattern it was made from, and the crate's default
+    /// limit (250) refused one that jq reads (#6106 then fell back to the pattern as written); since
+    /// #7528 the builder takes jq's own depth (`ONIG_NEST_LIMIT`), so the rewrite compiles at a depth
+    /// the default limit refuses. The fall-back remains for a rewrite past the raised limit, which a
+    /// pattern within jq's 511 groups cannot make.
     #[cfg(feature = "regex")]
     #[test]
     fn build_regex_falls_back_to_the_pattern_as_written_6106() {
@@ -149524,9 +150658,12 @@ mod tests {
                 super::super::onig_loop::rewrite(&nested(d))
                     .is_some_and(|rewritten| regex::Regex::new(&rewritten).is_err())
             })
-            .expect("some depth nests the rewrite past the crate's limit");
+            .expect("some depth nests the rewrite past the crate's default limit");
         assert!(regex::Regex::new(&nested(depth)).is_ok());
-        assert_eq!(compiled(&nested(depth)), nested(depth));
+        assert_eq!(
+            compiled(&nested(depth)),
+            super::super::onig_loop::rewrite(&nested(depth)).unwrap()
+        );
     }
 
     /// #6332: a loop with a capture group the plain rewrite would copy or drop is written with the
@@ -150896,13 +152033,15 @@ mod tests {
             ["1", "2", "3", "6", "6", "12"]
         );
 
-        // INIT-comma: same null-after-the-first-fork rule as `reduce` above
-        // (#3895): jq prints `1,3,6` then errors on the second fork's `.[]`.
+        // INIT-comma: unlike `reduce` above, every fork's `.[]` reads the real
+        // input (#7519): jq 1.8.2 prints `1,3,6,2,4,7`, where jq 1.7.1 printed
+        // `1,3,6` and then raised on the second fork's `.[]` against `null`
+        // (jqlang/jq#3266 fixed `foreach` only).
         let (values, error) = outputs_and_error(b"[1,2,3]", "foreach .[] as $x (0,1; .+$x)");
-        assert_eq!(values, ["1", "3", "6"]);
+        assert_eq!(values, ["1", "3", "6", "2", "4", "7"]);
         assert!(
-            error.is_some_and(|e| e.contains("Cannot iterate over null")),
-            "the second fork's `.[]` runs against null"
+            error.is_none(),
+            "every fork reads the real input: {error:?}"
         );
         assert_eq!(
             outputs(b"[1,2,3]", "foreach range(1;4) as $x (0,1; .+$x)"),
@@ -150911,14 +152050,16 @@ mod tests {
     }
 
     /// #2163, closed by #3895: the INIT-fork rule above isn't specific to a
-    /// `.[]`-iterating SOURCE — a later INIT fork's SOURCE runs against `null`
+    /// `.[]`-iterating SOURCE — a later `reduce` fork's SOURCE runs against `null`
     /// for *any* SOURCE that reads `.`, including a bare field access with no
     /// iteration at all, which answers `null` silently rather than raising.
-    /// Verified live against jq 1.7.1:
+    /// `foreach` reads the real input on every fork since #7519, as jq 1.8.2
+    /// does (pin moved from 1.7.1's `[1,null]`). Verified live against jq 1.8.2
+    /// (`reduce` answers the same in 1.7.1):
     ///
     /// ```console
     /// $ echo '{"a":1,"c":2}' | jq -c '[foreach (.a) as $k ((0,.c); $k)]'
-    /// [1,null]
+    /// [1,1]
     /// $ echo '{"a":1,"c":2}' | jq -c '[reduce (.a) as $k ((0,.c); $k)]'
     /// [1,null]
     /// ```
@@ -150926,7 +152067,7 @@ mod tests {
     fn test_foreach_reduce_init_fork_source_reads_null_after_first_fork_2163() {
         assert_eq!(
             outputs(br#"{"a":1,"c":2}"#, "[foreach (.a) as $k ((0,.c); $k)]"),
-            ["[1,null]"]
+            ["[1,1]"]
         );
         assert_eq!(
             outputs(br#"{"a":1,"c":2}"#, "[reduce (.a) as $k ((0,.c); $k)]"),
@@ -153544,7 +154685,7 @@ mod tests {
         // Non-string input errors.
         query!(b"1", "trim",
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "trim requires string");
+                assert_eq!(e.message, "trim input must be a string");
             }
         );
     }
@@ -153568,7 +154709,7 @@ mod tests {
         // Non-string input errors.
         query!(b"1", "ltrim",
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "ltrim requires string");
+                assert_eq!(e.message, "trim input must be a string");
             }
         );
     }
@@ -153592,7 +154733,7 @@ mod tests {
         // Non-string input errors.
         query!(b"1", "rtrim",
             QueryResult::Error(e) => {
-                assert_eq!(e.message, "rtrim requires string");
+                assert_eq!(e.message, "trim input must be a string");
             }
         );
     }
@@ -154377,13 +155518,16 @@ mod tests {
     #[test]
     fn test_pad_with_nulls_refuses_past_the_bound_without_allocating_5500() {
         let mut arr = crate::jq::ArrayVec::from(vec![OwnedValue::Null]);
-        let err = pad_with_nulls(&mut arr.make_vec(), MAX_PADDED_ARRAY_LEN).unwrap_err();
+        let err = pad_with_nulls(&mut arr.make_vec(), MAX_PADDED_ARRAY_LEN, true).unwrap_err();
         assert_eq!(
             err.to_string(),
             format!("Cannot grow array to {} elements", MAX_PADDED_ARRAY_LEN + 1)
         );
+        // jq mode (#7536): jq 1.8.2's sentence for the same refusal.
+        let err = pad_with_nulls(&mut arr.make_vec(), MAX_PADDED_ARRAY_LEN, false).unwrap_err();
+        assert_eq!(err.to_string(), "Array index too large");
         assert_eq!(arr.len(), 1);
-        assert!(pad_with_nulls(&mut arr.make_vec(), 4).is_ok());
+        assert!(pad_with_nulls(&mut arr.make_vec(), 4, false).is_ok());
         assert_eq!(arr.len(), 5);
     }
 
@@ -154393,9 +155537,11 @@ mod tests {
     fn test_paddable_len_bound_is_exact_5500() {
         assert_eq!(MAX_PADDED_ARRAY_LEN, 1 << 29);
         assert_eq!(MAX_PADDED_ARRAY_LEN - 1, i32::MAX as usize >> 2);
-        assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN).is_ok());
-        assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN + 1).is_err());
-        assert!(check_paddable_len(0).is_ok());
+        for yq_mode in [false, true] {
+            assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN, yq_mode).is_ok());
+            assert!(check_paddable_len(MAX_PADDED_ARRAY_LEN + 1, yq_mode).is_err());
+            assert!(check_paddable_len(0, yq_mode).is_ok());
+        }
     }
 
     /// The padding length comes from the document, so an absurd index asks for
@@ -154403,12 +155549,11 @@ mod tests {
     /// answers that with a `capacity overflow` *panic*, which for a library
     /// means taking the embedder's process with it. It is a catchable error.
     ///
-    /// The message is matched by prefix because it names the requested length,
-    /// which differs by word size.
+    /// The message is jq 1.8.2's `Array index too large` (#7536).
     #[test]
     fn test_setpath_refuses_a_length_it_cannot_allocate() {
         let err = outcome(b"null", "setpath([1e30]; 9)").unwrap_err();
-        assert!(err.starts_with("Cannot grow array to"), "{err}");
+        assert_eq!(err, "Array index too large");
         // Lengths that do fit still pad, so jq's behaviour is untouched.
         assert_outcomes(&[(b"null", "setpath([3]; 9)", Ok("[null,null,null,9]"))]);
     }
@@ -159276,8 +160421,6 @@ mod tests {
             r"\Qab\E*+c",
             r"\C-a*+c",
             "(?i)*+c",
-            // An inline `(?x)` is not modelled.
-            "(?x)a *+ c",
             "*+c",
             "c?+a+?+",
             "c?+a??+",
@@ -159285,6 +160428,76 @@ mod tests {
             assert!(
                 refuse_possessive_quantifier(pattern, false).is_err(),
                 "{pattern}"
+            );
+        }
+    }
+
+    /// #7464: the `x` flag an inline flag group sets is read as the argument's is, for the extent
+    /// Oniguruma gives it: a group of its own (`(?x:...)`) for its body, a switch (`(?x)`, `(?-x)`) to
+    /// the end of the group it stands in, alternatives included.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn an_inline_x_flag_is_read_where_it_is_on_7464() {
+        for (pattern, extended, want) in [
+            ("(?x) a*+a", false, "(?x) (?>a*)a"),
+            ("(?x) a*+ b", false, "(?x) (?>a*) b"),
+            ("(?x)a *+ c", false, "(?x)(?>a *) c"),
+            ("(?x)a #c\n*+b", false, "(?x)(?>a #c\n*)b"),
+            ("(?x:a *+)b", false, "(?x:(?>a *))b"),
+            ("(?x:a *)b *+c", false, "(?x:a *)b(?> *)c"),
+            ("((?x) a *+b)", false, "((?x) (?>a *)b)"),
+            ("((?x)a)b *+c", false, "((?x)a)b(?> *)c"),
+            ("b|(?x) a *+b", false, "b|(?x) (?>a *)b"),
+            ("(?x)b| a *+b", false, "(?x)b| (?>a *)b"),
+            ("(?ix-s) a*+b", false, "(?ix-s) (?>a*)b"),
+            ("(?-x)a *+c", true, "(?-x)a(?> *)c"),
+            ("(?-x: a) b*+c", true, "(?-x: a) (?>b*)c"),
+            ("a(?-x) *+c", true, "a(?-x)(?> *)c"),
+        ] {
+            let got = refuse_possessive_quantifier(pattern, extended);
+            assert_eq!(got.ok().as_deref(), Some(want), "{pattern} x={extended}");
+        }
+    }
+
+    /// #7654: a blank or `#` comment under `x`, and a `(?#..)` comment, ends a quantifier, so a `?` or
+    /// `+` after one repeats the quantified atom: the gap is dropped and the atom and the quantifiers
+    /// before it are grouped. A gap with no quantifier before it, or none after it, is left alone,
+    /// and so is a blank where `x` is off.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_quantifier_after_a_gap_repeats_the_quantified_atom_7654() {
+        for (pattern, extended, want) in [
+            ("a{1,2} ?$", true, "(?:a{1,2})?$"),
+            ("(a)? +", true, "(?:(a)?)+"),
+            ("a{1,2} #c\n?$", true, "(?:a{1,2})?$"),
+            ("a{1,2}(?#c)?$", false, "(?:a{1,2})?$"),
+            ("(?x)a{2} ?", false, "(?x)(?:a{2})?"),
+            ("(?x:a* +)b", false, "(?x:(?:a*)+)b"),
+            ("a*? +", true, "(?:a*?)+"),
+            ("(a) ? +", true, "(?:(a) ?)+"),
+            // The later quantifier's group opens first: `a* ?+b` is the possessive `(?:a*)?+`.
+            ("a* ?+b", true, "(?>(?:a*)?)b"),
+            ("a* ? ?", true, "(?:(?:a*)?)?"),
+            ("a{2}+ ?", true, "(?:a{2})?"),
+            // `{,n}` is literal text: a quantifier after it repeats its `}`.
+            ("a{,2}+b", false, "a{,2}+b"),
+            ("a{,2} ?", true, "a{,2} ?"),
+        ] {
+            let got = refuse_possessive_quantifier(pattern, extended);
+            assert_eq!(got.ok().as_deref(), Some(want), "{pattern:?} x={extended}");
+        }
+        for (pattern, extended) in [
+            ("a ?", true),
+            ("a* ?", false),
+            ("a* b", true),
+            ("(?-x)a* ?", true),
+            ("a* (?x)?", false),
+        ] {
+            let got = refuse_possessive_quantifier(pattern, extended);
+            assert_eq!(
+                got.ok().as_deref(),
+                Some(pattern),
+                "{pattern:?} x={extended}"
             );
         }
     }
@@ -159694,14 +160907,14 @@ mod tests {
 
     #[test]
     fn test_datetime_nan_and_subsecond_negative_already_match_jq() {
-        // #869 suspected these were also bugs, but checking the pinned jq
-        // oracle (jq-1.7.1) directly showed both already match real jq
-        // exactly — do not "fix" either into diverging from jq:
-        //  - NaN silently maps to the Unix epoch (not an error) in jq too.
+        // #869 suspected these were also bugs:
+        //  - NaN mapped to the Unix epoch in jq 1.7.1, whose `jv2tm` read the
+        //    NaN seconds slot `gmtime` gives it as 0; jq 1.8.2 refuses that
+        //    slot (jqlang/jq#3070), and succinctly follows it (#7532).
         //  - A sub-second-negative timestamp truncates toward zero in jq
         //    (not floor semantics — `-0.5` maps to `secs=0`, not `-1`).
         query!(b"null", r#"(nan) | strftime("%Y-%m-%d")"#,
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970-01-01")
+            QueryResult::Error(e) => assert_eq!(e.message, "strftime/1 requires parsed datetime inputs")
         );
         query!(b"null", r#"(-0.5) | strftime("%Y-%m-%dT%H:%M:%SZ")"#,
             QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1970-01-01T00:00:00Z")
@@ -159721,9 +160934,10 @@ mod tests {
 
         // Each pair is the exact direct-field output observed in jq 1.7.1
         // after an input below/above the signed 32-bit range. The four
-        // values exercise both immediate boundaries and i64 extremes.
+        // values exercise both immediate boundaries and i64 extremes. The
+        // year saturates after its 1900 offset (#7532):
+        // `test_broken_down_year_saturates_after_its_offset_7532`.
         let fields = [
-            (0, "%Y", "2147483648", "2147483647"),
             (1, "%m", "-2147483647", "-2147483648"),
             (2, "%d", "-2147483648", "2147483647"),
             (3, "%H", "-2147483648", "2147483647"),
@@ -159766,37 +160980,70 @@ mod tests {
     }
 
     #[test]
-    fn test_broken_down_year_offset_wraps_across_full_boundary_3083() {
-        // jq 1.7.1 stores year - 1900 in a signed 32-bit tm_year. The wrap
-        // applies to 1900 consecutive input years, not only i32::MIN.
+    fn test_broken_down_year_saturates_after_its_offset_7532() {
+        // jq 1.8.2's `jv2tm` takes 1900 off the year as a double, then
+        // saturates it to a C `int` (jqlang/jq#3070), so the year never
+        // wraps: it runs from i32::MIN + 1900, before 1900 and so an
+        // `invalid gmtime representation` for `mktime`, to i32::MAX + 1900.
+        // jq 1.7.1 saturated first and wrapped the subtraction (#3083), so
+        // i32::MIN was year 2147483648 there. Captured from jq 1.8.2.
         for (year, displayed, timestamp) in [
-            (i32::MIN, "2147483648", 67_767_976_233_532_800.0),
-            (i32::MIN + 1, "2147483649", 67_767_976_265_155_200.0),
-            (i32::MIN + 1899, "2147485547", 67_768_036_160_140_800.0),
+            (i64::MIN, "-2147481748", None),
+            (i64::from(i32::MIN), "-2147481748", None),
+            (i64::from(i32::MIN) + 1, "-2147481748", None),
+            (i64::from(i32::MIN) + 1899, "-2147481748", None),
+            (i64::from(i32::MIN) + 1900, "-2147481748", None),
+            (i64::from(i32::MIN) + 1901, "-2147481747", None),
+            (
+                i64::from(i32::MAX),
+                "2147483647",
+                Some(67_767_976_201_996_800.0),
+            ),
+            (
+                i64::from(i32::MAX) + 1,
+                "2147483648",
+                Some(67_767_976_233_532_800.0),
+            ),
+            (
+                i64::from(i32::MAX) + 1900,
+                "2147485547",
+                Some(67_768_036_160_140_800.0),
+            ),
+            (
+                i64::from(i32::MAX) + 1901,
+                "2147485547",
+                Some(67_768_036_160_140_800.0),
+            ),
+            (i64::MAX, "2147485547", Some(67_768_036_160_140_800.0)),
         ] {
             let array = format!("[{year},0,1,0,0,0,4,0]");
             let format_filter = format!("{array} | strftime(\"%Y\")");
             query!(b"null", &format_filter,
                 QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, displayed, "{format_filter}"));
             let mktime_filter = format!("{array} | mktime");
-            query!(b"null", &mktime_filter,
-                QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, timestamp, "{mktime_filter}"));
+            if let Some(timestamp) = timestamp {
+                query!(b"null", &mktime_filter,
+                    QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, timestamp, "{mktime_filter}"));
+            } else {
+                query!(b"null", &mktime_filter,
+                    QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation", "{mktime_filter}"));
+            }
         }
-        query!(b"null", r#"[-2147481748,0,1,0,0,0,4,0] | strftime("%Y")"#,
-            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "-2147481748"));
-        query!(b"null", r"[-2147481748,0,1,0,0,0,4,0] | mktime",
-            QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation"));
+        // A fractional year is truncated after the offset too: 1899.5 is
+        // tm_year -0.5, so 0, the year 1900 (jq 1.7.1: 1899).
+        query!(b"null", r#"[1899.5,0,1,0,0,0,4,0] | strftime("%Y")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => assert_eq!(s, "1900"));
     }
 
     #[test]
     fn test_mktime_and_strftime_extreme_fields_3083() {
-        // jq 1.7.1 saturates each input field to `int`, then converts the
+        // jq saturates each input field to `int`, then converts the
         // broken-down time. A failed timegm is an error for mktime but the
-        // string "-1" for strftime's %s.
+        // string "-1" for strftime's %s. The year rows are jq 1.8.2's (#7532).
         query!(b"null", r"[9223372036854775807,0,1,0,0,0,0,0] | mktime",
-            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 67_767_976_201_996_800.0));
+            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 67_768_036_160_140_800.0));
         query!(b"null", r"[-9223372036854775808,0,1,0,0,0,0,0] | mktime",
-            QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 67_767_976_233_532_800.0));
+            QueryResult::Error(e) => assert_eq!(e.message, "invalid gmtime representation"));
         query!(b"null", r"[1970,9223372036854775807,1,0,0,0,4,0] | mktime",
             QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 5_647_336_530_739_200.0));
         query!(b"null", r"[1970,-9223372036854775808,1,0,0,0,4,0] | mktime",
@@ -159811,7 +161058,7 @@ mod tests {
             QueryResult::Owned(OwnedValue::Float(f)) => assert_eq!(f, 1_718_447_400.0));
 
         let positive = [
-            67_767_976_201_996_800.0,
+            67_768_036_160_140_800.0,
             5_647_336_530_739_200.0,
             185_542_587_014_400.0,
             7_730_941_129_200.0,
@@ -160034,15 +161281,11 @@ mod tests {
             }
         );
 
-        // Real jq requires the full 8-element array (weekday and yearday
-        // included), not just the 6 fields mktime needs — verified against
-        // the pinned oracle for every length 1-7. Before this fix, a
-        // 6-element array silently defaulted weekday/yearday to 0 instead
-        // of erroring, which %U/%V/%W/%G/%g would then silently compute a
-        // wrong answer from.
+        // A shorter array has its missing fields 0, as in jq 1.8.2 (#7532;
+        // jq 1.7.1 required all 8).
         query!(b"[2024,0,15,0,0,0]", r#"strftime("%Y")"#,
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024");
             }
         );
 
@@ -160223,14 +161466,14 @@ mod tests {
             QueryResult::None => {}
         );
 
-        // A too-short array gets the same wording real jq uses — it has no
-        // distinct "at least 6 elements" message.
-        query!(b"[2024,0,15]", r#"strftime("%Y")"#,
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+        // A shorter array has its missing fields 0, as in jq 1.8.2 (#7532;
+        // jq 1.7.1 refused it).
+        query!(b"[2024,0,15]", r#"strftime("%Y-%m-%d %H")"#,
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15 00");
             }
         );
-        query!(b"[2024,0,15]", r#"strftime("%Y")?"#,
+        query!(b"[2024,0,15,nan]", r#"strftime("%Y")?"#,
             QueryResult::None => {}
         );
 
@@ -160366,10 +161609,10 @@ mod tests {
                 assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
             }
         );
-        // Too-short array: same error as strftime's own (#760).
+        // A shorter array has its missing fields 0, as in jq 1.8.2 (#7532).
         query!(b"[2024,0,15,0,0,0]", r"todate",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
+            QueryResult::Owned(OwnedValue::String(s)) => {
+                assert_eq!(s, "2024-01-15T00:00:00Z");
             }
         );
         // Full 8-element broken-down-time array: succeeds, matching jq.
@@ -160381,13 +161624,13 @@ mod tests {
 
         // NaN and (either-signed) infinity share `broken_down_time_fields`'s
         // number arm with `strftime`/`gmtime`/`localtime` -- exercised here
-        // via `todate` specifically since, unlike `gmtime` (#3071), both
-        // already match jq exactly: `nan | todate` treats NaN as `0.0`
-        // (confirmed live against jq 1.7.1), and either infinity raises the
-        // same out-of-range error `mktime`'s own overflow path uses.
+        // via `todate` specifically: `nan | todate` converts, but its
+        // seconds slot is NaN, which jq 1.8.2 refuses (#7532; jq 1.7.1 read
+        // it as 0), and either infinity raises the same out-of-range error
+        // `mktime`'s own overflow path uses.
         query!(b"null", r"nan | todate",
-            QueryResult::Owned(OwnedValue::String(s)) => {
-                assert_eq!(s, "1970-01-01T00:00:00Z");
+            QueryResult::Error(e) => {
+                assert_eq!(e.message, "strftime/1 requires parsed datetime inputs");
             }
         );
         for filter in ["infinite | todate", "(-infinite) | todate"] {
@@ -160402,8 +161645,8 @@ mod tests {
             );
         }
 
-        // End-to-end `?` behavior over early-exit `todate` cases (a
-        // too-short array and a non-array/non-number value) -- confirmed via
+        // End-to-end `?` behavior over early-exit `todate` cases (an array
+        // with a non-number and a non-array/non-number value) -- confirmed via
         // `eprintln!` probing that `broken_down_time_fields`'s own `optional`
         // parameter is never `true` on these (suppression happens entirely
         // outside builtin dispatch here, not
@@ -160411,7 +161654,7 @@ mod tests {
         // observable behavior without claiming to cover those arms; see
         // their own `tolerate-line` markers above for why they're dead code
         // through every path that currently calls this function.
-        for filter in ["[1,2,3] | todate?", "null | todate?"] {
+        for filter in ["[1,\"x\",3] | todate?", "null | todate?", "nan | todate?"] {
             query!(b"null", filter, QueryResult::None => {});
         }
 
@@ -165824,6 +167067,22 @@ mod tests {
     }
 
     // Phase 12 tests: Additional builtins
+
+    /// #7484: a clock reading is cut to whole microseconds, as jq's `gettimeofday` one is, and the nanoseconds
+    /// (`as_secs_f64` kept them: 1795225997.4185658 against jq's 1795225997.418565) are dropped, not rounded.
+    #[cfg(feature = "std")]
+    #[test]
+    fn now_is_a_whole_number_of_microseconds_7484() {
+        use std::time::Duration;
+        let reading = Duration::new(1_795_225_997, 418_565_899);
+        assert_ne!(reading.as_secs_f64(), 1_795_225_997.418_565);
+        assert_eq!(unix_seconds_in_microseconds(reading), 1_795_225_997.418_565);
+        assert_eq!(
+            unix_seconds_in_microseconds(Duration::new(5, 999_999_999)),
+            5.999_999
+        );
+        assert_eq!(unix_seconds_in_microseconds(Duration::new(7, 0)), 7.0);
+    }
 
     #[test]
     fn test_now() {
@@ -181532,6 +182791,57 @@ mod tests {
         ));
     }
 
+    /// #7534: `jq_literal_length`'s arms -- a literal keeps its digits (negated when negative, a
+    /// zero of either sign positive), an integer a double holds is the plain `Int`, and a NaN or a
+    /// number with no literal is the caller's.
+    #[test]
+    fn jq_literal_length_arms_7534() {
+        let lit = |repr, text: &str| OwnedValue::NumberLiteral(repr, text.into());
+        // `OwnedValue`'s `==` compares a literal by its number, so the spelling is checked apart.
+        let spelled = |value: Option<OwnedValue>| match value {
+            Some(OwnedValue::NumberLiteral(repr, text)) => Some((repr, text.to_string())),
+            _ => None,
+        };
+        for (repr, text, want_repr, want_text) in [
+            (
+                NumberRepr::Float(-1e20),
+                "-100000000000000000001",
+                NumberRepr::Float(1e20),
+                "100000000000000000001",
+            ),
+            (
+                NumberRepr::Float(1.5),
+                "1.50",
+                NumberRepr::Float(1.5),
+                "1.50",
+            ),
+            (
+                NumberRepr::Float(0.0),
+                "-1E-400",
+                NumberRepr::Float(0.0),
+                "1E-400",
+            ),
+            (
+                NumberRepr::Float(-0.0),
+                "-0.0",
+                NumberRepr::Float(0.0),
+                "0.0",
+            ),
+        ] {
+            assert_eq!(
+                spelled(jq_literal_length(lit(repr, text))),
+                Some((want_repr, want_text.to_string())),
+                "{text}"
+            );
+        }
+        assert!(matches!(
+            jq_literal_length(lit(NumberRepr::Int(-7), "-007")),
+            Some(OwnedValue::Int(7))
+        ));
+        assert!(jq_literal_length(lit(NumberRepr::Float(f64::NAN), "nan")).is_none());
+        assert!(jq_literal_length(OwnedValue::Float(-1.5)).is_none());
+    }
+
     /// #2937: `math_operand`'s five match arms, direct rather than through
     /// an end-to-end `pow`/`atan2` filter -- every generator-argument shape
     /// this session tried (a filter literal, a document field, `"2.50" |
@@ -186574,7 +187884,7 @@ mod never_identical_tests_5176 {
         ] {
             let fold = last_as_reduce(&operand(source));
             assert!(
-                matches!(fold, Some(Expr::Reduce { .. })),
+                matches!(&fold, Some(Expr::Pipe(stages)) if matches!(stages[0], Expr::Reduce { .. })),
                 "{source}: {fold:?}"
             );
         }

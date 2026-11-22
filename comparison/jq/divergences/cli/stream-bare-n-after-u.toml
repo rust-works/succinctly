@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+reason = "a bare `n` token after an earlier token that left `u` at byte 1 (`\"iu\" n`, `nul n`) is `Invalid literal` in jq 1.7.1, whose `check_literal` reads `tokenbuf[1]` without checking `tokenpos`; jq 1.8.2 (jqlang/jq#3324) and succinctly say `Invalid numeric literal`. Here the message of `--stream`'s fault."
+issue = "7525"

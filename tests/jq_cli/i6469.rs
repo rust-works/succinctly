@@ -3,6 +3,8 @@
 //! repeat now moves only that repeat to its next reading, so a repeat that keeps its text no longer
 //! costs the pattern's other lazy repeats their write-out. Every expected answer was captured from
 //! jq 1.7.1 (`/usr/bin/jq`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -86,7 +88,7 @@ fn the_readings_still_answer_what_they_did_6469() -> Result<()> {
         (
             r"(?:^b*|(?:(a*)|b)+(?:(a)|b?){0,2}){1,2}?$",
             "abba",
-            "[[\"\",null],[\"\",\"\"]]\n",
+            "[[\"\",null],[\"\",null]]\n",
         ),
     ] {
         assert_eq!(
