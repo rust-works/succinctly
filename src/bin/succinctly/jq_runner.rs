@@ -11856,7 +11856,15 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
         let probed = std::fs::File::open(path)
             .and_then(|mut file| {
                 let head = read_head(&mut file)?;
-                Ok((head.len() < 3, probe_keeps_handle(&file), file, head))
+                let keep = probe_keeps_handle(&file);
+                if !keep {
+                    // A path naming a held descriptor (`/dev/stdin`, `/dev/fd/7`) opens as that
+                    // descriptor on macOS, sharing its offset, which the probe moved: back to where
+                    // it stood, so the reopen reads the stream from there, as jq does (#7568).
+                    let back = -i64::try_from(head.len()).unwrap_or(0);
+                    let _ = std::io::Seek::seek(&mut file, std::io::SeekFrom::Current(back));
+                }
+                Ok((head.len() < 3, keep, file, head))
             })
             .map(|(at_end, keep, file, head)| {
                 // #7295: a pipe or socket named by path (`/dev/stdin`, `/dev/fd/0`, a FIFO) cannot be

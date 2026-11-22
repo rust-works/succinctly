@@ -79,9 +79,14 @@ pub(crate) fn start_run() {
 /// Records how the run reads standard input: `None` when it reads none, or reads it in a way whose
 /// offset is left where the read left it (named files with no `-`, `--slurp`, `--seq`, DSV,
 /// `--stream-errors`). `files` are the input files: standard input is the first `-` among them,
-/// or the only input when there are none.
+/// or the only input when there are none. A path that opens as descriptor 0 itself, sharing its
+/// offset (`/dev/stdin` or `/dev/fd/0` on macOS, which duplicates the descriptor), is standard input
+/// too, read through the path: jq's stdio puts the offset back on it as it does on `-`.
 pub(crate) fn set_run(items: Option<Items>, main_loop: bool, files: &[PathBuf]) {
-    let items = match files.iter().position(|path| path.as_os_str() == "-") {
+    let at = files
+        .iter()
+        .position(|path| path.as_os_str() == "-" || (items.is_some() && opens_as_stdin(path)));
+    let items = match at {
         Some(dash) => {
             BEFORE.with(|b| *b.borrow_mut() = files[..dash].to_vec());
             items
@@ -90,6 +95,92 @@ pub(crate) fn set_run(items: Option<Items>, main_loop: bool, files: &[PathBuf]) 
         None => None,
     };
     RUN.with(|r| r.set(items.map(|items| Run { items, main_loop })));
+}
+
+/// Whether `path` names standard input and opens as descriptor 0 itself, sharing its offset, when that
+/// is a regular file: macOS duplicates the descriptor for `/dev/stdin` and `/dev/fd/0`, where Linux
+/// opens the file again from its start (and jq's reads there leave descriptor 0 alone, as this then
+/// does). Asked by moving the offset of a new open of the path and looking whether descriptor 0's
+/// moved too, then putting it back: once a run, before anything is read. Records where descriptor 0
+/// stands, for [`restore`].
+#[cfg(unix)]
+fn opens_as_stdin(path: &std::path::Path) -> bool {
+    if path != std::path::Path::new("/dev/stdin") && path != std::path::Path::new("/dev/fd/0") {
+        return false;
+    }
+    // SAFETY: `stat` is written by `fstat` before it is read, and only on success.
+    let regular = unsafe {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        libc::fstat(libc::STDIN_FILENO, stat.as_mut_ptr()) == 0
+            && stat.assume_init().st_mode & libc::S_IFMT == libc::S_IFREG
+    };
+    if !regular {
+        return false;
+    }
+    let Ok(opened) = std::fs::File::open(path) else {
+        return false;
+    };
+    match shares_offset(&opened, libc::STDIN_FILENO) {
+        Some(here) => {
+            note_origin(here);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Where descriptor `fd` stands, when `opened` (a new open of a path naming it) shares its offset, as
+/// macOS's `/dev/stdin` and `/dev/fd/N` do; `None` when the open has an offset of its own, as Linux's
+/// do (they open the file again from its start), or when `fd`'s offset cannot be read. Asked by moving
+/// the new open's offset and looking whether `fd`'s moved too, then putting it back.
+#[cfg(unix)]
+fn shares_offset(opened: &std::fs::File, fd: libc::c_int) -> Option<u64> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `lseek` reads and moves only the descriptor's offset.
+    let at = |fd| unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+    let here = at(fd);
+    let new = opened.as_raw_fd();
+    // SAFETY: as above, on the descriptor just opened.
+    let shared = here >= 0
+        && unsafe { libc::lseek(new, here + 1, libc::SEEK_SET) } == here + 1
+        && at(fd) == here + 1;
+    // Back where it stood, which is `fd`'s place too when the two share it.
+    // SAFETY: as above.
+    unsafe { libc::lseek(new, here.max(0), libc::SEEK_SET) };
+    shared.then_some(here as u64)
+}
+
+/// A new open of `path`, which names one of the run's descriptors (`/dev/stdin`, `/dev/fd/N`), from the
+/// file's start, when it opens the file again rather than sharing the descriptor's offset: Linux's
+/// `/proc/self/fd` links do, so jq's `fopen` of the path read the file from its start too, and reading
+/// it again by path reads what jq read. `None` when the open shares the descriptor's offset (macOS,
+/// where what jq read through it is gone), or names no regular file.
+#[cfg(unix)]
+fn opened_anew(path: &std::path::Path) -> Option<std::fs::File> {
+    use std::io::Seek;
+    let fd = if path == std::path::Path::new("/dev/stdin") {
+        libc::STDIN_FILENO
+    } else {
+        path.strip_prefix("/dev/fd")
+            .ok()?
+            .to_str()?
+            .parse::<libc::c_int>()
+            .ok()?
+    };
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut opened = std::fs::File::open(path).ok()?;
+    if shares_offset(&opened, fd).is_some() {
+        return None;
+    }
+    opened.rewind().ok()?;
+    Some(opened)
+}
+
+#[cfg(not(unix))]
+fn opens_as_stdin(_: &std::path::Path) -> bool {
+    false
 }
 
 /// Records the offset a regular file on standard input stood at before the run read it.
@@ -358,34 +449,42 @@ fn writes_to(stdin: &libc::stat) -> bool {
 /// Feeds `scan` an input file named before standard input's `-`, read again from its path, and ends
 /// it there (#7568). A path that does not open, or a directory, is a source with no bytes, as jq's
 /// reader reads it. The file standard input holds, named by its path, is opened anew, by jq as here,
-/// so its reads do not move descriptor 0. `false` for anything whose bytes cannot be read again as
-/// jq read them: a pipe or device, or a path naming a descriptor (`/dev/stdin`, `/dev/fd/N`), which
-/// may share standard input's offset. `Some(false)` for a file jq's reader counts as an input error
+/// so its reads do not move descriptor 0, and so is a path naming a descriptor (`/dev/stdin`,
+/// `/dev/fd/N`) where that opens the file again from its start (Linux). `None` for anything whose bytes
+/// cannot be read again as jq read them: a pipe or device, or a path naming a descriptor whose offset
+/// the open shares (macOS). `Some(false)` for a file jq's reader counts as an input error
 /// (it does not open, or is a directory), which ends jq's main loop one input later.
 #[cfg(unix)]
 fn scan_named_file(scan: &mut Scan, path: &PathBuf, block: &mut [u8]) -> Option<bool> {
     use std::io::Read;
-    if path.starts_with("/dev/fd") || path.starts_with("/dev/stdin") {
-        return None;
-    }
-    let opened = match std::fs::metadata(path) {
-        Ok(meta) if meta.is_file() => {
-            let Ok(mut file) = std::fs::File::open(path) else {
-                scan.end_of_file();
-                return Some(false);
-            };
-            while scan.found().is_none() {
-                match file.read(block) {
-                    Ok(0) => break,
-                    Ok(n) => scan.feed(&block[..n]),
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(_) => return None,
-                }
+    fn feed(scan: &mut Scan, file: &mut std::fs::File, block: &mut [u8]) -> Option<()> {
+        while scan.found().is_none() {
+            match file.read(block) {
+                Ok(0) => break,
+                Ok(n) => scan.feed(&block[..n]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return None,
             }
-            true
         }
-        Ok(meta) if !meta.is_dir() => return None,
-        _ => false,
+        Some(())
+    }
+    // A path naming a descriptor is read again only where it opened the file anew (Linux).
+    let opened = if path.starts_with("/dev/fd") || path.starts_with("/dev/stdin") {
+        feed(scan, &mut opened_anew(path)?, block)?;
+        true
+    } else {
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => {
+                let Ok(mut file) = std::fs::File::open(path) else {
+                    scan.end_of_file();
+                    return Some(false);
+                };
+                feed(scan, &mut file, block)?;
+                true
+            }
+            Ok(meta) if !meta.is_dir() => return None,
+            _ => false,
+        }
     };
     if scan.found().is_none() {
         scan.end_of_file();
