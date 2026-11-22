@@ -115,7 +115,7 @@ fn a_file_with_stretches_among_plain_files_is_read_by_its_own_gate_7341() -> Res
         "jq: ignoring parse error: Truncated value at line 35002, column 1\n",
         "jq: ignoring parse error: Unmatched '}' at line 45002, column 2 (need RS to resync)\n",
         "jq: ignoring parse error: Expected another array element at line 45004, column 5 (need RS to resync)\n",
-        "jq: ignoring parse error: Invalid literal at line 45007, column 0 (need RS to resync)\n",
+        "jq: ignoring parse error: Invalid numeric literal at line 45007, column 0 (need RS to resync)\n",
         "jq: ignoring parse error: Potentially truncated top-level numeric value at line 45007, column 3\n",
     ];
     let (out, err, status) = several(ODD, &files)?;

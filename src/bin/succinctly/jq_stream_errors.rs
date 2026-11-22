@@ -33,8 +33,7 @@
 //! this module decides only where each one begins and ends and which error fires.
 
 use crate::cli::jq_seq_reader::{
-    c_string, decode_string_in_place, fgets_chunk_len_at, fgets_visible_len, number_is_valid,
-    JQ_FGETS_CHUNK,
+    c_string, decode_string_in_place, fgets_visible_len, number_is_valid, JQ_FGETS_CHUNK,
 };
 use succinctly::jq::{ArrayVec, OwnedValue};
 
@@ -170,9 +169,13 @@ pub(crate) struct MemorySources<S: AsRef<[(Option<usize>, Vec<u8>)]>> {
 
 impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> MemorySources<S> {
     pub(crate) fn new(sources: S) -> Self {
+        let leads = STREAM_BOM_LEADS.with(|leads| leads.borrow().clone());
         Self {
             sources,
-            cursor: RefillCursor::default(),
+            cursor: RefillCursor {
+                leads,
+                ..RefillCursor::default()
+            },
         }
     }
 }
@@ -225,11 +228,16 @@ pub(crate) struct ChunkedSources {
     /// The tail's last failure is a source of its own in jq's reader, so the last source that
     /// opened does not end the stream.
     tail_is_source: bool,
+    /// How many of each source's first bytes are the BOM jq's parser skips (#7569): they are read in
+    /// the source's first chunk, which so holds that many fewer bytes of text, and dropped from it.
+    bom_cuts: Vec<usize>,
+    /// The source open in `current` has had no chunk read yet.
+    at_source_front: bool,
 }
 
 impl ChunkedSources {
-    /// `openers` in input order, each giving the reader of one source, already past a leading BOM
-    /// that is to be skipped.
+    /// `openers` in input order, each giving the reader of one source from its first byte; a BOM to
+    /// skip is [`with_bom_cuts`](Self::with_bom_cuts)'s.
     pub(crate) fn new(openers: Vec<Opener>) -> Self {
         Self {
             openers: openers.into_iter().map(Some).collect(),
@@ -242,7 +250,16 @@ impl ChunkedSources {
             error: None,
             tail: Vec::new(),
             tail_is_source: false,
+            bom_cuts: Vec::new(),
+            at_source_front: false,
         }
+    }
+
+    /// Skips `cuts[n]` bytes, the BOM jq's parser skips, at the front of source `n`, once its first
+    /// chunk is read with them (#7569).
+    pub(crate) fn with_bom_cuts(mut self, cuts: Vec<usize>) -> Self {
+        self.bom_cuts = cuts;
+        self
     }
 
     /// Has `tail` run when the reader asks past the last source (#6485).
@@ -316,6 +333,7 @@ impl RefillSource for ChunkedSources {
                     },
                     |open| open(),
                 );
+                self.at_source_front = true;
                 self.current = Some(match opened {
                     Ok(reader) => reader,
                     Err(e) => {
@@ -368,6 +386,11 @@ impl RefillSource for ChunkedSources {
             let (end, error) = read_chunk(reader.as_mut(), buf);
             if let Some(e) = error {
                 self.fail(e);
+            }
+            // jq's `fgets` reads the mark with the text after it, and its parser skips it.
+            if std::mem::take(&mut self.at_source_front) {
+                let cut = self.bom_cuts.get(source).copied().unwrap_or(0);
+                buf.drain(..cut.min(buf.len()));
             }
             if buf.is_empty() {
                 // A source with no bytes is a refill of its own.
@@ -447,6 +470,17 @@ struct RefillCursor {
     /// The source whose last chunk filled the buffer with no newline, so that jq's next `fgets` of
     /// it returns nothing, a refill of its own that is not the last (#6760).
     empty_after: Option<usize>,
+    /// How many bytes of each source's first chunk were a BOM, which the sources no longer hold
+    /// ([`STREAM_BOM_LEADS`], #7569): that chunk has room for that many fewer of their bytes.
+    leads: Vec<usize>,
+}
+
+thread_local! {
+    /// The BOM bytes `strip_leading_json_bom` cut off the front of each of the run's sources (#7569),
+    /// which jq's `fgets` read in each one's first chunk: [`MemorySources`] over those sources reads
+    /// their first chunks that much shorter. Empty when nothing was cut.
+    pub(crate) static STREAM_BOM_LEADS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A refill of the in-memory sources, with its bytes borrowed from them.
@@ -482,7 +516,15 @@ impl RefillCursor {
                     is_last,
                 });
             }
-            let Some(len) = fgets_chunk_len_at(raw, self.pos) else {
+            // The first chunk of a source held its BOM too.
+            let lead = if self.pos == 0 {
+                self.leads.get(source).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            let room = JQ_FGETS_CHUNK - lead;
+            let Some(len) = crate::cli::jq_seq_reader::fgets_chunk_len_in(raw, self.pos, room)
+            else {
                 self.source += 1;
                 self.pos = 0;
                 continue;
@@ -495,11 +537,11 @@ impl RefillCursor {
                 self.pos = 0;
             }
             let newline = chunk.ends_with(b"\n");
-            let hit_eof = !newline && len < JQ_FGETS_CHUNK;
+            let hit_eof = !newline && len < room;
             let bytes = &chunk[..fgets_visible_len(chunk)];
             let is_last = last_source && at_end && hit_eof;
             self.last = Some((source, is_last));
-            if at_end && !last_source && !newline && len == JQ_FGETS_CHUNK {
+            if at_end && !last_source && !newline && len == room {
                 self.empty_after = Some(source);
             }
             return Some(CursorRefill {
@@ -1163,6 +1205,11 @@ struct ParseFault {
     message: String,
 }
 
+/// The depth from which the events of a path share it ([`Parser::path_value`], #7567). Below it a
+/// path is copied per event, as before: the copy is short, and the records of an ordinary stream
+/// (a few levels deep) pay nothing for the share.
+const SHARE_PATH_FROM: usize = 64;
+
 struct Parser {
     /// Whether this is a `--seq` parser (`JV_PARSE_SEQ`): records are opened by an RS byte, and a
     /// fault abandons the record instead of the rest of the refill (#6115).
@@ -1179,6 +1226,16 @@ struct Parser {
     /// a string (inside an object, once its key is known) or `null` (inside an object, key not yet
     /// read).
     path: Vec<OwnedValue>,
+    /// The path as an array value its events share, kept once the path is [`SHARE_PATH_FROM`]
+    /// deep (#7567), as jq's events share `p->path`: each event of a deep path takes a window on
+    /// it ([`Parser::path_value`]), so the closes of a document nested `n` deep cost `O(n)` in
+    /// all, where a copy of the path per event cost `O(n^2)`. A shallower path is copied per event
+    /// as before, which is cheaper than sharing it: a write to a shared path would copy it anyway.
+    shared_path: Option<ArrayVec>,
+    /// How many leading elements of `shared_path` are known to be `path`'s, the last one aside:
+    /// set when the share is built and lowered by a pop, and never by a push or a write, which keeps
+    /// the parser's ordinary steps as they were ([`Parser::path_value`] says why that is enough).
+    shared_valid: usize,
     last_seen: LastSeen,
     /// jq's `p->output`: zero to three elements. `[path]` closes a container, `[path, value]` is a
     /// leaf, and `[path, value, true]` is a leaf whose container closes right after it, which
@@ -1186,9 +1243,8 @@ struct Parser {
     output: Vec<OwnedValue>,
     next: Option<OwnedValue>,
     /// jq's `tokenbuf`/`tokenpos`, as in [`crate::cli::jq_seq_reader`]: a buffer that is not cleared
-    /// with the token, because `check_literal` reads `tokenbuf[1]` without checking `tokenpos`.
-    /// Before any token has written index 1 that is uninitialised memory in jq, modelled here
-    /// as not `u` (#7256, see [`crate::cli::jq_seq_reader`]).
+    /// with the token. jq 1.7.1's `check_literal` read `tokenbuf[1]` for a bare `n` without checking
+    /// `tokenpos`; jq 1.8.2 does not, and neither does [`Parser::check_literal`] since #7525.
     token_buf: Vec<u8>,
     token_len: usize,
     source: usize,
@@ -1215,6 +1271,8 @@ impl Parser {
             column: 0,
             st: if seq { St::WaitingForRs } else { St::Normal },
             path: Vec::new(),
+            shared_path: None,
+            shared_valid: 0,
             last_seen: LastSeen::None,
             output: Vec::new(),
             next: None,
@@ -1253,6 +1311,7 @@ impl Parser {
     /// jq's `parser_reset` for a streaming parser.
     fn reset(&mut self) {
         self.path.clear();
+        self.shared_path = None;
         self.last_seen = LastSeen::None;
         self.output.clear();
         self.next = None;
@@ -1283,13 +1342,70 @@ impl Parser {
     }
 
     /// The path as it stands, as an array value. Built in its array block directly (#7260):
-    /// cloned into a `Vec` first, every event's path was a second allocation and a copy.
-    fn path_value(&self) -> OwnedValue {
-        OwnedValue::Array(ArrayVec::from_slice(&self.path))
+    /// cloned into a `Vec` first, every event's path was a second allocation and a copy. From
+    /// [`SHARE_PATH_FROM`] deep it is a window on the shared path instead (#7567), as jq's
+    /// `jv_array_slice(p->path, ...)` is, when the share still holds the path.
+    ///
+    /// The parser writes only the path's last element, and a pop lowers `shared_valid` below the
+    /// new last element. So with the path no longer than the share and `shared_valid` reaching its
+    /// last element, every element before the last is the share's, and the last is compared: a
+    /// push past the share, a pop and then a push, or a write since the share was built all fail one
+    /// of the three. A run of closes passes them, one window each, which is what makes the closes of
+    /// a deep document linear.
+    #[inline(always)]
+    fn path_value(&mut self) -> OwnedValue {
+        if self.path.len() < SHARE_PATH_FROM {
+            return OwnedValue::Array(ArrayVec::from_slice(&self.path));
+        }
+        self.shared_path_value()
+    }
+
+    /// [`Parser::path_value`] from [`SHARE_PATH_FROM`] deep: out of line, so the shallow paths of
+    /// an ordinary stream inline only the copy they always made.
+    #[inline(never)]
+    fn shared_path_value(&mut self) -> OwnedValue {
+        let len = self.path.len();
+        if let Some(shared) = &self.shared_path {
+            if len <= shared.len()
+                && self.shared_valid + 1 >= len
+                && shared[len - 1] == self.path[len - 1]
+            {
+                return OwnedValue::Array(shared.slice(0..len));
+            }
+        }
+        let shared = ArrayVec::from_slice(&self.path);
+        self.shared_valid = len;
+        let value = OwnedValue::Array(shared.clone());
+        self.shared_path = Some(shared);
+        value
+    }
+
+    /// Drops the path's last element. The share then vouches for the elements before the new last
+    /// one only ([`Parser::path_value`]), and is dropped once the path is shallower than it is kept
+    /// for.
+    #[inline(always)]
+    fn pop_path(&mut self) {
+        self.path.pop();
+        // The share exists only from `SHARE_PATH_FROM` deep, so a shallower pop asks the length
+        // it already has, and not the share.
+        if self.path.len() + 1 >= SHARE_PATH_FROM {
+            self.pop_shared_path();
+        }
+    }
+
+    /// [`Parser::pop_path`]'s work on the share, out of line for the same reason as
+    /// [`Parser::shared_path_value`].
+    #[inline(never)]
+    fn pop_shared_path(&mut self) {
+        if self.path.len() < SHARE_PATH_FROM {
+            self.shared_path = None;
+        } else if self.shared_path.is_some() {
+            self.shared_valid = self.shared_valid.min(self.path.len() - 1);
+        }
     }
 
     /// jq's `make_error` with `JV_PARSE_STREAM_ERRORS`: the message and the path as it stands.
-    fn error_value(&self, message: String) -> ParseFault {
+    fn error_value(&mut self, message: String) -> ParseFault {
         ParseFault {
             value: OwnedValue::array_from(vec![
                 OwnedValue::String(message.clone().into()),
@@ -1726,7 +1842,7 @@ impl Parser {
                 } else if self.last_seen != LastSeen::OpenArray {
                     self.output = vec![self.path_value()];
                 }
-                self.path.pop();
+                self.pop_path();
                 self.next = None;
                 if self.last_seen == LastSeen::OpenArray {
                     // Empty arrays are leaves.
@@ -1770,7 +1886,7 @@ impl Parser {
                         self.output = vec![self.path_value()];
                     }
                 }
-                self.path.pop();
+                self.pop_path();
                 self.next = None;
                 if self.last_seen == LastSeen::OpenObject {
                     // Empty objects are leaves.
@@ -1796,8 +1912,9 @@ impl Parser {
         let pattern: Option<&[u8]> = match self.token_buf[0] {
             b't' => Some(b"true"),
             b'f' => Some(b"false"),
-            // Deliberately the whole buffer, not just the token: see the field's docs.
-            b'n' if self.token_buf.get(1) == Some(&b'u') => Some(b"null"),
+            // jq 1.8.2 reads index 1 only when the token has one (`tokenpos > 1`, #7525);
+            // 1.7.1 read whatever an earlier token left there.
+            b'n' if self.token_len > 1 && self.token_buf[1] == b'u' => Some(b"null"),
             _ => None,
         };
         let value = match pattern {
@@ -2881,5 +2998,68 @@ mod tests {
         );
         // Only faults: an empty array, and each fault before it.
         assert_eq!(shape(&read(&[b"}\n}"])), (0, 2, vec![]));
+    }
+
+    /// #7567: every event of a deep path shares the parser's, so the closing events of a document
+    /// nested `n` deep cost `O(n)` in all. A path copied per event, as it was (and still is below
+    /// `SHARE_PATH_FROM`), holds its storage alone, which `is_shared` tells apart; the events
+    /// themselves are unchanged.
+    #[test]
+    fn the_events_of_a_deep_document_share_one_path_7567() {
+        let depth = 200;
+        let text = format!("{}{}\n", "[".repeat(depth), "]".repeat(depth));
+        let read = read(&[(None, text.into_bytes())]);
+        let paths: Vec<&ArrayVec> = read
+            .values
+            .iter()
+            .map(|event| match event.as_array().and_then(|e| e.first()) {
+                Some(OwnedValue::Array(path)) => path,
+                other => panic!("an event's path, not {other:?}"),
+            })
+            .collect();
+        // The empty innermost array as a leaf, then a close at every level but the innermost
+        // (jq 1.7.1: `[[[]]]` is `[[0,0],[]]`, `[[0,0]]`, `[[0]]`).
+        assert_eq!(paths.len(), depth);
+        assert_eq!(paths[0].len(), depth - 1);
+        for (at, path) in paths.iter().enumerate() {
+            assert_eq!(path.len(), depth - at.max(1), "event {at}");
+            assert!(
+                path.iter().all(|step| *step == OwnedValue::Int(0)),
+                "event {at}"
+            );
+            // From `SHARE_PATH_FROM` deep the events share the path; a shallower one is a copy
+            // of its own, as every path was before, so shallow streams take the old code.
+            assert_eq!(
+                path.is_shared(),
+                path.len() >= SHARE_PATH_FROM,
+                "event {at}, {} deep",
+                path.len()
+            );
+        }
+        assert_eq!(
+            read_values("[[[]]]"),
+            strings(&["[[0,0],[]]", "[[0,0]]", "[[0]]"])
+        );
+        // jq 1.7.1: `jq -c --stream . <<< '{"a":{"b":[1,{"c":2}]}}'`.
+        let read_obj = read_values(r#"{"a":{"b":[1,{"c":2}]}}"#);
+        assert_eq!(
+            read_obj,
+            strings(&[
+                r#"[["a","b",0],1]"#,
+                r#"[["a","b",1,"c"],2]"#,
+                r#"[["a","b",1,"c"]]"#,
+                r#"[["a","b",1]]"#,
+                r#"[["a","b"]]"#,
+                r#"[["a"]]"#,
+            ])
+        );
+    }
+
+    fn read_values(text: &str) -> Vec<String> {
+        read(&[(None, text.as_bytes().to_vec())])
+            .values
+            .iter()
+            .map(OwnedValue::to_json)
+            .collect()
     }
 }

@@ -259,6 +259,9 @@ pub struct ModuleLoader {
     search_path: Vec<PathBuf>,
     /// The library directories alone, which `modulemeta` searches (#5321)
     lib_dirs: Vec<PathBuf>,
+    /// The note a `module not found` on [`Self::search_path`] or [`Self::lib_dirs`] carries: jq
+    /// cannot expand the `~/` of `~/.jq` or of a `-L` entry with `HOME` unset, and says so (#7608).
+    default_note: Option<String>,
     /// The `-L` entries as given, kept so the directories can be worked out again once the
     /// program and jq origins are known (#7430): a `~/` and a `$ORIGIN/` entry names no
     /// directory until then.
@@ -399,7 +402,13 @@ pub(crate) enum ReportEntry {
     /// show for this case: `module not found: {module_path}`, a blank line
     /// standing in for the missing echo, then the usual trailer. Confirmed
     /// live against jq 1.7.1, byte-for-byte.
-    NotFound { module_path: String },
+    NotFound {
+        module_path: String,
+        /// jq's parenthesised note after the message: the last search entry it could not
+        /// expand (`Could not expand ~/.jq. (Could not find home directory.)` with `HOME`
+        /// unset, #7608), or `None`.
+        note: Option<String>,
+    },
     /// A module's own `include`/`import` chain leads back to a module still
     /// being loaded (`ca` includes `cb` includes `ca`, or a module including
     /// itself). jq 1.8.2 reports `circular import of {path}` (CVE-2026-44777, #7530)
@@ -565,11 +574,14 @@ fn print_report_entry(entry: &ReportEntry) {
     match entry {
         // jq's own shape for a module it cannot find: the message, then a blank
         // line standing in for the missing source echo.
-        ReportEntry::NotFound { module_path } => {
+        ReportEntry::NotFound { module_path, note } => {
             // jq rejects a malformed path before it searches, in the same report (#5322).
             match invalid_module_path(module_path) {
                 Some(message) => eprintln!("jq: error: {message}"),
-                None => eprintln!("jq: error: module not found: {module_path}"),
+                None => eprintln!(
+                    "jq: error: {}",
+                    module_not_found(module_path, note.as_deref())
+                ),
             }
             eprintln!();
         }
@@ -676,13 +688,7 @@ fn read_library(path: &Path) -> std::io::Result<String> {
 
 /// Strip Rust's `std::io::Error` Display's own `" (os error N)"` suffix,
 /// which has no jq equivalent -- jq's C `strerror()` call never appends an
-/// errno number. Leaves any other message untouched: the one `std::io::Error`
-/// shape with no such suffix to strip is `ErrorKind::InvalidData` (invalid
-/// UTF-8 in a `--slurpfile`/`--rawfile` argument, constructed from a plain
-/// string rather than an OS errno) -- an unverified-against-jq wording for a
-/// failure class real jq's own byte-oriented reader never hits at all (it
-/// accepts arbitrary bytes in `--rawfile`; confirmed live), so there is
-/// nothing to match there, only to not silently corrupt.
+/// errno number. Leaves any other message untouched.
 fn strerror_only(e: &std::io::Error) -> String {
     let full = e.to_string();
     match full.rsplit_once(" (os error ") {
@@ -712,13 +718,14 @@ fn load_file_detail(e: &std::io::Error) -> String {
 ///
 /// The file is opened by the bytes of its argv word (#7426), and the prefix names the variable and
 /// the file by theirs, as jq's `fprintf` does; the detail after it is jq's own text, so the file
-/// there reads as [`crate::cli::jq_word_text`] makes it.
+/// there reads as [`crate::cli::jq_word_text`] makes it. The file's bytes are handed back as read:
+/// jq reads them whatever they hold, a byte that is not UTF-8 included (#7436).
 fn read_arg_file(
     flag: &str,
     name: &std::ffi::OsStr,
     file: &std::ffi::OsStr,
-) -> Result<String, BuildContextError> {
-    std::fs::read_to_string(file).map_err(|e| {
+) -> Result<Vec<u8>, BuildContextError> {
+    std::fs::read(file).map_err(|e| {
         // #7576: a file there is no room for is jq's `cannot allocate memory`, not one that would not open.
         abort_if_out_of_memory(&e);
         bad_arg_file(
@@ -732,6 +739,68 @@ fn read_arg_file(
             ),
         )
     })
+}
+
+/// The text jq 1.7.1's `jv_load_file` makes of a file it reads raw (#7436): the program of `-f` and the
+/// string of `--rawfile`. It reads the file 4,096 bytes at a time, reads on to the end of a character
+/// the last byte of a full read starts (`jvp_utf8_backtrack`), and appends each read to the string on
+/// its own (`jv_string_append_buf`), so a byte that is not UTF-8 is U+FFFD by jq's rule
+/// ([`succinctly::text::utf8::substitute_invalid_utf8_jq_style`]) over the read that holds it: a
+/// sequence a read ends inside is one U+FFFD to the read's end, the bytes the next read starts with
+/// a text of their own.
+fn jq_raw_file_text(bytes: &[u8]) -> String {
+    const READ: usize = 4096;
+    let mut text = String::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let mut len = (bytes.len() - at).min(READ);
+        // A short read met the end of the file, so only a full one reads on.
+        if len == READ {
+            len += utf8_bytes_missing_at_end(&bytes[at..at + len]).min(bytes.len() - at - len);
+        }
+        let read = &bytes[at..at + len];
+        match std::str::from_utf8(read) {
+            Ok(valid) => text.push_str(valid),
+            Err(_) => text.push_str(&succinctly::text::utf8::substitute_invalid_utf8_jq_style(
+                read,
+            )),
+        }
+        at += len;
+    }
+    text
+}
+
+/// How many bytes the character `read` ends inside is short of, as jq's `jvp_utf8_backtrack` counts
+/// them from the last byte back to the lead (#7436): 0 for a read that ends on a whole character,
+/// on a byte that leads nothing, on continuation bytes with no lead before them, or on one byte.
+fn utf8_bytes_missing_at_end(read: &[u8]) -> usize {
+    // jq's `utf8_coding_length`: 0xFF for a continuation byte, 0 for a byte that is never a lead.
+    const CONTINUATION: usize = 0xFF;
+    let coding_length = |byte: u8| match byte {
+        0x00..=0x7F => 1,
+        0x80..=0xBF => CONTINUATION,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => 0,
+    };
+    if read.len() < 2 {
+        return 0;
+    }
+    let mut seen = 1;
+    let mut length = CONTINUATION;
+    for &byte in read.iter().rev() {
+        length = coding_length(byte);
+        if length != CONTINUATION {
+            break;
+        }
+        seen += 1;
+    }
+    if length == 0 || length == CONTINUATION {
+        0
+    } else {
+        length.saturating_sub(seen)
+    }
 }
 
 /// jq's `Bad JSON in --<flag> <name> <file>: <detail>` (#3051), `name` and `file` as the bytes of
@@ -793,13 +862,59 @@ fn invalid_module_path(module_path: &str) -> Option<String> {
 struct Target<'a> {
     path: &'a str,
     search: Option<Vec<PathBuf>>,
+    /// The note a `module not found` for `search` carries ([`unexpanded_home_note`]).
+    search_note: Option<String>,
 }
 
 #[cfg(test)]
 impl<'a> Target<'a> {
     /// A directive without `search` metadata, resolved on the default list.
     const fn plain(path: &'a str) -> Self {
-        Self { path, search: None }
+        Self {
+            path,
+            search: None,
+            search_note: None,
+        }
+    }
+}
+
+/// jq's `module not found: <path>`, with the note of the search list it was looked for in, in
+/// parentheses, when there is one (#7608).
+fn module_not_found(module_path: &str, note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!("module not found: {module_path} ({note})"),
+        None => format!("module not found: {module_path}"),
+    }
+}
+
+/// The note jq's `find_lib` puts after a `module not found` (#7608): `build_lib_search_chain`
+/// expands each search entry in turn and keeps the error of the last one that does not expand.
+/// Only a `~/` entry can fail, and only with `HOME` unset (`get_home`); an empty `HOME` expands
+/// (to `/...`). `entries` are the search list as written, in order.
+fn unexpanded_home_note<'e>(entries: impl IntoIterator<Item = &'e str>) -> Option<String> {
+    if std::env::var_os("HOME").is_some() {
+        return None;
+    }
+    entries
+        .into_iter()
+        .filter(|entry| entry.starts_with("~/"))
+        .last()
+        .map(|entry| format!("Could not expand {entry}. (Could not find home directory.)"))
+}
+
+/// [`unexpanded_home_note`] for the library list ([`library_dirs`]): the `-L` entries, or jq's
+/// default list when there are none. A `-L` entry that names a directory as written is no `~/`
+/// to jq, which takes its real path first.
+fn library_note(cli_dirs: &[PathBuf]) -> Option<String> {
+    if cli_dirs.is_empty() {
+        unexpanded_home_note(DEFAULT_LIBRARY_ENTRIES)
+    } else {
+        unexpanded_home_note(
+            cli_dirs
+                .iter()
+                .filter(|entry| !entry.is_dir())
+                .filter_map(|entry| entry.to_str()),
+        )
     }
 }
 
@@ -823,8 +938,19 @@ fn directive_search(
     origin: &Path,
     jq_origin: &Path,
 ) -> Option<Vec<PathBuf>> {
+    Some(
+        directive_search_entries(metadata)?
+            .into_iter()
+            .filter_map(|entry| expand_search_entry(entry, origin, jq_origin))
+            .collect(),
+    )
+}
+
+/// The `search` entries of a directive's metadata as written, or `None` without one; see
+/// [`directive_search`].
+fn directive_search_entries(metadata: Option<&MetaObject>) -> Option<Vec<&str>> {
     let (_, value) = metadata?.iter().find(|(key, _)| key == "search")?;
-    let entries: Vec<&str> = match value {
+    Some(match value {
         MetaValue::String(entry) => vec![entry.as_str()],
         MetaValue::Array(items) => items
             .iter()
@@ -834,13 +960,12 @@ fn directive_search(
             })
             .collect(),
         _ => Vec::new(),
-    };
-    Some(
-        entries
-            .into_iter()
-            .filter_map(|entry| expand_search_entry(entry, origin, jq_origin))
-            .collect(),
-    )
+    })
+}
+
+/// The note a `module not found` for a directive with `search` metadata carries (#7608).
+fn directive_search_note(metadata: Option<&MetaObject>) -> Option<String> {
+    unexpanded_home_note(directive_search_entries(metadata)?)
 }
 
 /// One `search` entry as a directory; see [`directive_search`].
@@ -1002,11 +1127,13 @@ fn resolve_data_file_in(search_path: &[PathBuf], module_path: &str) -> Option<Pa
 /// data file <path>: <detail>` for the latter.
 fn load_data_import(
     search_path: &[PathBuf],
+    note: Option<String>,
     module_path: &str,
 ) -> Result<OwnedValue, ModuleLoadError> {
     let Some(path) = resolve_data_file_in(search_path, module_path) else {
         return Err(ModuleLoadError::single(ReportEntry::NotFound {
             module_path: module_path.to_string(),
+            note,
         }));
     };
     read_data_file(&path).map_err(|failure| ModuleLoadError::single(ReportEntry::Data(failure)))
@@ -1020,7 +1147,13 @@ fn read_data_file(path: &Path) -> Result<OwnedValue, DataFileFailure> {
         path: canonical_or_self(path),
         detail,
     };
-    let contents = std::fs::read_to_string(path).map_err(|e| unreadable(strerror_only(&e)))?;
+    let bytes = std::fs::read(path).map_err(|e| unreadable(strerror_only(&e)))?;
+    // jq's parser reads the bytes (`jv_load_file`, as for `--slurpfile`), and a string's that are
+    // not UTF-8 are U+FFFD by the rule the main input's are (#7604).
+    let contents = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(e) => succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(e.as_bytes()),
+    };
     let values = parse_json_stream(&contents).map_err(|e| unreadable(format!("{e:#}")))?;
     Ok(OwnedValue::array_from(values))
 }
@@ -1035,14 +1168,18 @@ fn read_data_file(path: &Path) -> Result<OwnedValue, DataFileFailure> {
 /// import, `is_data` and `relpath`) and `defs` (`name/arity` of each top-level `def`). A
 /// module that fails to load is not an error of the filter: jq prints the diagnostic and
 /// answers `null`, with exit 0, so it comes back as stderr text.
-fn module_meta_outcome(lib_dirs: &[PathBuf], name: &str) -> jq::cli_context::ModuleMetaOutcome {
+fn module_meta_outcome(
+    lib_dirs: &[PathBuf],
+    note: Option<&str>,
+    name: &str,
+) -> jq::cli_context::ModuleMetaOutcome {
     use jq::cli_context::ModuleMetaOutcome::{Error, LoadFailure, Meta};
 
     if let Some(message) = invalid_module_path(name) {
         return Error(message);
     }
     let Some(file) = resolve_module_in(lib_dirs, name) else {
-        return Error(format!("module not found: {name}"));
+        return Error(module_not_found(name, note));
     };
     let canonical = canonical_or_self(&file);
     // Lossily, as `import` reads a module (#5351, #7429): jq parses the raw bytes.
@@ -1498,6 +1635,8 @@ struct Directive<'a> {
     data: bool,
     /// The directories its `search` metadata names in place of the default list (#5338).
     search: Option<Vec<PathBuf>>,
+    /// The note a `module not found` for `search` carries (#7608).
+    search_note: Option<String>,
 }
 
 /// `program`'s directives in jq's walk order: last-declared first. `origin` is the directory
@@ -1512,12 +1651,14 @@ fn directives_of<'p>(program: &'p Program, origin: &Path, jq_origin: &Path) -> V
             path: &include.path,
             data: false,
             search: directive_search(include.metadata.as_ref(), origin, jq_origin),
+            search_note: directive_search_note(include.metadata.as_ref()),
         })
         .chain(program.imports.iter().map(|import| Directive {
             decl_index: import.decl_index,
             path: &import.path,
             data: import.data,
             search: directive_search(import.metadata.as_ref(), origin, jq_origin),
+            search_note: directive_search_note(import.metadata.as_ref()),
         }))
         .collect();
     directives.sort_by_key(|directive| core::cmp::Reverse(directive.decl_index));
@@ -1528,6 +1669,8 @@ fn directives_of<'p>(program: &'p Program, origin: &Path, jq_origin: &Path) -> V
 /// (#3573). [`ModuleLoader::failure_report`] documents the rules this follows.
 struct FailureWalk<'a> {
     search_path: &'a [PathBuf],
+    /// The note a `module not found` on `search_path` carries (#7608).
+    default_note: Option<&'a str>,
     /// jq's own directory, which a `search` entry's `$ORIGIN/` stands for (#5338).
     jq_origin: &'a Path,
     /// The modules already reached, by canonical file, whether or not they
@@ -1559,8 +1702,13 @@ impl FailureWalk<'_> {
             let Some(resolved) = resolved else {
                 // A missing module stops this level and returns `1` for it,
                 // whatever the level had counted.
+                let note = match &directive.search {
+                    Some(_) => directive.search_note.clone(),
+                    None => self.default_note.map(str::to_string),
+                };
                 self.entries.push(ReportEntry::NotFound {
                     module_path: directive.path.to_string(),
+                    note,
                 });
                 return 1;
             };
@@ -1756,6 +1904,7 @@ impl ModuleLoader {
         Self {
             search_path,
             lib_dirs,
+            default_note: library_note(&cli_dirs),
             cli_dirs,
             env_dirs,
             prog_origin: PathBuf::from("."),
@@ -1813,6 +1962,7 @@ impl ModuleLoader {
         Target {
             path,
             search: directive_search(metadata, &origin, &self.jq_origin),
+            search_note: directive_search_note(metadata),
         }
     }
 
@@ -1854,6 +2004,15 @@ impl ModuleLoader {
     /// The directories `target` is looked for in: its own `search` list, else the default.
     fn search_for<'t>(&'t self, target: &'t Target<'_>) -> &'t [PathBuf] {
         target.search.as_deref().unwrap_or(&self.search_path)
+    }
+
+    /// The note a `module not found` for `target` carries: its own `search` list's, else the
+    /// default list's (#7608).
+    fn note_for(&self, target: &Target<'_>) -> Option<String> {
+        match &target.search {
+            Some(_) => target.search_note.clone(),
+            None => self.default_note.clone(),
+        }
     }
 
     /// The canonical file a run id names, for compile-error attribution.
@@ -1965,6 +2124,7 @@ impl ModuleLoader {
             resolve_module_in(self.search_for(target), module_path).ok_or_else(|| {
                 ModuleLoadError::single(ReportEntry::NotFound {
                     module_path: module_path.to_string(),
+                    note: self.note_for(target),
                 })
             })?;
 
@@ -2222,7 +2382,11 @@ impl ModuleLoader {
             if import.data {
                 data_bindings.push((
                     import.alias.clone(),
-                    load_data_import(self.search_for(&target), import.path.as_str())?,
+                    load_data_import(
+                        self.search_for(&target),
+                        self.note_for(&target),
+                        import.path.as_str(),
+                    )?,
                 ));
                 continue;
             }
@@ -2419,6 +2583,7 @@ impl ModuleLoader {
                 if resolve_data_file_in(self.search_for(&target), &import.path).is_none() {
                     let missing = ModuleLoadError::single(ReportEntry::NotFound {
                         module_path: import.path.clone(),
+                        note: self.note_for(&target),
                     });
                     return Err(self.failure_report(program, missing));
                 }
@@ -2467,6 +2632,7 @@ impl ModuleLoader {
     fn failure_report(&self, program: &Program, first: ModuleLoadError) -> ModuleLoadError {
         let mut walk = FailureWalk {
             search_path: &self.search_path,
+            default_note: self.default_note.as_deref(),
             jq_origin: &self.jq_origin,
             visited: BTreeSet::new(),
             chain: Vec::new(),
@@ -2562,7 +2728,11 @@ impl ModuleLoader {
             // (#2956). A load failure (missing file, unreadable, bad JSON)
             // ends the pass like any other directive's.
             if import.data {
-                match load_data_import(self.search_for(&target), &import.path) {
+                match load_data_import(
+                    self.search_for(&target),
+                    self.note_for(&target),
+                    &import.path,
+                ) {
                     Ok(value) => data_bindings.push((import.alias.clone(), value)),
                     Err(e) => return Err(self.failure_report(program, e)),
                 }
@@ -5050,7 +5220,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         program_ctx.jq_origin.as_deref(),
     );
     let module_lib_dirs = module_loader.lib_dirs().to_vec();
-    jq::cli_context::set_module_resolver(move |name| module_meta_outcome(&module_lib_dirs, name));
+    let module_lib_note = module_loader.default_note.clone();
+    jq::cli_context::set_module_resolver(move |name| {
+        module_meta_outcome(&module_lib_dirs, module_lib_note.as_deref(), name)
+    });
 
     // #2395: re-parse the filter once the module-sourced def names are known,
     // so a `def` arriving through `include` or `~/.jq` can shadow a builtin
@@ -5594,7 +5767,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     if files.is_empty() {
                         (files, vec![read_stdin_bytes()?], Vec::new())
                     } else {
-                        read_input_files(&files, false)
+                        // #7478: a named pipe the windowed gate read and found short hands its
+                        // bytes on here, since it gives them once.
+                        take_named_pushback(&files)
+                            .unwrap_or_else(|| read_input_files(&files, false))
                     }
                 }
             },
@@ -5644,13 +5820,14 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         };
         jq::cli_context::set_input_names(names);
         // #5291: jq skips a BOM at the start of its input, `--validate` included.
-        strip_leading_json_bom(raw_inputs.iter_mut());
+        let bom_cuts = strip_leading_json_bom(raw_inputs.iter_mut());
         // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
         let mut seams = if args.validate {
             Vec::new()
         } else {
             stitch_json_file_seams(raw_inputs.iter_mut(), false, false)
         };
+        note_bom_leads(&mut seams, &bom_cuts, raw_inputs.len());
         // Substitution is skipped under `--validate` so the strict validator
         // in the loop below still sees the *original* bytes (#1247).
         // Substituting first silently repaired a non-UTF-8 document, leaving
@@ -6771,6 +6948,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             let pending_failures = PENDING_OPEN_FAILURES
                 .with(|pending| !pending.borrow().is_empty())
                 || RAW_OPEN_FAILURES_POSSIBLE.with(std::cell::Cell::get);
+            // #7567: what the owned route asks of the run, once and not per document: a plain
+            // `--stream-errors` walk's events, and the array a stream slurps.
+            let stream_errors_events = plain_stream_errors(&args) && !args.slurp;
+            let slurped_stream =
+                stream_slurp_by_reader(&args) || (plain_stream_errors(&args) && args.slurp);
             'documents: for (document, location, source) in documents {
                 // #6531: a file that did not open is reported when the line read from past it is
                 // reached, before that line.
@@ -6808,12 +6990,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 // #5764: the slurped array takes it only for a program the owned evaluator answers
                 // without the reindex bridge; any other reads the array's own index, as before #5744,
                 // which that bridge made 10-15% slower on `[limit(5;.[])]` and `select`.
+                // #7567: every input a `--stream-errors` read gives is a tree with no source text
+                // too, its events and the array `-s` slurps them into, and each took the reindex
+                // bridge, which cost an event its path's length: the closes of a document nested
+                // `n` deep cost `O(n^2)`. Its events are read where they are, and its array as
+                // `--stream -s`'s is.
                 let owned_route = owned_route_for(
-                    false,
+                    stream_errors_events,
                     args.raw_input
                         && args.input_dsv.is_none()
                         && matches!(*document, OwnedValue::String(_)),
-                    stream_slurp_by_reader(&args) && matches!(*document, OwnedValue::Array(_)),
+                    slurped_stream && matches!(*document, OwnedValue::Array(_)),
                 );
                 if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
                 {
@@ -6985,7 +7172,17 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                     .map(|pair| (pair, crate::cli::jq_word_text(&pair[0])))
                     .filter(|(_, name)| !context.named.contains_key(name))
                 {
-                    let contents = read_arg_file("slurpfile", raw_name, file)?;
+                    // jq's parser reads the bytes, and a string's that are not UTF-8 are U+FFFD by
+                    // the rule the main input's are (#7436).
+                    let bytes = read_arg_file("slurpfile", raw_name, file)?;
+                    let contents = match String::from_utf8(bytes) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(
+                                e.as_bytes(),
+                            )
+                        }
+                    };
                     let values = parse_json_stream(&contents).map_err(|e| {
                         bad_arg_file("slurpfile", raw_name, file, &format!("{e:#}"))
                     })?;
@@ -7002,7 +7199,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                     .map(|pair| (pair, crate::cli::jq_word_text(&pair[0])))
                     .filter(|(_, name)| !context.named.contains_key(name))
                 {
-                    let contents = read_arg_file("rawfile", raw_name, file)?;
+                    let contents = jq_raw_file_text(&read_arg_file("rawfile", raw_name, file)?);
                     context
                         .named
                         .insert(name, OwnedValue::String(contents.into()));
@@ -7178,12 +7375,9 @@ fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
                 "program file contains NUL bytes".into(),
             ));
         }
-        let text = String::from_utf8(bytes).map_err(|_| {
-            open_error(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8",
-            ))
-        })?;
+        // A byte that is not UTF-8 reads as jq reads it, U+FFFD (#7436): harmless in a string or a
+        // comment, and a compile error anywhere else.
+        let text = jq_raw_file_text(&bytes);
         let skipped = text.len() - skip_shebang(&text).len();
         Ok(if skipped == 0 {
             text
@@ -7512,10 +7706,11 @@ fn read_inputs(
     // #5498: a program that asks for the `--stream` events as it goes reads them from the files a
     // chunk at a time, as jq does, and not from their bytes read whole first.
     if stream_read_in_chunks(args, track_eof) {
-        let (files, readers, unopened_tail, tail_is_source) = match open_chunked_inputs(&files) {
-            Ok(opened_inputs) => opened_inputs,
-            Err(e) => return Ok(Err(e)),
-        };
+        let (files, readers, unopened_tail, tail_is_source, bom_cuts) =
+            match open_chunked_inputs(&files) {
+                Ok(opened_inputs) => opened_inputs,
+                Err(e) => return Ok(Err(e)),
+            };
         opened.clone_from(&files);
         let locations =
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
@@ -7539,7 +7734,8 @@ fn read_inputs(
                 files: tags,
                 reader: crate::cli::jq_stream_errors::Reader::from_source(Box::new(
                     crate::cli::jq_stream_errors::ChunkedSources::new(readers)
-                        .with_tail(unopened_tail, tail_is_source),
+                        .with_tail(unopened_tail, tail_is_source)
+                        .with_bom_cuts(bom_cuts),
                 )),
                 raise_errors: !args.stream_errors,
             });
@@ -7596,7 +7792,7 @@ fn read_inputs(
         SEVERAL_WINDOWED_STARTS.with(|n| n.set(n.get() + 1));
         let sources = windows
             .into_iter()
-            .map(|windows| (String::new(), Vec::new(), LazyRest { windows }))
+            .map(|(windows, lead)| (String::new(), Vec::new(), LazyRest { windows }, lead))
             .collect();
         return Ok(Ok(defer_windowed_lazy_sources(&files, opened, sources)));
     }
@@ -7607,10 +7803,15 @@ fn read_inputs(
     let mut read_whole: Option<Vec<u8>> = None;
     if lone_lazy_read(args, track_eof, &files) {
         match lone_lazy_start(&files) {
-            Ok(LoneStart::Lazy { text, spans, rest }) => {
+            Ok(LoneStart::Lazy {
+                text,
+                spans,
+                rest,
+                lead,
+            }) => {
                 #[cfg(test)]
                 LONE_FRONT_STARTS.with(|n| n.set(n.get() + 1));
-                let sources = vec![(text, spans, rest)];
+                let sources = vec![(text, spans, rest, lead)];
                 return Ok(Ok(defer_windowed_lazy_sources(&files, opened, sources)));
             }
             Ok(LoneStart::Read(bytes)) => read_whole = Some(bytes),
@@ -7983,10 +8184,15 @@ fn read_inputs(
     // record-sequence mode: the program reads the events a record produces, not its document.
     let seq_by_stream_reader = seq_by_stream_reader(args);
     // `--seq` keeps the mark: its reader removes it as jq's does, and reacts to one that breaks off.
-    if json_input_mode {
+    let bom_cuts = if json_input_mode {
         // #5291: jq skips a BOM at the start of its input.
-        strip_leading_json_bom(raw_bytes.iter_mut().map(|(_, raw)| raw));
-    }
+        strip_leading_json_bom(raw_bytes.iter_mut().map(|(_, raw)| raw))
+    } else {
+        Vec::new()
+    };
+    // #7569: the stream reader's chunks of these sources held the cut bytes.
+    crate::cli::jq_stream_errors::STREAM_BOM_LEADS
+        .with(|leads| leads.borrow_mut().clone_from(&bom_cuts));
     // #4305: jq reads every input file as one byte stream, so a token still open at the end of
     // a file continues in the next one.
     // `--validate` is strict per file (an empty file is rejected too), so it reads the files as
@@ -8018,6 +8224,7 @@ fn read_inputs(
     } else {
         Vec::new()
     };
+    note_bom_leads(&mut seams, &bom_cuts, raw_bytes.len());
 
     // #1525: real jq warns on stderr when it drops a malformed --seq
     // record; succinctly silently ignored malformed records entirely
@@ -8958,7 +9165,11 @@ fn read_inputs(
                     let seam = if stitched {
                         seams.get(pos).cloned().unwrap_or_default()
                     } else {
-                        Seam::NONE
+                        // The BOM's lead is no stitch (#7569).
+                        Seam {
+                            lead: seams.get(pos).map_or(0, |seam| seam.lead),
+                            ..Seam::NONE
+                        }
                     };
                     let more = more_from.map(|(scanned_to, chunks)| LazyMore {
                         scanned_to,
@@ -9102,7 +9313,15 @@ fn read_inputs(
                                 rest: None,
                             });
                             if recorded_tail.is_none() {
-                                debug_assert_eq!(seam, Seam::NONE, "a lone source is unstitched");
+                                // A BOM's lead is no stitch (#7569).
+                                debug_assert_eq!(
+                                    Seam {
+                                        lead: 0,
+                                        ..seam.clone()
+                                    },
+                                    Seam::NONE,
+                                    "a lone source is unstitched"
+                                );
                                 locations.eof_tail = Some(if more.is_some() {
                                     EofTail {
                                         newlines: 0,
@@ -9832,10 +10051,10 @@ impl EofTail {
         let mut last_event = None;
         let mut offset = 0;
         loop {
-            // #7470: past a fault, only through the first depth refusal.
+            // #7470, #7611: past a fault, only through the next fault.
             let rest = &last[offset..];
             let read = if offset > 0 {
-                &rest[..depth_refusal_cut(rest, stream)]
+                &rest[..fault_cut(rest, stream)]
             } else {
                 rest
             };
@@ -10740,18 +10959,10 @@ fn first_yield_past_failure(raws: &[Vec<u8>], first_failure: usize) -> Option<Yi
     {
         return None;
     }
-    let first = raws.iter().position(|raw| !raw.is_empty());
-    let sources: Vec<(Option<usize>, Vec<u8>)> = raws
-        .iter()
+    let sources: Vec<(Option<usize>, Vec<u8>)> = past_stream_bom(raws)
+        .into_iter()
         .enumerate()
-        .map(|(at, raw)| {
-            let bom = if Some(at) == first {
-                crate::cli::front_matter::leading_bom_len(raw)
-            } else {
-                0
-            };
-            (Some(at), raw[bom..].to_vec())
-        })
+        .map(|(at, text)| (Some(at), text.to_vec()))
         .collect();
     let mut reader = crate::cli::jq_stream_errors::Reader::new(&sources[..]);
     while let Some(yielded) = reader.next_yielded() {
@@ -10928,12 +11139,10 @@ fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bo
             };
             return completes && first_stream_fault(&raws[at..=at]).is_none();
         }
-        // jq skips a byte-order mark at the front of its input: of the first file with bytes.
-        let bom = if raws[..at].iter().all(Vec::is_empty) {
-            crate::cli::front_matter::leading_bom_len(raw)
-        } else {
-            0
-        };
+        // jq skips a byte-order mark at the front of its input, which the first files with bytes
+        // may share (#7566).
+        let cuts = crate::cli::front_matter::stream_bom_cuts(raws.iter().map(Vec::as_slice));
+        let bom = crate::cli::front_matter::bom_cut_at(&cuts, at);
         crate::cli::jq_stream_errors::first_event_completes_in(&raw[bom..])
     } else {
         first_value_completes_in(&raws[at], args)
@@ -10948,17 +11157,14 @@ fn first_value_completes_at(raws: &[Vec<u8>], at: usize, args: &JqCommand) -> bo
 fn first_event_completing_file(raws: &[Vec<u8>]) -> Option<usize> {
     let limit = crate::cli::jq_stream_errors::FIRST_EVENT_PREFIX_LIMIT;
     let mut text: Vec<u8> = Vec::new();
+    // jq skips a byte-order mark at the front of its input, which the first files with bytes may
+    // share (#7566).
+    let texts = past_stream_bom(raws);
     let files = raws.iter().enumerate().filter(|(_, raw)| !raw.is_empty());
-    for (position, (at, raw)) in files.enumerate() {
-        // jq skips a byte-order mark at the front of its input: of the first file with bytes.
-        let bom = if position == 0 {
-            crate::cli::front_matter::leading_bom_len(raw)
-        } else {
-            0
-        };
+    for (at, _) in files {
         // Never more than the prefix a first event is read in: a longer one is not worth the copy.
         let room = limit - text.len();
-        let bytes = &raw[bom..];
+        let bytes = texts[at];
         text.extend_from_slice(&bytes[..bytes.len().min(room)]);
         if crate::cli::jq_stream_errors::first_event_completes_in(&text) {
             return Some(at);
@@ -11002,18 +11208,10 @@ fn text_ends_in_string(raws: &[Vec<u8>]) -> bool {
 
 /// The file jq's parser is reading when it meets the first fault of the text the files `raws`
 /// make, and whether that fault is at the end of the text, or `None` when it reads every value
-/// ([`jq::jq_stream_fault_chunk`]). jq skips the byte-order mark at the front of its input: of the
-/// first file with bytes.
+/// ([`jq::jq_stream_fault_chunk`]). jq skips the byte-order mark at the front of its input, which the
+/// first files with bytes may share (#7566).
 fn first_stream_fault(raws: &[Vec<u8>]) -> Option<(usize, bool)> {
-    let first = raws.iter().position(|raw| !raw.is_empty());
-    let chunks = raws.iter().enumerate().map(|(at, raw)| {
-        if Some(at) == first {
-            &raw[crate::cli::front_matter::leading_bom_len(raw)..]
-        } else {
-            raw.as_slice()
-        }
-    });
-    jq::jq_stream_fault_chunk(chunks)
+    jq::jq_stream_fault_chunk(past_stream_bom(raws))
 }
 
 /// Reports the pending open failures a read has reached (#6475): the ones before the source it
@@ -11343,6 +11541,7 @@ type ChunkedInputs = (
     Vec<crate::cli::jq_stream_errors::Opener>,
     crate::cli::jq_stream_errors::Tail,
     bool,
+    Vec<usize>,
 );
 
 /// Wraps `open` so that the reader, on reaching the source, first says what jq says of the files
@@ -11381,13 +11580,17 @@ fn report_lazy_open_failures(failures: &[InputFileOpenError]) {
 /// A pipe or socket named by path is the exception (#7295): it cannot be opened again or seeked, so
 /// the probe's handle is kept (until the reader gets to it) and read on from the probe.
 /// Stdin is read for its first bytes and kept.
+///
+/// Each opener reads its source from its first byte, a BOM included: the last element is how many
+/// of each opener's first bytes are the mark, which the reader skips once it has read them in its
+/// first `fgets` chunk of the source, as jq's parser skips them (#7569). The mark may be cut across
+/// the first sources with bytes (#7566), and a stream that ends inside it is empty input (#7454).
 fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let mut opened = Vec::with_capacity(files.len());
     let mut openers: Vec<crate::cli::jq_stream_errors::Opener> =
         Vec::with_capacity(files.len().max(1));
-    let mut look_for_bom = true;
-    // #7454: set while the first source with bytes is the start of the BOM and no later one has any.
-    let mut truncated_bom: Option<std::rc::Rc<std::cell::Cell<bool>>> = None;
+    // Each opener's first bytes, for the cuts.
+    let mut fronts: Vec<Vec<u8>> = Vec::new();
     if files.is_empty() {
         let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
         let mut stdin =
@@ -11402,16 +11605,12 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                 Vec::new()
             })
         };
-        let mut skip = bom_to_skip(&head, &mut look_for_bom);
-        // #7454: all there is of the stream is the start of the mark.
-        if skip == 0 && crate::cli::front_matter::truncated_bom_len(&head) > 0 {
-            skip = head.len();
-        }
+        let cuts = crate::cli::front_matter::stream_bom_cuts([head.as_slice()]);
         openers.push(Box::new(move || {
-            let rest = std::io::Cursor::new(head[skip..].to_vec()).chain(stdin);
+            let rest = std::io::Cursor::new(head).chain(stdin);
             Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, rest)))
         }));
-        return Ok((opened, openers, Vec::new(), false));
+        return Ok((opened, openers, Vec::new(), false, cuts));
     }
     // The files that would not open since the last one that did: said when the reader reaches
     // the next source, or its end (#6485).
@@ -11421,15 +11620,12 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
         if is_stdin_dash(path) {
             // `-` is standard input: the first one holds it all (kept whole), a later one is empty.
             let first = !std::mem::replace(&mut dash_seen, true);
-            let (mut bytes, failed) = if first {
+            let (bytes, failed) = if first {
                 dash_stdin_read()
             } else {
                 (Vec::new(), false)
             };
-            let first = look_for_bom && !bytes.is_empty();
-            let skip = bom_to_skip(&bytes[..bytes.len().min(3)], &mut look_for_bom);
-            bytes.drain(..skip);
-            let only_the_mark = truncated_bom_head(&bytes, first, skip, &mut truncated_bom);
+            fronts.push(bytes[..bytes.len().min(3)].to_vec());
             opened.push(path.clone());
             openers.push(report_unopened_before(
                 std::mem::take(&mut unopened),
@@ -11437,9 +11633,6 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                 Box::new(move || {
                     if failed {
                         note_stdin_read_failed();
-                    }
-                    if only_the_mark.is_some_and(|flag| flag.get()) {
-                        bytes.clear();
                     }
                     Ok(Box::new(std::io::Cursor::new(bytes)))
                 }),
@@ -11461,22 +11654,14 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
             .map_err(|e| InputFileOpenError::from_io(path, &e, at + 1 == files.len()));
         match probed {
             Ok((head, kept)) => {
-                let first = look_for_bom && !head.is_empty();
-                let skip = bom_to_skip(&head, &mut look_for_bom);
-                let only_the_mark = truncated_bom_head(&head, first, skip, &mut truncated_bom);
+                fronts.push(head.clone());
                 let path = path.clone();
                 opened.push(path.clone());
                 openers.push(report_unopened_before(
                     std::mem::take(&mut unopened),
                     Box::new(move || {
-                        use std::io::Seek;
-                        let skip = if only_the_mark.is_some_and(|flag| flag.get()) {
-                            head.len()
-                        } else {
-                            skip
-                        };
                         if let Some(file) = kept {
-                            let front = std::io::Cursor::new(head[skip..].to_vec());
+                            let front = std::io::Cursor::new(head);
                             let rest: Box<dyn std::io::Read> = match file {
                                 Some(file) => Box::new(front.chain(file)),
                                 None => Box::new(front),
@@ -11486,8 +11671,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                                     as Box<dyn std::io::BufRead>,
                             );
                         }
-                        let mut file = std::fs::File::open(&path)?;
-                        file.seek(std::io::SeekFrom::Start(skip as u64))?;
+                        let file = std::fs::File::open(&path)?;
                         Ok(Box::new(std::io::BufReader::with_capacity(64 * 1024, file)))
                     }),
                 ));
@@ -11537,6 +11721,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let tail_is_source = unopened
         .last()
         .is_some_and(|failure| !failure.is_directory());
+    let cuts = crate::cli::front_matter::stream_bom_cuts(fronts.iter().map(Vec::as_slice));
     // #6531: and `input_filename` names it from there on, once `get_inputs` hands it to the
     // locations.
     if let Some(failure) = unopened.last().filter(|_| tail_is_source) {
@@ -11560,7 +11745,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
         });
         Vec::new()
     };
-    Ok((opened, openers, tail, tail_is_source))
+    Ok((opened, openers, tail, tail_is_source, cuts))
 }
 
 /// Whether the probe's handle on a source is the one the reader reads on: a pipe or a socket
@@ -11591,43 +11776,6 @@ fn read_head(reader: &mut impl std::io::Read) -> std::io::Result<Vec<u8>> {
         }
     }
     Ok(head)
-}
-
-/// How many bytes of a source that starts with `head` are the BOM jq skips: the first source that
-/// has bytes may start with one (`look_for_bom`, cleared once a source has any).
-fn bom_to_skip(head: &[u8], look_for_bom: &mut bool) -> usize {
-    if !*look_for_bom || head.is_empty() {
-        return 0;
-    }
-    *look_for_bom = false;
-    crate::cli::front_matter::leading_bom_len(head)
-}
-
-/// Whether the first source with bytes holds nothing but the start of the BOM (`EF` or `EF BB`),
-/// and so is empty input unless a later source goes on from it (#7454): jq's parser keeps its place
-/// in the mark across a refill and accepts the end of the stream inside it.
-///
-/// `first` says `head` is the head of the first source that has bytes; the answer is a flag the
-/// source's opener reads once every source is probed, and a later source with bytes clears it
-/// (`note_later_bytes`), as that source makes the mark `Malformed BOM` instead.
-fn truncated_bom_head(
-    head: &[u8],
-    first: bool,
-    skip: usize,
-    pending: &mut Option<std::rc::Rc<std::cell::Cell<bool>>>,
-) -> Option<std::rc::Rc<std::cell::Cell<bool>>> {
-    if first {
-        if skip == 0 && crate::cli::front_matter::truncated_bom_len(head) > 0 {
-            let flag = std::rc::Rc::new(std::cell::Cell::new(true));
-            *pending = Some(flag.clone());
-            return Some(flag);
-        }
-    } else if !head.is_empty() {
-        if let Some(flag) = pending {
-            flag.set(false);
-        }
-    }
-    None
 }
 
 /// A read of standard input failed, or it cannot be read at all (`jq . 0>>file`, `jq . 0<&-`,
@@ -11773,25 +11921,48 @@ pub(super) fn abort_if_out_of_memory(error: &std::io::Error) {
 /// stream (#4305), so only the very start of the stream is skipped: a BOM at
 /// the front of a later file is a byte in the middle of a value there, and
 /// stays one. An empty file contributes no bytes, so the BOM may sit at the
-/// front of the first file that has any.
+/// front of the first file that has any, and the mark itself may be cut across
+/// the first files with bytes (#7566): jq's parser matches it a byte at a time.
+/// A stream that ends inside the mark is empty input, not a fault (#7454).
 ///
 /// `-R` and `--seq` never come through here: raw input is never parsed, and
 /// the `--seq` reader accounts for the BOM itself (`bom_prefix`), including
 /// the malformed forms.
-fn strip_leading_json_bom<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) {
-    let mut raws = raws.into_iter().filter(|raw| !raw.is_empty());
-    if let Some(first) = raws.next() {
-        let bom_len = crate::cli::front_matter::leading_bom_len(first);
-        // A stream that ends inside the mark is empty input, not a fault (#7454): the mark's
-        // first bytes are all there is, and no later file goes on from them.
-        if bom_len == 0
-            && crate::cli::front_matter::truncated_bom_len(first) > 0
-            && raws.next().is_none()
-        {
-            first.clear();
-        }
-        first.drain(..bom_len);
+///
+/// The cuts are handed back, one per file (empty when there is no mark): jq's `fgets` still reads
+/// the mark, so the reads of a file's first line start that many bytes before its text (#7569).
+fn strip_leading_json_bom<'a>(raws: impl Iterator<Item = &'a mut Vec<u8>>) -> Vec<usize> {
+    let raws: Vec<&mut Vec<u8>> = raws.collect();
+    let cuts = crate::cli::front_matter::stream_bom_cuts(raws.iter().map(|raw| raw.as_slice()));
+    for (raw, &cut) in raws.into_iter().zip(&cuts) {
+        raw.drain(..cut);
     }
+    cuts
+}
+
+/// Puts the BOM cuts [`strip_leading_json_bom`] made on the seams of the `files` files, as each
+/// file's [`Seam::lead`] (#7569), filling an empty list of seams with [`Seam::NONE`] when there is a
+/// mark to record.
+fn note_bom_leads(seams: &mut Vec<Seam>, cuts: &[usize], files: usize) {
+    if cuts.iter().all(|&cut| cut == 0) {
+        return;
+    }
+    if seams.is_empty() {
+        seams.resize(files, Seam::NONE);
+    }
+    for (seam, &cut) in seams.iter_mut().zip(cuts) {
+        seam.lead = cut;
+    }
+}
+
+/// Each of `raws` past the cut [`crate::cli::front_matter::stream_bom_cuts`] gives it: the text
+/// jq's parser reads of each file of a stream that starts with a BOM (#5291, #7566).
+fn past_stream_bom(raws: &[Vec<u8>]) -> Vec<&[u8]> {
+    let cuts = crate::cli::front_matter::stream_bom_cuts(raws.iter().map(Vec::as_slice));
+    raws.iter()
+        .enumerate()
+        .map(|(at, raw)| &raw[crate::cli::front_matter::bom_cut_at(&cuts, at)..])
+        .collect()
 }
 
 /// A main input file [`read_file_bytes`] couldn't open (#3098).
@@ -12178,8 +12349,36 @@ fn raw_windowed_source(args: &JqCommand, files: &[PathBuf]) -> Option<RawWindowe
         };
     }
     // No length: the file is read to the end it has when the reads get there (#7446).
-    let file = lone_raw_windowed_file(args, files)?;
-    Some((Box::new(file), None, Vec::new()))
+    if let Some(file) = lone_raw_windowed_file(args, files) {
+        return Some((Box::new(file), None, Vec::new()));
+    }
+    raw_windowed_named_pipe(args, files)
+}
+
+/// `-R`'s read of a lone input named on the command line that gives its bytes once (#7478): `-` as
+/// standard input ([`raw_windowed_stdin`]), and a FIFO or socket by its path ([`named_pipe`]) as a pipe on
+/// standard input is read, a window at a time once it holds one, so `-R -n input` over a producer that
+/// never ends its stream answers at once, as jq does. A pipe that ends sooner hands its bytes to the
+/// route that reads it whole ([`hand_back_short_pipe`]).
+#[cfg(unix)]
+fn raw_windowed_named_pipe(args: &JqCommand, files: &[PathBuf]) -> Option<RawWindowed> {
+    if !raw_window_flags(args) {
+        return None;
+    }
+    if let [path] = files {
+        if is_stdin_dash(path) {
+            return raw_windowed_stdin();
+        }
+    }
+    let path = named_pipe(files)?;
+    let file = std::fs::File::open(path).ok()?;
+    let front = probe_pipe(&file, raw_window_min_pipe_bytes(), Some(path))?;
+    Some((Box::new(file), None, front))
+}
+
+#[cfg(not(unix))]
+fn raw_windowed_named_pipe(_args: &JqCommand, _files: &[PathBuf]) -> Option<RawWindowed> {
+    None
 }
 
 /// Standard input for `-R` (#7024) when it is a regular file with [`raw_window_min_bytes`] or more left
@@ -12380,10 +12579,13 @@ fn windowed_plain_file(args: &JqCommand) -> Option<WindowedSource> {
     windowed_source(args, window::min_windowed_file_bytes()).or_else(|| {
         // #7024: a pipe on standard input, read a window at a time with its first fault kept as it is
         // read (`--seq` over a pipe is [`windowed_seq_pipe`]'s, #7164).
-        get_input_files(args)
-            .is_empty()
-            .then(windowed_stdin_pipe)
-            .flatten()
+        let files = get_input_files(args);
+        if files.is_empty() {
+            windowed_stdin_pipe()
+        } else {
+            // #7478: a lone pipe named on the command line, or `-`, is read as standard input is.
+            windowed_named_pipe(&files)
+        }
     })
 }
 
@@ -12424,6 +12626,38 @@ fn windowed_source(args: &JqCommand, min: u64) -> Option<WindowedSource> {
     ))
 }
 
+/// Whether the first of `sources` with a byte holds only the start of the BOM (`EF` or `EF BB`), which
+/// the sources after it go on with or end (#7566). One definition for the windowed route's refusal
+/// ([`bom_cut_across_files`]) and the tests that compare that route with the one that reads the files
+/// whole.
+#[cfg(any(unix, test))]
+fn first_with_bytes_is_a_cut_bom(sources: impl IntoIterator<Item = impl AsRef<[u8]>>) -> bool {
+    sources
+        .into_iter()
+        .find(|source| !source.as_ref().is_empty())
+        .is_some_and(|first| crate::cli::front_matter::truncated_bom_len(first.as_ref()) > 0)
+}
+
+/// Whether the list `files` opens with a mark cut across files ([`first_with_bytes_is_a_cut_bom`]).
+/// The windows skip a mark at the front of the first file with bytes alone, so such a list is left to
+/// the route that reads the files whole, which joins the mark across them ([`strip_leading_json_bom`]).
+/// A file that will not open or read here is left to that route too.
+#[cfg(unix)]
+fn bom_cut_across_files(files: &[PathBuf]) -> bool {
+    let mut unreadable = false;
+    let heads = files.iter().map(|path| {
+        std::fs::File::open(path)
+            .and_then(|mut file| read_head(&mut file))
+            .unwrap_or_else(|_| {
+                // patchcov: coverage tolerate reason="untestable: a file judged readable a moment ago that fails to read"
+                unreadable = true;
+                Vec::new()
+                // patchcov: coverage end
+            })
+    });
+    first_with_bytes_is_a_cut_bom(heads) || unreadable
+}
+
 /// How many files the several-files route holds open: each is kept by the second read that words a
 /// fault, which reads them all again, and a process has only so many descriptors. A process's descriptor
 /// table starts at 64 slots and doubling it waits for an RCU grace period (35 ms on the 7950X's Linux, for
@@ -12448,6 +12682,9 @@ fn windowed_regular_files(
         judge_regular_files(files, window::min_windowed_file_bytes(), |path, _, _| {
             named.push(std::rc::Rc::new(window::NamedFile::new(path.clone())));
         })?;
+        if bom_cut_across_files(files) {
+            return None;
+        }
         return Some((
             window::WindowedFiles::named(&named, window::window_bytes()),
             std::rc::Rc::new(window::Reread::new_named(&named)),
@@ -12457,6 +12694,9 @@ fn windowed_regular_files(
     judge_regular_files(files, window::min_windowed_file_bytes(), |_, file, meta| {
         opened.push((std::rc::Rc::new(file), meta.len()));
     })?;
+    if bom_cut_across_files(files) {
+        return None;
+    }
     let reread = window::Reread::new_many(&opened);
     Some((
         window::WindowedFiles::new(opened, window::window_bytes()),
@@ -12618,6 +12858,13 @@ fn regular_stdin_left(
 /// standard input reads it ([`not_open_for_reading`]).
 #[cfg(unix)]
 fn probe_stdin_pipe(file: &std::fs::File, min: u64) -> Option<Vec<u8>> {
+    probe_pipe(file, min, None)
+}
+
+/// [`probe_stdin_pipe`] over standard input (`named` is `None`) or over a pipe named on the command line
+/// (#7478), whose short front goes to [`hand_back_short_pipe`].
+#[cfg(unix)]
+fn probe_pipe(file: &std::fs::File, min: u64, named: Option<&PathBuf>) -> Option<Vec<u8>> {
     // The probe's whole size at once, so that its bytes are not grown and copied on the way.
     let mut front = Vec::with_capacity(usize::try_from(min).unwrap_or(0));
     let error = Read::take(file, min)
@@ -12625,11 +12872,46 @@ fn probe_stdin_pipe(file: &std::fs::File, min: u64) -> Option<Vec<u8>> {
         .err()
         .filter(|error| !not_open_for_reading(error));
     if (front.len() as u64) < min {
-        STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
-        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(front));
+        hand_back_short_pipe(named, front, error);
         return None;
     }
     Some(front)
+}
+
+/// What a probe read of a pipe that ended before a windowed route would take it, handed to the route that
+/// reads it whole as if that route had read it itself: standard input's through [`STDIN_PUSHBACK`] (and
+/// the failure of a read through [`STDIN_PUSHBACK_ERROR`]), a pipe named on the command line's (#7478)
+/// through [`NAMED_PUSHBACK`], which that route takes for the same list of files: such a pipe gives its
+/// bytes once, and opening it again waits for a writer that has gone.
+#[cfg(unix)]
+fn hand_back_short_pipe(named: Option<&PathBuf>, bytes: Vec<u8>, error: Option<std::io::Error>) {
+    match named {
+        None => {
+            STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
+            STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(bytes));
+        }
+        // A read of a named pipe that fails after it opened leaves what it read as the pipe's bytes.
+        Some(path) => NAMED_PUSHBACK.with(|slot| {
+            let files = vec![path.clone()];
+            *slot.borrow_mut() = Some((files.clone(), (files, vec![bytes], Vec::new())));
+        }),
+    }
+}
+
+/// A lone input named on the command line that gives its bytes once (#7478): a FIFO or a socket by its
+/// path (`mkfifo`, `<(cmd)`), or `/dev/stdin` or `/dev/fd/N` naming one; judged by `stat`, which opens
+/// nothing. `-` is standard input, which each route reads as it reads an unnamed one.
+#[cfg(unix)]
+fn named_pipe(files: &[PathBuf]) -> Option<&PathBuf> {
+    use std::os::unix::fs::FileTypeExt;
+    let [path] = files else {
+        return None;
+    };
+    if is_stdin_dash(path) {
+        return None;
+    }
+    let kind = std::fs::metadata(path).ok()?.file_type();
+    (kind.is_fifo() || kind.is_socket()).then_some(path)
 }
 
 /// [`probe_stdin_pipe`] a block at a time (#7260): the probe's bytes as blocks of `block` bytes each,
@@ -12643,6 +12925,18 @@ fn probe_stdin_pipe_blocks(
     file: &std::fs::File,
     min: u64,
     block: usize,
+) -> Option<std::collections::VecDeque<Vec<u8>>> {
+    probe_pipe_blocks(file, min, block, None)
+}
+
+/// [`probe_stdin_pipe_blocks`] over standard input (`named` is `None`) or a pipe named on the command
+/// line (#7478), whose short front goes to [`hand_back_short_pipe`].
+#[cfg(unix)]
+fn probe_pipe_blocks(
+    file: &std::fs::File,
+    min: u64,
+    block: usize,
+    named: Option<&PathBuf>,
 ) -> Option<std::collections::VecDeque<Vec<u8>>> {
     const ROOM: usize = 64 << 10;
     let block = block.max(1);
@@ -12668,8 +12962,7 @@ fn probe_stdin_pipe_blocks(
         for bytes in blocks {
             whole.extend_from_slice(&bytes);
         }
-        STDIN_PUSHBACK_ERROR.with(|slot| *slot.borrow_mut() = error);
-        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(whole));
+        hand_back_short_pipe(named, whole, error);
         return None;
     }
     Some(blocks)
@@ -12725,7 +13018,18 @@ fn windowed_stdin_pipe() -> Option<WindowedSource> {
 /// documents before it as on a regular file.
 #[cfg(unix)]
 fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
-    let blocks = probe_stdin_pipe_blocks(&file, min, window::window_bytes())?;
+    windowed_pipe_named(file, min, None)
+}
+
+/// [`windowed_pipe`] over standard input (`named` is `None`) or a pipe named on the command line
+/// (#7478), which is the run's file list then, so its documents and faults name it.
+#[cfg(unix)]
+fn windowed_pipe_named(
+    file: std::fs::File,
+    min: u64,
+    named: Option<&PathBuf>,
+) -> Option<WindowedSource> {
+    let blocks = probe_pipe_blocks(&file, min, window::window_bytes(), named)?;
     let seen = window::SeenFault::default();
     let reader = window::WindowedFiles::pipe(
         std::rc::Rc::new(file),
@@ -12734,14 +13038,38 @@ fn windowed_pipe(file: std::fs::File, min: u64) -> Option<WindowedSource> {
         seen.clone(),
     );
     Some((
-        Vec::new(),
+        named.cloned().into_iter().collect(),
         reader,
         std::rc::Rc::new(window::Reread::seen(seen)),
     ))
 }
 
+/// The plain route's read of a lone input named on the command line that gives its bytes once (#7478):
+/// `-` is read as standard input is ([`windowed_stdin_pipe`]), named `<stdin>`; a FIFO or socket by its
+/// path ([`named_pipe`]) is opened (which waits for its writer, as jq's open does) and read as a pipe on
+/// standard input is, a window at a time once it holds two, so `halt` or `first(.), halt` over a producer
+/// that never ends its stream ends at once, as jq does; the route that reads it whole read it to its end
+/// first. A pipe that ends sooner hands its bytes to that route ([`hand_back_short_pipe`]).
+#[cfg(unix)]
+fn windowed_named_pipe(files: &[PathBuf]) -> Option<WindowedSource> {
+    if let [path] = files {
+        if is_stdin_dash(path) {
+            let (_, reader, reread) = windowed_stdin_pipe()?;
+            return Some((files.to_vec(), reader, reread));
+        }
+    }
+    let path = named_pipe(files)?;
+    let file = std::fs::File::open(path).ok()?;
+    windowed_pipe_named(file, window::min_windowed_pipe_bytes(), Some(path))
+}
+
 #[cfg(not(unix))]
 fn windowed_stdin_pipe() -> Option<WindowedSource> {
+    None
+}
+
+#[cfg(not(unix))]
+fn windowed_named_pipe(_files: &[PathBuf]) -> Option<WindowedSource> {
     None
 }
 
@@ -12938,6 +13266,12 @@ struct Seam {
     /// and a share can end inside a replacement, where jq's next read starts on a byte the text
     /// no longer has. `None` until the substitution has run on the file.
     raw_ends: Option<std::rc::Rc<[usize]>>,
+    /// How many bytes of the file come before its text that jq's first read of it holds: the BOM
+    /// jq's parser skips, which its `fgets` still reads (#7569). The text's first line therefore
+    /// starts that many bytes into the first 4095-byte read, and its later reads start that many
+    /// bytes early. 0 for every file but the stream's first with bytes (and those the mark is cut
+    /// across, #7566).
+    lead: usize,
 }
 
 /// One file's share of the bytes moved onto the front of a later file (#5936).
@@ -12979,6 +13313,39 @@ impl Seam {
         self
     }
 
+    /// This seam once the first `dropped` bytes of the file's text are gone (#7480): a source read in
+    /// windows drops its text up to a line start its line count has passed, which is never before the
+    /// bytes moved onto its front, so they all go and the seam keeps only what was moved off its end.
+    fn after_front_dropped(self, dropped: usize) -> Self {
+        if self.base == 0 || dropped == 0 {
+            return self;
+        }
+        debug_assert!(dropped >= self.base, "a window drops the moved bytes whole");
+        if dropped >= self.base {
+            return Self {
+                moved_len: self.moved_len,
+                moved_newline: self.moved_newline,
+                ..Self::NONE
+            };
+        }
+        // patchcov: coverage tolerate reason="unreachable: the counter's line start, the most a window drops, is never before the moved bytes' end"
+        Self {
+            base: self.base - dropped,
+            earlier: self.earlier.map(|earlier| {
+                earlier
+                    .iter()
+                    .map(|part| SeamPart {
+                        end: part.end.saturating_sub(dropped),
+                        ..part.clone()
+                    })
+                    .collect()
+            }),
+            raw_ends: None,
+            ..self
+        }
+        // patchcov: coverage end
+    }
+
     const NONE: Self = Self {
         base: 0,
         moved_len: 0,
@@ -12987,6 +13354,7 @@ impl Seam {
         prev_source: 0,
         earlier: None,
         raw_ends: None,
+        lead: 0,
     };
 
     /// The file's own bytes: `raw` without the ones moved onto its front.
@@ -13129,6 +13497,9 @@ struct LineCounter<'a> {
     /// What [`stitch_json_file_seams`] did to `bytes`, whose lines are jq's lines of the file
     /// as it was on disk (#4316).
     seam: Seam,
+    /// The bytes jq's first read held before `bytes` while the counter is on the text's first line
+    /// ([`Seam::lead`], #7569), and 0 once it is past a line break.
+    lead: usize,
 }
 
 /// A [`LineCounter`]'s position without its text (#5661): only [`LineCounter::resume`] over
@@ -13140,6 +13511,7 @@ struct LinePlace {
     line_start: usize,
     next_newline: Option<usize>,
     seam: Seam,
+    lead: usize,
 }
 
 impl LinePlace {
@@ -13184,6 +13556,7 @@ impl<'a> LineCounter<'a> {
             newlines_before_pos: 0,
             line_start: base,
             next_newline: None,
+            lead: seam.lead,
             seam,
         }
     }
@@ -13205,6 +13578,7 @@ impl<'a> LineCounter<'a> {
             line_start: self.line_start,
             next_newline: self.next_newline,
             seam: self.seam.clone(),
+            lead: self.lead,
         }
     }
 
@@ -13217,6 +13591,7 @@ impl<'a> LineCounter<'a> {
             line_start: place.line_start,
             next_newline: place.next_newline,
             seam: place.seam.clone(),
+            lead: place.lead,
         }
     }
 
@@ -13297,8 +13672,7 @@ impl<'a> LineCounter<'a> {
     /// it costs nothing more.
     fn read_end(&self, at: usize) -> usize {
         let at = at.max(self.line_start);
-        let chunk_end =
-            self.line_start + ((at - self.line_start) / JQ_READ_CHUNK + 1) * JQ_READ_CHUNK;
+        let chunk_end = self.line_start + (self.read_of(at) + 1) * JQ_READ_CHUNK - self.lead;
         match self.next_newline {
             Some(newline) if newline < chunk_end && newline < self.read_len() => newline + 1,
             _ => chunk_end.min(self.read_len()),
@@ -13313,6 +13687,8 @@ impl<'a> LineCounter<'a> {
         let counted = &self.bytes[self.pos..completes_at];
         if let Some(last) = counted.iter().rposition(|&b| b == b'\n') {
             self.line_start = self.pos + last + 1;
+            // A read starts after the line break: the mark jq's first read held is behind it.
+            self.lead = 0;
         }
         self.newlines_before_pos += count_newlines(counted);
         self.pos = completes_at;
@@ -13330,10 +13706,14 @@ impl<'a> LineCounter<'a> {
                 ),
         };
         self.next_newline = Some(next);
-        let same_read = next < self.read_len()
-            && (next - self.line_start) / JQ_READ_CHUNK
-                == (completes_at - self.line_start) / JQ_READ_CHUNK;
+        let same_read = next < self.read_len() && self.read_of(next) == self.read_of(completes_at);
         self.newlines_before_pos + usize::from(same_read)
+    }
+
+    /// Which of the reads of the line holding `at` (from `line_start`) holds it, counted from 0: the
+    /// first read of the text's first line holds the [`lead`](Self::lead) bytes too (#7569).
+    fn read_of(&self, at: usize) -> usize {
+        (at - self.line_start + self.lead) / JQ_READ_CHUNK
     }
 
     /// Same result [`line_at`] would return for this `end`, given every
@@ -13601,21 +13981,31 @@ fn meet_fault(
 }
 
 /// How many bytes of `text`, which jq's parser reads on into from a fault, a loop that resumes
-/// past faults has to split and parse (#7470): through the bracket jq refuses for its depth limit,
-/// when that is the first fault the parser meets in `text`, or all of it. `--stream` (`stream`)
-/// has no depth limit, so all of it there.
+/// past faults has to split and parse (#7470, #7611): through the byte at which jq's parser meets
+/// the first fault in `text` ([`jq::jq_stream_fault_offset`]), whatever the fault, and on to the end
+/// of the character it is in; all of it when the parser meets none before the end. `--stream`
+/// (`stream`) reads with jq's streaming parser, which that model is not, so all of it there.
 ///
-/// jq stops on that bracket and drops the rest of its read, so nothing after it changes the values
-/// before it or the fault. But a container that deep closes only near the end of the text, and the
-/// splitter, the index and the validators each walked it whole, once per read the loop resumed at:
-/// a deeply nested document's refusal was quadratic in its depth. The cut ends inside the refused
-/// container and leaves it unclosed, so the splitter stops at its start, where over the whole text
-/// the refused span starts, with the same values before it.
-fn depth_refusal_cut(text: &[u8], stream: bool) -> usize {
+/// jq stops on that byte and drops the rest of its read, so nothing after it changes the values
+/// before it or the fault. But the value holding a fault can run to the end of the text (a deeply
+/// nested document, or `[x[x[x...` with its closers at the end), and the splitter, the index and
+/// the validators each walked it whole, once per read the loop resumed at: quadratic in the text
+/// after the first fault. The cut ends inside the malformed value or just after it, so the
+/// splitter stops at the value's start, where over the whole text the malformed span starts, with
+/// the same values before it.
+fn fault_cut(text: &[u8], stream: bool) -> usize {
     if stream {
         return text.len();
     }
-    jq::jq_stream_depth_fault_offset(text).map_or(text.len(), |at| at + 1)
+    let Some(at) = jq::jq_stream_fault_offset(text) else {
+        return text.len();
+    };
+    // A `&str` caller slices at the cut, so it ends on a character boundary.
+    let mut cut = at + 1;
+    while text.get(cut).is_some_and(|&b| b & 0xC0 == 0x80) {
+        cut += 1;
+    }
+    cut
 }
 
 /// The line jq's parser stands on when it meets the fault that ends `raw`'s clean prefix of
@@ -13865,8 +14255,21 @@ fn stitch_json_file_seams<'a>(
     resumes: bool,
     stream: bool,
 ) -> Vec<Seam> {
+    stitch_json_file_seams_onto(raws, resumes, stream, Vec::new())
+}
+
+/// [`stitch_json_file_seams`] over files of which some already start with bytes moved onto them
+/// (#7480): `seams[i]`, where given, is what was moved onto the front of file `i` before (the lazy
+/// route carries a document a file ends inside onto the next file as it reaches that end), and the
+/// stitch goes on from it as it would from a carry of its own.
+fn stitch_json_file_seams_onto<'a>(
+    raws: impl Iterator<Item = &'a mut Vec<u8>>,
+    resumes: bool,
+    stream: bool,
+    mut seams: Vec<Seam>,
+) -> Vec<Seam> {
     let mut raws: Vec<&mut Vec<u8>> = raws.collect();
-    let mut seams = vec![Seam::NONE; raws.len()];
+    seams.extend(std::iter::repeat(Seam::NONE).take(raws.len().saturating_sub(seams.len())));
     let Some(last) = raws.len().checked_sub(1) else {
         return seams;
     };
@@ -13990,10 +14393,10 @@ fn open_tail_start(raw: &[u8], resumes: bool, seam: Seam, stream: bool) -> Optio
     let mut offset = 0;
     loop {
         let split = if resumes {
-            // #7470: past a fault, only through the first depth refusal.
+            // #7470, #7611: past a fault, only through the next fault.
             let rest = &raw[offset..];
             let read = if offset > 0 {
-                &rest[..depth_refusal_cut(rest, stream)]
+                &rest[..fault_cut(rest, stream)]
             } else {
                 rest
             };
@@ -14198,11 +14601,11 @@ fn read_json_tail(
     let mut file_end: Option<(usize, usize)> = None;
     loop {
         let mut segment = &raw[offset..];
-        // #7470: past a fault, only through the first depth refusal. The parse below names the
+        // #7470, #7611: past a fault, only through the next fault. The parse below names the
         // fault with jq's parser model over these same bytes, which a `lossy` text does not hold
         // (the model reads the bytes jq read), so that one is read whole.
         if parser_at.is_some() && cx.lossy.is_none() {
-            segment = &segment[..depth_refusal_cut(segment.as_bytes(), cx.stream)];
+            segment = &segment[..fault_cut(segment.as_bytes(), cx.stream)];
         }
         let seg_pos = (!cx.stream).then(|| {
             parser_at.unwrap_or_else(|| {
@@ -14427,6 +14830,10 @@ struct DroppedText {
     bytes: usize,
     /// How many line breaks came before the window.
     newlines: usize,
+    /// How many line breaks were in the bytes an earlier file's cut document moved onto the front of
+    /// the text (#7480), all of which go with the first window dropped: they are not the file's lines,
+    /// but they are in jq's input ahead of the window.
+    moved_newlines: usize,
 }
 
 impl DroppedText {
@@ -14435,7 +14842,7 @@ impl DroppedText {
         if self.bytes == 0 {
             file_start
         } else {
-            (file_start.0 + self.newlines, 0)
+            (file_start.0 + self.moved_newlines + self.newlines, 0)
         }
     }
 
@@ -14499,13 +14906,9 @@ fn lazy_prefix_bytes() -> usize {
 /// `input`/`inputs` (`track_eof`), over plain JSON documents, one file or stdin, nothing that
 /// needs the whole text first. Every condition is one the lone source's branch of [`get_inputs`]
 /// takes the stream on; `lone_lazy_read_is_the_lone_source_route_6451` checks the two agree.
+/// A lone `-`, and a lone pipe named by its path, are read as standard input is (#7478).
 fn lone_lazy_read(args: &JqCommand, track_eof: bool, files: &[PathBuf]) -> bool {
-    lazy_read_flags(args, track_eof)
-        && match files {
-            [] => true,
-            [file] => !is_stdin_dash(file),
-            _ => false,
-        }
+    lazy_read_flags(args, track_eof) && files.len() <= 1
 }
 
 /// The flags of a run whose documents the lazy route reads as the program asks for them: a program
@@ -14543,7 +14946,7 @@ fn several_lazy_windowed_files(
     args: &JqCommand,
     track_eof: bool,
     files: &[PathBuf],
-) -> Option<Vec<window::LineWindows>> {
+) -> Option<Vec<(window::LineWindows, usize)>> {
     if files.len() < 2 || !lazy_read_flags(args, track_eof) {
         return None;
     }
@@ -14570,9 +14973,12 @@ fn several_lazy_windowed_files(
     Some(
         sources
             .into_iter()
-            .map(|(file, ..)| {
+            .map(|(file, start, _)| {
                 // No length: the file is read to the end it has when the reads get there.
-                window::LineWindows::new(Box::new(file), None, lazy_window_bytes(), Vec::new())
+                let windows =
+                    window::LineWindows::new(Box::new(file), None, lazy_window_bytes(), Vec::new());
+                // The start past a BOM is the mark jq's first read held (#7569).
+                (windows, usize::try_from(start).unwrap_or(0))
             })
             .collect(),
     )
@@ -14591,6 +14997,8 @@ fn windowed_file_start(
         let mut head = Vec::with_capacity(3);
         (&*file).take(3).read_to_end(&mut head).ok()?;
         *before_first_byte = head.is_empty();
+        // A file that is only the start of the mark, which the files after it go on with (#7566), is
+        // not UTF-8 on its own, so the check below leaves the list to the route that joins it.
         crate::cli::front_matter::leading_bom_len(&head) as u64
     } else {
         0
@@ -14604,7 +15012,9 @@ fn windowed_file_start(
 /// the list holds one descriptor, and each file's windows read through [`window::OpenWhenRead`], which
 /// opens the path when the run first reads it, as jq does. A file that will not open then reads as no
 /// bytes and is noted for the read hook ([`note_raw_open_failure`]), as for `-R`.
-fn several_lazy_windowed_files_by_path(files: &[PathBuf]) -> Option<Vec<window::LineWindows>> {
+fn several_lazy_windowed_files_by_path(
+    files: &[PathBuf],
+) -> Option<Vec<(window::LineWindows, usize)>> {
     judge_regular_paths(files, raw_window_min_bytes())?;
     let count = files.len();
     let mut sources = Vec::with_capacity(count);
@@ -14637,7 +15047,15 @@ fn several_lazy_windowed_files_by_path(files: &[PathBuf]) -> Option<Vec<window::
                 // reader reads it, where the length a `stat` gave now may be another file's.
                 let reader =
                     window::OpenWhenRead::new(path.clone(), at, at + 1 == count).starting_at(start);
-                window::LineWindows::new(Box::new(reader), None, lazy_window_bytes(), Vec::new())
+                // The start past a BOM is the mark jq's first read held (#7569).
+                let lead = usize::try_from(start).unwrap_or(0);
+                let windows = window::LineWindows::new(
+                    Box::new(reader),
+                    None,
+                    lazy_window_bytes(),
+                    Vec::new(),
+                );
+                (windows, lead)
             })
             .collect(),
     )
@@ -14647,8 +15065,9 @@ fn several_lazy_windowed_files_by_path(files: &[PathBuf]) -> Option<Vec<window::
 /// the route that reads the files whole takes them lazily without stitching them first
 /// ([`lazy_json_sources`]): its first chunk clean, and, when that chunk is all of it, not ending in a
 /// number or literal the next file could go on with. That route stitches such a file onto the next
-/// and goes on lazily over all of them, where the windowed route would hand the rest of the stream to
-/// the eager reader at its end, so the windowed route turns it down. A file the front
+/// and goes on lazily over all of them, so the windowed route turns it down. (Since #7480 the windowed
+/// route would carry such a file's end onto the next as it carries a later file's; the gate keeps the
+/// choice between the two routes where it was.) A file the front
 /// ([`lazy_prefix_bytes`]) holds whole is asked of [`lazy_json_sources`] itself; a longer one is taken
 /// only when the front's first chunk has more after it, which the whole text's would then too.
 ///
@@ -14764,8 +15183,9 @@ fn check_file_text(file: &mut std::fs::File, start: u64) -> Option<FileText> {
 }
 
 /// One source [`defer_windowed_lazy_sources`] defers: the text read of it so far, the documents of its
-/// first chunk in that text, and the rest of it to read.
-type WindowedLazySource = (String, Vec<(usize, usize)>, LazyRest);
+/// first chunk in that text, the rest of it to read, and the bytes of a BOM before the text that jq's
+/// first read of it held ([`Seam::lead`], #7569).
+type WindowedLazySource = (String, Vec<(usize, usize)>, LazyRest, usize);
 
 /// The read of a stream the lazy route reads a window at a time, for [`get_inputs`] to hand over:
 /// `sources` deferred in order, each with the text read of it so far, the documents of its first chunk
@@ -14785,18 +15205,19 @@ fn defer_windowed_lazy_sources(
         unknown: true,
     });
     let last_source = locations.last_src();
-    for (src, (text, spans, rest)) in sources.into_iter().enumerate() {
+    for (src, (text, spans, rest, lead)) in sources.into_iter().enumerate() {
+        let seam = Seam { lead, ..Seam::NONE };
         let more = LazyMore {
             scanned_to: spans.last().map_or(0, |&(_, end)| end),
             chunks: usize::from(!spans.is_empty()),
-            seams: vec![Seam::NONE],
+            seams: vec![seam.clone()],
             last_source,
             lossy: None,
             last_span: None,
             recorded_tail: None,
             rest: Some(rest),
         };
-        defer_lazy_start(std::rc::Rc::new(text), spans, src, Seam::NONE, Some(more));
+        defer_lazy_start(std::rc::Rc::new(text), spans, src, seam, Some(more));
     }
     mark_lazy_stream_end(true);
     (Vec::new(), locations, None, Vec::new())
@@ -14810,6 +15231,8 @@ enum LoneStart {
         text: String,
         spans: Vec<(usize, usize)>,
         rest: LazyRest,
+        /// The BOM before `text`, which jq's first read held (#7569).
+        lead: usize,
     },
     /// Every byte of the source, read for the route that reads it whole.
     Read(Vec<u8>),
@@ -14840,9 +15263,34 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     // doubling as they are (a 2.5 MiB buffer copied out of a 1.25 MiB one at the peak); room not
     // written to is not memory the run holds.
     let room = front + 2 * lazy_window_bytes();
-    // A regular file's length, which a read whole of it is sized for; `None` for standard input.
+    // A regular file's length, which a read whole of it is sized for; `None` for standard input and for
+    // a pipe named on the command line (#7478), which are read as a stream.
+    let dash = files.first().is_some_and(|path| is_stdin_dash(path));
     let (mut reader, len): (Box<dyn std::io::Read>, Option<usize>) = match files.first() {
-        None => {
+        // #7478: `-` is standard input, read below as an unnamed one is (named `<stdin>`), unless a
+        // route before has read it whole already.
+        Some(_) if dash && DASH_STDIN.with(|cache| cache.borrow().is_some()) => {
+            return Ok(LoneStart::Read(dash_stdin_bytes()?)); // patchcov: coverage tolerate-line reason="unreachable today: no route before this one reads a lone `-`; kept so a cached read is never read again"
+        }
+        Some(path) if !dash => {
+            let Ok(file) = std::fs::File::open(path) else {
+                return Ok(LoneStart::Declined);
+            };
+            // A file the front holds whole gains nothing, and a directory keeps its route, which
+            // reports it. #7478: a FIFO, a socket or a device (`<(cmd)`, `/dev/stdin` on a pipe) gives
+            // its bytes once, so it is read here as standard input is, from the open just made, and
+            // never turned back once read: the route that reads it whole read it to its end before the
+            // program started, which never ends over an endless producer.
+            match file
+                .metadata()
+                .map(|meta| (meta.is_file(), meta.is_dir(), usize::try_from(meta.len())))
+            {
+                Ok((true, _, Ok(len))) if len > front => (Box::new(file), Some(len)),
+                Ok((false, false, _)) => (Box::new(file), None),
+                _ => return Ok(LoneStart::Declined),
+            }
+        }
+        _ => {
             let pushed_back = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take());
             // #7126: standard input that cannot be read is empty, and ends the run with exit 2.
             if crate::cli::stdin_access::unreadable() {
@@ -14853,28 +15301,18 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                 .chain(super::stdin_offset::Stdin);
             (Box::new(stdin), None)
         }
-        Some(path) => {
-            let Ok(file) = std::fs::File::open(path) else {
-                return Ok(LoneStart::Declined);
-            };
-            // A file the front holds whole gains nothing; a FIFO or a directory keeps its route.
-            match file
-                .metadata()
-                .map(|meta| (meta.is_file(), usize::try_from(meta.len())))
-            {
-                Ok((true, Ok(len))) if len > front => (Box::new(file), Some(len)),
-                _ => return Ok(LoneStart::Declined),
-            }
-        }
     };
-    let from_stdin = files.is_empty();
+    let from_stdin = files.is_empty() || dash;
+    // Standard input or a named stream: its length is not known, and what is read of it is not read
+    // again, so a read past the front is never turned down.
+    let streamed = len.is_none();
     let mut bytes = Vec::with_capacity(len.map_or(room, |len| len.min(room)));
     // A file longer than the front is known to be, so its first chunk is looked for in the first
     // [`LAZY_START_BYTES`] of it and the front is read only when that holds no whole chunk (#7264):
     // reading 256 KiB first was a tenth of `-n 'first(inputs)|.id'`'s time. Standard input may end
     // anywhere, and that it holds a front's worth is how it is told from a short source, so it reads
     // the front at once.
-    let mut want = if from_stdin {
+    let mut want = if streamed {
         front
     } else {
         front.min(LAZY_START_BYTES)
@@ -14890,6 +15328,11 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             return if from_stdin {
                 note_stdin_read_failed();
                 Ok(LoneStart::Read(bytes))
+            } else if streamed {
+                // patchcov: coverage tolerate reason="untestable: a read that fails after the pipe opened"
+                // A named stream cannot be read again: what it gave is the stream.
+                Ok(LoneStart::Read(bytes))
+                // patchcov: coverage end
             } else {
                 // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
                 Ok(LoneStart::Declined)
@@ -14952,6 +15395,7 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             Ok(text) => {
                 return Ok(LoneStart::Lazy {
                     text,
+                    lead: bom,
                     spans: chunk.spans,
                     rest: LazyRest {
                         windows: {
@@ -15005,6 +15449,8 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             note_stdin_read_failed();
             Ok(LoneStart::Read(bytes))
         }
+        // A named stream cannot be read again (#7478).
+        Err(_) if streamed => Ok(LoneStart::Read(bytes)),
         Err(_) => Ok(LoneStart::Declined),
         // patchcov: coverage end
     }
@@ -15210,17 +15656,37 @@ fn slide_lazy_window(
     }
     #[cfg(test)]
     LAZY_WINDOWS_READ.with(|n| n.set((n.get().0, n.get().1 + drop)));
+    // #7480: the bytes an earlier file's cut document moved onto the front go with the first drop (the
+    // counter's line start is never before them); their line breaks are jq's input's, not the file's.
+    // The counter starts its line at their end, which is no line start in jq's input (the cut document
+    // goes on there), so the text waits for a line break of the file's own: a window starts at a line
+    // start, which is what `DroppedText` counts it from.
+    if lazy.seam.base > 0 && drop <= lazy.seam.base {
+        return;
+    }
+    let moved = lazy.seam.base.min(drop);
     // Every line break before the counter's line start is before its position, and counted.
     lazy.dropped = DroppedText {
         bytes: lazy.dropped.bytes + drop,
         newlines: place.newlines_before(),
+        moved_newlines: lazy.dropped.moved_newlines
+            + count_newlines(&lazy.text.as_bytes()[..moved]),
     };
     std::rc::Rc::make_mut(&mut lazy.text).drain(..drop);
     more.scanned_to -= drop;
     more.last_span = more
         .last_span
         .map(|(first, end)| (first, end.saturating_sub(drop)));
-    *lines = lines.take().map(|place| place.after_dropping(drop));
+    lazy.seam = std::mem::take(&mut lazy.seam).after_front_dropped(drop);
+    more.seams = std::mem::take(&mut more.seams)
+        .into_iter()
+        .map(|seam| seam.after_front_dropped(drop))
+        .collect();
+    *lines = lines.take().map(|place| {
+        let mut place = place.after_dropping(drop);
+        place.seam = std::mem::take(&mut place.seam).after_front_dropped(drop);
+        place
+    });
 }
 
 /// The first chunk of a lazy stream covers about this much text, and each chunk after it twice the
@@ -15610,11 +16076,22 @@ fn lazy_scan_on(
         && lazy.spans.last().is_some_and(|&(start, end)| {
             end == lazy.text.len() && !matches!(lazy.text.as_bytes()[start], b'{' | b'[' | b'"')
         });
-    if bare_end {
-        lazy.spans.pop();
-    }
+    let bare = if bare_end { lazy.spans.pop() } else { None };
     let end_of_last = lazy.spans.last().map_or(more.scanned_to, |&(_, end)| end);
     if !later.is_empty() && (chunk.end == ChunkEnd::Fault || bare_end) {
+        // #7480: a document this file ends inside, or a number or literal it ends in, goes on in the
+        // next file, which reads on from it lazily: the stitch the eager reader would make, made here
+        // for this file's end alone. Only a fault no later byte can mend hands the stream over.
+        let cut = match bare {
+            Some((start, _)) => Some((start, Vec::new())),
+            None if chunk.open_tail => cut_document_start(&lazy.text, end_of_last),
+            None => None,
+        };
+        if let Some((start, before)) = cut.filter(|_| !lazy.stitched && more.lossy.is_none()) {
+            lazy.spans.extend(before);
+            carry_cut_document(lazy, start, &mut later[0], lines, more.last_source);
+            return false;
+        }
         let (handed, end) = hand_off_later_sources(lazy, end_of_last, later, more.last_source);
         *tail = handed;
         *exhausted = end;
@@ -15693,6 +16170,91 @@ fn lazy_scan_on(
     false
 }
 
+/// Where the document a file's text ends inside starts, for a chunk that ended at a fault that is only
+/// that (`LazyChunk::open_tail`) after its documents up to `from`: the container or string the text
+/// does not finish, as [`open_tail_start`] finds it for the stitch, and the documents between `from` and
+/// it (a number or literal the scan left before the fault, which the next byte, the cut one's opener,
+/// ends). `None` when the text from `from` on is not that.
+fn cut_document_start(text: &str, from: usize) -> Option<(usize, Vec<(usize, usize)>)> {
+    let bytes = text.as_bytes();
+    let past_space = |at: usize| {
+        bytes[at.min(bytes.len())..]
+            .iter()
+            .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+            .map_or(bytes.len(), |offset| at + offset)
+    };
+    let mut start = past_space(from);
+    if !matches!(bytes.get(start), Some(b'{' | b'[' | b'"')) {
+        start = past_space(token_end(bytes, start));
+    }
+    if !matches!(bytes.get(start), Some(b'{' | b'[' | b'"')) || !token_runs_to_end(&bytes[start..])
+    {
+        return None; // patchcov: coverage tolerate-line reason="unreachable: an open tail is the splitter's fault at an opener the text does not close, after at most the one number or literal the scan gives back"
+    }
+    if past_space(from) == start {
+        return Some((start, Vec::new()));
+    }
+    let gap = lazy_json_scan_chunk(&text[..start], from, usize::MAX);
+    (gap.end == ChunkEnd::Done).then_some((start, gap.spans))
+}
+
+/// Moves the document `lazy`'s text ends inside, from byte `start`, onto the front of `next`, the file
+/// after it (#7480), as [`stitch_json_file_seams`] moves it for the files read whole: `lazy` is then
+/// read to `start` and done, and `next` reads on from the moved bytes, its seam saying they are not its
+/// lines. The producer's line count of `lazy` (`lines`) learns the bytes moved off its end, which its
+/// last reads run on into. `next` has read nothing yet: a file read a window at a time holds no text,
+/// one read whole its own.
+///
+/// The eager reader took the rest of the stream here before, and turned every document left into a
+/// value before the first was read: about ten times the text (995 MiB for 100 MB in three files).
+fn carry_cut_document(
+    lazy: &mut LazyJsonInputs,
+    start: usize,
+    next: &mut LazyJsonInputs,
+    lines: &mut Option<LinePlace>,
+    last_source: u32,
+) {
+    debug_assert!(
+        next.spans.is_empty() && next.seam == Seam::NONE && !next.stitched,
+        "the next file has read nothing"
+    );
+    let mut head = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
+    let tail = head.split_off(start);
+    let mut stitcher = SeamStitcher::default();
+    stitcher.move_tail(
+        lazy.source as usize,
+        &mut lazy.seam,
+        start,
+        tail,
+        &head,
+        true,
+    );
+    *std::rc::Rc::make_mut(&mut lazy.text) = stitched_text(head);
+    if let Some(place) = lines.as_mut() {
+        place.seam.moved_len = lazy.seam.moved_len;
+        place.seam.moved_newline = lazy.seam.moved_newline;
+        // The next line break it found may be among the bytes moved off: it is found again.
+        place.next_newline = None;
+    }
+    let carry = stitched_text(stitcher.take_carry(&mut next.seam));
+    // The line breaks a window of `lazy` dropped are ahead of its share.
+    next.seam = std::mem::take(&mut next.seam)
+        .with_lines_before_source(lazy.source as usize, lazy.dropped.newlines);
+    std::rc::Rc::make_mut(&mut next.text).insert_str(0, &carry);
+    // A file of white space, which the route that reads them whole does not scan, scans the moved bytes.
+    let more = next.more.get_or_insert_with(|| LazyMore {
+        scanned_to: 0,
+        chunks: 0,
+        seams: Vec::new(),
+        last_source,
+        lossy: None,
+        last_span: None,
+        recorded_tail: None,
+        rest: None,
+    });
+    more.seams = vec![next.seam.clone()];
+}
+
 /// The eager reader of a stream of several files from byte `from` of `lazy` on (#6455), for a
 /// fault there or a number or literal it ends in: what [`get_inputs`]' loop reads of these files
 /// for a stream it reads eagerly, queued for `input`, and the end of the stream (named on
@@ -15749,7 +16311,16 @@ fn hand_off_later_sources(
             .take(before)
             .chain(std::mem::take(&mut raws))
             .collect();
-        let mut seams = stitch_json_file_seams(all.iter_mut(), true, false);
+        // #7480: `lazy` may start with a document an earlier file ended inside, carried onto it by the
+        // producer; the stitch goes on from that, and records what it moves off `lazy`'s end itself.
+        let carried = Seam {
+            moved_len: 0,
+            moved_newline: None,
+            ..lazy.seam.clone()
+        };
+        let mut seeds = vec![Seam::NONE; before];
+        seeds.push(carried);
+        let mut seams = stitch_json_file_seams_onto(all.iter_mut(), true, false, seeds);
         raws = all.split_off(before);
         // The line breaks ahead of what the stitch moved off `lazy` are counted from its text's front,
         // past what its windows dropped.
@@ -17406,28 +17977,25 @@ fn slurp_fault(
 /// that was not slurped names.
 fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
     let mut unreadable = false;
-    let mut at_front = true;
-    let chunks = files.iter().map_while(|path| {
-        match if is_stdin_dash(path) {
+    // The bytes as read, not as substituted: jq's parser counts those (#5964).
+    let mut raws = files.iter().map_while(|path| {
+        let raw = if is_stdin_dash(path) {
             None
         } else {
             read_again(path)
-        } {
-            Some(mut raw) => {
-                // The bytes as read, not as substituted: jq's parser counts those (#5964).
-                if at_front && !raw.is_empty() {
-                    at_front = false;
-                    raw.drain(..crate::cli::front_matter::leading_bom_len(&raw));
-                }
-                Some(raw)
-            }
-            None => {
-                unreadable = true;
-                None
-            }
-        }
+        };
+        unreadable |= raw.is_none();
+        raw
     });
-    let fault = jq::jq_stream_fault(chunks, 1, 0);
+    // The mark at the front may be cut across the first files with bytes (#7566): the files that
+    // hold the stream's first three bytes settle it.
+    let mut front: Vec<Vec<u8>> = Vec::new();
+    while front.iter().map(Vec::len).sum::<usize>() < crate::cli::front_matter::UTF8_BOM.len() {
+        let Some(raw) = raws.next() else { break };
+        front.push(raw);
+    }
+    strip_leading_json_bom(front.iter_mut());
+    let fault = jq::jq_stream_fault(front.into_iter().chain(raws), 1, 0);
     (!unreadable).then_some(fault).flatten()
 }
 
@@ -18591,9 +19159,12 @@ fn owned_route_for(events: bool, raw_line: bool, where_answered: bool) -> OwnedR
 /// evaluator answers (while `door` has not seen enough declines to close, [`DoorMemory`]), and
 /// anything else reads its own index.
 fn queue_record_route(args: &JqCommand, door: &DoorMemory) -> OwnedRoute {
+    // #7567: a `--stream-errors` event is one too (it takes the slot a `-R` line takes in the
+    // document loop, which is `false` here). Written out and indexed, each event cost its path's
+    // length, so the closes of a document nested `n` deep cost `O(n^2)`.
     owned_route_for(
         args.stream,
-        false,
+        args.stream_errors,
         args.seq && !args.slurp && door.is_open(),
     )
 }
@@ -23020,6 +23591,106 @@ mod tests {
         }
     }
 
+    /// #7480: a document a file ends inside (a container, a string, a number one file ends and the next
+    /// goes on with, a file that is all inside one) is carried onto the front of the next file, and the
+    /// run reads on lazily: nothing is handed to the eager reader, which turned every later document into
+    /// a value up front, and several files read in windows hold a window, not a file. Files read whole
+    /// (shorter than the windowed route's least) carry it on as well. Each run hands out what the eager
+    /// route does. A fault in the cut document still hands the stream over, from the next file. The pin
+    /// fails with the hand-off at every such cut.
+    #[test]
+    fn a_document_cut_across_files_is_carried_on_lazily_7480() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let docs: Vec<u8> = (0..20_000)
+            .flat_map(|n| {
+                if n % 9 == 4 {
+                    format!("{n}\n").into_bytes()
+                } else {
+                    format!("{{\"n\":{n},\n\"pad\":\"xxxxxxxxxxxxxxxxxxxxxx\"}}\n").into_bytes()
+                }
+            })
+            .collect();
+        assert!(docs.len() > 10 * (64 << 10), "{} bytes", docs.len());
+        let third = docs.len() / 3;
+        // A number the first file ends inside, and the byte after an object's opener.
+        let number = docs.windows(6).position(|w| w == b"\n6664\n").unwrap() + 3;
+        let opener = third + docs[third..].iter().position(|&b| b == b'{').unwrap() + 1;
+        let cut = |at: &[usize]| -> Vec<&[u8]> {
+            let mut pieces = Vec::new();
+            let mut prev = 0;
+            for &at in at {
+                pieces.push(&docs[prev..at]);
+                prev = at;
+            }
+            pieces.push(&docs[prev..]);
+            pieces
+        };
+        let shapes: Vec<Vec<&[u8]>> = vec![
+            cut(&[third + 7, 2 * third + 13]),
+            cut(&[third + 1, third + 4, third + 9]),
+            cut(&[number, 2 * third]),
+            cut(&[third + 20, third + 20, 2 * third]),
+            {
+                let mut files = cut(&[opener]);
+                files.insert(1, b"\n \n");
+                files
+            },
+        ];
+        for files in &shapes {
+            let whole = observe_inputs(dir.path(), files, true, None).0;
+            for windowed in [true, false] {
+                if windowed {
+                    LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(Some(0)));
+                    LAZY_WINDOW_OVERRIDE.with(|c| c.set(Some(64 << 10)));
+                }
+                let (handed, started) = (
+                    HAND_OFFS.with(std::cell::Cell::get),
+                    SEVERAL_WINDOWED_STARTS.with(std::cell::Cell::get),
+                );
+                LAZY_TEXT_PEAK.with(|n| n.set(0));
+                let seen = observe_inputs(dir.path(), files, false, None).0;
+                LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(None));
+                LAZY_WINDOW_OVERRIDE.with(|c| c.set(None));
+                assert_eq!(seen, whole, "windowed {windowed}");
+                assert_eq!(
+                    SEVERAL_WINDOWED_STARTS.with(std::cell::Cell::get),
+                    started + usize::from(windowed)
+                );
+                assert_eq!(
+                    HAND_OFFS.with(std::cell::Cell::get),
+                    handed,
+                    "a hand-off, windowed {windowed}"
+                );
+                if windowed {
+                    let peak = LAZY_TEXT_PEAK.with(std::cell::Cell::get);
+                    // A few 64 KiB windows, where a hand-off held every file after the cut.
+                    assert!(peak < 5 * (64 << 10), "peak {peak}");
+                }
+            }
+        }
+        // A fault in the cut document, met in the next file: that file hands the rest over.
+        let at = opener - 1;
+        let broken = [&docs[..at], b"{\"n\":}", &docs[at..]].concat();
+        let files: [&[u8]; 3] = [
+            &broken[..at + 4],
+            &broken[at + 4..2 * third],
+            &broken[2 * third..],
+        ];
+        let whole = observe_inputs(dir.path(), &files, true, None).0;
+        LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(Some(0)));
+        LAZY_WINDOW_OVERRIDE.with(|c| c.set(Some(64 << 10)));
+        let handed = HAND_OFFS.with(std::cell::Cell::get);
+        let seen = observe_inputs(dir.path(), &files, false, None).0;
+        LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(None));
+        LAZY_WINDOW_OVERRIDE.with(|c| c.set(None));
+        assert_eq!(seen, whole);
+        assert_eq!(HAND_OFFS.with(std::cell::Cell::get), handed + 1);
+        assert!(
+            seen.iter().any(|item| item.starts_with("error")),
+            "{seen:?}"
+        );
+    }
+
     /// #7024: a first file with a document that the route reading the files whole stitches onto the next
     /// before it takes them lazily (its first chunk ends in a fault, a document it does not finish, or a
     /// number or literal the next file may go on with) is left to that route, which then stays lazy:
@@ -23212,14 +23883,16 @@ mod tests {
         assert!(check(b"\xef\xbb\xbf \n", 3).blank);
     }
 
-    /// #6920: the gate judges a path by `stat` and opens nothing it declines. A named pipe (what
-    /// `<(cmd)` is on some systems) pairs a reader with its writer when it is opened, and a handle opened
-    /// and dropped on the way to the route that reads it would take the writer's bytes with it.
+    /// #6920, #7478: a named pipe (what `<(cmd)` is on some systems) pairs a reader with its writer when it
+    /// is opened, so a handle opened and dropped on the way to the route that reads it would take the
+    /// writer's bytes with it. Since #7478 the gate reads such a pipe as it reads one on standard input: a
+    /// pipe that ends before it holds two windows hands what it read to the route that reads it whole
+    /// ([`NAMED_PUSHBACK`]), which takes it for the same file list, and nothing is lost. A regular file
+    /// too small for the route is judged by `stat` and not opened.
     #[cfg(unix)]
     #[test]
-    fn the_gate_does_not_open_a_named_pipe_6920() {
+    fn the_gate_hands_a_short_named_pipe_on_whole_7478() {
         use clap::Parser;
-        use std::sync::mpsc;
         let dir = tempfile::tempdir().expect("tempdir");
         let fifo = dir.path().join("pipe");
         let made = std::process::Command::new("mkfifo")
@@ -23229,23 +23902,17 @@ mod tests {
         assert!(made.success());
         let writer_path = fifo.clone();
         let writer = std::thread::spawn(move || std::fs::write(&writer_path, b"{\"a\":1}\n"));
-        // Let the writer reach its open, which blocks until a reader opens the pipe.
-        std::thread::sleep(std::time::Duration::from_millis(200));
         let cmd =
             JqCommand::try_parse_from(["jq", ".", fifo.to_str().expect("utf-8 path")]).unwrap();
         assert!(windowed_plain_file(&cmd).is_none());
-        // The writer is still waiting for its reader: the first open after the gate gets its bytes.
-        let (sender, receiver) = mpsc::channel();
-        let reader_path = fifo.clone();
-        std::thread::spawn(move || {
-            let _ = sender.send(std::fs::read(&reader_path));
-        });
-        let got = receiver
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("the writer's bytes were not taken by the gate")
-            .expect("reads");
-        assert_eq!(got, b"{\"a\":1}\n");
         writer.join().expect("writer").expect("written");
+        let (files, raws, failures) =
+            take_named_pushback(&get_input_files(&cmd)).expect("the pipe's bytes are handed on");
+        assert_eq!(files, get_input_files(&cmd));
+        assert_eq!(raws, vec![b"{\"a\":1}\n".to_vec()]);
+        assert!(failures.is_empty());
+        // Taken once.
+        assert!(take_named_pushback(&files).is_none());
     }
 
     /// #6920: the plain route reads a window at a time only for one regular file big enough to be
@@ -30113,6 +30780,9 @@ mod tests {
             // A `--stream` event is read where it is, closed door or not.
             (&["--stream", ".[1]"], OwnedRoute::Always),
             (&["--seq", "--stream", ".[1]"], OwnedRoute::Always),
+            // #7567: so is a `--stream-errors` event.
+            (&["--stream-errors", ".[1]"], OwnedRoute::Always),
+            (&["--seq", "--stream-errors", ".[1]"], OwnedRoute::Always),
         ];
         for (argv, want) in rows {
             assert!(route(argv, &open) == want, "{argv:?}, door open");
