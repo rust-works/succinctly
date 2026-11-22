@@ -107,6 +107,17 @@ fn null_input_reads_a_terminal_on_stdin_as_jq_does_7742() {
         ),
         // A line with no newline is handed on by a first `^D`, and the stream ends at a second.
         (&["-n", "-c", "input"][..], "1", 2, ok("1\n")),
+        // #7738: a line that does not parse, or is not UTF-8, is reported as it is typed.
+        (
+            &["-n", "-c", "input"][..],
+            "tru\n",
+            0,
+            (
+                String::new(),
+                "jq: error (at <stdin>:1): Invalid literal at line 2, column 0\n".into(),
+                5,
+            ),
+        ),
         // A BOM at the front is skipped, as jq skips it.
         (&["-n", "-c", "input"][..], "\u{feff}1\n", 0, ok("1\n")),
         // Nothing typed: the stream ends at the first `^D`.
@@ -170,18 +181,11 @@ fn null_input_reads_a_named_terminal_a_line_at_a_time_7742() {
 /// What is left of #7742, recorded in `docs/compliance/jq/limitations.md`: `-R -n` and `--stream -n`
 /// read the terminal, with jq's answers, but not a line at a time: `-R` waits for its `^D` (or a window of
 /// typing) before the program runs, and `--stream` for 3 bytes, where jq answers the line `1` as it is
-/// typed. And a line the lazy route cannot parse (a fault, a byte that is not UTF-8) is reported after
-/// the `^D`, with jq's message, where jq reports it as the line is typed. Each row checks the run is
-/// still waiting before its `^D`: a fix makes that fail, and the record is then to be updated.
+/// typed. Each row checks the run is still waiting before its `^D`: a fix makes that fail, and the
+/// record is then to be updated. (A line that does not parse, or is not UTF-8, waited for the `^D` too
+/// until #7738.)
 #[test]
 fn what_waits_for_more_than_a_line_on_a_terminal_7742() {
-    let fault = |message: &str| {
-        (
-            String::new(),
-            format!("jq: error (at <stdin>:1): {message}\n"),
-            5,
-        )
-    };
     for (args, input, want) in [
         (
             &["-R", "-n", "-c", "input"][..],
@@ -192,16 +196,6 @@ fn what_waits_for_more_than_a_line_on_a_terminal_7742() {
             &["--stream", "-n", "-c", "input"][..],
             &b"1\n"[..],
             ok("[[],1]\n"),
-        ),
-        (
-            &["-n", "-c", "input"][..],
-            &b"tru\n"[..],
-            fault("Invalid literal at line 2, column 0"),
-        ),
-        (
-            &["-n", "-c", "input"][..],
-            &b"\xff\n"[..],
-            fault("Invalid numeric literal at line 2, column 0"),
         ),
     ] {
         assert_eq!(
