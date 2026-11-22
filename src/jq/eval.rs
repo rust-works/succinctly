@@ -38824,25 +38824,40 @@ fn is_fancy_syntax(pattern: &str) -> bool {
 #[cfg(feature = "regex")]
 fn pattern_match_lengths(pattern: &str) -> (bool, Option<usize>) {
     match crate::jq::onig_hir_parser().parse(pattern) {
-        Ok(hir) => {
-            let properties = hir.properties();
-            (
-                properties.minimum_len() == Some(0),
-                properties.maximum_len(),
-            )
-        }
+        Ok(hir) => (hir_can_match_empty(&hir), hir.properties().maximum_len()),
         Err(_) => (true, None),
     }
 }
 
+/// Whether `hir` can match the empty string somewhere (#7689). `regex-syntax` gives a node with a
+/// part that never matches no minimum length, the optional ones included: `[^\s\S]?` (the item
+/// `keep_zero_count_groups` writes for `(a){0}`) has none, though it matches empty, and so has an
+/// alternation of it with `b`. Read as "never empty", such a pattern kept the `regex` crate's route
+/// under `n`, which skips the empty match the first way gives instead of trying the later ways:
+/// `"ab" | [match("(a){0}|b"; "n")]` was `[]`, and is `[{"offset":1,...}]` in jq.
+#[cfg(feature = "regex")]
+fn hir_can_match_empty(hir: &regex_syntax::hir::Hir) -> bool {
+    use regex_syntax::hir::HirKind;
+    match hir.kind() {
+        HirKind::Empty | HirKind::Look(_) => true,
+        HirKind::Literal(_) | HirKind::Class(_) => false,
+        HirKind::Repetition(rep) => rep.min == 0 || hir_can_match_empty(&rep.sub),
+        HirKind::Capture(cap) => hir_can_match_empty(&cap.sub),
+        HirKind::Concat(items) => items.iter().all(hir_can_match_empty),
+        HirKind::Alternation(ways) => ways.iter().any(hir_can_match_empty),
+    }
+}
+
 /// Whether matches of `pattern` may differ in length. A pattern the `regex` crate cannot parse
-/// (lookaround, a backreference) is taken to.
+/// (lookaround, a backreference) is taken to, and so is one with a part that never matches, to
+/// which `regex-syntax` gives no length at all (#7689, see [`hir_can_match_empty`]).
 #[cfg(feature = "regex")]
 fn pattern_is_variable_length(pattern: &str) -> bool {
     match crate::jq::onig_hir_parser().parse(pattern) {
         Ok(hir) => {
             let properties = hir.properties();
-            properties.minimum_len() != properties.maximum_len()
+            properties.minimum_len().is_none()
+                || properties.minimum_len() != properties.maximum_len()
         }
         Err(_) => true,
     }
@@ -38924,8 +38939,13 @@ fn build_fancy_regex_at<S: EvalSemantics>(
         Some(close) => format!("\\G(?:{pattern}{close})"),
         None => pattern,
     };
+    // #7689: the optimizer merges a repeated group's loop into one span, which these searches
+    // would otherwise report as jq does (see `fancy_has_merged_group_loop`).
+    let keep_tree =
+        (modes.longest || modes.not_empty) && fancy_has_merged_group_loop(&expr, !modes.longest);
     fancy_regex::RegexBuilder::new(&pattern)
         .oniguruma_mode(true)
+        .optimize(!keep_tree)
         .leftmost_longest(modes.longest)
         .find_not_empty(modes.not_empty)
         .backtrack_limit(FANCY_BACKTRACK_LIMIT)
@@ -39403,6 +39423,45 @@ fn group_holds_g(group: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// Whether `expr` repeats a capture group whose body is a `?` or `*` repeat (`(a?)+`, `(a*)*`,
+/// `(?:(a*)?)+`), which the optimizer of `fancy-regex` 0.20 merges with the repeat around it
+/// (`optimize_nested_repeats`: `(a?)+` is compiled as `(a*)`, `(a*)*` as `(a*)?`). The group then
+/// spans every iteration instead of the last one, and the empty iteration that ends Oniguruma's
+/// loop is gone: `"aaa" | match("(a?)+"; "l").captures[0]` was at `[0,3]`, a span `(a?)` cannot
+/// match, where jq has `[3,0]` (#7689). The `l` and `n` searches build such a pattern with the
+/// optimizer off, and their engine then keeps that last, empty iteration as jq does. A `+` body
+/// (`(a+)+`) is merged too, and left so: its single greedy iteration is the whole span. A `*` body
+/// counts only when `star`, which the `l` search does not ask for: unmerged, its longest-match
+/// search tries every way to split the run, and `"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!" |
+/// test("(a*)*b"; "l")` ran out of budget where the merged loop answers `false` at once.
+#[cfg(feature = "regex")]
+fn fancy_has_merged_group_loop(expr: &fancy_regex::Expr, star: bool) -> bool {
+    use fancy_regex::Expr;
+    let merged = |e: &Expr| {
+        let Expr::Repeat { child, .. } = e else {
+            return false;
+        };
+        let mut item: &Expr = child;
+        let mut in_group = false;
+        loop {
+            match item {
+                Expr::Group(inner) => {
+                    in_group = true;
+                    item = inner;
+                }
+                Expr::Repeat { child, lo, hi, .. } => {
+                    if in_group && *lo == 0 && (*hi == 1 || (star && *hi == usize::MAX)) {
+                        return true;
+                    }
+                    item = child;
+                }
+                _ => return false,
+            }
+        }
+    };
+    merged(expr) || expr.has_descendant(merged)
 }
 
 /// Whether `expr` holds two greedy `X+` repeats of the same expression with exactly one repeat that
@@ -150003,6 +150062,42 @@ mod tests {
             Some(r"[^\x{0}-\x{10FFFF}]")
         );
         assert_eq!(spelled_complement(r"\p{NoSuchName}"), None);
+    }
+
+    /// #7689: a part that never matches leaves `regex-syntax` without a minimum length, which is
+    /// not "never empty"; and which repeated groups the `l` and `n` searches build unmerged.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn test_empty_reach_and_merged_group_loops_7689() {
+        for (pattern, can_be_empty) in [
+            (r"[^\s\S]?|b", true),
+            (r"(?:(a)[^\s\S])?|b", true),
+            (r"x?|b", true),
+            (r"[^\s\S]|b", false),
+            (r"a[^\s\S]?", false),
+            (r"\b", true),
+        ] {
+            assert_eq!(pattern_match_lengths(pattern).0, can_be_empty, "{pattern}");
+        }
+        assert!(pattern_is_variable_length(r"(?:(a)[^\s\S])?|b"));
+        assert!(!pattern_is_variable_length("ab"));
+        let tree = |pattern: &str| parse_fancy_tree(pattern.into()).map(|(expr, _)| expr);
+        for (pattern, star, merged) in [
+            ("(a?)+", false, true),
+            ("(?:(a*)?)+", false, false),
+            ("(?:(a*)?)+", true, true),
+            ("(a*)*", true, true),
+            ("(a+)+", true, false),
+            ("(?:(a)?)+", true, false),
+            ("(a)+", true, false),
+        ] {
+            let expr = tree(pattern).expect(pattern);
+            assert_eq!(
+                fancy_has_merged_group_loop(&expr, star),
+                merged,
+                "{pattern} {star}"
+            );
+        }
     }
 
     #[cfg(feature = "regex")]

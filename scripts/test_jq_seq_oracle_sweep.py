@@ -15,6 +15,7 @@ Imported via `importlib` rather than `import`: the script's filename has hyphens
 """
 
 import importlib.util
+import json
 import pathlib
 import unittest
 
@@ -96,6 +97,50 @@ class UnwrittenTokenbufTests(unittest.TestCase):
         # `main()` calls `artifact()` only without `--expect-artifacts`; the stream still runs there.
         self.assertTrue(sweep.artifact(b"\x1en\n"))
         self.assertFalse(sweep.artifact(b"\x1enan n\n"))
+
+
+class ProbeInputsTests(unittest.TestCase):
+    """#7391: `comparison/jq/probes/*.tsv` feeds the same jq 1.7.1 parser, so a probe whose stdin has a bare
+    `n` before any token has written `tokenbuf[1]` makes the reference answer from uninitialised heap: the
+    `man-streaming-errors-example` probe (`["a",n]`) failed `Ledger drift` on one run in several and passed
+    on the re-run. A probe may name a bare `n` only after a token that settled index 1, and the one
+    shape that `reads_unwritten_tokenbuf` skips on purpose, a string of two or more bytes before it
+    (`"iu" n`, whose second byte is a `u` that 1.7.1 reads deterministically), is listed here."""
+
+    # The probes that put a `u` at index 1 on purpose (#7525): 1.7.1 says "Invalid literal", always.
+    DELIBERATE = {"stream-bare-n-after-u", "stream-errors-bare-n-after-u", "inputs-bare-n-after-u"}
+
+    @staticmethod
+    def parsed_by_jq(args):
+        # `-R` reads lines, which no JSON parser sees.
+        return not any(
+            isinstance(a, str) and (a == "--raw-input" or (a.startswith("-") and not a.startswith("--") and "R" in a))
+            for a in args
+        )
+
+    def exposed_probes(self):
+        found = set()
+        for path in sorted((pathlib.Path(__file__).parent.parent / "comparison" / "jq" / "probes").glob("*.tsv")):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                fields = line.split("\t")
+                if line.startswith("#") or len(fields) < 4 or fields[3] == "-":
+                    continue
+                try:
+                    args, stdin = json.loads(fields[2]), json.loads(fields[3])
+                except ValueError:
+                    continue
+                if isinstance(stdin, str) and self.parsed_by_jq(args):
+                    # An RS first: it puts the stream's parser at its start, as a stream's first byte does.
+                    if sweep.reads_unwritten_tokenbuf(b"\x1e" + stdin.encode("utf-8")):
+                        found.add(fields[0])
+        return found
+
+    def test_no_probe_reads_jqs_uninitialised_byte_but_the_deliberate_ones(self):
+        self.assertEqual(self.exposed_probes(), self.DELIBERATE)
+
+    def test_the_manual_example_probe_is_settled_by_an_earlier_token(self):
+        self.assertTrue(sweep.reads_unwritten_tokenbuf(b'\x1e["a",n]'))
+        self.assertFalse(sweep.reads_unwritten_tokenbuf(b'\x1e["a",1,n]'))
 
 
 if __name__ == "__main__":

@@ -685,6 +685,20 @@ anything else at any depth. The `setpath_*` probes added alongside it pin the re
 surface — wrong-key-type on a real container, out-of-bounds negative and NaN indices, and a
 non-array path argument.
 
+## A write past the end of a slice pads with `null`; jq can show the elements the slice dropped (#7574)
+
+A slice in jq is a view: `jv_array_slice` keeps the parent's buffer and moves an offset and a length over it.
+A write past the view's end (`jvp_array_write`, the same in 1.7.1 and 1.8.2) reuses that buffer in place when nothing else holds it and the index fits its allocated capacity, and then pads with `null` only from the end of the *buffer's* elements, so the parent's elements after the slice come back.
+`[1,2,3,4,5,6] | .[:1] | .[3] = 9` over parsed input is `[1,2,3,9]` in jq 1.7.1 and 1.8.2, and `[1,null,null,9]` here.
+The same holds for `setpath`, `|=`, `+=` and `//=` at such an index, for a middle slice (`.[1:2] | .[3] = 9` is `[2,3,4,9]` in jq), for a slice of a slice and for a second write after the first (`.[:1] | .[3] = 9 | .[4] = 8` is `[1,2,3,9,8]` in jq), and the later reads see the same elements (`| .[1]` is `2`, `| add` is `15`).
+jq's answer is not a function of the value.
+It depends on the buffer's capacity, which is 16 for an array built element by element and grows by half each time it fills (`.[:1] | .[15] = 9` shows the parent's elements on a parsed six-element array, `.[:1] | .[16] = 9` pads), and on whether anything still holds the parent at the write: the same array as a program literal (`jq -n '[1,2,3,4,5,6] | .[:1] | .[3] = 9'`), behind `. as $x |`, or used again later (`(.[:1] | .[3] = 9), .`) gives the padded `[1,null,null,9]`.
+`succinctly jq` gives the padded answer everywhere, which is jq's answer whenever the parent is shared, and is what the slice holds: the output never carries an element the program cut away.
+That is ADR-0018's "matching would corrupt data" exception, and reproducing it is also out of reach: it would need jq's allocation capacities for every array and the reference counts of jq's bytecode interpreter at each write (its forks, bindings and stack slots), neither of which this evaluator has, and every slice would have to keep its parent's whole buffer alive.
+Writes inside the slice, `+`, `del`, slice assignment (`.[:1] | .[3:] = [9]`) and a slice of an empty range agree with jq, which builds a new array or writes within the view there.
+`succinctly yq` is not affected: yq pads with `null` (`[1,null,null,9]`), and so does `succinctly yq`.
+Pinned by `tests/jq_cli/i7574.rs`.
+
 ## Dynamic path targets run on the path-mode interpreter (#5223)
 
 Since [#5223](https://github.com/rust-works/succinctly/issues/5223) ([ADR-0026](../../adrs/adr-0026.md)), a jq-mode program whose path target is more than navigation runs whole through the path-mode interpreter (`src/jq/path_mode.rs`), which carries jq 1.7.1's path register `(path, value)` with every output and checks it with `jv_identical` where jq does.
@@ -708,7 +722,8 @@ The interpreter's own recorded divergences:
 
 - **A write to an unshared slice view.** jq's `jvp_array_write` writes a slice in place when nothing else holds it, so the slice keeps its offset into the original buffer.
   The interpreter's write builds a new array at offset 0.
-  The difference is observable only through jq's 65,536-element slice-copy rule: `[range(70003)] | .[60000:] | .[0] = 0 | del(.[6000:] as $x | .[6000:] | $x) | length` is `6000` here and an `Invalid path expression` in jq, whose second slice reaches offset 66,000 and is copied (`test_5118_a_written_view_answers_where_jq_refuses_5223`).
+  A write past the view's end is the other observable effect, on every route, not only this one: jq shows the parent's elements after the slice there, recorded in "A write past the end of a slice pads with `null`" above (#7574).
+  Within the view the difference is observable only through jq's 65,536-element slice-copy rule: `[range(70003)] | .[60000:] | .[0] = 0 | del(.[6000:] as $x | .[6000:] | $x) | length` is `6000` here and an `Invalid path expression` in jq, whose second slice reaches offset 66,000 and is copied (`test_5118_a_written_view_answers_where_jq_refuses_5223`).
 - **A walk jq never finishes raises the existing caps.** `null | [path(recurse(.a))] | length` and `path(recurse(.a?; true))` on `{"a":null}` never return in jq; they raise `recurse: maximum nodes exceeded` here after 2^20 nodes (fewer for a path, which costs more of the cap the longer it is, see "`recurse(f)` raises at 2^20 nodes" below), as the value walker does (the shipped path walker pruned a `null` node's children and answered `1`, #856).
   `until`/`while`, `range` (at `MAX_RANGE_TOTAL`) and `repeat` keep their caps the same way (see the sections on each below).
 - **`del(.[nan])`** loops forever in jq 1.7.1 on an array; here the NaN path names no element and the document comes back unchanged.
@@ -8220,6 +8235,16 @@ A count of zero writes only the atom under it, whose groups keep their numbers: 
 Over 37,067 generated rows (the 24,956 of #7654, #7669 and #7670, and 12,111 of every pair and 4,000 triples of 26 quantifier forms over ten atoms, eight heads, eight tails and the flags none, `g`, `n`, `x`, `l` and `gn`), the rows that differ from jq 1.7.1 went from 2,567 to 1,401, most of the rest being 1.7.1's empty captures (#7520) and the `l` flag's limits.
 Seven rows that matched only by accident now show older faults of the `n` and `l` routes, each of which a pattern without a quantifier run shows too: `"ab" | [match("(a){0}|b"; "n")]` is `[]` here, `"ba" | match("(a?)++$"; "n").captures[0].offset` is `1` (jq `2`), and `"aaa" | match("(a?)+"; "l").captures[0].length` is `3` (jq `0`).
 Pinned by `tests/jq_cli/i7682.rs` and the unit test in `src/jq/onig_quantifier.rs`.
+Since [#7689](https://github.com/rust-works/succinctly/issues/7689) the three answer as in jq: `regex-syntax` gives no minimum length to a pattern with a part that never matches (`[^\s\S]?`, which `(a){0}` is written as), so `n` took `(a){0}|b` for a pattern that cannot match empty, and `fancy-regex`'s optimizer merged `(a?)+` into `(a*)` (see "Regex flags `l` and `n`").
+#7689 also writes three more runs.
+A `{1}` marked lazy or possessive beside another quantifier is dropped with its marker: `(a){1}?++(a)` is `(a)++(a)` as in jq, where the possessive scan refused it, and `(?#c)(a){1}++a` reached the `regex` crate with its comment, which refused it.
+A count of zero after a gap, after a `{1}` or before another count is written on the atom, whose groups keep their capture entries (`(?x)(a?) {0}|b`, `(a|b){1}{0}+a`, `(a)?{0}{2}`).
+A `{1}` on a plain group of characters leaves Oniguruma's string node, the group gone, and a quantifier after it repeats the last character: `"abbbab" | [match("(?:ab){1}*"; "g") | .string]` is `["abbb","ab"]` in jq 1.7.1 and 1.8.2, and was `["ab","","","ab",""]`.
+Only a group of letters, digits and dashes is read so; one with a blank under `x` is a string node to Oniguruma too and keeps the pattern as written: `"abbbab" | [match("(?:a b){1}*"; "gx") | .string]` is `["abbb","ab"]` in jq and `["ab","","","ab",""]` here.
+The #7682 harness was not kept, so #7689 regenerated a net of 34,308 rows (pairs and triples of 26 quantifier forms over 13 atoms, eight heads, ten tails, blank and comment gaps and ten flag sets): the rows that differ from jq 1.7.1 went from 767 to 629, 139 fixed.
+One row that matched by accident now shows the merged `*` loop of the `l` flag: `"aab" | match("(a*){1}?(?#c)+|b"; "ln")` is `(a*)+|b` in jq as here, whose group is at `[2,0]` in jq and at `[0,2]` here, as it was for `(a*)+|b` before.
+Of the 629, 491 are the `l` flag on a lazy quantifier and most of the rest are a group's last iteration on the second engine, both recorded below.
+Pinned by `tests/jq_cli/i7689.rs`.
 yq mode is unchanged: Go's `regexp` rejects the form (`invalid nested repetition operator: `*+``), as yq does.
 
 ## Lookaround and backreferences: a second regex engine (#5502)
@@ -8535,6 +8560,9 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   Without `\K` the one-pass index of [#5563](https://github.com/rust-works/succinctly/issues/5563) is kept.
   The `x` flag works: the anchored copy closes its group on a new line, so that a `#` comment cannot swallow the parenthesis.
   An inline `(?x)` or a flag switched off inside the pattern (`(?-x)`) keeps the search that measures the span `\K` keeps.
+- **`l` reads past an atomic group's first way.**
+  A possessive repeat is an atomic group, and `fancy-regex`'s longest mode does not stop at the way the group commits to: `"aaab" | match("a(|a){1,2}+"; "l")` is `"a"` in jq 1.7.1 and 1.8.2 (the group's first iteration matches empty and ends its loop) and `"aaa"` here ([#7689](https://github.com/rust-works/succinctly/issues/7689)).
+  Pinned by `tests/jq_cli/i7689.rs`.
 - **`l` stays a no-op on a pattern with a lazy quantifier.**
   `fancy-regex`'s longest mode returns the lazy match where Oniguruma returns the longest of all the ways to match: `"aa" | match("a*?";"l")` is `"aa"` in jq and `""` here.
   Such a pattern keeps its old route whole, `n` included, because the two flags are not independent (`ln` is the longest non-empty match anywhere).
@@ -8547,10 +8575,21 @@ Every other pattern keeps the `regex` crate, its speed and its output, and yq mo
   The `regex` crate kept the last non-empty iteration (`[0,1,"a"]`) until such a loop was rewritten to end with its empty iteration (#6069, the entry below), and with a capture group it still matches `"bcba"` (#6106).
   Without the capture groups the match agrees: `"bcba" | match("b(?:c|(?:|.))*")` is `"bc"` in both since [#6106](#a-loop-ends-at-an-iteration-that-matches-nothing-6106), which leaves a body with a group as written.
   Under `n` the pattern goes to `fancy-regex`, which kept the last non-empty iteration of such a loop (`"a" | match("(a*)*";"n")` had the group at `[0,1]`); since [#7670](https://github.com/rust-works/succinctly/issues/7670) the capture rewrite of #6069 runs there too, and the group is at `[1,0]` as in jq, unless the engine reads the pattern with an atomic group (a possessive quantifier), which the rewrite cannot read.
+  Since [#7689](https://github.com/rust-works/succinctly/issues/7689) a possessive repeat of such a group (`(a?)++`) keeps the empty iteration under `n` too, by the bullet on the optimizer below: `"ba" | match("(a?)++$"; "n").captures[0]` is at `[2,0]`, as in jq.
   A bounded repeat is not rewritten, so under `n` it still keeps the last non-empty iteration: `"a" | match("(a??){1,3}b?";"n")` has the group at `[1,0]` in jq and `[0,1]` here.
   `fancy-regex` also backtracks out of an empty iteration to a longer match, so `"bcba" | match("b(c|(|.))*";"n")` is still `"bcba"`.
   A repeated group with an empty alternative and `n` is another shape: `"ab" | match("(((b)|(|a))){2}";"n")` is `"ab"` in jq, `"a"` here and `"b"` before.
   This predates `l` and `n`, which only move a pattern to the other route.
+- **`fancy-regex`'s optimizer merges a repeated group with the repeat in its body ([#7689](https://github.com/rust-works/succinctly/issues/7689)).**
+  `optimize_nested_repeats` compiles `(a?)+` as `(a*)` and `(a*)*` as `(a*)?`, so the group spans every iteration: `"aaa" | match("(a?)+"; "l").captures[0]` was at `[0,3]`, a span `(a?)` cannot match, where jq 1.7.1 and 1.8.2 have `[3,0]`.
+  The `l` and `n` searches build a pattern that repeats a group whose body is a `?` repeat, and under `n` alone a `*` repeat, with the optimizer off (`fancy_has_merged_group_loop`), and their engine then ends the loop with the empty iteration jq keeps.
+  Under `l` a `*` body keeps the merged loop: unmerged, the longest-match search tries every split of the run, and `("a" * 31 + "!") | test("(a*)*b"; "l")` ran out of budget where jq answers `false`.
+  So `"aaa" | match("(a*)*"; "l").captures[0]` is still at `[0,3]` (jq: `[3,0]`), the last non-empty iteration of the #6069 entry below.
+  A `+` body (`(a+)+`) is merged too and left so, since its one greedy iteration is the whole run.
+  Pinned by `tests/jq_cli/i7689.rs` and `test_empty_reach_and_merged_group_loops_7689`.
+- **`n` reads a pattern with a part that never matches as one that can match empty ([#7689](https://github.com/rust-works/succinctly/issues/7689)).**
+  `regex-syntax` gives such a pattern no minimum length, `[^\s\S]?|b` included, which the `n` route took for one that never matches empty, and the `regex` crate's search then stopped at the first way's empty match: `"ab" | [match("(a){0}|b"; "n")]` was `[]`, where jq finds `b`.
+  Whether a pattern can match empty is now read off its tree.
 - **A search can run out of budget where jq's optimizer does not.**
   `l` and `n` run the backtracking engine on patterns the `regex` crate used to answer in one pass, so a pathological pattern that Oniguruma settles at once can raise `Regex failure: retry-limit-in-match over` here, the budget of the lookaround route (above).
   As in Oniguruma, each start position an `l` search tries has a budget of its own.
@@ -8589,6 +8628,7 @@ What still differs:
 - **A pattern on the `fancy-regex` route.**
   A lookaround, a backreference, the `l` flag, or `$` together with `\z` sends the pattern to `fancy-regex`, which keeps the last non-empty iteration for some of these bodies: `"ab" | match("(?=)(a*)*b")` and `"ab" | match("(a*)*b"; "l")` have `[0,1,"a"]` here, and so does `"ab" | match("(?=)(a?)*b")`, though `"ab" | match("(a?)*b"; "l")` agrees.
   So does the `fancy-regex` reading that settles a tie between the two views of a text that ends in `\n` (#5572, the next entry).
+  A possessive repeat is an atomic group, which sends the pattern there as well, so without `l` or `n` its group keeps the last non-empty iteration: `"aa" | match("(a*)*+$").captures[0]` is at `[0,2]` here and `[2,0]` in jq 1.7.1 and 1.8.2 ([#7689](https://github.com/rust-works/succinctly/issues/7689), pinned by `tests/jq_cli/i7689.rs`; under `l` and `n` it agrees, see "Regex flags `l` and `n`").
   `onig` and `pcre2`, which would end the loop as jq does, fail the portability bar ([ADR-0019](../../adrs/adr-0019.md)'s candidates table).
 - **A body that matches empty only where an assertion holds.**
   `(a|$)*` is not rewritten, because a copy of it could fail where Oniguruma's loop simply stops.
@@ -8616,6 +8656,8 @@ A differential against jq 1.7.1 over 160,000 cases (5,000 generated capture-free
 
 These keep their loop as written, and still match longer than jq where the shape occurs:
 
+- **A loop inside a possessive repeat** ([#7689](https://github.com/rust-works/succinctly/issues/7689)): the atomic group the possessive scan writes is not read by the rewrite, and `fancy-regex` tries the loop's later ways inside it, so `"ba" | match("(?:b|)(b*|a)++$")` is `"ba"` at offset 0 here and the empty match at offset 2 in jq 1.7.1 and 1.8.2, where the first iteration of `b*` that matches nothing ends the loop and the group commits to it.
+  Pinned by `tests/jq_cli/i7689.rs`.
 - **A body with a capture group inside it** is rewritten with the group copied ([#6310](https://github.com/rust-works/succinctly/issues/6310), [#6332](https://github.com/rust-works/succinctly/issues/6332)): `"ba" | [match("(?:b*|(a))+") | .string]` is `["b"]`, as in jq, and so is `"abca" | [match("(?:(a)|b*|c)+") | .string]` (`["ab","","a",""]`).
   So is `"ba" | [match("(b*|(a))+") | .string]`, whose repeated group the capture rewrite of #6069 first writes as a plain loop over the body.
   The rewrite writes the consuming ways before the empty one twice, so a group in one has two copies, and a counted repeat writes its body again for each count.
@@ -11708,6 +11750,35 @@ A host with less memory than those rows need is taken to an out-of-memory failur
 
 The ledger (`comparison/jq/divergences/`) has no entry for these: the probes `succinctly dev compare jq` runs are against jq 1.7.1 and none reaches a 10,001-level walk, a string past 2 GiB, a 1 GiB token, a 4,096-parameter `def` or a repeat count of 2^31.
 Pinned by `tests/jq_cli/i7526.rs` for the rows that are cheap to run: depth 10,001 and 20,000 through `==`, `<`, `sort`, `contains`, `*`, `setpath`, `getpath`, `delpaths` and `tostream`, a `def` of 4,096 and 4,097 parameters, and the refusal of a repeat count of `1e19`, so a later fidelity change cannot add the caps without failing it.
+
+### `halt_error(n)` for an `n` of 2^31 or more, or `infinite`: 255 on every platform, where jq's answer is the CPU's (#7561)
+
+jq reads the exit code of `halt_error(n)` with an implicit double-to-`int` conversion (`ret = jv_number_value(exit_code)` in `main.c`, unchanged between 1.7.1 and 1.8.2).
+That conversion is undefined behaviour in C for a double outside `int`'s range, so jq's status for such an `n` is the compiler's and the CPU's, not a rule of the language.
+On aarch64 (macOS, Linux) the conversion saturates, and every `n` of 2^31 or more, and `infinite`, exits 255.
+On x86_64 Linux it returns `INT_MIN`, whose low byte is 0, and the same values exit 0.
+`succinctly jq` saturates on every platform: it exits 255 for those values, equal to jq on aarch64 and different from jq 1.7.1 on x86_64 Linux.
+Reproducing the x86_64 answer would make the exit status of one program depend on the CPU it runs on, for no use to a caller; that is a recorded, by-design divergence, as for `"x" * n` with an `n` of 2^31 or more (#7500, above).
+Every other argument agrees with jq 1.7.1 and 1.8.2 on both architectures: a non-negative argument below 2^31 exits with its integer part's low byte (`256` exits 0, `257` exits 1, `1.5` exits 1, `2147483647` exits 255), and every negative number, `-infinite` and `nan` exit 0.
+The message on stderr is jq's in every row.
+jq 1.8.2 was measured on aarch64 only (it matches 1.7.1 there in every row below); its source is unchanged, so it is expected to match 1.7.1 on x86_64.
+
+| `halt_error(n)` for `n`                                                            | jq 1.7.1 x86_64 Linux | jq 1.7.1 and 1.8.2 aarch64 | `succinctly jq` |
+|------------------------------------------------------------------------------------|-----------------------|----------------------------|-----------------|
+| `2147483647`                                                                       | 255                   | 255                        | 255             |
+| `2147483648`, `2147483649`, `3000000000`, `4294967295`, `4294967296`, `4294967297` | 0                     | 255                        | 255             |
+| `1e10`, `1e19`, `1e100`, `infinite`                                                | 0                     | 255                        | 255             |
+| `-2147483648`, `-2147483649`, `-1e10`, `-infinite`, `-1`, `nan`, `0.5`, `256`      | 0                     | 0                          | 0               |
+
+The x86_64 Linux column is the issue's measurements, repeated on terminus against jq 1.7.1; the aarch64 and `succinctly jq` columns were captured on an Apple M5 Max.
+The ledger (`comparison/jq/divergences/`) has no entry for it: no probe of `succinctly dev compare jq` and no fuzz dimension passes `halt_error` an argument of 2^31 or more (the probes' `halt_error` rows use 1, 7 and 11), so the x86_64 Linux differential never reaches it.
+Pinned by `tests/jq_cli/i7561.rs`: every row above and the in-range neighbours, on every platform, and the saturated status after output, under `try` and under `-e`.
+
+```console
+$ jq-1.7.1 -n '"x\n" | halt_error(4294967296)'   # x86_64 Linux: exit 0; aarch64: exit 255
+$ jq-1.8.2 -n '"x\n" | halt_error(4294967296)'   # aarch64: exit 255
+$ sjq      -n '"x\n" | halt_error(4294967296)'   # exit 255 on every platform
+```
 
 ### `fromdate` parses exactly `%Y-%m-%dT%H:%M:%SZ`; yq's `to_unix` stays lenient (#4967)
 

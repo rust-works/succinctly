@@ -2,6 +2,22 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-11-23 — A guide to differential bug hunting
+
+**Sources ingested:**
+- The briefs, filing log, verification passes (on `main` at `41642530`, `b7e58eb2a` and `47c652241`), integration
+  passes, A/B timing reports and hunters' reports of the 2026-11-21/22 `succinctly jq` bug hunt (issues #7425 to #7700)
+- [ADR-0018](adrs/adr-0018.md), [compliance/jq/limitations.md](compliance/jq/limitations.md) (structure),
+  [comparison/jq/README.md](../comparison/jq/README.md), [guides/benchmarking.md](guides/benchmarking.md) and
+  [guides/developer.md](guides/developer.md)
+
+**Pages updated:**
+- [guides/bug-hunting.md](guides/bug-hunting.md) — new: what counts as a finding and the reference rule (jq 1.7.1,
+  with jq 1.8.2 where upstream fixed a bug), the known-set check, the strategies with their yields, a coverage map of
+  what was hunted, what was clean and what was never covered, the harness rules, the path from finding to merged fix,
+  coordinating several agents, and a checklist for the next hunt
+- [guides/README.md](guides/README.md) and [index.md](index.md) — link the guide
+
 ## 2026-11-11 — A write holds no tree for the parts of a document that say nothing (issue #6880)
 
 **Sources ingested:**
