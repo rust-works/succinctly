@@ -5835,6 +5835,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             Some(prepared) => prepared,
             None => match seq_windowed.take().or_else(|| windowed_plain_file(&args)) {
                 Some((files, reader, again)) => {
+                    window::note_route(if args.seq { "seq" } else { "plain" });
                     windowed = Some(reader);
                     reread = Some(again);
                     // One empty buffer for each file: the windows are what the loop reads, and the
@@ -7866,6 +7867,7 @@ fn read_inputs(
     // reads its documents; #7024: so does `-R` over standard input, and over several regular files,
     // each a window at a time and in turn. Anything the gate turns down is read whole below.
     if let Some(sources) = raw_windowed_sources(args, &files) {
+        window::note_route("raw");
         let mut windows: Vec<Option<window::LineWindows>> = sources
             .into_iter()
             .map(|(reader, len, front)| {
@@ -7907,6 +7909,7 @@ fn read_inputs(
     // the stream to the eager reader there, which reads what is left of the files whole
     // ([`hand_off_later_sources`]). Anything the gate turns down is read whole below.
     if let Some(windows) = several_lazy_windowed_files(args, track_eof, &files) {
+        window::note_route("inputs");
         #[cfg(test)]
         SEVERAL_WINDOWED_STARTS.with(|n| n.set(n.get() + 1));
         let sources = windows
@@ -13081,7 +13084,7 @@ fn judge_regular_paths(files: &[PathBuf], min: u64) -> Option<()> {
 /// `/dev/fd/N`), which may share an offset with it. Whether it is one of the run's own descriptors
 /// ([`names_stdin`], [`names_output`]) is left to the caller, which asks once it has a reason to open it.
 fn regular_file(path: &PathBuf) -> Option<std::fs::Metadata> {
-    if is_stdin_dash(path) || path.starts_with("/dev/fd/") {
+    if window::whole_file_forced() || is_stdin_dash(path) || path.starts_with("/dev/fd/") {
         return None;
     }
     let meta = std::fs::metadata(path).ok()?;
@@ -13101,6 +13104,9 @@ fn lone_regular_file(files: &[PathBuf], min_len: u64) -> Option<(&PathBuf, std::
     let [path] = files else {
         return None;
     };
+    if window::whole_file_forced() {
+        return None;
+    }
     let meta = match descriptor_path(path) {
         // Standard output and error, whose `stat` on macOS names the descriptor's own file system and so
         // escapes [`names_output`].
@@ -13160,7 +13166,7 @@ fn not_open_for_reading(error: &std::io::Error) -> bool {
 #[cfg(unix)]
 fn stdin_to_window() -> Option<(std::fs::File, std::fs::Metadata)> {
     use std::os::fd::AsFd;
-    if STDIN_PUSHBACK.with(|slot| slot.borrow().is_some()) {
+    if window::whole_file_forced() || STDIN_PUSHBACK.with(|slot| slot.borrow().is_some()) {
         return None;
     }
     let file = std::fs::File::from(std::io::stdin().as_fd().try_clone_to_owned().ok()?);
@@ -13248,7 +13254,7 @@ fn named_pipe(files: &[PathBuf]) -> Option<&PathBuf> {
     let [path] = files else {
         return None;
     };
-    if is_stdin_dash(path) {
+    if window::whole_file_forced() || is_stdin_dash(path) {
         return None;
     }
     let kind = std::fs::metadata(path).ok()?.file_type();
