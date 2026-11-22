@@ -42152,6 +42152,9 @@ fn fanout_regex_pattern_with_collected_flags<'a, W: Clone + AsRef<[u64]>, S: Eva
                 // with no flags value there is no `match($re; ...)` call to
                 // evaluate, so `$re` is never inspected: `"abc" |
                 // [split(1; empty)]` is `[["abc"]]` in jq, not a type error.
+                // Nor is the input's: a non-string one is sliced whole
+                // (`null | split("b"; empty)` is `[null]`, #7560), see
+                // `unsplit_non_string`.
                 None => body("", &flags),
             }
         },
@@ -42534,6 +42537,13 @@ fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(cow) => cow.into_owned(),
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
+        _ if global_flags.is_empty() => {
+            return match unsplit_non_string::<W, S>(value) {
+                Ok(piece) => QueryResult::Owned(OwnedValue::array_from(vec![piece])),
+                Err(e) if suppresses(&e, optional) => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            }
+        }
         _ if optional => return QueryResult::None,
         _ => {
             return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy::<S, _>(value)))
@@ -42572,6 +42582,31 @@ fn split_regex_resolved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         .collect();
 
     QueryResult::Owned(OwnedValue::array_from(parts))
+}
+
+/// The one piece `split(re; flags)` and `splits(re; flags)` cut from a non-string input when
+/// `flags` yields nothing (#7560).
+///
+/// jq 1.7.1 defines `splits($re; flags)` as `. as $s | [match($re; "g" + flags) | (.offset,
+/// .offset + .length)] | [0] + . + [$s | length] | _nwise(2) | $s[.[0]:.[1]]`: with no flags value
+/// no `match` runs, so nothing checks the input's type, and the one pair is `[0, ($s | length)]`.
+/// The piece is therefore `$s[0:($s | length)]`, which is `null` for `null` and the array itself
+/// for an array; a boolean has no length, and a number or an object cannot be sliced. jq 1.8.2
+/// binds `$flags` as a value and yields nothing instead, from a refactor (jqlang/jq#3260) that
+/// upstream does not call a fix, so 1.7.1 is the reference.
+#[cfg(feature = "regex")]
+fn unsplit_non_string<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    value: &StandardJson<'_, W>,
+) -> Result<OwnedValue, EvalError> {
+    let owned = to_owned::<S, _>(value)?;
+    match owned.type_name() {
+        "boolean" => Err(EvalError::has_no_length(&owned)),
+        container @ ("number" | "object") => {
+            Err(EvalError::cannot_index_with_type(container, "object"))
+        }
+        // `null`, an array, and a string (which the callers split themselves).
+        _ => Ok(owned),
+    }
 }
 
 /// Builtin: splits(re; flags) - split by regex with flags as stream
@@ -42650,6 +42685,13 @@ fn splits_with_resolved_pattern<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             Ok(cow) => cow.into_owned(),
             Err(e) => return QueryResult::Error(EvalError::decode_failure(e.message())),
         },
+        _ if global_flags.is_empty() => {
+            return match unsplit_non_string::<W, S>(&value) {
+                Ok(piece) => QueryResult::Owned(piece),
+                Err(e) if suppresses(&e, optional) => QueryResult::None,
+                Err(e) => QueryResult::Error(e),
+            }
+        }
         _ if optional => return QueryResult::None,
         _ => {
             return QueryResult::Error(EvalError::cannot_be_matched(&to_owned_lossy::<S, _>(
