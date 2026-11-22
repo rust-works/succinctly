@@ -6904,15 +6904,6 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                             slurp_read_made = true;
                             input
                         }
-                        // #6141: `--seq --stream`'s end-of-stream stop ends the input call that met it,
-                        // and the main loop when it is the one that pops it.
-                        jq::InputPop::ParseError(error)
-                            if seq_by_stream_reader(&args)
-                                && error.message
-                                    == crate::cli::jq_seq_reader::MESSAGELESS_RETURN =>
-                        {
-                            break;
-                        }
                         jq::InputPop::ParseError(error) if seq_stream_warns => {
                             eprintln!(
                                 "{}",
@@ -6933,12 +6924,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         }
                         // #6137: and so does a fault of the `--seq` reader the program's own
                         // `input` did not read first, which need not be the last thing the
-                        // stream holds -- but the reader's message-less return ends jq's main
-                        // loop, whatever follows it.
+                        // stream holds.
                         jq::InputPop::ParseError(error) if seq_faults_warn => {
-                            if error.message == crate::cli::jq_seq_reader::MESSAGELESS_RETURN {
-                                break;
-                            }
                             eprintln!(
                                 "{}",
                                 crate::cli::jq_seq_reader::ignored_parse_error(&error.message)
@@ -7955,6 +7942,11 @@ fn read_inputs(
     // #6004: a file that would not open after the last one that did is read after it, so the
     // stream does not end where the last opened file does.
     let mut unopened_tail = false;
+    // #7718: whether the last file is a directory, whose failed read jq 1.7.1 took for the last
+    // refill, as for a file that did not open. jq 1.8.2 reads once more there (and says `Is a
+    // directory`), which #7607 leaves to jq 1.7.1, so `--seq --stream` keeps 1.7.1's refills then.
+    // (`any_open_failure` may not count it: a directory opens.)
+    let mut last_is_directory = false;
     // #6620: the walk `seq_plain_json_inputs` made of this stream, with whether it recorded faults and
     // the length of the bytes it walked, when this read is of the same source.
     let mut handed: Option<HandedWalk> = None;
@@ -8007,6 +7999,7 @@ fn read_inputs(
             None => read_input_files(&files, failed_as_sources),
         };
         unopened_tail = failures.iter().any(|&(at, _)| at >= files.len());
+        last_is_directory = ends_in_last_directory(&failures);
         if let Some(name) = unopened_tail_name(&failures, files.len()) {
             UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = Some(name));
             LAST_VALUE_AT_TAIL.with(|at| {
@@ -8378,15 +8371,11 @@ fn read_inputs(
     // over the whole stream measured +15% on a 12 MB `--seq -s -c length`
     // (interleaved A/B, release, output-identity gated).
     let mut seq_slurp_position_lost = false;
-    // `jq_seq_reader::SeqStreamWalk::deferred_warning` (#3201).
-    let mut seq_deferred_warning: Option<String> = None;
     // #6481: whether the `--seq` walk printed a fault before the program runs.
     let mut seq_warned = false;
     // The raw walk's value ranges (`jq_seq_reader::SeqStreamWalk::values`,
     // #3247): the same pass that decides jq's warnings decides its values,
-    // over the same raw bytes, cut at #2998's end-of-stream drop when the walk records no faults
-    // (a walk that does, as the queue's reads and the clean check's handed-on one do, goes past it
-    // and holds the message-less fault there instead).
+    // over the same raw bytes, to the stream's end as jq 1.8.2 reads it (#7718).
     // Empty for #1525's no-RS-byte stream, where nothing ever leaves
     // `WAITING_FOR_RS`: the warning arm runs no walk, and under `-n` the walk
     // finds no value but records the `Unfinished abandoned text` fault `input` raises
@@ -8400,8 +8389,8 @@ fn read_inputs(
     // each comes out in order with the values, where a plain run prints it as a warning.
     let mut seq_fault_errors: Vec<(usize, TrailingParseError)> = Vec::new();
     // #6584: a last file that did not open is one more source to jq's `--seq` readers, an empty one
-    // they stand at, line 0. The walk's own `Tail` (#6588) keeps the end-of-stream drop (#2998) off
-    // the last file that opened; this source is where what is read past it is placed: the fault at
+    // they stand at, line 0. The walk's own `Tail` (#6588) places jq 1.7.1's final buffer there for
+    // the positions; this source is where what is read past it is placed: the fault at
     // the end of the text (#6531) and a value that completes only there.
     // #6599: `-s -n` reads the same stream through the program's `input`, so the fault at the end of
     // the text is raised there too.
@@ -8506,7 +8495,6 @@ fn read_inputs(
                 seq_values = walk.values;
                 seq_cuts = walk.cuts;
                 seq_value_locations = walk.locations;
-                seq_deferred_warning = walk.deferred_warning;
                 seq_fault_errors = seq_fault_errors_of(walk.faults, &raw_bytes, args.slurp);
                 walk.slurp_position_lost
             }
@@ -8529,8 +8517,6 @@ fn read_inputs(
         seq_value_locations = walk.locations;
         // `input`/`inputs` raise what a plain run only warns about (#5640).
         seq_fault_errors = seq_fault_errors_of(walk.faults, &raw_bytes, args.slurp);
-        // `-n -s`'s `input`/`inputs` read the deferred warning too.
-        seq_deferred_warning = walk.deferred_warning;
         seq_slurp_position_lost = walk.slurp_position_lost;
     }
 
@@ -8569,14 +8555,13 @@ fn read_inputs(
         // stream. Only `-s` without `-n` warns up front, a program that reads `input` included:
         // jq's main loop has read the whole slurp before it runs (#6676).
         let faults_as_inputs = args.null_input || (track_eof && !args.slurp);
-        // And the end-of-stream stop (#2998) is a barrier in that queue, behind which the stream
-        // goes on (#6141); a run that never reads an input ends at it. A slurp's loop reads on past
-        // that stop (`stops_on_empty`), so the barrier never comes up there.
         let read = crate::cli::jq_stream_errors::read_seq(
             &raw_bytes,
             args.slurp,
             args.stream_errors,
-            faults_as_inputs,
+            // #7718: a failed last file's read is the last refill in both releases, and what jq 1.8.2
+            // reads past a last directory is #7607's.
+            unopened_tail || last_is_directory,
         );
         let mut locations =
             InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
@@ -9203,21 +9188,10 @@ fn read_inputs(
 
     // Process based on input mode
     let mut values = Vec::new();
-    // A `--seq -s` warning jq defers past the filter rides the same slot
-    // (#3201): delivered after the slurped array, to the driver or to the
-    // filter's own `input`. jq has lost its position by then -- the call
-    // that raises it closed the stream -- so it names `<unknown>`.
     let mut resumed_errors: Vec<(usize, TrailingParseError)> = seq_fault_errors;
     // #6019: whether `-n -s` read a stream with a fault the resuming way (below).
     let mut resume_slurp_done = false;
-    let mut trailing_error: Option<TrailingParseError> =
-        seq_deferred_warning.map(|message| TrailingParseError {
-            error: EvalError::new(message),
-            source: NO_SOURCE,
-            line: UNKNOWN_LINE,
-            seq_warning: true,
-            as_parse_error: false,
-        });
+    let mut trailing_error: Option<TrailingParseError> = None;
 
     // `--seq` (RFC 7464, #1571) and raw-input (`-R`, #1809): both can
     // genuinely join content across a file boundary -- real jq's own
@@ -10985,7 +10959,7 @@ fn seq_fault_ends(raws: &[Vec<u8>], unopened_tail: bool) -> Vec<bool> {
 }
 
 /// Whether `--seq`'s own reader reads the text the files `raws` make without a fault (#6555): no
-/// diagnostic and none deferred, the message-less end of #2998 included, so each value is read
+/// diagnostic, so each value is read
 /// where a JSON stream's is and nothing else comes out of the input queue. That holds for
 /// `--stream` and `--stream-errors` too, whose events of a clean record stream are placed as their
 /// values'. A slurp reads every file before the program runs, so this is asked only of a run
@@ -10998,8 +10972,7 @@ fn seq_text_reads_clean(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
         .map(|(at, raw)| (Some(at), raw.clone()))
         .collect();
     let mut warned = false;
-    // Collecting the faults, as the queue's own walk does: without it, a final buffer that starts on
-    // an RS (#2998) ends the stream with no word, which the queue raises as `break` (#5662).
+    // Collecting the faults, as the queue's own walk does.
     let walk = crate::cli::jq_seq_reader::walk_stream_collecting(
         &sources,
         false,
@@ -11009,7 +10982,7 @@ fn seq_text_reads_clean(raws: &[Vec<u8>], unopened_tail: bool) -> bool {
             warned = true;
         },
     );
-    !warned && walk.faults.is_empty() && walk.deferred_warning.is_none()
+    !warned && walk.faults.is_empty()
 }
 
 /// The open failures jq's reader reaches before its parser stops (#6485): it opens the files in
@@ -17695,29 +17668,9 @@ fn seq_stream_walked_as_plain_json_with(
         }
         _ => crate::cli::jq_seq_reader::walk_stream_values(&sources, slurp, &mut |_| warned = true),
     };
-    // A walk that records faults goes on past jq's end-of-stream drop (#2998), where the one that
-    // does not stops. The verdict is the stopping walk's (it was before the walk was kept, #6620),
-    // which is this walk's up to the drop: the warnings met before it, and the values it had
-    // yielded (`values_before`). The stopping walk has no end-of-text warning to defer and no lost
-    // position without a warning before it. What is handed on is this whole walk, which is the one
-    // the reading route makes.
-    let drop = kept
-        .then(|| {
-            walk.faults
-                .iter()
-                .position(|fault| fault.body == crate::cli::jq_seq_reader::MESSAGELESS_RETURN)
-        })
-        .flatten();
-    let (warned, deferred, position_lost, values_end) = match drop {
-        Some(at) => (at > 0, false, false, walk.faults[at].values_before),
-        None => (
-            warned,
-            walk.deferred_warning.is_some(),
-            walk.slurp_position_lost,
-            walk.values.len(),
-        ),
-    };
-    let values = &walk.values[..values_end];
+    // What is handed on is this whole walk, which is the one the reading route makes.
+    let position_lost = walk.slurp_position_lost;
+    let values = &walk.values[..];
     let Some((_, mut raw)) = sources.pop() else {
         return Err((Vec::new(), None)); // patchcov: coverage tolerate-line reason="unreachable: the one source pushed above"
     };
@@ -17729,7 +17682,7 @@ fn seq_stream_walked_as_plain_json_with(
         };
     }
     // #7340: a stream with bytes inside its values that are not part of them is never plain.
-    if warned || deferred || position_lost || values.is_empty() || !walk.cuts.is_empty() {
+    if warned || position_lost || values.is_empty() || !walk.cuts.is_empty() {
         not_plain!(raw, walk);
     }
     // `-s` wraps the values in one array, which is a level more than the deepest value has: a
@@ -31430,8 +31383,8 @@ mod tests {
 
     /// #6620: a `--seq` stream with a diagnostic is walked once, not by the clean check and again by
     /// the route that reads it. A file is read once too. A slurp keeps both walks (it is a different
-    /// walk), and a stream that reaches jq's end-of-stream drop is walked once like any other: its
-    /// verdict is read off the kept walk up to the drop.
+    /// walk), and a stream with an empty record in its last buffer, which jq 1.7.1 ended at (#2998)
+    /// and jq 1.8.2 reads past (#7718), is walked once like any other.
     #[test]
     fn a_seq_stream_with_a_diagnostic_is_walked_once_6620() {
         use clap::Parser;
@@ -31479,14 +31432,14 @@ mod tests {
         // The streams the handoff declines keep the walk each route makes.
         assert_eq!(walks_made(faulty, &["-s"]), 2, "a slurp walks for itself");
         assert_eq!(
-            walks_made(b"\x1e{\"name\":1}\n\x1e\x1etrue", &[]),
+            walks_made(b"\x1e{\"name\":1}\n\x1e\x1e{\"name\":", &[]),
             1,
-            "the end-of-stream drop's verdict is read off the kept walk"
+            "an empty record in the last buffer, before a record cut short"
         );
     }
 
     /// Streams of RS bytes, newlines and the characters JSON is made of, from a fixed seed: most are
-    /// malformed, and some hold the empty record that reaches jq's end-of-stream drop (#2998).
+    /// malformed, and some hold an empty record in the last buffer (#2998, #7718).
     fn random_seq_streams(count: usize) -> Vec<Vec<u8>> {
         let alphabet: &[u8] = b"\x1e\x1e\x1e\n\n {}[]\":,1a0.tnul-";
         let mut state = 0x2545_f491_4f6c_dd1d_u64;
@@ -31507,10 +31460,9 @@ mod tests {
     }
 
     /// #6620: the walk the check keeps (one that records faults) gives the verdict the walk that
-    /// stops at jq's end-of-stream drop gave, and is the walk the reading route would have made.
-    /// The streams reach the drop, warnings, faults and clean shapes; the test fails with the
-    /// drop's truncation of the kept walk's values removed (its warnings half is subsumed by the
-    /// gap check, so no stream pins it alone).
+    /// records none gives, and is the walk the reading route would have made. The streams reach
+    /// empty records in the last buffer (where jq 1.7.1 ended the stream, #2998, and 1.8.2 reads
+    /// on, #7718), warnings, faults and clean shapes.
     #[test]
     fn the_kept_walk_decides_as_the_stopping_walk_did_6620() {
         let mut streams = random_seq_streams(20_000);
@@ -31519,8 +31471,8 @@ mod tests {
             b"\x1e\"a\"\x1e\"b\"".to_vec(),
             b"\x1e[1] \x1e{}".to_vec(),
             b"\x1e{\"a\":1}\x1e{\"a\":2}".to_vec(),
-            // The end-of-stream drop (#2998): an empty record in the final buffer ends the stopping
-            // walk, so what follows it is not read, and the stream is clean only when nothing does.
+            // An empty record in the last buffer (#2998, #7718): read past, and the stream is clean
+            // when the records around it are.
             b"\x1e1\n\x1e\x1e2\n".to_vec(),
             b"\x1e1\n\x1e\x1e".to_vec(),
             b"\x1e{\"a\":1}\n\x1e\x1e{\"a\":2}".to_vec(),
@@ -31528,9 +31480,7 @@ mod tests {
             b"\x1e1\n\x1e\x1e2 ".to_vec(),
             b"\x1e\x1e1\n".to_vec(),
             b"\x1e1\n\x1e\x1e\n".to_vec(),
-            // A warning before the drop makes the stream not clean whatever follows. (The gap check
-            // rejects such a stream too, since a warning leaves junk in a gap, so the `at > 0` term of
-            // the rule is defence in depth: no stream tells it from `false`.)
+            // A warning before it makes the stream not clean whatever follows.
             b"\x1e1\n\x1e2}\n\x1e\x1e3".to_vec(),
             b"\x1e1\n\x1e}\n\x1e\x1e".to_vec(),
             b"\x1e{\"a\":1}\n\x1etru\n\x1e\x1e".to_vec(),
@@ -31555,7 +31505,7 @@ mod tests {
                 streams.push(broken);
             }
         }
-        let (mut clean, mut kept, mut drops) = (0, 0, 0);
+        let (mut clean, mut kept) = (0, 0);
         for raw in streams {
             let stopping = seq_stream_as_plain_json_with(raw.clone(), false, None);
             let keeping = seq_stream_as_plain_json_with(raw.clone(), false, Some(true));
@@ -31569,12 +31519,6 @@ mod tests {
                     assert_eq!(a, b, "{raw:?}");
                     let mut walk = walk.expect("every walked stream hands its walk on");
                     kept += 1;
-                    // The streams that reach jq's end-of-stream drop: the walk goes past it, and
-                    // its verdict is the stopping walk's.
-                    drops +=
-                        usize::from(walk.faults.iter().any(|fault| {
-                            fault.body == crate::cli::jq_seq_reader::MESSAGELESS_RETURN
-                        }));
                     // The walk the reading route makes over the same bytes.
                     let sources = [(None, raw.clone())];
                     let mut fresh = crate::cli::jq_seq_reader::walk_stream_collecting_at(
@@ -31588,7 +31532,6 @@ mod tests {
                     assert_eq!(walk.values, fresh.values, "{raw:?}");
                     assert_eq!(walk.locations, fresh.locations, "{raw:?}");
                     assert_eq!(walk.faults, fresh.faults, "{raw:?}");
-                    assert_eq!(walk.deferred_warning, fresh.deferred_warning, "{raw:?}");
                     assert_eq!(
                         walk.slurp_position_lost, fresh.slurp_position_lost,
                         "{raw:?}"
@@ -31605,10 +31548,6 @@ mod tests {
         // The test must reach each shape, or it proves nothing.
         assert!(clean >= 3, "{clean} clean streams");
         assert!(kept > 1_000, "{kept} streams handed on");
-        assert!(
-            drops > 20,
-            "{drops} streams that reach the end-of-stream drop"
-        );
     }
 
     /// #6620: reading a `--seq` file the check found not clean from the check's own bytes and walk

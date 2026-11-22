@@ -346,7 +346,7 @@ A NUL byte in such a chunk ends the chunk there, and the rest of it is dropped w
 The input's last chunk, the only one of a short file without a trailing newline, is the case that loses data.
 `succinctly jq` reads the text as it is and reports such a NUL as a parse error.
 This is jq discarding the input after the NUL with exit status 0, so the divergence stands under [ADR-0018](../../adrs/adr-0018.md) rather than being matched.
-The `--seq` reader matches jq instead (#7340), as it matches jq's other silent drops there (#2998): a `--seq` stream is one jq reads past its faults by design, with no exit status to report them.
+The `--seq` reader matches jq instead (#7340): a `--seq` stream is one jq reads past its faults by design, with no exit status to report them.
 jq 1.8.2 no longer truncates a chunk at a NUL (CVE-2026-33948, upstream commit 6374ae0bcd), so it reads `[1\0,2]` with no newline as `[1,2]`; `succinctly jq` does not follow that change yet.
 
 A chunk that does hold a newline is handed to the parser whole, NULs included, and jq's tokenizer reads a NUL into the token it is in like any other byte.
@@ -446,7 +446,8 @@ jq 1.8.2 reads once more before it closes the array (jqlang/jq#3279, commit 4e30
 This replaces the rule #5548 added, which matched 1.7.1.
 `input_filename` and `input_line_number` read where the array was closed, as they did.
 What the same upstream change does not reach here: a text that ends in a fault (`printf '[1,' | jq -s --stream .`) is raised without the array in 1.8.2, where 1.7.1 printed the array and then raised, and `succinctly jq` still prints the array first; with `--stream-errors -s` the fault event that follows the array reads `input_filename` as the last file in 1.8.2 and as `null` here, and in that case the closing event keeps the 1.7.1 place too.
-`--seq` keeps the 1.7.1 model of the slurp loop, and so do the cases that read a directory in the middle of the file list.
+`--seq --stream -s` follows 1.8.2 too since #7718, which adopts the same commit's reading for `--seq` (below).
+The cases that read a directory in the middle of the file list keep the 1.7.1 model of the slurp loop.
 `succinctly yq` is not changed.
 Pinned by `tests/jq_cli/i7523.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 
@@ -10606,63 +10607,36 @@ lead byte *and* the RS or whitespace after it into one U+FFFD, so
 A NUL byte is matched too, since [#7340](https://github.com/rust-works/succinctly/issues/7340).
 `jq_util_input_read_more` measures an `fgets` chunk that holds no newline with `strlen`, so jq's parser never sees the chunk from its first NUL on (`printf '\x1eA+\x008e'` reports at column 3, where succinctly said column 6), and `check_literal` reads a number token as a C string, so a NUL in one ends the number (`\x1e1\x00\n` is the value `1`, where succinctly warned and dropped it).
 The sweep's alphabet holds a NUL, and `--long` generates the lines past a 4095-byte chunk that put one inside an open value.
-The `--seq` reader's own non-slurp end-of-stream rule, described just below, is in the corpus unconditionally too, now that it is modeled.
 
-### jq's stream can end silently, mid-buffer, with nothing to explain it (#2998)
+### jq 1.7.1 could end a `--seq` stream silently at an empty record; jq 1.8.2 reads every record, and so does `succinctly jq` (#2998, #7718)
 
-Two shapes that used to be recorded here as unattributed "`fgets` line-reader artifacts"
-turned out to be the *same* rule, once traced into jq's own C source rather than inferred
-from output alone: real jq's non-slurp `--seq` driver
-(`jq_util_input_next_input`, `src/util.c`) tracks "was the buffer I'm holding just
-refilled" in a local variable, reset on every call. `jv_parser_next` returns a
-message-less invalid — no value, no error — exactly once: when an RS byte arrives with
-nothing pending (an empty record). If that is the *first* thing scanned from the specific
-call that just performed the terminal `fgets` refill, the driver's loop condition reads it
-as "no more input" and exits **without ever setting `p->eof`** — so nothing after that RS
-is scanned, and there is no `at EOF` diagnostic for whatever was abandoned. Any later call
-reusing the same (already-final) buffer has no fresh refill to reset that local variable,
-so it keeps looping internally instead, absorbing any number of further empty records
-without dropping anything:
+jq 1.7.1's non-slurp `--seq` driver (`jq_util_input_next_input`, `src/util.c`) took the refill that reached the end of the last file for the end of the stream (`is_last`), and `jv_parser_next` returns an invalid with no message, no value and no error, when an RS arrives with nothing pending (an empty record).
+When that was the first thing the call that made the last refill scanned, the driver read it as "no more input" and stopped without setting `p->eof`, so nothing after that RS was scanned and nothing left there was reported, with exit status 0:
+`printf '\x1e1\n\x1etrue' | jq --seq -c .` printed `1` alone, `\x1e"a"\n\x1e"b"` printed `"a"`, `\x1e\x1etrue` printed nothing, and a last record cut short after a newline (`\x1e1\n\x1e[2`) went without its `Unfinished JSON term at EOF` warning.
+A later call on the same buffer, after one that had returned something from it, read past any number of empty records (`\x1e1 \x1etrue` printed both), and `fgets` chunks at a newline or after 4,095 bytes, so the drop moved with the padding (`\x1e1\n\x1e` and 4,093 spaces before `\x1etrue` kept `true`, one more space dropped it).
+Under `input`/`inputs` the same record was a `break`: `inputs` ended there and a later read went on (#5662, #6141), so `[inputs], [inputs]` over `\x1e\x1etrue` was `[]` and `[true]`.
+`succinctly jq` modelled all of it from #2998 on.
 
-```
-$ printf '\x1e\x1etrue'     | jq --seq -c '.'   # (nothing at all, exit 0)
-$ printf '\x1e1\n\x1etrue'  | jq --seq -c '.'   # 1        -- the earlier record already
-                                                #             leaves the parser in the same
-                                                #             state an empty one would
-$ printf '\x1e1 \x1etrue'   | jq --seq -c '.'   # 1, true  -- one buffer, no newline: the
-                                                #             first event is a *value*, so
-                                                #             the rest parses normally
-```
+jq 1.8.2 reports the end only once the last file has been closed, one refill later (upstream commit 4e3088f, [jqlang/jq#3279](https://github.com/jqlang/jq/pull/3279), "Fix behavior of `--slurp --stream` when input has no trailing newline character", labelled a bug), so the buffer that holds the last bytes is never the final one and an empty record never ends the stream.
+It prints `1` and `true`, `"a"` and `"b"`, `true`, and the warning for `[2`; `[inputs]` over `\x1e[1]\n\x1e[2]` is `[[1],[2]]` where 1.7.1 answered `[[1]]`.
+Since [#7718](https://github.com/rust-works/succinctly/issues/7718) `succinctly jq` follows 1.8.2, on every route that reads `--seq`: a file, several files, standard input whole, a pipe or a file read in windows (#7082, #7164, #7218), and `--seq --stream`.
+The owners adopted it as a 1.7.1 bug that 1.8.2 fixes: 1.7.1 lost input with exit status 0, and the commit that removed the loss is labelled a bug.
+Three more answers come from the same extra refill and follow 1.8.2 too:
+- With a byte-order mark that breaks off (`\xef\xbb`), the empty last call begins with `parser_reset`, so no `at EOF` warning survives and a number still waiting for the byte after it is wiped: `\xef\xbb1 2` reads as `1` alone, where 1.7.1 also warned `Potentially truncated top-level numeric value at EOF at line 1, column 3` (it already did the same when the last chunk ended on a newline).
+- Under `-s` the EOF branch's warning is printed when the stream is read, before the program runs, where 1.7.1 raised it in the call after the array when the last byte completed a value (#3201, below): `printf '\x1e1{' | jq --seq -s -c 'error("x")'` prints the warning and then `jq: error (at <stdin>:0): x`, `[., (try input catch .)]` is `[[1],"break"]`, and `-n -s` raises the warning from `input` at `<stdin>:0`, not `<unknown>`.
+- `--seq --stream -s` keeps in the array the closing event the last byte left pending, as `--stream -s` already did (#7523): `\x1e[1]\n\x1e[2]` is `[[[0],1],[[0]],[[0],2],[[0]]]`, where 1.7.1 printed the last `[[0]]` after the array.
+  The empty last call hands that event out and ends the slurp, so a fault at the end of the text still comes after the array, as in 1.7.1; with nothing pending the call meets the fault itself, before the array.
+  A list that ends in a file that did not open, or in a directory, keeps 1.7.1's reads: that file's read is the last one in both releases, and what 1.8.2 does past a last directory is #7607's.
 
-Real jq's own `fgets` chunks at a newline *or* after 4095 bytes, whichever comes first, so
-the drop is observable by padding alone: `\x1e1\n\x1e` + 4093 spaces + `\x1etrue` keeps
-`true`, and one byte more of padding drops it. `succinctly jq` now matches all of this,
-modeled in [`jq_seq_reader`](../../../src/bin/succinctly/jq_seq_reader.rs)'s
-`final_buffer_start`/`drops_at_first_empty_record`. It lives in the same raw-byte walk
-that produces the values, which simply stops at the drop point (#3247). `-s` is unaffected (`has_more` keeps its own loop
-going) -- the warning this same drop would otherwise suppress still fires there:
-
-```
-$ printf '\x1e\x1etrue' | jq --seq -s -c '.'
-jq: ignoring parse error: Unfinished string at EOF at line 2, column 6
-[1]
-```
-
-This is also what an earlier draft of this page recorded, without the mechanism, as "a
-separate, pre-existing rule" on multi-record streams -- the trigger it named ("once jq's
-reader has seen one newline, a later record must itself be newline-terminated to be
-emitted") was an *effect* of this same driver rule, not an independent one:
-
-```
-$ printf '\x1e"a"\x1e"b"'     | jq --seq -c '.'   # "a" and "b" -- one buffer, no newline
-$ printf '\x1e"a"\n\x1e"b"'   | jq --seq -c '.'   # "a" only    -- second RS is the first
-                                                  #                event of the final buffer
-$ printf '\x1e"a"\n\x1e"b"\n' | jq --seq -c '.'   # "a" and "b" -- trailing newline empties
-                                                  #                the final buffer entirely
-```
-
-All three now match (`succinctly jq` reproduces every row above, including `-s`); before
-#2998 `succinctly jq` also printed `"b"` on the middle row.
+What does not follow 1.8.2 is where jq stands after the last input, which the same commit also changed (#7607 keeps 1.7.1's answers): `-s`'s `(at <unknown>)` (#3003 below) and the `<unknown>` of an EOF report a non-slurp `input` raises after the stream's last value (`printf '\x1e1{' | jq --seq -n -c '[inputs]'`, where 1.8.2 names `<stdin>:0`) are 1.7.1's, placed by 1.7.1's final buffer (`final_buffer_start`).
+Nor do the 1.8.2 changes from other upstream commits: its 4,091-byte reads (jqlang/jq#3421), which move the line a value on a longer line is named at, and its reading of a NUL byte (6374ae0bcd, above).
+Where those meet, the answer can be neither release's.
+With `f1.seq` holding `\x1e1\n` and `f2.seq` holding `\x1e2 `, `jq --seq -n -c '[input,input,input]' f1.seq f2.seq` raises `break` at `f2.seq:0` in both releases, 1.7.1 because it ended the stream at the RS that opens `f2.seq` and 1.8.2 because it keeps the name past the end; `succinctly jq` reads the `2` and then loses the position by 1.7.1's rule (`(at <unknown>)`).
+And a `--seq --stream` file of exactly 4,095 bytes whose last byte closes a container, then a file that fails, then a record: both releases stop after the first file's events (1.7.1 at the third file's RS, 1.8.2 because its 4,091-byte reads hand the closer out with the failed file's read), where `succinctly jq` reads the third file's first event too (`tests/jq_cli/i6760.rs`).
+Both would go if #7607 and the read size were followed as well.
+The compare harness compares against the pinned 1.7.1: `scripts/jq-seq-oracle-sweep.py` skips the streams 1.7.1 reads in a last buffer that holds data (`reads_past_last_buffer`, counted under `artifact-shapes-skipped`; `--expect-artifacts` includes them).
+`scripts/jq-seq-door-sweep.py` skips the same streams by the same test, and counts them; no probe or differential case of `comparison/jq/` reads past such a buffer, so the ledger has no entry for it.
+Pinned by `tests/jq_cli/i7718.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`), with jq 1.7.1's answers in its comments, and whose route rows hold the pipe, standard input, a file, the file read whole and two files to one answer, below and above the windowed routes' size.
 
 ### Past the end of a `--seq` stream, `input` names the plain-JSON position (#6146)
 
@@ -10705,21 +10679,9 @@ file's own last chunk (`\x1e1` in one file and `{` in the next keeps `second:0`)
 read off the same walk that produces the warnings; `scripts/jq-seq-oracle-sweep.py
 --slurp-location` sweeps it.
 
-The warning on these streams belongs to jq's call *after* the one that dispatched the array,
-and succinctly reproduces that too
-([#3201](https://github.com/rust-works/succinctly/issues/3201)). The walk holds that one
-warning back, and it follows the array the way a plain JSON stream's trailing parse error
-does (#2961):
-
-- a runtime error prints first and the `ignoring parse error` line second;
-- `halt` in the filter suppresses the warning entirely;
-- `input`/`inputs` in the filter receive it as a runtime error instead
-  (`jq: error (at <unknown>): Unfinished JSON term at EOF ...`, exit 5), and
-  `try input catch .` yields the message.
-
-Every other `--seq -s` warning is reported in the reading call, before the filter runs, in
-jq as here. Without `-s`, the interleaving of warnings with evaluation is still not
-reproduced; see the ordering note below.
+In jq 1.7.1 the warning on the streams that keep the position belongs to its call *after* the one that dispatched the array, and succinctly reproduced that from [#3201](https://github.com/rust-works/succinctly/issues/3201) on: a runtime error printed first and the `ignoring parse error` line second, `halt` in the filter suppressed the warning, and `input`/`inputs` in the filter received it as a runtime error (`jq: error (at <unknown>): Unfinished JSON term at EOF ...`, exit 5).
+jq 1.8.2 reads the empty buffer after the last bytes before it hands the array on, so every `--seq -s` warning is reported in the reading call, before the filter runs, and `succinctly jq` follows it since #7718 (above); the position the array's error names is still 1.7.1's.
+Without `-s`, the interleaving of warnings with evaluation is still not reproduced; see the ordering note below.
 
 A **malformed** BOM — a byte sequence that begins one and then contradicts it, such as
 `\xef\xbb` — is *not* in that category and is matched exactly. jq consumes the bytes that did
@@ -10760,9 +10722,9 @@ randomized corpus. A fabricated value is a correctness failure even where an unr
 line-reader artifact still leaves succinctly with extra output.
 
 That is a statement about malformed-record handling, not a guarantee about `--seq` as a
-whole -- see "jq's stream can end silently, mid-buffer, with nothing to explain it" above
-for the multi-record, non-slurp rule that also bears on stdout's contents (#2998), now
-matched rather than diverging.
+whole -- see "jq 1.7.1 could end a `--seq` stream silently at an empty record" above
+for the multi-record, non-slurp rule that also bears on stdout's contents (#2998), where
+`succinctly jq` follows jq 1.8.2 since #7718.
 
 `-n` combined with a filter that forces a real read (`input`/`inputs`) turns these conditions into **fatal** errors on real jq (exit 5), not warnings, and `succinctly jq` raises them the same way (#5640).
 That covers the stream with no RS byte at all and every error the reader finds in the middle of a stream.
@@ -10778,8 +10740,8 @@ Each error comes behind the values read before it, the reads after it resume, an
 The EOF report jq defers past the stream's last value names `<unknown>` instead of `file:line`.
 No warning is printed in this mode.
 
-An empty record (`\x1e\x1e`) does not end the stream for `input`/`inputs` either (#5662): the read that meets it raises `break`, as an exhausted stream does, and the next read scans on.
-`inputs` ends at that `break`, so `[inputs]` is `[]` and a second `inputs` yields the values behind the record, as in jq.
+An empty record (`\x1e\x1e`) does not end the stream for `input`/`inputs` either: jq 1.8.2 reads past it, so `[inputs]` over `\x1e\x1etrue` is `[true]` (#7718).
+jq 1.7.1 raised `break` at one that was the first thing its last buffer held, as an exhausted stream does, so `inputs` ended there (`[]`) and a second `inputs` yielded the values behind the record (#5662).
 `test_seq_null_input_with_inputs_raises_not_warns_1525` and `tests/jq_cli/i5640.rs` pin the exit status and the text.
 
 ## Real-time stdout/stderr interleaving
@@ -15334,7 +15296,7 @@ What follows is the missing-file behaviour of the features that route input diff
   Without `-n`, a filter that reads `input`, `inputs` or `input_line_number` reports a missing file the same way, since [#6525](https://github.com/rust-works/succinctly/issues/6525): the main loop reads the first file before the program does and stops one value past the first failure, so `jq -c 'try input catch .' missing.json three.json m2.json` reports `missing.json` and never `m2.json`.
   A read that finds the stream at its end reports every one it has not reached, and a failure fails the run when it is reported.
   A `--seq` stream does so whatever it holds, a fault included, since [#6584](https://github.com/rust-works/succinctly/issues/6584): its readers place each value and fault at the file jq's reader is in when it completes it.
-  A last file that did not open is one more, empty source to them, since [#6588](https://github.com/rust-works/succinctly/issues/6588): `jq --seq -n -c '[inputs]' q.seq missing` over `\x1e1\n\x1e[2]` keeps `[2]`, which the end-of-stream drop of [#2998](https://github.com/rust-works/succinctly/issues/2998) took when the missing file was not counted.
+  A last file that did not open is one more, empty source to them, since [#6588](https://github.com/rust-works/succinctly/issues/6588): `jq --seq -n -c '[inputs]' q.seq missing` over `\x1e1\n\x1e[2]` keeps `[2]`, which jq 1.7.1's end-of-stream drop ([#2998](https://github.com/rust-works/succinctly/issues/2998), no longer modelled since #7718) took when the missing file was not counted.
   `--seq -s -n` does too, since [#6599](https://github.com/rust-works/succinctly/issues/6599): the program's `input` reads the stream, so `jq --seq -s -n input bad.json missing` over a record cut short in `bad.json` raises the fault at `bad.json:3` and exits 5 without ever reporting `missing`, and no failure loses the array.
   Still up front or out of order: `--seq --stream` and `--seq --stream-errors` with several missing files at the end, or in a main loop jq cuts earlier ([#6591](https://github.com/rust-works/succinctly/issues/6591)), and a faulting `--seq` stream followed by a directory under `-n input` without `-s`, which exits 2 where jq exits 5 ([#6610](https://github.com/rust-works/succinctly/issues/6610)).
   So does the read of a fault at the end of the text, since [#6480](https://github.com/rust-works/succinctly/issues/6480): `[1,` waits for more, so jq's parser asks the reader for the next file before it raises `Unfinished JSON term at EOF` (`jq -n '[inputs]' t1.json missing` reports `missing` and exits 2, and under `try` the run still exits 2).
@@ -15626,10 +15588,9 @@ Two differences remain:
   `tests/jq_cli/i6115.rs` pins it, and 15,500 random record sequences (one to three files, lines across jq's 4,095-byte read, `-s`, `-n`, `input`, `inputs`, `input_line_number`, `input_filename`) matched `/usr/bin/jq` 1.7.1 on stdout, status and the set of stderr lines.
   One difference remains, shared with `--seq` over documents.
   A plain run prints its warnings before it evaluates anything, so a runtime error or `halt` on an earlier event comes after warnings jq would not have printed yet.
-  The end of the stream that jq's non-slurp rule draws on an empty record in the last read (#2998) ends only the call that met it, as it does over documents since [#6141](https://github.com/rust-works/succinctly/issues/6141): a program that reads inputs finds a barrier there, which `input` raises as `break` and `inputs` ends at, and the main loop ends only if it is the one that pops it.
-  The stream goes on behind it, so what follows reaches a later `input` (`printf '\x1e[1]\n\x1e[2' | jq -c --seq --stream '[inputs]'` prints `[[[0]]]` and then the warning `Unfinished JSON term at EOF`, and `jq -e` exits 5 on a fault a later `input` raises).
-  A run that never reads an input ends at the stop.
-  `tests/jq_cli/i6141.rs` pins it, and random record sequences over 16 programs matched `/usr/bin/jq` 1.7.1 on stdout, stderr and exit status (the same sequences differed in 13 of 4,000 runs before).
+  An empty record in the last read does not end the stream, as over documents: jq 1.8.2 reads past it, and `succinctly jq` follows it since #7718, so `printf '\x1e[1]\n\x1e[2]' | jq --seq --stream -c .` prints every event of both records.
+  jq 1.7.1 ended the stream there (#2998), and from [#6141](https://github.com/rust-works/succinctly/issues/6141) to #7718 a program that read inputs found a barrier there, which `input` raised as `break` and `inputs` ended at.
+  `tests/jq_cli/i6141.rs` pins jq 1.8.2's reading of its rows now.
   The events of a `--seq --stream` run are read whole before the program starts, so memory grows with the input; the chunked reader that plain `--stream` uses (#5498) does not serve `--seq`.
 - **A file that does not open** and is named before one that does makes jq's `--stream` stop after the first event of the later file (`jq -c --stream . missing.json a.json` prints `[[0],1]` and the open error, exit 2), where succinctly prints every event.
   Both `-n` with `inputs` and a non-stream run agree with jq there, so the quirk is in jq's streaming parser's state after the failed open, not in what the program reads.

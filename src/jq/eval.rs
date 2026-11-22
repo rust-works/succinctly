@@ -109396,10 +109396,9 @@ fn each_inputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                         return Flow::Stopped { pending: None };
                     }
                 }
-                // jq's `inputs` re-raises anything but `break` (#2961). A `break` read from the
-                // queue itself is a read the driver raised that error for -- `--seq`'s empty
-                // record (#5662) -- so `inputs` ends there, and the next read resumes.
-                InputPop::ParseError(error) if error.message == "break" => return Flow::Exhausted,
+                // jq's `inputs` re-raises anything but `break` (#2961). (No reader queues a
+                // `break` since #7718: jq 1.7.1's `--seq` driver raised one at an empty record in
+                // its last buffer, #5662, and jq 1.8.2's does not.)
                 InputPop::ParseError(error) => return Flow::Escaped(Control::Error(error)),
                 InputPop::Exhausted => return Flow::Exhausted,
             }

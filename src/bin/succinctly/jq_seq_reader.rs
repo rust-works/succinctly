@@ -45,25 +45,24 @@
 //! a value which looks complete to a token scanner can still be discarded by
 //! the scan call that discovers a malformed suffix (notably `1,2`).
 //!
-//! **Non-slurp `--seq` can end the whole stream silently, with nothing left
-//! to explain it (#2998).** This is not a property of any record's own
-//! content, so it sits outside the "moment of detection" model above:
-//! real jq's caller (`jq_util_input_next_input`, `src/util.c`) tracks "was
-//! this buffer just refilled" in a local variable, reset on every call. The
-//! one scan-loop event this module already modelled as an "unreachable in
-//! practice" branch -- an RS byte arriving with nothing pending, which
-//! `jv_parser_next` returns as a message-less invalid -- is exactly what
-//! that caller reads as "no more input", but *only* when it is the first
-//! event scanned by the specific call that just performed the terminal
-//! `fgets` refill. A later call reusing the same (already-final) buffer,
-//! because an earlier call already returned something from it, has no
-//! fresh refill to reset that local, so it keeps looping internally
-//! instead and absorbs any number of further empty records.
-//! `final_buffer_start`/`yielded_in_final_buffer`/`stopped` on [`Reader`]
-//! model exactly that: the drop point is [`final_buffer_start`], not a byte
-//! the scanner itself finds anything wrong with.
+//! **Every byte of every file is read, as in jq 1.8.2 (#7718).** jq 1.7.1's
+//! caller (`jq_util_input_next_input`, `src/util.c`) took the refill that
+//! reached the end of the last file for the end of the stream (`is_last`), so
+//! an empty record that was the first thing that call scanned (`jv_parser_next`'s
+//! message-less return) ended the whole stream silently, and the records
+//! behind it were never read (#2998): `\x1e1\n\x1etrue` printed only `1`. jq
+//! 1.8.2 reports the end only once the last file is closed, one refill later
+//! (jqlang/jq#3279, commit 4e3088f), so the buffer that holds the last bytes is
+//! never the final one: the final buffer is always the empty one read after
+//! them. The reader follows 1.8.2 there -- an empty record never ends the
+//! stream, under a malformed BOM that empty buffer's `parser_reset` wipes what
+//! the EOF branch would report ([`Reader::suppress_eof_warning`]), and under `-s`
+//! the EOF branch reports in the call that reads the stream, before the array
+//! is handed on. What 1.7.1 answers for the *position* after the last input
+//! is kept (#7607): [`final_buffer_start`] still places 1.7.1's final buffer for
+//! that.
 //!
-//! **The same local decides `--seq -s`'s error location (#2947/#3003).**
+//! **1.7.1's `is_last` local decides `--seq -s`'s error location (#2947/#3003).**
 //! Under `-s` nothing is dropped, but whether a later runtime error can
 //! name `file:line` or must say `<unknown>` is again a question about
 //! *which call* did what: the slurped array keeps its position iff the
@@ -81,11 +80,6 @@ const ASCII_RS: u8 = 0x1e;
 /// (`src/util.c`) calls `fgets(state->buf, sizeof(state->buf), f)` on a
 /// `char buf[4096]`, and `fgets` reserves one byte for the terminating NUL.
 pub(crate) const JQ_FGETS_CHUNK: usize = 4095;
-
-/// The fault the reader records for `jv_parser_next`'s message-less return (#5662): `input` raises
-/// it as `break`, the error an exhausted stream raises, and jq's main loop takes it for the end of
-/// the stream and stops reading, where it prints any other fault as ignored (#6137).
-pub(crate) const MESSAGELESS_RETURN: &str = "break";
 
 /// jq 1.7.1's `main` line for a `--seq` parse error it skips
 /// (`fprintf(stderr, "jq: ignoring parse error: %s\n", ...)`), for the
@@ -277,10 +271,12 @@ fn value_locations(
 /// empty (or newline-free) trailing source from inheriting an earlier
 /// source's chunk boundary.
 ///
-/// Two rules hang off "does offset X fall in jq's last buffer": `-s`'s
-/// EOF-location answer ([`SeqStreamWalk::slurp_position_lost`] -- a
-/// diagnostic's position) and the non-slurp end-of-stream rule (a *value*,
-/// #2998). Returns the stream's own total length when the final buffer is
+/// The positions jq 1.7.1 names after the last input hang off "does offset X fall in jq's last
+/// buffer" (#7607): `-s`'s EOF-location answer ([`SeqStreamWalk::slurp_position_lost`]) and the
+/// `<unknown>` of an EOF report raised after the last value ([`Reader::fault_position_lost`]). What
+/// is read no longer does: jq 1.8.2 reads one more, empty, buffer after this one, and the reader
+/// follows it (#7718; 1.7.1 ended a non-slurp stream at an empty record that was this buffer's
+/// first event, #2998). Returns the stream's own total length when the final buffer is
 /// empty, so a caller comparing `offset >= final_buffer_start` correctly
 /// finds nothing: no real offset ever reaches the stream's own length --
 /// and `final_buffer_start == total` is how that emptiness is read back.
@@ -567,14 +563,12 @@ fn rfind_byte(needle: u8, hay: &[u8]) -> Option<usize> {
 /// (2 MB of `}` measured at 286 MB, against jq's 2.4 MB). Streaming them
 /// keeps the reader flat.
 ///
-/// `slurp` matters beyond the warnings: real jq's non-slurp `--seq` driver
-/// (`jq_util_input_next_input`, `src/util.c`) can end the *entire* stream
-/// silently once it reaches jq's own `fgets`-chunked final buffer -- see
-/// [`SeqStreamWalk::values`] and [`final_buffer_start`] (#2998). `-s`
-/// keeps looping (`has_more`), so this never applies there; passing
-/// `slurp: true` disables it, matching jq's own mode split exactly. The
-/// walk's other answer, [`SeqStreamWalk::slurp_position_lost`], is
-/// computed either way and only read under `-s`.
+/// `slurp` decides one position: the `<unknown>` of an EOF report raised after
+/// the last value, which only a run without `-s` can name ([`Reader::fault_position_lost`]).
+/// The walk's other answer, [`SeqStreamWalk::slurp_position_lost`], is
+/// computed either way and only read under `-s`. (jq 1.7.1's non-slurp driver
+/// could also end the stream at an empty record in its final buffer, #2998;
+/// jq 1.8.2's does not, and the walk follows it, #7718.)
 pub(crate) fn walk_stream(
     raw_bytes: &[(Option<usize>, Vec<u8>)],
     slurp: bool,
@@ -664,10 +658,11 @@ pub(crate) struct PlainGuards {
     /// The stream starts on an RS: bytes before the first RS are discarded by jq's reader without a
     /// word (`WaitingForRs`), so `false\n` is no value at all.
     pub(crate) starts_on_rs: bool,
-    /// The stream ends on a newline (#2998): every RS after the first takes the reader's
-    /// message-less branch, so a final buffer that starts on one ends the stream and drops its
-    /// record (`\x1e12.5`). The record guard below rejects the same streams, but only after the
-    /// check has read every record before the last: this one is a precheck that fails them first.
+    /// The stream ends on a newline: a last record with none after it ends in the EOF branch, which
+    /// warns on a number with nothing after it (`\x1e12.5`), and jq 1.7.1 dropped such a record
+    /// (#2998, which jq 1.8.2 and the reader no longer do, #7718). The record guard below rejects
+    /// the same streams, but only after the check has read every record before the last: this one
+    /// is a precheck that fails them first.
     pub(crate) ends_on_newline: bool,
     /// Every record ends on a newline: an RS straight after a number or a literal is a truncation
     /// warning (`\x1e1\x1e`).
@@ -823,10 +818,9 @@ impl PlainRecords {
 /// it, from the first record that is not, is walked by the reader that reads a stream whole.
 ///
 /// After such a record jq's reader stands at the start of a line, in `Normal` (an RS is a record of its
-/// own there, which in the final buffer ends the stream, #2998, where at the start of a stream it only
-/// opens one), with nothing pending, and its `fgets` chunks start afresh at the line break. So the
+/// own there, where at the start of a stream it only opens one), with nothing pending, and its `fgets` chunks start afresh at the line break. So the
 /// bytes from there are read as they are read after an RS and `lines` line breaks, each a chunk of its
-/// own: every line, value, warning and drop rule comes out as in the whole stream, the column too (it
+/// own: every line, value, warning and position rule comes out as in the whole stream, the column too (it
 /// is 0 at a line's start). Nothing before the tail yields a value or a warning. The one other state the
 /// reader carries over a clean record is the stale byte of its token buffer, which
 /// [`token_byte_after`] finds and [`seed_token_byte`] gives the walk.
@@ -980,8 +974,9 @@ thread_local! {
 /// ends it already reported. The windows of a `--seq` stream hand a tail on at an RS ([`resumed_stream`]),
 /// and when the stretch read before it ended at that RS, jq's reader met it there as the end of a
 /// truncated value: an error the call returns, never the message-less return of an RS with nothing
-/// pending, which in the last `fgets` buffer ends the stream (#2998). A reader of the tail alone would
-/// have met it with nothing pending, and dropped what follows it. `None` reads every RS as it comes.
+/// pending. A reader of the tail alone would have met it with nothing pending, and not counted the
+/// fault for the positions that hang off the final buffer ([`Reader::note_fault`]). `None` reads every
+/// RS as it comes.
 pub(crate) fn seed_faulted_rs(at: Option<usize>) {
     SEEDED_FAULTED_RS.with(|seed| seed.set(at));
 }
@@ -1013,7 +1008,7 @@ const MAX_STRETCH_WARNINGS: usize = 1 << 16;
 /// pending (or waiting for the stream's first RS). After its last byte, an RS, the reader is there
 /// again whatever the stretch held: an RS resets the parser, with a warning or without. So the
 /// records after the stretch are read as the records before it were, and the stretch is all of the
-/// stream this walk needs. It is never the stream's end, so neither the final buffer's rule (#2998)
+/// stream this walk needs. It is never the stream's end, so neither the final buffer's position rules
 /// nor the EOF branch applies.
 ///
 /// `None` when the stretch warns more than [`MAX_STRETCH_WARNINGS`] times, or (defensive) when the
@@ -1052,8 +1047,7 @@ pub(crate) fn walk_stretch(
     let settled = reader.st == St::Normal
         && reader.stack.is_empty()
         && reader.token_len == 0
-        && reader.next.is_none()
-        && !reader.stopped;
+        && reader.next.is_none();
     let token_byte = reader.token_buf.get(1).copied();
     let values = std::mem::take(&mut reader.values);
     let at_eof = reader.yielded_at.contains(&YIELDED_AT_EOF);
@@ -1184,17 +1178,12 @@ fn walk_stream_placing(
     };
     reader.final_buffer_start = final_buffer_start;
     reader.total = total;
-    if bom.malformed {
-        // The call for an *empty* final buffer -- after a chunk that ended
-        // on a newline, or filled the buffer exactly -- resets as well,
-        // wiping the accumulated state before the EOF branch can report on
-        // it, so no `at EOF` warning survives. A final buffer holding data
-        // hits EOF in the same read and does report one. `final_buffer_start
-        // == total` is how [`final_buffer_start`] spells an empty one.
-        reader.suppress_eof_warning = final_buffer_start == total;
-    }
-    reader.drops_at_first_empty_record = !slurp;
-    reader.defers_eof_warning = slurp;
+    // The call for the *empty* final buffer resets as well, wiping the accumulated state before the
+    // EOF branch can report on it, so no `at EOF` warning survives. jq 1.8.2's final buffer is always
+    // that empty one (#7718); jq 1.7.1's held data unless the last chunk ended on a newline or filled
+    // the buffer exactly, and reported there.
+    reader.suppress_eof_warning = bom.malformed;
+    reader.slurp = slurp;
     // One buffer, so `run` can look ahead; only a multi-source stream is copied into one.
     let combined: std::borrow::Cow<'_, [u8]> = match raw_bytes {
         [(_, only)] => std::borrow::Cow::Borrowed(only.as_slice()),
@@ -1212,19 +1201,6 @@ fn walk_stream_placing(
     let slurp_position_lost = reader.warned_in_final_buffer
         || (reader.last_warning_at_eof
             && !(reader.last_byte_yielded_value && final_buffer_start < total));
-    // #3201: jq raises the EOF branch's report in the *next* `next_input`
-    // call exactly when the terminal call returned without an error -- the
-    // same condition that keeps its position -- so it is deferred past the
-    // filter iff the position survives. Otherwise it is the reading call's,
-    // and the last warning printed.
-    let deferred_warning = match reader.pending_eof_warning.take() {
-        Some(body) if !slurp_position_lost => Some(body),
-        Some(body) => {
-            reader.emit_warning(&body);
-            None
-        }
-        None => None,
-    };
     let faults = if collect_faults {
         let at: Vec<usize> = reader.faults.iter().map(|fault| fault.at).collect();
         value_locations(raw_bytes, &at)
@@ -1264,7 +1240,6 @@ fn walk_stream_placing(
         slurp_position_lost,
         locations,
         unplaced,
-        deferred_warning,
         values: reader.values,
         cuts,
     }
@@ -1313,6 +1288,9 @@ pub(crate) struct SeqStreamWalk {
     /// jq answering `(at <unknown>)` where it would otherwise name a file
     /// and line (#1542/#1550/#1568/#2947/#3003). Only meaningful under
     /// `-s`; a non-slurp stream carries a location per value instead.
+    ///
+    /// jq 1.7.1's answer, kept where what is *read* follows jq 1.8.2 (#7718):
+    /// 1.8.2 never forgets the file name, so it always names one (#7607).
     ///
     /// **The mechanism, from jq 1.7.1's own `src/util.c`.** `<unknown>` is
     /// not a property of the trailing record at all:
@@ -1425,8 +1403,9 @@ pub(crate) struct SeqStreamWalk {
     pub(crate) slurp_position_lost: bool,
     /// The byte range of every value jq yields, in order, as absolute
     /// offsets into the concatenated raw sources (BOM bytes counted, the
-    /// numbering [`Reader::run`] uses). Already cut at real jq's
-    /// non-slurp end-of-stream drop (#2998), since the walk stops there.
+    /// numbering [`Reader::run`] uses). Every value of the stream: jq 1.8.2
+    /// reads to the end, where 1.7.1 could end a non-slurp stream at an empty
+    /// record (#2998, #7718).
     ///
     /// Raw, like everything else this walk answers (#3247). The values used
     /// to come from a second walk over the stream *after* UTF-8
@@ -1454,19 +1433,6 @@ pub(crate) struct SeqStreamWalk {
     /// the newlines of every `fgets` chunk read by then, the whole chunk
     /// holding it included ([`value_locations`]).
     pub(crate) locations: Vec<(usize, usize)>,
-    /// Under `-s`, the EOF branch's warning when jq raises it only on the
-    /// *next* `next_input` call, after the slurped array has been handed to
-    /// the filter (#3201) -- the same-call exit [`Self::slurp_position_lost`]
-    /// describes for #3003: the terminal call yielded a value on the final
-    /// buffer's last byte and returned, so what that byte opened is reported
-    /// by the call after. Not passed to `emit`. The body only, without the
-    /// `jq: ignoring parse error: ` prefix.
-    ///
-    /// jq's main loop prints it as an ignored parse error once the filter
-    /// has run -- so a runtime error comes first, and `halt` suppresses it
-    /// -- and an `input`/`inputs` in the filter receives it as its own
-    /// error instead, at `(at <unknown>)`.
-    pub(crate) deferred_warning: Option<String>,
 }
 
 /// The bytes of `combined[start..end]` with `cuts` ([`SeqStreamWalk::cuts`]) taken out, borrowed
@@ -1633,12 +1599,12 @@ struct Reader<'a> {
     /// yielded each one, or [`YIELDED_AT_EOF`] for jq's EOF branch. jq names
     /// a value's position from where its reader stood *then* (#3250).
     yielded_at: Vec<usize>,
-    /// See [`walk_stream`]: a malformed BOM plus an empty final `fgets`
-    /// buffer (the stream ends on a newline, or fills its last chunk
-    /// exactly) means jq's own EOF report is wiped before it is written. It
-    /// models jq's reset at that empty buffer, so [`Reader::finish`] yields
-    /// no value either -- none can be pending there, since the refill before
-    /// it already reset -- and the value walk is this walk.
+    /// See [`walk_stream`]: a malformed BOM plus the empty final `fgets`
+    /// buffer jq 1.8.2 always reads last (#7718) means jq's own EOF report is
+    /// wiped before it is written. It models jq's reset at that empty buffer,
+    /// so [`Reader::finish`] yields no value either: the reset wipes a number
+    /// or literal still waiting for the byte after it (`\xef\xbb1 2` is `1`
+    /// alone), and the value walk is this walk.
     suppress_eof_warning: bool,
     /// Whether the most recent [`Reader::warn`] came from [`Reader::finish`],
     /// jq's EOF branch. `finish` warns at most once and runs last, so this
@@ -1656,52 +1622,29 @@ struct Reader<'a> {
     /// The raw offset where jq's final `fgets` buffer begins (see
     /// [`final_buffer_start`]). [`walk_stream`] always sets it; the
     /// `usize::MAX` it starts at is past every real offset, so a `Reader`
-    /// built without it would silently skip both rules below. Two rules
-    /// hang off it: the non-slurp end-of-stream drop (#2998, gated by
-    /// [`Reader::drops_at_first_empty_record`]) and `-s`'s EOF-location
-    /// answer (#3003, [`SeqStreamWalk::slurp_position_lost`]).
+    /// built without it would silently skip the position rules that hang
+    /// off it: `-s`'s EOF-location answer (#3003,
+    /// [`SeqStreamWalk::slurp_position_lost`]) and
+    /// [`Reader::fault_position_lost`], both jq 1.7.1's (#7607, #7718).
     final_buffer_start: usize,
-    /// Whether real jq's non-slurp end-of-stream rule (#2998) applies:
-    /// `-s` keeps its own `has_more` loop going past the event that ends a
-    /// non-slurp stream, so the drop below never fires there. When the walk
-    /// collects faults (`-n`'s `input`/`inputs`) the drop is a recorded `break`
-    /// instead of a stop: `input` raises it and the next read scans on (#5662).
-    drops_at_first_empty_record: bool,
-    /// Whether a value or a warning has already been produced at an offset
-    /// `>= final_buffer_start`. jq's own driver (`jq_util_input_next_input`,
-    /// `src/util.c`) tracks "is this the buffer that just got refilled"
-    /// (`is_last`) as a *local*, reset on every call: only the specific
-    /// call that performs the terminal refill can exit silently on a
-    /// message-less empty-record reset, and only if that is the very
-    /// *first* event the call scans. Any later call reusing the same
-    /// buffer (because an earlier call already returned a value or an
-    /// error from it) loops internally instead, absorbing any number of
-    /// further empty records without dropping anything. This flag is that
-    /// "already returned something from this buffer" condition.
-    yielded_in_final_buffer: bool,
     /// Whether a *mid-stream* warning (not the EOF branch's) was raised at
     /// an offset `>= final_buffer_start`. Under `-s` that is an early
     /// `return` out of the very `next_input` call that performed the
     /// terminal refill, which is what costs jq its position (#2947/#3003);
     /// see [`SeqStreamWalk::slurp_position_lost`].
     warned_in_final_buffer: bool,
-    /// [`walk_stream`]'s `slurp`: whether the EOF branch's warning is held
-    /// in `pending_eof_warning` for [`walk_stream`] to emit or defer
-    /// ([`SeqStreamWalk::deferred_warning`]).
-    defers_eof_warning: bool,
-    /// The EOF branch's warning body, held per `defers_eof_warning`.
-    pending_eof_warning: Option<String>,
+    /// [`walk_stream`]'s `slurp`. jq 1.8.2's slurp loop reads the empty final
+    /// buffer before it hands the array on, so the EOF branch's report is the
+    /// reading call's, with its position, before the filter runs (#7718); jq
+    /// 1.7.1 raised it in the call after when the last byte completed a value
+    /// (#3201).
+    slurp: bool,
     /// Whether scanning the stream's *last* byte handed a value to the
     /// caller -- jq's `jv_parser_next` returning `OK` with its buffer fully
     /// consumed, so `has_more == 0` and the EOF branch is never reached in
     /// that call (#3003). Captured per byte inside [`Reader::run`]'s loop:
     /// a value [`Reader::finish`] itself completes is not this.
     last_byte_yielded_value: bool,
-    /// Set once [`Reader::scan`]'s empty-record reset hits jq's drop point:
-    /// [`Reader::run`] stops scanning immediately and skips [`Reader::finish`]
-    /// entirely, since real jq's `p->eof` is never set on this path -- no
-    /// `at EOF` diagnostic for anything left unscanned (#2998).
-    stopped: bool,
     /// Whether [`Reader::emit_warning`] records each diagnostic (#5640); see
     /// [`walk_stream_collecting`].
     collect_faults: bool,
@@ -1749,13 +1692,9 @@ impl<'a> Reader<'a> {
             faulted_rs: SEEDED_FAULTED_RS.with(std::cell::Cell::get),
             at_eof: false,
             final_buffer_start: usize::MAX,
-            drops_at_first_empty_record: false,
-            yielded_in_final_buffer: false,
             warned_in_final_buffer: false,
-            defers_eof_warning: false,
-            pending_eof_warning: None,
+            slurp: false,
             last_byte_yielded_value: false,
-            stopped: false,
             collect_faults: false,
             faults: Vec::new(),
             total: 0,
@@ -1765,14 +1704,6 @@ impl<'a> Reader<'a> {
 
     fn warn(&mut self, body: &str) {
         self.note_fault();
-        // #3201: under `-s` the EOF branch's report is held here and
-        // [`walk_stream`] decides, once the whole walk has answered
-        // `slurp_position_lost`, whether jq raises it in the reading call
-        // (emitted then) or in the next one (deferred).
-        if self.at_eof && self.defers_eof_warning {
-            self.pending_eof_warning = Some(body.to_string());
-            return;
-        }
         self.emit_warning(body);
     }
 
@@ -1780,11 +1711,8 @@ impl<'a> Reader<'a> {
     /// here: [`Reader::warn`]'s, and a fault the stream was handed on after ([`seed_faulted_rs`]).
     fn note_fault(&mut self) {
         self.last_warning_at_eof = self.at_eof;
-        if self.offset >= self.final_buffer_start {
-            self.yielded_in_final_buffer = true;
-            if !self.at_eof {
-                self.warned_in_final_buffer = true;
-            }
+        if self.offset >= self.final_buffer_start && !self.at_eof {
+            self.warned_in_final_buffer = true;
         }
     }
 
@@ -1794,9 +1722,14 @@ impl<'a> Reader<'a> {
     /// returns that value from its terminal refill and raises the report in the *next* read,
     /// after `read_more` has closed the stream (#3201, #3003) -- so `input` names `<unknown>`
     /// where it would name `file:line` for the same report raised in the reading call. A
-    /// mid-stream fault is raised by the call that met it, position intact.
+    /// mid-stream fault is raised by the call that met it, position intact. That is jq 1.7.1's
+    /// position, which jq 1.8.2 keeps the file name for (#7607). Never under `-s`, whose loop reads
+    /// the stream to its end before it hands anything on (#7718), so the reading call raises it.
     fn fault_position_lost(&self) -> bool {
-        self.at_eof && self.last_byte_yielded_value && self.final_buffer_start < self.total
+        !self.slurp
+            && self.at_eof
+            && self.last_byte_yielded_value
+            && self.final_buffer_start < self.total
     }
 
     fn emit_warning(&mut self, body: &str) {
@@ -1959,12 +1892,6 @@ impl<'a> Reader<'a> {
                 // (#3003).
                 self.last_byte_yielded_value = self.produced_value;
                 self.produced_value = false;
-                if self.stopped {
-                    // jq's stream ends *here*: `p->eof` is never set on this
-                    // path, so nothing past this byte is ever scanned and no
-                    // `at EOF` diagnostic follows (#2998).
-                    return;
-                }
             }
             match self.scan_cuts.get(cut) {
                 // Past the cut; a BOM jq consumed can already have taken the reader beyond its start.
@@ -1993,9 +1920,6 @@ impl<'a> Reader<'a> {
 
     fn flush_completed(&mut self) {
         if let Some(range) = self.completed.take() {
-            if self.offset >= self.final_buffer_start {
-                self.yielded_in_final_buffer = true;
-            }
             self.values.push(range);
             self.yielded_at.push(if self.at_eof {
                 YIELDED_AT_EOF
@@ -2041,30 +1965,12 @@ impl<'a> Reader<'a> {
             }
             // jq's own "shouldn't happen" branch: `jv_parser_next` returns
             // a message-less invalid here (`parser_reset` then
-            // `*out = jv_invalid()`). Real jq's caller
-            // (`jq_util_input_next_input`, `src/util.c`) tracks whether the
-            // *current* buffer was just refilled in a local variable reset
-            // on every call, so it treats that message-less return as "no
-            // more input" only when this is the first event scanned from
-            // the stream's final `fgets` buffer -- any later call reusing
-            // the same buffer (because an earlier call already returned a
-            // value or an error from it) simply loops and keeps parsing.
-            // #2998. `-s` has its own `has_more` loop and never stops here.
-            if self.drops_at_first_empty_record
-                && self.offset >= self.final_buffer_start
-                && !self.yielded_in_final_buffer
-            {
-                if self.collect_faults {
-                    // #5662: `input` reads through the same driver, and the message-less
-                    // return is its `break` -- the error an exhausted stream raises -- but the
-                    // stream is not over: the next read scans on, and the call that
-                    // performed the terminal refill is spent.
-                    self.record_fault(MESSAGELESS_RETURN);
-                    self.yielded_in_final_buffer = true;
-                } else {
-                    self.stopped = true;
-                }
-            }
+            // `*out = jv_invalid()`), which jq 1.8.2's caller
+            // (`jq_util_input_next_input`, `src/util.c`) reads past: it ends
+            // only once the last file is closed. jq 1.7.1's ended the whole
+            // stream here when this was the first event of the call that read
+            // the last file's last bytes (#2998), and `input` raised `break`
+            // (#5662); the reader follows 1.8.2 (#7718).
             self.reset();
             return Ok(());
         }
@@ -2594,9 +2500,7 @@ mod tests {
             sources.iter().map(|s| (None, s.to_vec())).collect();
         let mut got = Vec::new();
         // Non-slurp: these templates were all captured against plain
-        // `jq --seq -c .`, not `-s` (#2998 gives the two modes different
-        // end-of-stream behavior, but none of these inputs reach it --
-        // see `warnings_are_unaffected_by_the_2998_drop_rule` below).
+        // `jq --seq -c .`, not `-s`.
         walk_stream(&owned, false, &mut |w| {
             got.push(
                 w.strip_prefix("jq: ignoring parse error: ")
@@ -2788,54 +2692,40 @@ mod tests {
         }
     }
 
-    /// Real jq's non-slurp `--seq` driver can end the *entire* stream
-    /// silently at the first empty record of jq's own final `fgets`
-    /// buffer (#2998) -- oracle-verified against `/usr/bin/jq` 1.7.1,
-    /// every row here confirmed live. None of these produce a warning
-    /// either: jq's `p->eof` is never set on this path, so there is no
-    /// `at EOF` diagnostic for whatever went unscanned.
+    /// jq 1.7.1's non-slurp `--seq` driver ended the *entire* stream
+    /// silently at the first empty record of its own final `fgets` buffer
+    /// (#2998); jq 1.8.2 reads every record (#7718), and so does the walk.
+    /// Every row is `/opt/homebrew/bin/jq` 1.8.2's (1.7.1 printed nothing for
+    /// each, and no warning).
     #[test]
-    fn end_of_stream_rule_drops_the_final_buffers_leading_empty_record_2998() {
-        for input in [
-            &b"\x1e\x1etrue"[..],
-            b"\x1e\x1e\"s\"",
-            b"\x1e\x1e5",
-            b"\x1e \x1e{}",
-            b"\x1e\n\x1etrue",
+    fn an_empty_record_in_the_last_buffer_does_not_end_the_stream_7718() {
+        for (input, values) in [
+            (&b"\x1e\x1etrue"[..], &["true"][..]),
+            (b"\x1e\x1e\"s\"", &["\"s\""]),
+            (b"\x1e \x1e{}", &["{}"]),
+            (b"\x1e\n\x1etrue", &["true"]),
+            (b"\x1e1\n\x1etrue", &["1", "true"]),
+            (b"\x1e1\n\x1e\x1e\"abc", &["1"]),
+            (b"\x1e\x1e5", &[]),
         ] {
-            assert_eq!(
-                seq_value_texts(input, false),
-                Vec::<String>::new(),
-                "input: {input:?}"
-            );
-            assert_eq!(warnings(&[input]), Vec::<String>::new(), "input: {input:?}");
+            assert_eq!(seq_value_texts(input, false), values, "input: {input:?}");
         }
+        // What the EOF branch reports is reported: 1.7.1 never reached it here.
+        assert_warnings(
+            b"\x1e\x1e5",
+            &["Potentially truncated top-level numeric value at EOF at line 1, column 3"],
+        );
+        assert_warnings(
+            b"\x1e1\n\x1e\x1e\"abc",
+            &["Unfinished string at EOF at line 2, column 6"],
+        );
+        assert_warnings(b"\x1e1\n\x1etrue", &[]);
     }
 
-    /// An earlier record's own *value* leaves the parser in the same state
-    /// a genuinely empty one would (both return to `NORMAL` with nothing
-    /// pending) -- the drop doesn't need the empty record to be the
-    /// stream's first, just the final buffer's own first event. `1` still
-    /// prints: it was returned by an earlier `fgets` chunk, before the
-    /// buffer this rule ever looks at existed.
+    /// An earlier value or error in the same buffer never mattered, and
+    /// still does not.
     #[test]
-    fn end_of_stream_rule_only_needs_the_final_buffers_own_first_event_to_be_empty_2998() {
-        assert_eq!(seq_value_texts(b"\x1e1\n\x1etrue", false), vec!["1"]);
-        assert_eq!(warnings(&[b"\x1e1\n\x1etrue"]), Vec::<String>::new());
-        // The suppression reaches later warnings in the same (final)
-        // buffer too: no "Unfinished string at EOF" here, even though
-        // `"abc` never gets a closing quote -- jq's `p->eof` is never set
-        // on this path.
-        assert_eq!(seq_value_texts(b"\x1e1\n\x1e\x1e\"abc", false), vec!["1"]);
-        assert_eq!(warnings(&[b"\x1e1\n\x1e\x1e\"abc"]), Vec::<String>::new());
-    }
-
-    /// The drop fires only when the empty record is the *first* event
-    /// scanned from the final buffer -- an earlier value or error in the
-    /// same (single, newline-free) buffer means every later empty record
-    /// is just absorbed, matching real jq's own per-call `is_last` reset.
-    #[test]
-    fn end_of_stream_rule_spares_a_buffer_whose_first_event_is_not_empty_2998() {
+    fn an_empty_record_after_a_value_in_the_same_buffer_is_read_past_2998() {
         assert_eq!(seq_value_texts(b"\x1e1 \x1etrue", false), vec!["1", "true"]);
         assert_eq!(
             seq_value_texts(b"\x1e{}\x1etrue", false),
@@ -2845,19 +2735,17 @@ mod tests {
             seq_value_texts(b"\x1e\"a\"\x1etrue", false),
             vec!["\"a\"", "true"]
         );
-        // The first event is an *error* (truncated `1`), not a value --
-        // still not empty, so the rest of the buffer parses normally.
+        // The first event is an *error* (truncated `1`).
         assert_eq!(
             seq_value_texts(b"\x1e1\x1e2 \x1etrue", false),
             vec!["2", "true"]
         );
     }
 
-    /// Controls: a trailing newline empties the final buffer entirely (no
-    /// offset in the stream can reach it), so nothing is ever dropped by
-    /// this rule regardless of what came before.
+    /// Controls: a trailing newline, which empties jq 1.7.1's final buffer
+    /// too, so both releases read these alike.
     #[test]
-    fn end_of_stream_rule_never_fires_on_a_trailing_newline_2998() {
+    fn a_trailing_newline_reads_alike_in_both_releases_2998() {
         assert_eq!(seq_value_texts(b"\x1e\x1etrue\n", false), vec!["true"]);
         assert_eq!(
             seq_value_texts(b"\x1e\x1etrue\n\x1e5\n", false),
@@ -2865,12 +2753,10 @@ mod tests {
         );
     }
 
-    /// `-s` is unaffected: real jq's `has_more` keeps its own read loop
-    /// going regardless of which buffer produced the empty record, so the
-    /// value survives and the warning the non-slurp rule would have
-    /// suppressed fires normally.
+    /// `-s` reads alike in both releases: jq 1.7.1's `has_more` kept its read
+    /// loop going past the empty record too.
     #[test]
-    fn end_of_stream_rule_does_not_apply_under_slurp_2998() {
+    fn an_empty_record_under_slurp_is_read_past_2998() {
         assert_eq!(seq_value_texts(b"\x1e\x1etrue", true), vec!["true"]);
         assert_eq!(
             warnings_slurp(&[b"\x1e1\n\x1e\x1e\"abc"]),
@@ -2981,15 +2867,13 @@ mod tests {
 
     /// The #3003 answer is read off the same walk as the diagnostics and
     /// the values: keeping the position changes neither the warning's text
-    /// nor the values. Under `-s` the warning is jq's *next* `next_input`
-    /// call's, so it is deferred rather than emitted (#3201); the
-    /// non-slurp walk still emits it.
+    /// nor the values. Under `-s` jq 1.8.2 reports it in the reading call
+    /// (#7718), as the non-slurp walk does.
     #[test]
     fn final_byte_rule_leaves_warnings_and_values_alone_3003() {
-        assert_eq!(warnings_slurp(&[b"\x1e1{"]), Vec::<String>::new());
         assert_eq!(
-            deferred_slurp(&[b"\x1e1{"]).as_deref(),
-            Some("Unfinished JSON term at EOF at line 1, column 3"),
+            warnings_slurp(&[b"\x1e1{"]),
+            ["Unfinished JSON term at EOF at line 1, column 3"],
         );
         assert_eq!(
             warnings(&[b"\x1e1{"]),
@@ -2999,21 +2883,14 @@ mod tests {
         assert_eq!(seq_value_texts(b"\x1e1{", false), vec!["1"]);
     }
 
-    /// [`SeqStreamWalk::deferred_warning`] under `-s`.
-    fn deferred_slurp(sources: &[&[u8]]) -> Option<String> {
-        let owned: Vec<(Option<usize>, Vec<u8>)> =
-            sources.iter().map(|s| (None, s.to_vec())).collect();
-        walk_stream(&owned, true, &mut |_| {}).deferred_warning
-    }
-
-    /// #3201: jq defers exactly the EOF warning whose terminal call yielded
-    /// a value on the final buffer's last byte. Anything else it reports in
-    /// the reading call, before the filter runs. Captured from
-    /// `/usr/bin/jq` 1.7.1 as `--seq -s 'error("x")'` (the deferred warning
-    /// prints *after* the runtime error).
+    /// #7718: jq 1.8.2's slurp loop reads the empty buffer after the last bytes before it hands the
+    /// array on, so the EOF warning is the reading call's, before the program runs, whatever the
+    /// last byte completed. jq 1.7.1 raised it in the call after when the last byte yielded a value
+    /// (#3201: the first group, printed after `error("x")`'s line). Captured from
+    /// `/opt/homebrew/bin/jq` 1.8.2 as `--seq -s 'error("x")'`.
     #[test]
-    fn slurp_defers_only_the_next_calls_eof_warning_3201() {
-        for (input, deferred) in [
+    fn slurp_reports_the_eof_warning_in_the_reading_call_7718() {
+        for (input, warning) in [
             (
                 &b"\x1e1{"[..],
                 "Unfinished JSON term at EOF at line 1, column 3",
@@ -3027,20 +2904,8 @@ mod tests {
                 b"\x1e1 2{",
                 "Unfinished JSON term at EOF at line 1, column 5",
             ),
-        ] {
-            assert_eq!(
-                deferred_slurp(&[input]).as_deref(),
-                Some(deferred),
-                "{input:?}"
-            );
-            assert_eq!(warnings_slurp(&[input]), Vec::<String>::new(), "{input:?}");
-        }
-        // Reported in the reading call: a string or container completes on
-        // its own last byte, so the `{` after it is scanned in the same call;
-        // a separator before the `{` means the last byte yielded nothing.
-        for (input, warning) in [
             (
-                &b"\x1e\"a\"{"[..],
+                b"\x1e\"a\"{",
                 "Unfinished JSON term at EOF at line 1, column 5",
             ),
             (
@@ -3052,16 +2917,8 @@ mod tests {
                 "Unfinished JSON term at EOF at line 1, column 5",
             ),
         ] {
-            assert_eq!(deferred_slurp(&[input]), None, "{input:?}");
             assert_eq!(warnings_slurp(&[input]), [warning], "{input:?}");
         }
-        // The final buffer's last byte: a trailing newline starts an empty
-        // final buffer, which reports in the reading call.
-        assert_eq!(deferred_slurp(&[b"\x1e1{\n"]), None);
-        // A warning earlier in the final buffer means the terminal refill
-        // happened in an earlier call, which returned that error; the call
-        // yielding on the last byte then reads on to EOF itself (review).
-        assert_eq!(deferred_slurp(&[b"\x1e1{\x1e1{"]), None);
         assert_eq!(
             warnings_slurp(&[b"\x1e1{\x1e1{"]),
             [
@@ -3071,10 +2928,11 @@ mod tests {
         );
     }
 
-    /// [`final_buffer_start`]'s own boundary arithmetic: real jq's `fgets`
-    /// stops at a newline *or* after 4095 bytes, whichever comes first, so
-    /// padding a stream by one byte flips which side of the boundary the
-    /// trailing record lands on (#2998).
+    /// [`final_buffer_start`]'s own boundary arithmetic, which places jq
+    /// 1.7.1's final buffer for the positions (#7607): `fgets` stops at a
+    /// newline *or* after 4095 bytes, whichever comes first. What is read
+    /// does not hang off it any more (#7718): jq 1.7.1 dropped `true` from
+    /// 4094 spaces on (#2998), jq 1.8.2 keeps it at every padding.
     #[test]
     fn final_buffer_start_matches_jqs_4095_byte_fgets_chunk() {
         let padded = |spaces: usize| {
@@ -3083,28 +2941,34 @@ mod tests {
             v.extend_from_slice(b"\x1etrue");
             v
         };
-        // Tail (from the second RS onward) is `spaces + 6` bytes; jq's
-        // chunk is 4095 bytes, so 4093 keeps `true` and 4094 drops it --
-        // and the same one-byte flip recurs at the next chunk (8188/8189).
-        assert_eq!(seq_value_texts(&padded(4093), false), vec!["1", "true"]);
-        assert_eq!(seq_value_texts(&padded(4094), false), vec!["1"]);
-        assert_eq!(seq_value_texts(&padded(4095), false), vec!["1"]);
-        assert_eq!(seq_value_texts(&padded(8188), false), vec!["1", "true"]);
-        assert_eq!(seq_value_texts(&padded(8189), false), vec!["1"]);
+        let start = |raw: Vec<u8>| {
+            let total = raw.len();
+            final_buffer_start(&[(None, raw)], total)
+        };
+        // The tail (from the second RS on) is `spaces + 6` bytes, starting at 3.
+        assert_eq!(start(padded(4088)), 3, "one chunk holds the tail");
+        assert_eq!(start(padded(4089)), 3 + 4095, "the tail's last chunk");
+        assert_eq!(start(padded(8183)), 3 + 4095, "two chunks hold it");
+        assert_eq!(start(padded(8184)), 3 + 2 * 4095);
+        for spaces in [4088, 4089, 4093, 4094, 4095, 8188, 8189] {
+            assert_eq!(
+                seq_value_texts(&padded(spaces), false),
+                vec!["1", "true"],
+                "{spaces} spaces"
+            );
+        }
     }
 
-    /// Multi-file: only the *last* file's own final buffer can trigger the
-    /// drop -- an earlier file's newline-free tail is `is_partial` and
-    /// joins the next file instead (#3002), and an empty last file has no
-    /// final buffer to drop from at all.
+    /// Multi-file: an earlier file's newline-free tail joins the next file
+    /// (#3002), and a last file, empty or not, ends nothing early (#7718).
     #[test]
-    fn end_of_stream_rule_only_applies_to_the_last_file_2998() {
+    fn several_files_read_every_record_2998() {
         let a: &[u8] = b"\x1e\x1etrue"; // no trailing newline
         let b: &[u8] = b"\x1e5\n";
         assert_eq!(
             walk_values(&[a, b], false),
             walk_values(&[a, b], true),
-            "a's own drop is masked by joining with b"
+            "a joins b"
         );
         let combined: Vec<u8> = [a, b].concat();
         assert_eq!(
@@ -3124,11 +2988,7 @@ mod tests {
                 .map(|(s, e)| String::from_utf8(combined[s..e].to_vec()).unwrap())
                 .collect()
         };
-        assert_eq!(
-            kept(false),
-            vec!["true"],
-            "an empty trailing file has no final buffer to drop from"
-        );
+        assert_eq!(kept(false), vec!["true"], "an empty trailing file");
         assert_eq!(kept(false), kept(true));
     }
 
@@ -3466,8 +3326,8 @@ mod tests {
     /// jq a `parser_reset` that leaves it reading rather than waiting for
     /// an RS byte. Both halves matter: forget the first and every column
     /// in the stream shifts, forget the second and the pre-RS content is
-    /// discarded when jq would have parsed it. All captured from
-    /// `/usr/bin/jq` 1.7.1.
+    /// discarded when jq would have parsed it. Captured from `/usr/bin/jq`
+    /// 1.7.1, and from jq 1.8.2 where they differ (#7718).
     #[test]
     fn malformed_bom_is_consumed_and_starts_the_parser_reading_1723() {
         assert_warnings(
@@ -3475,12 +3335,13 @@ mod tests {
             &["Expected another array element at line 1, column 5 (need RS to resync)"],
         );
         // Read as a record, so this is *not* #1525's abandoned-text
-        // template even though the stream holds no RS byte at all.
+        // template even though the stream holds no RS byte at all: `1` is
+        // read. jq 1.7.1 then warned `Potentially truncated top-level numeric
+        // value at EOF at line 1, column 3` for the `2`; jq 1.8.2's empty last
+        // call resets first, so the `2` and the warning are gone (#7718).
         for input in [&b"\xef\xbb1 2"[..], b"\xef1 2"] {
-            assert_warnings(
-                input,
-                &["Potentially truncated top-level numeric value at EOF at line 1, column 3"],
-            );
+            assert_warnings(input, &[]);
+            assert_eq!(seq_value_texts(input, false), ["1"], "{input:?}");
         }
         // A stream that simply runs out mid-BOM is not malformed -- jq is
         // still waiting for the rest of it, and has consumed no content.
@@ -3617,7 +3478,8 @@ mod tests {
     /// including one after a full 4095-byte chunk with no newline, and an
     /// empty final buffer (a stream filling its last chunk exactly) wipes
     /// the EOF report just as a trailing newline does. Rows are the issue's
-    /// three, captured from `/usr/bin/jq` 1.7.1 as `--seq -s 'error("x")'`.
+    /// three, captured from `/usr/bin/jq` 1.7.1 as `--seq -s 'error("x")'`,
+    /// and from jq 1.8.2 where they differ (#7718).
     #[test]
     fn malformed_bom_resets_at_every_fgets_refill_3200() {
         let padded = |head: &[u8], pad: usize, tail: &[u8]| -> Vec<u8> {
@@ -3636,15 +3498,14 @@ mod tests {
         let over = padded(b"\xef\xbb{", 4093, b"");
         assert_eq!(warnings_slurp(&[&over]), Vec::<String>::new());
         assert!(!position_lost(&[&over]));
-        // The reverse: the refill drops the open string, the trailing `"`
-        // opens a new one, and the EOF branch reports it -- position lost.
+        // The reverse: the refill drops the open string and the trailing `"`
+        // opens a new one, which jq 1.7.1's EOF branch reported (`Unfinished
+        // string at EOF at line 1, column 4094`, position lost). jq 1.8.2 reads
+        // one more, empty, buffer, whose reset wipes it: no warning, `file:0`.
         let reopened = padded(b"\xef\xbb\"a", 4091, b"\"");
         assert_eq!(reopened.len(), 4096);
-        assert_eq!(
-            warnings_slurp(&[&reopened]),
-            ["Unfinished string at EOF at line 1, column 4094"]
-        );
-        assert!(position_lost(&[&reopened]));
+        assert_eq!(warnings_slurp(&[&reopened]), Vec::<String>::new());
+        assert!(!position_lost(&[&reopened]));
         // Control: without a malformed BOM there is no reset at a refill.
         let plain = padded(b"\x1e{", 4093, b"");
         assert_eq!(
@@ -4359,7 +4220,6 @@ mod tests {
         Vec<SeqFault>,
         Vec<(usize, usize)>,
         Vec<(usize, usize)>,
-        Option<String>,
         bool,
     );
 
@@ -4377,7 +4237,6 @@ mod tests {
             walk.faults,
             walk.values,
             walk.locations,
-            walk.deferred_warning,
             walk.slurp_position_lost,
         )
     }

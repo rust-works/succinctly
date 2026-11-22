@@ -5,6 +5,10 @@
 //! still held (the fault at the end of the text). succinctly ran the loop again and said it
 //! (`Unfinished JSON term at EOF` under `--stream`, an uncaught `break` under `--stream-errors`).
 //! Every row was captured from jq 1.7.1.
+//!
+//! Since #7718 `succinctly jq` reads `--seq` past the last bytes as jq 1.8.2 does (jqlang/jq#3279), so
+//! the rows that read differently there are jq 1.8.2's (`/opt/homebrew/bin/jq`), with jq 1.7.1's
+//! position after the last input (#7607) and its reads past a last directory.
 
 use anyhow::Result;
 
@@ -49,66 +53,27 @@ fn check(rows: &[Row]) -> Result<()> {
 #[test]
 fn a_slurp_by_the_seq_stream_reader_runs_the_loop_once_past_a_failure_6796() -> Result<()> {
     check(&[
-        (
-            &["--seq", "-s", "--stream", "input"],
-            &["trunc", "gone", "obj"],
-            "\x1e[[1,\"a\"]]\n",
-            "jq: error: Could not open file @D@/gone: No such file or directory\n",
-            2,
-        ),
-        (
-            &["--seq", "-s", "--stream", "first(inputs)"],
-            &["rend", "dir", "nors"],
-            "\x1e[[1,0]]\n",
-            "jq: error: Is a directory\n",
-            2,
-        ),
-        (
-            &["--seq", "-s", "--stream", "[., input]"],
-            &["trunc", "gone", "nors"],
-            "\x1e[[[[0],1],[[1,0],1]],[[1,0]]]\n",
-            "jq: error: Could not open file @D@/gone: No such file or directory\n",
-            2,
-        ),
-        (
-            &[
+        // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
+        (&["--seq", "-s", "--stream", "input"], &["trunc", "gone", "obj"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 11\n", 2),
+        // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
+        (&["--seq", "-s", "--stream", "first(inputs)"], &["rend", "dir", "nors"], "", "jq: error: Is a directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 2, column 7\n", 2),
+        // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
+        (&["--seq", "-s", "--stream", "[., input]"], &["trunc", "gone", "nors"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 7\n", 2),
+        (&[
                 "--seq",
                 "-s",
                 "--stream",
                 "(try input catch .), (try input catch .)",
-            ],
-            &["rend", "dir", "obj"],
-            "\x1e[[1,\"a\"]]\n\x1e\"Unfinished JSON term at EOF at line 2, column 11\"\n",
-            "jq: error: Is a directory\n",
-            2,
-        ),
+            ], &["rend", "dir", "obj"], "\u{1e}\"Unfinished JSON term at EOF at line 2, column 11\"\n\u{1e}\"break\"\n", "jq: error: Is a directory\n", 2),
     ])
 }
 
 #[test]
 fn a_slurp_by_the_seq_stream_errors_reader_runs_the_loop_once_past_a_failure_6796() -> Result<()> {
     check(&[
-        (
-            &["--seq", "-s", "--stream-errors", "input"],
-            &["trunc", "gone", "obj"],
-            "\x1e[[1,\"a\"]]\n",
-            "jq: error: Could not open file @D@/gone: No such file or directory\n",
-            2,
-        ),
-        (
-            &["--seq", "-s", "--stream-errors", "[., input]"],
-            &["rend", "dir", "nors"],
-            "\x1e[[[[],12],[[0],1],[[1,0],1]],[[1,0]]]\n",
-            "jq: error: Is a directory\n",
-            2,
-        ),
-        (
-            &["--seq", "-s", "--stream-errors", "first(inputs)"],
-            &["rend", "gone", "obj"],
-            "\x1e[[1,\"a\"]]\n",
-            "jq: error: Could not open file @D@/gone: No such file or directory\n",
-            2,
-        ),
+        (&["--seq", "-s", "--stream-errors", "input"], &["trunc", "gone", "obj"], "\u{1e}[\"Unfinished JSON term at EOF at line 1, column 11\",[1]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
+        (&["--seq", "-s", "--stream-errors", "[., input]"], &["rend", "dir", "nors"], "\u{1e}[[[[],12],[[0],1],[[1,0],1],[[1,0]]],[\"Unfinished JSON term at EOF at line 2, column 7\",[1]]]\n", "jq: error: Is a directory\n", 2),
+        (&["--seq", "-s", "--stream-errors", "first(inputs)"], &["rend", "gone", "obj"], "\u{1e}[\"Unfinished JSON term at EOF at line 2, column 11\",[1]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
     ])
 }
 
@@ -116,12 +81,13 @@ fn a_slurp_by_the_seq_stream_errors_reader_runs_the_loop_once_past_a_failure_679
 #[test]
 fn the_slurps_loop_ends_after_its_first_call_wherever_the_failure_is_6796() -> Result<()> {
     check(&[
-        (&["--seq", "-s", "--stream", "input"], &["gone", "trunc", "obj"], "\x1e[[1,\"a\"]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
+        // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
+        (&["--seq", "-s", "--stream", "input"], &["gone", "trunc", "obj"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 11\n", 2),
         (&["--seq", "-s", "--stream", "input"], &["trunc", "obj", "gone"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error (at @D@/gone:0): Unfinished JSON term at EOF at line 1, column 11\n", 2),
-        (&["--seq", "-s", "--stream-errors", "[., input]"], &["gone", "rend", "nors"], "\x1e[[[[],12],[[0],1],[[1,0],1]],[[1,0]]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
+        (&["--seq", "-s", "--stream-errors", "[., input]"], &["gone", "rend", "nors"], "\u{1e}[[[[],12],[[0],1],[[1,0],1],[[1,0]]],[\"Unfinished JSON term at EOF at line 2, column 7\",[1]]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
         (&["--seq", "-s", "--stream-errors", "[., input]"], &["rend", "nors", "dir"], "\x1e[[[[],12],[[0],1],[[1,0],1],[[1,0]]],[\"Unfinished JSON term at EOF at line 2, column 7\",[1]]]\n", "jq: error: Is a directory\n", 2),
         (&["--seq", "-s", "--stream", "empty"], &["trunc", "gone", "obj"], "", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
-        (&["--seq", "-s", "--stream", "first(inputs)"], &["gone", "dir", "trunc"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error: Is a directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 4\n", 2),
+        (&["--seq", "-s", "--stream", "first(inputs)"], &["gone", "dir", "trunc"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error: Is a directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 4\n", 2),
     ])
 }
 
@@ -130,10 +96,11 @@ fn the_slurps_loop_ends_after_its_first_call_wherever_the_failure_is_6796() -> R
 #[test]
 fn the_slurps_other_loops_still_match_jq_6796() -> Result<()> {
     check(&[
-        (&["--seq", "-s", "--stream", "."], &["trunc", "gone", "obj"], "\x1e[[[0],1],[[1,\"a\"],1]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
+        (&["--seq", "-s", "--stream", "."], &["trunc", "gone", "obj"], "\u{1e}[[[0],1],[[1,\"a\"],1],[[1,\"a\"]]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
         (&["--seq", "-s", "--stream", "[inputs]"], &["trunc", "gone", "obj"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 11\n", 2),
-        (&["--seq", "-s", "--stream-errors", "[inputs]"], &["rend", "dir", "nors"], "\x1e[[[1,0]],[\"Unfinished JSON term at EOF at line 2, column 7\",[1]]]\n", "jq: error: Is a directory\n", 2),
-        (&["--seq", "-s", "--stream", "input"], &["trunc", "obj"], "\x1e[[1,\"a\"]]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 11\n", 0),
+        (&["--seq", "-s", "--stream-errors", "[inputs]"], &["rend", "dir", "nors"], "\u{1e}[[\"Unfinished JSON term at EOF at line 2, column 7\",[1]]]\n", "jq: error: Is a directory\n", 2),
+        // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
+        (&["--seq", "-s", "--stream", "input"], &["trunc", "obj"], "", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 11\n", 5),
         (&["-n", "--seq", "-s", "--stream", "[inputs]"], &["trunc", "gone", "obj"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 11\n", 2),
         (&["-s", "--stream", "input"], &["obj", "gone", "obj"], "[[\"a\"]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
         (&["-s", "--stream-errors", "input"], &["obj", "gone", "obj"], "[[\"a\"]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),

@@ -155,6 +155,12 @@ pub(crate) trait RefillSource {
     /// none was, the sources start with the stream's own first bytes, and the reader matches them
     /// against the mark as jq's parser does (#7603).
     fn bom_cut(&self) -> bool;
+
+    /// Whether the empty closing refill always follows the last bytes, as jq 1.8.2 reads a `--seq`
+    /// stream ([`RefillCursor::reads_to_close`], #7718).
+    fn reads_to_close(&self) -> bool {
+        false
+    }
 }
 
 impl RefillSource for Box<dyn RefillSource> {
@@ -168,6 +174,10 @@ impl RefillSource for Box<dyn RefillSource> {
 
     fn bom_cut(&self) -> bool {
         (**self).bom_cut()
+    }
+
+    fn reads_to_close(&self) -> bool {
+        (**self).reads_to_close()
     }
 }
 
@@ -190,6 +200,15 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> MemorySources<S> {
     }
 }
 
+impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> MemorySources<S> {
+    /// The same sources read as jq 1.8.2 reads a `--seq` stream: the empty closing refill always
+    /// follows the last bytes ([`RefillCursor::reads_to_close`], #7718).
+    fn reading_to_close(mut self) -> Self {
+        self.cursor.reads_to_close = true;
+        self
+    }
+}
+
 impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> RefillSource for MemorySources<S> {
     fn next_refill(&mut self, buf: &mut Vec<u8>) -> Option<Refill> {
         let refill = self.cursor.next(self.sources.as_ref())?;
@@ -204,6 +223,10 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> RefillSource for MemorySources<S> {
 
     fn bom_cut(&self) -> bool {
         self.cursor.leads.iter().any(|&lead| lead > 0)
+    }
+
+    fn reads_to_close(&self) -> bool {
+        self.cursor.reads_to_close
     }
 }
 
@@ -491,6 +514,12 @@ struct RefillCursor {
     /// How many bytes of each source's first chunk were a BOM, which the sources no longer hold
     /// ([`STREAM_BOM_LEADS`], #7569): that chunk has room for that many fewer of their bytes.
     leads: Vec<usize>,
+    /// Whether the refill that holds the last bytes is never the last one, as in jq 1.8.2, which
+    /// reports the end only once the last file is closed, one refill later (jqlang/jq#3279, #7718):
+    /// the empty closing refill always follows. jq 1.7.1 took the refill that hit the end of the last
+    /// file for the last one. `--seq` reads this way; plain `--stream` keeps 1.7.1's refills, with
+    /// #7523's closing event moved into a slurp's array instead.
+    reads_to_close: bool,
 }
 
 thread_local! {
@@ -525,7 +554,7 @@ impl RefillCursor {
             let source = self.source;
             if raw.is_empty() {
                 self.source += 1;
-                let is_last = last_source;
+                let is_last = last_source && !self.reads_to_close;
                 self.last = Some((source, is_last));
                 return Some(CursorRefill {
                     source,
@@ -557,7 +586,7 @@ impl RefillCursor {
             let newline = chunk.ends_with(b"\n");
             let hit_eof = !newline && len < room;
             let bytes = &chunk[..fgets_visible_len(chunk)];
-            let is_last = last_source && at_end && hit_eof;
+            let is_last = last_source && at_end && hit_eof && !self.reads_to_close;
             self.last = Some((source, is_last));
             if at_end && !last_source && !newline && len == room {
                 self.empty_after = Some(source);
@@ -628,13 +657,6 @@ pub(crate) struct Reader<R: RefillSource> {
     finished: bool,
     values_before_last_refill: usize,
     done: bool,
-    /// Whether the reader is `--seq`'s and does not slurp: only then does the first call after the
-    /// refill that hit the end of the file stop jq's input on an empty record (#2998).
-    stops_on_empty: bool,
-    /// Whether that stop is only the end of the call that met it: the input queue holds a barrier
-    /// there ([`crate::cli::jq_seq_reader::MESSAGELESS_RETURN`]) and the reader parses on past it, as
-    /// jq's parser keeps the rest of its buffer for the next call (#6141).
-    stop_is_barrier: bool,
     /// Whether a parse error ends jq's `next_input` call, as it does where it is not an input of its
     /// own (`--seq --stream`): `-s` returns it at once and goes on in a new call that reads again.
     errors_end_call: bool,
@@ -643,6 +665,15 @@ pub(crate) struct Reader<R: RefillSource> {
     terminal_fault: bool,
     /// The refill being fed paused after a value ([`Parser::feed_from`], #7260).
     paused: Option<PausedRefill>,
+    /// Whether the call that read the last byte of the last refill with bytes returned something.
+    /// Under [`RefillSource::reads_to_close`] that decides the position of what the closing refill
+    /// yields, by jq 1.7.1's rule (#7607, #7718): its call after such a return closed the input
+    /// before it answered, and one that was still scanning answered first.
+    last_bytes_ended_call: bool,
+    /// Whether a call on the last refill with bytes returned a parse error that ends its call
+    /// ([`Reader::terminal_fault`]'s first half, kept for the closing refill under
+    /// [`RefillSource::reads_to_close`]).
+    last_bytes_errored: bool,
 }
 
 /// Where a paused refill reads on from, and what [`Reader::step`] knew of it.
@@ -662,13 +693,8 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> Reader<MemorySources<S>> {
 /// How a `--seq` [`Reader`] differs from a plain one.
 #[derive(Clone, Copy)]
 struct SeqMode {
-    /// Whether the run slurps, which keeps jq's loop reading after an empty record.
-    slurp: bool,
     /// Whether a parse error is an input of its own (`--stream-errors`).
     errors_are_events: bool,
-    /// Whether the reads go through the input queue, which meets the end-of-stream stop as a barrier
-    /// (#6141). A slurp never stops there, so this says nothing under `slurp`.
-    stop_is_barrier: bool,
 }
 
 impl<R: RefillSource> Reader<R> {
@@ -679,9 +705,7 @@ impl<R: RefillSource> Reader<R> {
     /// The reader over `source` for `--seq` when `seq` is given (#6115).
     fn with_seq(source: R, seq: Option<SeqMode>) -> Self {
         let mode = seq.unwrap_or(SeqMode {
-            slurp: false,
             errors_are_events: true,
-            stop_is_barrier: false,
         });
         let seq = seq.is_some();
         let mut parser = Parser::new(seq);
@@ -700,11 +724,11 @@ impl<R: RefillSource> Reader<R> {
             finished: false,
             values_before_last_refill: 0,
             done: false,
-            stops_on_empty: seq && !mode.slurp,
-            stop_is_barrier: mode.stop_is_barrier,
             errors_end_call: seq && !mode.errors_are_events,
             terminal_fault: false,
             paused: None,
+            last_bytes_ended_call: false,
+            last_bytes_errored: false,
         }
     }
 
@@ -733,9 +757,9 @@ impl<R: RefillSource> Reader<R> {
     /// feed paused.
     fn step(&mut self) {
         if let Some(paused) = self.paused.take() {
-            let feeding =
-                self.parser
-                    .feed_from(&self.buf, paused.at, &mut self.deferred, false, true);
+            let feeding = self
+                .parser
+                .feed_from(&self.buf, paused.at, &mut self.deferred, true);
             self.after_feed(feeding, paused.is_last, paused.drained);
             return;
         }
@@ -751,10 +775,16 @@ impl<R: RefillSource> Reader<R> {
             self.done = true;
             return;
         };
+        let closing = refill.is_last && self.buf.is_empty() && self.source.reads_to_close();
         let parser = &mut self.parser;
         parser.strip_bom(&mut self.buf);
         if refill.is_last {
             self.values_before_last_refill = parser.yielded;
+        }
+        if closing && self.last_bytes_ended_call {
+            // #7718: jq 1.8.2's closing refill is the call jq 1.7.1 made after its last refill
+            // returned, which had closed the input when it answered (#7607 keeps that position).
+            parser.closed = true;
         }
         if parser.source != refill.source {
             parser.source = refill.source;
@@ -784,21 +814,15 @@ impl<R: RefillSource> Reader<R> {
         for value in std::mem::take(&mut self.deferred) {
             parser.yield_value(value);
         }
-        // A `--seq` parser's stops and barriers are decided over the whole refill.
+        // A `--seq` parser is fed the whole refill: its calls carry state across a value.
         let pause = !parser.seq;
-        let feeding = parser.feed_from(
-            &self.buf,
-            0,
-            &mut self.deferred,
-            refill.is_last && !drained && self.stops_on_empty,
-            pause,
-        );
+        let feeding = parser.feed_from(&self.buf, 0, &mut self.deferred, pause);
         self.after_feed(feeding, refill.is_last, drained);
     }
 
     /// What [`step`](Self::step) does once a refill has been fed to its end.
     fn after_feed(&mut self, feeding: Feeding, is_last: bool, drained: bool) {
-        let mut fed = match feeding {
+        let fed = match feeding {
             Feeding::Done(fed) => fed,
             Feeding::Paused(at) => {
                 self.paused = Some(PausedRefill {
@@ -809,33 +833,11 @@ impl<R: RefillSource> Reader<R> {
                 return;
             }
         };
+        if !self.buf.is_empty() {
+            self.last_bytes_ended_call = fed.ended;
+            self.last_bytes_errored = self.errors_end_call && fed.errored;
+        }
         let parser = &mut self.parser;
-        if fed.stopped && self.stop_is_barrier {
-            // The call that read the last refill returned nothing, which `input` raises as `break`
-            // and the main loop takes for the end of its input. The stream goes on behind it: the
-            // next call scans what the refill still holds (#6141).
-            parser.pending.push_back(Yielded {
-                value: OwnedValue::Null,
-                location: (parser.source, parser.lines_read),
-                error: Some(crate::cli::jq_seq_reader::MESSAGELESS_RETURN.to_string()),
-                raised: false,
-            });
-            let rest = &self.buf[fed.consumed..];
-            fed = if rest.is_empty() {
-                Fed::ended()
-            } else {
-                parser.feed(rest, &mut self.deferred, false)
-            };
-        }
-        if fed.stopped {
-            // The call that read the last refill returned nothing: jq's input is over, with the
-            // rest of the refill unread and no EOF branch.
-            self.finished = true;
-            self.done = true;
-            self.inside = Some(parser.yielded);
-            self.slurp_at = (parser.source, parser.lines_read);
-            return;
-        }
         let ended_with_value = fed.ended;
         if is_last {
             // The slurp loop ends with the first call that leaves nothing in the buffer.
@@ -864,8 +866,17 @@ impl<R: RefillSource> Reader<R> {
             }
             // A call that returned an error was followed by another that read again, and the read
             // after the last one closes jq's input.
-            self.terminal_fault =
-                self.errors_end_call && (fed.errored || parser.errors > errors_after_feed);
+            self.terminal_fault = if self.buf.is_empty() && self.source.reads_to_close() {
+                // #7718: the closing refill jq 1.8.2 reads; the position the array is named at is
+                // jq 1.7.1's (#7607), whose terminal call was the last refill with bytes, and ran
+                // the EOF branch itself unless its last byte had ended a call.
+                self.last_bytes_errored
+                    || (!self.last_bytes_ended_call
+                        && self.errors_end_call
+                        && parser.errors > errors_after_feed)
+            } else {
+                self.errors_end_call && (fed.errored || parser.errors > errors_after_feed)
+            };
             self.inside = Some(parser.yielded);
             self.slurp_at = (parser.source, parser.lines_read);
         }
@@ -1059,21 +1070,27 @@ pub(crate) struct SeqRead {
 /// Read `sources` (each source's bytes as read, a leading BOM already removed) the way
 /// `jq --seq --stream` does, or `--seq --stream-errors` when `errors_are_events` (#6115).
 ///
+/// Read to the close, as jq 1.8.2 reads (#7718: an empty refill follows the last bytes), unless the
+/// list ends in a file that failed (`failed_tail`): a file after the last that opened, whose empty
+/// read is the last refill in both releases, or a directory, whose read jq 1.8.2 follows with one
+/// more that #7607 leaves to jq 1.7.1.
+///
 /// A record's events come out as the bytes that complete them are read, so a record cut short
 /// still yields the events before the cut, and the cut is a warning: `jq: ignoring parse error`.
 pub(crate) fn read_seq(
     sources: &[(Option<usize>, Vec<u8>)],
     slurp: bool,
     errors_are_events: bool,
-    stop_is_barrier: bool,
+    failed_tail: bool,
 ) -> SeqRead {
+    let memory = MemorySources::new(sources);
     let mut reader = Reader::with_seq(
-        MemorySources::new(sources),
-        Some(SeqMode {
-            slurp,
-            errors_are_events,
-            stop_is_barrier,
-        }),
+        if failed_tail {
+            memory
+        } else {
+            memory.reading_to_close()
+        },
+        Some(SeqMode { errors_are_events }),
     );
     // Each event and each fault with its place in the sequence of inputs jq yielded.
     let mut events: Vec<(usize, OwnedValue, (usize, usize))> = Vec::new();
@@ -1081,11 +1098,7 @@ pub(crate) fn read_seq(
     let mut index = 0;
     while let Some(item) = reader.next_yielded() {
         match item.error {
-            // The barrier is a read of its own, whatever a fault is under `--stream-errors`.
-            Some(message)
-                if !errors_are_events
-                    || message == crate::cli::jq_seq_reader::MESSAGELESS_RETURN =>
-            {
+            Some(message) if !errors_are_events => {
                 faults.push((index, events.len(), message, item.location));
             }
             _ => events.push((index, item.value, item.location)),
@@ -1250,15 +1263,11 @@ pub(crate) fn is_closing_event(value: &OwnedValue) -> bool {
         if parts.len() == 1 && matches!(parts[0], OwnedValue::Array(_)))
 }
 
-/// What [`Parser::feed`] did with a refill.
+/// What [`Parser::feed_from`] did with a refill.
 struct Fed {
     /// Whether the last byte ended a call, which is whether the call that read the refill's last
     /// byte returned something (a value, an error, or the nothing an RS leaves).
     ended: bool,
-    /// Whether jq's input ended in the refill's first call (#2998): see [`Parser::feed`].
-    stopped: bool,
-    /// How many bytes of the refill the stop consumed, up to and including the RS that met it.
-    consumed: usize,
     /// Whether any call on the refill returned an error.
     errored: bool,
 }
@@ -1286,8 +1295,6 @@ impl Fed {
     fn ended() -> Self {
         Self {
             ended: true,
-            stopped: false,
-            consumed: 0,
             errored: false,
         }
     }
@@ -1518,17 +1525,11 @@ impl Parser {
     ///
     /// A `--seq` parser differs in two ways. An error ends its call only, since `jv_parser_next`
     /// keeps the buffer when it reads a record sequence, and the call that meets an RS with
-    /// nothing pending returns an invalid with no message. That last one ends jq's input when it is
-    /// the first call after the refill that hit the end of the file (`stops_on_empty`, #2998).
-    fn feed(&mut self, chunk: &[u8], deferred: &mut Vec<OwnedValue>, stops_on_empty: bool) -> Fed {
-        match self.feed_from(chunk, 0, deferred, stops_on_empty, false) {
-            Feeding::Done(fed) => fed,
-            // patchcov: coverage tolerate-line reason="unreachable: a feed that does not pause runs to the end of its chunk"
-            Feeding::Paused(_) => Fed::ended(),
-        }
-    }
-
-    /// [`feed`](Self::feed) from byte `from` of the refill, and when `pause` is set, stopping after
+    /// nothing pending returns an invalid with no message, which jq 1.8.2 reads past wherever it
+    /// falls (#7718): jq 1.7.1 ended its input there when it was the first call after the refill
+    /// that hit the end of the file (#2998).
+    ///
+    /// Fed from byte `from` of the refill, and when `pause` is set, stopping after
     /// a byte that leaves [`PAUSE_EVENTS`] values waiting, unless it is the refill's last (#7260):
     /// the reader hands those out before the parser reads on, so a refill's worth of values is not
     /// built ahead of the program reading them. Only a parser that is not `--seq`'s pauses: its
@@ -1538,11 +1539,9 @@ impl Parser {
         chunk: &[u8],
         from: usize,
         deferred: &mut Vec<OwnedValue>,
-        stops_on_empty: bool,
         pause: bool,
     ) -> Feeding {
         debug_assert!(!(pause && self.seq), "a --seq parser does not pause");
-        let mut first_call = true;
         let mut errored = false;
         let mut call_start = true;
         // Where a run of string bytes read in one step ends (#7260).
@@ -1585,7 +1584,6 @@ impl Parser {
             }
             match self.scan(ch) {
                 Ok(Scanned::Value(value)) => {
-                    first_call = false;
                     call_start = true;
                     self.yield_value(value);
                     // The next call starts with `stream_check_done`, which hands out whatever the
@@ -1614,15 +1612,6 @@ impl Parser {
                 Ok(Scanned::More) => {}
                 Ok(Scanned::Empty) => {
                     call_start = true;
-                    if first_call && stops_on_empty {
-                        return Feeding::Done(Fed {
-                            ended: true,
-                            stopped: true,
-                            consumed: index + 1,
-                            errored: false,
-                        });
-                    }
-                    first_call = false;
                     if last {
                         return Feeding::Done(Fed {
                             errored,
@@ -1653,7 +1642,6 @@ impl Parser {
                             ..Fed::ended()
                         });
                     }
-                    first_call = false;
                     if last {
                         return Feeding::Done(Fed {
                             errored,
@@ -1665,8 +1653,6 @@ impl Parser {
         }
         Feeding::Done(Fed {
             ended: false,
-            stopped: false,
-            consumed: 0,
             errored,
         })
     }

@@ -2,9 +2,11 @@
 //! parse errors as jq's does: the read that reaches a fault raises it, and one the program does not
 //! read is printed as `jq: ignoring parse error: ...` when the main loop reaches it, after the
 //! values before it, rather than up front. The records after a fault then pair with the main loop
-//! as in jq. The reader's message-less return (#5662), `break` to `input`, ends the main loop.
-//! `-s` still warns as it reads. Rows, messages, locations and exit statuses were captured from
-//! jq 1.7.1 (`/usr/bin/jq`).
+//! as in jq. `-s` still warns as it reads. Rows, messages, locations and exit statuses were
+//! captured from jq 1.7.1 (`/usr/bin/jq`), except the streams whose last record follows the last
+//! newline: jq 1.7.1 ended those at an empty record (#5662's `break`), and since #7718 they are read
+//! to the end as jq 1.8.2 reads them, with its rows (the `<unknown>` after the last value is 1.7.1's,
+//! #7607).
 
 use anyhow::Result;
 
@@ -24,16 +26,16 @@ const ROWS: &[(&str, &str, bool, &str, &str, i32)] = &[
     // it, and an error on the first comes ahead of it.
     ("\x1e1\n\x1e[1,]\n\x1e2\n", "if . == 1 then halt else . end, input_line_number", false, "", "", 0),
     ("\x1e1\n\x1e[1,]\n\x1e2\n", "if . == 1 then error(\"E\") else . end, input_line_number", false, "\x1e2\n\x1e3\n", "jq: error (at <stdin>:1): E\njq: ignoring parse error: Expected another array element at line 2, column 5 (need RS to resync)\n", 0),
-    // The message-less return ends the main loop, and `input` reads on past it.
-    ("\x1e0\n\x1e1[", "if . == 1 then input else . end", false, "\x1e0\n", "", 0),
-    ("\x1e0\n\x1e1[", "[.,(try input catch .)]", false, "\x1e[0,\"break\"]\n\x1e[1,\"Unfinished JSON term at EOF at line 2, column 3\"]\n", "", 0),
-    ("\x1e0\n\x1e1[", "[.,input]", false, "", "jq: error (at <stdin>:1): break\njq: error (at <unknown>): Unfinished JSON term at EOF at line 2, column 3\n", 5),
-    ("\x1e0\n\x1e1", "[limit(4;repeat(try input catch .))]", false, "\x1e[\"break\",\"Potentially truncated top-level numeric value at EOF at line 2, column 2\",\"break\",\"break\"]\n", "", 0),
-    // An empty record's stop is the same return (#6141's rows over documents): `inputs` ends at
-    // it, and the main loop reads on to the value and the fault behind it.
-    ("\x1e1\n\x1e\x1e2", "[inputs]", false, "\x1e[]\n", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 3\n", 0),
-    ("\x1e1\n\x1e\x1e2", "[.,(try input catch .)], input_line_number", false, "\x1e[1,\"break\"]\n\x1e1\n", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 3\n", 0),
-    ("\x1e1\n\x1e\x1e2", "first(inputs)", false, "", "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column 3\n", 0),
+    // A last record after the last newline is read (#7718).
+    // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
+    ("\x1e0\n\x1e1[", "if . == 1 then input else . end", false, "\x1e0\n", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 2, column 3\n", 5),
+    ("\x1e0\n\x1e1[", "[.,(try input catch .)]", false, "\x1e[0,1]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 3\n", 0),
+    ("\x1e0\n\x1e1[", "[.,input]", false, "\x1e[0,1]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 3\n", 0),
+    ("\x1e0\n\x1e1", "[limit(4;repeat(try input catch .))]", false, "\x1e[\"Potentially truncated top-level numeric value at EOF at line 2, column 2\",\"break\",\"break\",\"break\"]\n", "", 0),
+    // And so is the value behind an empty record, and the fault behind that (#7718).
+    ("\x1e1\n\x1e\x1e2", "[inputs]", false, "", "jq: error (at <stdin>:1): Potentially truncated top-level numeric value at EOF at line 2, column 3\n", 5),
+    ("\x1e1\n\x1e\x1e2", "[.,(try input catch .)], input_line_number", false, "\x1e[1,\"Potentially truncated top-level numeric value at EOF at line 2, column 3\"]\n\x1e1\n", "", 0),
+    ("\x1e1\n\x1e\x1e2", "first(inputs)", false, "", "jq: error (at <stdin>:1): Potentially truncated top-level numeric value at EOF at line 2, column 3\n", 5),
     // `-s` reads the whole stream, warning as it goes, before the program runs.
     ("\x1e1\n\x1e[1,]\n\x1e2\n\x1e3\n", "[.,input]", true, "", "jq: ignoring parse error: Expected another array element at line 2, column 5 (need RS to resync)\njq: error (at <unknown>): break\n", 5),
 ];

@@ -1,9 +1,9 @@
 //! #5662: an empty `--seq` record (`\x1e` then whitespace, or `\x1e\x1e`) is not the end of the stream
-//! for `-n`'s `input`/`inputs`. jq's main loop stops there silently (#2998), but `input` reads through
-//! the same driver and raises `break` -- the error an exhausted stream raises -- and the next read
-//! scans on. `inputs` ends at that `break` (a following `inputs` resumes), so `[inputs]` is `[]` while a
-//! `try input catch .` loop sees `"break"` and then the values behind the record. Rows, messages and
-//! exit statuses were captured from jq 1.7.1 (`/usr/bin/jq`).
+//! for `-n`'s `input`/`inputs`. jq 1.7.1's driver raised `break` at one that was the first thing its
+//! last buffer held (#2998), and the next read scanned on, so `[inputs]` over `\x1e\x1e[1]` was `[]`;
+//! jq 1.8.2 reads past every empty record (#7718), and so does `succinctly jq`: `[inputs]` is `[[1]]`.
+//! Rows, messages and exit statuses were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`), except the
+//! `<unknown>` of a read past the last value, which is jq 1.7.1's (#7607).
 
 use anyhow::Result;
 
@@ -11,18 +11,20 @@ use crate::run_jq_full;
 
 /// `(stdin, filter, slurp, stdout, stderr, exit status)`.
 const ROWS: &[(&str, &str, bool, &str, &str, i32)] = &[
-    ("\x1e\x1e[1]", "[limit(5;repeat(try input catch .))]", false, "\x1e[\"break\",[1],\"break\",\"break\",\"break\"]\n", "", 0),
-    ("\x1e\x1e[1]", "[inputs]", false, "\x1e[]\n", "", 0),
-    ("\x1e\x1e[1]", "[inputs],[inputs]", false, "\x1e[]\n\x1e[[1]]\n", "", 0),
-    ("\x1e\x1e[1]", "input,input", false, "", "jq: error (at <stdin>:0): break\n", 5),
-    ("\x1e\x1e2  \"x\"", "[limit(5;repeat(try input catch .))]", false, "\x1e[\"break\",2,\"x\",\"break\",\"break\"]\n", "", 0),
-    ("\x1e\x1e2  \"x\"", "[inputs]", false, "\x1e[]\n", "", 0),
-    ("\x1e\x1e2  \"x\"", "[inputs],[inputs]", false, "\x1e[]\n\x1e[2,\"x\"]\n", "", 0),
-    ("\x1e\x1e2  \"x\"", "input,input", false, "", "jq: error (at <stdin>:0): break\n", 5),
-    ("\x1e\n\x1e[1][1]", "[limit(5;repeat(try input catch .))]", false, "\x1e[\"break\",[1],[1],\"break\",\"break\"]\n", "", 0),
-    ("\x1e\n\x1e[1][1]", "[inputs]", false, "\x1e[]\n", "", 0),
-    ("\x1e\n\x1e[1][1]", "[inputs],[inputs]", false, "\x1e[]\n\x1e[[1],[1]]\n", "", 0),
-    ("\x1e\n\x1e[1][1]", "input,input", false, "", "jq: error (at <stdin>:1): break\n", 5),
+    ("\x1e\x1e[1]", "[limit(5;repeat(try input catch .))]", false, "\x1e[[1],\"break\",\"break\",\"break\",\"break\"]\n", "", 0),
+    ("\x1e\x1e[1]", "[inputs]", false, "\x1e[[1]]\n", "", 0),
+    ("\x1e\x1e[1]", "[inputs],[inputs]", false, "\x1e[[1]]\n\x1e[]\n", "", 0),
+    // jq 1.8.2 names `<stdin>:0`; the position after the last value is jq 1.7.1's (#7607).
+    // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
+    ("\x1e\x1e[1]", "input,input", false, "\x1e[1]\n", "jq: error (at <unknown>): break\n", 5),
+    ("\x1e\x1e2  \"x\"", "[limit(5;repeat(try input catch .))]", false, "\x1e[2,\"x\",\"break\",\"break\",\"break\"]\n", "", 0),
+    ("\x1e\x1e2  \"x\"", "[inputs]", false, "\x1e[2,\"x\"]\n", "", 0),
+    ("\x1e\x1e2  \"x\"", "[inputs],[inputs]", false, "\x1e[2,\"x\"]\n\x1e[]\n", "", 0),
+    ("\x1e\x1e2  \"x\"", "input,input", false, "\x1e2\n\x1e\"x\"\n", "", 0),
+    ("\x1e\n\x1e[1][1]", "[limit(5;repeat(try input catch .))]", false, "\x1e[[1],[1],\"break\",\"break\",\"break\"]\n", "", 0),
+    ("\x1e\n\x1e[1][1]", "[inputs]", false, "\x1e[[1],[1]]\n", "", 0),
+    ("\x1e\n\x1e[1][1]", "[inputs],[inputs]", false, "\x1e[[1],[1]]\n\x1e[]\n", "", 0),
+    ("\x1e\n\x1e[1][1]", "input,input", false, "\x1e[1]\n\x1e[1]\n", "", 0),
     ("\x1e1\x1e\x1e2\n", "[limit(5;repeat(try input catch .))]", false, "\x1e[\"Potentially truncated top-level numeric value at line 1, column 3\",2,\"break\",\"break\",\"break\"]\n", "", 0),
     ("\x1e1\x1e\x1e2\n", "[inputs]", false, "", "jq: error (at <stdin>:1): Potentially truncated top-level numeric value at line 1, column 3\n", 5),
     ("\x1e1\x1e\x1e2\n", "[inputs],[inputs]", false, "", "jq: error (at <stdin>:1): Potentially truncated top-level numeric value at line 1, column 3\n", 5),
@@ -45,14 +47,14 @@ const ROWS: &[(&str, &str, bool, &str, &str, i32)] = &[
     ("\x1e[1]\x1e\x1e[2]", "[limit(6;repeat(try input catch .))]", false, "\x1e[[1],[2],\"break\",\"break\",\"break\",\"break\"]\n", "", 0),
     ("\x1e[1]\x1e\x1e[2]", "[inputs],[inputs],[inputs]", false, "\x1e[[1],[2]]\n\x1e[]\n\x1e[]\n", "", 0),
     ("\x1e[1]\x1e\x1e[2]", "null", false, "\x1enull\n", "", 0),
-    ("\x1e\x1e[1]\x1e\x1e[2]", "[limit(6;repeat(try input catch .))]", false, "\x1e[\"break\",[1],[2],\"break\",\"break\",\"break\"]\n", "", 0),
-    ("\x1e\x1e[1]\x1e\x1e[2]", "[inputs],[inputs],[inputs]", false, "\x1e[]\n\x1e[[1],[2]]\n\x1e[]\n", "", 0),
+    ("\x1e\x1e[1]\x1e\x1e[2]", "[limit(6;repeat(try input catch .))]", false, "\x1e[[1],[2],\"break\",\"break\",\"break\",\"break\"]\n", "", 0),
+    ("\x1e\x1e[1]\x1e\x1e[2]", "[inputs],[inputs],[inputs]", false, "\x1e[[1],[2]]\n\x1e[]\n\x1e[]\n", "", 0),
     ("\x1e\x1e[1]\x1e\x1e[2]", "null", false, "\x1enull\n", "", 0),
     ("\x1e[1]\x1e\x1e", "[limit(6;repeat(try input catch .))]", false, "\x1e[[1],\"break\",\"break\",\"break\",\"break\",\"break\"]\n", "", 0),
     ("\x1e[1]\x1e\x1e", "[inputs],[inputs],[inputs]", false, "\x1e[[1]]\n\x1e[]\n\x1e[]\n", "", 0),
     ("\x1e[1]\x1e\x1e", "null", false, "\x1enull\n", "", 0),
-    ("\x1e\x1e[1]\x1e\x1e", "[limit(6;repeat(try input catch .))]", false, "\x1e[\"break\",[1],\"break\",\"break\",\"break\",\"break\"]\n", "", 0),
-    ("\x1e\x1e[1]\x1e\x1e", "[inputs],[inputs],[inputs]", false, "\x1e[]\n\x1e[[1]]\n\x1e[]\n", "", 0),
+    ("\x1e\x1e[1]\x1e\x1e", "[limit(6;repeat(try input catch .))]", false, "\x1e[[1],\"break\",\"break\",\"break\",\"break\",\"break\"]\n", "", 0),
+    ("\x1e\x1e[1]\x1e\x1e", "[inputs],[inputs],[inputs]", false, "\x1e[[1]]\n\x1e[]\n\x1e[]\n", "", 0),
     ("\x1e\x1e[1]\x1e\x1e", "null", false, "\x1enull\n", "", 0),
 ];
 

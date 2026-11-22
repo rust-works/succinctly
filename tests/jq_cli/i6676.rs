@@ -4,11 +4,13 @@
 //! met before it leaves the array (`mix.seq dir` keeps `[[[],2]]`), a failure sits among the
 //! warnings by source, and a directory given last is read after every warning, which counts it with
 //! nothing said. A warning met after a failure was reported stops the loop with the array lost, and
-//! the warning at the end of the text is met after every file. Every row was captured from jq 1.7.1.
+//! the warning at the end of the text is met after every file. Every row was captured from jq 1.7.1,
+//! except the ones jq 1.8.2 reads differently because it reads one more, empty, buffer after the last
+//! bytes before it closes the array (#7718): those are 1.8.2's (`/opt/homebrew/bin/jq`).
 //!
 //! A program that reads `input` is no exception: that whole slurp comes first, warnings and failures
-//! included, and its `input` reads what is left after the array: the events and the one fault the
-//! slurp's last call left, then the end of the stream. A last file that did not open is a source of the stream reader's
+//! included, and its `input` reads the end of the stream. (jq 1.7.1 left it the events and the one
+//! fault its slurp's last call had not read, #7718.) A last file that did not open is a source of the stream reader's
 //! own, with or without `-n`: a closing event held back at the end of the file before it goes in the
 //! array, and the array is read at the failure.
 
@@ -108,8 +110,8 @@ fn a_failed_last_file_is_a_source_of_the_stream_readers_slurp_6676() -> Result<(
         (&["-c", "-s", "--seq", "--stream", "."][..], &["arr.seq", "dir", "missing.json"][..], "\u{1e}[[[0],1],[[0]]]\n", "jq: error: Is a directory\njq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
         (&["-c", "-s", "--seq", "--stream-errors", "."][..], &["arr.seq", "missing.json"][..], "\u{1e}[[[0],1],[[0]]]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
         (&["-c", "-s", "--seq", "--stream-errors", "[., input_filename]"][..], &["two.seq", "missing.json"][..], "\u{1e}[[[[],2]],\"@DIR@/missing.json\"]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
-        (&["-c", "-s", "--seq", "--stream", "."][..], &["arr.seq"][..], "\u{1e}[[[0],1]]\n\u{1e}[[0]]\n", "", 0),
-        (&["-c", "-n", "-s", "--seq", "--stream", "[inputs]"][..], &["arr.seq"][..], "\u{1e}[[[[0],1]],[[0]]]\n", "", 0),
+        (&["-c", "-s", "--seq", "--stream", "."][..], &["arr.seq"][..], "\u{1e}[[[0],1],[[0]]]\n", "", 0),
+        (&["-c", "-n", "-s", "--seq", "--stream", "[inputs]"][..], &["arr.seq"][..], "\u{1e}[[[[0],1],[[0]]]]\n", "", 0),
     ];
     check_rows(&dir.path().to_string_lossy(), rows)
 }
@@ -132,9 +134,11 @@ fn a_slurp_warns_before_a_program_that_reads_input_runs_6676() -> Result<()> {
         (&["-c", "-s", "--seq", "--stream", "[inputs]"][..], &["arr.seq", "missing.json"][..], "\u{1e}[]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
         (&["-c", "-s", "--seq", "--stream", "[.,input]"][..], &["two.seq", "missing.json"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: error (at @DIR@/missing.json:0): break\n", 2),
         (&["-c", "-s", "--seq", "--stream", "input"][..], &["bad.seq", "dir", "missing.json"][..], "", "jq: ignoring parse error: Unmatched '}' in the middle of an array at line 1, column 4 (need RS to resync)\njq: error: Is a directory\njq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: error (at @DIR@/missing.json:0): break\n", 2),
-        (&["-c", "-s", "--seq", "--stream", "input"][..], &["arr.seq"][..], "\u{1e}[[0]]\n", "", 0),
-        (&["-c", "-s", "--seq", "--stream", "[.,input]"][..], &["arr.seq"][..], "\u{1e}[[[[0],1]],[[0]]]\n", "", 0),
-        (&["-c", "-s", "--seq", "--stream", "[inputs]"][..], &["trunc.seq"][..], "", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 4\n", 5),
+        // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
+        (&["-c", "-s", "--seq", "--stream", "input"][..], &["arr.seq"][..], "", "jq: error (at <unknown>): break\n", 5),
+        // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
+        (&["-c", "-s", "--seq", "--stream", "[.,input]"][..], &["arr.seq"][..], "", "jq: error (at <unknown>): break\n", 5),
+        (&["-c", "-s", "--seq", "--stream", "[inputs]"][..], &["trunc.seq"][..], "\u{1e}[]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 4\n", 0),
         (&["-c", "-s", "--seq", "--stream", "[.,input_filename]"][..], &["trunc.seq"][..], "\u{1e}[[[[0],1]],\"@DIR@/trunc.seq\"]\n", "jq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 4\n", 0),
     ];
     check_rows(&dir.path().to_string_lossy(), rows)
@@ -161,19 +165,20 @@ fn a_last_directory_is_read_by_the_programs_extra_input_6676() -> Result<()> {
     check_rows(&dir.path().to_string_lossy(), rows)
 }
 
-/// #6700's stream, a failure before a last file ending in an unfinished term: the program's `input` raises
-/// the fault, and with no such read, whatever the program could have done, nothing says it.
+/// #6700's stream, a failure before a last file ending in an unfinished term. jq 1.7.1 left the fault for
+/// the program's `input`, and with no such read said nothing; jq 1.8.2 meets it while it reads the
+/// slurp, after the failure, so the loop stops with the array lost (#7718).
 #[test]
-fn the_fault_after_the_array_is_for_the_programs_input_alone_6676() -> Result<()> {
+fn a_fault_at_the_end_after_a_failure_stops_the_slurp_6676() -> Result<()> {
     let dir = fixtures()?;
     #[rustfmt::skip]
     let rows: &[Row<'_>] = &[
-        (&["-c", "-s", "--seq", "--stream", "try input catch ."][..], &["two.seq", "missing.json", "trunc.seq"][..], "\u{1e}\"Unfinished JSON term at EOF at line 2, column 4\"\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
-        (&["-c", "-s", "--seq", "--stream", "[inputs]"][..], &["two.seq", "missing.json", "trunc.seq"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 2, column 4\n", 2),
-        (&["-c", "-s", "--seq", "--stream", "input"][..], &["arr.seq", "missing.json", "trunc.seq"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 8\n", 2),
-        (&["-c", "-s", "--seq", "--stream", "if false then input else . end"][..], &["two.seq", "missing.json", "trunc.seq"][..], "\u{1e}[[[],2],[[0],1]]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
-        (&["-c", "-s", "--seq", "--stream", "."][..], &["two.seq", "missing.json", "trunc.seq"][..], "\u{1e}[[[],2],[[0],1]]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
-        (&["-c", "-s", "--seq", "--stream", "[., input_filename]"][..], &["two.seq", "missing.json", "trunc.seq"][..], "\u{1e}[[[[],2],[[0],1]],\"@DIR@/trunc.seq\"]\n", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\n", 2),
+        (&["-c", "-s", "--seq", "--stream", "try input catch ."][..], &["two.seq", "missing.json", "trunc.seq"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 4\n", 2),
+        (&["-c", "-s", "--seq", "--stream", "[inputs]"][..], &["two.seq", "missing.json", "trunc.seq"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 4\n", 2),
+        (&["-c", "-s", "--seq", "--stream", "input"][..], &["arr.seq", "missing.json", "trunc.seq"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 1, column 8\n", 2),
+        (&["-c", "-s", "--seq", "--stream", "if false then input else . end"][..], &["two.seq", "missing.json", "trunc.seq"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 4\n", 2),
+        (&["-c", "-s", "--seq", "--stream", "."][..], &["two.seq", "missing.json", "trunc.seq"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 4\n", 2),
+        (&["-c", "-s", "--seq", "--stream", "[., input_filename]"][..], &["two.seq", "missing.json", "trunc.seq"][..], "", "jq: error: Could not open file @DIR@/missing.json: No such file or directory\njq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 4\n", 2),
     ];
     check_rows(&dir.path().to_string_lossy(), rows)
 }

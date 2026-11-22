@@ -76,7 +76,14 @@ fn test_several_files_name_the_last_one_6146() -> Result<()> {
     let second = dir.path().join("f2.seq");
     std::fs::write(&first, format!("{RS}1\n"))?;
     std::fs::write(&second, format!("{RS}2 "))?;
-    for (a, b, at) in [(&first, &second, "f2.seq:0"), (&second, &first, "f1.seq:1")] {
+    // `f1` then `f2`: jq 1.7.1 ended the stream at the RS that opens `f2` (#2998), so its `break` was
+    // that read's, at `f2.seq:0`; jq 1.8.2 reads `2` and names `f2.seq:0` past the end too, as it keeps
+    // the file name (#7607). `succinctly jq` reads `2` as 1.8.2 does (#7718), and the read past the
+    // end then loses the position by 1.7.1's rule, since the last read completed the last value.
+    for (a, b, at) in [
+        (&first, &second, "<unknown>"),
+        (&second, &first, "f1.seq:1"),
+    ] {
         let (stdout, stderr, code) = run_jq_full(
             &[
                 "-c",

@@ -4,6 +4,10 @@
 //! reach the warning or the file: it exits 0 or 5 where the stream's failure had made it exit 2.
 //! The record reader's faults already went through the input queue (#6147); the stream reader's
 //! take it too. Every row was captured from jq 1.7.1.
+//!
+//! Since #7718 `succinctly jq` reads `--seq` past the last bytes as jq 1.8.2 does (jqlang/jq#3279), so
+//! the rows that read differently there are jq 1.8.2's (`/opt/homebrew/bin/jq`), with jq 1.7.1's
+//! position after the last input (#7607) and its reads past a last directory.
 
 use anyhow::Result;
 
@@ -17,7 +21,7 @@ type Row<'a> = (&'a [&'a str], &'a [&'a str], &'a str, &'a str, i32);
 fn a_halting_program_comes_before_the_streams_warnings_and_failures_6725() -> Result<()> {
     let rows: &[Row] = &[
         (&["--seq", "--stream", "halt"], &["trunc"], "", "", 0),
-        (&["--seq", "--stream", "error(\"x\")"], &["two", "mix"], "", "jq: error (at @D@/two:1): x\njq: ignoring parse error: Unmatched ']' in the middle of an object at line 2, column 3 (need RS to resync)\n", 5),
+        (&["--seq", "--stream", "error(\"x\")"], &["two", "mix"], "", "jq: error (at @D@/two:1): x\njq: ignoring parse error: Unmatched ']' in the middle of an object at line 2, column 3 (need RS to resync)\njq: error (at @D@/mix:1): x\n", 5),
         (&["--seq", "--stream-errors", "halt"], &["arr", "miss"], "", "", 0),
         (&["--seq", "--stream", "halt"], &["multi", "miss", "bad"], "", "", 0),
         (&["--seq", "--stream", "halt_error"], &["two", "miss", "bad", "arr"], "", "[[],2]\n", 5),
@@ -32,10 +36,10 @@ fn a_halting_program_comes_before_the_streams_warnings_and_failures_6725() -> Re
         (&["--seq", "--stream", "."], &["two", "dir"], "\x1e[[],2]\n", "", 2),
         (&["--seq", "--stream-errors", "error(\"x\")"], &["arr", "dir", "two"], "", "jq: error (at @D@/arr:0): x\njq: error (at @D@/dir:0): x\n", 2),
         (&["--seq", "--stream-errors", "error(\"x\")"], &["arr", "dir"], "", "jq: error (at @D@/arr:0): x\njq: error (at @D@/dir:0): x\n", 2),
-        (&["-n", "--seq", "--stream", "[inputs]"], &["two", "miss", "arr"], "\x1e[[[],2]]\n", "jq: error: Could not open file @D@/miss: No such file or directory\n", 2),
+        (&["-n", "--seq", "--stream", "[inputs]"], &["two", "miss", "arr"], "\u{1e}[[[],2],[[0],1],[[0]]]\n", "jq: error: Could not open file @D@/miss: No such file or directory\n", 2),
         (&["-n", "--seq", "--stream-errors", "[inputs]"], &["arr", "miss", "two"], "\x1e[[[0],1],[[0]],[[],2]]\n", "jq: error: Could not open file @D@/miss: No such file or directory\n", 2),
         (&["--seq", "--stream", "[., input]"], &["multi", "two", "miss"], "\x1e[[[],1],[[],2]]\n", "jq: error: Could not open file @D@/miss: No such file or directory\njq: error (at @D@/miss:0): break\n", 2),
-        (&["--seq", "--stream-errors", "[., input]"], &["multi", "dir", "arr"], "\x1e[[[],1],[[],2]]\n", "jq: error: Is a directory\n", 2),
+        (&["--seq", "--stream-errors", "[., input]"], &["multi", "dir", "arr"], "\u{1e}[[[],1],[[],2]]\n\u{1e}[[[0],1],[[0]]]\n", "jq: error: Is a directory\n", 2),
     ];
     let dir = tempfile::tempdir()?;
     let d = dir.path().to_string_lossy().into_owned();
