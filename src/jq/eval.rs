@@ -115589,26 +115589,52 @@ pub fn snapshot_environment() {
     ENVIRONMENT_SNAPSHOT.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// The object of all environment variables: built now, or the thread's snapshot of it once
-/// [`snapshot_environment`] has been called.
+/// Which of jq's two readings of the environment an object is (#7734). They differ only on an entry
+/// with no `=`, which only a raw `execve` makes.
 #[cfg(feature = "std")]
-fn environment_object() -> OwnedValue {
-    environment_object_in(ENVIRONMENT_SNAPSHOT.load(core::sync::atomic::Ordering::Relaxed))
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EnvironmentView {
+    /// `$ENV`, which jq builds once at compile time (`make_env` in `compile.c`): an entry with no
+    /// `=` deletes its name, so `A=1` then `A` leaves no `A`, and a later `A=3` adds it at the end.
+    Variable,
+    /// The `env` builtin (`f_env` in `builtin.c`): an entry with no `=` sets its name to `null`, in
+    /// place, so `A=1` then `A` is `{"A":null}` and `A` then `A=3` keeps `A` first.
+    Builtin,
+}
+
+/// The object of all environment variables as `view` reads them: built now, or the thread's
+/// snapshot of it once [`snapshot_environment`] has been called.
+#[cfg(feature = "std")]
+fn environment_object(view: EnvironmentView) -> OwnedValue {
+    environment_object_in(
+        view,
+        ENVIRONMENT_SNAPSHOT.load(core::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// [`environment_object`] with the snapshot choice passed in, so a test can read either way without
 /// switching the process-wide flag for every other test.
 #[cfg(feature = "std")]
-fn environment_object_in(snapshot: bool) -> OwnedValue {
-    fn build() -> OwnedValue {
+fn environment_object_in(view: EnvironmentView, snapshot: bool) -> OwnedValue {
+    fn build(view: EnvironmentView) -> OwnedValue {
         let mut env_obj = FieldMap::new();
         // jq splits every `environ` string at its first `=`; `std` skips a name that is empty and
         // reads `=X=1` as `X`, so Unix reads the strings themselves (#7487). An entry with no `=`
-        // is no variable, as in jq.
+        // is the whole string as a name: `null` in `env`, a deletion in `$ENV` (#7734). `std` skips
+        // it too.
         #[cfg(unix)]
         for entry in super::environ::entries() {
             use std::os::unix::ffi::OsStrExt;
             let Some(eq) = entry.iter().position(|&b| b == b'=') else {
+                let name = environment_text(std::ffi::OsStr::from_bytes(&entry));
+                match view {
+                    EnvironmentView::Builtin => {
+                        env_obj.insert(name, OwnedValue::Null);
+                    }
+                    EnvironmentView::Variable => {
+                        env_obj.shift_remove(name.as_str());
+                    }
+                }
                 continue;
             };
             env_obj.insert(
@@ -115621,22 +115647,33 @@ fn environment_object_in(snapshot: bool) -> OwnedValue {
         // `vars_os`, not `vars`: `vars` panics on the first name or value that is not UTF-8
         // (#6564); jq substitutes it instead.
         #[cfg(not(unix))]
-        for (key, value) in std::env::vars_os() {
-            env_obj.insert(
-                environment_text(&key),
-                OwnedValue::String(environment_text(&value).into()),
-            );
+        {
+            let _ = view;
+            for (key, value) in std::env::vars_os() {
+                env_obj.insert(
+                    environment_text(&key),
+                    OwnedValue::String(environment_text(&value).into()),
+                );
+            }
         }
         OwnedValue::Object(env_obj.into())
     }
     thread_local! {
-        static SNAPSHOT: core::cell::RefCell<Option<OwnedValue>> =
-            const { core::cell::RefCell::new(None) };
+        static SNAPSHOT: core::cell::RefCell<[Option<OwnedValue>; 2]> =
+            const { core::cell::RefCell::new([None, None]) };
     }
     if !snapshot {
-        return build();
+        return build(view);
     }
-    SNAPSHOT.with(|cell| cell.borrow_mut().get_or_insert_with(build).clone())
+    let slot = match view {
+        EnvironmentView::Variable => 0,
+        EnvironmentView::Builtin => 1,
+    };
+    SNAPSHOT.with(|cell| {
+        cell.borrow_mut()[slot]
+            .get_or_insert_with(|| build(view))
+            .clone()
+    })
 }
 
 /// $ENV expression - returns object of all environment variables
@@ -115645,7 +115682,7 @@ fn eval_env<'a, W: Clone + AsRef<[u64]>>(_optional: bool) -> QueryResult<'a, W> 
     if let Some(refusal) = super::eval_generic::env_ops_refusal() {
         return QueryResult::Error(EvalError::new(refusal));
     }
-    QueryResult::Owned(environment_object())
+    QueryResult::Owned(environment_object(EnvironmentView::Variable))
 }
 
 /// An environment name or value as text: jq's maximal-subpart substitution of its bytes where the
@@ -115678,7 +115715,7 @@ fn builtin_env<W: Clone + AsRef<[u64]>>(
     if let Some(refusal) = super::eval_generic::env_ops_refusal() {
         return QueryResult::Error(EvalError::new(refusal));
     }
-    QueryResult::Owned(environment_object())
+    QueryResult::Owned(environment_object(EnvironmentView::Builtin))
 }
 
 #[cfg(not(feature = "std"))]
@@ -159802,25 +159839,31 @@ mod tests {
             }
             format!("{:?}", OwnedValue::Object(map.into()))
         };
-        assert_eq!(format!("{:?}", environment_object_in(false)), expected());
-        let (first, second) = std::thread::spawn(|| {
-            (
-                format!("{:?}", environment_object_in(true)),
-                format!("{:?}", environment_object_in(true)),
-            )
-        })
-        .join()
-        .unwrap();
-        assert_eq!(first, expected());
-        assert_eq!(second, first);
-        // The same thread, switched back, reads the environment again rather than the snapshot.
-        let (cached, fresh) = std::thread::spawn(|| {
-            let cached = format!("{:?}", environment_object_in(true));
-            (cached, format!("{:?}", environment_object_in(false)))
-        })
-        .join()
-        .unwrap();
-        assert_eq!(cached, fresh);
+        // The test process's environment has no entry without `=`, so both views read it whole (#7734).
+        for view in [EnvironmentView::Variable, EnvironmentView::Builtin] {
+            assert_eq!(
+                format!("{:?}", environment_object_in(view, false)),
+                expected()
+            );
+            let (first, second) = std::thread::spawn(move || {
+                (
+                    format!("{:?}", environment_object_in(view, true)),
+                    format!("{:?}", environment_object_in(view, true)),
+                )
+            })
+            .join()
+            .unwrap();
+            assert_eq!(first, expected());
+            assert_eq!(second, first);
+            // The same thread, switched back, reads the environment again rather than the snapshot.
+            let (cached, fresh) = std::thread::spawn(move || {
+                let cached = format!("{:?}", environment_object_in(view, true));
+                (cached, format!("{:?}", environment_object_in(view, false)))
+            })
+            .join()
+            .unwrap();
+            assert_eq!(cached, fresh);
+        }
     }
 
     /// #6527: [`eval_owned_number_fold`] answers what the reindex bridge answers for every array of
