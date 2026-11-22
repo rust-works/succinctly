@@ -482,8 +482,9 @@ fn an_unbound_variable_is_a_compile_error_5223() {
 }
 
 /// The prelude parsed one definition at a time is the chain [`PRELUDE`] spells,
-/// each definition's own `FuncDef` with the rest of the chain cut off; and it
-/// parses on a 2 MiB thread, which the whole chain does not in a debug build.
+/// each definition's own `FuncDef` with the rest of the chain cut off. (Parsed
+/// as one chain it needs more stack than a 2 MiB debug thread has; one
+/// definition at a time it fits the bound the next test pins.)
 #[test]
 fn the_prelude_parses_one_definition_at_a_time_5223() {
     on_big_stack(|| {
@@ -502,17 +503,44 @@ fn the_prelude_parses_one_definition_at_a_time_5223() {
             assert_eq!(parsed, expected);
         }
     });
+}
+
+/// The most native stack a parse run under `with_native_stack_floor_lifted` may take (#7676), a
+/// prelude definition's or the `_nwise` template's. Measured on an Apple M5 Max as the smallest
+/// thread each parses on (the thread's own start included, 36 KiB debug and 12 KiB release): the
+/// deepest definition, `modify`, took 632 KiB in a debug build and 100 KiB in a release one, and the
+/// template 388 KiB and 52 KiB. The bound is about 1.6 and 2.5 times those.
+const TRUSTED_PARSE_STACK: usize = if cfg!(debug_assertions) {
+    1024 * 1024
+} else {
+    256 * 1024
+};
+
+/// #7676: a definition is parsed on its first use, which can be at the native-stack floor, so it
+/// is parsed with the floor lifted, and the stack below the floor pays for it. Every definition
+/// parses there, at the floor, on a thread of `TRUSTED_PARSE_STACK`: the bound the floor's other
+/// half has to cover (ADR-0025). A definition that outgrew it would overflow this thread and abort
+/// the test binary.
+#[cfg(feature = "std")]
+#[test]
+fn every_prelude_definition_parses_at_the_floor_within_its_stack_bound_7676() {
     std::thread::Builder::new()
-        .stack_size(2 << 20)
+        .stack_size(TRUSTED_PARSE_STACK)
         .spawn(|| {
             let prelude = Prelude::new();
-            for def in &prelude.defs {
-                def.expr();
-            }
+            crate::jq::with_stack_budget(0, || {
+                for def in &prelude.defs {
+                    def.expr();
+                }
+            });
+            // The `_nwise` template is the other text parsed with the floor lifted.
+            crate::jq::with_stack_budget(0, || {
+                parse("[1,2,3] | [_nwise(2)], [_nwise(.; 2)]").expect("parses")
+            });
         })
         .expect("spawn")
         .join()
-        .expect("the prelude parses on a 2 MiB thread");
+        .expect("the prelude parses at the floor within the stated bound");
 }
 
 /// A definition's name and arity are read off its source text, so a call finds
@@ -2661,6 +2689,273 @@ fn an_object_key_is_one_value_per_object_7401() {
     });
 }
 
+/// Which programs can hand a key out as a value (#7489): only those that reach
+/// `EACH` on an object or `keys`/`keys_unsorted`, directly, through a `def` of
+/// their own, or through a jq-defined builtin's prelude body.
+#[test]
+fn a_program_hands_out_keys_only_through_each_or_keys_7489() {
+    on_big_stack(|| {
+        let blind = [
+            ". as $d | path($d)",
+            "path(getpath([\"a\", \"b\"]))",
+            "path(.a | select(.b))",
+            "path(first(.a, .b))",
+            "path(limit(1; .a, .b))",
+            "path(if .a then .b else .c end)",
+            ".a as $x | path(.b | $x)",
+            "path(.[0] | .[1:])",
+            "del(.a, .b) | .c |= 1",
+            "(.a, .b) += 1",
+            ".a //= 3",
+            "path(until(. == null; .a))",
+            "path(recurse(.a; . != null))",
+            "def f: .a; path(f | f)",
+            "path(\"\\(.a)\" as $s | .b)",
+            "[path(.a), (.b | length)]",
+            "path(.a | tostring)",
+        ];
+        let reaching = [
+            "keys",
+            "keys_unsorted",
+            "path(.[])",
+            "path(.[]?)",
+            "path(..)",
+            "[paths]",
+            "[leaf_paths]",
+            "to_entries",
+            "with_entries(.)",
+            "map(.)",
+            "map_values(.)",
+            "add",
+            "any",
+            "del(.[] | select(. == 1))",
+            "walk(.)",
+            "recurse",
+            "path(recurse)",
+            "tostream",
+            "unique",
+            "def f: keys[0]; f as $k | path($k)",
+            "def f(g): g; path(f(.[]))",
+            "reduce .[] as $x (0; . + 1)",
+            "first(.[])",
+            "input | keys",
+        ];
+        let classify = |filter: &str| {
+            let program = compile(filter).unwrap_or_else(|e| panic!("{filter}: {e}"));
+            hands_out_keys(&program)
+        };
+        let wrong: Vec<String> = blind
+            .iter()
+            .filter(|f| classify(f))
+            .map(|f| format!("{f}: reaches a key"))
+            .chain(
+                reaching
+                    .iter()
+                    .filter(|f| !classify(f))
+                    .map(|f| format!("{f}: blind")),
+            )
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    });
+}
+
+/// [`KEY_HANDING_PRELUDE_DEFS`] is what [`reaches_a_key`] answers over every
+/// parsed [`PRELUDE`] definition, looking inside each definition it calls
+/// (#7489): the walk is the one definition of the answer, and the table only
+/// spares a run parsing the prelude to find it.
+#[test]
+fn the_key_handing_prelude_table_is_derived_from_the_prelude_7489() {
+    /// Whether the prelude definition `name/arity` can hand a key out, `seen`
+    /// the definitions already being looked inside (a recursive one is looked
+    /// inside once).
+    fn reaches(
+        prelude: &Prelude,
+        name: &str,
+        arity: usize,
+        seen: &mut Vec<(&'static str, usize)>,
+    ) -> bool {
+        let Some(def) = prelude.find(name, arity) else {
+            return false;
+        };
+        if seen.contains(&(def.name, def.arity)) {
+            return false;
+        }
+        seen.push((def.name, def.arity));
+        reaches_a_key(def.expr(), &mut |name, arity| {
+            reaches(prelude, name, arity, seen)
+        })
+    }
+    on_big_stack(|| {
+        let prelude = Prelude::new();
+        let mut derived: Vec<(&str, usize)> = prelude
+            .defs
+            .iter()
+            .filter(|def| reaches(&prelude, def.name, def.arity, &mut Vec::new()))
+            .map(|def| (def.name, def.arity))
+            .collect();
+        derived.sort_unstable();
+        assert!(derived.contains(&("_sp_to_entries", 0)), "{derived:?}");
+        assert!(prelude.find("_sp_first", 1).is_some());
+        assert!(!derived.contains(&("_sp_first", 1)), "{derived:?}");
+        assert_eq!(
+            KEY_HANDING_PRELUDE_DEFS,
+            derived.as_slice(),
+            "KEY_HANDING_PRELUDE_DEFS disagrees with the prelude; the derived table is\n{derived:?}"
+        );
+        // Sorted and without repeats, as its binary search needs.
+        assert!(KEY_HANDING_PRELUDE_DEFS.windows(2).all(|w| w[0] < w[1]));
+    });
+}
+
+/// ADR-0025 (#3262, #7475): a run that starts at the native-stack floor,
+/// where the parser refuses, still decides [`hands_out_keys`], which parses
+/// nothing (#7489). Through the library entry, a path program that calls its
+/// own `def` first is then refused at that call, as eval.rs's
+/// `every_route_checks_the_native_stack_floor_3262` pins, where deciding by
+/// parsing the prelude's bodies panicked before the run began. Without `std`
+/// there is no floor ([`crate::jq::with_stack_budget`] is a no-op).
+#[cfg(feature = "std")]
+#[test]
+fn the_key_decision_is_reached_at_the_native_stack_floor_7489() {
+    on_big_stack(|| {
+        let json = br#"{"a":{"b":1}}"#;
+        let index = JsonIndex::build(json);
+        for (filter, keys) in [
+            ("def f: .a; [path(f)]", false),
+            ("def f(g): g; [path(f(.a))]", false),
+            ("def f(g): g; f(.a) |= 2", false),
+            ("def f: .a; first(f)", false),
+            ("def f: .a; [path(f | first(.b, .c))]", false),
+            ("def f: .; [path(f | .a | to_entries)]", true),
+            ("def f: .; [path(f | paths)]", true),
+            ("def f: .; del(f | .[] | select(. == 1))", true),
+            ("[path(first(.a, .b))]", false),
+            ("[path(.a | select(.b))]", false),
+            ("[paths]", true),
+            ("[path(..)]", true),
+        ] {
+            let program = compile(filter).unwrap_or_else(|e| panic!("{filter}: {e}"));
+            let at_floor = crate::jq::with_stack_budget(0, || hands_out_keys(&program));
+            assert_eq!(at_floor, keys, "{filter}");
+            assert_eq!(hands_out_keys(&program), keys, "{filter}: off the floor");
+            if !filter.starts_with("def f") {
+                continue;
+            }
+            let expr = crate::jq::parse(filter).expect("parses");
+            match crate::jq::with_stack_budget(0, || {
+                crate::jq::eval_full::<Vec<u64>, JqSemantics>(&expr, index.root(json))
+            }) {
+                crate::jq::QueryResult::Error(e) => assert!(
+                    e.message.ends_with("exceeded maximum recursion depth"),
+                    "{filter}: {}",
+                    e.message
+                ),
+                other => panic!("{filter}: expected a refusal, got {other:?}"),
+            }
+        }
+    });
+}
+
+/// A run that cannot hand a key out leaves the document's keys as they were
+/// read: an inline key stays inline, and a key the reader shares between
+/// sibling records (#7260) stays shared, where a run that can splits and
+/// promotes each (#7401). That is the allocation per key #7489 saves.
+#[test]
+fn a_run_that_cannot_hand_out_a_key_leaves_the_keys_as_read_7489() {
+    on_big_stack(|| {
+        let prelude = Prelude::new();
+        let doc = || {
+            let mut doc =
+                crate::jq::parse_plain(r#"[{"a":1,"b":2},{"a":3,"b":4}]"#).expect("plain");
+            if let OwnedValue::Array(items) = &mut doc {
+                if let Some(OwnedValue::Object(map)) = items.iter_mut().next() {
+                    map.insert(String::from("inline"), OwnedValue::Null);
+                }
+            }
+            doc
+        };
+        let key = |doc: &OwnedValue, record: usize, at: usize| -> SharableString {
+            let records = doc.as_array().expect("an array");
+            let map = records[record].as_object().expect("an object");
+            map.key_at(at).cloned().expect("a key")
+        };
+        for (filter, keys) in [(". as $d | path($d)", false), ("keys", true)] {
+            let program = compile(filter).expect("compiles");
+            let interp = Interp::new(&prelude);
+            let mut input = doc();
+            assert!(
+                key(&input, 0, 0).ptr_eq(&key(&input, 1, 0)),
+                "the reader shares a sibling's key"
+            );
+            assert!(!key(&input, 0, 2).is_shared(), "built inline");
+            interp.prepare(&program, &mut input);
+            assert_eq!(interp.key_ids.get(), keys, "{filter}");
+            assert_eq!(
+                key(&input, 0, 0).ptr_eq(&key(&input, 1, 0)),
+                !keys,
+                "{filter}: siblings' keys"
+            );
+            assert_eq!(key(&input, 0, 2).is_shared(), keys, "{filter}: inline key");
+        }
+    });
+}
+
+/// Leaving the keys as read changes no answer (#7489): every program of the
+/// differential corpus that cannot hand a key out answers the same as with
+/// one identity per key, as every run had before.
+#[test]
+fn leaving_the_keys_as_read_changes_no_answer_7489() {
+    on_big_stack(|| {
+        let prelude = Prelude::new();
+        let mut compared = 0;
+        let mut differ = Vec::new();
+        for (doc, filter) in differential_corpus() {
+            let Ok(program) = compile(&filter) else {
+                continue;
+            };
+            if hands_out_keys(&program) {
+                continue;
+            }
+            let input = parse_doc(&doc);
+            let gated = owned_summary(&prelude, &program, &input);
+            let interp = Interp::new(&prelude);
+            let mut every_key = input.clone();
+            every_key.promote_identities(true);
+            let mut outputs = Vec::new();
+            let result = interp.eval(
+                &program,
+                &Env::default(),
+                every_key,
+                Reg::top(),
+                &mut |v, _| {
+                    outputs.push(v);
+                    Ok(())
+                },
+            );
+            let ending = match result.map_or_else(Interp::outcome, |()| Outcome::Done) {
+                Outcome::Done => String::from("done"),
+                Outcome::Error(e) => format!("error {}", e.payload().to_json_jq_preserve()),
+                Outcome::Halt(code) => format!("halt {code}"),
+                Outcome::Unsupported(what) => format!("unsupported {what}"),
+            };
+            compared += 1;
+            let exact = summary(&outputs, ending);
+            if gated != exact {
+                differ.push(format!(
+                    "{doc} | {filter}\n  gated: {gated:?}\n  exact: {exact:?}"
+                ));
+            }
+        }
+        assert!(compared > 2_000, "{compared}");
+        assert!(
+            differ.is_empty(),
+            "{} rows differ:\n{}",
+            differ.len(),
+            differ.join("\n")
+        );
+    });
+}
+
 /// The `reduce` update of a prelude definition.
 fn prelude_reduce_update(prelude: &Prelude, name: &str, arity: usize) -> Expr {
     let Expr::FuncDef { body, .. } = prelude.find(name, arity).expect(name).expr() else {
@@ -2696,8 +2991,13 @@ fn add_and_flatten_steps_append_in_place_7564() {
         "if $x | type == \"array\" then . + $x else . + [$x] end",
         ".",
         ". + ($x | length | [.])",
+        ". + {(\"k\\($x)\"): $x}",
+        ". + \"<\\($x)>\"",
     ] {
         assert!(is_append_update(&update(src)), "{src}");
+    }
+    for src in [". + {(\"k\\(.)\"): $x}", ". + \"\\(.a)\""] {
+        assert!(!is_append_update(&update(src)), "{src}");
     }
     for src in [
         ". + [.[0]]",
@@ -2775,6 +3075,94 @@ fn the_append_step_answers_as_jq_7564() {
             "[[1],[2]]",
             "path(add)",
             err(&[], "Invalid path expression with result [1,2]"),
+        ),
+    ]);
+}
+
+/// `PathList::to_array` gathers a path of up to `SHORT_PATH` keys on the stack
+/// and builds its array at that exact length (#7465); a longer one takes the
+/// `Vec` route. Both answer the keys root first, at and either side of the
+/// boundary.
+#[test]
+fn path_list_to_array_answers_keys_root_first_either_side_of_short_path_7465() {
+    for len in [0, 1, 3, SHORT_PATH - 1, SHORT_PATH, SHORT_PATH + 1, 40] {
+        let mut path = PathList::default();
+        for i in 0..len {
+            path = path.push(OwnedValue::Int(i as i64));
+        }
+        let expected: Vec<OwnedValue> = (0..len).map(|i| OwnedValue::Int(i as i64)).collect();
+        assert_eq!(
+            path.to_array(),
+            OwnedValue::Array(expected.into()),
+            "len {len}"
+        );
+    }
+}
+
+/// End to end: `path()` of a 17-key path (one past `SHORT_PATH`) and of a
+/// three-key one, collected and counted.
+#[test]
+fn path_answers_long_and_short_paths_7465() {
+    let deep = "[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]";
+    check(&[
+        (deep, "[path(..)] | length", ok(&["18"])),
+        (deep, "[path(..)] | last | length", ok(&["17"])),
+        (
+            r#"{"a":[{"b":1}]}"#,
+            "[path(.a[0].b)]",
+            ok(&[r#"[["a",0,"b"]]"#]),
+        ),
+    ]);
+}
+
+/// The object and string step's answers, each captured from jq 1.7.1 (jq 1.8.2 agrees): only a
+/// generator's last operand is the next state, `null` and `{}` add nothing (a state the input
+/// shares then stays that value, which `path` sees), an existing key keeps its place, no output
+/// leaves `null`, and an operand of another kind raises with the state as it was (#7610).
+#[test]
+fn the_grow_step_answers_as_jq_7610() {
+    check(&[
+        (
+            "null",
+            "reduce range(3) as $i ({}; . + ({a: $i}, {b: $i}))",
+            ok(&[r#"{"b":2}"#]),
+        ),
+        (
+            r#"[{"b":1,"a":2},{"a":3,"c":4},null,{}]"#,
+            "add",
+            ok(&[r#"{"b":1,"a":3,"c":4}"#]),
+        ),
+        (
+            "null",
+            r#"reduce range(3) as $i ({}; . + {("k\($i)"): $i})"#,
+            ok(&[r#"{"k0":0,"k1":1,"k2":2}"#]),
+        ),
+        ("null", "reduce range(3) as $i ({}; empty)", ok(&["null"])),
+        (
+            "null",
+            "reduce range(2) as $i ({}; . + ({x: 1}, 2))",
+            err(&[], "object ({}) and number (2) cannot be added"),
+        ),
+        (r#"["a","b",null,"",  "c"]"#, "add", ok(&[r#""abc""#])),
+        (
+            "null",
+            r#"reduce range(3) as $i (""; . + ("x", "y\($i)"))"#,
+            ok(&[r#""y0y1y2""#]),
+        ),
+        (
+            "null",
+            r#"reduce (1, 2) as $x ("a"; . + ("b", {}))"#,
+            err(&[], r#"string ("a") and object ({}) cannot be added"#),
+        ),
+        (
+            r#"{"a":{"x":1}}"#,
+            "path(.a | reduce (null, {}) as $x (.; . + $x))",
+            ok(&[r#"["a"]"#]),
+        ),
+        (
+            r#"{"a":"s"}"#,
+            r#"path(.a | reduce ("") as $x (.; . + $x))"#,
+            err(&[], r#"Invalid path expression with result "s""#),
         ),
     ]);
 }

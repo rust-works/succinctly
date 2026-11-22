@@ -17229,13 +17229,14 @@ fn test_first_last_wrapping_computation_gets_scientific_notation_997() -> Result
 
 /// `last(f)`/`first(f)` are succinctly-only extensions in yq mode -- real yq
 /// (Homebrew v4.53.3) rejects both outright with "lexer: invalid input
-/// text", live-confirmed -- so #1521's "empty operand answers `null`" rule
-/// has no yq oracle to check against. succinctly mirrors jq's own semantics
-/// here by design; this pins that choice on both dispatch routes so a future
-/// change to only one of `eval_generic.rs`'s `eval_first_or_last_generic` or
-/// `eval.rs`'s `eval_last_expr` can't silently regress the other for yq mode.
+/// text", live-confirmed -- so the rule for an empty operand has no yq oracle to
+/// check against. succinctly mirrors jq's own semantics here by design: #1521
+/// pinned jq 1.7.1's `null` answer, and #7518 moved it to jq 1.8.2's (nothing, as
+/// for `first`; jqlang/jq#3179). This pins that choice on both dispatch routes so
+/// a future change to only one of `eval_generic.rs`'s `eval_first_or_last_generic`
+/// or `eval.rs`'s `eval_last_expr` can't silently regress the other for yq mode.
 #[test]
-fn test_yq_last_of_an_empty_stream_is_null_1521() -> Result<()> {
+fn test_yq_last_of_an_empty_stream_yields_nothing_1521_7518() -> Result<()> {
     // M2/streaming route.
     let (out, code) = run_yq_stdin(
         "last(.a[])",
@@ -17243,7 +17244,7 @@ fn test_yq_last_of_an_empty_stream_is_null_1521() -> Result<()> {
         &["--jq-extensions", "-o=json", "-I=0"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "null");
+    assert_eq!(out.trim(), "");
 
     // DOM fallback route (`--sort-keys` forces it past `can_use_m2_streaming`).
     let (out, code) = run_yq_stdin(
@@ -17252,9 +17253,9 @@ fn test_yq_last_of_an_empty_stream_is_null_1521() -> Result<()> {
         &["--jq-extensions", "-o=json", "-I=0", "--sort-keys"],
     )?;
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "null");
+    assert_eq!(out.trim(), "");
 
-    // `first` stays asymmetric here too, same as jq mode (#1521).
+    // `first` yields nothing for an empty operand too, same as jq mode.
     let (out, code) = run_yq_stdin(
         "limit(1; .a[])",
         "a: []\n",

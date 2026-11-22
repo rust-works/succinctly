@@ -1,0 +1,3 @@
+category = "newer-than-primary"
+reason = "A malformed `--indent` value (empty, white space, trailing text, `abc`, past an int, a following option) is refused with exit 2 as in jq 1.8 (jqlang/jq#3195); jq 1.7.1 reads it with `atoi` and runs. succinctly follows 1.8.2 (docs/compliance/jq/limitations.md, #7501)."
+issue = "7501"
