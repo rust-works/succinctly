@@ -9614,6 +9614,8 @@ parameter is re-evaluated at each use, so reading one at depth `d` costs `O(d)`.
 `$`-style parameter is bound to a value once per call (#3149), so recursion through one is
 linear. Measured interleaved on one machine,
 `sum_to(8000)` is 10.8 s here against jq's 4.3 s: same complexity, ~2.5x constant.
+A recursion that makes many cheap calls is slower than jq by a constant for a second reason: this evaluator binds by substitution, so every call of a recursive `def` copies its body (its call nodes are new at each level, so nothing is cached), up to three times for a `$` parameter with a computed argument ([#7699](https://github.com/rust-works/succinctly/issues/7699)).
+Since #7699 the copy that substituted the bare names is skipped when the body reads none of them and no argument is a literal, which leaves `def f($n): ... f($n - 1) | f($n - 1) ...; 0 | f(16)` 4.1-5.1x slower than jq 1.7.1 on an Apple M4 Pro and an AMD Ryzen 9 7950X (from 5.5-6.4x), with the same output.
 
 `MAX_EVAL_FRAMES`'s ceiling is calibrated against the 256 MB (release) / 2 GB (debug)
 stack the CLI reserves for evaluation (`EVAL_STACK_SIZE`, `src/bin/succinctly/main.rs`),
