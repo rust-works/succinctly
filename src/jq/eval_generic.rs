@@ -467,13 +467,20 @@ fn unary_math_of_document_number<S: EvalSemantics, V: DocumentValue>(
 /// number literal, read as an owned value as [`binary_math_of_document_number`] reads one. `None`
 /// (the double's `numeric_length_owned` below) in yq mode, for a value that is not a valid RFC 8259
 /// number span (a bridge token, a lenient span, a non-number) and for a number with no literal.
+/// A document's parsed `Infinity` is no RFC 8259 span but is decNumber's literal (#7469), whose
+/// `length` jq 1.8.2 keeps a literal too (`-Infinity | length > 1e1000` is `true` there), as the
+/// owned route's `tonumber`, `fromjson` and `--argjson` infinities already answer.
 fn jq_literal_length_of_document_number<S: EvalSemantics, V: DocumentValue>(
     value: &V,
 ) -> Option<OwnedValue> {
     if S::TAG != EvalTag::Jq {
         return None;
     }
-    value.valid_number_text()?;
+    if value.valid_number_text().is_none()
+        && !(value.as_f64().is_some_and(f64::is_infinite) && value.number_token_address().is_some())
+    {
+        return None;
+    }
     crate::jq::eval::jq_literal_length(to_owned::<S, V>(value).ok()?)
 }
 
@@ -753,6 +760,11 @@ fn document_float_to_owned<S: EvalSemantics, V: DocumentValue>(value: &V, f: f64
         }
         // A bridge token for a parsed NaN: the instance it was written from.
         return OwnedValue::from_bridge_float(f);
+    }
+    // A document's `Infinity` is a literal in jq (#7469); a bridge token (no address) is the
+    // computed infinity it was written from.
+    if S::DECNUMBER_LITERALS && f.is_infinite() && value.number_token_address().is_some() {
+        return OwnedValue::parsed_infinity(f.is_sign_negative());
     }
     OwnedValue::from_document_float(f)
 }

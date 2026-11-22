@@ -314,25 +314,30 @@ substitution into the more sensible WHATWG-consistent shape. See
 substitution-mechanism history and
 [#1717](https://github.com/rust-works/succinctly/issues/1717) for the algorithm fix itself.
 
-## `-R` replaces a character that straddles jq's 4095-byte read; succinctly keeps it (#5476)
+## A character that straddles jq 1.7.1's 4095-byte `-R` read is kept, as jq 1.8.2 keeps it (#5476)
 
 jq 1.7.1 reads `--raw-input` with `fgets` into a 4096-byte buffer, so it sees a long line in pieces of at most 4095 bytes.
 A multi-byte character that starts before the end of one piece and ends in the next is read as invalid UTF-8 and printed as U+FFFD replacement characters (two or three for a 3-byte character, depending on where it splits).
 `succinctly jq` reads the line whole and keeps the character.
-This is jq corrupting valid text, so the divergence stands under [ADR-0018](../../adrs/adr-0018.md) rather than being matched.
-It reaches `-R`, `-Rs`, `-Rc` and `-nR` with `input`, and a differential sweep of 1,977 real JSON files found it in five of them (language packs with CJK text in a minified line).
+jq 1.8.2 keeps it too: upstream fixed the corruption as a bug (jqlang/jq#3389, "Slurping corrupts multibyte characters that cross a 4095-byte boundary", fixed by jqlang/jq#3421 and listed in the 1.8 NEWS as "Fix raw input flag not to corrupt multi-byte characters").
+So `succinctly jq` follows 1.8.2, as ADR-0018's fork order says for an upstream bug fix, and the difference from the pinned 1.7.1 stands as `newer-than-primary` (the ledger's `cli:raw-input-read-boundary` and its siblings).
+Before 1.8.2 was checked, this page kept the character on a ground that still holds: matching 1.7.1 would corrupt valid text, which [ADR-0018](../../adrs/adr-0018.md) does not ask for.
+It reaches `-R`, `-Rs`, `-Rc`, a file and standard input alike, and `-nR` with `input` and with `inputs`; `--rawfile` reads the file whole in jq 1.7.1 too and never split the character.
+A differential sweep of 1,977 real JSON files found it in five of them (language packs with CJK text in a minified line).
 
 ```bash
-$ python3 -c "import sys; sys.stdout.buffer.write(b'a'*4094 + '主'.encode() + b'b\n')" > t.txt
-$ jq -R length t.txt          # three U+FFFD for the one character
-4098
-$ sjq -R length t.txt
-4096
+$ python3 -c "import sys; sys.stdout.write('a'*4094 + 'é'*3 + '\n')" > t.txt
+$ /usr/bin/jq -R '.[4090:]' t.txt               # jq 1.7.1: the first é is two U+FFFD
+"aaaa��éé"
+$ /opt/homebrew/bin/jq -R '.[4090:]' t.txt      # jq 1.8.2
+"aaaaééé"
+$ sjq -R '.[4090:]' t.txt
+"aaaaééé"
 ```
 
-The offset is the character's first byte within its line: a 3- or 4-byte character at 4093 or 4094, and a 2-byte one at 4094, are replaced.
-One at 4092 or below, or at 4095 or above, is read intact, and `-Rn` with `inputs` agrees with jq on the same line.
-Pinned by `tests/jq_cli/i5476.rs`, which asserts succinctly's side; jq's side was captured from `/usr/bin/jq` 1.7.1.
+In jq 1.7.1 the character is replaced when it starts at or before byte 4094 of its line and ends at or after byte 4095: a 4-byte character at 4092, 4093 or 4094, a 3-byte one at 4093 or 4094, and a 2-byte one at 4094.
+One that starts at 4095 or later, or ends by 4094, is read intact.
+Pinned by `tests/jq_cli/i5476.rs`, which asserts succinctly's side and, for the routes above, the output jq 1.8.2 (`/opt/homebrew/bin/jq`) prints; jq 1.7.1's side was captured from `/usr/bin/jq`.
 
 ## A NUL byte truncates jq's input in a chunk with no newline; succinctly reports it (#5654)
 
@@ -406,6 +411,16 @@ Only the NUL changes: the rest of 1.8.2's reworded `tonumber` failures and its r
 `fromjson` is not affected: it hands its parser a length in both versions.
 `succinctly yq` is not changed.
 Pinned by `tests/jq_cli/i7521.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+
+## A group that takes no part in an empty match is unmatched, as jq 1.8.2 reports it; jq 1.7.1 reports it as empty (#7520)
+
+When the whole match is empty, jq 1.7.1's `f_match` writes every capture group as an empty string at the match's offset, including a group that took no part: `"a" | match("(b)?") | .captures` is `[{"offset":0,"string":"","length":0,"name":null}]`, and `capture`, `scan` and `sub`'s named captures follow (`"a" | capture("(?<x>b)?")` is `{"x":""}`, `[scan("(b)?")]` is `[[""],[""]]`, `sub("(?<x>b)?"; "[\(.x)]")` is `"[]a"`).
+jq 1.8.2 reports such a group as unmatched, as it already did when the whole match is not empty: `{"offset":-1,"string":null,"length":0,"name":null}`, `{"x":null}`, `[[null],[null]]` and `"[null]a"` (jqlang/jq#3238, commit 2755664 "Non-matched optional capture group should be null and offset -1", listed in the 1.8 NEWS under changes to existing functions, fixing jqlang/jq#3093).
+`succinctly jq` follows 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
+A group that took part in the empty match is unchanged in both versions: an empty match at the whole match's offset, whatever it captured (`"abc" | match("(?=(b))").captures[0].string` is `""`).
+The matches that 1.7.1 repeats at each continuation byte of a multibyte character (#6326) carry the same groups as the match they repeat.
+`succinctly yq` is not changed: Go's `regexp` already reports such a group as unmatched.
+Pinned by `tests/jq_cli/i7520.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
@@ -731,7 +746,7 @@ Costs and gaps this change leaves:
   The CLI parses on a 256 MiB (release) / 2 GiB (debug) thread, and that was not enough either: about 48,000 bindings in a release build overflowed it and aborted the process (exit 134), and so did 500,000 chained definitions, in the walks after the parse ([#7475](https://github.com/rust-works/succinctly/issues/7475)).
   Since #7475 a binding's body checks ADR-0025's native-stack floor, and a chain past it is the compile error jq gives a program past its own parser's stack, `memory exhausted` (exit 3): from about 23,000 bindings in a release build, where jq refuses from about 2,500.
   A module-level chain of definitions, which the parser reads in a loop, is charged a fixed share of the floor's room per definition (`DEF_CHAIN_LINK_STACK`, 2 KiB in a release build, 48 KiB in a debug one, about three and two times what the deepest walk after the parse was measured to take on an Apple M5) and refused the same way from about 65,000 definitions in a release build (about 21,000 in a debug one); jq refuses from somewhere between 5,000 and 10,000.
-  A chain of definitions nested in an expression stops at `MAX_EXPR_DEPTH` already (256, where jq's message is `memory exhausted` from much further on).
+  A chain of definitions nested in an expression is a level of nesting each, held to the native stack with the rest of a program's nesting ([below](#a-programs-nesting-and-operator-chains-are-held-to-the-native-stack-not-to-256-levels-7435), #7435).
   A library caller that registers no stack budget (`with_stack_budget`) gets neither refusal, and its parser still overflows a small stack first.
 - **Stack per negated factor.** jq's `'-' Exp` puts the rest of a multiplicative chain
   under the negation, so `-1 * -1 * -1 ...` nests one negation per negated factor and the
@@ -746,6 +761,21 @@ Costs and gaps this change leaves:
   non-associative check covers bindings, not the other greedy-body prefixes.
 - **`try` bodies and `catch` handlers** take a binding as jq does (`try 1 as $x | $x == 1
   == 1` is a syntax error in both).
+
+## A program's nesting and operator chains are held to the native stack, not to 256 levels (#7435)
+
+`succinctly jq` refused a program nested more than 256 levels deep, or with more than 256 links in one chain of left-associative operators, with `expression nesting exceeds depth limit of 256` (exit 3): `select(.a == 0 or .a == 1 or ... or .a == 299)`, `1 + 1 + ...` with 258 operands, 256 nested brackets or parentheses, `.a` and 300 `?`, 255 local `def`s inside parentheses.
+jq 1.7.1 and 1.8.2 run all of them.
+The fixed limit (`MAX_EXPR_DEPTH`, #1156) was a guard against overflowing the native stack in the recursive-descent parser and in the walks after it, which recurse down a chain's left-deep tree once a link although the parser reads the chain in a loop.
+Since #7435 a jq program is held to the stack itself: when the parser starts it reads the room the native-stack floor leaves ([ADR-0025](../../adrs/adr-0025.md), half the thread's stack), and charges each level of nesting `EXPR_LEVEL_STACK` (14 KiB in a release build, 80 KiB in a debug one) and each chain link of the whole program `CHAIN_LINK_STACK` (6 KiB, 48 KiB) of it.
+The figures are about 1.3 to 1.5 times what the deepest walk was measured to take a level and a link on an Apple M5 (`src/jq/parser.rs` has the measurements), so a program the parser admits leaves the walks more than half the stack to spare.
+On the CLI's threads that is about 9,360 levels of nesting and 21,840 chain links in a release build, and 13,100 levels and 21,840 links in a debug one; a program past it is the compile error jq gives a program too deep for its own parser, `memory exhausted` (exit 3), where it used to be the 256-level refusal.
+
+jq's own limits differ by shape (captured from jq 1.7.1, and the same in 1.8.2): its parser refuses nesting at about 10,000 levels with `memory exhausted` (3,000 run, 30,000 are refused, and 3,000 nested `reduce`s are already refused), it runs a chain of `+`, `-` or `*` of any length (30,000 operands answer), and its compiler refuses an `or`, `//` or `label` chain of 3,000 links, and an `and` or postfix-`?` chain of 30,000, with `function compiled to N bytes which is too long` (3,000 `or` operands: `function compiled to 80985 bytes`).
+So `succinctly jq` answers a few shapes jq refuses (an `or` chain of 3,000 to 21,840 operands, 3,000 nested `reduce`s): those refusals protect jq's C implementation, which the owner's rule for jq's hard limits leaves unadopted, and the answers are the ones jq gives below its limits.
+It refuses a chain of `+`, `-` or `*` past about 21,840 operands that jq runs, where the stack is what bounds it: a bounded-stack walk of the tree is what would lift that.
+`succinctly yq` keeps the 256-level limit, and so does a library caller that registers no stack budget (`with_stack_budget`), or a small one, where each chain is held to it on its own as before.
+Pinned by `tests/jq_cli/i7435.rs`, whose answers were captured from jq 1.7.1 (or, where jq refuses for one of its own limits, are the ones it gives below that limit).
 
 ## `reduce`/`foreach` and a `?//` in their source or INIT (#3293)
 
@@ -9213,6 +9243,7 @@ nothing blocks matching jq byte for byte: `jq: error: module not found: {name}`,
 line (jq's own stand-in for the missing source echo), then the trailer.
 `ModuleLoader::ensure_module_loaded`'s not-found case now reports this exactly; verified
 against jq 1.7.1 for both `include` and `import`.
+With `HOME` unset jq cannot expand a `~/` search entry (`~/.jq` in its default list, a `-L ~/x`, a `search` metadata entry) and appends the last such error, `module not found: zz (Could not expand ~/.jq. (Could not find home directory.))`, as `modulemeta` does too; `succinctly jq` writes the same since [#7608](https://github.com/rust-works/succinctly/issues/7608) (`unexpanded_home_note`).
 
 **Closed for *which* module is named when *more than one* unresolvable declaration is spread
 across the top-level `include`s and `import`s (#2857).** jq reports the last failing declaration
@@ -11587,7 +11618,7 @@ jq 1.8.2 refuses a `def` with more than 4,095 parameters (4,096 is refused, 4,09
 Upstream: "Limit the number of function parameters and definitions to prevent SEGV" (jqlang/jq#3460, commit a2741ee; the overflow it fixes is jqlang/jq#3458).
 jq 1.7.1 and `succinctly jq` compile and run the same program (`null`, exit 0) at 4,096, 4,097 and 20,000 parameters; captured on this change, where 4,095 agrees in all three.
 What bounds it: the program's own size and available memory.
-Upstream's second test, 4,097 sibling local definitions, is refused by `succinctly jq` for another reason (`expression nesting exceeds depth limit of 256`, #7435), not by this divergence.
+Upstream's second test, 4,097 sibling local definitions, runs in `succinctly jq` too since #7435 (`7`, as in jq 1.7.1); before, it was refused for nesting past 256 levels.
 
 **String repetition: 2^31 bytes (#7500).**
 jq 1.8.2 refuses `s * n` with a result of 2,147,483,639 bytes or more (1.8.0 had the plain `INT_MAX` bound; 1.8.2 tightened it with the other string bounds above) with `Repeat string result too long`, in `jv_string_repeat`.
@@ -13390,7 +13421,8 @@ jq 1.8.0 fixed it with the negation fix above: "Preserve numerical precision on 
 `jv_number_abs` takes `decNumberAbs` of a literal's decimal, so the result is a literal: it keeps every digit and prints as written (`100000000000000000001`, `1E-400`, `1E+1000`, `1.50`, `1.0`, `0.00001` for `1e-5`), and a zero of either sign is a positive zero with its spelling kept (`-0 | length` is `0`, `-0.0 | length` is `0.0`).
 `succinctly jq` follows jq 1.8.2, because it is the same upstream fix as the negation above, so the difference from the pinned 1.7.1 stands as newer than primary.
 It holds for every number that carries its literal: an input document, `-s`, `inputs`, `--argjson`, `--slurpfile` and a program literal, on both evaluators (`jq_literal_length`, which negates a negative literal with `jq_negated_literal`).
-A computed number keeps the double's answer (`(1 + 0.5) | length` is `1.5`, `(100000000000000000001 * 1) | length` is `1e+20`), and so do NaN, the infinities and every non-number, in which both jq releases agree.
+A computed number keeps the double's answer (`(1 + 0.5) | length` is `1.5`, `(100000000000000000001 * 1) | length` is `1e+20`), and so do NaN, the computed infinities and every non-number, in which both jq releases agree.
+A parsed `Infinity` is a literal (#7469, below), so its `length` is one as well, as in jq 1.8.2.
 `abs` needs nothing of its own: jq defines it as `if . < 0 then -. else . end`, so it keeps a literal through the negation above, and `-0 | abs` stays `-0` where `-0 | length` is `0`, in both.
 `succinctly yq` is unchanged: yq's `length` of a number measures its text.
 Pinned by `tests/jq_cli/i7534.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
@@ -13652,6 +13684,17 @@ Ordering is unchanged in both: NaN sorts below NaN, itself included. A mixed-ins
 `sort`/`unique`/`group_by` (`[.a,.b,.a] | unique` over two NaN tokens) depends on the sort's
 comparison order in jq, and may group differently here.
 
+### A parsed infinity orders as decNumber's infinity (#7469)
+
+jq 1.7.1 keeps a parsed `Infinity` (`infinity`, `+Infinity`, `-Infinity`, from a document, `fromjson`, `tonumber`, `--argjson` or `--jsonargs`) as a decNumber literal, not as the `f64` infinity the section above describes.
+Two literals compare as exact decimals, so it orders past every finite literal, one past `DBL_MAX` included: `printf Infinity | jq '. > 1e1000'` is `true`, `[., 1e1000] | unique` keeps both and `max` picks it.
+Against a computed double it compares as the double infinity (`. == infinite`, `(. + 0) == 1e1000` are `true`), and it prints as `DBL_MAX` either way.
+succinctly read it as the computed infinity, so `. == 1e1000` was `true`; it is now a literal whose text is decNumber's word, printed as jq prints it (`OwnedValue::parsed_infinity`).
+Negating it keeps it a literal, as #7453 negates every literal after jqlang/jq#3242, so `-. | . == -1e1000` is `false`, jq 1.8.2's answer, where jq 1.7.1, whose `-` computes a double, says `true`.
+Its `length` keeps it a literal too, as #7534 keeps every literal's after jqlang/jq#3275, so `-Infinity | length > 1e1000` is `true` and `length == 1e1000` is `false`, jq 1.8.2's answers, where jq 1.7.1, whose `length` is `fabs` of the double, says `false` and `true`.
+Under `--preserve-input` (a succinctly extension that echoes a number's source spelling) it now prints as `Infinity` inside a constructed value too (`[., 1]`), as it already did at the top level.
+yq mode keeps the bare double.
+
 ### Two equally long slices of one array are `==` in jq, and are compared by content here (#7459)
 
 jq's `jv_equal` answers `true` for two arrays with the same length and the same storage pointer before it compares any element, and it does not compare the slice offset.
@@ -13717,7 +13760,9 @@ A mark that breaks off because the input ends (`printf '\xef' | jq .`, or `EF BB
 `succinctly jq` does the same, on standard input and in files, when the stream's only bytes are the start of the mark, with files without bytes before or after it, and when that start is cut across files (`EF` in one and `BB` in the next).
 A mark cut across the first files (`EF BB` in one and `BF [2]` in the next, or a byte in each of three) is skipped as jq skips it, since jq's parser matches the mark a byte at a time whichever file each byte comes from (#7566).
 The routes that read several files a window at a time skip a mark at the front of the first file with bytes only, so a list whose first file with bytes is only the start of the mark is read whole, which joins it.
-The stream routes word their first fault through `jq_stream_fault`, which does not look for a partial BOM; closing that is a separate change.
+`--stream` and `--stream-errors` read with a model of jq's streaming parser that matches the mark as `jv_parser_set_buf` does, and since [#7603](https://github.com/rust-works/succinctly/issues/7603) they answer a mark that breaks off as jq does: `jq: parse error: Malformed BOM`, exit 5, with no event, and under `-n` the error `Malformed BOM` from every `input`, since jq's parser never reads past it.
+Before #7603 `--stream-errors` turned it into a numeric-literal event and exited 0 (`printf '\xef1\n' | jq -c --stream-errors .` printed `["Invalid numeric literal at line 2, column 0",[]]`), and `--stream` worded it as that numeric literal.
+Only the plain routes, which do not read with the streaming parser, keep the numeric-literal wording.
 
 ### A leading BOM is read in jq's first 4,095-byte read, as jq 1.7.1 reads it; jq 1.8.2 reads 4,091 bytes (#7569)
 
@@ -15600,6 +15645,30 @@ The usage hint after `Unknown option` is 1.7.1's (`online docs  at https://jqlan
 `succinctly dev compare jq` has no probe of these shapes, so the ledger has no entry for them.
 Pinned by `tests/jq_cli/i7438.rs`.
 
+## A broken-down time is read as jq 1.8.2 reads it, not as jq 1.7.1 does (#7532)
+
+`mktime`, `strftime`, `strflocaltime`, `todate` and `todateiso8601` take a broken-down time, an array `[year, month, day, hour, minute, second, weekday, yearday]`, which jq's `jv2tm` copies into a C `struct tm`.
+jq 1.7.1's `jv2tm` needs all 8 elements, casts each double to `int` unchecked and reads NaN as 0.
+jq 1.8 fixed it: upstream commit bc96146 ("jv2tm: fix UB and accept array inputs with not all the values"), [jqlang/jq#3070](https://github.com/jqlang/jq/pull/3070) ("fix signed integer overflow in jv2tm", labelled `bug`, from an oss-fuzz report) and [jqlang/jq#3162](https://github.com/jqlang/jq/pull/3162) ("mktime/0: remove unnecessary length>=6 input requirement", labelled `bug`), listed in its NEWS.md as "Fix `mktime/0` overflow and allow fewer elements in date-time representation array".
+`succinctly jq` follows jq 1.8.2, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary` (the ledger's `features:todate/0` and `features:todateiso8601/0`, whose probe is `[1,2,3]`):
+
+- **NaN** in any of the first 8 elements is `<name> requires parsed datetime inputs`, and so is a NaN number given to `strftime`, `strflocaltime`, `todate` or `todateiso8601`, because the array `gmtime` makes of it has a NaN seconds slot (`nan | gmtime` is `[1970,0,1,0,0,null,4,0]` in both releases).
+  jq 1.7.1 read NaN as 0: `[2024,0,1,0,0,nan,0,0] | mktime` is `1704067200` and `nan | todate` is `"1970-01-01T00:00:00Z"`.
+  `nan | strftime(1)` still reads the format first and keeps its own message (#7533).
+- **A shorter array** is read with its missing fields 0, so a missing year is 1900: `[2024,0,1] | mktime` is `1704067200`, `[2024] | mktime` is `1703980800` (January 0 is December 31) and `[2024,2,15] | strftime("%Y-%m-%dT%H:%M:%SZ")` is `"2024-03-15T00:00:00Z"`.
+  jq 1.7.1 raises `requires parsed datetime inputs` for any array shorter than 8.
+- **Each field saturates** at the C `int` bounds after truncation, the year after 1900 has been taken off it, so the year saturates at 2147485547 and never wraps: `[1e20,0,1,0,0,0,0,0] | mktime` is `67768036160140800` and `[-1e20,0,1,0,0,0,0,0] | strftime("%Y")` is `"-2147481748"`.
+  jq 1.7.1's cast is undefined behaviour; on arm64 it saturates before 1900 is taken off, so the same rows are `67767976201996800` and `"2147483648"` (the year wraps), on x86_64 it gives `INT_MIN`, and the 1.7.1 model this replaced followed the arm64 build (#3083).
+  The order shows on a fractional year just below 1900 too: `[1899.5,0,1,0,0,0,0,0] | strftime("%Y")` is `"1900"` in jq 1.8.2 and `"1899"` in jq 1.7.1.
+
+What `timegm` makes of a saturated or pre-1900 date is the C library's: `[-1e20,0,1,0,0,0,0,0] | mktime` and `[] | mktime` are `invalid gmtime representation` here and in the macOS jq 1.8.2, by the existing pre-1900 rule above, where a glibc jq converts a date before 1900.
+Only the macOS jq 1.8.2 was captured; a glibc jq 1.8.2 was not, and on Linux CI compares these rows with the pinned 1.7.1 alone.
+
+jq 1.8.2 also passes the array through `timegm` (`mktime` for `strflocaltime`) before it formats it, so that the C library fills in the zone ([jqlang/jq#3203](https://github.com/jqlang/jq/pull/3203), NEWS.md "Populate timezone data when formatting time"), and that call normalises the fields: `[2024,0,1,0,0,0,0,0] | strftime("%a")` is `"Mon"` there and `"Sun"` (the weekday given) in jq 1.7.1, and `[2024,5] | strftime("%Y-%m-%d")` is `"2024-05-31"` there and `"2024-06-00"` here.
+`succinctly jq` does not follow that change: it formats the fields as given, as jq 1.7.1 does, and a short array is formatted the same way.
+`succinctly yq` is not changed: real yq has none of these builtins, and `--jq-extensions` reaches the jq code above.
+Pinned by `tests/jq_cli/i7532.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`) under `TZ=UTC` and avoid the C library's share (no `%Z`, `%z` or `%s`, no date before 1900, no field the normalisation would move).
+
 ## `@urid`: jq 1.8.2's behaviour for the format, jq 1.7.1's for `format("urid")`
 
 `@urid` is new in jq 1.8, so the pinned jq 1.7.1 answers `urid is not a valid format` (the `str-format-urid` ledger entry).
@@ -15615,3 +15684,40 @@ A dump of at most 29 bytes is whole, and a longer one keeps 25 bytes (cut back t
 
 `format("urid")` is the one divergence from the 1.8.2 behaviour: `"%41" | format("urid")` is `"A"` there, and here it stays jq 1.7.1's `urid is not a valid format` (pinned in `tests/jq_cli_tests.rs` and `tests/jq_cli/i6726.rs`).
 It keeps following the pin, as `add/1`, `trimstr/1`, `have_decnum/0` and `have_literal_numbers/0` do.
+
+### `--indent` refuses a malformed value, as jq 1.8 does — newer than the 1.7.1 pin (#7501)
+
+jq 1.7.1 reads the value of `--indent` with C's `atoi`, so `--indent abc` and `--indent ""` are 0, `--indent 3x` and `--indent " 2"` are 3 and 2, and `--indent 99999999999999999999` wraps to an `int` (#6017 pinned that rule).
+Upstream called it a bug and jq 1.8.0 fixed it: "Fix `--indent` option to error for malformed values" ([jqlang/jq#3195](https://github.com/jqlang/jq/pull/3195), NEWS.md of 1.8).
+jq 1.8.2 accepts an optional `+` or `-` followed by one or more ASCII digits and nothing else, in -1 to 7, and exits 2 with `--indent takes a number between -1 and 7` for every other value.
+So `+3`, `007` and `-00` are accepted, and an empty value, white space before or after the digits, `3x`, `3.0`, `1e1`, `0x3`, `+-3`, `--`, a following option such as `-c` (the value is taken from the next word, as before) and a number past an `int` are refused.
+`succinctly jq` follows 1.8.2 since #7501 (`parse_jq_indent`); the usage text around the message is clap's, not jq's three lines.
+Pinned by `tests/jq_cli/i6017.rs` and the unit test beside `parse_jq_indent`.
+
+```console
+$ jq-1.7.1 -nc --indent abc '[1]'   # [1], exit 0
+$ jq-1.8.2 -nc --indent abc '[1]'   # jq: --indent takes a number between -1 and 7, exit 2
+$ sjq      -nc --indent abc '[1]'   # error: invalid value 'abc' for '--indent <N>': --indent takes a number between -1 and 7, exit 2
+```
+
+jq 1.8 also stopped printing `--indent 0` compactly (jqlang/jq#3232), which `succinctly jq` follows too: see the next section (#7605).
+
+### `--indent 0` prints newlines with no indentation, as jq 1.8 does — newer than the 1.7.1 pin (#7605)
+
+jq 1.7.1 printed `--indent 0` as `-c` does (its `JV_PRINT_INDENT_FLAGS(0)` dropped the pretty flag), and #3155 pinned that on every route.
+Upstream called it a bug and jq 1.8.0 fixed it: "Fix `--indent 0` implicitly enabling `--compact-output`" ([jqlang/jq#3232](https://github.com/jqlang/jq/pull/3232), NEWS.md of 1.8).
+jq 1.8.2 prints each element and key on its own line, with the space after each `:` and no indentation, and `succinctly jq` follows it since #7605, for every spelling of 0 (`0`, `-0`, `00`, `+0`) and on every print route.
+`-c`, `--tab` and `--indent` stay one setting whose last spelling wins, so `-c --indent 0` and `--tab --indent 0` print that layout too (jq 1.7.1 printed both compactly), and `--indent 0 -c` is compact in all three.
+With `-C` the colour bytes stay jq 1.7.1's (#5473), in the 1.8 layout.
+Pinned by `tests/jq_cli/i7605.rs` (a matrix captured from jq 1.8.2), `test_indent_zero_layout_on_every_route_3155`, and the `--indent 0` rows of `tests/jq_cli/i6017.rs` and `tests/jq_cli/i5473.rs`; the `cli:indent-0` and `cli:color-indent-0` compare probes are ledgered as `newer-than-primary`.
+
+```console
+$ printf '{"a":[1]}' | jq-1.7.1 --indent 0 .
+{"a":[1]}
+$ printf '{"a":[1]}' | jq-1.8.2 --indent 0 .   # sjq prints the same
+{
+"a": [
+1
+]
+}
+```

@@ -4,10 +4,13 @@
 //! `docs/compliance/jq/limitations.md`). jq's side of each row was captured from jq 1.7.1
 //! (`/usr/bin/jq`): the straddling rows below print U+FFFD there, so jq's `length` is larger than
 //! the character count (`主` at 4094: 4098, not 4096).
+//!
+//! jq 1.8.2 keeps the character too (jqlang/jq#3389, fixed by jqlang/jq#3421): the last test pins
+//! the output it prints on each route, which is a `newer-than-primary` difference from 1.7.1.
 
 use anyhow::Result;
 
-use crate::run_jq_stdin;
+use crate::{run_jq_full, run_jq_stdin};
 
 /// `prefix` ASCII bytes, `ch`, then `b`: a line whose character starts at byte offset `prefix`.
 fn line(prefix: usize, ch: char) -> String {
@@ -55,5 +58,33 @@ fn test_raw_input_slurp_and_null_input_keep_a_straddling_character_5476() -> Res
     );
     let (stdout, code) = run_jq_stdin("input | endswith(\"主b\")", &input, &["-nR"])?;
     assert_eq!((stdout.as_str(), code), ("true\n", 0));
+    Ok(())
+}
+
+/// jq 1.8.2's output (`/opt/homebrew/bin/jq`) for the line of jqlang/jq#3389's shape: `é` at byte
+/// 4094, which jq 1.7.1 prints as two U+FFFD on every route here but `--rawfile` (`"aaaa��éé"`).
+#[test]
+fn every_raw_route_keeps_a_straddling_character_as_jq_1_8_2_does_5476() -> Result<()> {
+    let input = format!("{}ééé\n", "a".repeat(4094));
+    for (args, want) in [
+        (&["-R", ".[4090:]"][..], "\"aaaaééé\"\n"),
+        (&["-R", "-s", ".[4090:]"][..], "\"aaaaééé\\n\"\n"),
+        (&["-n", "-R", "input[4090:]"][..], "\"aaaaééé\"\n"),
+        (
+            &["-n", "-R", "-c", "[inputs[4090:]]"][..],
+            "[\"aaaaééé\"]\n",
+        ),
+        (
+            &["-n", "--rawfile", "x", "/dev/stdin", "$x[4090:]"][..],
+            "\"aaaaééé\\n\"\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_jq_full(args, Some(&input))?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (want, "", 0),
+            "{args:?}"
+        );
+    }
     Ok(())
 }

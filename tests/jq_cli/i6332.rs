@@ -3,6 +3,8 @@
 //! does (`"abca" | match("(?:(a)|b*|c)+")` is `"ab"`), where the `regex` crate matched `"abca"`. The
 //! loop is written with the groups copied, and each copy is read back into its group. Every row was
 //! captured from jq 1.7.1 (`/usr/bin/jq -nc`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -35,17 +37,17 @@ fn test_a_group_before_the_empty_way_is_copied_and_read_back_6332() -> Result<()
         (
             "abca",
             r"(?:(a)|b*|c)+",
-            r#"[[0,"ab",["a"]],[2,"",[""]],[3,"a",["a"]],[4,"",[""]]]"#,
+            r#"[[0,"ab",["a"]],[2,"",[null]],[3,"a",["a"]],[4,"",[null]]]"#,
         ),
         (
             "abc",
             r"(?:(a)b|b*|(c))+",
-            r#"[[0,"ab",["a",null]],[2,"",["",""]],[3,"",["",""]]]"#,
+            r#"[[0,"ab",["a",null]],[2,"",[null,null]],[3,"",[null,null]]]"#,
         ),
         (
             "abca",
             r"(?:(a)|b*|c)+(?:(d)|e*|f)*",
-            r#"[[0,"ab",["a",null]],[2,"",["",""]],[3,"a",["a",null]],[4,"",["",""]]]"#,
+            r#"[[0,"ab",["a",null]],[2,"",[null,null]],[3,"a",["a",null]],[4,"",[null,null]]]"#,
         ),
     ] {
         assert_rows(&[(&row(subject, pattern), expected)])?;
@@ -53,20 +55,20 @@ fn test_a_group_before_the_empty_way_is_copied_and_read_back_6332() -> Result<()
     // Beside a repeated group the capture rewrite of #6069 writes too, and the copies are composed.
     assert_rows(&[(
         &row("abc", r"(a*)*(?:(a)|b*|c)+"),
-        r#"[[0,"ab",["",null]],[2,"",["",""]],[3,"",["",""]]]"#,
+        r#"[[0,"ab",["",null]],[2,"",["",null]],[3,"",["",null]]]"#,
     )])?;
     assert_rows(&[(
         &row("abc", r"((?:(a)|b*|c)+)(b*)*"),
-        r#"[[0,"ab",["ab","a",""]],[2,"",["","",""]],[3,"",["","",""]]]"#,
+        r#"[[0,"ab",["ab","a",""]],[2,"",["",null,""]],[3,"",["",null,""]]]"#,
     )])?;
     // A name stays on its group, whichever copy the match set.
     assert_rows(&[(
         r#""abca" | [match("(?:(?<x>a)|b*|c)+";"g") | [.string, (.captures|map([.name,.string]))]]"#,
-        r#"[["ab",[["x","a"]]],["",[["x",""]]],["a",[["x","a"]]],["",[["x",""]]]]"#,
+        r#"[["ab",[["x","a"]]],["",[["x",null]]],["a",[["x","a"]]],["",[["x",null]]]]"#,
     )])?;
     assert_rows(&[(
         r#""abca" | [capture("(?:(?<x>a)|b*|c)+";"g")]"#,
-        r#"[{"x":"a"},{"x":""},{"x":"a"},{"x":""}]"#,
+        r#"[{"x":"a"},{"x":null},{"x":"a"},{"x":null}]"#,
     )])
 }
 
@@ -76,27 +78,27 @@ fn test_a_group_in_the_empty_way_is_set_where_the_loop_leaves_6332() -> Result<(
         (
             "ba",
             r"(?:b*|()|a)+",
-            r#"[[0,"b",[null]],[1,"",[""]],[2,"",[""]]]"#,
+            r#"[[0,"b",[null]],[1,"",[null]],[2,"",[null]]]"#,
         ),
         (
             "ba",
             r"(?:b*|(a)|())*",
-            r#"[[0,"b",[null,null]],[1,"",["",""]],[2,"",["",""]]]"#,
+            r#"[[0,"b",[null,null]],[1,"",[null,null]],[2,"",[null,null]]]"#,
         ),
         (
             "bab",
             r"(?:a|(a*)|(\\w*))+",
-            r#"[[0,"",["",""]],[1,"a",["",null]],[2,"",["",""]],[3,"",["",""]]]"#,
+            r#"[[0,"",["",null]],[1,"a",["",null]],[2,"",["",null]],[3,"",["",null]]]"#,
         ),
         (
             "bab",
             r"(?:a*(a*)|(b*))*",
-            r#"[[0,"",["",""]],[1,"a",["",null]],[2,"",["",""]],[3,"",["",""]]]"#,
+            r#"[[0,"",["",null]],[1,"a",["",null]],[2,"",["",null]],[3,"",["",null]]]"#,
         ),
         (
             "bab",
             r"(?:a*|(b)*|(?:a|b*)())*",
-            r#"[[0,"",["",""]],[1,"a",[null,null]],[2,"",["",""]],[3,"",["",""]]]"#,
+            r#"[[0,"",[null,null]],[1,"a",[null,null]],[2,"",[null,null]],[3,"",[null,null]]]"#,
         ),
     ] {
         assert_rows(&[(&row(subject, pattern), expected)])?;
@@ -112,7 +114,7 @@ fn test_the_builtins_over_a_loop_with_a_group_before_its_empty_way_agree_with_jq
         (r#""abca" | gsub("(?:(a)|b*|c)+"; "X")"#, r#""XXcXX""#),
         (
             r#""abca" | [scan("(?:(a)|b*|c)+")]"#,
-            r#"[["a"],[""],["a"],[""]]"#,
+            r#"[["a"],[null],["a"],[null]]"#,
         ),
         (r#""abca" | test("(?:(a)|b*|c)+d")"#, "false"),
     ])
@@ -124,7 +126,7 @@ fn test_the_flags_that_prefix_a_switch_keep_the_fix_6332() -> Result<()> {
     assert_rows(&[
         (
             r#""ABCA" | [match("(?:(a)|b*|c)+";"gi") | [.string, (.captures|map(.string))]]"#,
-            r#"[["AB",["A"]],["",[""]],["A",["A"]],["",[""]]]"#,
+            r#"[["AB",["A"]],["",[null]],["A",["A"]],["",[null]]]"#,
         ),
         (
             r#""abca" | [match("(?:(a)|b*|c)+";"gp") | .string]"#,
@@ -142,17 +144,17 @@ fn test_loops_that_already_agreed_still_do_6332() -> Result<()> {
         (
             "aab",
             r"(?:(a)|b*|c){2}",
-            r#"[[0,"aa",["a"]],[2,"b",[null]],[3,"",[""]]]"#,
+            r#"[[0,"aa",["a"]],[2,"b",[null]],[3,"",[null]]]"#,
         ),
         (
             "abab",
             r"(?:(a)|b*|c){1,3}",
-            r#"[[0,"aba",["a"]],[3,"b",[null]],[4,"",[""]]]"#,
+            r#"[[0,"aba",["a"]],[3,"b",[null]],[4,"",[null]]]"#,
         ),
         (
             "abab",
             r"(?:(a)|b*|c){2,}",
-            r#"[[0,"abab",["a"]],[4,"",[""]]]"#,
+            r#"[[0,"abab",["a"]],[4,"",[null]]]"#,
         ),
         (
             "ba",
@@ -163,12 +165,12 @@ fn test_loops_that_already_agreed_still_do_6332() -> Result<()> {
         (
             "abab",
             r"(?:(?:(a|b)|(?:|a)){0,3}){2}?",
-            r#"[[0,"abab",["b"]],[4,"",[""]]]"#,
+            r#"[[0,"abab",["b"]],[4,"",[null]]]"#,
         ),
         (
             "bab",
             r"(?:(?:b*|(a))+(a|b)|(?:b*|(a))+){2}",
-            r#"[[0,"bab",[null,"b",null]],[3,"",["","",""]]]"#,
+            r#"[[0,"bab",[null,"b",null]],[3,"",[null,null,null]]]"#,
         ),
         (
             "abc",

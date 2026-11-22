@@ -4,6 +4,8 @@
 //! that hold at the head (`\b` or `\B`, and `\A` at the first head), so each kind of head is written
 //! behind its anchors with its own ways before and after the exit. Every expected answer was
 //! captured from jq 1.7.1 (`/usr/bin/jq`).
+//! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
+//! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
 use anyhow::Result;
 
@@ -34,13 +36,13 @@ fn a_loop_with_several_exits_leaves_where_oniguruma_does_6473() -> Result<()> {
         // a greedy unbounded repeat past its minimum, an exit that holds nowhere (`\B\b`) and one at the start beside `\b`.
         (r"(?:\B\b|\w|\b\A){2,}", "a b", "[[0,\"\",[]]]\n"),
         // a greedy unbounded repeat with no minimum, an exit at the start beside a group.
-        (r"(?:^(\w*)|(?:a|)|b())+", " ab", "[[0,\"\",[\"\",\"\"]],[1,\"a\",[null,null]],[2,\"\",[\"\",\"\"]],[3,\"\",[\"\",\"\"]]]\n"),
+        (r"(?:^(\w*)|(?:a|)|b())+", " ab", "[[0,\"\",[\"\",null]],[1,\"a\",[null,null]],[2,\"\",[null,null]],[3,\"\",[null,null]]]\n"),
         // a greedy bounded repeat with a start exit and a word exit.
         (r"(^(?:a|)|^|(?:a|b*)\b){2}", "aab", "[[0,\"\",[\"\"]],[2,\"b\",[\"\"]],[3,\"\",[\"\"]]]\n"),
         // a greedy repeat past a minimum of two, three exits with consuming ways between them.
         (r"(?:(?:a|b*)\B|(?:a|b*)\b|b?\b){2,}", "aab", "[[0,\"aa\",[]],[2,\"\",[]],[3,\"\",[]]]\n"),
         // a prefix before the loop, an empty way between two word exits.
-        (r"x?(?:()(a*)|\B\b|(a|b)\w)+", "abab", "[[0,\"a\",[\"\",\"\",null]],[1,\"\",[\"\",\"\",\"\"]],[2,\"a\",[\"\",\"\",null]],[3,\"\",[\"\",\"\",\"\"]],[4,\"\",[\"\",\"\",\"\"]]]\n"),
+        (r"x?(?:()(a*)|\B\b|(a|b)\w)+", "abab", "[[0,\"a\",[\"\",\"\",null]],[1,\"\",[\"\",\"\",null]],[2,\"a\",[\"\",\"\",null]],[3,\"\",[\"\",\"\",null]],[4,\"\",[\"\",\"\",null]]]\n"),
         // a lazy bounded repeat before a literal.
         (r"(\b|(.*?)|b){2,5}?c", "abc", "[[0,\"abc\",[\"b\",\"b\"]]]\n"),
     ] {

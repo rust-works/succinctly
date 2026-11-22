@@ -28,11 +28,25 @@
 //!   or an argument (`c_builtin_identity`), when that value itself is the
 //!   answer.
 //!
-//! It is reachable from `succinctly dev jq-path-mode` (hidden) and from tests,
-//! never from `succinctly jq`. A construct it does not implement raises
-//! `Raise::Unsupported`, which nothing catches, so a row it cannot run is never
-//! mistaken for one it answers. See `docs/plan/jq-path-mode-interpreter-spike.md`
-//! for the Phase 0 go/no-go report.
+//! `succinctly jq` runs a program through it when `route` sends it here
+//! (ADR-0026, #5223, #5233): a jq-mode program with a dynamic path target,
+//! that is an argument of `path`, `del` or `pick` or the left side of an
+//! assignment that is not one of the static shapes the shipped walkers take
+//! natively (`.k`, `.[n]`, `.[$k]`, `.[i:j]`, `.[]`, `..` and their pipes and
+//! commas), such as `1 |= 1`, `del(1)` or `path(1)`, even in a branch that
+//! never runs. The evaluator entries in `eval.rs` (`eval_full`,
+//! `eval_owned_with_file_index`) and `eval_generic.rs` ask `route` and hand
+//! such a program to `run_program`; `jq_runner.rs` refuses up front, through
+//! [`refusal`], one that also uses a construct the interpreter declines. It is
+//! also reachable from `succinctly dev jq-path-mode` (hidden) and from tests.
+//! A construct it does not implement raises `Raise::Unsupported`, which
+//! nothing in the interpreter catches, so a row it cannot run is never
+//! mistaken for one it answers: the dev entry reports it apart (`path-mode:
+//! unsupported`), and on the routed path, where `route` has already sent
+//! every program holding such a construct elsewhere, `run_program` turns it
+//! into an internal error. See
+//! `docs/plan/jq-path-mode-interpreter-spike.md` for the Phase 0 go/no-go
+//! report.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
