@@ -351,7 +351,7 @@ const MAX_EXPR_DEPTH: usize = 256;
 /// the chain (#7475). The parser reads such a chain in a loop and spends nothing on its length,
 /// but the walks after it (the resolver, the def binder, the analyses, a clone of the tree)
 /// recurse once per definition, and a long enough chain overflowed the stack in one of them:
-/// measured on an Apple M5, the deepest walk took up to 670 bytes a definition in a release build
+/// measured on aarch64, the deepest walk took up to 670 bytes a definition in a release build
 /// (400,000 ran, 500,000 aborted, on the CLI's 256 MiB thread) and up to 21 KiB in a debug build
 /// (100,000 ran, 150,000 aborted, on 2 GiB). This is about three times the first and twice the
 /// second, against the room left to the floor, half the thread's stack, so a chain the parser
@@ -365,7 +365,7 @@ const DEF_CHAIN_LINK_STACK: usize = if cfg!(debug_assertions) {
 /// The native stack the parse and the walks after it (the resolver, the analyses, the evaluator,
 /// a clone or a drop of the tree) spend on each level of a jq program's nesting, a bracket, a
 /// parenthesis, a `try`, an `if` or a local `def`, charged against the stack's room when the parser
-/// starts (#7435). Measured on an Apple M5 with the charge taken off: the deepest walk of a nesting
+/// starts (#7435). Measured on aarch64 with the charge taken off: the deepest walk of a nesting
 /// level took 8.9 to 10.7 KiB in a release build (25,000 levels of parentheses, brackets, `if`s,
 /// string interpolations, labels or local `def`s ran on the CLI's 256 MiB thread, 30,000 aborted)
 /// and 27 to 54 KiB in a debug one (40,000 ran and 80,000 aborted on 2 GiB). This is about 1.3 and

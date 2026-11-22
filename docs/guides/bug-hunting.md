@@ -669,7 +669,7 @@ line self-contained:
   post-processing inside a shared hold too: anything outside the lock disturbs a timing run.
 - **Budgets are per machine, for all agents together:** jobs, RAM and disk. The grants in this hunt were 24 jobs, 24 GB
   and 30 GB on the 7950X box; 8 jobs and 16 GB on the M4 Pro (2 cores left free for its owner); 8 jobs and 10 GB on an
-  M5 MacBook Air (builds and tests only); 6 jobs and 5 GB on a Linux VM on the Intel i7-6700. Test threads count as
+  Apple M5 machine (builds and tests only); 6 jobs and 5 GB on a Linux VM on the Intel i7-6700. Test threads count as
   jobs: set `RUST_TEST_THREADS` and `cargo test -j`, and run the deep-recursion tests (2 GB stacks each) at 2 threads.
   On the coordinating laptop: `CARGO_BUILD_JOBS=4`, one cargo invocation per agent, never a build and a test run together.
 - **Disk:** `CARGO_INCREMENTAL=0`, one target directory per agent, `cargo clean -p succinctly` between branches, and
