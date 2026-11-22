@@ -35530,12 +35530,19 @@ fn translate_posix_brackets_scan(
             out.push(c);
             i += 1;
             continue;
-        } else if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
-            && extended_in.last().copied().unwrap_or(false)
-        {
+        } else if (c == '#' || c.is_whitespace()) && extended_in.last().copied().unwrap_or(false) {
             // Oniguruma's extended mode ignores blanks outside a class only; the `regex` crate
             // drops them inside one as well (`(?x:[a b])+` lost its space, #6133 review).
-            out.push_str(&format!("\\x{:02x}", c as u32));
+            // #7804: it also reads a `#` there as a comment, and every Unicode blank (U+3000) as
+            // ignored, so the class did not parse, and the pattern went to `fancy-regex`, whose
+            // route skips jq's one-byte step after an empty match (#6326). Both are literals here.
+            if c == '#' {
+                out.push_str("\\#");
+            } else if c.is_ascii() {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            } else {
+                out.push_str(&format!("\\x{{{:x}}}", c as u32));
+            }
             changed = true;
             at_start = false;
             i += 1;
@@ -35589,7 +35596,16 @@ fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
     }
     // The blanks and comments of the `x` flag are followed only where no inline flag changes them.
     let blanks = extended && !flag_switched_off(pattern) && !inline_extended(pattern);
-    if !blanks && inline_extended(pattern) && pattern.contains('#') {
+    // An escaped `\#` opens no comment: the translation writes a class's `#` so under `x` (#7804).
+    let holds_hash = || {
+        let mut escaped = false;
+        pattern.chars().any(|c| {
+            let hash = c == '#' && !escaped;
+            escaped = c == '\\' && !escaped;
+            hash
+        })
+    };
+    if !blanks && inline_extended(pattern) && holds_hash() {
         return None;
     }
     let chars: Vec<char> = pattern.chars().collect();
