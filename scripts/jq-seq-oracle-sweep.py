@@ -32,16 +32,18 @@ string, so the number ends there too. The reader models both, and `--long`
 generates the records that put a NUL in a full 4095-byte chunk, with a value
 open across the bytes jq drops.
 
-One artifact is not the line reader's but jq's own, and no implementation
-can match it (#7256): `check_literal` reads `tokenbuf[1]` for a bare `n` without
-consulting `tokenpos`, and when no earlier token of the stream has written index 1
-that byte is uninitialised heap (`parser_init` leaves `tokenbuf` null and `token()`
-grows it with `jv_mem_realloc`). Apple's jq and x86_64 glibc's happen to hold
-something that is not `u` there, Amazon Linux 2023 on aarch64 holds `u`, so
-`\x1en` reports "Invalid numeric literal" on the first two and "Invalid literal" on
-the third. `artifact()` skips a stream whose first bare `n` is classified before
-any token has written index 1, so the sweep keeps checking the case it can check,
-a byte an earlier token left (#1723, #6513). `--expect-artifacts` includes it.
+One artifact is not the line reader's but jq 1.7.1's own, and no implementation can match
+it (#7256): `check_literal` reads `tokenbuf[1]` for a bare `n` without consulting
+`tokenpos`. When an earlier token left a `u` there, 1.7.1 reports "Invalid literal" for
+the `n`; when no earlier token of the stream has written index 1 that byte is
+uninitialised heap (`parser_init` leaves `tokenbuf` null and `token()` grows it with
+`jv_mem_realloc`): Apple's jq and x86_64 glibc's hold something that is not `u` there,
+Amazon Linux 2023 on aarch64 holds `u`. jq 1.8.2 fixed the read (`tokenpos > 1`, jqlang/jq#3324),
+and `succinctly jq` follows it (#7525): a bare `n` is always "Invalid numeric literal". So
+against the pinned 1.7.1 `artifact()` skips a stream whose first bare `n` is classified
+before any token has written index 1, or after one that may have left a `u` there. A bare
+`n` after any other byte agrees on both versions, so the sweep keeps checking it (#1723,
+#6513). `--expect-artifacts` includes the skipped shapes.
 
 **History.** Two more artifacts of that same `fgets` buffer used to live
 here -- a trailing unterminated RS-record after an earlier newline being
@@ -203,9 +205,10 @@ _TOKEN_ENDS = b" \t\r\n\x1e[]{},:\""
 
 
 def reads_unwritten_tokenbuf(data):
-    """Whether jq 1.7.1 classifies a bare one-byte `n` token (`check_literal`'s
-    `tokenbuf[1] == 'u'`) before anything in `data` has written `tokenbuf[1]`
-    (#7256), so what it compares is uninitialised heap.
+    """Whether jq 1.7.1 may classify a bare one-byte `n` token (`check_literal`'s
+    `tokenbuf[1] == 'u'`) against a `u`: before anything in `data` has written
+    `tokenbuf[1]` (#7256, uninitialised heap), or after a token that left a `u` or
+    may have (#7525: jq 1.8.2 and succinctly never read the byte, 1.7.1 does).
 
     Index 1 is written by a token of two or more bytes (`tokenadd`), by a one-byte
     token on the number path (`t`, `f` and `n` are the three that are not: jq
@@ -218,7 +221,7 @@ def reads_unwritten_tokenbuf(data):
     ahead: it resets the parser and reads the next byte (limitations.md, "need RS to
     resync" never resyncs).
 
-    Where this cannot tell it says "not written", which skips more streams than the
+    Where this cannot tell it says "may be `u`", which skips more streams than the
     exposure needs and never fewer."""
     if malformed_bom(data):
         # jq consumed the part of the BOM that matched without tokenising it.
@@ -229,7 +232,9 @@ def reads_unwritten_tokenbuf(data):
         start = data.find(RS)
         if start < 0:
             return False
-    written = False
+    # What index 1 holds: None before any write; else a byte value (0 for a NUL), or -1 for a
+    # string, whose decoded text decides and is not worked out here.
+    held = None
     i = start
     n = len(data)
     while i < n:
@@ -239,7 +244,7 @@ def reads_unwritten_tokenbuf(data):
             while j < n and data[j] not in (0x22, RS[0]):
                 j += 2 if data[j] == 0x5C and data[j + 1 : j + 2] != RS else 1
             if j - i - 1 >= 2:
-                written = True
+                held = -1
             i = j + 1 if data[j : j + 1] == b'"' else j
         elif byte in _TOKEN_ENDS:
             i += 1
@@ -249,13 +254,13 @@ def reads_unwritten_tokenbuf(data):
                 j += 1
             word = data[i:j]
             if len(word) >= 2:
-                written = True
+                held = word[1]
             elif word == b"n":
-                if not written:
+                if held is None or held in (-1, ord("u")):
                     return True
-                # written already; a bare `n` leaves its own NUL at index 1
+                held = 0  # a bare `n` leaves its own NUL at index 1
             elif word not in (b"t", b"f"):
-                written = True
+                held = 0
             i = j
     return False
 
@@ -277,14 +282,14 @@ def visible(data):
 
 def artifact(data):
     """Whether `data` trips an artifact of jq itself: the one `fgets`-line-reader
-    artifact #2998 left unmodeled, or the uninitialised `tokenbuf` byte (#7256). jq's own end-of-stream rule (an RS closing a record
+    artifact #2998 left unmodeled, or the `tokenbuf` byte jq 1.7.1 reads for a bare `n` (#7256, #7525). jq's own end-of-stream rule (an RS closing a record
     that yields no value ends the *entire* stream, silently, iff that
     record is the first thing jq's own `fgets`-chunked final buffer
     scans) is matched now, so the two shapes that used to trip it --
     both properties of that same buffer boundary, not of the parser --
     are no longer here; see the module docstring's history note."""
     if reads_unwritten_tokenbuf(visible(data)):
-        return True  # jq reads uninitialised memory -- #7256, matched by no implementation
+        return True  # 1.7.1 reads an uninitialised or stale `u` -- #7256/#7525, matched by no implementation
     if RS not in visible(data):
         # #1525's separate template -- except after a malformed BOM, which
         # makes jq read the stream rather than abandon it, so those stay in.

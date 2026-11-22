@@ -171,16 +171,23 @@ fn every_text_word_reads_as_jq_reads_it_7426() -> Result<()> {
     Ok(())
 }
 
-/// jq reads `--indent` with `atoi`, so a value that starts with a bad byte is 0.
+/// A value that is not UTF-8 is read as text (its bad byte one U+FFFD) and so is no number:
+/// `--indent` takes jq 1.8's rule (#7501), which refuses it with exit 2, as jq 1.8.2 does
+/// (jq 1.7.1's `atoi` read it as 0).
 #[test]
-fn an_indent_that_is_not_utf8_is_zero_7426() -> Result<()> {
-    let (stdout, _, code) = printed(&jq(&[
+fn an_indent_that_is_not_utf8_is_refused_7426() -> Result<()> {
+    let (stdout, stderr, code) = printed(&jq(&[
         "-n".into(),
         "--indent".into(),
         word(b"\xff"),
         "[1]".into(),
     ])?);
-    assert_eq!((stdout.as_str(), code), ("[1]", Some(0)));
+    assert_eq!((stdout.as_str(), code), ("", Some(2)));
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(
+        stderr.contains("--indent takes a number between -1 and 7"),
+        "{stderr}"
+    );
     Ok(())
 }
 

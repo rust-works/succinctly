@@ -124,6 +124,39 @@ mod parse_message;
 mod parser;
 #[cfg(feature = "regex")]
 mod regex_blocks;
+
+/// How deeply a jq pattern may nest groups: 511, the most jq 1.8.2 answers (a pattern with 512
+/// nested groups, capturing, `(?:` or a look-ahead alike, is `Regex failure: parse depth limit
+/// over`, where jq 1.7.1 accepts up to 2,047 and the `regex` crate stops at 250 nested AST nodes by
+/// default, #7528). jq counts groups only, so a concatenation, an alternation or a repeat between
+/// two of them does not count, where the crate's own limit counts every node: the nesting is counted
+/// by `exceeds_onig_parse_depth` (in `eval.rs`), and [`ONIG_NEST_LIMIT`] is only the crate's.
+#[cfg(feature = "regex")]
+pub(crate) const ONIG_PARSE_DEPTH_LIMIT: usize = 511;
+
+/// The nesting the `regex` crate and `regex-syntax` are allowed to read in a jq pattern: as many AST
+/// nodes as [`ONIG_PARSE_DEPTH_LIMIT`] nested groups can come to (a group, its alternation, one of the
+/// alternation's concatenations and a repeat per level) and a little over. Every parser and builder
+/// that reads a jq pattern takes it, so that the passes that rewrite it for Oniguruma's semantics and
+/// the engine that compiles it agree on what is too deep.
+#[cfg(feature = "regex")]
+pub(crate) const ONIG_NEST_LIMIT: u32 = 4 * ONIG_PARSE_DEPTH_LIMIT as u32 + 64;
+
+/// The `regex-syntax` AST parser for a jq pattern, with [`ONIG_NEST_LIMIT`].
+#[cfg(feature = "regex")]
+pub(crate) fn onig_ast_parser() -> regex_syntax::ast::parse::Parser {
+    regex_syntax::ast::parse::ParserBuilder::new()
+        .nest_limit(ONIG_NEST_LIMIT)
+        .build()
+}
+
+/// The `regex-syntax` parser (AST and HIR) for a jq pattern, with [`ONIG_NEST_LIMIT`].
+#[cfg(feature = "regex")]
+pub(crate) fn onig_hir_parser() -> regex_syntax::Parser {
+    regex_syntax::ParserBuilder::new()
+        .nest_limit(ONIG_NEST_LIMIT)
+        .build()
+}
 // #5223: the register-carrying path-mode interpreter, reachable only from
 // `succinctly dev jq-path-mode` and its own tests.
 #[doc(hidden)]
@@ -219,8 +252,8 @@ pub use lazy::JqValue;
 // #5497: jq's parse-depth limit, applied by the CLI's document routes.
 #[doc(hidden)]
 pub use parse_message::{
-    is_jq_depth_fault, jq_depth_fault_offset, jq_input_depth_fault, jq_stream_depth_fault_offset,
-    jq_stream_fault, jq_stream_fault_chunk, jq_stream_fault_end, jq_stream_prefix_fault,
+    is_jq_depth_fault, jq_depth_fault_offset, jq_input_depth_fault, jq_stream_fault,
+    jq_stream_fault_chunk, jq_stream_fault_end, jq_stream_fault_offset, jq_stream_prefix_fault,
     InputSource, JqStreamFaults, JQ_MAX_PARSING_DEPTH,
 };
 pub use parser::{

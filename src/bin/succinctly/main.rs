@@ -926,46 +926,36 @@ pub(crate) fn yq_word_text(word: std::ffi::OsString) -> String {
     })
 }
 
-/// `--indent`'s value as jq 1.7.1 reads it (#6017): C's `atoi`, which is `(int)strtol(text, 0, 10)`.
-/// Leading white space and one sign are skipped, the digits that follow are read and anything after
-/// them is ignored, so `" 2"` and `"3x"` are 2 and 3 and text that starts with anything else (`""`,
-/// `"abc"`, `"0x2"`) is 0. A value past a `long` clamps to it and then wraps to an `int`, as the C
-/// cast does (`99999999999999999999` is `-1`): that is a 64-bit `long`'s, as on macOS and Linux
-/// (a 32-bit-`long` libc clamps at an `int` instead). jq refuses what is outside -1 to 7; `-1` is a tab.
+/// `--indent`'s value as jq 1.8 reads it (#7501, upstream jqlang/jq#3195): an optional `+` or `-`
+/// and one or more ASCII digits, with nothing before, between or after them. White space, `3x`,
+/// `3.0`, `0x3`, `1e1`, an empty value and a second sign are malformed, and so is a number outside
+/// -1 to 7 (a value past any integer is outside it); jq exits 2 with `--indent takes a number
+/// between -1 and 7` for all of them. Leading zeros are digits (`007` is 7, `-00` is 0); `-1` is a
+/// tab. jq 1.7.1 read the value with C's `atoi` instead (#6017): the text up to its first non-digit,
+/// `0` when there is none, so it ran every malformed value above.
 fn parse_jq_indent(text: &str) -> Result<i8, String> {
-    let mut bytes = text.bytes().peekable();
-    while bytes
-        .next_if(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
-        .is_some()
-    {}
-    let negative = match bytes.peek() {
-        Some(b'-') => {
-            bytes.next();
-            true
-        }
-        Some(b'+') => {
-            bytes.next();
-            false
-        }
-        _ => false,
+    let refused = || "--indent takes a number between -1 and 7".to_string();
+    let (negative, digits) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
     };
-    let mut magnitude: u64 = 0;
-    while let Some(digit) = bytes.next_if(u8::is_ascii_digit) {
-        magnitude = magnitude
-            .saturating_mul(10)
-            .saturating_add(u64::from(digit - b'0'));
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refused());
     }
-    // `strtol` clamps to `LONG_MAX` / `LONG_MIN`; `atoi` then keeps the low 32 bits.
-    let long = if negative {
-        i64::try_from(magnitude).map_or(i64::MIN, |m| -m)
-    } else {
-        i64::try_from(magnitude).unwrap_or(i64::MAX)
-    };
-    let int = long as i32;
-    i8::try_from(int)
-        .ok()
-        .filter(|n| (-1..=7).contains(n))
-        .ok_or_else(|| "--indent takes a number between -1 and 7".to_string())
+    let mut value: i8 = 0;
+    for digit in digits.bytes().map(|b| (b - b'0') as i8) {
+        // Past 7 the value is out of range whatever follows, so it never overflows.
+        value = value * 10 + digit;
+        if value > 7 {
+            return Err(refused());
+        }
+    }
+    match (negative, value) {
+        (false, n) => Ok(n),
+        (true, 0 | 1) => Ok(-value),
+        (true, _) => Err(refused()),
+    }
 }
 
 /// Command-line JSON processor (jq-compatible CLI)
@@ -1095,8 +1085,8 @@ struct JqCommand {
     /// See `compact_output`'s own doc comment for the shared
     /// last-flag-wins rationale (#2009).
     ///
-    /// The value is read as jq reads it (C's `atoi`, #6017): `-1` is a tab, white space and a
-    /// sign are allowed, and text that does not start with a digit is 0.
+    /// The value is read as jq 1.8 reads it (#7501): `-1` is a tab, an optional sign and digits are
+    /// allowed, and anything else is refused with exit 2.
     #[arg(long, value_name = "N", value_parser = clap::builder::TypedValueParser::try_map(clap::builder::OsStringValueParser::new(), |word| parse_jq_indent(&jq_word_text(&word))), allow_hyphen_values = true, overrides_with_all = JQ_OUTPUT_FORMAT_FLAGS)]
     indent: Option<i8>,
 
@@ -4211,38 +4201,70 @@ mod tests {
         );
     }
 
-    /// #6017: `--indent` reads its value as C's `atoi` does, so everything jq 1.7.1 takes is taken
-    /// here (rows captured from `/usr/bin/jq`; `tests/jq_cli/i6017.rs` runs them end to end).
+    /// #7501: `--indent` reads its value as jq 1.8 does: a sign and ASCII digits, nothing else,
+    /// in -1 to 7 (rows captured from `/opt/homebrew/bin/jq` 1.8.2; `tests/jq_cli/i6017.rs` runs
+    /// them end to end).
     #[test]
-    fn the_indent_value_is_read_as_atoi_reads_it() {
+    fn the_indent_value_is_a_signed_number_and_nothing_else() {
         let ok = |text: &str| parse_jq_indent(text).unwrap();
         for (text, want) in [
             ("0", 0),
             ("7", 7),
             ("-1", -1),
             ("+2", 2),
-            (" 2", 2),
-            ("\t\n\x0b\x0c\r3", 3),
-            ("3x", 3),
-            ("2.5", 2),
-            ("007", 7),
-            ("", 0),
-            ("abc", 0),
-            ("0x2", 0),
-            ("+-3", 0),
+            ("+0", 0),
             ("-0", 0),
-            // past a `long`, `strtol` clamps and the `int` cast keeps the low 32 bits
-            ("99999999999999999999", -1),
-            ("-99999999999999999999", 0),
-            ("4294967295", -1),
-            ("4294967296", 0),
-            ("4294967297", 1),
-            ("4294967303", 7),
-            ("-4294967295", 1),
+            ("-00", 0),
+            ("007", 7),
+            ("0003", 3),
+            ("+7", 7),
+            ("-01", -1),
+            ("0000000000000000000000000000000000000003", 3),
         ] {
             assert_eq!(ok(text), want, "{text:?}");
         }
-        for text in ["8", "-2", "99999999999", "-99999999999"] {
+        for text in [
+            "",
+            " ",
+            " 2",
+            "2 ",
+            "\t3",
+            "\n3",
+            "3\n",
+            "3x",
+            "x3",
+            "abc",
+            "2.5",
+            "3.0",
+            "-1.0",
+            "0.5",
+            "1e1",
+            "3e0",
+            "0x2",
+            "0b1",
+            "+-3",
+            "-+3",
+            "--3",
+            "+",
+            "-",
+            "--",
+            "1_0",
+            "3,",
+            "1 2",
+            "8",
+            "-2",
+            "+8",
+            "99999999999",
+            "-99999999999",
+            "99999999999999999999",
+            "2147483648",
+            "4294967297",
+            "-4294967295",
+            "\u{663}",
+            "\u{0661}",
+            "-c",
+            "--tab",
+        ] {
             assert!(
                 parse_jq_indent(text)
                     .unwrap_err()
