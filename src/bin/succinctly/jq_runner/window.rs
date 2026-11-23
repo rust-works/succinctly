@@ -237,7 +237,7 @@ pub(super) fn seq_block_bytes(file: &File, start: u64) -> usize {
 }
 
 /// How many windows a document that does not fit in one is read on to before the rest of the file is.
-const LOOKAHEAD_WINDOWS: usize = 8;
+pub(super) const LOOKAHEAD_WINDOWS: usize = 8;
 
 /// A file shorter than this many windows (4 MiB in every build that ships) whose window ends inside a
 /// document is read on to its end at once ([`WindowedFile::small_enough_to_read_whole`], #7412).
@@ -549,6 +549,9 @@ pub(super) struct WindowedFile {
     /// text is not split again from its first byte at each read and at each file boundary.
     tail_reader: Option<succinctly::jq::JqOpenTail>,
     tail_read_to: usize,
+    /// jq's parser over the value a stream is read on for, once it is long (#7812): where the value starts
+    /// in the stream, the reader, and where in the stream it has read to ([`Self::open_value_faults`]).
+    open_check: Option<(usize, succinctly::jq::JqOpenTail, usize)>,
     /// A NUL was found in the text validated so far (#7437), which the validation changed.
     nul_seen: bool,
     /// How much of the front was validated before the file was read: a carry the file before
@@ -620,6 +623,7 @@ impl WindowedFile {
             split_bytes: 0,
             tail_reader: None,
             tail_read_to: 0,
+            open_check: None,
             nul_seen: false,
             front_validated: carry_validated,
             #[cfg(test)]
@@ -737,8 +741,13 @@ impl WindowedFile {
             // A fault before the end of the file is only one when no byte that follows can change
             // it: where no container or string starts, in a text that ends at a line break (a bare
             // token is bounded by it). Otherwise the document may only lack its text.
-            let definitive =
-                split_error.is_some_and(|at| !self.eof && !opens_container_or_string(self.buf[at]));
+            // #7812: and in a stream, one inside a container or string open past the look-ahead that jq's
+            // parser meets in what has been read ([`Self::open_value_faults`]): no byte that follows
+            // changes it, and the close the route would read on for may never come.
+            let definitive = split_error.is_some_and(|at| {
+                !self.eof
+                    && (!opens_container_or_string(self.buf[at]) || self.open_value_faults(at))
+            });
             let pending = split_error.is_some() && !self.eof && !definitive;
             // The last document before a fault that may still move is a number or literal whose
             // completion the fault's own byte could be, so it waits to be seen with what follows.
@@ -894,6 +903,29 @@ impl WindowedFile {
         }
         self.tail_reader = None;
         false
+    }
+
+    /// Whether the value that starts at `buf[at]` and is still open at `validated` holds a fault jq's
+    /// parser meets there (#7812), for a stream ([`Self::unknown_len`]) whose value is open past the
+    /// look-ahead ([`LOOKAHEAD_WINDOWS`] windows). The split's judgement of an open document is a bracket
+    /// and quote count, so a fault inside a container never closed (`[tru,`, `{x`, random bytes after a
+    /// `{`) read the stream on for the close, without end, where jq reports the fault. jq's parser model
+    /// ([`succinctly::jq::JqOpenTail`], #7750) reads the value a piece at a time as it is read on, from
+    /// where it last stopped; a value shorter than the look-ahead, and every value of a file of known
+    /// length, are not read by it, and cost nothing.
+    fn open_value_faults(&mut self, at: usize) -> bool {
+        if !self.unknown_len || self.validated - at < self.block.saturating_mul(LOOKAHEAD_WINDOWS) {
+            return false;
+        }
+        let start = self.offset + at;
+        let check = match &mut self.open_check {
+            Some(check) if check.0 == start => check,
+            check => check.insert((start, succinctly::jq::JqOpenTail::new(), start)),
+        };
+        let from = check.2 - start;
+        let read = check.1.read(&self.buf[at..self.validated], from);
+        check.2 = self.offset + self.validated;
+        read == succinctly::jq::TailRead::Fault
     }
 
     /// #7412: a file of a known length under [`MAX_READ_WHOLE_WINDOWS`] windows whose window ends inside
@@ -3209,11 +3241,12 @@ fn stdin_is_a_stream() -> bool {
     false
 }
 
-/// One read of `reader` onto the end of `bytes`, of at most `n` bytes (and at most 64 KiB, more than a
-/// terminal's line holds): what a terminal gives a read is the line typed (#7742).
+/// One read of `reader` onto the end of `bytes`, of at most `n` bytes (and at most 4 KiB, what a terminal's
+/// line holds): what a terminal gives a read is the line typed (#7742). The room is zeroed for the read,
+/// so it is no more than a line's: a terminal that streams is read a line a read (#7812).
 fn read_once(reader: &mut dyn Read, bytes: &mut Vec<u8>, n: usize) -> io::Result<usize> {
     let start = bytes.len();
-    bytes.resize(start + n.min(64 << 10), 0);
+    bytes.resize(start + n.min(4 << 10), 0);
     let read = loop {
         match reader.read(&mut bytes[start..]) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -3249,6 +3282,8 @@ pub(super) struct LineWindows {
     typed: bool,
     /// The terminal has not been read yet: a BOM at the front of its first line is the one jq skips.
     typed_front: bool,
+    /// The terminal's descriptor, asked whether more is ready past a line ([`Self::ready_on`], #7812).
+    typed_fd: Option<i32>,
     /// What the source is, for a fault or a byte that is not UTF-8 ([`is_stream`](Self::is_stream), #7738).
     kind: SourceKind,
 }
@@ -3285,6 +3320,7 @@ impl LineWindows {
             first_ask: None,
             typed: false,
             typed_front: false,
+            typed_fd: None,
             kind: SourceKind::File,
         }
     }
@@ -3294,6 +3330,15 @@ impl LineWindows {
     /// for the end of the input. A read of no bytes is the end (a `^D`), and nothing is read after it. A
     /// BOM at the front of the first line is dropped, as jq's parser skips it: nothing was read of the
     /// terminal to find it before the run started.
+    /// A terminal read on descriptor `fd` (#7812): a window that has had a line goes on reading while the
+    /// terminal has more ready, up to what it asks for, so a terminal that streams is read a window at a
+    /// time and not a line at a time (a scan of a value open over many lines read again at each line);
+    /// one typed into still hands on each line as it is typed.
+    pub(super) fn ready_on(mut self, fd: i32) -> Self {
+        self.typed_fd = Some(fd);
+        self
+    }
+
     pub(super) fn typed_into(mut self) -> Self {
         self.typed = true;
         self.typed_front = true;
@@ -3444,6 +3489,15 @@ impl LineWindows {
             }
             if !self.eof {
                 if let Some(at) = last_line_break(&bytes[before..]) {
+                    // #7812: a terminal with more ready is read on to the window asked for.
+                    if self.typed
+                        && bytes.len() - floor < ask
+                        && self
+                            .typed_fd
+                            .is_some_and(super::super::stdin_offset::readable_now)
+                    {
+                        continue;
+                    }
                     self.carried = bytes.split_off(before + at + 1);
                     return Ok(bytes);
                 }
