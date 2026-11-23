@@ -1,5 +1,6 @@
 //! #7697: a program the path-mode interpreter runs keeps the last value's document to the end of
-//! the run, which the CLI then forgets instead of taking its tree apart. Nothing a program sees
+//! the run, which the CLI then forgets instead of taking its tree apart, unless the program can
+//! walk it with `..`. Nothing a program sees
 //! moves: these pin the answers on the routes the held document passes through (one document,
 //! several on one stream or over several files, a write, a stream of paths, an error on every
 //! value and a halt on the last). Every expectation was captured from `/usr/bin/jq` 1.7.1, which
@@ -48,6 +49,14 @@ fn test_7697_the_kept_document_moves_no_answer() -> Result<()> {
             r#"path(.. | if type == "string" then . else empty end)"#,
             DOC,
             "[\"meta\",\"s\",0]\n[\"meta\",\"s\",1]\n[\"data\",0,\"name\"]\n[\"data\",2,\"name\"]\n[\"tail\",\"k\"]\n",
+            "",
+            0,
+        ),
+        // A walk with `..` keeps nothing; its answer is unchanged too.
+        (
+            r#"[path(.. | if type == "string" then . else empty end)] | length"#,
+            DOC,
+            "5\n",
             "",
             0,
         ),

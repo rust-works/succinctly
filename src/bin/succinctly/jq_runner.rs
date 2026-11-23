@@ -6131,11 +6131,13 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // one left when the loop ends is forgotten below, unless the run goes on.
         let mut held_index: Option<JsonIndex> = None;
         // #7697: likewise the document a program the path-mode interpreter runs had as its tree,
-        // which that run would otherwise take apart (see `jq::path_mode::kept_document`).
+        // which that run would otherwise take apart (see `jq::path_mode::kept_document`), unless
+        // the program can walk it with `..`: such a run frees the tree as it walks it, and the
+        // handle would hold all of it beside what the walk builds.
         let keeps_document = matches!(
             jq::path_mode::route(&expr),
             jq::path_mode::Route::Interpreter
-        );
+        ) && !jq::path_mode::walks_recursively(&expr);
         let mut held_document: Option<OwnedValue> = None;
         'files: loop {
             // The next file's text, or for a windowed file its next window with the documents the

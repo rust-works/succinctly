@@ -2759,17 +2759,17 @@ fn a_program_hands_out_keys_only_through_each_or_keys_7489() {
     });
 }
 
-/// [`KEY_HANDING_PRELUDE_DEFS`] is what [`reaches_a_key`] answers over every
-/// parsed [`PRELUDE`] definition, looking inside each definition it calls
-/// (#7489): the walk is the one definition of the answer, and the table only
-/// spares a run parsing the prelude to find it.
-#[test]
-fn the_key_handing_prelude_table_is_derived_from_the_prelude_7489() {
-    /// Whether the prelude definition `name/arity` can hand a key out, `seen`
-    /// the definitions already being looked inside (a recursive one is looked
-    /// inside once).
+/// A walk over an expression that asks its second argument about each prelude definition the
+/// expression calls ([`reaches_a_key`], [`reaches_a_descent`]).
+type PreludeWalk = fn(&Expr, &mut dyn FnMut(&str, usize) -> bool) -> bool;
+
+/// The prelude definitions whose body `walk` answers `true` for, looking inside each definition
+/// it calls (a recursive one is looked inside once), sorted: how [`KEY_HANDING_PRELUDE_DEFS`]
+/// and [`DESCENDING_PRELUDE_DEFS`] are derived.
+fn derive_prelude_table(prelude: &Prelude, walk: PreludeWalk) -> Vec<(&'static str, usize)> {
     fn reaches(
         prelude: &Prelude,
+        walk: PreludeWalk,
         name: &str,
         arity: usize,
         seen: &mut Vec<(&'static str, usize)>,
@@ -2781,19 +2781,47 @@ fn the_key_handing_prelude_table_is_derived_from_the_prelude_7489() {
             return false;
         }
         seen.push((def.name, def.arity));
-        reaches_a_key(def.expr(), &mut |name, arity| {
-            reaches(prelude, name, arity, seen)
+        walk(def.expr(), &mut |name, arity| {
+            reaches(prelude, walk, name, arity, seen)
         })
     }
+    let mut derived: Vec<(&'static str, usize)> = prelude
+        .defs
+        .iter()
+        .filter(|def| reaches(prelude, walk, def.name, def.arity, &mut Vec::new()))
+        .map(|def| (def.name, def.arity))
+        .collect();
+    derived.sort_unstable();
+    derived
+}
+
+/// #7697: [`DESCENDING_PRELUDE_DEFS`] is what [`reaches_a_descent`] answers over every parsed
+/// [`PRELUDE`] definition, as [`KEY_HANDING_PRELUDE_DEFS`] is for [`reaches_a_key`].
+#[test]
+fn the_descending_prelude_table_is_derived_from_the_prelude_7697() {
     on_big_stack(|| {
         let prelude = Prelude::new();
-        let mut derived: Vec<(&str, usize)> = prelude
-            .defs
-            .iter()
-            .filter(|def| reaches(&prelude, def.name, def.arity, &mut Vec::new()))
-            .map(|def| (def.name, def.arity))
-            .collect();
-        derived.sort_unstable();
+        let derived = derive_prelude_table(&prelude, reaches_a_descent);
+        assert!(derived.contains(&("_sp_paths", 0)), "{derived:?}");
+        assert!(!derived.contains(&("_sp_to_entries", 0)), "{derived:?}");
+        assert_eq!(
+            DESCENDING_PRELUDE_DEFS,
+            derived.as_slice(),
+            "DESCENDING_PRELUDE_DEFS disagrees with the prelude; the derived table is\n{derived:?}"
+        );
+        assert!(DESCENDING_PRELUDE_DEFS.windows(2).all(|w| w[0] < w[1]));
+    });
+}
+
+/// [`KEY_HANDING_PRELUDE_DEFS`] is what [`reaches_a_key`] answers over every
+/// parsed [`PRELUDE`] definition, looking inside each definition it calls
+/// (#7489): the walk is the one definition of the answer, and the table only
+/// spares a run parsing the prelude to find it.
+#[test]
+fn the_key_handing_prelude_table_is_derived_from_the_prelude_7489() {
+    on_big_stack(|| {
+        let prelude = Prelude::new();
+        let derived = derive_prelude_table(&prelude, reaches_a_key);
         assert!(derived.contains(&("_sp_to_entries", 0)), "{derived:?}");
         assert!(prelude.find("_sp_first", 1).is_some());
         assert!(!derived.contains(&("_sp_first", 1)), "{derived:?}");
@@ -3209,5 +3237,35 @@ fn a_run_asked_to_keep_its_document_leaves_the_whole_tree_7697() {
         assert_eq!(kept, Some(materialize()));
         let (_, kept) = run_on_doc("[path(.data[] | .name // empty)]", false);
         assert_eq!(kept, None);
+    });
+}
+
+/// #7697: the CLI keeps the document only for a program that cannot walk it with
+/// [`Interp::recurse`], which frees a document it owns as it walks it.
+#[test]
+fn walks_recursively_names_every_way_to_run_a_descent_7697() {
+    on_big_stack(|| {
+        let walks = |filter: &str| walks_recursively(&compile(filter).expect("compiles"));
+        for filter in [
+            r#"[path(.. | if type == "string" then . else empty end)] | length"#,
+            "(.. | select(type == \"string\") // empty) |= . + \"x\" | length",
+            "[path(recurse(.[]?; . != null) | .a? // empty)]",
+            "[path(recurse(.a) | .b // empty)]",
+            "[paths] | length",
+            "[paths(type == \"number\")] | length",
+            "[leaf_paths] | length",
+            "def p: path(.. | .a? // empty); [p]",
+            "[path(.data[] | .name // empty)] | [recurse] | length",
+        ] {
+            assert!(walks(filter), "{filter}");
+        }
+        for filter in [
+            "[path(.data[] | .name // empty)] | length",
+            "(.data[] | .name // empty) |= 1 | .data | length",
+            "[path(.data[] | to_entries[] | .value // empty)] | length",
+            ". as $d | path($d)",
+        ] {
+            assert!(!walks(filter), "{filter}");
+        }
     });
 }

@@ -204,14 +204,73 @@ const KEY_HANDING_PRELUDE_DEFS: &[(&str, usize)] = &[
 /// [`hands_out_keys`] runs over a program, and the derivation of
 /// [`KEY_HANDING_PRELUDE_DEFS`] over the prelude's own bodies.
 fn reaches_a_key(expr: &Expr, prelude_reaches: &mut dyn FnMut(&str, usize) -> bool) -> bool {
+    reaches(expr, hands_out_a_key, prelude_reaches)
+}
+
+/// Whether `expr` itself can hand a key out ([`reaches_a_key`]).
+fn hands_out_a_key(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Iterate
+            | Expr::RecursiveDescent
+            | Expr::RecursiveDescentWithKeys
+            | Expr::Builtin(Builtin::Keys | Builtin::KeysUnsorted | Builtin::Recurse)
+    )
+}
+
+/// Whether a run of `program` can walk a value with [`Interp::recurse`] (`..`, `recurse`, or a
+/// definition that runs one, such as `paths`), which lets go of each node of a document it
+/// owned alone once the node's children are queued: such a run frees the document as it walks
+/// it, so keeping it to the end would hold it beside everything the walk builds (#7697).
+pub(crate) fn walks_recursively(program: &Expr) -> bool {
+    reaches_a_descent(program, &mut |name, arity| {
+        DESCENDING_PRELUDE_DEFS
+            .binary_search(&(name, arity))
+            .is_ok()
+    })
+}
+
+/// The [`PRELUDE`] definitions whose body can run [`Interp::recurse`], directly or through a
+/// definition it calls (#7697), by name and arity, sorted. Derived from the bodies by
+/// [`reaches_a_descent`], which a unit test checks, as [`KEY_HANDING_PRELUDE_DEFS`] is.
+const DESCENDING_PRELUDE_DEFS: &[(&str, usize)] = &[
+    ("_sp_leaf_paths", 0),
+    ("_sp_paths", 0),
+    ("_sp_paths", 1),
+    ("_sp_recurse", 0),
+    ("_sp_recurse_down", 0),
+];
+
+/// [`reaches_a_key`] for [`walks_recursively`].
+fn reaches_a_descent(expr: &Expr, prelude_reaches: &mut dyn FnMut(&str, usize) -> bool) -> bool {
+    reaches(expr, descends, prelude_reaches)
+}
+
+/// Whether `expr` itself runs [`Interp::recurse`].
+fn descends(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::RecursiveDescent
+            | Expr::RecursiveDescentWithKeys
+            | Expr::Builtin(Builtin::Recurse | Builtin::RecurseF(_) | Builtin::RecurseCond(..))
+    )
+}
+
+/// Whether `expr` holds a node `node` answers for, looking into the prelude definitions it
+/// calls through `prelude_reaches` (the walk behind [`reaches_a_key`] and [`reaches_a_descent`]).
+/// Generic over `node`, so that each walk tests its nodes inline: [`hands_out_keys`] runs once
+/// per document, and a call through a pointer per node of the program cost a stream of small
+/// records 0.6% of its instructions (cachegrind, AMD Ryzen 9 7950X).
+fn reaches<N: Fn(&Expr) -> bool + Copy>(
+    expr: &Expr,
+    node: N,
+    prelude_reaches: &mut dyn FnMut(&str, usize) -> bool,
+) -> bool {
     any_subexpr(expr, &mut |e| {
+        if node(e) {
+            return true;
+        }
         let (name, arity) = match e {
-            Expr::Iterate | Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys => {
-                return true;
-            }
-            Expr::Builtin(Builtin::Keys | Builtin::KeysUnsorted | Builtin::Recurse) => {
-                return true;
-            }
             Expr::Builtin(builtin) => match prelude_call(builtin) {
                 Some((name, args)) => (name, args.len()),
                 None => return false,
@@ -237,7 +296,7 @@ fn reaches_a_key(expr: &Expr, prelude_reaches: &mut dyn FnMut(&str, usize) -> bo
                 // `def` answers it.
                 if builtin_fallback
                     .as_deref()
-                    .is_some_and(|fallback| reaches_a_key(fallback, prelude_reaches))
+                    .is_some_and(|fallback| reaches(fallback, node, prelude_reaches))
                 {
                     return true;
                 }
@@ -1621,13 +1680,27 @@ pub(crate) fn run_program(
     input: OwnedValue,
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
 ) -> Option<Control> {
+    #[cfg(feature = "std")]
+    if kept_document::requested() {
+        return kept_document::run(program, input, on_value);
+    }
+    run_program_seeing(program, input, on_value, |_| {})
+}
+
+/// [`run_program`], showing `see` the document once its identities are promoted, before the
+/// program runs on it.
+#[inline(always)]
+fn run_program_seeing(
+    program: &Expr,
+    input: OwnedValue,
+    on_value: &mut dyn FnMut(OwnedValue) -> bool,
+    see: impl FnOnce(&OwnedValue),
+) -> Option<Control> {
     with_prelude(|prelude| {
         let interp = Interp::new(prelude);
         let mut input = input;
         interp.prepare(program, &mut input);
-        // #7697: taken after `prepare`, whose promotions write the tree in place.
-        #[cfg(feature = "std")]
-        let kept = kept_document::requested().then(|| input.clone());
+        see(&input);
         let result = interp.eval(program, &Env::default(), input, Reg::top(), &mut |v, _| {
             if on_value(v) {
                 Ok(())
@@ -1635,8 +1708,6 @@ pub(crate) fn run_program(
                 Err(Raise::Stop)
             }
         });
-        #[cfg(feature = "std")]
-        kept_document::leave(kept);
         match result {
             Ok(()) | Err(Raise::Stop) => None,
             Err(raise) => match Interp::outcome(raise) {
@@ -1671,8 +1742,11 @@ pub(crate) fn run_program(
 /// The handle does not change what the program sees: a write through a container it shares
 /// copies the container where a write to one the run owned alone would have written it in
 /// place, and in either case the result is a value no other handle of the run holds, as jq's
-/// would be. What it costs is memory the program no longer reads, held to the end: on a run
-/// that writes every node of its document, the old one stays beside the new one.
+/// would be. What it costs is memory the program no longer reads, held to the end. That is
+/// why the CLI asks for it only for a program that cannot walk its document with `..`
+/// ([`walks_recursively`]): `[path(.. | strings)]` frees each node as the walk passes it, and
+/// the memory goes to the paths it collects: a handle on the whole tree raised that run's peak
+/// memory by 12% on an AMD Ryzen 9 7950X and 15% on an Apple M4 Pro at 100 MB.
 #[cfg(feature = "std")]
 pub(crate) mod kept_document {
     use super::OwnedValue;
@@ -1697,15 +1771,27 @@ pub(crate) mod kept_document {
     }
 
     /// Whether this run keeps a handle (the request is used up).
+    #[inline]
     pub(super) fn requested() -> bool {
         REQUESTED.with(|requested| requested.replace(false))
     }
 
-    /// Leave the run's handle, if it kept one, for [`take`].
-    pub(super) fn leave(kept: Option<OwnedValue>) {
-        if kept.is_some() {
-            LEFT.with(|left| *left.borrow_mut() = kept);
-        }
+    /// [`run_program`](super::run_program) keeping a handle on the document, taken after its
+    /// identities are promoted (which writes the tree in place), and left for [`take`]. Out of
+    /// line, so that a run that keeps nothing runs the code it ran before.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn run(
+        program: &super::Expr,
+        input: OwnedValue,
+        on_value: &mut dyn FnMut(OwnedValue) -> bool,
+    ) -> Option<super::Control> {
+        let mut kept = None;
+        let control = super::run_program_seeing(program, input, on_value, |document| {
+            kept = Some(document.clone());
+        });
+        LEFT.with(|left| *left.borrow_mut() = kept);
+        control
     }
 }
 
