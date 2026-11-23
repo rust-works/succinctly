@@ -2,14 +2,15 @@
 //! it is at its end, so the refill that ends the stream is the empty one at the missing file. The
 //! last opened file's last chunk is then not the final buffer, and #2998's silent end, which drops
 //! a record a final buffer starting on an RS holds, does not apply there. Every row was captured
-//! from jq 1.7.1; the ones without the missing file show the drop still applying.
+//! from jq 1.7.1, which jq 1.8.2 agrees with, except the two without the missing file: 1.7.1 dropped
+//! the `[2]` there, and since #7718 `succinctly jq` reads it as jq 1.8.2 does (those rows are 1.8.2's).
 
 use anyhow::Result;
 
 use crate::run_jq_full;
 
 #[test]
-fn a_seq_final_buffer_drop_does_not_apply_before_an_unopened_last_file_6588() -> Result<()> {
+fn a_seq_stream_before_an_unopened_last_file_reads_every_record_6588() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let d = dir.path().to_string_lossy().into_owned();
     for (name, text) in [
@@ -22,9 +23,9 @@ fn a_seq_final_buffer_drop_does_not_apply_before_an_unopened_last_file_6588() ->
     #[rustfmt::skip]
     let rows = [
         (&["--seq", "-c", "-n", "[inputs]"][..], &["nonl", "gone"][..], "\u{1e}[1,[2]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
-        (&["--seq", "-c", "-n", "[inputs]"][..], &["nonl"][..], "\u{1e}[1]\n", "", 0),
+        (&["--seq", "-c", "-n", "[inputs]"][..], &["nonl"][..], "\u{1e}[1,[2]]\n", "", 0),
         (&["--seq", "-c", "."][..], &["nonl", "gone"][..], "\u{1e}1\n\u{1e}[2]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
-        (&["--seq", "-c", "."][..], &["nonl"][..], "\u{1e}1\n", "", 0),
+        (&["--seq", "-c", "."][..], &["nonl"][..], "\u{1e}1\n\u{1e}[2]\n", "", 0),
         (&["--seq", "-c", "-n", "[inputs]"][..], &["rsend", "gone"][..], "\u{1e}[[1]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
         (&["--seq", "-c", "[., input]"][..], &["seq", "rsend", "gone"][..], "\u{1e}[1,2]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: error (at @DIR@/gone.json:0): break\n", 2),
         (&["--seq", "-c", "[., input]"][..], &["seq", "rsend"][..], "\u{1e}[1,2]\n", "jq: error (at @DIR@/rsend.json:1): break\n", 5),

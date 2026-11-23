@@ -41,7 +41,8 @@ uninitialised heap (`parser_init` leaves `tokenbuf` null and `token()` grows it 
 Amazon Linux 2023 on aarch64 holds `u`. jq 1.8.2 fixed the read (`tokenpos > 1`, jqlang/jq#3324),
 and `succinctly jq` follows it (#7525): a bare `n` is always "Invalid numeric literal". So
 against the pinned 1.7.1 `artifact()` skips a stream whose first bare `n` is classified
-before any token has written index 1, or after one that may have left a `u` there. A bare
+before any token has written index 1, or after one that may have left a `u` there (a failing
+token's terminating `"` opens no string, as jq resets the parser there, #7806). A bare
 `n` after any other byte agrees on both versions, so the sweep keeps checking it (#1723,
 #6513). `--expect-artifacts` includes the skipped shapes.
 
@@ -49,10 +50,14 @@ before any token has written index 1, or after one that may have left a `u` ther
 here -- a trailing unterminated RS-record after an earlier newline being
 dropped unread below the buffer boundary and parsed above it, and a record
 yielding no value silently ending the *whole* stream when it was the first
-thing scanned from jq's own final buffer. Both are real jq's own
+thing scanned from jq's own final buffer. Both are jq 1.7.1's own
 non-slurp end-of-stream rule (`jq_util_input_next_input`, `src/util.c`),
-not two separate corner cases, and #2998 modeled it: the corpus no longer
-excludes either shape.
+not two separate corner cases, and #2998 modeled it. jq 1.8.2 reads one more,
+empty, buffer after the last bytes (jqlang/jq#3279), so it reads every record,
+and `succinctly jq` follows it (#7718): against the pinned 1.7.1, `artifact()`
+skips a stream whose last buffer holds data and an RS the parser scans there
+(not under `--slurp-location`, where 1.7.1 never dropped), or a byte-order
+mark that breaks off (whose EOF report 1.8.2's empty last call wipes).
 
 Expected result: `0 stderr mismatches, 0 stdout supersets`; exits non-zero
 otherwise. Any superset is a real failure. The one this corpus used to hit
@@ -204,6 +209,17 @@ def malformed_bom(data):
 _TOKEN_ENDS = b" \t\r\n\x1e[]{},:\""
 
 
+_NUMBER = re.compile(
+    rb"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?|[+-]?(inf|infinity|nan\d*|snan\d*)", re.IGNORECASE
+)
+
+
+def _valid_word(word):
+    """Whether jq 1.7.1's `check_literal` accepts `word`: `true`, `false`, `null`, `nan`, or a number
+    its decNumber reader takes (digits with an optional point and exponent, `infinity`, `nan`)."""
+    return word in (b"true", b"false", b"null", b"nan") or _NUMBER.fullmatch(word) is not None
+
+
 def reads_unwritten_tokenbuf(data):
     """Whether jq 1.7.1 may classify a bare one-byte `n` token (`check_literal`'s
     `tokenbuf[1] == 'u'`) against a `u`: before anything in `data` has written
@@ -261,7 +277,10 @@ def reads_unwritten_tokenbuf(data):
                 held = 0  # a bare `n` leaves its own NUL at index 1
             elif word not in (b"t", b"f"):
                 held = 0
-            i = j
+            # A word that is no literal or number fails at the byte that ends it; jq resets the
+            # parser there, so a `"` that ends it opens no string (#7806): the bytes after it are
+            # tokens, not string text.
+            i = j + 1 if data[j : j + 1] == b'"' and not _valid_word(word) else j
     return False
 
 
@@ -280,16 +299,49 @@ def visible(data):
     return b"".join(out)
 
 
-def artifact(data):
+def final_buffer(data):
+    """jq 1.7.1's final `fgets` buffer of `data` as its parser sees it (#7718): the last 4095-byte or
+    newline-ended chunk, empty when that chunk ends on a newline or fills the buffer (an empty read
+    follows it then), and `(start, bytes)` with `start` its offset in `data`."""
+    at, last = 0, (len(data), b"")
+    while at < len(data):
+        newline = data.find(b"\n", at, at + 4095)
+        end = newline + 1 if newline >= 0 else min(at + 4095, len(data))
+        chunk = data[at:end]
+        if newline >= 0 or len(chunk) == 4095:
+            last = (len(data), b"")
+        else:
+            last = (at, chunk[: chunk.index(b"\x00")] if b"\x00" in chunk else chunk)
+        at = end
+    return last
+
+
+def reads_past_last_buffer(data, slurp):
+    """Whether jq 1.8.2 may read `data` differently from the pinned 1.7.1 because it reads one more,
+    empty, buffer after the last bytes (jqlang/jq#3279, #7718), which `succinctly jq` follows. 1.7.1
+    took the buffer holding the last bytes for the final one, so (without `-s`) an RS scanned there
+    with nothing pending as that call's first event ended the stream, and with a byte-order mark that
+    breaks off the EOF branch ran there without the `parser_reset` 1.8.2's empty last call makes.
+    Errs on the side of skipping: any RS the parser scans in a final buffer that holds data."""
+    start, last = final_buffer(data)
+    if not last:
+        return False
+    if malformed_bom(data):
+        return True
+    if slurp:
+        return False
+    first_rs = data.find(RS)
+    return any(start + i != first_rs for i, b in enumerate(last) if b == RS[0])
+
+
+def artifact(data, slurp=False):
     """Whether `data` trips an artifact of jq itself: the one `fgets`-line-reader
-    artifact #2998 left unmodeled, or the `tokenbuf` byte jq 1.7.1 reads for a bare `n` (#7256, #7525). jq's own end-of-stream rule (an RS closing a record
-    that yields no value ends the *entire* stream, silently, iff that
-    record is the first thing jq's own `fgets`-chunked final buffer
-    scans) is matched now, so the two shapes that used to trip it --
-    both properties of that same buffer boundary, not of the parser --
-    are no longer here; see the module docstring's history note."""
+    artifact #2998 left unmodeled, or the `tokenbuf` byte jq 1.7.1 reads for a bare `n` (#7256, #7525),
+    or a stream jq 1.8.2 reads past 1.7.1's last buffer, which `succinctly jq` follows (#7718)."""
     if reads_unwritten_tokenbuf(visible(data)):
         return True  # 1.7.1 reads an uninitialised or stale `u` -- #7256/#7525, matched by no implementation
+    if reads_past_last_buffer(data, slurp):
+        return True  # 1.7.1's end-of-stream drop or its in-buffer EOF branch -- #2998/#7718
     if RS not in visible(data):
         # #1525's separate template -- except after a malformed BOM, which
         # makes jq read the stream rather than abandon it, so those stay in.
@@ -376,7 +428,7 @@ def main():
     cases = HAND + random_cases(args.cases, args.seed, args.expect_artifacts, args.long)
     stderr_bad, stdout_super, skipped = [], [], 0
     for data in cases:
-        if not args.expect_artifacts and artifact(data):
+        if not args.expect_artifacts and artifact(data, args.slurp_location):
             skipped += 1
             continue
         jq_out, jq_err, jq_code = run([jq], data, mode_args)

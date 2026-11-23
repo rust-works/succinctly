@@ -20310,9 +20310,17 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // sees both occurrences of a mapping key; `each_paths_filter_generic`
         // keeps the demand-forwarding and sends only a live `input`/`inputs`
         // queue to the bridge below, which every jq-mode call still takes.
-        Expr::Builtin(Builtin::PathsFilter(_)) => {
-            each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink)
-        }
+        //
+        // #7726: `combinations` takes the same bridge, in both modes: it
+        // streams its rows from `eval_each` (`each_combinations`), so a
+        // consumer that stops after one row stops the walk, where the wildcard
+        // below collected the whole product first (`first(combinations(20))`
+        // on `[1,2]` built 2^20 rows). It shares this arm rather than taking
+        // one of its own, which grew this frame and took `r(12000; 7)` in
+        // `test_literal_dollar_argument_matches_jq_3260` past the depth limit.
+        Expr::Builtin(
+            Builtin::PathsFilter(_) | Builtin::Combinations | Builtin::CombinationsN(_),
+        ) => each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink),
 
         // #3448: jq's `=`/`op=`/`//=` run their right side as the outer
         // generator, so a consumer that stops after one document must stop
@@ -23552,7 +23560,23 @@ fn loop_step_generic<S: EvalSemantics, V: DocumentValue>(
                 }
                 document => document,
             };
-            let (mut next, update_control) = state.fork::<S>(update, optional);
+            // #7702: a computed state goes to #7483's owned-call door by value.
+            let (mut next, update_control) = match state {
+                LoopState::Owned(owned) => {
+                    match crate::jq::eval::owned_door_fork::<S>(
+                        update,
+                        owned,
+                        optional,
+                        Reentry::REBUILT,
+                    ) {
+                        Ok((values, control)) => {
+                            (values.into_iter().map(LoopState::Owned).collect(), control)
+                        }
+                        Err(owned) => LoopState::Owned(owned).fork::<S>(update, optional),
+                    }
+                }
+                document => document.fork::<S>(update, optional),
+            };
             if update_control.is_none() && next.len() == 1 {
                 state = next.pop().expect("one update output");
                 continue;
@@ -26330,8 +26354,9 @@ fn binary_fanout_each_generic<V: DocumentValue, S: EvalSemantics>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     // #3296: decided once per operator, as in `eval::binary_fanout_each`;
-    // #4132 measured it, see docs/optimizations/jq-settled-operands.md.
-    if settles_both(left, right) {
+    // #4132 measured it, see docs/optimizations/jq-settled-operands.md. #7713: and calls that
+    // answer once, as there.
+    if crate::jq::eval::operands_settle::<S>(left, right) {
         binary_fanout_each_generic_with::<V, S>(
             settled_operand_strategy_generic(each_operand),
             left,
@@ -27119,7 +27144,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                 ) =>
             {
                 // #5292: handed over a batch at a time, as `each_range` does.
-                let end = each_range_batches(
+                let end = each_range_batches::<S>(
                     from_val,
                     to_val,
                     step_val,
@@ -31376,6 +31401,7 @@ fn each_paths_filter_generic<S: EvalSemantics, V: DocumentValue>(
 
 /// Which producer `paths(f)` takes in `eval_each_generic` (#1342): the walk
 /// where duplicate keys survive, the owned bridge where they collapse anyway.
+/// `combinations` and `combinations(n)` always take the bridge (#7726).
 /// A function of its own, with the same arguments the single bridge call it
 /// replaced took, so `eval_each_generic`'s native frame -- the one the
 /// recursion floor is read against -- is the size it was.

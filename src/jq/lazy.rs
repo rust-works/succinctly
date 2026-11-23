@@ -578,7 +578,8 @@ impl<'a, W: Clone + AsRef<[u64]>> JqValue<'a, W> {
     /// pattern.
     ///
     /// For a **CLI-output-boundary** call site (`write_output_jq_value`'s
-    /// materialize arm and `-e`'s exit-status check, `jq_runner.rs`) rather
+    /// materialize arm, `jq_runner.rs`; `-e`'s exit-status check was the
+    /// other until #7757, which made it read only truthiness) rather
     /// than the evaluator's own hot recursion, where a panic stays deliberate
     /// -- the identical split [`super::eval_generic::check_nesting_depth`]
     /// already draws from [`super::eval_generic::assert_nesting_depth`]

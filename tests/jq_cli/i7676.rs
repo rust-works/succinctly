@@ -72,7 +72,7 @@ fn test_a_binding_chain_ending_in_nwise_runs_or_is_refused_at_the_floor_7676() -
     }
     // Just past it the program's own last binding is at the floor, or the template is: before the
     // fix the template's refusal panicked over several lengths there (23,359 to 23,361 at least in
-    // a release build on an Apple M5 Max). Each is now the program's refusal.
+    // a release build on aarch64). Each is now the program's refusal.
     for links in refused..refused + 4 {
         assert_eq!(run_chain(links)?, Outcome::Refused, "{links} links");
     }

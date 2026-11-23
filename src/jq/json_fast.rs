@@ -125,8 +125,9 @@ pub(crate) const PLAIN_END_MAX_DEPTH: usize = 64;
 
 /// Where the plain RFC 8259 value at `bytes[start]` ends, if it is one: checked as the reader
 /// checks it, and built into nothing (#7260). `None` for anything else, a value nested deeper
-/// than [`PLAIN_END_MAX_DEPTH`] and a string holding a surrogate escape included, for the caller's
-/// general route to decide.
+/// than [`PLAIN_END_MAX_DEPTH`] and a string holding a lone surrogate escape included, for the
+/// caller's general route to decide; a high half followed by a low one is read as the reader reads
+/// it (#7758).
 ///
 /// What follows the value is not looked at. The lazy `inputs` scan finds a document and checks it
 /// with this one pass, where it ran the splitter and then serde over the same text.
@@ -141,6 +142,19 @@ pub(crate) fn plain_value_end(text: &str, start: usize) -> Option<usize> {
     };
     skip.value(0)?;
     Some(skip.at)
+}
+
+/// Whether the four hex digits of a `\u` escape name a surrogate half: `Some(true)` for a high
+/// one (U+D800..U+DBFF), `Some(false)` for a low one (U+DC00..U+DFFF), `None` for any other code.
+fn surrogate_half(hex: &[u8]) -> Option<bool> {
+    if !matches!(hex[0], b'd' | b'D') {
+        return None;
+    }
+    match hex[1] {
+        b'8' | b'9' | b'a' | b'b' | b'A' | b'B' => Some(true),
+        b'c'..=b'f' | b'C'..=b'F' => Some(false),
+        _ => None,
+    }
 }
 
 /// [`plain_value_end`]'s walk: the grammar [`Reader`] reads, without building the value.
@@ -227,27 +241,50 @@ impl Skip<'_> {
                     self.at += 1;
                     return Some(());
                 }
-                b'\\' => {
-                    match *self.bytes.get(self.at + 1)? {
-                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => self.at += 2,
-                        b'u' => {
-                            let hex = self.bytes.get(self.at + 2..self.at + 6)?;
-                            // A surrogate half is the general route's, as it is the reader's.
-                            if !hex.iter().all(u8::is_ascii_hexdigit)
-                                || matches!(hex[0], b'd' | b'D')
-                                    && matches!(hex[1], b'8'..=b'9' | b'a'..=b'f' | b'A'..=b'F')
-                            {
-                                return None;
-                            }
+                b'\\' => match *self.bytes.get(self.at + 1)? {
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => self.at += 2,
+                    b'u' => {
+                        let hex = self.bytes.get(self.at + 2..self.at + 6)?;
+                        if !hex.iter().all(u8::is_ascii_hexdigit) {
+                            return None;
+                        }
+                        if matches!(hex[0], b'd' | b'D') {
+                            self.d_escape()?;
+                        } else {
                             self.at += 6;
                         }
-                        _ => return None,
                     }
-                }
+                    _ => return None,
+                },
                 // The run stopped at a control byte.
                 _ => return None,
             }
         }
+    }
+
+    /// The `\u` escape at `self.at` whose code starts with `d`, its hex digits checked: a surrogate
+    /// half is read as the reader reads it (#7758), a high half followed by a low one as one
+    /// character and a lone half of either kind left to the general route. Out of line, so the
+    /// string walk of text with no such escape keeps its shape.
+    #[cold]
+    #[inline(never)]
+    fn d_escape(&mut self) -> Option<()> {
+        let hex = self.bytes.get(self.at + 2..self.at + 6)?;
+        match surrogate_half(hex) {
+            None => self.at += 6,
+            Some(true) => {
+                let low = self.bytes.get(self.at + 6..self.at + 12)?;
+                if low[..2] != *b"\\u"
+                    || !low[2..].iter().all(u8::is_ascii_hexdigit)
+                    || surrogate_half(&low[2..]) != Some(false)
+                {
+                    return None;
+                }
+                self.at += 12;
+            }
+            Some(false) => return None,
+        }
+        Some(())
     }
 
     fn array(&mut self, depth: usize) -> Option<()> {
@@ -648,7 +685,7 @@ mod tests {
     ///
     /// For a container, the values the lazy scan asks about: [`plain_value_end`] either declines,
     /// or ends it where serde's stream reader ends it, and it accepts every one the reader builds
-    /// that holds no surrogate escape (#7260). (A scalar's end is where serde would look at the
+    /// (#7260; surrogate pairs included since #7758). (A scalar's end is where serde would look at the
     /// byte after it, which the caller decides.)
     #[cfg(feature = "serde")]
     fn end_agrees(text: &str) -> bool {
@@ -667,7 +704,7 @@ mod tests {
         if end.is_some() && end != serde_end {
             return false;
         }
-        if !text.to_ascii_lowercase().contains("\\ud") && parse_plain(text).is_some() {
+        if parse_plain(text).is_some() {
             return end == Some(text.trim_end_matches([' ', '\t', '\n', '\r']).len());
         }
         true
@@ -736,11 +773,27 @@ mod tests {
         assert_eq!(plain_value_end("[1] [2]", 0), Some(3));
         assert_eq!(plain_value_end("[1] [2]", 4), Some(7));
         assert_eq!(plain_value_end(r#"{"a":{"b":[]}}"#, 0), Some(14));
-        // Deeper than the limit, a surrogate escape, a repeated key the reader declines: the caller's.
+        // Deeper than the limit and a lone surrogate half of either kind are the caller's; a high
+        // half followed by a low one is read, as the reader reads it (#7758), and so is a repeated
+        // key the reader declines.
         let deep = |n: usize| alloc::format!("{}{}", "[".repeat(n), "]".repeat(n));
         assert!(plain_value_end(&deep(PLAIN_END_MAX_DEPTH), 0).is_some());
         assert!(plain_value_end(&deep(PLAIN_END_MAX_DEPTH + 1), 0).is_none());
-        assert!(plain_value_end(r#"["\ud83d\ude00"]"#, 0).is_none());
+        assert_eq!(plain_value_end(r#"["\ud83d\ude00"]"#, 0), Some(16));
+        assert_eq!(plain_value_end(r#"["\uD83D\uDE00", "x"]"#, 0), Some(21));
+        for lone in [
+            r#"["\ud83d"]"#,
+            r#"["\udc00"]"#,
+            r#"["\ud83dx"]"#,
+            r#"["\ud83d\u0041"]"#,
+            r#"["\ud83d\ud83d\ude00"]"#,
+            r#"["\udc00\ud83d"]"#,
+            r#"{"\ud800":1}"#,
+            r#"["\ud83d\ude0"]"#,
+            r#"["\ud83d\"]"#,
+        ] {
+            assert!(plain_value_end(lone, 0).is_none(), "{lone}");
+        }
         assert!(plain_value_end(r#"{"a":1,"a":2}"#, 0).is_some());
     }
 
