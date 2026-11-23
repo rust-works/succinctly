@@ -58,6 +58,7 @@
 #   ./scripts/jq-path-context-oracle-sweep.sh --summary       # + per-category counts
 #   ./scripts/jq-path-context-oracle-sweep.sh --list-cases    # generated corpus only
 #   ./scripts/jq-path-context-oracle-sweep.sh --self-test     # alphabet + precedence checks
+#   ./scripts/jq-path-context-oracle-sweep.sh --jq-only --jq-latest=/path/to/jq-1.8.2 BIN
 #
 # `--list-cases` and `--self-test` need no binary at all (neither succinctly
 # nor an oracle), which is what lets `tests/jq_path_context_alphabet_tests.rs`
@@ -77,6 +78,15 @@
 # (see `classify_divergence`), so the headline number stays a pass/fail signal
 # — the `scripts/jq-fanout-oracle-sweep.sh` convention. Exits non-zero if any
 # *unexpected* divergence appears.
+#
+# **Which jq judges a jq-mode case (#7518).** `last(f)` of an `f` that yields
+# nothing yields nothing, as in jq 1.8.2 (jqlang/jq#3179), where jq 1.7.1
+# answers its `null` seed (`1 | (last(paths))?` is `null` in 1.7.1 and empty
+# in 1.8.2). `--jq-latest=JQ` (jq 1.8.2; `succinctly dev compare jq` passes its
+# secondary reference) judges the cases whose filter calls `last(` against it
+# and the rest against the pinned 1.7.1. Without it every case is judged
+# against the pin, and the `last` cases over an empty generator diverge by
+# design.
 
 set -euo pipefail
 
@@ -89,14 +99,16 @@ SUMMARY=0
 RUN_JQ=1
 RUN_YQ=1
 SUCC=""
+JQ_LATEST=""
 for arg in "$@"; do
   case "$arg" in
+    --jq-latest=*) JQ_LATEST="${arg#--jq-latest=}" ;;
     --list-cases) MODE=list ;;
     --self-test) MODE=selftest ;;
     --summary) SUMMARY=1 ;;
     --jq-only) RUN_YQ=0 ;;
     --yq-only) RUN_JQ=0 ;;
-    -h|--help) sed -n '2,60p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,61p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) SUCC="$arg" ;;
   esac
 done
@@ -371,6 +383,10 @@ if ((RUN_JQ)); then
     exit 2
   fi
 fi
+if ((RUN_JQ)) && [[ -n "$JQ_LATEST" ]] && ! "$JQ_LATEST" --version 2>/dev/null | grep -q '^jq-1\.8'; then
+  echo "error: --jq-latest=$JQ_LATEST is not a jq 1.8 build" >&2
+  exit 2
+fi
 if ((RUN_YQ)); then
   if command -v yq >/dev/null 2>&1 && yq --version | grep -qF "version $YQ_PIN"; then
     YQ="$(command -v yq)"
@@ -384,7 +400,7 @@ if [[ ! -x "$SUCC" ]]; then
   echo "error: succinctly binary not found at $SUCC — run: cargo build --release --features cli,simd,regex,serde" >&2
   exit 2
 fi
-echo "oracles: ${JQ:-<skipped>} ${YQ:-<skipped>}; succinctly: $SUCC" >&2
+echo "oracles: ${JQ:-<skipped>}${JQ_LATEST:+ (${JQ_LATEST} where a filter calls last)} ${YQ:-<skipped>}; succinctly: $SUCC" >&2
 
 # --- documents --------------------------------------------------------------
 
@@ -510,11 +526,15 @@ run_case() {
   local mode="$1" class="$2" filter="$3" variant="${4:-}"
   total=$((total + 1))
 
-  local s_out s_code o_out o_code s_err o_err
+  local s_out s_code o_out o_code s_err o_err oracle
   if [[ "$mode" == jq ]]; then
+    oracle="$JQ"
+    if [[ -n "$JQ_LATEST" && "$filter" == *"last("* ]]; then
+      oracle="$JQ_LATEST"
+    fi
     s_out="$("$SUCC" jq -c "$filter" "$WORK/doc.json" 2>"$S_ERR")" && s_code=0 || s_code=$?
     s_err="$(cat "$S_ERR")"
-    o_out="$("$JQ" -c "$filter" "$WORK/doc.json" 2>"$O_ERR")" && o_code=0 || o_code=$?
+    o_out="$("$oracle" -c "$filter" "$WORK/doc.json" 2>"$O_ERR")" && o_code=0 || o_code=$?
     o_err="$(cat "$O_ERR")"
   else
     # Two input files, deliberately: `file_index` is a leaf in this alphabet
