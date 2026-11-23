@@ -3,7 +3,8 @@
 //! (`/opt/homebrew/bin/jq`), and `strftime("%s")` of it prints `-1`. What macOS's `timegm` refuses
 //! beyond that (a minute, hour or day carry that overflows `int`) is its C library's, recorded in
 //! `docs/compliance/jq/limitations.md` and pinned here at `succinctly jq`'s own answer, the instant
-//! by 64-bit arithmetic; glibc was not captured.
+//! by 64-bit arithmetic, which is also what jq 1.7.1 on Linux (glibc 2.35) answers for those
+//! carries (jq 1.8.2 on Linux was not captured).
 
 use std::process::Command;
 

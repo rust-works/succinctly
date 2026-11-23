@@ -15879,8 +15879,12 @@ Two upstream pull requests to accept both instants ([jqlang/jq#3708](https://git
 jq 1.7.1 reads those years differently (#7532) and answers `67767976233532800` and `mktime requires parsed datetime inputs`.
 What macOS's `timegm` (tzcode's `time2sub`) refuses beyond that is the C library's, not jq's, and is not matched: it carries minutes into hours and hours into days in C `int` and fails when a carry overflows, so `[1970,0,1,2147483647,2147483647,0,0,0] | mktime`, `[1970,0,1,2147483647,60,0,0,0] | mktime` and `[1970,0,2147483647,24,0,0,0,0] | mktime` are `invalid gmtime representation` in both macOS releases, where `succinctly jq` answers `7859790148020`, `7730941132800` and `185542587100800` (the instant, by 64-bit arithmetic), and `strftime`/`todate` normalise those fields where the macOS jq 1.8.2 formats them as given.
 It adds the seconds separately, so `[2147485547,11,31,23,59,60,0,0] | mktime` is `67768036191590400` in the macOS jq 1.8.2 (below the `:59` reading's `67768036191676800`), where the carry into the next year makes it `invalid gmtime representation` here.
-glibc's `timegm` does its arithmetic in a wider type and was not captured, so what a Linux jq answers for these rows is unverified.
-Pinned by `tests/jq_cli/i7722.rs` and `tests/jq_cli/i7723.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`) and jq 1.8.2 (`/opt/homebrew/bin/jq`) on macOS.
+jq 1.7.1 on Linux (glibc 2.35) answers `7859790148020`, `7730941132800` and `185542587100800` for those three carry rows, exactly `succinctly jq`'s answers: glibc's `timegm` does not fail on the carries, so the refusal is the Apple C library's only.
+Its `todate` formats the fields as given, as the macOS jq does (`[1970,0,1,2147483647,2147483647,0,0,0] | todate` is `"1970-01-01T2147483647:2147483647:00Z"`), where `succinctly jq` normalises them.
+`[1969,11,31,23,59,58,0,0] | mktime` and `[253402300800,100] | mktime` are `mktime not supported on this platform` and `mktime requires parsed datetime inputs` there, as in the macOS jq 1.7.1.
+For the saturated year it answers `67767976265155200` for `[2147485547,12,1,0,0,0,0,0] | mktime` and for both the `:59` and the `:60` reading of `[2147485547,11,31,23,59,60,0,0] | mktime` (the macOS jq 1.7.1 answers `67767976233532800` for all three), which is jq 1.7.1's own reading of those years (#7532) and says nothing about the 1.8.2 rows.
+jq 1.8.2 on Linux was not captured, so what it answers for the saturated-year rows, the `:60` reading among them, remains uncaptured.
+Pinned by `tests/jq_cli/i7722.rs` and `tests/jq_cli/i7723.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`) and jq 1.8.2 (`/opt/homebrew/bin/jq`) on macOS; the Linux answers above were captured from jq 1.7.1 on Linux (glibc 2.35).
 
 ## No program with a terminal on both standard input and output is jq's usage error (#7462)
 
