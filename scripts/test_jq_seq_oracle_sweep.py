@@ -60,6 +60,31 @@ class UnwrittenTokenbufTests(unittest.TestCase):
         ):
             self.assertTrue(sweep.reads_unwritten_tokenbuf(data), data)
 
+    def test_a_quote_that_ends_a_failing_token_opens_no_string_7806(self):
+        # `iu` fails at the `"` that ends it; jq resets the parser there, so the `"` opens no string
+        # and the `n` after it is a bare token, read against the `u` `iu` left (1.7.1 says
+        # "Invalid literal", 1.8.2 and succinctly "Invalid numeric literal").
+        for data in (b'\x1eiu"n\n', b'\x1eiu"n,', b'\x1eiu"n"', b'\x1e1 iu"n\n', b'\x1enul"n\n', b'\x1euu"n\n'):
+            self.assertTrue(sweep.reads_unwritten_tokenbuf(data), data)
+            self.assertTrue(sweep.artifact(data), data)
+
+    def test_a_quote_that_ends_a_valid_word_still_opens_a_string_7806(self):
+        # The word is a literal or a number, so nothing fails: the `"` opens a string whose text
+        # (`n` and the newline) holds no token, and no bare `n` is read.
+        for data in (b'\x1etrue"n\n', b'\x1enull"n\n', b'\x1e12"n\n', b'\x1e-1.5e3"n\n', b'\x1enan"n\n', b'\x1e1"n\n'):
+            self.assertFalse(sweep.reads_unwritten_tokenbuf(data), data)
+
+    def test_a_failing_token_that_wrote_a_byte_other_than_u_is_still_checked_7806(self):
+        # `ix`, `tru` and `1.2.3` leave `x`, `r` and `.` at index 1: the `n` is checked, not skipped.
+        for data in (b'\x1eix"n\n', b'\x1etru"n\n', b'\x1e1.2.3"n\n'):
+            self.assertFalse(sweep.reads_unwritten_tokenbuf(data), data)
+
+    def test_valid_words(self):
+        for word in (b"true", b"false", b"null", b"nan", b"0", b"12", b"-1", b"+1", b".5", b"1.", b"1e5", b"1E-5", b"infinity", b"-Infinity", b"NaN"):
+            self.assertTrue(sweep._valid_word(word), word)
+        for word in (b"iu", b"n", b"t", b"tru", b"nul", b"x", b"-", b"1e", b"1.2.3", b"0x1", b"."):
+            self.assertFalse(sweep._valid_word(word), word)
+
     def test_only_the_first_bare_n_is_exposed(self):
         # The first reads the heap; it leaves its own NUL at index 1 for the second.
         self.assertTrue(sweep.reads_unwritten_tokenbuf(b"\x1en n\n"))
