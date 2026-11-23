@@ -110158,6 +110158,9 @@ mod remaining_inputs {
         // What the reads since the seed took from the stream, for where jq's reader leaves a
         // standard input it did not read to the end (#7455): see `reads`.
         static READS: Cell<Reads> = const { Cell::new(Reads::NONE) };
+        // The message of the fault every read after the first parse error repeats, when the CLI
+        // armed it (#7863): see `repeat_fault_at_end`.
+        static REPEAT_MESSAGE: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
     /// What the reads of the queue took from the stream since it was seeded (#7455).
@@ -110284,6 +110287,7 @@ mod remaining_inputs {
         COUNT_PAST_END.with(|c| c.set(false));
         HOLD_END.with(|h| h.set(false));
         ON_READ.with(|slot| *slot.borrow_mut() = None);
+        REPEAT_MESSAGE.with(|m| *m.borrow_mut() = None);
         clear_reads();
     }
 
@@ -110305,6 +110309,7 @@ mod remaining_inputs {
         COUNT_PAST_END.with(|c| c.set(false));
         HOLD_END.with(|h| h.set(false));
         ON_READ.with(|slot| *slot.borrow_mut() = None);
+        REPEAT_MESSAGE.with(|m| *m.borrow_mut() = None);
         clear_reads();
     }
 
@@ -110317,6 +110322,32 @@ mod remaining_inputs {
     pub fn hold_reads_past_end() {
         COUNT_PAST_END.with(|c| c.set(true));
         HOLD_END.with(|h| h.set(true));
+    }
+
+    /// Has every read after the stream's first parse error hand out that fault again (#7863).
+    ///
+    /// Worded `message`, at the marker the first one named: jq's parser stays in the state it
+    /// faulted in (`Malformed BOM`, `bom_strip_position` 0xff), so each later read fails again and
+    /// never reaches the end of the stream. A seed resets it.
+    pub fn repeat_fault_at_end(message: &str) {
+        REPEAT_MESSAGE.with(|m| *m.borrow_mut() = Some(message.to_owned()));
+    }
+
+    /// Called by the read that hands out a parse error, at `at`: when [`repeat_fault_at_end`] armed
+    /// it, the documents and errors still queued are dropped and the producer is replaced by one
+    /// that raises the armed message at `at` on every read. Only a fault pays for it.
+    fn note_fault(at: (u32, u64)) {
+        let Some(message) = REPEAT_MESSAGE.with(|m| m.borrow_mut().take()) else {
+            return;
+        };
+        QUEUE.with(|q| q.borrow_mut().clear());
+        QUEUE_HIGHS.with(|h| *h.borrow_mut() = LineHighs::new());
+        ERRORS.with(|e| e.borrow_mut().clear());
+        PRODUCER.with(|p| {
+            *p.borrow_mut() = Some(Box::new(move || {
+                Produced::Error(EvalError::new(message.clone()), at)
+            }));
+        });
     }
 
     /// Whether a CLI driver has seeded the queue on this thread.
@@ -110379,6 +110410,7 @@ mod remaining_inputs {
             // input catch 0)` on `1\n2 }\n\n\n`.
             LAST_LINE.with(|l| l.set(at.1));
             CURRENT.with(|c| c.set(Some(at)));
+            note_fault(at);
             reached(Some(at.0), true);
             return Pop::ParseError(error);
         }
@@ -110400,6 +110432,9 @@ mod remaining_inputs {
             PRODUCER.with(|p| *p.borrow_mut() = Some(producer));
             LAST_LINE.with(|l| l.set(line));
             CURRENT.with(|c| c.set(Some((src, line))));
+            if matches!(pop, Pop::ParseError(_)) {
+                note_fault((src, line));
+            }
             reached(Some(src), matches!(pop, Pop::ParseError(_)));
             return pop;
         }
@@ -110420,6 +110455,7 @@ mod remaining_inputs {
             // input catch 0)` on `1\n2 }\n\n\n`.
             LAST_LINE.with(|l| l.set(at.1));
             CURRENT.with(|c| c.set(Some(at)));
+            note_fault(at);
             reached(Some(at.0), true);
             return Pop::ParseError(error);
         }
@@ -110809,6 +110845,16 @@ pub type InputProducer = Box<dyn FnMut() -> ProducedInput>;
 #[cfg(feature = "std")]
 pub fn seed_remaining_inputs_from(producer: InputProducer) {
     remaining_inputs::seed_producer(producer);
+}
+
+/// Has every read after the input stream's first parse error raise that fault again (#7863).
+///
+/// Each read raises `message` at the `(at ...)` marker the first one named, and the documents and
+/// errors queued behind the first are dropped. For a stream jq's parser faulted in before it read a
+/// token (`Malformed BOM`) and stays in that state; a seed resets it, so it is armed after the seed.
+#[cfg(feature = "std")]
+pub fn repeat_input_fault_at_end(message: &str) {
+    remaining_inputs::repeat_fault_at_end(message);
 }
 
 /// Counts the reads past the end of the input just seeded, as jq does (#4303).
@@ -135178,6 +135224,33 @@ mod tests {
             assert_eq!(remaining_inputs::last_line(), Some(0));
         }
         assert_eq!(pulls.get(), 4);
+    }
+
+    /// #7863: armed with a message, the queue hands the first parse error out as it is and every
+    /// read after it as that message at the same marker, ahead of any document queued behind the
+    /// error and past the end of the stream; a seed disarms it.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_repeated_fault_follows_the_first_parse_error_and_hides_what_is_queued_7863() {
+        seed_remaining_inputs_with_errors(
+            vec![(OwnedValue::Int(1), 0, 2)],
+            Some((0, 3)),
+            vec![(0, EvalError::new("first"), (0, 1))],
+        );
+        repeat_input_fault_at_end("again");
+        assert!(matches!(pop_input(), InputPop::ParseError(e) if e.message == "first"));
+        for _ in 0..3 {
+            assert!(matches!(pop_input(), InputPop::ParseError(e) if e.message == "again"));
+            assert_eq!(current_input_location(), Some((0, 1)));
+            assert_eq!(remaining_inputs::last_line(), Some(1));
+        }
+        // A seed forgets it, and a stream with no parse error never repeats anything.
+        seed_remaining_inputs(vec![(OwnedValue::Int(7), 0, 1)], Some((0, 1)));
+        repeat_input_fault_at_end("again");
+        assert_eq!(pop_remaining_input(), Some(OwnedValue::Int(7)));
+        assert!(matches!(pop_input(), InputPop::Exhausted));
+        seed_remaining_inputs(Vec::new(), None);
+        assert!(matches!(pop_input(), InputPop::Exhausted));
     }
 
     /// #7472: jq counts input lines in a `size_t`, so `input_line_number` and the marker go on
