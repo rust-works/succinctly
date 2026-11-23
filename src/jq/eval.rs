@@ -34468,7 +34468,7 @@ fn translate_posix_brackets(
     // meets, which is otherwise the one reported.
     if extended || inline_extended(pattern) {
         let bare = strip_extended_blanks(pattern, extended);
-        if let Err(refusal) = translate_posix_brackets_scan(&bare, false, ignore_case) {
+        if let Err(refusal) = translate_posix_brackets_scan_as(&bare, false, ignore_case, true) {
             if refusal.to_string().contains("target of repeat operator") {
                 return Err(refusal);
             }
@@ -34570,6 +34570,26 @@ fn strip_extended(pattern: &str, extended: bool, runs: ExtendedRuns) -> String {
             }
             if let Some(&next) = chars.get(i + 1) {
                 out.push(next);
+                // #7887: `\c ` and `\c#` name a control character, so the blank or the `#` is
+                // the escape's and no text the mode ignores.
+                if next == 'c' {
+                    if let Some(&named) = chars.get(i + 2).filter(|&&named| named != '\\') {
+                        out.push(named);
+                        class_start = false;
+                        i += 3;
+                        continue;
+                    }
+                }
+                // #7888: the name of `\k<..>` or `\g<..>` is read as it is written, blanks and
+                // all (`\k< n>` is `invalid char in group name`).
+                if matches!(next, 'k' | 'g') && class_depth == 0 {
+                    if let Some(end) = name_end(&chars, i + 2) {
+                        out.extend(&chars[i + 2..end]);
+                        class_start = false;
+                        i = end;
+                        continue;
+                    }
+                }
                 // `\1 0` is the reference `\1` and a `0`: a blank is kept so that the digits do not
                 // run into one number.
                 if next.is_ascii_digit() && class_depth == 0 {
@@ -34586,9 +34606,16 @@ fn strip_extended(pattern: &str, extended: bool, runs: ExtendedRuns) -> String {
         }
         if class_depth > 0 {
             match c {
+                // #7888: jq's classes do not nest. A POSIX bracket is copied whole, and any other
+                // `[` is a member, so the first `]` after it closes the class.
                 '[' => {
-                    class_depth += 1;
-                    class_start = true;
+                    if let Some((name_end, _, _)) = posix_bracket_at(&chars, i) {
+                        out.extend(&chars[i..name_end]);
+                        class_start = false;
+                        i = name_end;
+                        continue;
+                    }
+                    class_start = false;
                 }
                 ']' if !class_start => class_depth -= 1,
                 '^' if class_start => {}
@@ -34620,6 +34647,29 @@ fn strip_extended(pattern: &str, extended: bool, runs: ExtendedRuns) -> String {
             continue;
         }
         let mode = on.last().copied().unwrap_or(extended);
+        // #7888: so is the name of a group, `(?<..>` or `(?'..'` (`(?< n>` is refused for its blank).
+        if c == '('
+            && chars.get(i + 1) == Some(&'?')
+            && !matches!(chars.get(i + 3), Some('=' | '!'))
+        {
+            if let Some(end) = name_end(&chars, i + 2) {
+                on.push(mode);
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+        }
+        // #7888: a blank right after `(?` is the group's option character and no text the mode
+        // ignores (`(? a)` is `undefined group option`).
+        if c == '('
+            && chars.get(i + 1) == Some(&'?')
+            && chars.get(i + 2).is_some_and(|b| b.is_whitespace())
+        {
+            on.push(mode);
+            out.extend(&chars[i..i + 3]);
+            i += 3;
+            continue;
+        }
         if c == '(' {
             let letters = if chars.get(i + 1) == Some(&'?') {
                 chars[i + 2..]
@@ -35598,6 +35648,19 @@ fn translate_posix_brackets_scan(
     extended: bool,
     ignore_case: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
+    translate_posix_brackets_scan_as(pattern, extended, ignore_case, false)
+}
+
+/// [`translate_posix_brackets_scan`]; `stripped` says that `pattern` is the text
+/// [`strip_extended_blanks`] wrote, which has no extended mode left whatever it spells: a group's
+/// name is copied as written, and may hold a `(?x` (#7888).
+#[cfg(feature = "regex")]
+fn translate_posix_brackets_scan_as(
+    pattern: &str,
+    extended: bool,
+    ignore_case: bool,
+    stripped: bool,
+) -> Result<std::borrow::Cow<'_, str>, EvalError> {
     // A backslash, a `(` or a `{` may hold Oniguruma syntax this scan rewrites or refuses (#6070).
     if !pattern.contains(['[', '\\', '(', '{'])
         && !may_hold_assertion(pattern)
@@ -35641,7 +35704,7 @@ fn translate_posix_brackets_scan(
     // assertion there), so a pattern in that mode is not judged as written: `translate_posix_brackets`
     // runs the scan again over the pattern without the blanks and comments (#6215, #6249) and keeps
     // only its repeat-operator refusals, and so it does for a pattern with an inline `(?x)` (#7852).
-    let check_repetition = !extended && !inline_extended(pattern);
+    let check_repetition = stripped || (!extended && !inline_extended(pattern));
     // #6127: a repeated group whose body Oniguruma reads as an assertion, refused at its repeat
     // operator as the parse reads it, so that an error before it is the one reported and an error
     // after it is not (#7852).
@@ -35670,10 +35733,13 @@ fn translate_posix_brackets_scan(
     });
     let mut i = 0;
     while i < chars.len() {
-        if invalid_repeat.is_some_and(|at| i >= at) {
-            return Err(EvalError::new(
-                "Regex failure: target of repeat operator is invalid",
-            ));
+        if let Some(at) = invalid_repeat.filter(|&at| i >= at) {
+            // #7888: the interval is refused as it is read, before its target is looked at.
+            return Err(EvalError::new(if inverted_interval(&chars, at) {
+                INVERTED_INTERVAL
+            } else {
+                "Regex failure: target of repeat operator is invalid"
+            }));
         }
         let c = chars[i];
         let was_assertion = std::mem::take(&mut prev_assertion);
@@ -35779,6 +35845,77 @@ fn translate_posix_brackets_scan(
                 )? {
                     late_refusal.get_or_insert(late);
                 }
+                // #7888: a reference at a recursion level (`\k<1+0>`, `\k<n-1>`), which neither
+                // engine reads. A pattern with no call is only ever at level 0, so the reference
+                // is the plain one there and matches nothing at any other level. With a call the
+                // level counts, and the pattern is left as it was.
+                if let Some(end) = name_end(&chars, i + 2) {
+                    let name: String = chars[i + 3..end - 1].iter().collect();
+                    let target = leveled_reference(&name).filter(|(target, _)| {
+                        let digits = target.strip_prefix(['-', '+']).unwrap_or(target);
+                        (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                            || names_opened.iter().any(|known| known == target)
+                    });
+                    if let Some((target, level_zero)) = target {
+                        if !pattern.contains("\\g<") && !pattern.contains("\\g'") {
+                            if level_zero {
+                                out.push_str("\\k<");
+                                out.push_str(target);
+                                out.push('>');
+                            } else {
+                                out.push_str(NEVER_MATCHES);
+                            }
+                            changed = true;
+                            at_start = false;
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+            }
+            // #7888: the name of a call runs to its `>` or `'`, pattern syntax and all, so nothing
+            // in it is a group, a class, a reference or a count (`\g<n\k<n>` calls a group named
+            // `n\k<n`, and `\g<a{2,1}>` one named `a{2,1}`); a `)` before then ends it early.
+            // Not after `\c`, which takes the escape for the character it names (`\c\g<n>`).
+            let after_control = i >= 2
+                && chars[i - 1] == 'c'
+                && chars[..i - 1]
+                    .iter()
+                    .rev()
+                    .take_while(|&&c| c == '\\')
+                    .count()
+                    % 2
+                    == 1;
+            if depth == 0 && !after_control && chars.get(i + 1) == Some(&'g') {
+                if let Some(end) = name_end(&chars, i + 2) {
+                    let name = &chars[i + 3..end - 1];
+                    match name.iter().position(|&c| c == ')') {
+                        Some(0) => {}
+                        Some(stop) => {
+                            let name: String = name[..stop].iter().collect();
+                            return Err(EvalError::new(format!(
+                                "Regex failure: invalid group name <{name}>"
+                            )));
+                        }
+                        None => {
+                            out.extend(&chars[i..end]);
+                            at_start = false;
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+            }
+            // #7888: a property whose braces never close, or hold a `)` or a `{` first, is
+            // refused where it stands, in these words (`\p{a)b`, `\p{a{2,1}`).
+            if depth == 0
+                && matches!(chars.get(i + 1), Some('p' | 'P'))
+                && chars.get(i + 2) == Some(&'{')
+                && chars[i + 3..].iter().find(|c| matches!(c, '}' | ')' | '{')) != Some(&'}')
+            {
+                return Err(EvalError::new(
+                    "Regex failure: end pattern with unmatched parenthesis",
+                ));
             }
             // #6070: the escapes Oniguruma reads that the `regex` crate refuses or reads another way.
             // #7689: a backreference to a group the pattern does not have is refused once the
@@ -36004,6 +36141,21 @@ fn translate_posix_brackets_scan(
             continue;
         }
         if depth == 0 {
+            // #7888: Oniguruma refuses an interval whose upper bound is below its lower one as it
+            // reads the token, whatever it follows and before anything later in the pattern
+            // (`a{2,1}\k<m>`, `\A{2,1}`, `{2,1}`). The crate words it too, but only once this scan
+            // has met no error of its own, wherever that one stands.
+            if c == '{' && inverted_interval(&chars, i) {
+                return Err(EvalError::new(INVERTED_INTERVAL));
+            }
+            // A conditional whose condition is neither a number nor a name is a pattern, and one
+            // that starts with `?` starts with a repeat of nothing (`(?(?i)a)`, `(?(?=a)b)`): an
+            // error that comes before an interval after it.
+            if c == '(' && chars.get(i + 1..i + 4) == Some(&['?', '(', '?']) {
+                return Err(EvalError::new(
+                    "Regex failure: target of repeat operator is not specified",
+                ));
+            }
             // #5535: a repetition operator right after an assertion is an error in jq
             // (`^*`, `$+`, `\b?`, `\A{2}`); the `regex` crate repeats the empty match.
             if check_repetition && was_assertion && starts_repetition(&chars[i..]) {
@@ -36586,6 +36738,53 @@ fn is_plain_letter_escape(letter: char, after: Option<char>) -> bool {
 fn opens_interval(chars: &[char], at: usize) -> bool {
     chars.get(at + 1).is_some_and(char::is_ascii_digit)
         && interval_quantifier_at(chars, at).is_some()
+}
+
+/// The index after the name that opens at `chars[at]` with `<` or `'` and runs to the next `>` or
+/// `'`: a group's (`(?<n>`, `(?'n'`) or a reference's (`\k<n>`, `\g'n'`). `None` when `chars[at]`
+/// opens none, or it never closes.
+#[cfg(feature = "regex")]
+fn name_end(chars: &[char], at: usize) -> Option<usize> {
+    let close = match chars.get(at) {
+        Some('<') => '>',
+        Some('\'') => '\'',
+        _ => return None,
+    };
+    let len = chars[at + 1..].iter().position(|&c| c == close)?;
+    Some(at + len + 2)
+}
+
+/// A reference's name that ends in a recursion level (`1+0`, `n-2`): the group it names, and
+/// whether the level is `0`, the one a pattern with no call is ever at (#7888).
+#[cfg(feature = "regex")]
+fn leveled_reference(name: &str) -> Option<(&str, bool)> {
+    let sign = name.rfind(['+', '-']).filter(|&sign| sign > 0)?;
+    let level = &name[sign + 1..];
+    (!level.is_empty() && level.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| (&name[..sign], level.bytes().all(|b| b == b'0')))
+}
+
+/// jq's refusal of an interval whose upper bound is below its lower one (`a{2,1}`).
+#[cfg(feature = "regex")]
+const INVERTED_INTERVAL: &str = "Regex failure: upper is smaller than lower in repeat range";
+
+/// Whether the `{` at `chars[at]` opens an interval `{n,m}` with `m` below `n` (#7888). A count
+/// too long to read is no such interval here: jq refuses it for its size first.
+#[cfg(feature = "regex")]
+fn inverted_interval(chars: &[char], at: usize) -> bool {
+    if chars.get(at) != Some(&'{') || !opens_interval(chars, at) {
+        return false;
+    }
+    let mut bounds = chars[at + 1..]
+        .split(|&c| c == '}')
+        .next()
+        .unwrap_or_default()
+        .split(|&c| c == ',')
+        .map(|digits| digits.iter().collect::<String>().parse::<u32>());
+    matches!(
+        (bounds.next(), bounds.next()),
+        (Some(Ok(lower)), Some(Ok(upper))) if upper < lower
+    )
 }
 
 /// A class nothing is in: what a byte sequence that is no character compiles to. A class and not
@@ -37580,6 +37779,19 @@ fn backreference_refusal(
         return Err(refused("group name is empty".into()));
     }
     let backref = || refused("invalid backref number/name".into());
+    // #7888: a group number may carry a recursion level (`\k<1+0>`), and is read as without it.
+    let name = match leveled_reference(&name) {
+        Some((target, _))
+            if target
+                .strip_prefix(['-', '+'])
+                .unwrap_or(target)
+                .bytes()
+                .all(|b| b.is_ascii_digit()) =>
+        {
+            target.to_string()
+        }
+        _ => name,
+    };
     let numbered = name.strip_prefix(['-', '+']).unwrap_or(&name);
     if !numbered.is_empty() && numbered.bytes().all(|b| b.is_ascii_digit()) {
         let count: usize = numbered.parse().unwrap_or(usize::MAX);
@@ -37612,6 +37824,16 @@ fn backreference_refusal(
         _ => name.as_str(),
     };
     if base.is_empty() || !base.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        // #7888: a name with a character no name may hold is refused where it stands (`\k< n>`,
+        // `\k<a.b>`); one with a sign or a `)` in it, or a digit first, has other words.
+        if !name.contains([')', '-', '+'])
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name
+                .chars()
+                .any(|c| c.is_ascii() && !c.is_ascii_alphanumeric() && c != '_')
+        {
+            return Err(refused(format!("invalid char in group name <{name}>")));
+        }
         return Ok(None);
     }
     if base.starts_with(|c: char| c.is_ascii_digit()) {
@@ -37936,6 +38158,14 @@ fn first_invalid_repeat(chars: &[char]) -> Option<usize> {
                     self.at += 2;
                     match next {
                         Some('b' | 'B' | 'A' | 'z' | 'Z' | 'G' | 'K') => Ok(Some(true)),
+                        // #7887: `\c$` is a control character, the `$` its name and no anchor
+                        // (nor is the `(` of `\c(` a group).
+                        Some('c') => {
+                            if self.peek().is_some_and(|named| named != '\\') {
+                                self.at += 1;
+                            }
+                            Ok(Some(false))
+                        }
                         Some('p' | 'P' | 'x' | 'k' | 'g' | 'N' | 'o') => {
                             // `\p{L}`, `\x{41}`, `\k<n>`, `\g<n>`: a name may hold `)`.
                             let close = match self.peek() {
@@ -37987,9 +38217,10 @@ fn first_invalid_repeat(chars: &[char]) -> Option<usize> {
             self.at = skip_comments(self.chars, self.at);
         }
 
-        /// A character class, nested classes and escapes included.
+        /// A character class, escapes included. jq's classes do not nest (#7888): a `[` inside
+        /// one is a member, or opens a POSIX bracket (`[:alpha:]`), which is skipped whole.
         fn skip_class(&mut self) {
-            let mut depth = 0usize;
+            let open = self.at;
             let mut first = true;
             // Whether the negating `^` has been read, so that a second one is a member (#6193).
             let mut caret_taken = false;
@@ -37997,22 +38228,17 @@ fn first_invalid_repeat(chars: &[char]) -> Option<usize> {
                 self.at += 1;
                 match c {
                     '\\' => self.at += 1,
+                    '[' if self.at - 1 == open => continue,
                     '[' => {
-                        depth += 1;
-                        first = true;
-                        caret_taken = false;
-                        continue;
+                        if let Some((name_end, _, _)) = posix_bracket_at(self.chars, self.at - 1) {
+                            self.at = name_end;
+                        }
                     }
                     '^' if first && !caret_taken => {
                         caret_taken = true;
                         continue;
                     }
-                    ']' if !first => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return;
-                        }
-                    }
+                    ']' if !first => return,
                     _ => {}
                 }
                 first = false;
@@ -38043,6 +38269,12 @@ fn first_invalid_repeat(chars: &[char]) -> Option<usize> {
                 (3, Some(true))
             } else if starts("(?<=") || starts("(?<!") {
                 (4, Some(true))
+            } else if let Some(end) = starts("(?")
+                .then(|| name_end(self.chars, self.at + 2))
+                .flatten()
+            {
+                // #7888: a named group, whose name may hold anything (`(?<n*[>`).
+                (end - self.at, None)
             } else if starts("(?") {
                 // An option group, `(?i)` or `(?i:...)`, a named or atomic group, a conditional,
                 // an absent operator: an enclosure, whose own body is still checked inside.
@@ -39405,7 +39637,11 @@ fn rewrite_onig_constructs(
                 i = end;
                 continue;
             }
-            let end = (i + 2).min(chars.len());
+            // #7888: the name of a reference or a call is no pattern text.
+            let named = (class_depth == 0 && matches!(chars.get(i + 1), Some('k' | 'g')))
+                .then(|| name_end(&chars, i + 2))
+                .flatten();
+            let end = named.unwrap_or(i + 2).min(chars.len());
             out.extend(&chars[i..end]);
             class_start = false;
             i = end;
@@ -39413,9 +39649,15 @@ fn rewrite_onig_constructs(
         }
         if class_depth > 0 {
             match c {
+                // #7888: jq's classes do not nest: a `[` is a member, or opens a POSIX bracket.
                 '[' => {
-                    class_depth += 1;
-                    class_start = true;
+                    if let Some((name_end, _, _)) = posix_bracket_at(&chars, i) {
+                        out.extend(&chars[i..name_end]);
+                        class_start = false;
+                        i = name_end;
+                        continue;
+                    }
+                    class_start = false;
                 }
                 ']' if !class_start => class_depth -= 1,
                 '^' if class_start => {}
@@ -39495,9 +39737,15 @@ fn build_regex_uncached<S: EvalSemantics>(
                 "never ending recursion",
             ];
             deferred_refusal = Some(match refusal(&pattern[..brace]) {
+                // #7888: nor does it meet, before the count, a refusal of a pass later than the
+                // parse (a call by a name no group has, a reference to a group past the last).
+                // Such a one gives way to an error of the parse written after it; one the parse
+                // makes where it stands does not.
                 Some(earlier)
                     if refusal(&small).as_ref() == Some(&earlier)
-                        && !LATE.iter().any(|late| earlier.contains(late)) =>
+                        && !LATE.iter().any(|late| earlier.contains(late))
+                        && refusal(&format!("{}\n{{2,1}}", &pattern[..brace])).as_ref()
+                            == Some(&earlier) =>
                 {
                     EvalError::new(earlier)
                 }
@@ -40209,6 +40457,21 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                     }
                     let end = start + 3 + name.len() + 1;
                     let rewritten = || format!("{}(?:){}", &pattern[..start], at(end));
+                    // #7888: a backreference's group number may carry a recursion level
+                    // (`\k<1+0>`), and is refused as without it.
+                    let name = match leveled_reference(name) {
+                        Some((target, _))
+                            if at(start).starts_with("\\k")
+                                && target
+                                    .strip_prefix(['-', '+'])
+                                    .unwrap_or(target)
+                                    .bytes()
+                                    .all(|b| b.is_ascii_digit()) =>
+                        {
+                            target
+                        }
+                        _ => name,
+                    };
                     let numbered = name.strip_prefix(['-', '+']).unwrap_or(name);
                     if !numbered.is_empty() && numbered.bytes().all(|b| b.is_ascii_digit()) {
                         let count: usize = numbered.parse().unwrap_or(usize::MAX);
@@ -40270,6 +40533,13 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                         _ => name,
                     };
                     if base.starts_with(|c: char| c.is_ascii_digit()) {
+                        // #7888: a call by such a name is no error of the parse. It names no group,
+                        // which `tune_call` says once the whole pattern is read, after the errors
+                        // of the passes before it (`\1\g<1 >` is `invalid backref number/name`).
+                        if at(start).starts_with("\\g") {
+                            let undefined = format!("undefined name <{name}> reference");
+                            return earlier(rewritten(), OnigPass::Calls).or(Some(undefined));
+                        }
                         return Some(format!("invalid group name <{base}>"));
                     }
                     let names = group_facts_of(&pattern.chars().collect::<Vec<_>>()).names;
@@ -40353,7 +40623,22 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                 let escape = pattern.get(span.start.offset..span.end.offset)?;
                 // jq names the property without the `^` that negates it (`\p{^Foo}`).
                 let name = escape.get(2..)?.replacen("{^", "{", 1);
-                Some(format!("invalid character property name {name}"))
+                let refused = format!("invalid character property name {name}");
+                // #7888: the crate does not read the `^`, so a property jq has is not found for it
+                // in a pattern that came here for another reason (`\g<n>\p{^N}`): read on with
+                // the negation written as the other letter.
+                if escape.get(2..4) == Some("{^") {
+                    let letter = if escape.starts_with("\\p") { 'P' } else { 'p' };
+                    let flipped = format!("\\{letter}{name}");
+                    if crate::jq::onig_hir_parser().parse(&flipped).is_ok() {
+                        return retry(format!(
+                            "{}{flipped}{}",
+                            &pattern[..span.start.offset],
+                            &pattern[span.end.offset..]
+                        ));
+                    }
+                }
+                Some(refused)
             }
             _ => None,
         },
@@ -164381,12 +164666,18 @@ mod tests {
             (r"\P{Lu}+", r"(?-i:\P{Lu})+"),
             (r"\pL", "pL"),
             (r"[\pL]", "[pL]"),
-            // An unclosed brace is copied through, so the crate's error quotes the pattern as written.
-            (r"\p{Lu", r"\p{Lu"),
         ] {
             let got = translate_posix_brackets(pattern, false, false).unwrap();
             assert_eq!(got, want, "{pattern}");
         }
+        // An unclosed `\p{` is jq's error where it stands since #7888 (it was copied through, and
+        // refused in the same words once the pattern had been read).
+        assert_eq!(
+            translate_posix_brackets(r"\p{Lu", false, false)
+                .unwrap_err()
+                .message,
+            "Regex failure: end pattern with unmatched parenthesis"
+        );
         // An unclosed `\x{` is jq's own error since #6251, not the crate's.
         assert_eq!(
             translate_posix_brackets(r"\x{e9", false, false)
