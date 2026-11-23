@@ -1,8 +1,10 @@
 //! #6005: `-n -s --stream` reads on the first `input`, as jq does, so a fault in the stream is an
 //! input of its own and not the result of the whole run. A fault in the middle of the stream is
 //! raised by the first `input` and the array of the events before it (and after it, since jq goes on
-//! with the next line) comes with the next one; a fault at the end of the stream comes after the
-//! array. A program that never asks for an input prints its result. Every expectation was captured
+//! with the next line) comes with the next one; a fault at the end of the stream came after the
+//! array in jq 1.7.1, and comes before it in jq 1.8.2, which `succinctly jq` follows since #7807
+//! (those rows say what 1.7.1 printed; the position the fault names is still 1.7.1's, #7607). A
+//! program that never asks for an input prints its result. Every other expectation was captured
 //! from jq 1.7.1 (`/usr/bin/jq`); the file names in stderr are shown as `<fN>`.
 
 use anyhow::Result;
@@ -30,14 +32,18 @@ fn a_fault_in_a_slurped_stream_is_raised_by_the_input_that_reaches_it_6005() -> 
         (&[b"1 2 }"], "input_filename", "null\n", "", 0),
         (&[b"1 2 }"], "(try input catch null), input", "null\n[[[],1],[[],2]]\n", "", 0),
         (&[b"1 2 }"], "[inputs]|length", "", "jq: error (at <f0>:0): Unmatched '}' at the top-level at line 1, column 5\n", 5),
-        (&[b"1 [2,"], "input", "[[[],1],[[0],2]]\n", "", 0),
+        // jq 1.7.1 (the array first, then the fault): `[[[],1],[[0],2]]`, exit 0.
+        (&[b"1 [2,"], "input", "", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 5\n", 5),
         (&[b"1 [2,"], "[inputs]", "", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 5\n", 5),
-        (&[b"1 [2,"], "try input catch \"E\"", "[[[],1],[[0],2]]\n", "", 0),
+        // jq 1.7.1 (the array first, then the fault): `[[[],1],[[0],2]]`.
+        (&[b"1 [2,"], "try input catch \"E\"", "\"E\"\n", "", 0),
         (&[b"1 [2,"], "input_line_number", "0\n", "", 0),
-        (&[b"1 [2,"], "[limit(4;repeat(try input catch .))]", "[[[[],1],[[0],2]],\"Unfinished JSON term at EOF at line 1, column 5\",\"break\",\"break\"]\n", "", 0),
+        // jq 1.7.1 (the array first, then the fault): `[[[[],1],[[0],2]],"Unfinished ...","break","break"]`.
+        (&[b"1 [2,"], "[limit(4;repeat(try input catch .))]", "[\"Unfinished JSON term at EOF at line 1, column 5\",[[[],1],[[0],2]],\"break\",\"break\"]\n", "", 0),
         (&[b"1 [2,"], "1", "1\n", "", 0),
         (&[b"1 [2,"], "input_filename", "null\n", "", 0),
-        (&[b"1 [2,"], "(try input catch null), input", "[[[],1],[[0],2]]\n", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 5\n", 5),
+        // jq 1.7.1 (the array first, then the fault): `[[[],1],[[0],2]]`, then the error.
+        (&[b"1 [2,"], "(try input catch null), input", "null\n[[[],1],[[0],2]]\n", "", 0),
         (&[b"1 [2,"], "[inputs]|length", "", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 5\n", 5),
         (&[b"1 2 3 }\n4"], "input", "", "jq: error (at <f0>:1): Unmatched '}' at the top-level at line 1, column 7\n", 5),
         (&[b"1 2 3 }\n4"], "[inputs]", "", "jq: error (at <f0>:1): Unmatched '}' at the top-level at line 1, column 7\n", 5),
@@ -84,14 +90,18 @@ fn a_fault_in_a_slurped_stream_is_raised_by_the_input_that_reaches_it_6005() -> 
         (&[b"1 2", b"3 }"], "input_filename", "null\n", "", 0),
         (&[b"1 2", b"3 }"], "(try input catch null), input", "null\n[[[],1],[[],23]]\n", "", 0),
         (&[b"1 2", b"3 }"], "[inputs]|length", "", "jq: error (at <f1>:0): Unmatched '}' at the top-level at line 1, column 6\n", 5),
-        (&[b"1 2", b"[3,"], "input", "[[[],1],[[],2],[[0],3]]\n", "", 0),
+        // jq 1.7.1 (the array first, then the fault): `[[[],1],[[],2],[[0],3]]`, exit 0.
+        (&[b"1 2", b"[3,"], "input", "", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 6\n", 5),
         (&[b"1 2", b"[3,"], "[inputs]", "", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 6\n", 5),
-        (&[b"1 2", b"[3,"], "try input catch \"E\"", "[[[],1],[[],2],[[0],3]]\n", "", 0),
+        // jq 1.7.1 (the array first, then the fault): `[[[],1],[[],2],[[0],3]]`.
+        (&[b"1 2", b"[3,"], "try input catch \"E\"", "\"E\"\n", "", 0),
         (&[b"1 2", b"[3,"], "input_line_number", "0\n", "", 0),
-        (&[b"1 2", b"[3,"], "[limit(4;repeat(try input catch .))]", "[[[[],1],[[],2],[[0],3]],\"Unfinished JSON term at EOF at line 1, column 6\",\"break\",\"break\"]\n", "", 0),
+        // jq 1.7.1 (the array first, then the fault): `[[[[],1],[[],2],[[0],3]],"Unfinished ...","break","break"]`.
+        (&[b"1 2", b"[3,"], "[limit(4;repeat(try input catch .))]", "[\"Unfinished JSON term at EOF at line 1, column 6\",[[[],1],[[],2],[[0],3]],\"break\",\"break\"]\n", "", 0),
         (&[b"1 2", b"[3,"], "1", "1\n", "", 0),
         (&[b"1 2", b"[3,"], "input_filename", "null\n", "", 0),
-        (&[b"1 2", b"[3,"], "(try input catch null), input", "[[[],1],[[],2],[[0],3]]\n", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 6\n", 5),
+        // jq 1.7.1 (the array first, then the fault): `[[[],1],[[],2],[[0],3]]`, then the error.
+        (&[b"1 2", b"[3,"], "(try input catch null), input", "null\n[[[],1],[[],2],[[0],3]]\n", "", 0),
         (&[b"1 2", b"[3,"], "[inputs]|length", "", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 6\n", 5),
         (&[b"[1,2] [3"], "input", "", "jq: error (at <f0>:0): Unfinished JSON term at EOF at line 1, column 8\n", 5),
         (&[b"[1,2] [3"], "[inputs]", "", "jq: error (at <f0>:0): Unfinished JSON term at EOF at line 1, column 8\n", 5),

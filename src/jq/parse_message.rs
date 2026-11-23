@@ -380,36 +380,114 @@ fn check_string(token: &[u8]) -> Result<(), Stop> {
             }
             continue;
         }
-        let Some(&escape) = token.get(at) else {
-            return Err(Stop::Fault("Expected escape character at end of string"));
-            // patchcov: coverage tolerate-line reason="unreachable: a backslash puts the scanner in its escape state, which cannot close the string, so a finished token never ends on one (jq keeps the check as a guard)"
-        };
-        at += 1;
-        match escape {
-            b'\\' | b'"' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
-            b'u' => {
-                if at + 4 > token.len() {
-                    return Err(Stop::Fault("Invalid \\uXXXX escape"));
-                }
-                let Some(code) = hex4(&token[at..]) else {
-                    return Err(Stop::Fault("Invalid characters in \\uXXXX escape"));
-                };
-                at += 4;
-                if (0xD800..=0xDBFF).contains(&code) {
-                    const PAIR: Stop = Stop::Fault("Invalid \\uXXXX\\uXXXX surrogate pair escape");
-                    if at + 6 > token.len() || token[at] != b'\\' || token[at + 1] != b'u' {
-                        return Err(PAIR);
-                    }
-                    match hex4(&token[at + 2..]) {
-                        Some(low) if (0xDC00..=0xDFFF).contains(&low) => at += 6,
-                        _ => return Err(PAIR),
-                    }
-                }
-            }
-            _ => return Err(Stop::Fault("Invalid escape")),
-        }
+        at = check_escape(token, at)?;
     }
     Ok(())
+}
+
+/// [`check_string`]'s check of the escape whose backslash is just before `token[at]`: where the
+/// escape ends, or jq's fault. The one definition of which escapes jq's parser accepts, for the
+/// parser and for [`jq_refused_escape_offset`] (#7758).
+fn check_escape(token: &[u8], mut at: usize) -> Result<usize, Stop> {
+    let Some(&escape) = token.get(at) else {
+        return Err(Stop::Fault("Expected escape character at end of string"));
+        // patchcov: coverage tolerate-line reason="unreachable: a backslash puts the scanner in its escape state, which cannot close the string, so a finished token never ends on one (jq keeps the check as a guard)"
+    };
+    at += 1;
+    match escape {
+        b'\\' | b'"' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+        b'u' => {
+            if at + 4 > token.len() {
+                return Err(Stop::Fault("Invalid \\uXXXX escape"));
+            }
+            let Some(code) = hex4(&token[at..]) else {
+                return Err(Stop::Fault("Invalid characters in \\uXXXX escape"));
+            };
+            at += 4;
+            if (0xD800..=0xDBFF).contains(&code) {
+                const PAIR: Stop = Stop::Fault("Invalid \\uXXXX\\uXXXX surrogate pair escape");
+                if at + 6 > token.len() || token[at] != b'\\' || token[at + 1] != b'u' {
+                    return Err(PAIR);
+                }
+                match hex4(&token[at + 2..]) {
+                    Some(low) if (0xDC00..=0xDFFF).contains(&low) => at += 6,
+                    _ => return Err(PAIR),
+                }
+            }
+        }
+        _ => return Err(Stop::Fault("Invalid escape")),
+    }
+    Ok(at)
+}
+
+/// The byte of `text` at which the first escape jq's parser refuses starts (its backslash), or
+/// `None` when it refuses none (#7758): an unknown escape, a short or non-hex `\u`, and a high
+/// surrogate with no low one after it. A lone low surrogate is accepted, as jq reads it as U+FFFD.
+///
+/// For a route whose own check accepts a document jq refuses for an escape alone: serde's
+/// `IgnoredAny` reads a `\u` escape without looking at the code it names, and a key that does
+/// not decode falls back to its source span (#1642), so neither raises. The text is the documents
+/// of a stream as a whole; a backslash is only ever in a string there, and the escapes are read
+/// from each string's first one on, so an escaped backslash is never read as the start of one.
+/// Escapes at the very end of the text are left to the route's own handling of an unfinished
+/// string.
+///
+/// An escape jq accepts is passed over without the parser model: a one-character escape, and a
+/// `\u` of four hex digits that is not a high surrogate; only the rest ([`check_escape`])
+/// decide. The backslashes are found eight bytes at a time.
+#[doc(hidden)]
+pub fn jq_refused_escape_offset(text: &[u8]) -> Option<usize> {
+    if !crate::util::simd::escape::contains_byte(text, b'\\') {
+        return None;
+    }
+    let mut from = 0;
+    while let Some(found) = find_backslash(&text[from..]) {
+        let backslash = from + found;
+        let escape = *text.get(backslash + 1)?;
+        from = match escape {
+            b'\\' | b'"' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => backslash + 2,
+            b'u' if text.get(backslash + 2..backslash + 6).is_some_and(|hex| {
+                hex.iter().all(u8::is_ascii_hexdigit) && !is_high_surrogate(hex)
+            }) =>
+            {
+                backslash + 6
+            }
+            _ => match check_escape(text, backslash + 1) {
+                Ok(end) => end,
+                Err(_) => return Some(backslash),
+            },
+        };
+    }
+    None
+}
+
+/// Whether four hex digits name a high surrogate (U+D800..U+DBFF).
+fn is_high_surrogate(hex: &[u8]) -> bool {
+    matches!(hex[0], b'd' | b'D') && matches!(hex[1], b'8' | b'9' | b'a' | b'b' | b'A' | b'B')
+}
+
+/// The offset of the first backslash of `hay`, read a word of eight bytes at a time: a byte that is
+/// a backslash is a zero byte of the word XORed with backslashes, and the lowest byte the zero-byte
+/// test flags is always a true zero.
+fn find_backslash(hay: &[u8]) -> Option<usize> {
+    const ONES: u64 = u64::from_le_bytes([1; 8]);
+    const HIGHS: u64 = u64::from_le_bytes([0x80; 8]);
+    const BACKSLASHES: u64 = u64::from_le_bytes([b'\\'; 8]);
+    let mut at = 0;
+    while let Some(word) = hay.get(at..at + 8) {
+        let word = u64::from_le_bytes([
+            word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7],
+        ]) ^ BACKSLASHES;
+        let zeros = word.wrapping_sub(ONES) & !word & HIGHS;
+        if zeros != 0 {
+            return Some(at + (zeros.trailing_zeros() / 8) as usize);
+        }
+        at += 8;
+    }
+    hay[at..]
+        .iter()
+        .position(|&byte| byte == b'\\')
+        .map(|found| at + found)
 }
 
 impl Parser {
@@ -1723,6 +1801,119 @@ mod tests {
             message(&"[".repeat(256)).as_deref(),
             Some("Unfinished JSON term at EOF at line 1, column 256")
         );
+    }
+
+    /// #7758: the first escape jq's parser refuses, at its backslash, by the rules the parser itself
+    /// applies to a string ([`check_escape`]): every shape the hunt captured from jq 1.7.1 and 1.8.2.
+    #[test]
+    fn refused_escape_offset_is_where_the_parser_refuses_an_escape_7758() {
+        for (text, want) in [
+            (r#""\ud83d""#, Some(1)),
+            (r#""\uD83D""#, Some(1)),
+            (r#""\udc00""#, None),
+            (r#""\udc00\udc01""#, None),
+            (r#""\ud83d\ude00""#, None),
+            (r#""\uD83D\uDE00""#, None),
+            (r#""\ud83dx""#, Some(1)),
+            (r#""\uD83D\u0041""#, Some(1)),
+            (r#""\ud83d\n""#, Some(1)),
+            (r#""\udc00\ud83d""#, Some(7)),
+            (r#""\ud83d\ud83d\ude00""#, Some(1)),
+            (r#""ab\ud83d""#, Some(3)),
+            (r#"{"\ud800":1}"#, Some(2)),
+            (r#"[{"a":["\ud83d"]}]"#, Some(8)),
+            (r#"1 "ok" ["\x"]"#, Some(9)),
+            (r#"{"\u12":1}"#, Some(2)),
+            (r#""\u12zz""#, Some(1)),
+            // An escaped backslash is no start of an escape; one at the very end is left alone.
+            (r#""\\ud83d" "\\x""#, None),
+            (r#""a\"b\/\b\f\n\r\t""#, None),
+            ("\"\\", None),
+            ("[1, 2, \"no escapes\"]", None),
+        ] {
+            assert_eq!(jq_refused_escape_offset(text.as_bytes()), want, "{text}");
+            // The parser refuses the same texts, at the string the escape is in.
+            if want.is_some() {
+                let fault = jq_stream_fault_offset(text.as_bytes());
+                assert!(
+                    fault.is_some_and(|at| at >= want.unwrap()),
+                    "{text}: {fault:?}"
+                );
+            } else if !text.ends_with('\\') {
+                assert_eq!(jq_stream_fault([text], 1, 0), None, "{text}");
+            }
+        }
+    }
+
+    /// #7758: the escape search with its fast paths and word-at-a-time scan answers as the plain
+    /// walk it replaced (every backslash through [`check_escape`]) on texts dense with backslashes,
+    /// escaped backslashes before a `u`, surrogate halves in both cases at every position, and
+    /// escapes cut short at the end of the text.
+    #[test]
+    fn refused_escape_offset_agrees_with_the_walk_it_replaced_7758() {
+        fn walk(text: &[u8]) -> Option<usize> {
+            let mut from = 0;
+            while let Some(found) = text[from..].iter().position(|&byte| byte == b'\\') {
+                let backslash = from + found;
+                if backslash + 1 == text.len() {
+                    return None;
+                }
+                match check_escape(text, backslash + 1) {
+                    Ok(end) => from = end,
+                    Err(_) => return Some(backslash),
+                }
+            }
+            None
+        }
+        const PIECES: &[&[u8]] = &[
+            b"\\",
+            b"\\\\",
+            b"\\u",
+            b"\\ud83d",
+            b"\\uD83D",
+            b"\\ude00",
+            b"\\uDE00",
+            b"\\udbff",
+            b"\\udc00",
+            b"\\u0041",
+            b"\\u00e9",
+            b"\\ud8",
+            b"\\uzz12",
+            b"\\n",
+            b"\\\"",
+            b"\\/",
+            b"\\x",
+            b"u",
+            b"d83d",
+            b"\"",
+            b"a",
+            "\u{e9}".as_bytes(),
+            b" ",
+            b"0",
+        ];
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize % bound
+        };
+        let mut text = Vec::new();
+        for _ in 0..200_000 {
+            text.clear();
+            for _ in 0..next(24) {
+                text.extend_from_slice(PIECES[next(PIECES.len())]);
+            }
+            // Every cut of the text, so an escape is cut short at the end of the text and the
+            // word-at-a-time scan meets its last backslash at every offset in a word.
+            let cut = next(text.len() + 1);
+            assert_eq!(
+                jq_refused_escape_offset(&text[..cut]),
+                walk(&text[..cut]),
+                "{:?}",
+                String::from_utf8_lossy(&text[..cut])
+            );
+        }
     }
 
     fn depth_fault(text: &str, line: usize, column: usize) -> Option<String> {

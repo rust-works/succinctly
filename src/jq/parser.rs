@@ -172,6 +172,281 @@ fn is_program_whitespace(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n')
 }
 
+/// `?` for the part of an object entry jq's parser recovers from (#7716): an error breaks out of
+/// the block `$label` names with it, for [`Parser::recover_object_entry`], instead of returning.
+macro_rules! entry_try {
+    ($label:lifetime, $result:expr) => {
+        match $result {
+            Ok(value) => value,
+            Err(error) => break $label Err(error),
+        }
+    };
+}
+
+/// Where [`Parser::recover_object_entry`] resumes an object construction (#7716).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryRecovery {
+    /// At a `:`, whose value it has read: jq's `MkDictPair: error ':' ExpD`.
+    Pair,
+    /// Past a `,`, at the next entry: `MkDict: error ',' MkDict`.
+    NextEntry,
+    /// Past the `}`, with the object closed: `Term: '{' error '}'`.
+    Closed,
+}
+
+/// What one of jq's tokens is to the recovery from a malformed object entry (#7716).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryToken {
+    Colon,
+    Comma,
+    CloseBrace,
+    Other,
+}
+
+/// jq 1.7.1's lexer (`src/lexer.l`) over a program from a byte offset, for counting and placing
+/// tokens the way bison sees them (#7716): it skips `[ \n\t]+` and `#` comments, and reads a
+/// string as its own tokens (`"`, each run of text or of escapes, `"`), a number, an identifier
+/// (with its `::` parts), a `.name`, a `$name` or an `@format` as one token, the multi-character
+/// operators as one, and any other byte as one. `None` at the end of the text.
+///
+/// Like jq's lexer it keeps a stack of the brackets, strings and interpolations it is inside, which
+/// decides what a closer is: one that matches the innermost bracket closes it (an interpolation's
+/// `)` too), and any other is an invalid character, so a `}` is the object's only where it closes
+/// a `{`.
+#[derive(Clone)]
+struct JqTokens<'a> {
+    text: &'a [u8],
+    at: usize,
+    /// `(`, `[` or `{` for a bracket, `i` for an interpolation, `"` for a string's body.
+    states: Vec<u8>,
+}
+
+impl<'a> JqTokens<'a> {
+    /// The lexer at the start of `text`.
+    fn new(text: &'a str) -> Self {
+        Self {
+            text: text.as_bytes(),
+            at: 0,
+            states: Vec::new(),
+        }
+    }
+
+    /// Read on to the first token that starts at `at` or after it, and answer the fewest states
+    /// the stack held on the way. A token pushes or pops at most one state, so the one read past
+    /// `at` is undone by putting that one back.
+    fn advance_to(&mut self, at: usize) -> usize {
+        let mut fewest = self.states.len();
+        loop {
+            let (before, depth, top) = (self.at, self.states.len(), self.states.last().copied());
+            match self.next() {
+                Some((start, _, _)) if start < at => fewest = fewest.min(self.states.len()),
+                _ => {
+                    self.at = before;
+                    self.states.truncate(depth);
+                    if let (true, Some(top)) = (self.states.len() < depth, top) {
+                        self.states.push(top);
+                    }
+                    return fewest;
+                }
+            }
+        }
+    }
+
+    fn byte(&self, at: usize) -> Option<u8> {
+        self.text.get(at).copied()
+    }
+
+    /// The end of the identifier starting at `at`, or `at` when none does.
+    fn ident_end(&self, at: usize) -> usize {
+        if !self
+            .byte(at)
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        {
+            return at;
+        }
+        let mut end = at + 1;
+        while self
+            .byte(end)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            end += 1;
+        }
+        end
+    }
+
+    /// The end of a `(name::)*name` starting at `at`, or `at` when none does.
+    fn qualified_end(&self, at: usize) -> usize {
+        let mut end = self.ident_end(at);
+        while end > at && self.text[end..].starts_with(b"::") {
+            let next = self.ident_end(end + 2);
+            if next == end + 2 {
+                break;
+            }
+            end = next;
+        }
+        end
+    }
+
+    fn digits_end(&self, mut at: usize) -> usize {
+        while self.byte(at).is_some_and(|b| b.is_ascii_digit()) {
+            at += 1;
+        }
+        at
+    }
+
+    /// The token at `self.at` inside a string's body.
+    fn string_token(&mut self) -> Option<(usize, usize, RecoveryToken)> {
+        let start = self.at;
+        match self.byte(start)? {
+            b'"' => {
+                self.states.pop();
+                self.at = start + 1;
+            }
+            b'\\' if self.byte(start + 1) == Some(b'(') => {
+                self.states.push(b'i');
+                self.at = start + 2;
+            }
+            b'\\' => {
+                let mut end = start;
+                while self.byte(end) == Some(b'\\') {
+                    match self.byte(end + 1) {
+                        Some(b'(') | None => break,
+                        Some(b'u') => {
+                            end += 2;
+                            let mut hex = 0;
+                            while hex < 4
+                                && self.byte(end).is_some_and(|b| b.is_ascii_alphanumeric())
+                            {
+                                end += 1;
+                                hex += 1;
+                            }
+                        }
+                        Some(_) => end += 2,
+                    }
+                }
+                // A lone `\` at the end of the text is a character of its own.
+                self.at = end.max(start + 1);
+            }
+            _ => {
+                let mut end = start;
+                while self.byte(end).is_some_and(|b| b != b'\\' && b != b'"') {
+                    end += 1;
+                }
+                self.at = end;
+            }
+        }
+        Some((start, self.at, RecoveryToken::Other))
+    }
+}
+
+impl Iterator for JqTokens<'_> {
+    /// The token's start and end, and what it is.
+    type Item = (usize, usize, RecoveryToken);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.states.last() == Some(&b'"') {
+            return self.string_token();
+        }
+        loop {
+            match self.byte(self.at)? {
+                b' ' | b'\n' | b'\t' => self.at += 1,
+                b'#' => {
+                    while self.byte(self.at).is_some_and(|b| b != b'\n') {
+                        self.at += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let start = self.at;
+        let rest = &self.text[start..];
+        let first = rest[0];
+        let mut kind = RecoveryToken::Other;
+        let end = if ["?//", "//="]
+            .iter()
+            .any(|op| rest.starts_with(op.as_bytes()))
+        {
+            start + 3
+        } else if [
+            "!=", "==", "//", "|=", "+=", "-=", "*=", "/=", "%=", "<=", ">=", "..",
+        ]
+        .iter()
+        .any(|op| rest.starts_with(op.as_bytes()))
+        {
+            start + 2
+        } else if first == b'"' {
+            self.states.push(b'"');
+            start + 1
+        } else if first.is_ascii_digit()
+            || (first == b'.' && rest.get(1).is_some_and(u8::is_ascii_digit))
+        {
+            // `([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?`
+            let mut end = self.digits_end(start);
+            if self.byte(end) == Some(b'.') {
+                end = self.digits_end(end + 1);
+            }
+            if matches!(self.byte(end), Some(b'e' | b'E')) {
+                let sign = usize::from(matches!(self.byte(end + 1), Some(b'+' | b'-')));
+                let digits = self.digits_end(end + 1 + sign);
+                if digits > end + 1 + sign {
+                    end = digits;
+                }
+            }
+            end
+        } else if first == b'.' || first == b'$' {
+            // `.name` and `$name` (`$__loc__` too), else the byte alone.
+            let name = if first == b'.' {
+                self.ident_end(start + 1)
+            } else {
+                self.qualified_end(start + 1)
+            };
+            name.max(start + 1)
+        } else if first == b'@' {
+            let mut end = start + 1;
+            while self
+                .byte(end)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                end += 1;
+            }
+            end
+        } else if first.is_ascii_alphabetic() || first == b'_' {
+            self.qualified_end(start)
+        } else {
+            kind = match first {
+                b':' => RecoveryToken::Colon,
+                b',' => RecoveryToken::Comma,
+                b'(' | b'[' | b'{' => {
+                    self.states.push(first);
+                    RecoveryToken::Other
+                }
+                b')' | b']' | b'}' => {
+                    let opener = match first {
+                        b')' => b'(',
+                        b']' => b'[',
+                        _ => b'{',
+                    };
+                    match self.states.last() {
+                        Some(&top) if top == opener || (top == b'i' && first == b')') => {
+                            self.states.pop();
+                            if first == b'}' {
+                                RecoveryToken::CloseBrace
+                            } else {
+                                RecoveryToken::Other
+                            }
+                        }
+                        _ => RecoveryToken::Other,
+                    }
+                }
+                _ => RecoveryToken::Other,
+            };
+            start + 1
+        };
+        self.at = end;
+        Some((start, end, kind))
+    }
+}
+
 /// Error that occurs during parsing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
@@ -396,6 +671,15 @@ const CHAIN_LINK_STACK: usize = if cfg!(debug_assertions) {
 #[inline(never)]
 fn stack_exhausted_error(position: usize) -> ParseError {
     ParseError::new("memory exhausted", position)
+}
+
+/// Whether `error` ends the parse whatever recovery jq's grammar has (#7716): bison's `memory
+/// exhausted` ([`stack_exhausted_error`]) aborts the parse and is always reported, and this
+/// parser's own limits on a pattern are not syntax errors to recover from.
+fn ends_the_parse(error: &ParseError) -> bool {
+    error.message == "memory exhausted"
+        || error.message.starts_with("pattern nesting exceeds")
+        || error.message.starts_with("pattern holds more than")
 }
 
 /// yq's `--string-interpolation` (#7025): whether a string literal reads `\(expr)` as an
@@ -2040,6 +2324,13 @@ struct Parser<'a> {
     /// only an error through [`Self::finish_all`], so every entry point that builds a `Parser`
     /// to compile a program calls it (the two public ones do).
     deferred_key_errors: BTreeMap<usize, ParseError>,
+    /// Where the last recovery from a malformed object entry stops hiding syntax errors (#7716):
+    /// the start of the third of jq's tokens after the one the recovery resumed at, or 0. Bison
+    /// reports no syntax error until three tokens have been shifted after one it recovered from,
+    /// so an error before this offset is not reported ([`Self::recover_object_entry`]).
+    recovery_quiet_until: usize,
+    /// Where [`Self::lexer_at`] last left jq's lexer (#7716).
+    recovery_lexer: Option<JqTokens<'a>>,
     /// [`Self::var_sites`]'s sibling for `break $name` label-break sites
     /// (#2964): every `Expr::Break` the parse has built, with the byte
     /// offset of its `break` keyword. Same shape, same side-table
@@ -3499,6 +3790,8 @@ impl<'a> Parser<'a> {
             call_sites: Vec::new(),
             var_sites: Vec::new(),
             deferred_key_errors: BTreeMap::new(),
+            recovery_quiet_until: 0,
+            recovery_lexer: None,
             break_sites: Vec::new(),
             def_sites: Vec::new(),
             shadowable_defs,
@@ -4899,7 +5192,10 @@ impl<'a> Parser<'a> {
             .into_values()
             .collect();
         if let Err(stopped) = result {
-            errors.push(stopped);
+            // #7716: a syntax error bison meets within three tokens of a recovery is not reported.
+            if stopped.position >= self.recovery_quiet_until || ends_the_parse(&stopped) {
+                errors.push(stopped);
+            }
         }
         Err(errors)
     }
@@ -5322,8 +5618,13 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Object(entries));
         }
 
-        loop {
+        // #7716: whether the entry follows a `,`: jq's parser recovers from an error in its key or
+        // value in the state after the `,`, where a `}` resumes nothing ([`Self::recover_object_entry`]).
+        let mut after_comma = false;
+        'entries: loop {
             self.skip_ws();
+            let entry_start = self.pos;
+            let mut resumed: Option<EntryRecovery> = None;
 
             // #2724: `{$a}` and `{$a: expr}` -- captured here rather than
             // folded into the shorthand check below, because the two
@@ -5373,18 +5674,23 @@ impl<'a> Parser<'a> {
             };
             if let Some(group) = pair_group {
                 entries.extend(group);
+            } else if yq_entry {
+                let entry = self.parse_yq_object_entry()?;
+                entries.push(entry);
             } else {
-                let entry = if yq_entry {
-                    self.parse_yq_object_entry()?
-                } else {
+                // #7716: a syntax error in the entry is one jq's parser may recover from at
+                // this object ([`Self::recover_object_entry`]). The block pushes the entry
+                // itself and hands out only the error, and the error's handling is out of
+                // line, so this frame, which every level of nesting pays, stays as it was.
+                let parsed: Result<(), ParseError> = 'entry: {
                     let mut string_key: Option<Expr> = None;
                     let mut constant_key_error: Option<ParseError> = None;
                     let (mut key, dollar_shorthand_value) = if self.peek() == Some('(') {
                         // Dynamic key: (expr)
                         let key_start = self.pos;
                         self.next();
-                        let key_expr = self.parse_expr()?;
-                        self.expect(')')?;
+                        let key_expr = entry_try!('entry, self.parse_expr());
+                        entry_try!('entry, self.expect(')'));
                         // #5501: jq's `check_object_key` refuses a *constant* non-string key
                         // while compiling (`jq: error: Cannot use number (0) as object key`,
                         // exit 3), before anything runs. yq has no such check -- it stringifies
@@ -5396,7 +5702,9 @@ impl<'a> Parser<'a> {
                                 Self::constant_key_error::<JqSemantics>(&key_expr, key_start);
                         }
                         (ObjectKey::Expr(Box::new(key_expr)), None)
-                    } else if let Some(key_string) = self.try_parse_interpolated_key()? {
+                    } else if let Some(key_string) =
+                        entry_try!('entry, self.try_parse_interpolated_key())
+                    {
                         match key_string {
                             // A format over a string with no interpolation never runs (`@base64
                             // "a"` is `"a"`): an ordinary literal key and its `.a` shorthand.
@@ -5412,15 +5720,18 @@ impl<'a> Parser<'a> {
                         }
                     } else if self.peek() == Some('"') {
                         // String key
-                        let s = self.parse_string_literal()?;
+                        let s = entry_try!('entry, self.parse_string_literal());
                         (ObjectKey::Literal(s), None)
                     } else if self.mode == ParserMode::Jq && self.peek() == Some('$') {
                         let sigil_offset = self.pos;
-                        let (name, line, has_colon) = self.parse_dollar_name()?;
+                        let (name, line, has_colon) = entry_try!('entry, self.parse_dollar_name());
                         if has_colon {
                             if name == "__loc__" {
-                                return Err(ParseError::new(
-                                    "may need parentheses around object key expression",
+                                // jq's lexer reads `$__loc__` as a token of its own, which no key
+                                // can start with but the shorthand `{$__loc__}`: the `:` is its
+                                // syntax error, then the pair is recovered as for any other key.
+                                break 'entry Err(ParseError::new(
+                                    "expected '}' after $__loc__, found ':'",
                                     self.pos,
                                 ));
                             }
@@ -5444,7 +5755,7 @@ impl<'a> Parser<'a> {
                         }
                     } else {
                         // Identifier key
-                        let name = self.parse_qualified_ident()?;
+                        let name = entry_try!('entry, self.parse_qualified_ident());
                         (ObjectKey::Literal(name), None)
                     };
 
@@ -5454,16 +5765,24 @@ impl<'a> Parser<'a> {
                     let value = if let Some(v) = dollar_shorthand_value {
                         v
                     } else if self.peek() == Some(':') {
-                        if let Some(error) = constant_key_error {
-                            // jq records it and parses on (#5510). Only set in jq mode, above.
-                            self.deferred_key_errors
-                                .entry(error.position)
-                                .or_insert(error);
-                        }
                         self.next();
                         self.skip_yq_space();
                         self.skip_ws();
-                        self.parse_object_value()?
+                        let value = match self.parse_object_value() {
+                            Ok(value) => value,
+                            // #7716: jq's parser may recover from it at this object.
+                            Err(error) => break 'entry Err(error),
+                        };
+                        if let Some(error) = constant_key_error {
+                            // jq records it and parses on (#5510). Only set in jq mode, above.
+                            // It is the pair's action, so it comes after the errors in the
+                            // value and is not raised for a pair whose value fails (#7716):
+                            // keyed by the value's last byte, as the hint is.
+                            self.deferred_key_errors
+                                .entry(self.pos - 1)
+                                .or_insert(error);
+                        }
+                        value
                     } else if let Some(key_string) = string_key {
                         // #5298: `{"a\(1)"}` is `{"a\(1)": .["a\(1)"]}`. jq reads the key once and
                         // indexes with that value, so an interpolation that could yield several
@@ -5492,53 +5811,60 @@ impl<'a> Parser<'a> {
                         match &key {
                             ObjectKey::Literal(name) => Expr::Field(name.clone()),
                             ObjectKey::Expr(_) | ObjectKey::Bare => {
-                                return Err(ParseError::new(
-                                    "dynamic key requires explicit value",
-                                    self.pos,
-                                ));
+                                break 'entry Err(self.dynamic_key_without_value());
                             }
                         }
                     };
 
-                    ObjectEntry { key, value }
+                    entries.push(ObjectEntry { key, value });
+                    Ok(())
                 };
-                entries.push(entry);
+                if let Err(error) = parsed {
+                    resumed = Some(self.object_entry_error(error, entry_start, after_comma)?);
+                }
             }
-            self.skip_ws();
-            match self.peek() {
-                Some(',') => {
-                    self.next();
-                    self.skip_ws();
-                    // #2788: jq's object-construction production alone
-                    // accepts a trailing comma (`{a:1,}`) -- array
-                    // construction and destructuring patterns don't, and
-                    // neither does real yq (`',' expects 2 args but there
-                    // is 1`), so this is jq-mode only. A doubled comma
-                    // (`{a:1,,}`) still re-enters key parsing below and
-                    // hits its existing "expected identifier" error --
-                    // this only short-circuits the single-trailing-comma
-                    // shape.
-                    if self.mode == ParserMode::Jq && self.peek() == Some('}') {
-                        self.next();
-                        break;
+            // The end of the entry: a `,`, the `}`, or a syntax error jq recovers from (#7716).
+            loop {
+                match resumed.take() {
+                    Some(EntryRecovery::Closed) => break 'entries,
+                    Some(EntryRecovery::NextEntry) => {
+                        after_comma = true;
+                        self.skip_ws();
+                        if self.peek() == Some('}') {
+                            self.next();
+                            break 'entries;
+                        }
+                        continue 'entries;
                     }
-                    continue;
+                    Some(EntryRecovery::Pair) | None => {}
                 }
-                Some('}') => {
-                    self.next();
-                    break;
-                }
-                Some(c) => {
-                    return Err(ParseError::new(
-                        format!("expected ',' or '}}', found '{c}'"),
-                        self.pos,
-                    ));
-                }
-                None => {
-                    return Err(ParseError::new(
-                        "expected ',' or '}', found end of input",
-                        self.pos,
-                    ));
+                self.skip_ws();
+                match self.peek() {
+                    Some(',') => {
+                        self.next();
+                        self.skip_ws();
+                        after_comma = true;
+                        // #2788: jq's object-construction production alone
+                        // accepts a trailing comma (`{a:1,}`) -- array
+                        // construction and destructuring patterns don't, and
+                        // neither does real yq (`',' expects 2 args but there
+                        // is 1`), so this is jq-mode only. A doubled comma
+                        // (`{a:1,,}`) still re-enters key parsing below and
+                        // hits its existing "expected identifier" error --
+                        // this only short-circuits the single-trailing-comma
+                        // shape.
+                        if self.mode == ParserMode::Jq && self.peek() == Some('}') {
+                            self.next();
+                            break 'entries;
+                        }
+                        continue 'entries;
+                    }
+                    Some('}') => {
+                        self.next();
+                        break 'entries;
+                    }
+                    Some(c) => resumed = Some(self.object_entry_end_error(c, entry_start)?),
+                    None => return Err(self.object_end_of_input()),
                 }
             }
         }
@@ -5550,6 +5876,204 @@ impl<'a> Parser<'a> {
             entries,
             multi_valued_keys,
         ))
+    }
+
+    /// Whether jq's parser, meeting a syntax error at `at` in an entry whose part from `from` it is
+    /// reading, recovers from it at the object or pattern (#7716): whether `at` is inside no bracket
+    /// opened since `from` that has a recovery rule of its own (`'(' error ')'`, `'[' error ']'`,
+    /// `Term '[' error ']'`, and an inner object's). A string or interpolation has none, nor has a
+    /// computed key's own `(` at `from` while the key is still open (`MkDictPair: '(' Exp ')' ...`)
+    /// or, in a pattern (`pattern`), an array pattern's `[`.
+    #[cold]
+    #[inline(never)]
+    fn recovers_at_entry(&mut self, from: usize, at: usize, pattern: bool) -> bool {
+        let mut tokens = self.lexer_at(from);
+        let mut outer = tokens.states.len();
+        // The key's own `(`, when it is the entry's first token and the error is inside it.
+        if self.input[from..].starts_with('(') && at > from {
+            let mut key = tokens.clone();
+            if key.advance_to(from + 1) >= outer
+                && key.states.len() == outer + 1
+                && key.advance_to(at) > outer
+            {
+                tokens = key;
+                outer += 1;
+            }
+        }
+        // A bracket open at `from` and closed before `at` is not one the error is inside.
+        if tokens.advance_to(at) < outer {
+            return false;
+        }
+        tokens.states[outer..]
+            .iter()
+            .filter(|&&state| state != b'"' && state != b'i')
+            .all(|&state| pattern && state == b'[')
+    }
+
+    /// What follows an object construction's entry where a `,` or the `}` should (#7716): a syntax
+    /// error, recovered from as jq's parser does. The entry is reduced to the object's own state
+    /// by then, where a `}` closes it. Out of line, with the other error paths of
+    /// [`Self::parse_object_construction`], so its frame, which every level of nesting pays,
+    /// holds none of them.
+    #[cold]
+    #[inline(never)]
+    fn object_entry_end_error(
+        &mut self,
+        found: char,
+        entry_start: usize,
+    ) -> Result<EntryRecovery, ParseError> {
+        let error = ParseError::new(format!("expected ',' or '}}', found '{found}'"), self.pos);
+        self.recover_object_entry(error, entry_start, false, false)
+    }
+
+    /// An object construction that the text ends inside, after an entry.
+    #[cold]
+    #[inline(never)]
+    fn object_end_of_input(&self) -> ParseError {
+        ParseError::new("expected ',' or '}', found end of input", self.pos)
+    }
+
+    /// A computed object key with no `:` and value after it (`{(1)}`).
+    #[cold]
+    #[inline(never)]
+    fn dynamic_key_without_value(&self) -> ParseError {
+        ParseError::new("dynamic key requires explicit value", self.pos)
+    }
+
+    /// An error in an object construction's entry, recovered from as jq's parser does
+    /// ([`Self::recover_object_entry`], #7716), or returned when it cannot be: yq mode, or an
+    /// error inside a bracket of the key or value (other than a computed key's own parentheses)
+    /// that jq recovers from there ([`Self::recovers_at_entry`]). Out of line, with the other error
+    /// paths of [`Self::parse_object_construction`], so its frame, which every level of nesting
+    /// pays, holds none of them.
+    #[cold]
+    #[inline(never)]
+    fn object_entry_error(
+        &mut self,
+        error: ParseError,
+        entry_start: usize,
+        after_comma: bool,
+    ) -> Result<EntryRecovery, ParseError> {
+        if self.mode != ParserMode::Jq
+            || !self.recovers_at_entry(entry_start, error.position, false)
+        {
+            return Err(error);
+        }
+        self.recover_object_entry(error, entry_start, after_comma, false)
+    }
+
+    /// jq's lexer at the first token that starts at `at` or after it (#7716), in the state reading
+    /// the program from its start leaves it in. It reads on from where the last call left it when
+    /// that is not past `at`, which is every call but after a backtrack: the recoveries go forward
+    /// through the text, so a program with many errors is lexed once, not once for each.
+    fn lexer_at(&mut self, at: usize) -> JqTokens<'a> {
+        let mut tokens = match self.recovery_lexer.take() {
+            Some(tokens) if tokens.at <= at => tokens,
+            _ => JqTokens::new(self.input),
+        };
+        tokens.advance_to(at);
+        self.recovery_lexer = Some(tokens.clone());
+        tokens
+    }
+
+    /// jq's recovery from a syntax error in an object construction's entry (#7716), in jq mode:
+    /// `error` is where this parser stopped, in a key or between an entry and the next `,`.
+    ///
+    /// jq 1.7.1's grammar has three rules that resume such an object, and bison takes the first
+    /// token after the error that one of them accepts, dropping the ones before it whatever they
+    /// are: a `:` (`MkDictPair: error ':' ExpD`), whose value is read and which then fails with
+    /// `May need parentheses around object key expression`, so `{1+2:3}` and `{.a:1}` are two
+    /// errors; a `,` (`MkDict: error ',' MkDict`), after which the next entry is read; and the `}`
+    /// (`Term: '{' error '}'`), which closes the object. An error in the key or value of an entry
+    /// after a `,` (`after_comma`) is recovered from in the state after it, where a `}` resumes
+    /// nothing and is dropped too (`{a:1, 2} | {3:4}` is two errors, the hint the second); one
+    /// after a whole entry is met once the entries are reduced to the object's own state. The text
+    /// ending first is the error alone, as before. Bison reports no syntax error before it has
+    /// shifted three tokens past the one it resumed at, so an error in that stretch is dropped,
+    /// here and in [`Self::finish_all`] (`{1:}` and `{1:2 3}` are not reported again); one in the
+    /// value is recovered from at this object again. Bison sees the tokens flat, an
+    /// interpolation's among them ([`JqTokens`]).
+    ///
+    /// A destructuring pattern (`pattern`) has the `:` rule alone, `ObjPat: error ':' Pattern`,
+    /// with the same hint, so `. as {1:$a} | $a` is two errors too.
+    ///
+    /// The hint is placed at the start of the entry, which is where jq's location for the rule
+    /// starts, and recorded once the value is read, after anything inside it.
+    #[cold]
+    #[inline(never)]
+    fn recover_object_entry(
+        &mut self,
+        error: ParseError,
+        entry_start: usize,
+        after_comma: bool,
+        pattern: bool,
+    ) -> Result<EntryRecovery, ParseError> {
+        if self.mode != ParserMode::Jq || ends_the_parse(&error) {
+            return Err(error);
+        }
+        let mut error = error;
+        loop {
+            let mut tokens = self.lexer_at(error.position);
+            let (resume, resume_end) = loop {
+                match tokens.next() {
+                    Some((_, end, RecoveryToken::Colon)) => break (EntryRecovery::Pair, end),
+                    Some((_, end, RecoveryToken::Comma)) if !pattern => {
+                        break (EntryRecovery::NextEntry, end)
+                    }
+                    Some((_, end, RecoveryToken::CloseBrace)) if !after_comma && !pattern => {
+                        break (EntryRecovery::Closed, end)
+                    }
+                    Some(_) => {}
+                    None => return Err(error),
+                }
+            };
+            if error.position >= self.recovery_quiet_until {
+                self.deferred_key_errors
+                    .entry(error.position)
+                    .or_insert(error);
+            }
+            // The third token after the one resumed at is the first whose error is reported. The
+            // end of the text is a token to bison: within the first two, an error there is not.
+            let mut after = self.lexer_at(resume_end);
+            self.recovery_quiet_until = match (after.next(), after.next()) {
+                (Some(_), Some(_)) => after.next().map_or(self.input.len(), |(start, _, _)| start),
+                _ => self.input.len() + 1,
+            };
+            self.pos = resume_end;
+            if resume != EntryRecovery::Pair {
+                return Ok(resume);
+            }
+            self.skip_ws();
+            let value = if pattern {
+                self.parse_pattern().map(drop)
+            } else {
+                self.parse_object_value().map(drop)
+            };
+            match value {
+                Ok(()) => {
+                    // Keyed by the value's last byte, which no other record starts at, so the
+                    // hint comes after the errors inside the value and before the next.
+                    let key = self.pos - 1;
+                    self.deferred_key_errors.entry(key).or_insert_with(|| {
+                        ParseError::new(
+                            "May need parentheses around object key expression",
+                            entry_start,
+                        )
+                    });
+                    return Ok(EntryRecovery::Pair);
+                }
+                // An error in the value is recovered from at this object again, reported unless
+                // bison is still quiet, with no hint for the pair it was in (`{1:, a:2}`). One jq
+                // recovers from at a bracket inside the value is not followed.
+                Err(inner)
+                    if ends_the_parse(&inner)
+                        || !self.recovers_at_entry(resume_end, inner.position, pattern) =>
+                {
+                    return Err(inner)
+                }
+                Err(next) => error = next,
+            }
+        }
     }
 
     /// A parenthesised run of `key: value` pairs at an entry position of a yq-mode `{...}`
@@ -7824,8 +8348,9 @@ impl<'a> Parser<'a> {
                     ));
                 }
 
-                loop {
+                'entries: loop {
                     self.skip_ws();
+                    let entry_start = self.pos;
                     // `{$a}` shorthand: real jq desugars a bare `$var` entry
                     // to `a: $var` -- the variable's own name doubles as
                     // both the key to match and the binding pattern, with
@@ -7858,100 +8383,135 @@ impl<'a> Parser<'a> {
                     // `{$a: expr}` lookahead (#2724) via `parse_dollar_name`.
                     if self.peek() == Some('$') {
                         let sigil_offset = self.pos;
-                        let (name, _line, has_colon) = self.parse_dollar_name()?;
-                        self.reject_loc_as_binding_name(&name, None, sigil_offset)?;
-                        if has_colon {
-                            self.next();
-                            self.skip_ws();
-                            let nested = self.parse_pattern()?;
-                            entries.push(PatternEntry {
-                                key: ObjectKey::Literal(name.clone()),
-                                bind: Some(name),
-                                pattern: nested,
-                            });
-                        } else {
-                            entries.push(PatternEntry {
-                                key: ObjectKey::Literal(name.clone()),
-                                bind: None,
-                                pattern: Pattern::Var(name),
-                            });
-                        }
-                    } else {
-                        // Parse key: `(expr)` (#2677, a computed key -- the
-                        // same production object construction's own
-                        // `(expr):` branch uses, just above in this file),
-                        // a plain or interpolated string (`"..."`/`"\(...)"`
-                        // -- an interpolation is itself a computed key, so
-                        // it shares the `Expr` arm), or a bare identifier.
-                        let key = if self.peek() == Some('(') {
-                            let key_start = self.pos;
-                            self.next();
-                            let key_expr = self.parse_expr()?;
-                            self.expect(')')?;
-                            self.count_pattern_computed_key()?;
-                            // #3018: a *constant* non-string key is refused at
-                            // compile time (`Cannot use number (1) as object
-                            // key`), exactly where jq's `check_object_key`
-                            // refuses it; only computed and string keys reach
-                            // evaluation. The object-*construction* sibling
-                            // `{(1): 1}` takes the same gate in jq mode only
-                            // (#5501, `parse_object_construction`): yq
-                            // stringifies a number key, so yq mode keeps its
-                            // runtime verdict.
-                            let refused = match self.mode {
-                                ParserMode::Jq => {
-                                    Self::constant_key_error::<JqSemantics>(&key_expr, key_start)
-                                }
-                                ParserMode::Yq => {
-                                    Self::constant_key_error::<YqSemantics>(&key_expr, key_start)
-                                }
-                            };
-                            if let Some(error) = refused {
-                                // jq records it and parses on (#5510); yq's own parser stops.
-                                if self.mode == ParserMode::Jq {
-                                    self.deferred_key_errors
-                                        .entry(error.position)
-                                        .or_insert(error);
+                        // #7716: `{$__loc__: $a}` is a syntax error jq recovers from at the `:`.
+                        let named = self.parse_dollar_name().and_then(|named| {
+                            self.reject_loc_as_binding_name(&named.0, None, sigil_offset)
+                                .map(|()| named)
+                        });
+                        match named {
+                            Err(error) => {
+                                self.recover_object_entry(error, entry_start, false, true)?;
+                            }
+                            Ok((name, _line, has_colon)) => {
+                                if has_colon {
+                                    self.next();
+                                    self.skip_ws();
+                                    let nested = self.parse_pattern()?;
+                                    entries.push(PatternEntry {
+                                        key: ObjectKey::Literal(name.clone()),
+                                        bind: Some(name),
+                                        pattern: nested,
+                                    });
                                 } else {
-                                    return Err(error);
+                                    entries.push(PatternEntry {
+                                        key: ObjectKey::Literal(name.clone()),
+                                        bind: None,
+                                        pattern: Pattern::Var(name),
+                                    });
                                 }
                             }
-                            ObjectKey::Expr(Box::new(key_expr))
-                        } else if let Some(key) = self.parse_pattern_string_key()? {
-                            key
-                        } else {
-                            ObjectKey::Literal(self.parse_qualified_ident()?)
+                        }
+                    } else {
+                        // #7716: a syntax error in the key is one jq's parser recovers from at
+                        // this pattern ([`Self::recover_object_entry`]).
+                        let keyed: Result<ObjectKey, ParseError> = 'key: {
+                            // Parse key: `(expr)` (#2677, a computed key -- the
+                            // same production object construction's own
+                            // `(expr):` branch uses, just above in this file),
+                            // a plain or interpolated string (`"..."`/`"\(...)"`
+                            // -- an interpolation is itself a computed key, so
+                            // it shares the `Expr` arm), or a bare identifier.
+                            let key = if self.peek() == Some('(') {
+                                let key_start = self.pos;
+                                self.next();
+                                let key_expr = entry_try!('key, self.parse_expr());
+                                entry_try!('key, self.expect(')'));
+                                self.count_pattern_computed_key()?;
+                                // #3018: a *constant* non-string key is refused at
+                                // compile time (`Cannot use number (1) as object
+                                // key`), exactly where jq's `check_object_key`
+                                // refuses it; only computed and string keys reach
+                                // evaluation. The object-*construction* sibling
+                                // `{(1): 1}` takes the same gate in jq mode only
+                                // (#5501, `parse_object_construction`): yq
+                                // stringifies a number key, so yq mode keeps its
+                                // runtime verdict.
+                                let refused = match self.mode {
+                                    ParserMode::Jq => Self::constant_key_error::<JqSemantics>(
+                                        &key_expr, key_start,
+                                    ),
+                                    ParserMode::Yq => Self::constant_key_error::<YqSemantics>(
+                                        &key_expr, key_start,
+                                    ),
+                                };
+                                if let Some(error) = refused {
+                                    // jq records it and parses on (#5510); yq's own parser stops.
+                                    if self.mode == ParserMode::Jq {
+                                        self.deferred_key_errors
+                                            .entry(error.position)
+                                            .or_insert(error);
+                                    } else {
+                                        return Err(error);
+                                    }
+                                }
+                                ObjectKey::Expr(Box::new(key_expr))
+                            } else if let Some(key) =
+                                entry_try!('key, self.parse_pattern_string_key())
+                            {
+                                key
+                            } else {
+                                ObjectKey::Literal(entry_try!('key, self.parse_qualified_ident()))
+                            };
+
+                            self.skip_ws();
+                            entry_try!('key, self.expect(':'));
+                            Ok(key)
                         };
+                        let failed = match keyed {
+                            Ok(key) => {
+                                self.skip_yq_space();
+                                self.skip_ws();
 
-                        self.skip_ws();
-                        self.expect(':')?;
-                        self.skip_yq_space();
-                        self.skip_ws();
-
-                        // Parse the pattern for this key
-                        let pattern = self.parse_pattern()?;
-                        entries.push(PatternEntry {
-                            key,
-                            bind: None,
-                            pattern,
-                        });
+                                // Parse the pattern for this key
+                                match self.parse_pattern() {
+                                    Ok(pattern) => {
+                                        entries.push(PatternEntry {
+                                            key,
+                                            bind: None,
+                                            pattern,
+                                        });
+                                        None
+                                    }
+                                    Err(error) if self.mode == ParserMode::Jq => Some(error),
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            Err(error) => Some(error),
+                        };
+                        if let Some(error) = failed {
+                            if !self.recovers_at_entry(entry_start, error.position, true) {
+                                return Err(error);
+                            }
+                            self.recover_object_entry(error, entry_start, false, true)?;
+                        }
                     }
 
-                    self.skip_ws();
-                    match self.peek() {
-                        Some(',') => {
-                            self.next();
-                            continue;
-                        }
-                        Some('}') => {
-                            self.next();
-                            break;
-                        }
-                        _ => {
-                            return Err(ParseError::new(
-                                "expected ',' or '}' in pattern",
-                                self.pos,
-                            ));
+                    loop {
+                        self.skip_ws();
+                        match self.peek() {
+                            Some(',') => {
+                                self.next();
+                                continue 'entries;
+                            }
+                            Some('}') => {
+                                self.next();
+                                break 'entries;
+                            }
+                            _ => {
+                                let error =
+                                    ParseError::new("expected ',' or '}' in pattern", self.pos);
+                                self.recover_object_entry(error, entry_start, false, true)?;
+                            }
                         }
                     }
                 }
@@ -13982,6 +14542,30 @@ mod tests {
         }
     }
     use super::*;
+
+    /// #7716: the recovery from a malformed object entry runs only after a syntax error: a program
+    /// that parses never reaches it, so it leaves its lexer unbuilt and bison's quiet stretch unset.
+    #[test]
+    fn a_program_that_parses_never_reaches_the_entry_recovery_7716() {
+        for source in [
+            "{a: 1, \"b\": [1, {c: 2}], (\"d\"): {e: .x | .y}, $__loc__, @base64 \"f\": 3,}",
+            ". as {a: $x, \"b\": [$y, {c: $z}], $w, (\"k\"): $v} | [$x, $y, $z, $w, $v]",
+            "{a: {b: {c: (1 + 2)}}} | {x: \"\\(.a): \\({k: 1})\"}",
+        ] {
+            let mut parser = Parser::new(source);
+            let result = parser.parse_program();
+            assert!(result.is_ok(), "{source}: {result:?}");
+            assert!(parser.recovery_lexer.is_none(), "{source}");
+            assert_eq!(parser.recovery_quiet_until, 0, "{source}");
+            assert!(parser.deferred_key_errors.is_empty(), "{source}");
+        }
+        // A malformed one does.
+        let mut parser = Parser::new("{1+2: 3}");
+        let result = parser.parse_program();
+        assert!(result.is_ok());
+        assert!(parser.recovery_lexer.is_some());
+        assert_eq!(parser.deferred_key_errors.len(), 2);
+    }
 
     /// #6854: yq's `|=` body that is a comma starting with a write applies each write in place;
     /// jq's `|=` takes the first output of its body, so jq mode keeps the comma as written.

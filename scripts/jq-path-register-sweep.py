@@ -106,6 +106,14 @@ against jq. No residual is documented, and it is how `succinctly dev compare jq
 --dimension sweeps` runs a sample of the grid (#5552); a residual that becomes
 accepted has to be listed here first.
 
+**Which jq judges a row (#7518).** `last(f)` of an `f` that yields nothing yields
+nothing, as in jq 1.8.2 (jqlang/jq#3179), where jq 1.7.1 answers its `null` seed
+(and so refuses `del(last(empty) and ...)` with "Invalid path expression with result
+false"). `--jq-latest JQ` (jq 1.8.2; `succinctly dev compare jq` passes its secondary
+reference) judges the rows whose program calls `last(` against it and the rest
+against `--jq`. Without it every row is judged against `--jq`, and against jq 1.7.1
+the `last` rows over an empty source are ACCEPT_WRONG or DIFF by design.
+
 Usage:
   cargo build --features cli
   ./scripts/jq-path-register-sweep.py --candidate target/debug/succinctly \\
@@ -132,6 +140,9 @@ import time
 
 ORACLE = "/usr/bin/jq"
 ORACLE_VERSION = "jq-1.7.1"
+# `--jq-latest`: the oracle of the rows that call `last(` (#7518), when it is given.
+LATEST = None
+LATEST_VERSION = "jq-1.8"
 
 # The most stdout one run may produce before it is killed and classed a timeout. A
 # real row prints a few hundred bytes; 4 MiB is far past that and is reached by an
@@ -3251,9 +3262,15 @@ def classify(oracle, result):
     return "DIFF"
 
 
+def oracle_for(program):
+    """The jq a row is judged against: `LATEST` (jq 1.8.2) for a program that calls `last(`, whose
+    empty-generator answer succinctly takes from jq 1.8 (#7518), when it is given; `ORACLE` otherwise."""
+    return LATEST if LATEST and "last(" in program else ORACLE
+
+
 def evaluate(row, builds, timeout):
     label, doc, program = row
-    oracle = run_one([ORACLE, "-c", program], doc, timeout)
+    oracle = run_one([oracle_for(program), "-c", program], doc, timeout)
     classes = {}
     outputs = {}
     for name, path in builds:
@@ -3317,7 +3334,7 @@ def format_duration(seconds):
 
 
 def main():
-    global ORACLE
+    global ORACLE, LATEST
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--candidate", help="build under test")
     ap.add_argument(
@@ -3330,6 +3347,10 @@ def main():
     ap.add_argument("--sample", type=int, default=0, help="run a seeded sample of N rows")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--jq", default=ORACLE, help=f"the pinned oracle ({ORACLE_VERSION}, default {ORACLE})")
+    ap.add_argument(
+        "--jq-latest",
+        help="jq 1.8.2, the oracle of the rows that call `last(` (#7518); default: --jq",
+    )
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--show", type=int, default=25, help="max rows printed per section")
@@ -3369,6 +3390,7 @@ def main():
     )
     args = ap.parse_args()
     ORACLE = args.jq  # `evaluate` and the version check read the module's oracle
+    LATEST = args.jq_latest
 
     unknown = [o for o in args.operand if o not in OPERANDS]
     if unknown:
@@ -3403,13 +3425,16 @@ def main():
         if not os.access(path, os.X_OK):
             print(f"error: {name} build {path!r} is not executable", file=sys.stderr)
             return 2
-    if not os.access(ORACLE, os.X_OK):
-        print(f"error: oracle {ORACLE!r} is not executable", file=sys.stderr)
-        return 2
-    ver = subprocess.run([ORACLE, "--version"], capture_output=True, text=True).stdout.strip()
-    if not ver.startswith(ORACLE_VERSION):
-        print(f"error: oracle is {ver!r}, expected {ORACLE_VERSION}*", file=sys.stderr)
-        return 2
+    for jq, want in ((ORACLE, ORACLE_VERSION), (LATEST, LATEST_VERSION)):
+        if jq is None:
+            continue
+        if not os.access(jq, os.X_OK):
+            print(f"error: oracle {jq!r} is not executable", file=sys.stderr)
+            return 2
+        ver = subprocess.run([jq, "--version"], capture_output=True, text=True).stdout.strip()
+        if not ver.startswith(want):
+            print(f"error: oracle {jq!r} is {ver!r}, expected {want}*", file=sys.stderr)
+            return 2
 
     if args.sample:
         # Drawn while generating: the whole grid as a list is about 15 GB (#5552).
@@ -3447,7 +3472,7 @@ def main():
             records[i] = evaluate(rows[i], builds, args.timeout)
 
     names = [n for n, _ in builds]
-    print("\nper-build class totals (vs jq 1.7.1):")
+    print("\nper-build class totals (vs jq 1.7.1" + (", and 1.8.2 where a row calls `last(`" if LATEST else "") + "):")
     classes = ["MATCH", "ACCEPT_WRONG", "REFUSE_WRONG", "DIFF", "TIMEOUT", "ORACLE_TIMEOUT"]
     print(f"  {'build':<12}" + "".join(f"{c:>15}" for c in classes))
     for n in names:

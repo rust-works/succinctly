@@ -3166,3 +3166,73 @@ fn the_grow_step_answers_as_jq_7610() {
         ),
     ]);
 }
+
+/// #7719, #7736: a jq-mode program that can observe jq's label values runs on
+/// this interpreter, and every other program keeps the shipped route.
+#[test]
+fn route_takes_programs_that_observe_label_values_7719() {
+    for filter in [
+        // A handler that reads a caught `break`.
+        "label $f | try (1, break $f) catch error",
+        "[label $f | try break $f catch type]",
+        // A call in the `try` body may break.
+        "label $f | def g: break $f; try g catch .",
+        // `__jq` spelled: a hand-made label value, or a read of one.
+        r#"[limit(3; 1, error({"__jq":0}), 2)]"#,
+        "{__jq: 0} | error",
+        ".__jq",
+        r#""\(1)__jq""#,
+        // A `break` through a same-named label.
+        "[label $f | (def g: break $f; label $f | g), 3]",
+        // A `break` passed to a definition that holds a label.
+        "def f(g): label $out | g; [label $out | f(break $out), 2]",
+        // A `?//` in a `while`/`repeat` that feeds a label-entering builtin: its retry
+        // catches the `break` (#7736).
+        "1 | [limit(3; while(. as [$x] ?// $x | $x; .))]",
+        "[limit(4; [1] | repeat(. as [$x] ?// $x | $x))]",
+        "[1] | first(while(. as [$x] ?// $x | $x; .))",
+        "isempty(while(. as [$x] ?// $x | $x; .))",
+    ] {
+        let expr = parse(filter).expect("parses");
+        assert!(
+            matches!(route(&expr), Route::Interpreter),
+            "{filter} runs on the interpreter"
+        );
+    }
+    for filter in [
+        ".a",
+        "first(.[])",
+        "limit(2; .[])",
+        "try error(\"x\") catch .",
+        "label $out | foreach .[] as $x (0; . + $x; if . > 3 then ., break $out else empty end)",
+        // No `break` to catch, or a handler that ignores what it catches.
+        "label $f | try .a catch .",
+        "label $f | try (1, break $f) catch \"c\"",
+        "label $f | try (1, break $f) catch empty",
+        "label $f | (1, break $f)?",
+        // Two labels of one name side by side, not nested.
+        "[label $f | 1, break $f], [label $f | 2, break $f]",
+        // A `break` in an argument, but no definition holds a label.
+        "label $f | first(1, break $f)",
+        // A `?//` with nothing that enters a label, and a label-entering builtin without one.
+        ". as [$x] ?// $x | $x + 1",
+        // A `?//` the shipped evaluator already retries after a native stop (#1519), or in the
+        // update of `|=`, which stays shipped (#7736).
+        "[limit(1; [1] as [$x] ?// $x | $x)]",
+        "[label $f | [1] as [$x] ?// $x | $x, break $f]",
+        ".[] |= (. as [$x] ?// $x | $x)",
+        ".[] |= select((. as [$x] ?// $x | $x) != null)",
+        "walk(select((. as [$x] ?// $x | $x) != null))",
+        // A `while` with a `?//` that no label-entering builtin consumes.
+        "[while(. as [$x] ?// $x | $x; .)] | length",
+        "first(.[] as [$x] | $x)",
+        // An extension the interpreter declines keeps the shipped route.
+        "label $f | try (key, break $f) catch .",
+    ] {
+        let expr = parse(filter).expect("parses");
+        assert!(
+            matches!(route(&expr), Route::Shipped),
+            "{filter} keeps the shipped route"
+        );
+    }
+}

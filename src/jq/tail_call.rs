@@ -253,7 +253,11 @@ fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
                 ObjectKey::Literal(_) | ObjectKey::Bare => true,
             }) && settles(&entry.value, budget, cx)
         }),
-        Expr::FirstExpr(_) | Expr::LastExpr(_) if cx.wide => true,
+        // #7795: `first(f)` stops `f` at its first output, but a `?//` in `f` is still retried by a
+        // failure raised after the call has returned (jq retries it through `first`), so it keeps
+        // the streaming route. `last(f)` runs `f` to the end, and jq does not retry through it.
+        Expr::FirstExpr(inner) if cx.wide => !super::eval::contains_retrying_pattern_bind(inner),
+        Expr::LastExpr(_) if cx.wide => true,
         Expr::DefCall { .. } if cx.wide => call_head_settles_in(expr, cx.jq, budget),
         // A def with no parameters declared in the body: its calls settle when its body does. In
         // both questions: a module's forwarding stub is one (`def g: <link name>;` wrapped into the
@@ -984,6 +988,30 @@ mod tests {
         }
         // Only a call: anything else at a pipe's head keeps its route.
         assert!(!call_head_settles(&parse(". + 1").expect("parses"), true));
+    }
+
+    /// #7795: `first(f)` settles unless `f` holds a `?//`, which a failure after the call retries.
+    #[test]
+    fn a_first_around_a_retrying_bind_does_not_settle_7795() {
+        for (def_src, want) in [
+            ("def f: first([1] as [$a] ?// $a | $a); f", false),
+            ("def f: first([1] as [$a] | $a); f", true),
+            ("def f: last([1] as [$a] ?// $a | $a); f", true),
+        ] {
+            let Expr::FuncDef {
+                name,
+                params,
+                body,
+                then,
+                ..
+            } = parse(def_src).expect("parses")
+            else {
+                panic!("a def");
+            };
+            let def = Rc::new(FuncDefData::new(name, params, *body));
+            let call = install_def_calls(&then, &def, 0, false);
+            assert_eq!(call_head_settles(&call, true), want, "`{def_src}`");
+        }
     }
 
     /// #7713: the shapes a body answers at most once with beyond the tail loop's -- `try`, `?`,

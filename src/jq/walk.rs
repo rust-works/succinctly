@@ -1165,6 +1165,12 @@ pub fn stamp_loc_file(expr: &Expr, file: &Rc<str>) -> Expr {
 /// the walk stops at the first `true`. `pred` therefore does not have to be
 /// pure, but it must not rely on visiting every node.
 ///
+/// Nor every occurrence of one: a called def's body ([`Expr::DefCall`]) and a
+/// substituted argument ([`Expr::Shared`]) are shared by pointer, and each is
+/// walked the first time the walk reaches it only (#7786). A question about
+/// whether something occurs is answered the same; one about how often it
+/// occurs is `count_subexpr`'s.
+///
 /// Exhaustive at both levels — over `Expr` here and over `Builtin` via
 /// [`builtin_kids`] — with no wildcard arm at either, so a new variant of
 /// either enum is a compile error rather than a silent "no".
@@ -1196,6 +1202,226 @@ pub(crate) enum Visit {
     Descend,
 }
 
+/// The children of one node for [`search_subexpr`]'s two walkers, so they
+/// cannot disagree about which children a variant has: `$rec!(child)` walks a
+/// child, `$shared!(node)` a shared node ([`Expr::Shared`], [`Expr::DefCall`]).
+macro_rules! search_children {
+    ($node:expr, $rec:ident, $shared:ident) => {
+        match $node {
+            // #1371: both variants only ever exist mid-evaluation, never in a
+            // freshly parsed program -- but `search_subexpr` answers "does this
+            // tree mention X anywhere" for callers that do run against
+            // evaluation-time trees, so both descend. A `Shared` holds a real
+            // argument expression, and a `DefCall` holds both the definition it
+            // resolved to and that call's arguments; treating either as a leaf
+            // would reintroduce exactly the "silently reported no match" bug
+            // this module exists to prevent. How: `search_shared_in` (#7786).
+            node @ (Expr::Shared(_) | Expr::DefCall { .. }) => $shared!(node),
+            // Leaves: nothing nested to descend into.
+            Expr::Identity
+            | Expr::Field(_)
+            | Expr::Index { .. }
+            | Expr::Slice { .. }
+            | Expr::ArrayKey(_)
+            | Expr::Iterate
+            | Expr::Literal(_)
+            | Expr::RecursiveDescent
+            | Expr::RecursiveDescentWithKeys
+            | Expr::Not
+            | Expr::Format(_)
+            | Expr::Var(_)
+            | Expr::TrackedVar(_)
+            | Expr::DeferredVar(_)
+            | Expr::Loc { .. }
+            | Expr::Env
+            | Expr::Break(_) => false,
+
+            Expr::Optional(inner)
+            | Expr::Array(inner)
+            | Expr::Paren(inner)
+            | Expr::Negate(inner)
+            | Expr::FirstExpr(inner)
+            | Expr::LastExpr(inner)
+            | Expr::Repeat(inner)
+            | Expr::Label { body: inner, .. } => $rec!(inner),
+
+            Expr::Error(inner) => inner.as_deref().is_some_and(|e| $rec!(e)),
+
+            Expr::Arithmetic { left, right, .. }
+            | Expr::Compare { left, right, .. }
+            | Expr::And(left, right)
+            | Expr::Or(left, right)
+            | Expr::Alternative(left, right)
+            | Expr::IndexExpr {
+                target: left,
+                key: right,
+            }
+            | Expr::Limit {
+                n: left,
+                expr: right,
+            }
+            | Expr::NthExpr {
+                n: left,
+                expr: right,
+            }
+            | Expr::Until {
+                cond: left,
+                update: right,
+            }
+            | Expr::While {
+                cond: left,
+                update: right,
+            }
+            | Expr::As {
+                expr: left,
+                body: right,
+                ..
+            }
+            | Expr::FuncDef {
+                body: left,
+                then: right,
+                ..
+            }
+            | Expr::Assign {
+                path: left,
+                value: right,
+            }
+            | Expr::Update {
+                path: left,
+                filter: right,
+            }
+            | Expr::CompoundAssign {
+                path: left,
+                value: right,
+                ..
+            }
+            | Expr::AlternativeAssign {
+                path: left,
+                value: right,
+            }
+            | Expr::MetaAssign {
+                target: left,
+                value: right,
+                ..
+            } => $rec!(left) || $rec!(right),
+
+            Expr::Try { expr, catch } => {
+                $rec!(expr)
+                    || catch.as_deref().is_some_and(|c| $rec!(c))
+            }
+
+            Expr::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                $rec!(cond)
+                    || $rec!(then_branch)
+                    || $rec!(else_branch)
+            }
+
+            Expr::SliceExpr { target, start, end } => {
+                $rec!(target)
+                    || start.as_deref().is_some_and(|e| $rec!(e))
+                    || end.as_deref().is_some_and(|e| $rec!(e))
+            }
+
+            Expr::Range { from, to, step } => {
+                $rec!(from)
+                    || to.as_deref().is_some_and(|e| $rec!(e))
+                    || step.as_deref().is_some_and(|e| $rec!(e))
+            }
+
+            // A computed key (`{(expr): $x}`, #2734) holds a real `Expr` that
+            // `visit` must see, via `any_pattern_key` (#2872) -- re-entered with
+            // `search_subexpr` itself, not `visit` bare, since `any_pattern_key`
+            // only tests each key's root and a hit like `input` can be nested
+            // under it (`(input | tostring)`). Stale before #3017: this arm used
+            // to skip `patterns` on the claim that it "holds only destructuring
+            // names, never an `Expr`."
+            Expr::AsPattern {
+                expr,
+                patterns,
+                body,
+                ..
+            } => {
+                $rec!(expr)
+                    || $rec!(body)
+                    || patterns
+                        .iter()
+                        .any(|p| any_pattern_key(p, &mut |k| $rec!(k)))
+            }
+
+            Expr::Reduce {
+                input,
+                patterns,
+                init,
+                update,
+            } => {
+                $rec!(input)
+                    || $rec!(init)
+                    || $rec!(update)
+                    || patterns
+                        .iter()
+                        .any(|p| any_pattern_key(p, &mut |k| $rec!(k)))
+            }
+
+            Expr::Foreach {
+                input,
+                patterns,
+                init,
+                update,
+                extract,
+            } => {
+                $rec!(input)
+                    || $rec!(init)
+                    || $rec!(update)
+                    || extract
+                        .as_deref()
+                        .is_some_and(|e| $rec!(e))
+                    || patterns
+                        .iter()
+                        .any(|p| any_pattern_key(p, &mut |k| $rec!(k)))
+            }
+
+            Expr::Pipe(exprs) => exprs.iter().any(|e| $rec!(e)),
+            Expr::Comma(exprs) => exprs.iter().any(|e| $rec!(e)),
+
+            // Ignores `builtin_fallback` (unlike `map_subexprs`'s own `FuncCall`
+            // arm, which recurses into it defensively) -- safe only because
+            // every caller of this predicate runs after `resolve.rs`'s
+            // compile-time pass, which leaves no live `builtin_fallback`
+            // reachable from a `def` it actually checked (#2036 always resolves
+            // it, one way or the other, before returning). #2740 means that no
+            // longer holds for a `def` body the reachability pass skipped
+            // entirely (it may still carry an untouched `builtin_fallback`),
+            // but a skipped body is by definition never evaluated, so this
+            // arm's blind spot is unreachable in practice, not merely unlikely.
+            Expr::FuncCall { args, .. } | Expr::NamespacedCall { args, .. } => {
+                args.iter().any(|e| $rec!(e))
+            }
+
+            Expr::Object(entries) => entries.iter().any(|entry| {
+                matches!(&entry.key, ObjectKey::Expr(k) if $rec!(k))
+                    || $rec!(&entry.value)
+            }),
+
+            Expr::StringInterpolation(parts) => parts
+                .iter()
+                .any(|part| matches!(part, StringPart::Expr(e) if $rec!(e))),
+
+            Expr::Builtin(builtin) => match builtin_kids(builtin) {
+                BuiltinKids::None => false,
+                BuiltinKids::One(a) => $rec!(a),
+                BuiltinKids::Two(a, b) => $rec!(a) || $rec!(b),
+                BuiltinKids::Three(a, b, c) => {
+                    $rec!(a) || $rec!(b) || $rec!(c)
+                }
+            },
+        }
+    };
+}
+
 /// [`any_subexpr`] with pruning.
 ///
 /// `visit` sees each node before its children and may answer [`Visit::Skip`]
@@ -1205,229 +1431,177 @@ pub(crate) enum Visit {
 /// Generic over the visitor, unlike [`any_subexpr`]'s `dyn` predicate: it is
 /// instantiated for `any_subexpr`'s own adapter and for each pruning caller,
 /// so `any_subexpr` still makes one dynamic call per node, not two.
+///
+/// Two walkers from one `search_children!` (#7786): this one, for the tree
+/// down to the first shared node, carries nothing, so a walk that meets none
+/// (any parsed program, and the questions asked of one per input) costs what
+/// it did before #7786; at a shared node [`search_shared`] takes over that
+/// subtree with a [`SeenShared`].
 pub(crate) fn search_subexpr<F: FnMut(&Expr) -> Visit + ?Sized>(
     expr: &Expr,
     visit: &mut F,
 ) -> bool {
+    macro_rules! rec {
+        ($e:expr) => {
+            search_subexpr($e, visit)
+        };
+    }
+    macro_rules! shared {
+        ($n:expr) => {
+            search_shared($n, visit)
+        };
+    }
     match visit(expr) {
         Visit::Found => return true,
         Visit::Skip => return false,
         Visit::Descend => {}
     }
+    search_children!(expr, rec, shared)
+}
 
-    match expr {
-        // #1371: both variants only ever exist mid-evaluation, never in a
-        // freshly parsed program -- but this function answers "does this tree
-        // mention X anywhere" for callers that do run against evaluation-time
-        // trees, so both descend. A `Shared` holds a real argument
-        // expression, and a `DefCall` holds both the definition it resolved
-        // to and that call's arguments; treating either as a leaf would
-        // reintroduce exactly the "silently reported no match" bug this
-        // module exists to prevent.
-        Expr::Shared(inner) => search_subexpr(inner, visit),
+/// A shared node met by [`search_subexpr`] and everything below it, with a
+/// fresh [`SeenShared`] (#7786).
+///
+/// Out of line so that [`search_subexpr`]'s frame, one per level of nesting,
+/// does not carry the set.
+#[inline(never)]
+fn search_shared<F: FnMut(&Expr) -> Visit + ?Sized>(node: &Expr, visit: &mut F) -> bool {
+    search_shared_in(node, visit, &mut SeenShared::default())
+}
+
+/// A shared node's children, each shared node the first time `seen` meets it
+/// only (#7786).
+///
+/// Both kinds are shared by pointer, so an evaluation-time tree is a DAG: a
+/// chain of defs that each call the one below twice reaches the bottom def
+/// 2^N times. A walk that already went through a shared node and is still
+/// going found nothing there, and walking it again finds the same. A call's
+/// arguments are its own and are walked at every call.
+fn search_shared_in<F: FnMut(&Expr) -> Visit + ?Sized>(
+    node: &Expr,
+    visit: &mut F,
+    seen: &mut SeenShared,
+) -> bool {
+    match node {
+        Expr::Shared(inner) => {
+            seen.first(Rc::as_ptr(inner).cast()) && search_seen(inner, visit, seen)
+        }
         Expr::DefCall { def, args, .. } => {
-            search_subexpr(&def.body, visit) || args.iter().any(|a| search_subexpr(a, visit))
+            (seen.first(Rc::as_ptr(def).cast()) && search_seen(&def.body, visit, seen))
+                || args.iter().any(|a| search_seen(a, visit, seen))
         }
-        // Leaves: nothing nested to descend into.
-        Expr::Identity
-        | Expr::Field(_)
-        | Expr::Index { .. }
-        | Expr::Slice { .. }
-        | Expr::ArrayKey(_)
-        | Expr::Iterate
-        | Expr::Literal(_)
-        | Expr::RecursiveDescent
-        | Expr::RecursiveDescentWithKeys
-        | Expr::Not
-        | Expr::Format(_)
-        | Expr::Var(_)
-        | Expr::TrackedVar(_)
-        | Expr::DeferredVar(_)
-        | Expr::Loc { .. }
-        | Expr::Env
-        | Expr::Break(_) => false,
-
-        Expr::Optional(inner)
-        | Expr::Array(inner)
-        | Expr::Paren(inner)
-        | Expr::Negate(inner)
-        | Expr::FirstExpr(inner)
-        | Expr::LastExpr(inner)
-        | Expr::Repeat(inner)
-        | Expr::Label { body: inner, .. } => search_subexpr(inner, visit),
-
-        Expr::Error(inner) => inner.as_deref().is_some_and(|e| search_subexpr(e, visit)),
-
-        Expr::Arithmetic { left, right, .. }
-        | Expr::Compare { left, right, .. }
-        | Expr::And(left, right)
-        | Expr::Or(left, right)
-        | Expr::Alternative(left, right)
-        | Expr::IndexExpr {
-            target: left,
-            key: right,
-        }
-        | Expr::Limit {
-            n: left,
-            expr: right,
-        }
-        | Expr::NthExpr {
-            n: left,
-            expr: right,
-        }
-        | Expr::Until {
-            cond: left,
-            update: right,
-        }
-        | Expr::While {
-            cond: left,
-            update: right,
-        }
-        | Expr::As {
-            expr: left,
-            body: right,
-            ..
-        }
-        | Expr::FuncDef {
-            body: left,
-            then: right,
-            ..
-        }
-        | Expr::Assign {
-            path: left,
-            value: right,
-        }
-        | Expr::Update {
-            path: left,
-            filter: right,
-        }
-        | Expr::CompoundAssign {
-            path: left,
-            value: right,
-            ..
-        }
-        | Expr::AlternativeAssign {
-            path: left,
-            value: right,
-        }
-        | Expr::MetaAssign {
-            target: left,
-            value: right,
-            ..
-        } => search_subexpr(left, visit) || search_subexpr(right, visit),
-
-        Expr::Try { expr, catch } => {
-            search_subexpr(expr, visit)
-                || catch.as_deref().is_some_and(|c| search_subexpr(c, visit))
-        }
-
-        Expr::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            search_subexpr(cond, visit)
-                || search_subexpr(then_branch, visit)
-                || search_subexpr(else_branch, visit)
-        }
-
-        Expr::SliceExpr { target, start, end } => {
-            search_subexpr(target, visit)
-                || start.as_deref().is_some_and(|e| search_subexpr(e, visit))
-                || end.as_deref().is_some_and(|e| search_subexpr(e, visit))
-        }
-
-        Expr::Range { from, to, step } => {
-            search_subexpr(from, visit)
-                || to.as_deref().is_some_and(|e| search_subexpr(e, visit))
-                || step.as_deref().is_some_and(|e| search_subexpr(e, visit))
-        }
-
-        // A computed key (`{(expr): $x}`, #2734) holds a real `Expr` that
-        // `visit` must see, via `any_pattern_key` (#2872) -- re-entered with
-        // `search_subexpr` itself, not `visit` bare, since `any_pattern_key`
-        // only tests each key's root and a hit like `input` can be nested
-        // under it (`(input | tostring)`). Stale before #3017: this arm used
-        // to skip `patterns` on the claim that it "holds only destructuring
-        // names, never an `Expr`."
-        Expr::AsPattern {
-            expr,
-            patterns,
-            body,
-            ..
-        } => {
-            search_subexpr(expr, visit)
-                || search_subexpr(body, visit)
-                || patterns
-                    .iter()
-                    .any(|p| any_pattern_key(p, &mut |k| search_subexpr(k, visit)))
-        }
-
-        Expr::Reduce {
-            input,
-            patterns,
-            init,
-            update,
-        } => {
-            search_subexpr(input, visit)
-                || search_subexpr(init, visit)
-                || search_subexpr(update, visit)
-                || patterns
-                    .iter()
-                    .any(|p| any_pattern_key(p, &mut |k| search_subexpr(k, visit)))
-        }
-
-        Expr::Foreach {
-            input,
-            patterns,
-            init,
-            update,
-            extract,
-        } => {
-            search_subexpr(input, visit)
-                || search_subexpr(init, visit)
-                || search_subexpr(update, visit)
-                || extract.as_deref().is_some_and(|e| search_subexpr(e, visit))
-                || patterns
-                    .iter()
-                    .any(|p| any_pattern_key(p, &mut |k| search_subexpr(k, visit)))
-        }
-
-        Expr::Pipe(exprs) => exprs.iter().any(|e| search_subexpr(e, visit)),
-        Expr::Comma(exprs) => exprs.iter().any(|e| search_subexpr(e, visit)),
-
-        // Ignores `builtin_fallback` (unlike `map_subexprs`'s own `FuncCall`
-        // arm, which recurses into it defensively) -- safe only because
-        // every caller of this predicate runs after `resolve.rs`'s
-        // compile-time pass, which leaves no live `builtin_fallback`
-        // reachable from a `def` it actually checked (#2036 always resolves
-        // it, one way or the other, before returning). #2740 means that no
-        // longer holds for a `def` body the reachability pass skipped
-        // entirely (it may still carry an untouched `builtin_fallback`),
-        // but a skipped body is by definition never evaluated, so this
-        // arm's blind spot is unreachable in practice, not merely unlikely.
-        Expr::FuncCall { args, .. } | Expr::NamespacedCall { args, .. } => {
-            args.iter().any(|e| search_subexpr(e, visit))
-        }
-
-        Expr::Object(entries) => entries.iter().any(|entry| {
-            matches!(&entry.key, ObjectKey::Expr(k) if search_subexpr(k, visit))
-                || search_subexpr(&entry.value, visit)
-        }),
-
-        Expr::StringInterpolation(parts) => parts
-            .iter()
-            .any(|part| matches!(part, StringPart::Expr(e) if search_subexpr(e, visit))),
-
-        Expr::Builtin(builtin) => match builtin_kids(builtin) {
-            BuiltinKids::None => false,
-            BuiltinKids::One(a) => search_subexpr(a, visit),
-            BuiltinKids::Two(a, b) => search_subexpr(a, visit) || search_subexpr(b, visit),
-            BuiltinKids::Three(a, b, c) => {
-                search_subexpr(a, visit) || search_subexpr(b, visit) || search_subexpr(c, visit)
-            }
-        },
+        _ => unreachable!("search_children passes only shared nodes here"),
     }
+}
+
+/// [`search_subexpr`]'s walk below a shared node, with the shared nodes it has
+/// walked into.
+fn search_seen<F: FnMut(&Expr) -> Visit + ?Sized>(
+    expr: &Expr,
+    visit: &mut F,
+    seen: &mut SeenShared,
+) -> bool {
+    macro_rules! rec {
+        ($e:expr) => {
+            search_seen($e, visit, seen)
+        };
+    }
+    macro_rules! shared {
+        ($n:expr) => {
+            search_shared_in($n, visit, seen)
+        };
+    }
+    match visit(expr) {
+        Visit::Found => return true,
+        Visit::Skip => return false,
+        Visit::Descend => {}
+    }
+    search_children!(expr, rec, shared)
+}
+
+/// The shared nodes ([`Expr::DefCall`] bodies, [`Expr::Shared`] arguments) one
+/// [`search_shared`] walk has walked into, by address (#7786).
+///
+/// Built only when a walk meets its first shared node: a walk of a tree with
+/// none, such as a parsed program, never builds one. A walk that meets some
+/// meets few, so the first few are kept inline and a set is built only past
+/// them.
+#[derive(Default)]
+struct SeenShared {
+    inline: [usize; SEEN_INLINE],
+    len: usize,
+    spill: alloc::collections::BTreeSet<usize>,
+}
+
+/// How many shared nodes a [`SeenShared`] keeps before it builds a set.
+const SEEN_INLINE: usize = 8;
+
+impl SeenShared {
+    /// Records `at`; `true` the first time it is recorded.
+    fn first(&mut self, at: *const ()) -> bool {
+        let at = at as usize;
+        if self.inline[..self.len].contains(&at) {
+            return false;
+        }
+        if self.len < SEEN_INLINE {
+            self.inline[self.len] = at;
+            self.len += 1;
+            return true;
+        }
+        self.spill.insert(at)
+    }
+}
+
+/// How many nodes of `expr` satisfy `pred`, up to `cap`: each occurrence counted
+/// as [`any_subexpr`] would visit it, a def's body once per call that reaches
+/// it, an argument once per place it was substituted into (#7786).
+///
+/// [`search_subexpr`] walks a shared node once, which is enough for any
+/// question about *whether* something occurs but not for one about *how
+/// often*. This counts a shared node's subtree once and adds the count at every
+/// occurrence, so it stays linear in the size of the tree where visiting every
+/// occurrence is exponential in a chain of defs that each call the one below
+/// twice. The walk stops once the count reaches `cap`, which it then answers.
+/// `pred` must answer the same for the same node.
+pub(crate) fn count_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool, cap: usize) -> usize {
+    type Memo = alloc::collections::BTreeMap<usize, usize>;
+    fn go(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool, cap: usize, memo: &mut Memo) -> usize {
+        let mut n = 0usize;
+        search_subexpr(expr, &mut |e| {
+            if pred(e) {
+                n += 1;
+            }
+            let (at, inner, args): (*const (), &Expr, &[Expr]) = match e {
+                Expr::DefCall { def, args, .. } => (Rc::as_ptr(def).cast(), &def.body, args),
+                Expr::Shared(inner) => (Rc::as_ptr(inner).cast(), &***inner, &[]),
+                _ if n >= cap => return Visit::Found,
+                _ => return Visit::Descend,
+            };
+            // A count that stopped at `cap` is remembered as `cap`: it only ever meets `cap` again.
+            let count = match memo.get(&(at as usize)) {
+                Some(&count) => count,
+                None => {
+                    let count = go(inner, pred, cap, memo);
+                    memo.insert(at as usize, count);
+                    count
+                }
+            };
+            n = n.saturating_add(count).min(cap);
+            for arg in args {
+                if n >= cap {
+                    break;
+                }
+                n = n.saturating_add(go(arg, pred, cap, memo)).min(cap);
+            }
+            if n >= cap {
+                Visit::Found
+            } else {
+                Visit::Skip
+            }
+        });
+        n.min(cap)
+    }
+    go(expr, pred, cap, &mut Memo::new())
 }
 
 /// Whether `expr` mentions a given builtin anywhere in the tree.
@@ -1465,6 +1639,18 @@ pub fn uses_input_builtins(expr: &Expr) -> bool {
 /// touching the files. Same expanded-program requirement as [`uses_input_builtins`].
 pub fn pulls_inputs(expr: &Expr) -> bool {
     contains_builtin(expr, |b| matches!(b, Builtin::Input | Builtin::Inputs))
+}
+
+/// Whether `expr` calls `halt` or `halt_error` anywhere (#7775): a main loop that can stop before its
+/// last input, as jq's then reads no further. Same expanded-program requirement as
+/// [`uses_input_builtins`].
+pub fn can_halt(expr: &Expr) -> bool {
+    contains_builtin(expr, |b| {
+        matches!(
+            b,
+            Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_)
+        )
+    })
 }
 
 /// Whether `expr` references a builtin whose answer comes from the *cursor*
@@ -3111,5 +3297,186 @@ mod tests {
             Expr::Var(_) | Expr::TrackedVar(_)
         )));
         assert_eq!(map_subexprs(&deferred, &mut |e| e.clone()), deferred);
+    }
+
+    /// A call to `def` with `args`.
+    fn call_7786(def: &Rc<FuncDefData>, args: Vec<Expr>) -> Expr {
+        Expr::DefCall {
+            def: Rc::clone(def),
+            args,
+            frames: 0,
+            bound: crate::jq::BoundBody::default(),
+        }
+    }
+
+    /// `def g0: 1; def g_k: g_{k-1} + g_{k-1};`, the top call.
+    fn doubling_chain_7786(levels: usize) -> Expr {
+        let mut def = Rc::new(FuncDefData::new(
+            "g0".into(),
+            Vec::new(),
+            Expr::Literal(crate::jq::Literal::Int(1)),
+        ));
+        for k in 1..=levels {
+            let body = Expr::arithmetic(
+                crate::jq::ArithOp::Add,
+                call_7786(&def, Vec::new()),
+                call_7786(&def, Vec::new()),
+            );
+            def = Rc::new(FuncDefData::new(format!("g{k}"), Vec::new(), body));
+        }
+        call_7786(&def, Vec::new())
+    }
+
+    /// The walk before #7786, for the cross-checks: every occurrence of a shared node walked again.
+    fn search_every_7786(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
+        search_subexpr(expr, &mut |e| {
+            if pred(e) {
+                return Visit::Found;
+            }
+            let found = match e {
+                Expr::DefCall { def, args, .. } => {
+                    search_every_7786(&def.body, pred)
+                        || args.iter().any(|a| search_every_7786(a, pred))
+                }
+                Expr::Shared(inner) => search_every_7786(inner, pred),
+                _ => return Visit::Descend,
+            };
+            if found {
+                Visit::Found
+            } else {
+                Visit::Skip
+            }
+        })
+    }
+
+    /// [`search_every_7786`]'s count of the nodes `pred` holds for.
+    fn count_every_7786(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> usize {
+        let mut n = 0;
+        search_every_7786(expr, &mut |e| {
+            n += usize::from(pred(e));
+            false
+        });
+        n
+    }
+
+    #[test]
+    fn a_def_body_reached_by_many_calls_is_walked_once_7786() {
+        // 60 levels: 2^60 visits if each call walked its def's body again.
+        let top = doubling_chain_7786(60);
+        let mut visits = 0usize;
+        assert!(!any_subexpr(&top, &mut |_| {
+            visits += 1;
+            false
+        }));
+        // The top call, then per level one body (`+`) and its two calls; the bottom literal.
+        assert_eq!(visits, 1 + 60 * 3 + 1);
+        assert!(any_subexpr(&top, &mut |e| matches!(e, Expr::Literal(_))));
+        // Counting still answers per occurrence, without the walk that took.
+        assert_eq!(
+            count_subexpr(&top, &mut |e| matches!(e, Expr::Literal(_)), usize::MAX),
+            1 << 60
+        );
+        assert_eq!(count_subexpr(&top, &mut |_| true, 1000), 1000);
+    }
+
+    #[test]
+    fn a_call_argument_is_walked_at_every_call_7786() {
+        // `def f(a): 1;` called as `f(1)` and `f($x)`: one body, two different arguments.
+        let def = Rc::new(FuncDefData::new(
+            "f".into(),
+            vec![Param::Bare("a".into())],
+            Expr::Literal(crate::jq::Literal::Int(1)),
+        ));
+        let expr = Expr::Comma(vec![
+            call_7786(&def, vec![Expr::Literal(crate::jq::Literal::Int(1))]),
+            call_7786(&def, vec![Expr::Var("x".into())]),
+        ]);
+        assert!(any_subexpr(&expr, &mut |e| matches!(e, Expr::Var(_))));
+        assert_eq!(
+            count_subexpr(&expr, &mut |e| matches!(e, Expr::Literal(_)), usize::MAX),
+            3
+        );
+    }
+
+    /// A small DAG of calls and shared arguments from `seed`: the cross-check's input.
+    fn random_dag_7786(seed: u64) -> Expr {
+        let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let mut next = |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as usize) % bound
+        };
+        let leaf = |n: usize| match n % 4 {
+            0 => Expr::Literal(crate::jq::Literal::Int(n as i64)),
+            1 => Expr::Var(format!("v{}", n % 3)),
+            2 => Expr::Identity,
+            _ => Expr::Builtin(Builtin::Empty),
+        };
+        let mut defs: Vec<Rc<FuncDefData>> = Vec::new();
+        let mut shared: Vec<Expr> = Vec::new();
+        for k in 0..(3 + next(8)) {
+            let mut parts = Vec::new();
+            for _ in 0..=next(4) {
+                let part = match next(5) {
+                    0 | 1 if !defs.is_empty() => {
+                        let def = &defs[defs.len() - 1 - next(defs.len().min(3))];
+                        let args = (0..next(3)).map(|_| leaf(next(12))).collect();
+                        call_7786(def, args)
+                    }
+                    2 if !shared.is_empty() => shared[next(shared.len())].clone(),
+                    _ => leaf(next(12)),
+                };
+                parts.push(part);
+            }
+            let body = if next(2) == 0 {
+                Expr::Comma(parts)
+            } else {
+                Expr::Pipe(parts.into())
+            };
+            if next(3) == 0 {
+                shared.push(Expr::shared(body.clone()));
+            }
+            defs.push(Rc::new(FuncDefData::new(format!("g{k}"), Vec::new(), body)));
+        }
+        let top = defs.last().expect("at least three defs");
+        Expr::Comma(vec![
+            call_7786(top, Vec::new()),
+            call_7786(top, vec![leaf(next(12))]),
+        ])
+    }
+
+    /// The cross-check the memo needs: on small DAGs the walk that visits each shared node once
+    /// answers what the walk that visits every occurrence answers, for searches and for counts.
+    #[test]
+    fn walking_shared_nodes_once_answers_as_walking_every_occurrence_7786() {
+        let preds: [fn(&Expr) -> bool; 5] = [
+            |e| matches!(e, Expr::Var(name) if name == "v2"),
+            |e| matches!(e, Expr::Literal(_)),
+            |e| matches!(e, Expr::Builtin(Builtin::Empty)),
+            |e| matches!(e, Expr::Pipe(_)),
+            |e| matches!(e, Expr::Shared(_)),
+        ];
+        for seed in 0..500 {
+            let expr = random_dag_7786(seed);
+            for pred in preds {
+                assert_eq!(
+                    any_subexpr(&expr, &mut |e| pred(e)),
+                    search_every_7786(&expr, &mut |e| pred(e)),
+                    "seed {seed}"
+                );
+                let every = count_every_7786(&expr, &mut |e| pred(e));
+                assert_eq!(
+                    count_subexpr(&expr, &mut |e| pred(e), usize::MAX),
+                    every,
+                    "seed {seed}"
+                );
+                assert_eq!(
+                    count_subexpr(&expr, &mut |e| pred(e), 3),
+                    every.min(3),
+                    "seed {seed}"
+                );
+            }
+        }
     }
 }

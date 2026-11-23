@@ -534,6 +534,9 @@ use super::value::{
     ObjectMapOf, OwnedValue, ScalarKind,
 };
 
+// #7483: a call, a pipe a call leads and an `if` over an owned value, run on the tree.
+mod owned_call;
+
 /// Which binary operator an operand that produced *zero outputs* is being
 /// combined under, for [`yq_empty_operand_output`].
 ///
@@ -13968,6 +13971,11 @@ impl RestCopy {
     }
 
     /// The owned pipe over `stages`, built on the first call.
+    ///
+    /// `inline(always)`: [`RestPipe::run_owned_past_front_doors`], on the path of every owned rest,
+    /// had it inlined until #7483's `run_moved` became a second caller, and the call it then made
+    /// cost 19 instructions per rest (`map(length) | .[]`, +0.2%).
+    #[inline(always)]
     fn owned_pipe<S: EvalSemantics>(
         &mut self,
         stages: &[Expr],
@@ -13987,7 +13995,9 @@ impl RestCopy {
         })
     }
 
-    /// The owned pipe, from `build` on the first call and kept after.
+    /// The owned pipe, from `build` on the first call and kept after. `inline(always)` for the
+    /// reason [`Self::owned_pipe`] is.
+    #[inline(always)]
     fn pipe_of(&mut self, build: impl FnOnce() -> PipeStages) -> &Expr {
         if !matches!(self, Self::Owned(_)) {
             *self = Self::Owned(Expr::Pipe(build()));
@@ -14445,6 +14455,30 @@ fn eval_each_owned_past_front_doors_in<S: EvalSemantics>(
     if let Some(declined) = declined {
         declined.set(true);
         return Flow::Exhausted;
+    }
+    owned_bridge::<S>(expr, input, optional, reentry, sink)
+}
+
+/// The re-index bridge of [`eval_each_owned_past_front_doors_in`], once every door above it has
+/// declined: `input` written out and indexed, and `expr` run on that document.
+///
+/// Its own function since #7483, which tries its door for a call, a pipe a call leads and an `if`
+/// first, so that a recursion threading a state through its calls does not write the state out
+/// at each call: inside the function that tried every door, that check moved the code and the
+/// registers of the paths the doors answer, which are most of its calls (+25 instructions per
+/// element of `map(length) | .[]`).
+#[inline(never)]
+fn owned_bridge<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    if owned_call::door_candidate(expr) {
+        if let Some(flow) = owned_call::door_borrowed::<S>(expr, input, optional, reentry, sink) {
+            return flow;
+        }
     }
     // After the fast path on purpose: it never reaches a resolver, and
     // demoting rebuilds `expr` whenever it holds a marker at all.
@@ -16096,7 +16130,8 @@ fn closed_pipe_to_owned<S: EvalSemantics>(
                 None if S::TAG == EvalTag::Jq => {
                     let stage = unwrap_paren(stage);
                     eval_owned_string_door::<S>(stage, current)
-                        .or_else(|| eval_owned_def_call_count::<S>(stage, current))?
+                        .or_else(|| eval_owned_def_call_count::<S>(stage, current))
+                        .or_else(|| closed_read_stage::<S>(stage, current, depth, escaped))?
                 }
                 None => return None,
             },
@@ -16104,6 +16139,39 @@ fn closed_pipe_to_owned<S: EvalSemantics>(
         value = Some(next);
     }
     value
+}
+
+/// [`closed_pipe_to_owned`]'s read stages over a bound value: `getpath(P)` (#7721) and
+/// `contains(C)` (#7785), the argument closed. `getpath` walks the value so far by
+/// [`owned_getpath_walk`] and `contains` asks [`owned_contains_verdict`], the reads the evaluator's own
+/// builtins make of an owned value, which the read doors ([`eval_owned_getpath_door`],
+/// [`eval_owned_contains_door`]) share. Without them `$a | getpath([$i])` and `$a | contains([$i])` in
+/// a fold step declined to the evaluator's route, which re-indexed the bound container `$a` for one
+/// read of it: linear per step, quadratic over the fold, where jq reads the element in place (and
+/// `contains` stops at its first match). An argument that is not closed, a path that is not an
+/// array, a walk that raises and a `contains` of mismatched kinds decline and keep the evaluator's
+/// route and text. The argument's own nodes never reach the answer (the walk reads only its keys, and
+/// `contains` answers a boolean), so an `escaped` mark it sets is dropped, as
+/// [`closed_if_to_owned`] drops the condition's: `escaped` follows the value read. jq mode only, like
+/// the rest of the stage chain. Its own function, not inline in the stage loop, for the reason
+/// [`closed_index_expr`] gives.
+#[inline(never)]
+fn closed_read_stage<S: EvalSemantics>(
+    stage: &Expr,
+    input: &OwnedValue,
+    depth: usize,
+    escaped: &mut bool,
+) -> Option<OwnedValue> {
+    let Expr::Builtin(Builtin::GetPath(arg) | Builtin::Contains(arg)) = stage else {
+        return None;
+    };
+    let before = *escaped;
+    let arg_value = closed_expr_to_owned_at_depth::<S>(arg, depth + 1, escaped)?;
+    *escaped = before;
+    match stage {
+        Expr::Builtin(Builtin::GetPath(_)) => owned_getpath_walk::<S>(arg_value, input),
+        _ => owned_contains_verdict::<S>(input, &arg_value),
+    }
 }
 
 /// A string's `length` as an owned stage (#6534): the count of the string, in the unit the mode
@@ -35300,11 +35368,14 @@ fn translate_posix_brackets_scan(
                 i += 7;
                 continue;
             }
-            if c == '(' {
+            let name_end = if c == '(' {
                 let opened = open_group(&chars, i, &mut group_facts)?;
                 groups_opened += usize::from(opened.captures);
                 body_start = opened.body_start;
-            }
+                opened.header_end
+            } else {
+                None
+            };
             // Follow the extended mode through the groups, to know where `#` starts a comment.
             if c == '(' {
                 // #6197: what Oniguruma refuses inside a look-behind.
@@ -35364,6 +35435,12 @@ fn translate_posix_brackets_scan(
                                 continue;
                             }
                             wrapped.push(false);
+                            // #7805: a group's name is no pattern text (`(?<a[>`, `(?<a$>`).
+                            if let Some(end) = name_end {
+                                out.extend(&chars[i..end]);
+                                i = end;
+                                continue;
+                            }
                         }
                     }
                 } else {
@@ -35530,12 +35607,19 @@ fn translate_posix_brackets_scan(
             out.push(c);
             i += 1;
             continue;
-        } else if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
-            && extended_in.last().copied().unwrap_or(false)
-        {
+        } else if (c == '#' || c.is_whitespace()) && extended_in.last().copied().unwrap_or(false) {
             // Oniguruma's extended mode ignores blanks outside a class only; the `regex` crate
             // drops them inside one as well (`(?x:[a b])+` lost its space, #6133 review).
-            out.push_str(&format!("\\x{:02x}", c as u32));
+            // #7804: it also reads a `#` there as a comment, and every Unicode blank (U+3000) as
+            // ignored, so the class did not parse, and the pattern went to `fancy-regex`, whose
+            // route skips jq's one-byte step after an empty match (#6326). Both are literals here.
+            if c == '#' {
+                out.push_str("\\#");
+            } else if c.is_ascii() {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            } else {
+                out.push_str(&format!("\\x{{{:x}}}", c as u32));
+            }
             changed = true;
             at_start = false;
             i += 1;
@@ -35589,7 +35673,16 @@ fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
     }
     // The blanks and comments of the `x` flag are followed only where no inline flag changes them.
     let blanks = extended && !flag_switched_off(pattern) && !inline_extended(pattern);
-    if !blanks && inline_extended(pattern) && pattern.contains('#') {
+    // An escaped `\#` opens no comment: the translation writes a class's `#` so under `x` (#7804).
+    let holds_hash = || {
+        let mut escaped = false;
+        pattern.chars().any(|c| {
+            let hash = c == '#' && !escaped;
+            escaped = c == '\\' && !escaped;
+            hash
+        })
+    };
+    if !blanks && inline_extended(pattern) && holds_hash() {
         return None;
     }
     let chars: Vec<char> = pattern.chars().collect();
@@ -35656,6 +35749,12 @@ fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
         } else if c == '(' {
             let captures = !opens_condition(&chars, i) && group_header(&chars, i).0;
             open.push((out.len(), captures));
+            // #7805: a group's name is no pattern text (`(?<a[>x){0}`).
+            if let Some(end) = onig_group_name_end(&chars, i).ok().flatten() {
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
         } else if c == ')' {
             out.push(c);
             i += 1;
@@ -36676,6 +36775,8 @@ fn group_header(chars: &[char], i: usize) -> (bool, Option<String>, usize) {
 struct GroupOpen {
     captures: bool,
     body_start: usize,
+    /// For a named group, the index just past the closing delimiter of its name (#7805).
+    header_end: Option<usize>,
 }
 
 /// A `(` at `chars[i]`: what it opens, refusing what Oniguruma refuses (#6070). A group name that
@@ -36693,19 +36794,11 @@ fn open_group(
         return Ok(GroupOpen {
             captures: false,
             body_start: usize::MAX,
+            header_end: None,
         });
     }
-    let (captures, name, body_start) = group_header(chars, i);
-    if let Some(name) = &name {
-        if name.is_empty() {
-            return Err(EvalError::new("Regex failure: group name is empty"));
-        }
-        if name.starts_with(|c: char| c.is_ascii_digit()) {
-            return Err(EvalError::new(format!(
-                "Regex failure: invalid group name <{name}>"
-            )));
-        }
-    }
+    let header_end = onig_group_name_end(chars, i)?;
+    let (captures, _, body_start) = group_header(chars, i);
     if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'(') {
         if let Some(n) = chars[i + 3..].iter().position(|&c| c == ')') {
             let condition: String = chars[i + 3..i + 3 + n].iter().collect();
@@ -36735,7 +36828,94 @@ fn open_group(
     Ok(GroupOpen {
         captures,
         body_start,
+        header_end,
     })
+}
+
+/// Whether Oniguruma counts `c` as a word character (`ONIGENC_IS_CODE_WORD` for UTF-8): Unicode's
+/// alphabetic characters, marks, decimal digits and connector punctuation, and below U+0100 its
+/// ISO-8859-1 table, which adds U+00B2, U+00B3, U+00B9 and U+00BC-U+00BE (see [`JQ_WORD_CLASS`]).
+#[cfg(feature = "regex")]
+fn is_onig_word_char(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphanumeric() || c == '_';
+    }
+    static WORD: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    WORD.get_or_init(|| regex::Regex::new(&format!("^[{JQ_WORD_CLASS}]$")).ok())
+        .as_ref()
+        .is_some_and(|word| word.is_match(c.encode_utf8(&mut [0; 4])))
+}
+
+/// The name of the group `(?<name>` or `(?'name'` opened by the `(` at `chars[i]`, read as
+/// Oniguruma's `fetch_name` reads a name it defines (#7805): the index just past its closing
+/// delimiter, `None` for any other group, or Oniguruma's refusal.
+///
+/// The first character is checked alone: an ASCII digit, `+` or `-` is `invalid group name`, and
+/// any other character that is not a word character ([`is_onig_word_char`]) is
+/// `invalid char in group name`. The rest of the name runs to the closing delimiter, and any
+/// character is accepted there (`fetch_name` notes a later non-word character and then returns
+/// success all the same), so `(?<a[>a)` and `(?<a(>a)` are groups named `a[` and `a(`. A `)`, or
+/// the end of the pattern, before the delimiter is `invalid group name`. The name in the message
+/// is the text from the first character to the delimiter, the `)` or the end; where the first
+/// character was fine and the pattern ends inside the name, it stops one character short of the
+/// end (`(?<ab` is `invalid group name <a>`), and where the first was refused and the delimiter is
+/// the pattern's last character, it takes the delimiter in (`(?<(>` is `<(>>`), both as in jq.
+#[cfg(feature = "regex")]
+fn onig_group_name_end(chars: &[char], i: usize) -> Result<Option<usize>, EvalError> {
+    let close = match (chars.get(i + 1), chars.get(i + 2), chars.get(i + 3)) {
+        (Some('?'), Some('<'), Some('=' | '!')) => return Ok(None),
+        (Some('?'), Some('<'), _) => '>',
+        (Some('?'), Some('\''), _) => '\'',
+        _ => return Ok(None),
+    };
+    let start = i + 3;
+    let refuse = |message: &str, end: usize| -> Result<Option<usize>, EvalError> {
+        let name: String = chars[start..end].iter().collect();
+        Err(EvalError::new(format!("Regex failure: {message} <{name}>")))
+    };
+    // `(?<` that ends the pattern is an unclosed group to Oniguruma, which reads one more character
+    // to tell a look-behind from a name; `(?'` is an empty name.
+    let Some(&first) = chars.get(start) else {
+        return Err(EvalError::new(if close == '>' {
+            "Regex failure: end pattern with unmatched parenthesis"
+        } else {
+            "Regex failure: group name is empty"
+        }));
+    };
+    if first == close {
+        return Err(EvalError::new("Regex failure: group name is empty"));
+    }
+    let first_refused = if first.is_ascii_digit() || first == '+' || first == '-' {
+        Some("invalid group name")
+    } else if !is_onig_word_char(first) {
+        Some("invalid char in group name")
+    } else {
+        None
+    };
+    if let Some(message) = first_refused {
+        // The name runs to the delimiter or a `)`; when that is the last character of the pattern
+        // (or there is none), the name runs to the end.
+        let stop = chars[start + 1..]
+            .iter()
+            .position(|&c| c == close || c == ')')
+            .map_or(chars.len(), |at| start + 1 + at);
+        let end = if stop + 1 >= chars.len() {
+            chars.len()
+        } else {
+            stop
+        };
+        return refuse(message, end);
+    }
+    match chars[start + 1..]
+        .iter()
+        .position(|&c| c == close || c == ')')
+    {
+        Some(at) if chars[start + 1 + at] == close => Ok(Some(start + 2 + at)),
+        Some(at) => refuse("invalid group name", start + 1 + at),
+        // The pattern ends inside the name: Oniguruma's last read leaves the last character out,
+        // unless the name is that one character.
+        None => refuse("invalid group name", (chars.len() - 1).max(start + 1)),
+    }
 }
 
 /// Whether `pattern` could hold an assertion `starts_repetition` has to look after: `^`, `$` or
@@ -40658,6 +40838,23 @@ fn scan_fancy_pattern(pattern: &str) -> Option<(String, bool)> {
                     i = end;
                     continue;
                 }
+                // #7805: a group's name is no pattern text (`(?<a$>`, `(?'a{'`): copied through.
+                let close = match (rest.first(), rest.get(1)) {
+                    (Some('<'), Some(c)) if !matches!(c, '=' | '!') => Some('>'),
+                    (Some('\''), Some(_)) => Some('\''),
+                    _ => None,
+                };
+                if let Some(end) =
+                    close.and_then(|close| rest[1..].iter().position(|&c| c == close))
+                {
+                    // The delimiter is at `i + 3 + end`.
+                    let close_at = i + 3 + end;
+                    groups.push(flags);
+                    out.extend(&chars[i..=close_at]);
+                    at_start = false;
+                    i = close_at + 1;
+                    continue;
+                }
                 let letters = rest
                     .iter()
                     .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
@@ -43606,12 +43803,13 @@ fn run_safe(stage: &Expr) -> bool {
 /// Whether a tail or a run of stateless stages is small enough to keep: no
 /// more than [`MAX_KEPT_TAIL_NODES`] nodes.
 fn may_keep_run(stages: &[Expr]) -> bool {
+    // Every occurrence counted, a called def's body at each call, as before #7786: counted once per
+    // shared node, so a chain of defs that each call the one below twice stays linear.
     let mut nodes = 0usize;
-    let small = !stages.iter().any(|stage| {
-        any_subexpr(stage, &mut |_| {
-            nodes += 1;
-            nodes > MAX_KEPT_TAIL_NODES
-        })
+    let small = stages.iter().all(|stage| {
+        let budget = MAX_KEPT_TAIL_NODES + 1 - nodes;
+        nodes += crate::jq::walk::count_subexpr(stage, &mut |_| true, budget);
+        nodes <= MAX_KEPT_TAIL_NODES
     });
     #[cfg(test)]
     if small {
@@ -60803,14 +61001,12 @@ fn source_destructures_only_foreign_nodes(source: &Expr, register: &OwnedValue) 
 /// reading states only for the ones [`update_entry_try_bodies`] names. A handler that emits nothing (`catch empty`)
 /// has no output to misplace.
 fn emitting_handler_count(expr: &Expr) -> usize {
-    let mut count = 0;
-    any_subexpr(expr, &mut |e| {
-        if matches!(e, Expr::Try { catch: Some(handler), .. } if !emits_nothing(handler)) {
-            count += 1;
-        }
-        false
-    });
-    count
+    // Every occurrence, a called def's body at each call (#7786: counted once per shared node).
+    crate::jq::walk::count_subexpr(
+        expr,
+        &mut |e| matches!(e, Expr::Try { catch: Some(handler), .. } if !emits_nothing(handler)),
+        usize::MAX,
+    )
 }
 
 /// Where [`nested_landing`] ends up.
@@ -93672,9 +93868,77 @@ fn fold_step_each<S: EvalSemantics>(
         }
         OwnedStep::Handled(Err(error)) => Flow::Escaped(Control::Error(error)),
         OwnedStep::Declined(state) => {
+            // #7702: an UPDATE that is a call (or a pipe a call leads) runs on the state handed
+            // down, through the owned-call door, rather than on a re-indexed copy of the state.
+            let state = match owned_door_step::<S>(expr, state, optional, reentry, on_update) {
+                Ok(flow) => return flow,
+                Err(state) => state,
+            };
             eval_each_owned::<S>(expr, &state, optional, reentry, on_update)
         }
     }
+}
+
+/// [`eval_owned_input_bridge`]'s door (#7702): every output of the owned-call door over `input`,
+/// as the eager result the bridge would have answered, or `None`, nothing evaluated, when the door
+/// declines. Out of line and cold, so the bridge's frame, on the path of the eager evaluator's
+/// recursion, holds one result slot more and nothing else.
+#[cold]
+#[inline(never)]
+fn owned_door_collect<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+) -> Option<QueryResult<'a, W>> {
+    let mut outputs = Vec::new();
+    let flow = owned_call::door_borrowed::<S>(expr, input, optional, Reentry::REBUILT, &mut |v| {
+        outputs.push(v);
+        Demand::Continue
+    })?;
+    Some(match flow {
+        Flow::Escaped(control) => partial(outputs, control),
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
+    })
+}
+
+/// A fold or loop step over the state the loop owns, through #7483's owned-call door with the
+/// state handed down (#7702): `Err(state)`, untouched, when the door declines, which is all a
+/// shape the door cannot take costs (a compare on the node's discriminant).
+#[inline(always)]
+pub(crate) fn owned_door_step<S: EvalSemantics>(
+    expr: &Expr,
+    state: OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Result<Flow, OwnedValue> {
+    if !owned_call::door_candidate(expr) {
+        return Err(state);
+    }
+    owned_call::door_moved::<S>(expr, state, optional, reentry, sink)
+}
+
+/// [`owned_door_step`] shaped as [`eval_owned_expr_fork`]'s answer, for the loops that fork on
+/// their update's outputs (`until`, `while`, and `eval_generic`'s loop): every output, then the
+/// control that ended the step.
+pub(crate) fn owned_door_fork<S: EvalSemantics>(
+    expr: &Expr,
+    state: OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+) -> Result<(Vec<OwnedValue>, Option<Control>), OwnedValue> {
+    let mut outputs = Vec::new();
+    let flow = owned_door_step::<S>(expr, state, optional, reentry, &mut |value| {
+        outputs.push(value);
+        Demand::Continue
+    })?;
+    Ok((
+        outputs,
+        match flow {
+            Flow::Escaped(control) => Some(control),
+            Flow::Exhausted | Flow::Stopped { .. } => None,
+        },
+    ))
 }
 
 /// The by-value step a `reduce`/`foreach` UPDATE or an `until`/`while` `update`
@@ -95751,6 +96015,10 @@ fn eval_owned_read_door_stage<S: EvalSemantics>(
         Expr::Builtin(Builtin::First | Builtin::Last | Builtin::Nth(_)) => {
             eval_owned_first_last_nth::<S>(shape, input)
         }
+        // #7721: `getpath(P)` of a closed path, the element read in place.
+        Expr::Builtin(Builtin::GetPath(path)) => eval_owned_getpath_door::<S>(path, input),
+        // #7785: `contains(C)` of a closed needle, searched in place.
+        Expr::Builtin(Builtin::Contains(needle)) => eval_owned_contains_door::<S>(needle, input),
         Expr::Slice { .. }
         | Expr::SliceExpr { .. }
         | Expr::Try { catch: None, .. }
@@ -95920,6 +96188,74 @@ fn eval_owned_first_last_nth<S: EvalSemantics>(
         Ok(Some(element)) => owned_door_answer_may_leave(element),
         _ => None,
     }
+}
+
+/// `getpath(P)` of an owned input whose path `P` is closed ([`closed_expr_to_owned`]: it never reads
+/// `.`, so its one value is the same whatever the input is), walked by [`owned_getpath_walk`] (#7721).
+/// `$a | getpath([$i])` over a bound array re-indexed the array for every read without it: linear per
+/// read, where jq reads the element in place, and quadratic over a `limit`, `range` or `recurse` body
+/// that reads once per output. The answer leaves under [`owned_door_answer_may_leave`], as the
+/// `first`/`last`/`nth` door's does, and a path that is not closed, is not an array, or whose walk
+/// raises declines, so the error, its text and `?` stay the bridge's. jq mode only: yq's lexer
+/// rejects `getpath` (gated by `--jq-extensions`, #1512), and its walk differs.
+#[inline(never)]
+fn eval_owned_getpath_door<S: EvalSemantics>(
+    path: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    owned_door_answer_may_leave(owned_getpath_walk::<S>(
+        closed_expr_to_owned::<S>(path)?,
+        input,
+    )?)
+}
+
+/// `getpath`'s walk of `path` over an owned `input`, through [`getpath_walk_owned_segments`], the
+/// walk the evaluator's own `getpath` of an owned value takes, so the two cannot drift (#7721).
+/// `None` for a path that is not an array and for a walk that raises.
+fn owned_getpath_walk<S: EvalSemantics>(
+    path: OwnedValue,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    let OwnedValue::Array(path) = path else {
+        return None;
+    };
+    match getpath_walk_owned_segments::<Vec<u64>, S>(input, &path, false) {
+        QueryResult::Owned(value) => Some(value),
+        _ => None,
+    }
+}
+
+/// `contains(C)` of an owned input whose needle `C` is closed ([`closed_expr_to_owned`]), answered by
+/// [`owned_contains_verdict`] (#7785). `$a | contains([$i])` over a bound array re-indexed the array for
+/// every call without it, where jq searches it in place and stops at the first match. A needle that is
+/// not closed, and one of another kind than the input (the containment error), decline, so the error,
+/// its text and `?` stay the bridge's. jq mode only, like [`eval_owned_getpath_door`].
+#[inline(never)]
+fn eval_owned_contains_door<S: EvalSemantics>(
+    needle: &Expr,
+    input: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq {
+        return None;
+    }
+    owned_contains_verdict::<S>(input, &closed_expr_to_owned::<S>(needle)?)
+}
+
+/// `input | contains(needle)` as the evaluator's `contains` answers it ([`builtin_contains`]): the
+/// kind check of [`containment_kind_mismatch_should_error`], then [`owned_contains`], the bridge's own
+/// search, so the doors and the bridge cannot drift (#7785). `None` where the bridge raises (a kind
+/// mismatch), and in yq mode, whose rules the bridge keeps.
+fn owned_contains_verdict<S: EvalSemantics>(
+    input: &OwnedValue,
+    needle: &OwnedValue,
+) -> Option<OwnedValue> {
+    if S::TAG != EvalTag::Jq || containment_kind_mismatch_should_error::<S>(input, needle) {
+        return None;
+    }
+    Some(OwnedValue::Bool(owned_contains::<S>(input, needle)))
 }
 
 /// Whether a value a door read off an owned input may leave as the stage's own answer (#7132): the
@@ -96255,6 +96591,14 @@ fn eval_owned_input_bridge<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     input: &OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #7702: #7483's owned-call door first, as the lazy twin's bridge (`owned_bridge`) tries it, so
+    // a call reached by an eager caller (a `recurse` level collected into `[...]`, a fold's fork)
+    // does not write its input out at each call.
+    if owned_call::door_candidate(expr) {
+        if let Some(answer) = owned_door_collect::<W, S>(expr, input, optional) {
+            return answer;
+        }
+    }
     // Serialize and reparse to obtain a document the evaluator can index into.
     //
     // `to_json_for_reindex` (not `to_json`): this round-trip is purely
@@ -100719,6 +101063,22 @@ impl<'e> LoopOperand<'e> {
         eval_owned_expr_fork::<S>(expr, input, optional, Reentry::Proven)
     }
 
+    /// [`Self::fork`] for the update of a round whose state the loop hands on (#7702): the state
+    /// goes to #7483's owned-call door by value ([`owned_door_fork`]), so a call's write lands in
+    /// place; a shape the door declines forks as before.
+    fn fork_moved<S: EvalSemantics>(
+        &self,
+        state: OwnedValue,
+        optional: bool,
+        ambient: bool,
+    ) -> (Vec<OwnedValue>, Option<Control>) {
+        let expr = if ambient { self.expr } else { self.demoted };
+        match owned_door_fork::<S>(expr, state, optional, Reentry::Proven) {
+            Ok(answer) => answer,
+            Err(state) => eval_owned_expr_fork::<S>(expr, &state, optional, Reentry::Proven),
+        }
+    }
+
     /// [`Self::fork`] for the loop's `cond`, which is read only for its
     /// truthiness: a shape [`owned_cond_verdict`] answers is settled from the
     /// state's tree, and anything else is [`Self::fork`]'s (#3697).
@@ -100875,7 +101235,7 @@ fn until_step<S: EvalSemantics>(
                 OwnedRound::Done => return Ok(Demand::Continue),
                 OwnedRound::Declined(declined) => state = declined,
             }
-            let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
+            let (update_vals, update_control) = update.fork_moved::<S>(state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {
                 state = update_vals.into_iter().next().unwrap();
                 ambient = false;
@@ -101067,7 +101427,7 @@ fn while_step<S: EvalSemantics>(
                 OwnedRound::Done => return Ok(Demand::Continue),
                 OwnedRound::Declined(declined) => state = declined,
             }
-            let (update_vals, update_control) = update.fork::<S>(&state, optional, ambient);
+            let (update_vals, update_control) = update.fork_moved::<S>(state, optional, ambient);
             if update_control.is_none() && update_vals.len() == 1 {
                 state = update_vals.into_iter().next().unwrap();
                 ambient = false;
@@ -111159,7 +111519,9 @@ fn format_strftime(
                     }
                 }
             }
+            let mut alternative = false;
             if let Some(modifier @ ('E' | 'O')) = spec {
+                alternative = modifier == 'O';
                 spec = chars.next();
                 if spec.is_none() {
                     result.push(modifier);
@@ -111190,8 +111552,18 @@ fn format_strftime(
                 // month abbreviation (#7784). glibc has neither (its `strftime` prints them as
                 // written), and there the pinned libc's C layout stands.
                 // A time the C library cannot hold (a year past `int`) gets the C rendering.
+                // #7790: `%OB` is the locale's alternative month name in macOS's libc, the
+                // nominative one a month standing alone takes (`leden` where `%B` is `ledna` under
+                // `cs_CZ`), as jq prints it there; glibc's manual gives `%OB`, `%Ob` and `%Oh` as
+                // its alternative names (not checked against a glibc jq). Every other modified
+                // name or layout is the plain one in macOS's libc, under every locale it has.
                 if !matches!(letter, '+' | 'v') || cfg!(target_vendor = "apple") {
-                    if let Some(text) = locale_time::render(&format!("%{letter}"), &tm) {
+                    let spec = if alternative && matches!(letter, 'B' | 'b' | 'h') {
+                        format!("%O{letter}")
+                    } else {
+                        format!("%{letter}")
+                    };
+                    if let Some(text) = locale_time::render(&spec, &tm) {
                         result.push_str(&text);
                         continue;
                     }
@@ -112028,7 +112400,10 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                             None => (MONTH_FULL[i], MONTH_ABBR[i]),
                         };
                         if alternative_names {
-                            strptime_name_len(&input_iter, full, "").map(|len| (i, len))
+                            // #7790: the alternative names `%OB` prints (`leden` under `cs_CZ`,
+                            // where `%B` reads `ledna`), as macOS's libc reads them.
+                            let alt = names.map_or(full, |n| n.month_alt[i].as_str());
+                            strptime_name_len(&input_iter, alt, "").map(|len| (i, len))
                         } else {
                             strptime_name_len(&input_iter, full, abbr).map(|len| (i, len))
                         }
@@ -120415,6 +120790,16 @@ fn is_static_dollar(params: &[Param], shared: &[Rc<SharedArg>], i: usize) -> boo
     params[i].is_dollar() && matches!(shared[i].expr(), Expr::Literal(_))
 }
 
+/// What a statically bound `$` parameter's `$name` is replaced with (#3260): the literal its
+/// argument is, as itself (#7483). A literal holds no variable for a later substitution to reach
+/// and evaluates to itself, so the `Shared` around it hid nothing, but it hid the literal from the
+/// owned evaluator's closed and pure grammars: `def f($n): if $n == 0 then ... end; f(12)` read its
+/// condition through the re-index bridge. A string literal is cloned per occurrence, where the
+/// `Shared` was a reference count, as an `as`-bound value's literal is.
+fn static_dollar_arg(arg: &Rc<SharedArg>) -> Expr {
+    arg.expr().clone()
+}
+
 /// Whether `$name` in the body resolves to `params[i]`: it is `$`-style and
 /// no later `$` parameter shares its name.
 fn is_last_dollar(params: &[Param], i: usize) -> bool {
@@ -120470,7 +120855,7 @@ fn substitute_params(body: &Expr, params: &[Param], shared: &[Rc<SharedArg>]) ->
         if is_static_dollar(params, shared, i) && is_last_dollar(params, i) {
             subs.push(ParamSubst {
                 name: param.name(),
-                arg: Expr::Shared(Rc::clone(arg)),
+                arg: static_dollar_arg(arg),
                 scope: DOLLAR_NAMESPACE_ONLY,
             });
         }
@@ -120539,7 +120924,7 @@ fn sequential_substitution(body: &Expr, params: &[Param], shared: &[Rc<SharedArg
             result = Some(substitute_func_param_impl(
                 result.as_ref().unwrap_or(body),
                 param.name(),
-                &Expr::Shared(Rc::clone(arg)),
+                &static_dollar_arg(arg),
                 DOLLAR_NAMESPACE_ONLY,
             ));
         }
@@ -120567,7 +120952,7 @@ fn eval_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 frames,
                 cache,
                 body,
-                value,
+                TailValue::Borrowed(value),
                 optional,
                 &mut |item| {
                     items.push(item);
@@ -120602,9 +120987,15 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     match bind_def_call(def, args, frames, bound) {
-        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
-            each_def_tail_loop::<W, S>(def, frames, bound, body, value, optional, sink)
-        }
+        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => each_def_tail_loop::<W, S>(
+            def,
+            frames,
+            bound,
+            body,
+            TailValue::Borrowed(value),
+            optional,
+            sink,
+        ),
         Ok(body) => match enter_def_call(def, frames, bound) {
             Ok(_guard) => eval_each::<W, S>(&body, value, optional, sink),
             Err(e) => Flow::Escaped(Control::Error(e)),
@@ -120657,9 +121048,48 @@ fn tail_one<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     cur: &TailValue<'a, W>,
     optional: bool,
 ) -> Result<Option<TailValue<'a, W>>, Flow> {
+    tail_one_of::<W>(|sink| tail_each::<W, S>(expr, cur, optional, sink))
+}
+
+/// [`tail_each`] for the last use of `cur` (#7483): a value the loop built is handed down to
+/// `expr` ([`owned_call::eval_moved`]), so an assignment writes into its storage instead of a copy
+/// of every container on its path. jq mode; a borrowed value and yq mode take [`tail_each`].
+fn tail_each_moved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    cur: TailValue<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match cur {
+        TailValue::Owned(value) if S::TAG == EvalTag::Jq => {
+            owned_call::eval_moved::<S>(expr, value, optional, &mut |o| sink(Item::Owned(o)))
+        }
+        cur => tail_each::<W, S>(expr, &cur, optional, sink),
+    }
+}
+
+/// [`tail_one`] for a stage whose answer replaces `cur` (#7483): a value the loop built is handed
+/// to the stage ([`tail_each_moved`]), leaving `null` in `cur` until the caller stores the answer.
+/// Every caller replaces `cur` with the answer or ends the round on what this returns otherwise.
+fn tail_one_moved<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    cur: &mut TailValue<'a, W>,
+    optional: bool,
+) -> Result<Option<TailValue<'a, W>>, Flow> {
+    if S::TAG != EvalTag::Jq || !matches!(cur, TailValue::Owned(_)) {
+        return tail_one::<W, S>(expr, cur, optional);
+    }
+    let taken = core::mem::replace(cur, TailValue::Owned(OwnedValue::Null));
+    tail_one_of::<W>(|sink| tail_each_moved::<W, S>(expr, taken, optional, sink))
+}
+
+/// The one value `run` hands its sink, as [`tail_one`] reads it.
+fn tail_one_of<'a, W: Clone + AsRef<[u64]>>(
+    run: impl FnOnce(&mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
+) -> Result<Option<TailValue<'a, W>>, Flow> {
     let mut out: Option<TailValue<'a, W>> = None;
     let mut more = false;
-    let flow = tail_each::<W, S>(expr, cur, optional, &mut |item| {
+    let flow = run(&mut |item| {
         if out.is_some() {
             more = true;
         } else {
@@ -120801,7 +121231,9 @@ fn tail_step<'e, 'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     return Tail::Rest(expr);
                 };
                 for stage in before {
-                    match tail_one::<W, S>(stage, cur, optional) {
+                    // #7483: `cur` is replaced by what the stage answers, so a built value is
+                    // handed to the stage and an assignment writes into it rather than a copy.
+                    match tail_one_moved::<W, S>(stage, cur, optional) {
                         Ok(Some(next)) => *cur = next,
                         Ok(None) => return Tail::Done(Flow::Exhausted),
                         Err(flow) => return Tail::Done(flow),
@@ -120851,7 +121283,7 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     frames: u32,
     bound: &BoundBody,
     body: Rc<Expr>,
-    value: StandardJson<'a, W>,
+    start: TailValue<'a, W>,
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
@@ -120865,7 +121297,7 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut hot = bound.is_hot();
     // Whether `body` can be run again as it is, asked at the first hop back to it.
     let mut reusable: Option<bool> = None;
-    let mut cur = TailValue::Borrowed(value);
+    let mut cur = start;
     loop {
         let _round = match enter_def_call_in(&callee, body_frames, hot) {
             Ok(guard) => guard,
@@ -120906,7 +121338,8 @@ fn each_def_tail_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     }
                 }
                 Tail::Bound(then) => walked = then,
-                Tail::Rest(rest) => return tail_each::<W, S>(rest, &cur, optional, sink),
+                // #7483: the rest is the round's last use of `cur`, so a built value is handed down.
+                Tail::Rest(rest) => return tail_each_moved::<W, S>(rest, cur, optional, sink),
                 Tail::Done(flow) => return flow,
             }
         };
@@ -121520,12 +121953,14 @@ impl ScopeMask {
         // (review) -- it is a property of the slice, and every entry point
         // builds its mask through this function, so checking it once per
         // bind replaces an O(subs.len()) scan at *every node* of the
-        // recursion.
+        // recursion. A literal (a statically bound `$` parameter's argument, #7483) is the one
+        // unwrapped argument allowed: it holds no variable or call a binder could recapture.
         debug_assert!(
-            subs.iter().all(|s| matches!(s.arg, Expr::Shared(_))),
+            subs.iter()
+                .all(|s| matches!(s.arg, Expr::Shared(_) | Expr::Literal(_))),
             "substitute_func_param's capture-hygiene argument (#2096) requires every `arg` to \
-             be Expr::Shared-wrapped -- an unwrapped `arg` can be recaptured by a same-named \
-             binder in `expr` (#2077)"
+             be Expr::Shared-wrapped (or a literal) -- an unwrapped `arg` can be recaptured by a \
+             same-named binder in `expr` (#2077)"
         );
         let mut mask = Self { dollar: 0, bare: 0 };
         for (i, sub) in subs.iter().enumerate() {
@@ -122920,6 +123355,104 @@ mod tests {
             &parse("reduce ({}) as {(.k): $v} (0; .)").unwrap()
         ));
         assert!(input_free_operand(&parse("error(1)").unwrap()));
+    }
+
+    /// #7721: `$a | getpath(P)` with a closed path reads the element off the bound value, in a fold
+    /// step (the closed pipe's stage) and in a body that reads once per output (the read door), where
+    /// it wrote the whole bound array out and indexed it again for every read: linear per read,
+    /// quadratic over the run. `reindex_count` counts every serialize-and-index of an `OwnedValue`. A
+    /// path that raises still takes the bridge once per read, so the counter is not one that reads
+    /// zero for everything.
+    #[test]
+    fn getpath_of_a_bound_container_reads_in_place_7721() {
+        use crate::jq::value::reindex_count;
+        fn run(filter: &str) -> (String, usize) {
+            let expr = parse(filter).expect("filter parses");
+            let doc = alloc::rc::Rc::new(
+                OwnedValue::Null
+                    .reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
+            );
+            let before = reindex_count::get();
+            let answer = eval::<Vec<u64>, JqSemantics>(&expr, doc.root())
+                .collect_owned::<JqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ");
+            (answer, reindex_count::get() - before)
+        }
+        let n = 400;
+        for (filter, expected) in [
+            (format!("[range({n})] as $a | reduce range({n}) as $i (0; . + ($a | getpath([$i])))"), "79800"),
+            (format!("[range({n})] as $a | reduce range({n}) as $i ([]; . + [$a | getpath([$i])]) | length"), "400"),
+            (format!(r#"{{k: [range({n})]}} as $o | reduce range({n}) as $i (0; . + ($o | getpath(["k", $i])))"#), "79800"),
+            (format!("[range({n})] as $a | [foreach range({n}) as $i (0; . + ($a | getpath([$i])))] | length"), "400"),
+            (format!("[range({n})] as $a | [range({n}) as $i | $a | getpath([$i])] | add"), "79800"),
+            (format!("[range({n})] as $a | [limit({n}; range({n}) as $i | $a | getpath([-1 - $i]))] | add"), "79800"),
+            (format!("[range({n})] as $a | [range({n}) as $i | $a | getpath([$i]) | . + 1] | add"), "80200"),
+        ] {
+            let (answer, reindexes) = run(&filter);
+            assert_eq!(answer, expected, "{filter}");
+            assert!(reindexes < 10, "{filter}: {reindexes} re-indexes, the bound array was read through the bridge");
+        }
+        // A path whose walk raises declines to the bridge, which keeps its error (here swallowed).
+        let (answer, reindexes) =
+            run(r#"[range(40)] as $a | [range(40) as $i | $a | getpath([$i, "x"])?] | length"#);
+        assert_eq!(answer, "0");
+        assert!(
+            reindexes >= 40,
+            "the declining path should bridge per read: {reindexes}"
+        );
+    }
+
+    /// #7785: `$a | contains(C)` with a closed needle searches the bound value in place, in a fold
+    /// step (the closed pipe's read stage) and in a body that asks once per output (the read door),
+    /// where it wrote the whole bound value out and indexed it again for every call. `reindex_count`
+    /// counts every serialize-and-index of an `OwnedValue`. A needle of another kind (the containment
+    /// error) still takes the bridge once per call, so the counter is not one that reads zero for
+    /// everything.
+    #[test]
+    fn contains_of_a_bound_container_reads_in_place_7785() {
+        use crate::jq::value::reindex_count;
+        fn run(filter: &str) -> (String, usize) {
+            let expr = parse(filter).expect("filter parses");
+            let doc = alloc::rc::Rc::new(
+                OwnedValue::Null
+                    .reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
+            );
+            let before = reindex_count::get();
+            let answer = eval::<Vec<u64>, JqSemantics>(&expr, doc.root())
+                .collect_owned::<JqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ");
+            (answer, reindex_count::get() - before)
+        }
+        let n = 400;
+        for (filter, expected) in [
+            (format!("[range({n})] as $a | reduce range({n}) as $i (0; if $a | contains([$i]) then . + 1 else . end)"), "400"),
+            (format!("[range({n})] as $a | reduce range({n}) as $i ([]; . + [$a | contains([$i, $i + {n}])]) | length"), "400"),
+            (format!("{{k: [range({n})]}} as $o | reduce range({n}) as $i (0; if $o | contains({{k: [$i]}}) then . + 1 else . end)"), "400"),
+            (format!("[range({n})] as $a | [foreach range({n}) as $i (0; if $a | contains([$i]) then . + 1 else . end)] | length"), "400"),
+            (format!("[range({n})] as $a | [range({n}) as $i | $a | contains([$i])] | length"), "400"),
+            (format!("[range({n})] as $a | [limit({n}; range({n}) as $i | $a | contains([[$i]]))] | length"), "400"),
+            (format!(r#"([range({n})] | tojson) as $s | [range({n}) as $i | $s | contains("\($i)")] | length"#), "400"),
+        ] {
+            let (answer, reindexes) = run(&filter);
+            assert_eq!(answer, expected, "{filter}");
+            assert!(reindexes < 10, "{filter}: {reindexes} re-indexes, the bound value was searched through the bridge");
+        }
+        // A needle of another kind declines to the bridge, which keeps its error (here swallowed).
+        let (answer, reindexes) =
+            run(r#"[range(40)] as $a | [range(40) as $i | $a | contains("x")?] | length"#);
+        assert_eq!(answer, "0");
+        assert!(
+            reindexes >= 40,
+            "the declining needle should bridge per call: {reindexes}"
+        );
     }
 
     /// #7563, #7452: a fold step that writes an array slot by a negative index (`.[-$k]`, `.[-1]`)
@@ -125727,14 +126260,15 @@ mod tests {
         };
         let pair = |a: Expr, b: Expr| Expr::Array(Box::new(Expr::Comma(vec![a, b])));
 
-        // `def f($a): [$a, a]; f(1)`: both namespaces substituted, no `as`.
+        // `def f($a): [$a, a]; f(1)`: both namespaces substituted, no `as`. `$a` reads the
+        // literal itself (#7483, `static_dollar_arg`); the bare `a` is the closure, a `Shared`.
         assert_eq!(
             bind_def_call_params(
                 &pair(dollar_ref("a"), bare_ref("a")),
                 &[dollar("a")],
                 &[lit(1)]
             ),
-            pair(shared_lit(1), shared_lit(1)),
+            pair(lit(1), shared_lit(1)),
         );
         // `def f($a; $a): $a; f(1; 2)`: the last `$a` wins, the shadowed
         // literal one is dropped.
@@ -125744,7 +126278,7 @@ mod tests {
                 &[dollar("a"), dollar("a")],
                 &[lit(1), lit(2)]
             ),
-            shared_lit(2),
+            lit(2),
         );
         // `def f($a; $a): $a; f(.x; 2)`: the shadowed non-literal one keeps
         // its `as`, so it still iterates (and can raise) as jq's does.
@@ -125757,7 +126291,7 @@ mod tests {
             Expr::As {
                 expr: Box::new(Expr::shared(Expr::Field("x".into()))),
                 var: "a".into(),
-                body: Box::new(shared_lit(2)),
+                body: Box::new(lit(2)),
             },
         );
         // `def f($a; $b): [$a, $b]; f(.x; 2)`: only the literal one is static.
@@ -125770,7 +126304,7 @@ mod tests {
             Expr::As {
                 expr: Box::new(Expr::shared(Expr::Field("x".into()))),
                 var: "a".into(),
-                body: Box::new(pair(dollar_ref("a"), shared_lit(2))),
+                body: Box::new(pair(dollar_ref("a"), lit(2))),
             },
         );
         // `def f(a; $a): [$a, a]; f(1; 2)`: a bare parameter never binds `$a`.
@@ -125780,7 +126314,7 @@ mod tests {
                 &[bare("a"), dollar("a")],
                 &[lit(1), lit(2)]
             ),
-            pair(shared_lit(2), shared_lit(2)),
+            pair(lit(2), shared_lit(2)),
         );
         // `def f($a): 5 as $a | $a; f(1)`: an inner binder shadows the static
         // substitution exactly as it shadowed the `as`.
@@ -163049,6 +163583,13 @@ mod tests {
             ("2100-03-01", 1), // Monday; bug self-corrects here
             ("2200-02-15", 6), // Saturday; jq-macOS wrongly gives 5 (Friday)
             ("2300-02-15", 4), // Thursday; jq-macOS wrongly gives 3 (Wednesday)
+            // #7808: every century year not divisible by 400 is affected, not only these.
+            ("0100-01-01", 5), // Friday; jq-macOS wrongly gives 4 (Thursday)
+            ("1000-01-01", 3), // Wednesday; jq-macOS wrongly gives 2 (Tuesday)
+            ("1000-03-01", 6), // Saturday; March agrees
+            ("1700-02-28", 0), // Sunday; jq-macOS wrongly gives 6 (Saturday)
+            ("3000-01-31", 5), // Friday; jq-macOS wrongly gives 4 (Thursday)
+            ("9900-02-01", 4), // Thursday; jq-macOS wrongly gives 3 (Wednesday)
         ] {
             let input = format!("\"{date}\"");
             query!(input.as_bytes(), r#"strptime("%Y-%m-%d")[6]"#,
@@ -184912,6 +185453,40 @@ mod share_audit_2999 {
             "reduce .[] as $t ([[], 0]; [.[0] + [[$t] | sort], .[1] + 1])",
             "reduce .[] as $t ([]; .[$t] = {a: [range(2)]})",
             "reduce .[] as $t ([]; . + [limit(2; range(5))])",
+        ] {
+            assert_forced(&json, filter, &[]);
+        }
+    }
+
+    /// #7721: a fold step that stores an element read off a bound container with `getpath`
+    /// declined the in-place step, because the closed pipe had no `getpath` stage, and the
+    /// evaluator's `+` or write on the borrowed state copied the accumulator on every step. The
+    /// stage now walks the bound value, and 1,000 steps force no copy.
+    #[test]
+    fn fold_step_storing_a_getpath_read_copies_nothing_7721() {
+        let json = ints(1000);
+        for filter in [
+            ". as $a | reduce range(length) as $i ([]; . + [$a | getpath([$i])])",
+            r#". as $a | reduce range(length) as $i ({}; .["\($i)"] = ($a | getpath([$i])))"#,
+            r#"{k: .} as $o | reduce range(length) as $i ([]; . + [$o | getpath(["k", $i])])"#,
+            ". as $a | reduce range(length) as $i ([]; .[$i] = ($a | getpath([-1 - $i])))",
+            ". as $a | [foreach range(length) as $i ([]; . + [$a | getpath([$i])]; length)] | length",
+        ] {
+            assert_forced(&json, filter, &[]);
+        }
+    }
+
+    /// #7785: the same for a fold step that stores a `contains` answer over a bound container: the
+    /// closed pipe had no `contains` stage, the step declined, and the evaluator's `+` or write on
+    /// the borrowed state copied the accumulator on every step. 1,000 steps now force no copy.
+    #[test]
+    fn fold_step_storing_a_contains_answer_copies_nothing_7785() {
+        let json = ints(1000);
+        for filter in [
+            ". as $a | reduce range(length) as $i ([]; . + [$a | contains([$i])])",
+            r#". as $a | reduce range(length) as $i ({}; .["\($i)"] = ($a | contains([$i, 1])))"#,
+            "{k: .} as $o | reduce range(length) as $i ([]; . + [$o | contains({k: [$i]})])",
+            ". as $a | [foreach range(length) as $i ([]; . + [$a | contains([$i])]; length)] | length",
         ] {
             assert_forced(&json, filter, &[]);
         }

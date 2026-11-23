@@ -2,6 +2,27 @@
 
 Tracks updates to the knowledge wiki pages in `docs/`.
 
+## 2026-11-23 — The bug-hunting guide covers the hunt's second round
+
+**Sources ingested:**
+- The second round's hunters' reports (five territories), the coordinator's log, the filing log (issues to #7815) and
+  the issue states on GitHub, the briefs' added rules, the A/B timing reports of the branches timed in the round, the
+  attribution of the M4 Pro's 1 MB rows, the mid-way `dev compare jq --full` run, the fourth integration and
+  verification passes, the AVX2 pass and the shipped-text audit
+- `src/bin/succinctly/jq_runner/window.rs` (`WINDOW_BYTES`, the `min_windowed_*_bytes` thresholds, the debug window's
+  limits) and `tests/common/small_window.rs`
+
+**Pages updated:**
+- [guides/bug-hunting.md](guides/bug-hunting.md) — the second round: headline counts as of 2026-11-23 00:45 UTC, the
+  strategies that paid off (builtin families, split files by unopenable files, terminals and devices through a
+  pseudo-terminal, debug against release, call-heavy grids and def DAGs, attribution by holding one quantity
+  constant, three-way upstream suites with stderr), the round's coverage map and the updated never-covered list, new
+  harness rules, the timing pass and its acceptance policy with the round's scoreboard, what the CI perf guard does
+  not see, regressions from the hunt's own fixes, shipped-text rules, permission boundaries, hand-over, and the
+  stopping rules as applied; the window thresholds corrected to the 256 KiB window
+- [guides/developer.md](guides/developer.md) — the window is 256 KiB since #7412, and the debug window's range is 8192
+  to 262144
+
 ## 2026-11-23 — A guide to differential bug hunting
 
 **Sources ingested:**

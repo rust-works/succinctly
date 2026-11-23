@@ -41,7 +41,8 @@ uninitialised heap (`parser_init` leaves `tokenbuf` null and `token()` grows it 
 Amazon Linux 2023 on aarch64 holds `u`. jq 1.8.2 fixed the read (`tokenpos > 1`, jqlang/jq#3324),
 and `succinctly jq` follows it (#7525): a bare `n` is always "Invalid numeric literal". So
 against the pinned 1.7.1 `artifact()` skips a stream whose first bare `n` is classified
-before any token has written index 1, or after one that may have left a `u` there. A bare
+before any token has written index 1, or after one that may have left a `u` there (a failing
+token's terminating `"` opens no string, as jq resets the parser there, #7806). A bare
 `n` after any other byte agrees on both versions, so the sweep keeps checking it (#1723,
 #6513). `--expect-artifacts` includes the skipped shapes.
 
@@ -208,6 +209,17 @@ def malformed_bom(data):
 _TOKEN_ENDS = b" \t\r\n\x1e[]{},:\""
 
 
+_NUMBER = re.compile(
+    rb"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?|[+-]?(inf|infinity|nan\d*|snan\d*)", re.IGNORECASE
+)
+
+
+def _valid_word(word):
+    """Whether jq 1.7.1's `check_literal` accepts `word`: `true`, `false`, `null`, `nan`, or a number
+    its decNumber reader takes (digits with an optional point and exponent, `infinity`, `nan`)."""
+    return word in (b"true", b"false", b"null", b"nan") or _NUMBER.fullmatch(word) is not None
+
+
 def reads_unwritten_tokenbuf(data):
     """Whether jq 1.7.1 may classify a bare one-byte `n` token (`check_literal`'s
     `tokenbuf[1] == 'u'`) against a `u`: before anything in `data` has written
@@ -265,7 +277,10 @@ def reads_unwritten_tokenbuf(data):
                 held = 0  # a bare `n` leaves its own NUL at index 1
             elif word not in (b"t", b"f"):
                 held = 0
-            i = j
+            # A word that is no literal or number fails at the byte that ends it; jq resets the
+            # parser there, so a `"` that ends it opens no string (#7806): the bytes after it are
+            # tokens, not string text.
+            i = j + 1 if data[j : j + 1] == b'"' and not _valid_word(word) else j
     return False
 
 

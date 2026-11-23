@@ -287,13 +287,19 @@ fn value_locations(
 fn final_buffer_start(raw_bytes: &[(Option<usize>, Vec<u8>)], total: usize) -> usize {
     let last: &[u8] = raw_bytes.last().map_or(&[], |(_, raw)| raw.as_slice());
     let last_start = total - last.len();
-
     let mut chunk_start = 0usize;
     let mut final_chunk = None;
     for len in fgets_chunk_lens(last) {
         final_chunk = Some((chunk_start, len));
         chunk_start += len;
     }
+    let final_chunk = final_chunk.map(|(start, len)| (start, len, last[start + len - 1] == b'\n'));
+    last_start + final_buffer_start_after(final_chunk, last.len())
+}
+
+/// [`final_buffer_start`] for a stream of `total` bytes whose last source's last chunk holding data
+/// is `final_chunk` (`(start, len)`, and whether it ends at a newline), found as the chunks were.
+fn final_buffer_start_after(final_chunk: Option<(usize, usize, bool)>, total: usize) -> usize {
     match final_chunk {
         // An empty last source is itself the (empty) final buffer.
         None => total,
@@ -301,12 +307,11 @@ fn final_buffer_start(raw_bytes: &[(Option<usize>, Vec<u8>)], total: usize) -> u
         // newline or on the size limit has not reached EOF yet, so an
         // *empty* buffer follows and that one is final; otherwise this
         // chunk is.
-        Some((start, len)) => {
-            let stopped_early = len == JQ_FGETS_CHUNK || last[start + len - 1] == b'\n';
-            if stopped_early {
+        Some((start, len, newline)) => {
+            if len == JQ_FGETS_CHUNK || newline {
                 total
             } else {
-                last_start + start
+                start
             }
         }
     }
@@ -418,6 +423,11 @@ const SEARCH_BLOCK: usize = 64;
 /// The bytes [`find_byte`] reads one at a time before it takes blocks: a match this near costs no
 /// block, which keeps a stream of short lines (one `fgets` chunk each) as cheap as it was.
 const SEARCH_HEAD: usize = 16;
+
+/// The window [`SeqStreamWalker`] probes for a newline (#7775): a run of [`JQ_FGETS_CHUNK`] bytes
+/// with no newline holds a whole window of this size wherever it starts, so a stretch whose every
+/// window holds a newline has none, and its `fgets` chunks are its lines.
+const LINE_PROBE: usize = JQ_FGETS_CHUNK.div_ceil(2);
 
 /// The offset of the first `needle` in `hay` (#7263): the first [`SEARCH_HEAD`] bytes one at a
 /// time, then a [`SEARCH_BLOCK`] at a time, where only the block that holds it is searched a byte
@@ -1245,6 +1255,725 @@ fn walk_stream_placing(
     }
 }
 
+/// A `--seq` stream walked as its bytes are read (#7775), for a run that reads it through the `input`
+/// queue: the walk [`walk_stream_collecting_at`] makes of the whole stream, a piece at a time, so a
+/// program that reads only the first records reads only the bytes they are in, as jq does.
+///
+/// The bytes are read a source at a time ([`SeqStreamWalker::start_source`],
+/// [`SeqStreamWalker::read_from`], [`SeqStreamWalker::end_source`], then [`SeqStreamWalker::end`]), and
+/// [`SeqStreamWalker::advance`] walks every byte of the `fgets` chunks that are whole by then: a chunk
+/// ends at a newline or after [`JQ_FGETS_CHUNK`] bytes, or at its source's end, and what jq's parser
+/// sees of it (the NUL cut of #7340) is known only then. Each value, each fault and each place is the
+/// one the whole walk gives, in the same order, so a run that reads to the end reads what it did: a
+/// test holds the two to each other. Not for `-s`, a stream with a file that did not open, or a
+/// resumed stream (`seed_*`): their walks need the whole stream first.
+///
+/// The walk holds what jq's reader holds and no more: the values are taken out as they are handed
+/// on ([`SeqStreamWalker::pop_value`], [`SeqStreamWalker::pop_fault`]), and the bytes before the first
+/// one still needed (by a value not yet taken, the value being read, the next byte to walk, or the
+/// next place to count) are released, so a stream of any length is read in the room of its longest
+/// record and a read or two.
+pub(crate) struct SeqStreamWalker {
+    /// The bytes still held: the stream from offset `base` on, the sources one after another. Every
+    /// offset the walk deals in is the stream's own.
+    data: Vec<u8>,
+    base: usize,
+    /// Each source's tag and where it starts in the stream.
+    sources: Vec<(Option<usize>, usize)>,
+    /// Whether the last source has ended, and whether every source has.
+    source_ended: bool,
+    ended: bool,
+    /// Where the next `fgets` chunk of the last source starts; the stream up to `whole` is in whole
+    /// chunks.
+    chunk_at: usize,
+    whole: usize,
+    /// Whether the last whole chunk of the last source filled the buffer without a newline: a
+    /// malformed BOM's reader resets at the refill after it ([`refill_boundaries`]).
+    after_full_chunk: bool,
+    /// The last whole chunk of the last source, `(start, len)`, and whether it ends at a newline:
+    /// where jq's final buffer starts ([`final_buffer_start`]) is read from it once the stream has ended.
+    last_chunk: Option<(usize, usize, bool)>,
+    /// What a read that is not a regular file's is read into, kept so it is zeroed once
+    /// ([`Self::read_from`]).
+    scratch: Vec<u8>,
+    /// How far the stream is known to be UTF-8, and its first byte that is not.
+    valid_to: usize,
+    first_invalid: Option<usize>,
+    /// The reader, once the stream's front has said whether it is a BOM ([`bom_prefix`]).
+    reader: Option<Reader<'static>>,
+    /// What [`Self::whole_chunks`] found before the reader was made: the starts of chunks after a
+    /// full one, and the NUL cuts.
+    pending: (Vec<usize>, Vec<(usize, usize)>),
+    /// Where the reader stands, and the refill boundaries: offsets into `data`, as every offset the
+    /// reader holds is, so its byte loop is the whole stream's ([`Reader::rebase`]).
+    at: RunAt,
+    boundaries: Vec<usize>,
+    /// Where the next place is counted from: each value's and each fault's, in the stream's order.
+    cursor: PlaceCursor,
+    /// The values walked and not yet taken, each with its place, and the faults with theirs.
+    values: std::collections::VecDeque<((usize, usize), (usize, usize))>,
+    faults: std::collections::VecDeque<SeqFault>,
+    /// How many values have been taken ([`Self::pop_value`]).
+    taken: usize,
+    /// The first byte and the end of the last value walked, for where the stream's end is read.
+    last_value: Option<(u8, usize)>,
+    /// The newlines of the last source in the bytes released, and where the last of them ends.
+    released_newlines: usize,
+    released_line_end: Option<usize>,
+    finished: bool,
+}
+
+/// The fewest bytes [`SeqStreamWalker`] releases at once: below this a stream is held whole. The tests
+/// release a few bytes at a time, so that their short streams are walked through the release too.
+const RELEASE_MIN: usize = if cfg!(test) { 16 } else { 1 << 16 };
+
+/// [`value_locations`] a yield at a time, over the sources a [`SeqStreamWalker`] has read: one cursor
+/// for the values and the faults together, asked in the stream's order.
+#[derive(Default)]
+struct PlaceCursor {
+    source: Option<usize>,
+    chunk_end: usize,
+    newlines: usize,
+}
+
+impl PlaceCursor {
+    /// Moves to source `index`, if it is not already there.
+    fn enter(&mut self, index: usize) {
+        if self.source != Some(index) {
+            self.source = Some(index);
+            self.chunk_end = 0;
+            // #7260: a resumed stream's first source starts that many line breaks in.
+            self.newlines = if index == 0 { seeded_line_base() } else { 0 };
+        }
+    }
+
+    /// The source holding offset `at`, and how far into it `at` is.
+    fn locate(sources: &[(Option<usize>, usize)], at: usize) -> (usize, usize) {
+        let index = sources
+            .partition_point(|&(_, start)| start <= at)
+            .saturating_sub(1);
+        (
+            index,
+            at - sources.get(index).map_or(0, |&(_, start)| start),
+        )
+    }
+
+    /// Steps over the chunks of the current source while `go(chunk_end)` holds of where the next one
+    /// starts and `fits(chunk_end, len)` of it, in `data`, the stream from `base` on.
+    fn step(
+        &mut self,
+        data: &[u8],
+        base: usize,
+        sources: &[(Option<usize>, usize)],
+        go: impl Fn(usize) -> bool,
+        fits: impl Fn(usize, usize) -> bool,
+    ) {
+        let index = self.source.unwrap_or(0);
+        let start = sources.get(index).map_or(0, |&(_, start)| start);
+        let end = sources
+            .get(index + 1)
+            .map_or(base + data.len(), |&(_, next)| next);
+        // The bytes of the source the walk still holds: the cursor never stands before them.
+        let skip = base.saturating_sub(start);
+        let raw = &data[start + skip - base..end - base];
+        debug_assert!(self.chunk_end >= skip);
+        while go(self.chunk_end) {
+            let Some(len) = fgets_chunk_len_at(raw, self.chunk_end - skip) else {
+                break;
+            };
+            if !fits(self.chunk_end, len) {
+                break;
+            }
+            self.chunk_end += len;
+            if raw[self.chunk_end - skip - 1] == b'\n' {
+                self.newlines += 1;
+            }
+        }
+    }
+
+    /// The `(source index, line)` of a yield at `at` ([`YIELDED_AT_EOF`] for the EOF branch), the
+    /// yields asked for in ascending order.
+    fn place(
+        &mut self,
+        data: &[u8],
+        base: usize,
+        sources: &[(Option<usize>, usize)],
+        at: usize,
+    ) -> (usize, usize) {
+        let (index, local) = if at == YIELDED_AT_EOF {
+            (sources.len().saturating_sub(1), usize::MAX)
+        } else {
+            Self::locate(sources, at)
+        };
+        self.enter(index);
+        // Read chunks until the one holding `local` has been read.
+        self.step(
+            data,
+            base,
+            sources,
+            |chunk_end| chunk_end <= local,
+            |_, _| true,
+        );
+        (index, self.newlines)
+    }
+
+    /// Steps over every chunk that ends at or before `offset`, where the walk stands: no yield to come
+    /// is in one, so their bytes need not be held to count it.
+    fn catch_up(
+        &mut self,
+        data: &[u8],
+        base: usize,
+        sources: &[(Option<usize>, usize)],
+        offset: usize,
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+        let (index, local) = Self::locate(sources, offset);
+        if self.source.is_some_and(|source| source > index) {
+            return;
+        }
+        self.enter(index);
+        self.step(
+            data,
+            base,
+            sources,
+            |_| true,
+            |chunk_end, len| chunk_end + len <= local,
+        );
+    }
+
+    /// The offset in the stream the cursor stands at.
+    fn position(&self, sources: &[(Option<usize>, usize)]) -> usize {
+        self.source
+            .and_then(|index| sources.get(index))
+            .map_or(0, |&(_, start)| start + self.chunk_end)
+    }
+}
+
+impl Default for SeqStreamWalker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SeqStreamWalker {
+    pub(crate) fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            base: 0,
+            sources: Vec::new(),
+            source_ended: true,
+            ended: false,
+            chunk_at: 0,
+            whole: 0,
+            after_full_chunk: false,
+            last_chunk: None,
+            scratch: Vec::new(),
+            valid_to: 0,
+            first_invalid: None,
+            reader: None,
+            pending: (Vec::new(), Vec::new()),
+            at: RunAt::default(),
+            boundaries: Vec::new(),
+            cursor: PlaceCursor::default(),
+            values: std::collections::VecDeque::new(),
+            faults: std::collections::VecDeque::new(),
+            taken: 0,
+            last_value: None,
+            released_newlines: 0,
+            released_line_end: None,
+            finished: false,
+        }
+    }
+
+    /// The stream's length so far.
+    fn len(&self) -> usize {
+        self.base + self.data.len()
+    }
+
+    /// The bytes still held, and the offset in the stream of the first of them.
+    pub(crate) fn window(&self) -> (&[u8], usize) {
+        (&self.data, self.base)
+    }
+
+    /// Each source's tag and where it starts in the stream.
+    pub(crate) fn sources(&self) -> &[(Option<usize>, usize)] {
+        &self.sources
+    }
+
+    /// The stream's first byte that is not UTF-8, or how far it is known to be UTF-8 (the next read
+    /// can still complete a character cut at the end of this one).
+    pub(crate) fn utf8_up_to(&self) -> usize {
+        self.first_invalid.unwrap_or(self.valid_to)
+    }
+
+    /// Starts the next source, tagged `tag`; the one before has ended ([`Self::end_source`]).
+    pub(crate) fn start_source(&mut self, tag: Option<usize>) {
+        debug_assert!(self.source_ended && !self.ended);
+        let start = self.len();
+        if !self.sources.is_empty() {
+            // jq refills one file at a time, so a later source's start begins a `jv_parser_next`.
+            self.boundaries.push(start - self.base);
+        }
+        self.sources.push((tag, start));
+        self.source_ended = false;
+        self.chunk_at = start;
+        self.after_full_chunk = false;
+        self.last_chunk = None;
+        self.released_newlines = 0;
+        self.released_line_end = None;
+    }
+
+    /// Reads at most `want` more bytes of the current source from `reader`; `Ok(0)` at its end. A
+    /// `regular` source (a regular file, or bytes in memory) is read until `want` bytes or its end,
+    /// straight into the stream. Any other (a pipe, a socket, a terminal) is read with one `read`,
+    /// which hands over what it holds, so a record that has arrived is answered without waiting for
+    /// more; it goes through a buffer zeroed once rather than at every read.
+    pub(crate) fn read_from(
+        &mut self,
+        reader: &mut dyn std::io::Read,
+        want: usize,
+        regular: bool,
+    ) -> std::io::Result<usize> {
+        use std::io::Read as _;
+        debug_assert!(!self.source_ended);
+        let read = if regular {
+            reader.take(want as u64).read_to_end(&mut self.data)
+        } else {
+            if self.scratch.len() < want {
+                self.scratch.resize(want, 0);
+            }
+            let read = loop {
+                match reader.read(&mut self.scratch[..want]) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    read => break read,
+                }
+            };
+            if let Ok(read) = read {
+                self.data.extend_from_slice(&self.scratch[..read]);
+            }
+            read
+        };
+        if read.is_ok() {
+            self.check_utf8();
+            self.whole_chunks();
+        }
+        read
+    }
+
+    /// More bytes of the current source (the tests feed a walk in pieces).
+    #[cfg(test)]
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        debug_assert!(!self.source_ended);
+        self.data.extend_from_slice(bytes);
+        self.check_utf8();
+        self.whole_chunks();
+    }
+
+    /// Extends what is known of the stream being UTF-8 past the bytes just read.
+    fn check_utf8(&mut self) {
+        if self.first_invalid.is_some() {
+            return;
+        }
+        match std::str::from_utf8(&self.data[self.valid_to - self.base..]) {
+            Ok(_) => self.valid_to = self.len(),
+            Err(e) => match e.error_len() {
+                Some(_) => self.first_invalid = Some(self.valid_to + e.valid_up_to()),
+                // A character cut at the end of what is read so far: the rest of it comes next.
+                None => self.valid_to += e.valid_up_to(),
+            },
+        }
+    }
+
+    /// The current source has no more bytes.
+    pub(crate) fn end_source(&mut self) {
+        self.source_ended = true;
+        self.whole_chunks();
+    }
+
+    /// Every source has ended.
+    pub(crate) fn end(&mut self) {
+        if !self.source_ended {
+            self.end_source();
+        }
+        self.ended = true;
+    }
+
+    /// Whether the walk is done: every source ended and its last byte walked, the EOF branch run.
+    #[cfg(test)]
+    pub(crate) fn finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Finds the chunks of the current source that are whole now, and their NUL cuts.
+    fn whole_chunks(&mut self) {
+        // Where the last newline read so far ends: the chunks before it can be taken as lines.
+        let lines_end = rfind_byte(b'\n', &self.data[self.chunk_at - self.base..])
+            .map(|at| self.chunk_at + at + 1);
+        let mut lines = true;
+        loop {
+            if let Some(end) = lines_end.filter(|&end| lines && end > self.chunk_at) {
+                if self.reader.is_some() && !self.after_full_chunk {
+                    lines = self.take_lines(end);
+                }
+            }
+            if !self.whole_chunk() {
+                break;
+            }
+            // Past a newline-free window, the chunks go one at a time until one ends at a newline.
+            lines |= self.data[self.chunk_at - 1 - self.base] == b'\n';
+        }
+    }
+
+    /// Takes the chunks from `chunk_at` to `end` (just past a newline) at once, when every
+    /// [`LINE_PROBE`] bytes there hold a newline: no run of [`JQ_FGETS_CHUNK`] bytes is then free of
+    /// one, so every chunk ends at a newline, and a chunk that ends at a newline has no NUL cut and is
+    /// not a full chunk. Otherwise takes the lines before the first window that holds none, and says
+    /// so with `false`.
+    fn take_lines(&mut self, end: usize) -> bool {
+        let from = self.chunk_at;
+        let span = &self.data[from - self.base..end - self.base];
+        let mut upto = span.len();
+        let mut all = true;
+        for (index, window) in span.chunks_exact(LINE_PROBE).enumerate() {
+            if find_byte(b'\n', window).is_none() {
+                let window_start = index * LINE_PROBE;
+                upto = rfind_byte(b'\n', &span[..window_start]).map_or(0, |at| at + 1);
+                all = false;
+                break;
+            }
+        }
+        if upto > 0 {
+            let last_start = rfind_byte(b'\n', &span[..upto - 1]).map_or(0, |at| at + 1);
+            self.last_chunk = Some((from + last_start, upto - last_start, true));
+            self.chunk_at = from + upto;
+            self.whole = self.chunk_at;
+        }
+        all
+    }
+
+    /// Finds the next chunk of the current source if it is whole now, and its NUL cut; `false` when
+    /// there is none.
+    fn whole_chunk(&mut self) -> bool {
+        let rest = &self.data[self.chunk_at - self.base..];
+        if rest.is_empty() {
+            return false;
+        }
+        let room = &rest[..rest.len().min(JQ_FGETS_CHUNK)];
+        let len = match find_byte(b'\n', room) {
+            Some(at) => at + 1,
+            None if room.len() == JQ_FGETS_CHUNK || self.source_ended => room.len(),
+            None => return false,
+        };
+        let chunk_start = self.chunk_at;
+        let chunk = &room[..len];
+        let visible = fgets_visible_len(chunk);
+        let newline = chunk[len - 1] == b'\n';
+        let full = len == JQ_FGETS_CHUNK && !newline;
+        let after_full = std::mem::replace(&mut self.after_full_chunk, full);
+        let cut = (visible < len).then_some((chunk_start + visible, chunk_start + len));
+        if let Some(reader) = self.reader.as_mut() {
+            if after_full && reader.resets_per_call {
+                self.boundaries.push(chunk_start - self.base);
+            }
+            if let Some((start, end)) = cut {
+                reader.scan_cuts.push((start - self.base, end - self.base));
+            }
+        } else {
+            // Held until the front decides the BOM, which makes the reader ([`Self::advance`]).
+            if after_full {
+                self.pending_full_starts().push(chunk_start);
+            }
+            if let Some(cut) = cut {
+                self.pending_cuts().push(cut);
+            }
+        }
+        self.last_chunk = Some((chunk_start, len, newline));
+        self.chunk_at += len;
+        self.whole = self.chunk_at;
+        true
+    }
+
+    /// The chunk starts after a full chunk and the cuts found before the reader was made.
+    fn pending_full_starts(&mut self) -> &mut Vec<usize> {
+        &mut self.pending.0
+    }
+
+    fn pending_cuts(&mut self) -> &mut Vec<(usize, usize)> {
+        &mut self.pending.1
+    }
+
+    /// Walks every byte of the whole chunks read so far, and, once the stream has ended, the EOF
+    /// branch; then releases what no value, fault or place to come needs.
+    pub(crate) fn advance(&mut self) {
+        if self.finished {
+            return;
+        }
+        if self.reader.is_none() && !self.make_reader() {
+            return;
+        }
+        let Some(reader) = self.reader.as_mut() else {
+            return;
+        };
+        let (base, total) = (self.base, self.base + self.data.len());
+        reader.run_to(
+            &mut self.at,
+            &self.data,
+            self.whole - base,
+            &self.boundaries,
+        );
+        if self.ended && self.at.offset + base >= total {
+            reader.final_buffer_start = final_buffer_start_after(self.last_chunk, total) - base;
+            reader.total = total - base;
+            reader.run_end(&self.at, &self.boundaries);
+            self.finished = true;
+        }
+        self.count_places();
+        self.release();
+    }
+
+    /// Makes the reader once the front of the stream says what jq's BOM handling makes of it: a
+    /// mismatch, or the end of the stream. Nothing is released before then.
+    fn make_reader(&mut self) -> bool {
+        debug_assert_eq!(self.base, 0);
+        // The front as whole chunks, a source at a time, as `bom_prefix` reads the sources.
+        let front: Vec<(Option<usize>, Vec<u8>)> = self
+            .sources
+            .iter()
+            .enumerate()
+            .map(|(index, &(tag, start))| {
+                let end = self
+                    .sources
+                    .get(index + 1)
+                    .map_or(self.whole, |&(_, next)| next.min(self.whole));
+                (tag, self.data[start.min(end)..end].to_vec())
+            })
+            .collect();
+        let bom = bom_prefix(&front);
+        let known: usize = front.iter().map(|(_, raw)| raw.len()).sum();
+        if bom.consumed >= known && !(self.ended && self.whole == self.len()) {
+            // Every byte so far matched, or was never seen: more can still change the verdict.
+            return false;
+        }
+        // The faults are recorded, not printed: the queue hands them out (#6147). A closure that
+        // captures nothing is zero-sized, so leaking its box allocates nothing.
+        let emit: &'static mut dyn FnMut(&str, usize) = Box::leak(Box::new(|_: &str, _: usize| {}));
+        let mut reader = Reader::new(bom, emit);
+        reader.line += seeded_line_base();
+        reader.collect_faults = true;
+        reader.suppress_eof_warning = bom.malformed;
+        let (full_starts, cuts) = std::mem::take(&mut self.pending);
+        reader.scan_cuts = cuts;
+        if bom.malformed {
+            self.boundaries.extend(full_starts);
+            self.boundaries.sort_unstable();
+        }
+        self.at = RunAt::from(bom.consumed);
+        self.reader = Some(reader);
+        true
+    }
+
+    /// Takes the values and faults the reader has yielded since the last call out of it, each with its
+    /// place, counted in the stream's order; then counts the places up to where the walk stands.
+    fn count_places(&mut self) {
+        let Some(reader) = self.reader.as_mut() else {
+            return;
+        };
+        let values = std::mem::take(&mut reader.values);
+        let yielded_at = std::mem::take(&mut reader.yielded_at);
+        let faults = std::mem::take(&mut reader.faults);
+        reader.values_drained += values.len();
+        let (data, base, sources) = (&self.data, self.base, &self.sources);
+        // The reader's offsets are into `data`: the stream's are `base` on.
+        let in_stream = |at: usize| if at == YIELDED_AT_EOF { at } else { at + base };
+        let mut faults = faults.into_iter().peekable();
+        for ((start, end), at) in values.into_iter().zip(yielded_at) {
+            while let Some(fault) = faults.next_if(|fault| fault.at < at) {
+                let place = self.cursor.place(data, base, sources, in_stream(fault.at));
+                self.faults.push_back(seq_fault(fault, place));
+            }
+            let place = self.cursor.place(data, base, sources, in_stream(at));
+            self.last_value = Some((data[start], end + base));
+            self.values.push_back(((start + base, end + base), place));
+        }
+        for fault in faults {
+            let place = self.cursor.place(data, base, sources, in_stream(fault.at));
+            self.faults.push_back(seq_fault(fault, place));
+        }
+        if !self.finished {
+            self.cursor
+                .catch_up(data, base, sources, self.at.offset + base);
+        }
+    }
+
+    /// Lets go of the bytes before the first one still needed: by a value not yet taken, the value
+    /// the reader is in, the next byte to walk, the next place to count, the last chunk and the UTF-8
+    /// check. They go
+    /// once they are at least [`RELEASE_MIN`] and eight times the bytes kept, so the bytes moved to the
+    /// front are an eighth of the stream at most.
+    fn release(&mut self) {
+        let Some(reader) = self.reader.as_mut() else {
+            return;
+        };
+        let mut keep = (self.at.offset + self.base).min(self.cursor.position(&self.sources));
+        if let Some(start) = reader.value_start {
+            keep = keep.min(start + self.base);
+        }
+        if let Some(&((start, _), _)) = self.values.front() {
+            keep = keep.min(start);
+        }
+        // The last chunk, where jq's final buffer may start, stays: the stream's end is read from it.
+        if let Some((start, _, _)) = self.last_chunk {
+            keep = keep.min(start);
+        }
+        if self.first_invalid.is_none() {
+            keep = keep.min(self.valid_to);
+        }
+        let gone = keep.saturating_sub(self.base);
+        if gone < RELEASE_MIN || gone / 8 < self.data.len() - gone {
+            return;
+        }
+        // Where the stream's end is read hangs off the last source's newlines.
+        let last_start = self.sources.last().map_or(0, |&(_, start)| start);
+        let from = last_start.max(self.base);
+        if from < keep {
+            let part = &self.data[from - self.base..keep - self.base];
+            self.released_newlines += count_byte(b'\n', part);
+            if let Some(at) = rfind_byte(b'\n', part) {
+                self.released_line_end = Some(from + at + 1);
+            }
+        }
+        self.data.drain(..gone);
+        self.base = keep;
+        // The cuts and the refill boundaries the walk is past, which no value kept overlaps; then
+        // every offset into `data` moves with it.
+        let walked = reader.scan_cuts[..self.at.cut].partition_point(|&(_, end)| end <= gone);
+        reader.scan_cuts.drain(..walked);
+        self.at.cut -= walked;
+        reader.rebase(gone);
+        self.boundaries.drain(..self.at.boundary);
+        self.at.boundary = 0;
+        // One the walk stepped over inside a cut is still to fire, at the next byte walked: at 0 it does.
+        for boundary in &mut self.boundaries {
+            *boundary = boundary.saturating_sub(gone);
+        }
+        self.at.offset -= gone;
+        self.at.eof_offset = self.at.eof_offset.saturating_sub(gone);
+    }
+
+    /// The next fault to hand out, if any has been walked.
+    pub(crate) fn peek_fault(&self) -> Option<&SeqFault> {
+        self.faults.front()
+    }
+
+    pub(crate) fn pop_fault(&mut self) -> Option<SeqFault> {
+        self.faults.pop_front()
+    }
+
+    /// The next value's byte range and `(source index, line)`, if one has been walked. Its bytes stay
+    /// held ([`Self::window`]) until the next [`Self::advance`].
+    pub(crate) fn pop_value(&mut self) -> Option<((usize, usize), (usize, usize))> {
+        let value = self.values.pop_front()?;
+        self.taken += 1;
+        Some(value)
+    }
+
+    /// Whether a value has been walked and not taken.
+    pub(crate) fn has_value(&self) -> bool {
+        !self.values.is_empty()
+    }
+
+    /// How many values have been taken.
+    pub(crate) fn taken(&self) -> usize {
+        self.taken
+    }
+
+    /// The first byte and the end of the last value walked.
+    pub(crate) fn last_value(&self) -> Option<(u8, usize)> {
+        self.last_value
+    }
+
+    /// The newlines of the last source, and where its last line starts.
+    pub(crate) fn last_source_lines(&self) -> (usize, usize) {
+        let last_start = self.sources.last().map_or(0, |&(_, start)| start);
+        let from = last_start.max(self.base);
+        let held = &self.data[from - self.base..];
+        let line_start = rfind_byte(b'\n', held)
+            .map(|at| from + at + 1)
+            .or(self.released_line_end)
+            .unwrap_or(last_start);
+        (self.released_newlines + count_byte(b'\n', held), line_start)
+    }
+
+    /// The stream's length so far.
+    pub(crate) fn total(&self) -> usize {
+        self.len()
+    }
+
+    /// The cuts that fall in the value at `start..end`, as offsets into [`Self::window`]
+    /// ([`SeqStreamWalk::cuts`]), for [`splice_cuts`].
+    pub(crate) fn cuts_for(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> std::borrow::Cow<'static, [(usize, usize)]> {
+        let Some(reader) = self.reader.as_ref() else {
+            return std::borrow::Cow::Borrowed(&[]);
+        };
+        // The reader's cuts are offsets into `data`, which is what is handed back.
+        let (start, end) = (start - self.base, end - self.base);
+        let overlaps =
+            |&&(cut_start, cut_end): &&(usize, usize)| cut_end > start && cut_start < end;
+        let first = reader
+            .scan_cuts
+            .partition_point(|&(_, cut_end)| cut_end <= start);
+        if reader.token_cuts.is_empty()
+            && reader
+                .scan_cuts
+                .get(first)
+                .map_or(true, |&(cut_start, _)| cut_start >= end)
+        {
+            return std::borrow::Cow::Borrowed(&[]);
+        }
+        let scan = reader.scan_cuts[first..]
+            .iter()
+            .take_while(|&&(cut_start, _)| cut_start < end);
+        let mut cuts: Vec<(usize, usize)> = scan
+            .chain(reader.token_cuts.iter().filter(overlaps))
+            .copied()
+            .collect();
+        cuts.sort_unstable();
+        std::borrow::Cow::Owned(cuts)
+    }
+}
+
+/// A fault the reader recorded, placed.
+fn seq_fault(fault: RecordedFault, (source, line): (usize, usize)) -> SeqFault {
+    SeqFault {
+        body: fault.body,
+        values_before: fault.values_before,
+        source,
+        line,
+        position_lost: fault.position_lost,
+    }
+}
+
+/// How many of `bytes` are `needle`: a block of 64 at a time, which the compiler vectorizes, as
+/// `count_newlines` in the runner (#4172).
+fn count_byte(needle: u8, bytes: &[u8]) -> usize {
+    let mut blocks = bytes.chunks_exact(64);
+    let mut total = 0usize;
+    for block in &mut blocks {
+        total += usize::from(
+            block
+                .iter()
+                .fold(0u8, |n, &b| n.wrapping_add(u8::from(b == needle))),
+        );
+    }
+    total + blocks.remainder().iter().filter(|&&b| b == needle).count()
+}
+
 impl SeqStreamWalk {
     /// The locations a walk made with `place_values` off would have returned (#6620): the walk is
     /// not repeated, only the pass over the stream's `fgets` chunks that places each value. A no-op
@@ -1543,6 +2272,25 @@ struct RecordedFault {
     at: usize,
 }
 
+/// Where [`Reader::run_to`] stopped: the next byte, the next of `boundaries` and of the reader's
+/// `scan_cuts`, and the offset just past the last byte it scanned (where the EOF branch stands).
+#[derive(Clone, Copy, Debug, Default)]
+struct RunAt {
+    boundary: usize,
+    eof_offset: usize,
+    offset: usize,
+    cut: usize,
+}
+
+impl RunAt {
+    fn from(skip: usize) -> Self {
+        Self {
+            offset: skip,
+            ..Self::default()
+        }
+    }
+}
+
 struct Reader<'a> {
     line: usize,
     column: usize,
@@ -1595,6 +2343,9 @@ struct Reader<'a> {
     /// off the `1` in `1 {invalid}` when the space scan completed.
     completed: Option<(usize, usize)>,
     values: Vec<(usize, usize)>,
+    /// How many values were taken out of `values` before the ones it holds: a walk made as the stream
+    /// is read moves them out as it goes ([`SeqStreamWalker`], #7775), and a fault still counts them.
+    values_drained: usize,
     /// Parallel to `values`: the absolute offset of the byte whose scan
     /// yielded each one, or [`YIELDED_AT_EOF`] for jq's EOF branch. jq names
     /// a value's position from where its reader stood *then* (#3250).
@@ -1686,6 +2437,7 @@ impl<'a> Reader<'a> {
             value_end: 0,
             completed: None,
             values: Vec::new(),
+            values_drained: 0,
             yielded_at: Vec::new(),
             suppress_eof_warning: false,
             last_warning_at_eof: false,
@@ -1744,7 +2496,7 @@ impl<'a> Reader<'a> {
     fn record_fault(&mut self, body: &str) {
         self.faults.push(RecordedFault {
             body: body.to_string(),
-            values_before: self.values.len(),
+            values_before: self.values_drained + self.values.len(),
             position_lost: self.fault_position_lost(),
             at: if self.at_eof {
                 YIELDED_AT_EOF
@@ -1790,13 +2542,27 @@ impl<'a> Reader<'a> {
     /// Walks `data` from `skip` (the bytes jq's BOM handling consumed, which are never scanned
     /// but are counted in every offset).
     fn run(&mut self, data: &[u8], skip: usize, boundaries: &[usize]) {
-        let mut boundary = 0;
-        let mut eof_offset = 0;
-        let mut offset = skip;
+        let mut at = RunAt::from(skip);
+        self.run_to(&mut at, data, data.len(), boundaries);
+        self.run_end(&at, boundaries);
+    }
+
+    /// [`Reader::run`]'s byte loop over `data[at.offset..end]`, for a walk that is handed the stream as
+    /// it is read (#7775): `at` is where it stopped, and `end` how far the bytes are known. A walk of the
+    /// whole stream is one call with `end` its length.
+    #[inline]
+    fn run_to(&mut self, at: &mut RunAt, data: &[u8], known: usize, boundaries: &[usize]) {
+        // Sliced, so the byte loop's bounds are the slice's own, as they were for the whole stream.
+        let data = &data[..known];
+        let RunAt {
+            mut boundary,
+            mut eof_offset,
+            mut offset,
+            mut cut,
+        } = *at;
         // #7340: the bytes are scanned a stretch at a time, each running to the next of
         // `scan_cuts` (whose bytes are never scanned) or to the end. A stream with no NUL is one
         // stretch, so the loop below costs it nothing it did not cost before.
-        let mut cut = 0;
         loop {
             let limit = self
                 .scan_cuts
@@ -1895,25 +2661,70 @@ impl<'a> Reader<'a> {
             }
             match self.scan_cuts.get(cut) {
                 // Past the cut; a BOM jq consumed can already have taken the reader beyond its start.
-                Some(&(_, end)) => {
-                    offset = offset.max(end);
+                Some(&(start, cut_end)) if start <= data.len() => {
+                    offset = offset.max(cut_end);
                     cut += 1;
                 }
-                None => break,
+                _ => break,
             }
         }
+        *at = RunAt {
+            boundary,
+            eof_offset,
+            offset,
+            cut,
+        };
+    }
+
+    /// Moves every offset the reader holds `gone` bytes towards the front, for a walk that has let go
+    /// of the stream's first `gone` bytes (#7775): its cuts, and where it stands and what it is in.
+    /// The values, yields and faults it has recorded are taken out before ([`SeqStreamWalker`]), and
+    /// the walk is past every cut that ends there.
+    fn rebase(&mut self, gone: usize) {
+        debug_assert!(
+            self.values.is_empty() && self.yielded_at.is_empty() && self.faults.is_empty()
+        );
+        let shift = |at: &mut usize| *at = at.saturating_sub(gone);
+        shift(&mut self.offset);
+        shift(&mut self.value_end);
+        if let Some(at) = self.value_start.as_mut() {
+            shift(at);
+        }
+        if let Some((start, end)) = self.completed.as_mut() {
+            shift(start);
+            shift(end);
+        }
+        if let Some(at) = self.token_nul_at.as_mut() {
+            shift(at);
+        }
+        if let Some(at) = self.faulted_rs.as_mut() {
+            shift(at);
+        }
+        if self.final_buffer_start != usize::MAX {
+            shift(&mut self.final_buffer_start);
+            shift(&mut self.total);
+        }
+        let walked = self.token_cuts.partition_point(|&(_, end)| end <= gone);
+        self.token_cuts.drain(..walked);
+        for (start, end) in self.scan_cuts.iter_mut().chain(&mut self.token_cuts) {
+            shift(start);
+            shift(end);
+        }
+    }
+
+    /// The end of [`Reader::run`]: what follows the stream's last byte, the EOF branch.
+    fn run_end(&mut self, at: &RunAt, boundaries: &[usize]) {
         // A boundary with no scanned byte at or after it (a trailing source
         // that is empty or consumed wholesale by the BOM prefix) still cost
         // jq the refill and its reset -- with a malformed BOM that wipes the
         // pending token before the EOF branch can report on it, so an empty
         // terminal source reads `EF BF` as nothing at all.
         if self.resets_per_call {
-            while boundary < boundaries.len() {
+            for _ in at.boundary..boundaries.len() {
                 self.reset();
-                boundary += 1;
             }
         }
-        self.offset = eof_offset;
+        self.offset = at.eof_offset;
         self.at_eof = true;
         self.finish();
     }
@@ -4329,5 +5140,225 @@ mod tests {
                 assert_eq!(run.2.len(), 1, "the one complete record is a value");
             }
         }
+    }
+
+    /// What a test takes out of a [`SeqStreamWalker`] as it goes: each value's range, place and
+    /// bytes (cuts taken out, read while the walk still holds them), and the faults.
+    #[derive(Default)]
+    struct Taken {
+        values: Vec<(usize, usize)>,
+        places: Vec<(usize, usize)>,
+        bytes: Vec<Vec<u8>>,
+        faults: Vec<SeqFault>,
+    }
+
+    impl Taken {
+        fn take(&mut self, walker: &mut SeqStreamWalker) {
+            while let Some(((start, end), place)) = walker.pop_value() {
+                let cuts = walker.cuts_for(start, end);
+                let (data, base) = walker.window();
+                self.values.push((start, end));
+                self.places.push(place);
+                self.bytes
+                    .push(splice_cuts(data, start - base, end - base, &cuts).into_owned());
+            }
+            while let Some(fault) = walker.pop_fault() {
+                self.faults.push(fault);
+            }
+        }
+    }
+
+    /// #7775: the walk made as the bytes arrive gives what the walk of the whole stream gives -- every
+    /// value, its place, every fault with its place, and the cuts -- however the bytes are handed over:
+    /// over random streams (RS, newlines, NUL, BOM bytes, lines past a 4095-byte `fgets` chunk), cut
+    /// into one to three sources and fed in pieces of random sizes: handed over, read whole from a
+    /// regular source, or read a `read` at a time from one that hands over less than is asked.
+    #[test]
+    fn a_walk_fed_in_pieces_answers_as_the_whole_walk_7775() {
+        /// A source whose every `read` hands over at most the next of `pieces` bytes.
+        struct Trickle<'a> {
+            raw: &'a [u8],
+            at: usize,
+            pieces: std::vec::IntoIter<usize>,
+        }
+        impl std::io::Read for Trickle<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let piece = self.pieces.next().unwrap_or(usize::MAX);
+                let n = buf.len().min(piece).min(self.raw.len() - self.at);
+                buf[..n].copy_from_slice(&self.raw[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        let alphabet: &[u8] = b"\x1e\x1e\x1e\n\n {}[]\":,1a0.tnul-\x00\xef\xbb\xbf\\u";
+        let mut checked = 0;
+        for case in 0..3000 {
+            let len = if case % 50 == 0 {
+                9000 + next(4000)
+            } else {
+                1 + next(60)
+            };
+            let mut stream: Vec<u8> = (0..len).map(|_| alphabet[next(alphabet.len())]).collect();
+            if case % 5 == 2 {
+                // Short lines around newline-free runs that fill `fgets` chunks, so the walk takes
+                // its lines at once around the windows that hold no newline.
+                stream.clear();
+                for _ in 0..=next(6) {
+                    let run = if next(2) == 0 {
+                        1 + next(9000)
+                    } else {
+                        1 + next(30)
+                    };
+                    stream.extend(
+                        (0..run)
+                            .map(|_| alphabet[4 + next(alphabet.len() - 4)])
+                            .map(|byte| if byte == b'\n' { b'x' } else { byte }),
+                    );
+                    stream.extend_from_slice(b"\n\x1e1\n");
+                }
+                stream.truncate(stream.len() - next(3));
+            } else if case % 7 == 0 {
+                // Records of RFC 7464's own framing, the shape the walk mostly reads.
+                stream = (0..=next(40))
+                    .flat_map(|i| format!("\x1e{{\"n\":{i}}}\n").into_bytes())
+                    .collect();
+                if case % 14 == 0 {
+                    stream.extend_from_slice(b"\x1e[1,");
+                }
+            }
+            // One to three sources.
+            let mut cuts = vec![0, stream.len()];
+            for _ in 0..next(3) {
+                cuts.push(next(stream.len() + 1));
+            }
+            cuts.sort_unstable();
+            let sources: Vec<(Option<usize>, Vec<u8>)> = cuts
+                .windows(2)
+                .enumerate()
+                .map(|(at, pair)| (Some(at), stream[pair[0]..pair[1]].to_vec()))
+                .collect();
+            let whole =
+                walk_stream_collecting_at(&sources, false, true, Tail::Opened, &mut |_, _| {});
+            let mut walker = SeqStreamWalker::new();
+            let mut got = Taken::default();
+            for (tag, raw) in &sources {
+                walker.start_source(*tag);
+                if case % 3 == 0 {
+                    let mut at = 0;
+                    while at < raw.len() {
+                        let piece = (1 + next(5000)).min(raw.len() - at);
+                        walker.push(&raw[at..at + piece]);
+                        walker.advance();
+                        got.take(&mut walker);
+                        at += piece;
+                    }
+                } else {
+                    let pieces: Vec<usize> = (0..64).map(|_| 1 + next(3000)).collect();
+                    let mut source = Trickle {
+                        raw,
+                        at: 0,
+                        pieces: pieces.into_iter(),
+                    };
+                    let regular = case % 3 == 1;
+                    while walker
+                        .read_from(&mut source, 1 + next(6000), regular)
+                        .unwrap()
+                        > 0
+                    {
+                        walker.advance();
+                        got.take(&mut walker);
+                    }
+                }
+                walker.end_source();
+                walker.advance();
+                got.take(&mut walker);
+            }
+            walker.end();
+            walker.advance();
+            got.take(&mut walker);
+            assert!(walker.finished(), "{stream:?}");
+            assert_eq!(got.values, whole.values, "values of {stream:?}");
+            assert_eq!(got.places, whole.locations, "places of {stream:?}");
+            assert_eq!(got.faults, whole.faults, "faults of {stream:?}");
+            // Each value's bytes, its cuts taken out, are the whole stream's, though the bytes
+            // before it may have been let go.
+            let want: Vec<Vec<u8>> = whole
+                .values
+                .iter()
+                .map(|&(start, end)| splice_cuts(&stream, start, end, &whole.cuts).into_owned())
+                .collect();
+            assert_eq!(got.bytes, want, "bytes of {stream:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, 3000);
+    }
+
+    /// #7775: a value is out as soon as the chunks it is in are whole, before the stream's end.
+    #[test]
+    fn a_walk_hands_out_a_record_before_the_stream_ends_7775() {
+        let mut walker = SeqStreamWalker::new();
+        walker.start_source(None);
+        walker.push(b"\x1e{\"a\":1}\n\x1e[2");
+        walker.advance();
+        let mut got = Taken::default();
+        got.take(&mut walker);
+        assert_eq!(got.values, [(1, 8)]);
+        assert_eq!(got.places, [(0, 1)]);
+        assert!(got.faults.is_empty() && !walker.finished());
+        // The cut-short record is reported only at the end, where jq meets it.
+        walker.end();
+        walker.advance();
+        got.take(&mut walker);
+        assert!(walker.finished());
+        assert_eq!(got.faults.len(), 1);
+        assert_eq!(
+            got.faults[0].body,
+            "Unfinished JSON term at EOF at line 2, column 3"
+        );
+    }
+
+    /// #7775: a walk whose values are taken as they come holds the bytes of the records not yet
+    /// taken and a read or so, not the stream: 7 MB of records read 4 KiB at a time, with a record cut
+    /// short in the middle and a long line, never holds more than a few reads, and answers as the walk
+    /// of the whole stream does.
+    #[test]
+    fn a_walk_lets_go_of_what_it_has_handed_on_7775() {
+        let record = |i: usize| match i {
+            50_000 => b"\x1e[1,\n".to_vec(),
+            70_000 => format!("\x1e\"{}\"\n", "y".repeat(10_000)).into_bytes(),
+            _ => format!("\x1e{{\"id\":{i},\"pad\":\"{}\"}}\n", "p".repeat(i % 80)).into_bytes(),
+        };
+        let stream: Vec<u8> = (0..100_000).flat_map(record).collect();
+        let mut walker = SeqStreamWalker::new();
+        walker.start_source(Some(0));
+        let mut got = Taken::default();
+        let mut held = 0usize;
+        for piece in stream.chunks(4096) {
+            walker.push(piece);
+            walker.advance();
+            got.take(&mut walker);
+            held = held.max(walker.window().0.len());
+        }
+        walker.end();
+        walker.advance();
+        got.take(&mut walker);
+        let whole = walk_stream_collecting_at(
+            &[(Some(0), stream.clone())],
+            false,
+            true,
+            Tail::Opened,
+            &mut |_, _| {},
+        );
+        assert_eq!(got.values, whole.values);
+        assert_eq!(got.places, whole.locations);
+        assert_eq!(got.faults, whole.faults);
+        assert!(held < 256 * 1024, "held {held} bytes at once");
     }
 }
