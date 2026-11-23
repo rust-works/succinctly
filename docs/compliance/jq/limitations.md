@@ -478,9 +478,11 @@ jq 1.8.2 keeps the name and the count past the end of the last file and makes on
 A last line with its newline keeps the position in both releases (`(at nl.json:2)`).
 Both changes come from upstream commit 4e3088f ([jqlang/jq#3279](https://github.com/jqlang/jq/pull/3279), "Fix behavior of `--slurp --stream` when input has no trailing newline character"), which moves the reset of the name and the count to the branch that opens the next file and makes `read_more` report the end only once `current_input` is closed.
 Its message, its PR text and its test name only the `--slurp --stream` fix, which `succinctly jq` follows (#7523, above); neither effect described here is called a bug or a fix upstream, so `succinctly jq` keeps jq 1.7.1's answers, the reference ADR-0018 pins, and the rules modelled on 1.7.1's reader (#2947, #3003, #6146, the directory-last family #6472, #6604, #6625, #6661, #6775, #6789) stand.
+One more such answer is the fault after a number or literal directly before the text's last byte, a `"`, `[` or `{` (`2"`, `true"`, `1 2[`; #6004, #7810): that byte completes the value, so the read that reached the end returned it and the next call meets the fault with the file closed, and jq 1.7.1's `input` names `(at <unknown>)` where jq 1.8.2 names `(at <stdin>:0)`.
+It holds only when that read is a short one: a last line that fills its 4095-byte reads exactly leaves an empty last read, and then both releases name the file.
 Whether to follow jq 1.8.2 here is a question for the owners (#7607); #7461's true line number and #7472's 64-bit count are unaffected either way.
 `succinctly yq` is not affected: these are jq's reader rules.
-Pinned by `tests/jq_cli/i7607.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`), with jq 1.8.2's (`/opt/homebrew/bin/jq`) answers in its comments.
+Pinned by `tests/jq_cli/i7607.rs` and `tests/jq_cli/i7810.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`), with jq 1.8.2's (`/opt/homebrew/bin/jq`) answers in its comments.
 
 ## A standard input that cannot be read: matched, with these differences (#7126)
 

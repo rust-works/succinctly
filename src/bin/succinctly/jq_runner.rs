@@ -681,9 +681,13 @@ fn report_usage_error_bytes(message: &[u8]) {
 /// The text of a library file -- a module, or `~/.jq` -- read as jq reads it (#5351): jq parses
 /// the raw bytes, so a byte that is not UTF-8 is harmless inside a comment, reads as U+FFFD
 /// inside a string, and is a syntax error anywhere else. Decoding it lossily hands the parser
-/// the same three outcomes, where `read_to_string` refused the whole file.
+/// the same three outcomes, where `read_to_string` refused the whole file. A file that is UTF-8
+/// throughout becomes the text with no copy (#7814).
 fn read_library(path: &Path) -> std::io::Result<String> {
-    std::fs::read(path).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    std::fs::read(path).map(|bytes| {
+        String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    })
 }
 
 /// Strip Rust's `std::io::Error` Display's own `" (os error N)"` suffix,
@@ -748,26 +752,56 @@ fn read_arg_file(
 /// ([`succinctly::text::utf8::substitute_invalid_utf8_jq_style`]) over the read that holds it: a
 /// sequence a read ends inside is one U+FFFD to the read's end, the bytes the next read starts with
 /// a text of their own.
-fn jq_raw_file_text(bytes: &[u8]) -> String {
-    const READ: usize = 4096;
-    let mut text = String::with_capacity(bytes.len());
+///
+/// Every read of a file that is UTF-8 throughout is UTF-8 too, since each one ends on a whole
+/// character, so such a file's text is its bytes: the buffer becomes the string with no copy, and
+/// only a file with a byte that is not UTF-8 takes the walk (#7814). The walk then starts at the
+/// read that holds the first such byte, keeping the reads before it in place.
+fn jq_raw_file_text(bytes: Vec<u8>) -> String {
+    let e = match String::from_utf8(bytes) {
+        Ok(text) => return text,
+        Err(e) => e,
+    };
+    let valid = e.utf8_error().valid_up_to();
+    let mut bytes = e.into_bytes();
+    // The reads wholly inside the valid prefix; the first invalid byte is in the next one.
     let mut at = 0;
-    while at < bytes.len() {
-        let mut len = (bytes.len() - at).min(READ);
-        // A short read met the end of the file, so only a full one reads on.
-        if len == READ {
-            len += utf8_bytes_missing_at_end(&bytes[at..at + len]).min(bytes.len() - at - len);
+    loop {
+        let len = jq_raw_read_len(&bytes[at..]);
+        if at + len > valid {
+            break;
         }
-        let read = &bytes[at..at + len];
+        at += len;
+    }
+    let rest = bytes.split_off(at);
+    let mut text =
+        String::from_utf8(bytes).expect("the reads before the first invalid byte are UTF-8");
+    text.reserve(rest.len());
+    let mut rest = rest.as_slice();
+    while !rest.is_empty() {
+        let (read, after) = rest.split_at(jq_raw_read_len(rest));
         match std::str::from_utf8(read) {
             Ok(valid) => text.push_str(valid),
             Err(_) => text.push_str(&succinctly::text::utf8::substitute_invalid_utf8_jq_style(
                 read,
             )),
         }
-        at += len;
+        rest = after;
     }
     text
+}
+
+/// The length of the read [`jq_raw_file_text`] takes at the start of `rest`, the bytes of the file
+/// not yet read: 4,096 bytes, and on to the end of the character a full read ends inside; a short
+/// read met the end of the file, so only a full one reads on.
+fn jq_raw_read_len(rest: &[u8]) -> usize {
+    const READ: usize = 4096;
+    let len = rest.len().min(READ);
+    if len == READ {
+        len + utf8_bytes_missing_at_end(&rest[..len]).min(rest.len() - len)
+    } else {
+        len
+    }
 }
 
 /// How many bytes the character `read` ends inside is short of, as jq's `jvp_utf8_backtrack` counts
@@ -800,6 +834,105 @@ fn utf8_bytes_missing_at_end(read: &[u8]) -> usize {
         0
     } else {
         length.saturating_sub(seen)
+    }
+}
+
+#[cfg(test)]
+mod raw_file_text_tests {
+    use super::{jq_raw_file_text, utf8_bytes_missing_at_end};
+
+    /// The walk over every read from the first byte, as #7436 wrote it: the answer
+    /// [`jq_raw_file_text`]'s shortcuts must keep (#7814).
+    fn every_read_walked(bytes: &[u8]) -> String {
+        const READ: usize = 4096;
+        let mut text = String::with_capacity(bytes.len());
+        let mut at = 0;
+        while at < bytes.len() {
+            let mut len = (bytes.len() - at).min(READ);
+            if len == READ {
+                len += utf8_bytes_missing_at_end(&bytes[at..at + len]).min(bytes.len() - at - len);
+            }
+            let read = &bytes[at..at + len];
+            match std::str::from_utf8(read) {
+                Ok(valid) => text.push_str(valid),
+                Err(_) => text.push_str(&succinctly::text::utf8::substitute_invalid_utf8_jq_style(
+                    read,
+                )),
+            }
+            at += len;
+        }
+        text
+    }
+
+    /// The last character boundary of `text` at or before `at`.
+    fn boundary_at_or_before(text: &str, at: usize) -> usize {
+        (0..=at.min(text.len()))
+            .rev()
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(0)
+    }
+
+    /// Files that are UTF-8 throughout, and files with one or two bad sequences at the start, in a
+    /// read, at and either side of a read's edge, and at the end, behind text of one- to four-byte
+    /// characters so that reads end inside characters and read on.
+    fn files() -> Vec<Vec<u8>> {
+        let fills: [&str; 4] = ["a", "\u{e9}", "\u{20ac}", "\u{1f600}"];
+        let bad: [&[u8]; 9] = [
+            b"\xff",
+            b"\xc3",
+            b"\xe1\x41",
+            b"\xf0\x9f\x98",
+            b"\xed\xa0\x80",
+            b"\x80",
+            b"\xc0\xaf",
+            b"\xf4\x90\x80\x80",
+            b"\xe2\x82",
+        ];
+        let at = [
+            0, 1, 2, 4093, 4094, 4095, 4096, 4097, 4098, 8190, 8191, 8192, 12289,
+        ];
+        let mut files = vec![Vec::new(), b"\0".to_vec(), b"\xef\xbb\xbfab\0c".to_vec()];
+        for fill in fills {
+            let text = fill.repeat(13_000 / fill.len());
+            files.push(text.clone().into_bytes());
+            for seq in bad {
+                for &cut in &at {
+                    let cut = boundary_at_or_before(&text, cut);
+                    let mut once = text.as_bytes()[..cut].to_vec();
+                    once.extend_from_slice(seq);
+                    files.push(once.clone());
+                    once.extend_from_slice(&text.as_bytes()[cut..]);
+                    files.push(once.clone());
+                    let later = boundary_at_or_before(&text, cut + 4100);
+                    let mut twice = once[..later + seq.len()].to_vec();
+                    twice.extend_from_slice(b"\xff");
+                    twice.extend_from_slice(&once[later + seq.len()..]);
+                    files.push(twice);
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn shortcuts_answer_as_the_walk_over_every_read() {
+        for file in files() {
+            assert_eq!(
+                jq_raw_file_text(file.clone()),
+                every_read_walked(&file),
+                "file of {} bytes",
+                file.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_utf8_throughout_is_its_own_text_with_no_copy() {
+        let bytes = "\u{1f600}".repeat(5_000).into_bytes();
+        let buffer = bytes.as_ptr();
+        let text = jq_raw_file_text(bytes);
+        assert_eq!(text.as_ptr(), buffer);
+        assert_eq!(text, "\u{1f600}".repeat(5_000));
     }
 }
 
@@ -1189,7 +1322,7 @@ fn read_data_file(path: &Path, raw: bool) -> Result<OwnedValue, DataFileFailure>
         .map_err(|e| unreadable(library_read_detail(&canonical_or_self(path), &e)))?;
     if raw {
         // `jv_load_file(path, 1)`, as for `--rawfile` (#7645).
-        return Ok(OwnedValue::String(jq_raw_file_text(&bytes).into()));
+        return Ok(OwnedValue::String(jq_raw_file_text(bytes).into()));
     }
     // jq's parser reads the bytes (`jv_load_file`, as for `--slurpfile`), and a string's that are
     // not UTF-8 are U+FFFD by the rule the main input's are (#7604).
@@ -7382,7 +7515,7 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                     .map(|pair| (pair, crate::cli::jq_word_text(&pair[0])))
                     .filter(|(_, name)| !context.named.contains_key(name))
                 {
-                    let contents = jq_raw_file_text(&read_arg_file("rawfile", raw_name, file)?);
+                    let contents = jq_raw_file_text(read_arg_file("rawfile", raw_name, file)?);
                     context
                         .named
                         .insert(name, OwnedValue::String(contents.into()));
@@ -7555,13 +7688,11 @@ fn get_filter(args: &JqCommand) -> Result<String, BuildContextError> {
         }
         // A byte that is not UTF-8 reads as jq reads it, U+FFFD (#7436): harmless in a string or a
         // comment, and a compile error anywhere else.
-        let text = jq_raw_file_text(&bytes);
+        let mut text = jq_raw_file_text(bytes);
+        // The shebang line goes in place, so the program is not copied (#7814).
         let skipped = text.len() - skip_shebang(&text).len();
-        Ok(if skipped == 0 {
-            text
-        } else {
-            text[skipped..].to_string()
-        })
+        text.drain(..skipped);
+        Ok(text)
     } else if let Some(ref filter) = args.filter {
         Ok(crate::cli::jq_word_text(filter))
     } else {
@@ -14469,22 +14600,39 @@ fn bare_token_lost_to_fault(
         && parse_error_detection(bytes, malformed, stream) == end
 }
 
-/// Whether the malformed value at `malformed` is the stream's last byte, a `[` or `{`, straight after
-/// the bare number or literal at `span`: the one shape where jq's parser has completed that token
-/// when it meets the end of input (#6004). A number or literal completes on the byte after it, and
-/// here that byte is the opener the end of input leaves unfinished, so the token is a value before
-/// the fault is raised. The read that completed it is the read that reached the end, so the fault
-/// is named `<unknown>`. (jq 1.7.1's slurp held the token too, `printf '1[' | jq -cs .` printing
-/// `[1]` before the error; jq 1.8.2 prints the error alone, and so does `succinctly jq` since
-/// #7807.) With white space between (`1 [`), or after a string or container (`"a"[`, `[1][`),
-/// the value was complete in an earlier read and the fault is named after the file as usual.
-/// Oracle-verified against jq 1.7.1.
+/// Whether the malformed value at `malformed` is the stream's last byte, a `[`, `{` or `"`, straight
+/// after the bare number or literal at `span`: the shape where jq's parser has completed that token
+/// when it meets the end of input (#6004, #7810). A number or literal completes on the byte after
+/// it, and here that byte opens the container or string the end of input leaves unfinished, so the
+/// token is a value before the fault is raised. When the read that completed it is the read that
+/// reached the end ([`final_read_holds_last_byte`]), the fault is named `<unknown>`. (jq 1.7.1's
+/// slurp held the token too, `printf '1[' | jq -cs .` printing `[1]` before the error; jq 1.8.2
+/// prints the error alone, and so does `succinctly jq` since #7807.) With white space between
+/// (`1 [`, `2 "`), after a string or container (`"a"[`, `"a""`), or with text after the quote
+/// (`2"abc`), the value was complete before the read met the fault, and the fault is named after
+/// the file as usual. Oracle-verified against jq 1.7.1.
 fn bare_token_before_final_opener(bytes: &[u8], span: (usize, usize), malformed: usize) -> bool {
     let (start, end) = span;
     end == malformed
         && malformed + 1 == bytes.len()
-        && matches!(bytes[malformed], b'[' | b'{')
+        && matches!(bytes[malformed], b'[' | b'{' | b'"')
         && !matches!(bytes.get(start), Some(b'"' | b'[' | b'{'))
+}
+
+/// Whether jq's read that reaches the end of a source holds the source's last byte, which it
+/// does unless the last line fills its [`JQ_READ_CHUNK`]-byte reads exactly and leaves an empty
+/// final read ([`EofTail::final_read_start`]). Then the token
+/// [`bare_token_before_final_opener`] finds was completed by a read before the one that reached
+/// the end, and the fault keeps the file's name: 4,093 spaces then `2[` (4,095 bytes, one full
+/// read) is named `<stdin>:0`, where 4,092 or 4,094 spaces are named `<unknown>` (#7810). jq's
+/// reads count the bytes as read, before the invalid-UTF-8 substitution (#5964), and the first
+/// `seam.base` bytes were moved onto this source from an earlier one (#4316).
+fn final_read_holds_last_byte(text: &[u8], seam: &Seam, lossy: Option<&LossySource>) -> bool {
+    let (read, base) = match lossy {
+        Some(lossy) => (lossy.original.as_slice(), lossy.original_offset(seam.base)),
+        None => (text, seam.base),
+    };
+    EofTail::final_read_start(read, base.min(read.len())) < read.len()
 }
 
 /// The byte at which jq detects the fault in the malformed value starting at
@@ -15104,8 +15252,8 @@ fn read_json_tail(
         };
         let (detected, mut line, resume) =
             meet_fault(&mut faults, raw.as_bytes(), start, cx.stream);
-        // #6004: a bare token straight before the last byte, an opener, completes in the read that
-        // reaches the end, so jq names the fault `<unknown>`.
+        // #6004, #7810: a bare token straight before the last byte, an opener or a quote, completes
+        // in the read that reaches the end, so jq names the fault `<unknown>`.
         if cx.ends_stream
             && !cx.stream
             && read
@@ -15114,6 +15262,7 @@ fn read_json_tail(
                 .is_some_and(|&(s, e)| {
                     bare_token_before_final_opener(raw.as_bytes(), (offset + s, offset + e), start)
                 })
+            && final_read_holds_last_byte(raw.as_bytes(), cx.seam, cx.lossy)
         {
             line = UNKNOWN_LINE as usize;
         }
