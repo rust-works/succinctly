@@ -7656,7 +7656,7 @@ At 100 MB succinctly is still faster than jq on every row below except `first(in
 For a log too large to hold in memory that a fixed route does not cover, use jq, or split the file and run each part (`split -l`).
 
 Peak resident set size of `succinctly jq ARGS FILE`, in MiB, over `json generate <size> -p ndjson` (about 105 bytes to a record, 993,416 records at 100 MiB).
-Each figure is `wait4`'s `ru_maxrss` for one run under a 2 GiB cap, on `main` @ 3fee4b116 built with `--features cli`, measured on `terminus` and `johns-mac-mini` and not on a laptop.
+Each figure is `wait4`'s `ru_maxrss` for one run under a 2 GiB cap, on `main` @ 3fee4b116 built with `--features cli`, measured on an AMD Ryzen 9 7950X and an Apple M4 Pro and not on a laptop.
 
 AMD Ryzen 9 7950X, x86_64:
 
@@ -7680,7 +7680,7 @@ Apple M4 Pro, aarch64:
 | `-R length` (`ndjson_raw_lines`)          |   6.0 |   15.1 |   105.1 |
 | `-n 'first(inputs)\|.id'`                 |   6.2 |    6.3 |     6.3 |
 
-Since [#7023](https://github.com/rust-works/succinctly/issues/7023), peak resident set size in MiB of the rows it fixed, base `main` @ dcfa1da7e against the change, each from `/usr/bin/time` for one run under a 4 GiB cap on `terminus` and `johns-mac-mini`, over the same kind of files (`json generate <size> -p ndjson`):
+Since [#7023](https://github.com/rust-works/succinctly/issues/7023), peak resident set size in MiB of the rows it fixed, base `main` @ dcfa1da7e against the change, each from `/usr/bin/time` for one run under a 4 GiB cap on an AMD Ryzen 9 7950X and an Apple M4 Pro, over the same kind of files (`json generate <size> -p ndjson`):
 
 | query                                                 | x86_64 10 MiB | x86_64 100 MiB | aarch64 10 MiB | aarch64 100 MiB |
 |-------------------------------------------------------|--------------:|---------------:|---------------:|----------------:|
@@ -7788,10 +7788,10 @@ The windows are certified on a thread of their own, started with the first one, 
 The copies keep peak RSS 6 to 8 MiB above what certifying on the filter's own thread held it at.
 A window of more than 8 MiB (a document bigger than a few windows) is certified on the filter's thread over the buffer itself, with no copy: a copy of one doubled the peak of a pipe holding a single 175 MB array (395 MB with it, 226 MB without, 223 MB for the route that read the pipe whole).
 The route is measured against the one that read a pipe whole (the commit before #7024), with a second build of that commit as an A/A control and the route's own commit, run interleaved (11 repetitions, output identical, NDJSON from `json generate -p ndjson`, both boxes idle).
-At 100 MiB, peak RSS falls from 125 to 127 MiB to 23 to 26 MiB on terminus (Ryzen 9 7950X) and from 123 MiB to 19 MiB on johns-mac-mini (M4 Pro).
-The run is no slower: `-c .` takes 552 ms against 586 ms (-5.9%) on terminus and 433 ms against 443 ms (-2.3%) on the mini, `-r .name` -5.0% and -3.0%, and `select(.score>50)` -2.7% and -2.4%, where the A/A control moved 0.4% at most.
-At 10 MiB the same rows read +0.2% to +1.1% on terminus (the control, +0.1% to +1.0%) and -2.1% to -1.3% on the mini.
-Certifying on the filter's own thread, as #7024's first version did, cost +3.0% to +10.4% on terminus and +9.3% to +17.4% on the mini at 100 MiB, and the same commit with `certify` returning at once read -6.6% to +0.3% and -5.3% to -3.3%, which is how the cost was attributed to the validator's pass and not to reading in windows (#7106).
+At 100 MiB, peak RSS falls from 125 to 127 MiB to 23 to 26 MiB on an AMD Ryzen 9 7950X and from 123 MiB to 19 MiB on an Apple M4 Pro Mac mini.
+The run is no slower: `-c .` takes 552 ms against 586 ms (-5.9%) on the 7950X and 433 ms against 443 ms (-2.3%) on the mini, `-r .name` -5.0% and -3.0%, and `select(.score>50)` -2.7% and -2.4%, where the A/A control moved 0.4% at most.
+At 10 MiB the same rows read +0.2% to +1.1% on the 7950X (the control, +0.1% to +1.0%) and -2.1% to -1.3% on the mini.
+Certifying on the filter's own thread, as #7024's first version did, cost +3.0% to +10.4% on the 7950X and +9.3% to +17.4% on the mini at 100 MiB, and the same commit with `certify` returning at once read -6.6% to +0.3% and -5.3% to -3.3%, which is how the cost was attributed to the validator's pass and not to reading in windows (#7106).
 The windows are read from descriptor 0's own offset, and a run that stops early puts it back where jq's reader would have left it (#7455).
 jq reads its input through stdio one `fgets` chunk at a time (a line, or 4095 bytes of a longer one), and stdio moves a seekable descriptor back to the end of what it handed out when the process exits, so `{ jq -n input; jq -n input; } < f` reads the first document and then the second, and `{ jq -c 'limit(10; inputs)' -n; cat; } < f` hands `cat` the rest.
 Before #7455 every route left a regular file where its own reads had taken it: at the end on the whole-file route, and at the end of the last window (256 KiB) on the windowed ones, so the second `jq -n input` read nothing, or began in the middle of a line.
@@ -7816,9 +7816,9 @@ A standard input the run also writes its output or errors to, at the same offset
 `-R` over standard input (#7024) is read by the `LineWindows` the `-R` file route reads its file with (#7023, above), and the plain route's machinery is not involved.
 A regular file is read by a duplicate of descriptor 0 from the offset it stands at; a pipe or socket has its first 4 MiB read to learn whether it is long enough, and one that ends sooner hands what it held to the route that reads it whole, as the plain route's pipe does.
 A stream of lines has no fault to word, so neither is read again and no window is certified: the time #7106 tracks for the plain route's pipe is not spent here.
-Measured interleaved against the route that read standard input whole (the commit before it, a second build of that commit as an A/A control, 11 repetitions, outputs identical, both machines idle), at 100 MiB of NDJSON peak RSS falls from 111 to 115 MiB to 14 to 20 MiB on terminus (Ryzen 9 7950X) and from 107 to 108 MiB to 8 to 13 MiB on johns-mac-mini (M4 Pro).
-The run is faster too: on a pipe `-R .` reads −7.5% and −5.4%, `-nR 'reduce inputs as $l (0; .+1)'` −15.8% and −6.8%, and `-R 'select(endswith("9}"))'` −11.8% and −6.7% (terminus, then the mini), and redirected −7.6% and −0.9%, −16.3% and −4.5%, and −13.3% and −3.6%, where the A/A control moved 3.6% and 2.5% at most.
-At 10 MiB the rows read −1.4% to −8.5% on terminus and −1.3% to −5.8% on the mini, and at 1 MiB (read whole) and on the named-file route they move no more than the control does.
+Measured interleaved against the route that read standard input whole (the commit before it, a second build of that commit as an A/A control, 11 repetitions, outputs identical, both machines idle), at 100 MiB of NDJSON peak RSS falls from 111 to 115 MiB to 14 to 20 MiB on an AMD Ryzen 9 7950X and from 107 to 108 MiB to 8 to 13 MiB on an Apple M4 Pro Mac mini.
+The run is faster too: on a pipe `-R .` reads −7.5% and −5.4%, `-nR 'reduce inputs as $l (0; .+1)'` −15.8% and −6.8%, and `-R 'select(endswith("9}"))'` −11.8% and −6.7% (the 7950X, then the mini), and redirected −7.6% and −0.9%, −16.3% and −4.5%, and −13.3% and −3.6%, where the A/A control moved 3.6% and 2.5% at most.
+At 10 MiB the rows read −1.4% to −8.5% on the 7950X and −1.3% to −5.8% on the mini, and at 1 MiB (read whole) and on the named-file route they move no more than the control does.
 The plain filter's pipe route, whose probe this shares, reads within the control's range too, and its peak RSS is the same or 1 MiB less.
 A run that stops early (`first(inputs)`, `halt`) leaves the rest of the pipe unread, as jq does, and a redirected file just past the last line it read, as jq does (#7455, above); the whole-file route had read both to the end.
 `-R` over several regular files (#7024: up to 32, 4 MiB or more between them, judged as the plain route judges them) is read by one `LineWindows` a file, each a window at a time and in turn.
@@ -7831,15 +7831,15 @@ A path that will not open when the run gets there, or names a directory, is read
 The failure is found by a read, not before the run, so it joins the failures the reads of the `input` queue report (`PENDING_OPEN_FAILURES`) as it is found.
 The list is judged by `stat` alone, not by opening each file as the plain route's longer list is: a file `stat` finds and that will not open (no read permission) is found when the run reaches it and reported as a removed one is, where the plain route sends it to the whole-file route before the run starts.
 Judging a file costs the run a `stat`, and the identities of standard input, output and error are read once for the list, not once a file (that was nine system calls a file, 14% of a 10 MiB run over 256 files on the M4 Pro).
-Measured interleaved against the commit before it (a second build of that commit as an A/A control, outputs identical, both machines idle) over NDJSON split at line starts into 16, 64 and 256 files: at 100 MiB peak RSS for `-R .` falls from 108.7 and 108.5 MiB to 12.8 and 11.2 MiB on terminus (Ryzen 9 7950X) at 64 and 256 files, and from 105.8 and 106.1 MiB to 6.6 and 5.8 MiB on johns-mac-mini (M4 Pro); `-nR 'reduce inputs'` and `select` read about the same, and 16 files (held open, not this change's route) read the same before and after.
-The terminus figures for the head build read 2 MiB above the base build on every route, the lone file and the 16 held files included (13.9 MiB against 11.8 for `-R .` over one 100 MiB file), so the floor of that build is 2 MiB higher and not the route's.
-At 100 MiB on terminus `-R .` reads −6.3% (64 files) and −15.3% (256), `select(endswith("9}"))` −7.4% and −21.7% and `-nR 'reduce inputs as $l (0; . + ($l | length))'` −50.6% and −55.7%, where the A/A control read within 1.7% and the unchanged 16-file route read −5.2% to −8.7%, so about that much of the gain is the build's layout; on the mini `-R .` reads −5.6% and −3.3% (control −4.7% and −5.2%), `select` +0.5% and +1.4%, and `reduce` −61.2% and −60.7%.
-At 10 MiB terminus reads −11.4% to −19.6% on `-R .` and `select` (control within 1.1%) and −51% to −54% on `reduce`; the mini reads −1.4% to +1.0% on `-R .`, +3.0% and +5.4% on `select` and −55% to −57% on `reduce`, so the extra `stat` and the second open of each file show on a run of 25 ms over 256 files of 40 KiB, which is the one cell of the sweep that trades time for memory.
-`scripts/jq-windowed-file-fuzz.py --raw --files K` (random streams of 4.3 to 7.5 MiB cut at random bytes into K files, compared with the same files given as `/dev/fd/N`, which the route declines) read 240 cases on terminus (K = 40, 150, 400, 80 each) and 360 on the mini (K = 40, 150 and 400), no difference.
+Measured interleaved against the commit before it (a second build of that commit as an A/A control, outputs identical, both machines idle) over NDJSON split at line starts into 16, 64 and 256 files: at 100 MiB peak RSS for `-R .` falls from 108.7 and 108.5 MiB to 12.8 and 11.2 MiB on an AMD Ryzen 9 7950X at 64 and 256 files, and from 105.8 and 106.1 MiB to 6.6 and 5.8 MiB on an Apple M4 Pro Mac mini; `-nR 'reduce inputs'` and `select` read about the same, and 16 files (held open, not this change's route) read the same before and after.
+The 7950X figures for the head build read 2 MiB above the base build on every route, the lone file and the 16 held files included (13.9 MiB against 11.8 for `-R .` over one 100 MiB file), so the floor of that build is 2 MiB higher and not the route's.
+At 100 MiB on the 7950X `-R .` reads −6.3% (64 files) and −15.3% (256), `select(endswith("9}"))` −7.4% and −21.7% and `-nR 'reduce inputs as $l (0; . + ($l | length))'` −50.6% and −55.7%, where the A/A control read within 1.7% and the unchanged 16-file route read −5.2% to −8.7%, so about that much of the gain is the build's layout; on the mini `-R .` reads −5.6% and −3.3% (control −4.7% and −5.2%), `select` +0.5% and +1.4%, and `reduce` −61.2% and −60.7%.
+At 10 MiB the 7950X reads −11.4% to −19.6% on `-R .` and `select` (control within 1.1%) and −51% to −54% on `reduce`; the mini reads −1.4% to +1.0% on `-R .`, +3.0% and +5.4% on `select` and −55% to −57% on `reduce`, so the extra `stat` and the second open of each file show on a run of 25 ms over 256 files of 40 KiB, which is the one cell of the sweep that trades time for memory.
+`scripts/jq-windowed-file-fuzz.py --raw --files K` (random streams of 4.3 to 7.5 MiB cut at random bytes into K files, compared with the same files given as `/dev/fd/N`, which the route declines) read 240 cases on the 7950X (K = 40, 150, 400, 80 each) and 360 on the mini (K = 40, 150 and 400), no difference.
 A file removed, made a directory, replaced, or made unreadable while the run is in its first file is read as the whole-file route reads the files as they then stand (`tests/jq_cli/i7024_raw_many_files.rs`).
-Measured interleaved against the commit before it (a second build of that commit as an A/A control, outputs identical) over NDJSON split inside a line into 4 and 16 files: at 100 MiB peak RSS falls from 108.5 to 111.7 MiB to 11.7 to 14.7 MiB on terminus (Ryzen 9 7950X) and from 105.4 to 107.0 MiB to 8.2 to 12.5 MiB on johns-mac-mini (M4 Pro), and at 10 MiB from 18.4 to 21.7 MiB to 9.5 to 13.8 and from 15.4 to 16.7 to 5.9 to 8.8.
-On terminus `-R .`, `-R length` and `-R 'select(endswith("9}"))'` read −4.3% to −6.7% at 100 MiB (control −2.0% to +1.1%), and on the mini −2.2% to +0.3% (control up to 4%, with other work on it); `-nR 'reduce inputs as $l (0; .+1)'` reads −65% on terminus and −73% on the mini, since the whole-file route built every line before the program ran.
-The lone file, which this change does not move, read +4.2% to +8.0% on three of its terminus rows at 10 and 100 MiB with fewer instructions than before (cachegrind: 330.2 million against 330.9 for `-R length` at 10 MiB), so that is where the code landed in the binary, and −3.0% to +2.3% on the mini.
+Measured interleaved against the commit before it (a second build of that commit as an A/A control, outputs identical) over NDJSON split inside a line into 4 and 16 files: at 100 MiB peak RSS falls from 108.5 to 111.7 MiB to 11.7 to 14.7 MiB on an AMD Ryzen 9 7950X and from 105.4 to 107.0 MiB to 8.2 to 12.5 MiB on an Apple M4 Pro Mac mini, and at 10 MiB from 18.4 to 21.7 MiB to 9.5 to 13.8 and from 15.4 to 16.7 to 5.9 to 8.8.
+On the 7950X `-R .`, `-R length` and `-R 'select(endswith("9}"))'` read −4.3% to −6.7% at 100 MiB (control −2.0% to +1.1%), and on the mini −2.2% to +0.3% (control up to 4%, with other work on it); `-nR 'reduce inputs as $l (0; .+1)'` reads −65% on the 7950X and −73% on the mini, since the whole-file route built every line before the program ran.
+The lone file, which this change does not move, read +4.2% to +8.0% on three of its 7950X rows at 10 and 100 MiB with fewer instructions than before (cachegrind: 330.2 million against 330.9 for `-R length` at 10 MiB), so that is where the code landed in the binary, and −3.0% to +2.3% on the mini.
 A program that calls `input`/`inputs` over several regular files (#7024: 4 MiB or more between them, judged as the plain route judges them) reads each file as a lazy source of its own, a window at a time and in turn, as the lone source past its front is read (#7023, above).
 Every file is opened and checked before the run starts (below), and the producer reads a file's windows when it reaches it.
 A fault, or a document nested deeper than the lazy route converts (64 levels), hands the rest of the stream to the eager reader there, which reads what is left of the files whole and holds it, as the route that read every file whole did from the same point (`hand_off_later_sources`): such a stream is flat only up to that point.
@@ -7863,10 +7863,10 @@ A run whose output is appended to a later file through a pipe (`jq -n inputs a b
 A list of more than 32 files (#7197) is read the same way, each file opened by its path when the run first reads it and closed with its lines (`OpenWhenRead`), so a run over hundreds of files holds one of them open at a time, as jq does; the list is judged by `stat`, and each file is opened once before the run to be checked as UTF-8 and closed.
 Such a file is read to its end as it stands when the run gets to it, as jq's reader reads it, not to the length it had when it was checked.
 A path that will not open by then, or names a directory, is read as an empty file and reported as the whole-file route reports it, in jq's words once its reader is past it, as for `-R` above.
-At 100 MiB of NDJSON in 64 or 256 files peak RSS falls from 112.6 to 15.2 MiB (terminus, Ryzen 9 7950X) and from 107 to 7.3 to 12.9 MiB (johns-mac-mini, M4 Pro), flat from 10 MiB; `first(inputs)` reads -80% and -77% on terminus and -33% and -25% on the mini; the programs that read every document read within a few percent (-4.9% to +2.9%), except `reduce inputs` over 64 files on terminus (+7.7% over 11 repetitions, where 256 files read -4.9%) and the two 10 MiB programs over 256 files of 40 KiB on the mini (+4.3% and +5.0%).
+At 100 MiB of NDJSON in 64 or 256 files peak RSS falls from 112.6 to 15.2 MiB (an AMD Ryzen 9 7950X) and from 107 to 7.3 to 12.9 MiB (an Apple M4 Pro Mac mini), flat from 10 MiB; `first(inputs)` reads -80% and -77% on the 7950X and -33% and -25% on the mini; the programs that read every document read within a few percent (-4.9% to +2.9%), except `reduce inputs` over 64 files on the 7950X (+7.7% over 11 repetitions, where 256 files read -4.9%) and the two 10 MiB programs over 256 files of 40 KiB on the mini (+4.3% and +5.0%).
 The base was the commit before it with a second build as an A/A control (within 1.9%), and every output was identical.
-Measured interleaved against the commit before it (a second build of that commit as an A/A control, 7 to 9 repetitions, the output of every run identical) over NDJSON cut at line starts into 4 and 16 files: at 100 MiB peak RSS falls from 111.1 to 111.7 MiB to 13.2 to 16.8 MiB on terminus (Ryzen 9 7950X) and from 105.9 to 107.7 MiB to 7.6 to 18.8 MiB on johns-mac-mini (M4 Pro), and at 10 MiB from 21.1 to 21.7 to 12.8 to 16.8 and from 15.8 to 17.1 to 7.0 to 12.8, so the route is flat from 10 MiB to 100 MiB.
-It is faster too: at 100 MiB `-n 'reduce inputs as $x (0; .+1)'` reads −45.6% to −47.3% on terminus and −52.8% to −53.0% on the mini, `inputs | select(.score > 50) | .name` −37.8% to −42.3% and −47.6% to −48.5%, `[.id, (input | .id)]` (no `-n`) −24.1% to −24.8% and −31.9% to −32.4%, and `first(inputs)` −98.6% to −98.7%, where the A/A control moved 1.0% at most (2.2% at 10 MiB, where the rows read −22.9% to −51.0%).
+Measured interleaved against the commit before it (a second build of that commit as an A/A control, 7 to 9 repetitions, the output of every run identical) over NDJSON cut at line starts into 4 and 16 files: at 100 MiB peak RSS falls from 111.1 to 111.7 MiB to 13.2 to 16.8 MiB on an AMD Ryzen 9 7950X and from 105.9 to 107.7 MiB to 7.6 to 18.8 MiB on an Apple M4 Pro Mac mini, and at 10 MiB from 21.1 to 21.7 to 12.8 to 16.8 and from 15.8 to 17.1 to 7.0 to 12.8, so the route is flat from 10 MiB to 100 MiB.
+It is faster too: at 100 MiB `-n 'reduce inputs as $x (0; .+1)'` reads −45.6% to −47.3% on the 7950X and −52.8% to −53.0% on the mini, `inputs | select(.score > 50) | .name` −37.8% to −42.3% and −47.6% to −48.5%, `[.id, (input | .id)]` (no `-n`) −24.1% to −24.8% and −31.9% to −32.4%, and `first(inputs)` −98.6% to −98.7%, where the A/A control moved 1.0% at most (2.2% at 10 MiB, where the rows read −22.9% to −51.0%).
 The time is the scan the route that read every file whole made before the program ran: it ran jq's parser model over every byte of the files to settle whether the stream faults (`first_stream_fault`, for the placement of a file that does not open), about 70% of that route's samples for `first(inputs)` on an Apple M4 laptop, and a list of files that all opened has nothing for it to place.
 At 1 MiB, under the threshold and read whole as before, every row moves 1.4% at most.
 Under the plain filter, several regular files (4 MiB or more between them) are read the same way, as the one stream jq reads them as, each a window at a time and in turn (`WindowedFiles`, #7024).
@@ -7901,8 +7901,8 @@ Peak resident set size at 100 MiB (993,416 records), in MiB:
 | Apple M4 Pro      | `-r .name`          |  122.5 |  13.0 |
 | Apple M4 Pro      | `select(.score>50)` |  123.0 |  13.0 |
 
-The x86_64 figures are `/usr/bin/time -f %M` under `ulimit -v 8 GB` on `terminus`; at 10 MiB they are 10.1, 10.4 and 11.6 (23.7, 24.2 and 24.7 before), so the route is flat from 10 MiB to 100 MiB.
-The aarch64 figures are `wait4`'s `ru_maxrss` under a memory cap on `johns-mac-mini`, whose floor for any process (jq's own included) is 13 MiB.
+The x86_64 figures are `/usr/bin/time -f %M` under `ulimit -v 8 GB` on an AMD Ryzen 9 7950X; at 10 MiB they are 10.1, 10.4 and 11.6 (23.7, 24.2 and 24.7 before), so the route is flat from 10 MiB to 100 MiB.
+The aarch64 figures are `wait4`'s `ru_maxrss` under a memory cap on an Apple M4 Pro, whose floor for any process (jq's own included) is 13 MiB.
 Both were measured on `main` @ `7a69d3cdf` and the same plus #6920, release builds with `--features cli`, and the output of every row is byte-identical to jq 1.7.1's.
 
 Time, from `scripts/ab-cli.py` (interleaved, 11 repetitions, `-c`, output and exit status gated, a control run beside each), 40 configurations per machine with no output difference:
@@ -7932,7 +7932,7 @@ Several files (#7024), peak resident set size in MiB for `-c .` at 100 MiB of ND
 | Apple M4 Pro      | 32 files                               |  106.8 |   7.8 |
 
 The same file twice is flat from 10 MiB to 100 MiB: 31.1, 117.5 and 225.4 before and 10.1, 10.2 and 10.2 after on the 7950X (26.9, 131.2 and 255.0 before and 6.7 throughout on the M4 Pro), and `.name` and `select(.score>50)` over it read 225.9 and 227.1 before and 10.7 and 11.8 after.
-Both are release builds with `--features cli` of `main` @ `8f2175b5c` and the same plus #7024, on `terminus` and `johns-mac-mini`, each checked for a running benchmark first.
+Both are release builds with `--features cli` of `main` @ `8f2175b5c` and the same plus #7024, on an AMD Ryzen 9 7950X and an Apple M4 Pro, each checked for a running benchmark first.
 
 Time, from an interleaved driver (the two binaries alternate within each repetition, 5 to 15 repetitions, medians, the output of every run gated on identity), against a control (the baseline binary against a copy of itself) that read −0.5% to +0.7% on x86_64 and −0.7% to +0.4% on aarch64:
 
@@ -7960,7 +7960,7 @@ More than 32 files (#7024, opened a file at a time), peak resident set size in M
 | Apple M4 Pro      |   256 | `select(.score > 50)` |  107.8 |   7.1 |
 
 At 10 MiB the same lists read 18.9 to 20.8 before and 9.5 to 11.4 after on the 7950X, and 15.8 to 18.3 before and 5.8 to 6.7 after on the M4 Pro, so the route is flat from 10 MiB to 100 MiB; 16 files (held open, not this change's route) read the same before and after.
-Release builds with `--features cli` of `main` @ `15dcf4a82`, a second build of it (an A/A control), and the same plus this change, on `terminus` and `johns-mac-mini`, each checked idle first; the three binaries alternate in rotated order within each repetition (9 at 10 MiB, 5 at 100 MiB, medians), and the output and exit status of every run are identical.
+Release builds with `--features cli` of `main` @ `15dcf4a82`, a second build of it (an A/A control), and the same plus this change, on an AMD Ryzen 9 7950X and an Apple M4 Pro, each checked idle first; the three binaries alternate in rotated order within each repetition (9 at 10 MiB, 5 at 100 MiB, medians), and the output and exit status of every run are identical.
 
 - **x86_64:** at 100 MiB, `-c .` reads −7.6% (64 files) and −8.5% (256), `-r .name` −6.1% and −6.5%, `select` −2.5% and −3.0%, where the A/A control read −1.1% to +0.4%; at 10 MiB −1.8% to −9.1%, control −1.5% to +1.8%; 16 files −0.3% to +3.1% at either size.
 - **aarch64:** at 100 MiB, `-c .` reads −5.0% and −5.0%, `-r .name` −5.2% and −4.3%, `select` −2.9% and −2.1%, where the control read −0.7% to +1.4%; at 10 MiB −3.4% to +1.2%, neutral, control −0.7% to +2.1%; 16 files −1.0% to +2.0% at either size.
@@ -7993,11 +7993,11 @@ Peak resident set size at 100 MiB (993,416 records, 105,851,071 bytes with an RS
 | AMD Ryzen 9 7950X |  125.9 |  11.2 |
 | Apple M4 Pro      |  123.5 |   6.8 |
 
-The x86_64 figures are `/usr/bin/time -f %M` on `terminus` (at 10 MiB 21.7 and 11.2, flat), the aarch64 ones `/usr/bin/time -l` on `johns-mac-mini` (at 10 MiB 17.0 and 6.8), medians of 5, release builds with `--features cli`, base `main` @ `0b39b94ae` (which has the several-files route, #7024).
+The x86_64 figures are `/usr/bin/time -f %M` on an AMD Ryzen 9 7950X (at 10 MiB 21.7 and 11.2, flat), the aarch64 ones `/usr/bin/time -l` on an Apple M4 Pro (at 10 MiB 17.0 and 6.8), medians of 5, release builds with `--features cli`, base `main` @ `0b39b94ae` (which has the several-files route, #7024).
 jq 1.7.1's peak on the same file is 2.3 MiB.
 The output of every row is byte-identical to the base binary's, on a file, `< file` and a pipe, and to jq 1.7.1's for the identity, `.name`, `select` and `input_line_number` rows.
 
-Time, interleaved (11 repetitions, a control run of the base beside the real one, output and exit status gated, an idle `terminus` and a `johns-mac-mini` that carried a load of 2 to 3 from other work):
+Time, interleaved (11 repetitions, a control run of the base beside the real one, output and exit status gated, an idle AMD Ryzen 9 7950X and an Apple M4 Pro that carried a load of 2 to 3 from other work):
 
 - **x86_64:** `-c .` reads −6.0% at 100 MiB and −4.1% at 10 MiB, `-r .name` −4.7% and −3.2%, against a control of −0.5% and +0.6%.
 - **aarch64:** `-c .` reads −1.3% at 100 MiB and +0.4% at 10 MiB, `-r .name` −0.8% and −2.0%, against a control of +0.6% and +3.8%: neutral, the prepass being a pass over the file that the whole-file route made as its own check.
@@ -8030,7 +8030,7 @@ Peak resident set size, in MiB, `--seq -c .` over 100 MiB of records (993,416 re
 | AMD Ryzen 9 7950X |  248.8 |  11.3 |             132.6 |
 | Apple M4 Pro      |  255.9 |   8.9 |             135.6 |
 
-The x86_64 figures are `/usr/bin/time -f %M` on `terminus` (at 10 MiB 33.2 and 10.3), the aarch64 ones `wait4`'s `ru_maxrss` on `johns-mac-mini` (at 10 MiB 32.9 and 5.8), medians of 3 interleaved with the base, release builds with `--features cli`, base `main` @ `650bf39ea`.
+The x86_64 figures are `/usr/bin/time -f %M` on an AMD Ryzen 9 7950X (at 10 MiB 33.2 and 10.3), the aarch64 ones `wait4`'s `ru_maxrss` on an Apple M4 Pro (at 10 MiB 32.9 and 5.8), medians of 3 interleaved with the base, release builds with `--features cli`, base `main` @ `650bf39ea`.
 The output, standard error included, and the exit status of every row are the base binary's, and the 100 plain files print what the one file of the same records prints.
 
 ## Costs that still grow past jq's (#7848)
@@ -12003,7 +12003,7 @@ Reproducing the x86_64 answer would make the result of one program depend on the
 | `nan \| strflocaltime("%Y")`                   | assertion failure, 134             | `"1970"`                  | `strflocaltime/1 requires parsed datetime inputs`, 5  | as 1.8.2        |
 | `nan \| gmtime \| mktime`                      | `error converting ...`, 5          | `0`                       | `mktime requires parsed datetime inputs`, 5           | as 1.8.2        |
 
-The x86_64 column was captured on terminus against jq 1.7.1, the arm64 columns on an Apple M5 Max; jq 1.8.2 was measured on arm64 only, and its `f_gmtime` is unchanged, so on x86_64 it is expected to raise as 1.7.1 does.
+The x86_64 column was captured on an AMD Ryzen 9 7950X against jq 1.7.1, the arm64 columns on an Apple M5 Max; jq 1.8.2 was measured on arm64 only, and its `f_gmtime` is unchanged, so on x86_64 it is expected to raise as 1.7.1 does.
 The ledger (`comparison/jq/divergences/`) has no entry for it: no probe of `succinctly dev compare jq` passes NaN to a date builtin, the grammar fuzzer's builtin lists have no date builtin, and the `localtime` sweep's inputs are finite, so the x86_64 Linux differential never reaches it.
 Pinned by `tests/jq_cli/i7735.rs`: every `succinctly jq` row above, and the `infinite` rows that agree everywhere, on every platform.
 
@@ -12041,7 +12041,7 @@ In the pin's libc a white-space character stands in for the first of the day's t
 A white-space character and one digit are all `%d` takes then, so a digit straight after them is no match when something follows (`" 55"` against `"%d%d"`), where `" 5 5"` is day 5 twice.
 A day above 31 is refused where it is read (`"500"` against `"%d%d"` reads 50 first).
 `%D`, `%F`, `%c` and `%x` stand for `%d` and read their day the same way, and `%Ed`, `%Od`, `%Ee` and `%Oe` as the plain specifier.
-glibc's `strptime` skips any run of white space before a number, so jq 1.6 on Linux reads `" 5"`, `"  5"`, `" 05"` and `" 55"` against `%d` or `%d%d` as day 5 (captured on terminus; 1.7.1 on glibc was not).
+glibc's `strptime` skips any run of white space before a number, so jq 1.6 on Linux reads `" 5"`, `"  5"`, `" 05"` and `" 55"` against `%d` or `%d%d` as day 5 (captured on an AMD Ryzen 9 7950X; 1.7.1 on glibc was not).
 succinctly follows the pin, as it does for the other `strptime` rows of this page.
 A 93,600-row grid of 20 formats (`%d`, `%e`, their `%E` and `%O` forms, pairs of them, `%D`, `%F`, `%Y-%m-%d`) over every string of up to four characters from space, tab, newline, `0`, `1`, `5`, `-` and `/` matched the pin on every row (weekday and yearday left out, see the century weekday below); 3,324 rows differed before.
 

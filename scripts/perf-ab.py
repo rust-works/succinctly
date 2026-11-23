@@ -9,7 +9,7 @@ pure layout shift the way cycles do.
 
 Default tool is `cachegrind` (valgrind's binary-instrumentation instruction/cache
 simulator): it needs no hardware perf-counter access, which matters because the
-pinned x86 bench host (terminus, WSL2) cannot use `perf stat` counters. Pass
+pinned x86 bench host (WSL2) cannot use `perf stat` counters. Pass
 `--tool perf` on a host where `perf stat -e instructions,cycles` works instead, or
 `--tool wallclock` (min/median ms, no extra tool needed — e.g. on the ARM cross-check
 box, which has neither valgrind nor perf) to reproduce the original criterion-based

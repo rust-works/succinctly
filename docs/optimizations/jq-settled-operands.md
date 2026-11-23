@@ -45,8 +45,8 @@ three variants:
 `succinctly jq -c <query> arr20k.json` over a 20,000-element numeric array; user + system time;
 the binaries alternate within each repetition (order rotating), minimum of 7; output hashes
 identical across variants before any timing is read; a copy of the settled binary is the noise
-control. Measured on `terminus` (Ryzen 9 7950X, one core pinned, load average 1.3) and
-`johns-mac-mini` (Apple M4 Pro, AC power). The mini was not strictly idle -- load average about
+control. Measured on an AMD Ryzen 9 7950X (one core pinned, load average 1.3) and
+an Apple M4 Pro Mac mini (AC power). The mini was not strictly idle -- load average about
 2.2 from background daemons and two other Claude sessions -- and its control copy read -2.3%
 to +1.4% against the settled binary, which is the noise floor for its rows.
 

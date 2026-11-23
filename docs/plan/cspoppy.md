@@ -287,7 +287,7 @@ binaries — a pre-existing generator bug on `main`, unrelated to this branch
 
 Of the 39 remaining benchmark ids, 38 are noise-level (< 2%) on both Zen 4 and
 M4 Pro. One group is not: **`yaml/block_scalars/*` is 12–28% slower on Zen 4**
-(`terminus`), reproduced identically across two independent interleaved
+(an AMD Ryzen 9 7950X), reproduced identically across two independent interleaved
 reruns — e.g. `100x100lines` 144.6 µs → 184.4 µs, `long_100x100lines` 354.6 µs
 → 407.7 µs. **The same group is neutral on the M4 Pro** (`100x100lines`
 161.9 µs → 160.3 µs, `long_100x100lines` 311.5 µs → 309.3 µs).
@@ -305,7 +305,7 @@ group, size-independent within the group, structurally impossible for the
 changed code to cause) matches a binary code-layout artifact from the
 recompile (e.g. an icache/alignment shift next to the P2.7 AVX2 block-scalar
 loop, which this branch does not touch) rather than a real regression. Not
-chased further — `terminus`'s WSL2 lacks `perf`; filed as #595 for a follow-up
+chased further — the Zen 4 box's WSL2 lacks `perf`; filed as #595 for a follow-up
 native-Linux `perf stat`/objdump comparison to confirm instructions-retired
 parity, which would settle "layout, not logic" conclusively.
 
@@ -329,7 +329,7 @@ attributing it to this change after all.
 ### 5b. Issue #595 follow-up (2026-08-06): confirmed layout artifact, not logic
 
 Settled the "layout, not logic" question the Verdict above deferred, using
-`valgrind --tool=cachegrind` (built from source into `~/local` on `terminus`,
+`valgrind --tool=cachegrind` (built from source into `~/local` on the Zen 4 box,
 no root needed — WSL2 has neither `perf` hardware counters nor an installed
 `valgrind`) in place of the `perf stat -e instructions,cycles` comparison
 originally proposed: cachegrind's binary instrumentation needs no hardware
@@ -347,7 +347,7 @@ The checksum identity gate passed on all 7 shapes on every host (byte-for-byte
 identical `YamlIndex` structure before/after, confirming the BP-structure
 inspection above).
 
-**Zen 4 (`terminus`), `--tool cachegrind`, 5 interleaved reps × 50 iterations:**
+**Zen 4 (AMD Ryzen 9 7950X), `--tool cachegrind`, 5 interleaved reps × 50 iterations:**
 
 | shape             | Ir Δ  | I1mr Δ | ILmr Δ |
 |-------------------|-------|--------|--------|
@@ -369,7 +369,7 @@ hot-loop alignment/layout shift rather than a genuinely larger working set).
 This is the deciding signature issue #595 asked for: same work, different
 cache behaviour, not real extra work.
 
-A same-harness, same-binaries wall-clock reproduction on `terminus`
+A same-harness, same-binaries wall-clock reproduction on the Zen 4 box
 immediately after (200 iterations × 9 reps) showed a smaller +2% median
 regression (range -0.8%..+6.2%) rather than the original 12-28% — plausibly
 because this harness's tight single-process loop reaches a hotter, more
@@ -377,7 +377,7 @@ consistent icache steady-state than criterion's start/stop sampling harness.
 Reported for transparency; it doesn't affect the Ir/I1mr conclusion, which
 holds within a single cachegrind-instrumented run of the same loop.
 
-**M4 Pro (`johns-mac-mini`), `--tool wallclock`, 9 interleaved reps × 200
+**Apple M4 Pro, `--tool wallclock`, 9 interleaved reps × 200
 iterations, reproduced twice:** `10x10lines`/`50x50lines`/`100x100lines`/
 `10x1000lines` neutral (-1.0%..+0.4%), matching the original finding above.
 Unexpectedly, the three `long_*` shapes (long lines, P2.7's SIMD stress
@@ -395,12 +395,12 @@ improvement is worth its own follow-up issue if someone wants to chase it.
 Filed as the ARM follow-up flagged at the end of §5b. Re-ran the exact
 `becd1b8d`/`09158571` `block_scalars_harness` binaries built for §5b's
 investigation — still present at `~/bench-scratch/issue-595/{wt-before,wt-after}`
-on `johns-mac-mini` — through `scripts/perf-ab.py --tool wallclock --reps 9
+on the Apple M4 Pro — through `scripts/perf-ab.py --tool wallclock --reps 9
 --iterations 200`, the same parameters as the two prior M4 Pro runs recorded
 above. Reusing the identical binaries (not rebuilding) tests reproducibility
 of the *measurement*, not the build.
 
-**M4 Pro (`johns-mac-mini`), `--tool wallclock`, 9 interleaved reps × 200
+**Apple M4 Pro, `--tool wallclock`, 9 interleaved reps × 200
 iterations, third independent run:**
 
 | shape              | min ms Δ | median ms Δ |
@@ -419,14 +419,14 @@ both prior runs (§5b's original two: -7.4%..-9.3% and -7.4%..-8.0%) — a third
 independent run landing in the same range confirms this is a real,
 reproducible effect on this box, not one-off noise.
 
-`johns-mac-mini-1` (the second sanctioned ARM twin) responded to `tailscale
+A second Apple M4 Pro Mac mini (the second sanctioned ARM twin) responded to `tailscale
 ping` but not SSH (port 22 timed out twice) — asleep or Remote Login
 disabled, not a routing problem. Could not cross-check that the effect isn't
 specific to one twin this round; noted rather than silently dropped, per the
 issue's own suggested next step.
 
 **ARM instruction-counting tooling: none available without new
-infrastructure.** Checked `johns-mac-mini` directly for an ARM equivalent of
+infrastructure.** Checked the Apple M4 Pro directly for an ARM equivalent of
 the cachegrind approach that settled #595: no `valgrind`, no `perf`, no
 `xctrace`/Instruments, no Homebrew, no MacPorts installed. Upstream valgrind
 still has no native macOS/arm64 support as of its latest release (3.27.0,
@@ -454,13 +454,13 @@ Re-checked #595's "expected, no action" call using #1587's finding: this crate
 has no `[profile.release]`, so it builds at Rust's default `codegen-units =
 16`, and an unrelated code change can reshuffle binary layout on every
 rebuild. §5b's cachegrind numbers were captured under that default profile;
-this re-runs the identical `becd1b8d`/`09158571` comparison on `terminus`
+this re-runs the identical `becd1b8d`/`09158571` comparison on the Zen 4 box
 using the same `scripts/perf-ab.py --tool cachegrind` harness (now carrying
 #1587's `--before-profile`/`--after-profile` recording), same box, same
 session, same 5 reps × 50 iterations — with only the codegen-units setting
 changed between the two runs below.
 
-**`terminus`, default profile (`codegen-units=16`, rebuilt today):**
+**Zen 4 (AMD Ryzen 9 7950X), default profile (`codegen-units=16`, rebuilt today):**
 
 | shape              | Ir Δ  | I1mr Δ  | ILmr Δ |
 |--------------------|-------|---------|--------|
@@ -494,7 +494,7 @@ flat in both runs, and the checksum identity gate passed 7/7 both times —
 nothing about the underlying `YamlIndex::build` work changed between binaries
 either time; only the compiler's layout choice did.
 
-**`johns-mac-mini` (M4 Pro, ARM), `--tool wallclock`, 9 interleaved reps ×
+**Apple M4 Pro (ARM), `--tool wallclock`, 9 interleaved reps ×
 200 iterations** — checked too, to complete the cross-arch record rather
 than assume "already neutral" needed no re-run:
 
@@ -566,7 +566,7 @@ follow-up issue once #64 lands. Mirrored in the issue body.
 **Status: rejected (2026-11-06).** Implemented in full and measured; the predicted trade is real and
 it loses. `rank_l2` stays. The write-up is the ❌ F1 entry in
 [the lessons log](../optimizations/lessons.md); the numbers, interleaved A/B with identical outputs,
-a 7950X (terminus) and an M4 Pro (Mac mini), `bp_rank_micro` and `bp_select_micro` in µs per 10,000
+a 7950X and an M4 Pro, `bp_rank_micro` and `bp_select_micro` in µs per 10,000
 queries:
 
 | row                                  | 7950X before | 7950X after | M4 Pro before | M4 Pro after |
