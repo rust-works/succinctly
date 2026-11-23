@@ -4546,15 +4546,14 @@ fn stage_may_have_effect(stage: &Expr) -> bool {
         Some(run) => kept_run_answers(run, |run| {
             pipe_effect_before_last(run) || run.last().is_some_and(stage_may_have_effect)
         }),
-        None => {
-            walk_body_may_have_effects(stage)
-                || any_subexpr(stage, &mut |e| {
-                    matches!(
-                        e,
-                        Expr::Builtin(Builtin::InputLineNumber | Builtin::InputFilename)
-                    )
-                })
-        }
+        // One walk for both questions: [`walk_body_may_have_effects`]'s set and the two reads.
+        None => any_subexpr(stage, &mut |e| {
+            is_effect_node(e)
+                || matches!(
+                    e,
+                    Expr::Builtin(Builtin::InputLineNumber | Builtin::InputFilename)
+                )
+        }),
     }
 }
 
@@ -4870,6 +4869,10 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             op, left, right, ..
         } => eval_arithmetic::<W, S>(*op, left, right, value, optional),
 
+        // #7859: an operand with an effect is negated as each value is read, as `E[K]` is (#7572).
+        Expr::Negate(operand) if generator_runs_depth_first::<S>(operand) => {
+            collect_depth_first::<W, S>(|sink| each_negate::<W, S>(operand, value, optional, sink))
+        }
         Expr::Negate(operand) => eval_negate::<W, S>(operand, value, optional),
 
         Expr::Compare { op, left, right } => {
@@ -4884,6 +4887,15 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         Expr::Alternative(left, right) => eval_alternative::<W, S>(left, right, value, optional),
 
+        // #7859: a condition with an effect picks a branch for each value as it is read, and the
+        // branch runs before the next is read.
+        Expr::If {
+            cond,
+            then_branch,
+            else_branch,
+        } if generator_runs_depth_first::<S>(cond) => collect_depth_first::<W, S>(|sink| {
+            each_if::<W, S>(cond, then_branch, else_branch, value, optional, sink)
+        }),
         Expr::If {
             cond,
             then_branch,
@@ -5821,11 +5833,30 @@ fn eval_object_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #7859: a key or value with an effect is read as each object is built, as jq does, as an
+    // `as` source is (#7845).
+    if object_runs_depth_first::<S>(entries) {
+        return object_depth_first::<W, S>(entries, value, optional);
+    }
     eval_object_construction_with::<W, S>(
         entries,
         &mut |expr| stream_outputs::<_, S>(eval_single::<W, S>(expr, value.clone(), optional)),
         optional,
     )
+}
+
+/// [`eval_object_construction`]'s [`object_runs_depth_first`] route: jq's cross product
+/// ([`each_object_entries`]), collected.
+#[cold]
+#[inline(never)]
+fn object_depth_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    entries: &[super::expr::ObjectEntry],
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    collect_depth_first::<W, S>(|sink| {
+        each_object_entries::<W, S>(entries, value, optional, &mut Vec::new(), sink)
+    })
 }
 
 /// [`eval_object_construction`] over [`build_object_entries`]'s
@@ -6324,6 +6355,85 @@ fn collect_depth_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match resume_from_escape(conversion_error, flow) {
         Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
         Flow::Escaped(control) => partial(outputs, control),
+    }
+}
+
+/// Whether an object construction builds its objects depth-first (#7859): a key or value that
+/// [`generator_runs_depth_first`] would run so. The collected construction already reads a key or
+/// value that yields one value once per object it builds, in jq's order (`[{a: (1, 2), b:
+/// input}]` reads two inputs either way), so only a slot that fans out and has an effect reads
+/// ahead; the usual construction (`{name: .name, n: .n}`, built once per record) has none and is
+/// told so by [`yields_at_most_one_value`] alone.
+#[inline]
+pub(crate) fn object_runs_depth_first<S: EvalSemantics>(
+    entries: &[super::expr::ObjectEntry],
+) -> bool {
+    // A path or literal slot, the usual one, is answered without a call.
+    let fans_with_effect = |slot: &Expr| {
+        !matches!(
+            slot,
+            Expr::Field(_) | Expr::Literal(_) | Expr::Identity | Expr::Var(_) | Expr::Index { .. }
+        ) && generator_runs_depth_first::<S>(slot)
+    };
+    S::TAG == EvalTag::Jq
+        && entries.iter().any(|entry| {
+            fans_with_effect(&entry.value)
+                || matches!(&entry.key, ObjectKey::Expr(key) if fans_with_effect(key))
+        })
+}
+
+/// The outputs of an argument that jq collects into an array whose step after each value can
+/// raise, as [`stream_outputs`]' `(values, escape)` pair (#7859): `split`'s and `splits`' flags
+/// (`[match($re; "g" + flags) | ...]`) and `combinations`' count (`[range(n) | $dot]`). jq runs
+/// that step on each value before it asks the argument for the next one, so a failing value ends
+/// the argument there. An argument with an effect ([`generator_runs_depth_first`]) therefore runs
+/// depth-first and stops at the first value `accepts` refuses, which is the last value returned:
+/// the caller raises on it as it raises on a collected one. `[split("a"; inputs)]` then reads
+/// inputs only up to the one that fails, so the error names its line and the main loop reads the
+/// rest. Any other argument is collected first, as before.
+fn collected_arg_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    arg: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    accepts: &mut dyn FnMut(&OwnedValue) -> bool,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    if generator_runs_depth_first::<S>(arg) {
+        return collect_until_refused::<W, S>(arg, value, optional, accepts);
+    }
+    stream_outputs::<_, S>(eval_single::<W, S>(arg, value, optional))
+}
+
+/// [`collected_arg_outputs`]' depth-first route. A stop the refusal asked for drops nothing: the
+/// argument's later values are never computed, as in jq.
+#[inline(never)]
+fn collect_until_refused<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    arg: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    accepts: &mut dyn FnMut(&OwnedValue) -> bool,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    let mut outputs = Vec::new();
+    let mut conversion_error = None;
+    let flow = eval_each::<W, S>(
+        arg,
+        value,
+        optional,
+        &mut |item| match item.into_owned::<S>() {
+            Ok(item) => {
+                let accepted = accepts(&item);
+                outputs.push(item);
+                if accepted {
+                    Demand::Continue
+                } else {
+                    Demand::Stop
+                }
+            }
+            Err(error) => stop_with_escape(&mut conversion_error, Control::Error(error)),
+        },
+    );
+    match resume_from_escape(conversion_error, flow) {
+        Flow::Exhausted | Flow::Stopped { .. } => (outputs, None),
+        Flow::Escaped(control) => (outputs, Some(control)),
     }
 }
 
@@ -8338,6 +8448,15 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // builds one row, not 2^20 of them.
         Expr::Builtin(builtin @ (Builtin::Combinations | Builtin::CombinationsN(_))) => {
             each_combinations::<W, S>(builtin, value, optional, sink)
+        }
+        // #7859: `in(xs)` and `walk(f)` hand each output on as jq's definitions make it, when the
+        // argument has an effect: `first(in(inputs))` and `first(walk(f))` stop reading input at
+        // the first output, where the collecting builtins ran the argument to its end first.
+        Expr::Builtin(Builtin::In(xs)) if generator_runs_depth_first::<S>(xs) => {
+            each_in::<W, S>(xs, value, optional, sink)
+        }
+        Expr::Builtin(Builtin::Walk(f)) if generator_runs_depth_first::<S>(f) => {
+            each_walk::<W, S>(f, value, optional, sink)
         }
         Expr::Builtin(Builtin::TruncateStream(f)) => {
             each_truncate_stream_of::<W, S>(f, value, optional, sink)
@@ -22414,50 +22533,16 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut results: Vec<OwnedValue> = Vec::new();
     let mut check_escape: Option<EvalEscape> = None;
     let mut check = |obj_owned: OwnedValue| -> Demand {
-        match (&key_owned, &obj_owned) {
-            (OwnedValue::String(key), OwnedValue::Object(fields)) => {
-                results.push(OwnedValue::Bool(fields.keys().any(|k| k == key)));
+        match in_verdict::<S>(&key_owned, key_idx, &obj_owned) {
+            Ok(found) => {
+                results.push(OwnedValue::Bool(found));
+                Demand::Continue
             }
-            // jq returns false for negative indices, yq returns true if in
-            // range. Any numeric key type is accepted here, not just Int --
-            // see `builtin_has`'s matching arm (#909 review) for the full
-            // rationale on truncating a Float toward zero and treating NaN
-            // as never-in-bounds via `numeric_key_to_index`.
-            (
-                OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
-                OwnedValue::Array(elements),
-            ) => {
-                let in_bounds = match key_idx {
-                    None => false,
-                    Some(idx) => {
-                        let len = elements.len() as i64;
-                        index_in_array_bounds::<S>(idx, len)
-                    }
-                };
-                results.push(OwnedValue::Bool(in_bounds));
-            }
-            // A null candidate is never "in" anything, regardless of key
-            // type -- matches `builtin_has`'s own `(StandardJson::Null, _)`
-            // short-circuit (#908 review; confirmed against jq 1.7.1:
-            // `"a" | in(null)` is `false`, not an error).
-            (_, OwnedValue::Null) => {
-                results.push(OwnedValue::Bool(false));
-            }
-            // Real yq never raises a type-mismatch error here either --
-            // see `builtin_has`'s matching arm (#917) for the
-            // real-yq-verified rationale. jq keeps erroring.
-            _ if has_type_mismatch_is_permissive::<S>() => {
-                results.push(OwnedValue::Bool(false));
-            }
-            _ => {
-                check_escape = Some(EvalEscape::Error(EvalError::cannot_check_has(
-                    obj_owned.type_name(),
-                    key_owned.type_name(),
-                )));
-                return Demand::Stop;
+            Err(e) => {
+                check_escape = Some(EvalEscape::Error(e));
+                Demand::Stop
             }
         }
-        Demand::Continue
     };
     // #7572: jq mode checks each candidate as `xs` produces it, as jq's `. as $x | xs | has($x)`
     // pipe does, so a mismatch stops `xs` there: collecting every candidate first ran
@@ -22493,6 +22578,89 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         check_escape.or(xs_escape).map(Into::into),
         optional,
     )
+}
+
+/// `has($x)` of one candidate `xs` produced for `in(xs)`, with `key` the input `$x` and `key_idx`
+/// its [`numeric_key_to_array_index`]: [`builtin_in`]'s check and [`each_in`]'s, one definition.
+#[inline]
+fn in_verdict<S: EvalSemantics>(
+    key: &OwnedValue,
+    key_idx: Option<i64>,
+    candidate: &OwnedValue,
+) -> Result<bool, EvalError> {
+    match (key, candidate) {
+        (OwnedValue::String(key), OwnedValue::Object(fields)) => {
+            Ok(fields.keys().any(|k| k == key))
+        }
+        // jq returns false for negative indices, yq returns true if in
+        // range. Any numeric key type is accepted here, not just Int --
+        // see `builtin_has`'s matching arm (#909 review) for the full
+        // rationale on truncating a Float toward zero and treating NaN
+        // as never-in-bounds via `numeric_key_to_index`.
+        (
+            OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
+            OwnedValue::Array(elements),
+        ) => Ok(match key_idx {
+            None => false,
+            Some(idx) => index_in_array_bounds::<S>(idx, elements.len() as i64),
+        }),
+        // A null candidate is never "in" anything, regardless of key
+        // type -- matches `builtin_has`'s own `(StandardJson::Null, _)`
+        // short-circuit (#908 review; confirmed against jq 1.7.1:
+        // `"a" | in(null)` is `false`, not an error).
+        (_, OwnedValue::Null) => Ok(false),
+        // Real yq never raises a type-mismatch error here either --
+        // see `builtin_has`'s matching arm (#917) for the
+        // real-yq-verified rationale. jq keeps erroring.
+        _ if has_type_mismatch_is_permissive::<S>() => Ok(false),
+        _ => Err(EvalError::cannot_check_has(
+            candidate.type_name(),
+            key.type_name(),
+        )),
+    }
+}
+
+/// `in(xs)` with each verdict handed to `sink` as `xs` produces its candidate (#7859), as jq's
+/// `. as $x | xs | has($x)` pipe hands it on: a consumer that stops (`first`, `limit`, `isempty`)
+/// stops `xs` there, so `first(in(inputs))` reads one input where [`builtin_in`], which collects
+/// every verdict, read them all. Reached for an `xs` with an effect only
+/// ([`generator_runs_depth_first`]); any other `xs` answers the same either way.
+#[inline(never)]
+fn each_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    xs: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let key = match to_owned::<S, _>(&value) {
+        Ok(key) => key,
+        Err(e) => return drain_result(suppress_or_raise(e, optional), sink),
+    };
+    let key_idx = numeric_key_to_array_index::<S>(&key);
+    let mut refusal = None;
+    let flow =
+        eval_each_owned::<S>(
+            xs,
+            &key,
+            false,
+            Reentry::REBUILT,
+            &mut |candidate| match in_verdict::<S>(&key, key_idx, &candidate) {
+                Ok(found) => sink(Item::Owned(OwnedValue::Bool(found))),
+                Err(e) => {
+                    refusal = Some(Control::Error(e));
+                    Demand::Stop
+                }
+            },
+        );
+    // A refusal comes before whatever ended `xs` after it, as in `builtin_in`.
+    let control = match (refusal, flow) {
+        (Some(control), _) | (None, Flow::Escaped(control)) => control,
+        (None, other) => return other,
+    };
+    match control {
+        Control::Error(e) if suppresses(&e, optional) => Flow::Exhausted,
+        control => Flow::Escaped(control),
+    }
 }
 
 /// Builtin: `IN(s)` - true if any output of `s` (run against the current
@@ -22799,6 +22967,24 @@ fn first_output_only<W, S: EvalSemantics>(result: QueryResult<'_, W>) -> QueryRe
 }
 
 /// Builtin: map_values(f)
+/// `f` on one member for [`builtin_map_values`], cursor materialized. jq's `.[] |= f` asks `f`
+/// for its first output only, so with `take_first` (an `f` with an effect,
+/// [`generator_runs_depth_first`]) `f` stops there (#7859): `map_values(inputs)` reads one input
+/// per member, where collecting every output first read them all. Any other `f` answers the same
+/// when its later outputs are computed and dropped.
+#[inline(always)]
+fn map_values_member<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: &Expr,
+    member: StandardJson<'a, W>,
+    optional: bool,
+    take_first: bool,
+) -> QueryResult<'a, W> {
+    if take_first {
+        return eval_first_expr::<W, S>(f, member, optional).materialize_cursor();
+    }
+    eval_single::<W, S>(f, member, optional).materialize_cursor()
+}
+
 fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     f: &Expr,
     value: StandardJson<'a, W>,
@@ -22815,6 +23001,7 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     {
         return eval_update::<W, S>(&Expr::Iterate, f, value, optional, false);
     }
+    let take_first = generator_runs_depth_first::<S>(f);
     match value {
         StandardJson::Object(fields) => {
             // #1829: preserve a decode-failure key via its raw source span
@@ -22851,9 +23038,9 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                     // (#6129).
                     let original = (S::TAG == EvalTag::Yq).then(|| field_val.clone());
                     let rewritten = Ok(
-                        match first_output_only::<W, S>(
-                            eval_single::<W, S>(f, field_val, optional).materialize_cursor(),
-                        ) {
+                        match first_output_only::<W, S>(map_values_member::<W, S>(
+                            f, field_val, optional, take_first,
+                        )) {
                             QueryResult::One(v) => match to_owned::<S, _>(&v) {
                                 Ok(owned) => Some(owned),
                                 Err(e) => return Err(suppress_or_raise(e, optional)),
@@ -23010,9 +23197,9 @@ fn builtin_map_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 let elem = cursor.value();
                 // #6129: yq's `.[] |= f` leaves an element `f` has no output for.
                 let original = (S::TAG == EvalTag::Yq).then(|| elem.clone());
-                match first_output_only::<W, S>(
-                    eval_single::<W, S>(f, elem, optional).materialize_cursor(),
-                ) {
+                match first_output_only::<W, S>(map_values_member::<W, S>(
+                    f, elem, optional, take_first,
+                )) {
                     QueryResult::One(v) => match to_owned::<S, _>(&v) {
                         Ok(owned) => results.push(owned),
                         Err(e) => return suppress_or_raise(e, optional),
@@ -43005,9 +43192,20 @@ fn fanout_regex_pattern_with_collected_flags<'a, W: Clone + AsRef<[u64]>, S: Eva
             // `""` by `stream_outputs_lossy`'s unchecked fold and then applied as
             // "no flags at all", silently answering with the wrong match
             // semantics instead of raising.
-            let (raw_flags_values, trailing) =
-                stream_outputs::<_, S>(eval_single::<W, S>(flags_expr, value.clone(), optional));
             let bad_input = regex_non_string_input::<W, S>(&value);
+            // #7859: jq's `match` runs on each flags value before `flags` is asked for the next,
+            // so flags with an effect stop at the first value whose `"g" + flags` or regex fails.
+            let (raw_flags_values, trailing) =
+                collected_arg_outputs::<W, S>(flags_expr, value.clone(), optional, &mut |raw| {
+                    resolve_concat_flags::<W, S>(
+                        raw_pattern.clone(),
+                        raw.clone(),
+                        concat,
+                        bad_input.as_ref(),
+                    )
+                    .and_then(|(pattern, flags)| build_regex::<S>(&pattern, Some(&flags)))
+                    .is_ok()
+                });
             let mut resolved_pattern: Option<String> = None;
             let mut flags = vec_with_capacity(raw_flags_values.len());
             for raw_flags in raw_flags_values {
@@ -65697,21 +65895,24 @@ fn drain_fork(
 /// do any of those. The set a probe must not re-run (#2744); read-only builtins
 /// (`input_line_number`, `input_filename`, `env`, `now`) are not in it.
 pub(crate) fn walk_body_may_have_effects(f: &Expr) -> bool {
-    any_subexpr(f, &mut |e| {
-        matches!(
-            e,
-            Expr::Builtin(
-                Builtin::Debug
-                    | Builtin::DebugMsg(_)
-                    | Builtin::Stderr
-                    | Builtin::Input
-                    | Builtin::Inputs
-                    | Builtin::Halt
-                    | Builtin::HaltError
-                    | Builtin::HaltErrorCode(_)
-            ) | Expr::FuncCall { .. }
-        )
-    })
+    any_subexpr(f, &mut is_effect_node)
+}
+
+/// One node of [`walk_body_may_have_effects`]'s set, without its children.
+fn is_effect_node(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Builtin(
+            Builtin::Debug
+                | Builtin::DebugMsg(_)
+                | Builtin::Stderr
+                | Builtin::Input
+                | Builtin::Inputs
+                | Builtin::Halt
+                | Builtin::HaltError
+                | Builtin::HaltErrorCode(_)
+        ) | Expr::FuncCall { .. }
+    )
 }
 
 /// The remaining eager recursion guard's terminal error (#843), now yq mode
@@ -100986,6 +101187,20 @@ pub(crate) fn loop_stream_budget(operand: &Expr) -> Option<RecurseNativeBudget> 
     contains_retrying_pattern_bind(operand).then(RecurseNativeBudget::start)
 }
 
+/// The budget a `while`/`until` operand streams its rounds under: [`loop_stream_budget`]'s, and
+/// also one for an operand with an effect ([`generator_runs_depth_first`], #7859). jq's
+/// `def _while: if cond then ., (update | _while) else empty end;` runs the rest of the loop on
+/// each output of `cond` or `update` before asking it for the next, so collecting the outputs
+/// first read ahead: `[while(inputs; . + 1)]` read every input in its first round and counted
+/// none of the later ones. Past the native-stack ceiling such a loop collects again, as a `?//`
+/// one does.
+pub(crate) fn loop_operand_stream_budget<S: EvalSemantics>(
+    operand: &Expr,
+) -> Option<RecurseNativeBudget> {
+    loop_stream_budget(operand)
+        .or_else(|| generator_runs_depth_first::<S>(operand).then(RecurseNativeBudget::start))
+}
+
 /// Enter the next native level of a loop whose [`loop_stream_budget`] is `budget`,
 /// or `None` when it has none or the stack it has spent is past the ceiling a
 /// `recurse` walk descends to before it queues ([`RECURSE_NATIVE_STACK_BYTES`]).
@@ -101033,8 +101248,8 @@ fn each_loop<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     let demoted_cond = demote_for_reentry(cond, &RootWitness::Owned);
     let demoted_update = demote_for_reentry(update, &RootWitness::Owned);
-    let cond = LoopOperand::new(cond, &demoted_cond);
-    let update = LoopOperand::new(update, &demoted_update);
+    let cond = LoopOperand::new::<S>(cond, &demoted_cond);
+    let update = LoopOperand::new::<S>(update, &demoted_update);
     let mut counters = LoopCounters::new();
     let mut emit = |state: OwnedValue| sink(Item::Owned(state));
     let mut out = SinkOut(&mut emit);
@@ -101092,8 +101307,8 @@ fn eval_until<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     let demoted_cond = demote_for_reentry(cond, &RootWitness::Owned);
     let demoted_update = demote_for_reentry(update, &RootWitness::Owned);
-    let cond = LoopOperand::new(cond, &demoted_cond);
-    let update = LoopOperand::new(update, &demoted_update);
+    let cond = LoopOperand::new::<S>(cond, &demoted_cond);
+    let update = LoopOperand::new::<S>(update, &demoted_update);
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut counters = LoopCounters::new();
     let result = until_step::<S>(
@@ -101136,12 +101351,13 @@ struct LoopOperand<'e> {
 impl<'e> LoopOperand<'e> {
     /// An operand with its demoted twin; one holding a `?//` is driven through a
     /// live sink so a retry can follow a failure a later round raises: `update`
-    /// (#3503) and `cond` (#3617).
-    fn new(expr: &'e Expr, demoted: &'e Expr) -> Self {
+    /// (#3503) and `cond` (#3617). So is one with an effect, which jq runs
+    /// depth-first (#7859, [`loop_operand_stream_budget`]).
+    fn new<S: EvalSemantics>(expr: &'e Expr, demoted: &'e Expr) -> Self {
         Self {
             expr,
             demoted,
-            stream: loop_stream_budget(expr),
+            stream: loop_operand_stream_budget::<S>(expr),
         }
     }
 
@@ -101516,8 +101732,8 @@ fn eval_while<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     let demoted_cond = demote_for_reentry(cond, &RootWitness::Owned);
     let demoted_update = demote_for_reentry(update, &RootWitness::Owned);
-    let cond = LoopOperand::new(cond, &demoted_cond);
-    let update = LoopOperand::new(update, &demoted_update);
+    let cond = LoopOperand::new::<S>(cond, &demoted_cond);
+    let update = LoopOperand::new::<S>(update, &demoted_update);
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let mut counters = LoopCounters::new();
     let result = while_step::<S>(
@@ -101759,6 +101975,11 @@ fn each_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Err(e) if suppresses(&e, optional) => return Flow::Exhausted,
         Err(e) => return Flow::Escaped(Control::Error(e)),
     };
+    if generator_runs_depth_first::<S>(expr) {
+        return each_repeat_round_by_round::<S>(expr, &owned, optional, &mut |v| {
+            sink(Item::Owned(v))
+        });
+    }
     let mut empty_rounds = 0usize;
     loop {
         // #3036: `owned` is this arm's own input, unrebuilt -- bridged.
@@ -101782,6 +102003,61 @@ fn each_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         if let Some(control) = control {
             return Flow::Escaped(control);
+        }
+    }
+}
+
+/// [`each_repeat`] for an `expr` with an effect ([`generator_runs_depth_first`], #7859): each round's
+/// values reach `sink` as `expr` makes them, as jq's `def repeat(f): def _repeat: f, _repeat;` hands
+/// them on, so a consumer that stops stops the round there. Collecting the round first ran `expr`
+/// to its end: `first(repeat((1, input)))` read an input jq never reads, and `limit(3; repeat((1,
+/// input)))` read one past the third value. The caps are [`each_repeat`]'s; the loop is
+/// `eval_generic::each_repeat_generic`'s.
+#[inline(never)]
+fn each_repeat_round_by_round<S: EvalSemantics>(
+    expr: &Expr,
+    owned: &OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    let mut empty_rounds = 0usize;
+    loop {
+        let mut stopped = false;
+        let mut produced_any = false;
+        let mut budget_control = None;
+        let mut budget = REPEAT_WIDTH_BUDGET;
+        // #3036: `owned` is this arm's own input, unrebuilt -- bridged.
+        let flow = eval_each_owned::<S>(expr, owned, optional, Reentry::Proven, &mut |v| {
+            produced_any = true;
+            if let Some(control) = charge_budget(&mut budget, "repeat") {
+                stopped = true;
+                return stop_with_escape(&mut budget_control, control);
+            }
+            match sink(v) {
+                Demand::Continue => Demand::Continue,
+                Demand::Stop => {
+                    stopped = true;
+                    Demand::Stop
+                }
+            }
+        });
+        if let Some(control) = budget_control {
+            return Flow::Escaped(control);
+        }
+        if stopped {
+            return Flow::Stopped { pending: None };
+        }
+        if !produced_any && matches!(flow, Flow::Exhausted) {
+            empty_rounds += 1;
+            if empty_rounds >= MAX_EMPTY_REPEAT_ROUNDS {
+                return Flow::Exhausted;
+            }
+            continue;
+        }
+        empty_rounds = 0;
+        match flow {
+            Flow::Exhausted => continue,
+            other => return other,
         }
     }
 }
@@ -102934,7 +103210,71 @@ fn walk_impl<S: EvalSemantics>(
     value: OwnedValue,
     optional: bool,
 ) -> (Vec<OwnedValue>, Option<Control>) {
-    walk_impl_at_depth::<S>(f, value, optional, 0)
+    walk_impl_at_depth::<S>(f, value, optional, 0, walk_members_take_first::<S>(f))
+}
+
+/// Whether `walk(f)`'s object members run `f` only up to its first output (#7859), as jq's
+/// `map_values(w)` asks it: an `f` with an effect ([`generator_runs_depth_first`]) and no `?//`
+/// retry, which may run `f` again after a stop. Any other `f` answers the same when its later
+/// outputs are computed and dropped, which is how they are computed for it.
+fn walk_members_take_first<S: EvalSemantics>(f: &Expr) -> bool {
+    generator_runs_depth_first::<S>(f) && !has_pattern_alternatives(f)
+}
+
+/// `walk(f)` with each output of the outermost `f` handed to `sink` as it is made (#7859): a
+/// consumer that stops stops `f` there, so `first(walk((1, input)))` reads no input past the one
+/// the first output needs. The members below are rebuilt as [`walk_impl`] rebuilds them. Reached
+/// for an `f` with an effect only ([`generator_runs_depth_first`]).
+#[inline(never)]
+fn each_walk<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    f: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    let owned = match to_owned::<S, _>(&value) {
+        Ok(v) => v,
+        Err(e) => return drain_result(suppress_or_raise(e, optional), sink),
+    };
+    let take_first = walk_members_take_first::<S>(f);
+    let flow = match walk_members_out_of_line::<S>(f, owned, optional, 0, take_first) {
+        Ok(processed) => {
+            eval_each_owned::<S>(f, &processed, optional, Reentry::REBUILT, &mut |v| {
+                sink(Item::Owned(v))
+            })
+        }
+        Err(control) => Flow::Escaped(control),
+    };
+    match flow {
+        Flow::Escaped(Control::Error(e)) if suppresses(&e, optional) => Flow::Exhausted,
+        other => other,
+    }
+}
+
+/// One object member of `walk` when [`walk_members_take_first`]: `w` on its value up to its first
+/// output, as `map_values(w)` asks it; a control after that output is never reached.
+#[cold]
+#[inline(never)]
+fn walk_member_first<S: EvalSemantics>(
+    f: &Expr,
+    value: OwnedValue,
+    optional: bool,
+    depth: usize,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    let processed = match walk_members_out_of_line::<S>(f, value, optional, depth, true) {
+        Ok(processed) => processed,
+        Err(control) => return (Vec::new(), Some(control)),
+    };
+    let mut first = None;
+    let flow = eval_each_owned::<S>(f, &processed, optional, Reentry::REBUILT, &mut |v| {
+        first = Some(v);
+        Demand::Stop
+    });
+    match (first, flow) {
+        (Some(v), _) => (vec![v], None),
+        (None, Flow::Escaped(control)) => (Vec::new(), Some(control)),
+        (None, Flow::Exhausted | Flow::Stopped { .. }) => (Vec::new(), None),
+    }
 }
 
 /// `walk(f)` over an owned `value`, as [`builtin_walk`] runs it once the value is materialized
@@ -102964,7 +103304,44 @@ fn walk_impl_at_depth<S: EvalSemantics>(
     value: OwnedValue,
     optional: bool,
     depth: usize,
+    take_first: bool,
 ) -> (Vec<OwnedValue>, Option<Control>) {
+    let processed = match walk_members::<S>(f, value, optional, depth, take_first) {
+        Ok(processed) => processed,
+        Err(control) => return (Vec::new(), Some(control)),
+    };
+
+    // Then apply f to the processed value, correctly threading Control
+    // (#855) at every level -- the same fork building block every other
+    // fork construct in this file uses.
+    eval_owned_expr_fork::<S>(f, &processed, optional, Reentry::REBUILT)
+}
+
+/// [`walk_members`] for the cold callers ([`each_walk`], [`walk_member_first`]), so that the one
+/// inlined copy is [`walk_impl_at_depth`]'s.
+#[inline(never)]
+fn walk_members_out_of_line<S: EvalSemantics>(
+    f: &Expr,
+    value: OwnedValue,
+    optional: bool,
+    depth: usize,
+    take_first: bool,
+) -> Result<OwnedValue, Control> {
+    walk_members::<S>(f, value, optional, depth, take_first)
+}
+
+/// `walk`'s `if type == "object" then map_values(w) elif type == "array" then map(w) else . end`:
+/// `value` with every member walked, or the control that aborted the container. `take_first` is
+/// [`walk_members_take_first`]'s answer, passed down. Inlined, so that a level of the walk is
+/// still one frame of [`walk_impl_at_depth`].
+#[inline(always)]
+fn walk_members<S: EvalSemantics>(
+    f: &Expr,
+    value: OwnedValue,
+    optional: bool,
+    depth: usize,
+    take_first: bool,
+) -> Result<OwnedValue, Control> {
     assert_value_tree_depth(depth);
     let processed = match value {
         // #7260: rebuilt in its own storage (copied first only if another handle shares it), the
@@ -102979,9 +103356,10 @@ fn walk_impl_at_depth<S: EvalSemantics>(
             let mut spill: Option<Vec<OwnedValue>> = None;
             for at in 0..len {
                 let v = core::mem::replace(&mut items[at], OwnedValue::Null);
-                let (mut vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
+                let (mut vs, control) =
+                    walk_impl_at_depth::<S>(f, v, optional, depth + 1, take_first);
                 if let Some(control) = control {
-                    return (Vec::new(), Some(control));
+                    return Err(control);
                 }
                 match &mut spill {
                     Some(spill) => spill.extend(vs),
@@ -103016,10 +103394,14 @@ fn walk_impl_at_depth<S: EvalSemantics>(
         OwnedValue::Object(obj) if obj.has_shadows() => {
             let mut new_obj = obj.clone();
             for (k, v) in obj {
-                let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
+                let (vs, control) = if take_first {
+                    walk_member_first::<S>(f, v, optional, depth + 1)
+                } else {
+                    walk_impl_at_depth::<S>(f, v, optional, depth + 1, false)
+                };
                 if let Some(control) = control {
                     if walk_member_raises(&vs) {
-                        return (Vec::new(), Some(control));
+                        return Err(control);
                     }
                 }
                 match vs.into_iter().next() {
@@ -103043,10 +103425,14 @@ fn walk_impl_at_depth<S: EvalSemantics>(
             for at in 0..map.len() {
                 let slot = map.get_index_mut(at).expect("in bounds").1;
                 let v = core::mem::replace(slot, OwnedValue::Null);
-                let (vs, control) = walk_impl_at_depth::<S>(f, v, optional, depth + 1);
+                let (vs, control) = if take_first {
+                    walk_member_first::<S>(f, v, optional, depth + 1)
+                } else {
+                    walk_impl_at_depth::<S>(f, v, optional, depth + 1, false)
+                };
                 if let Some(control) = control {
                     if walk_member_raises(&vs) {
-                        return (Vec::new(), Some(control));
+                        return Err(control);
                     }
                 }
                 match vs.into_iter().next() {
@@ -103070,11 +103456,7 @@ fn walk_impl_at_depth<S: EvalSemantics>(
         }
         other => other,
     };
-
-    // Then apply f to the processed value, correctly threading Control
-    // (#855) at every level -- the same fork building block every other
-    // fork construct in this file uses.
-    eval_owned_expr_fork::<S>(f, &processed, optional, Reentry::REBUILT)
+    Ok(processed)
 }
 
 /// Builtin: isvalid(expr) - check if expr succeeds without errors.
@@ -114930,8 +115312,12 @@ fn combinations_n_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // it used to be silently lossy-substituted and only then reach
     // `range_num`'s ordinary, `optional`-suppressible type error. Pinned by
     // `test_builtin_combinations_n_raises_on_undecodable_n_expr_2196`.
+    // #7859: `range(n)` raises on a value before `n` is asked for its next one, so an `n` with an
+    // effect stops at the first value that is not a number.
     let (n_values, trailing) =
-        stream_outputs::<_, S>(eval_single::<W, S>(n_expr, value.clone(), optional));
+        collected_arg_outputs::<W, S>(n_expr, value.clone(), optional, &mut |n| {
+            range_num(n).is_ok()
+        });
 
     // Array construction drops its prefix when its generator escapes, so a
     // trailing break/error aborts the whole call with no output -- verified

@@ -15615,20 +15615,6 @@ matches both: `default_colors::NULL` uses `0;90`, and `colorize_json` recognizes
 render (an internal marker text `format_json` substitutes for `null` only when colorizing,
 stripped before any byte reaches the user) to apply the same double wrap.
 
-## `map_values(f)` still fires the side effects of outputs of `f` after the first ([#5791](https://github.com/rust-works/succinctly/issues/5791))
-
-jq's `map_values(f)` is `.[] |= f`, which reads the first output of `f` and goes no further.
-Since #5791 `succinctly jq` takes the same value and no longer raises an error (or halts, or breaks) that `f` produces after it: `[1] | map_values((1, error("x")))` is `[1]`.
-It still evaluates `f` to its end before taking that value, so a side effect of a later output fires where jq never reaches it.
-`jq -n '[1] | map_values(2, halt_error(6))'` prints `[2]` and exits 0 with nothing on stderr; `succinctly jq` prints `[2]`, exits 0, and writes `1` to stderr.
-`debug` and `stderr` after the first output are the same, as is `input` (it consumes a document jq leaves).
-`succinctly yq` raises the later error, as real yq does.
-Pinned by `test_map_values_object_ignores_a_halt_after_the_first_output_5791`.
-`walk(f)` on an object is `map_values(w)` in jq, so since [#5794](https://github.com/rust-works/succinctly/issues/5794) a member keeps the first output of its own subtree the same way, and has the same residual.
-`{"a":1} | walk((., halt_error))` prints `{"a":1}` and exits 5 in jq with `{"a":1}` on stderr; `succinctly jq` prints the same on stdout and writes `1` to stderr first, for the member's later output.
-`succinctly yq --jq-extensions` takes jq's rule here, since real yq has no `walk` to follow.
-Pinned by `walk_still_fires_a_later_outputs_side_effect_5794`.
-
 ## A path through a named argument: assignments, `$ARGS` and scalars ([#5692](https://github.com/rust-works/succinctly/issues/5692))
 
 jq binds a named argument as `CONST as $name | program`, so a path ending on `$name` is certified by the variable's own `jv`.

@@ -15584,14 +15584,13 @@ fn test_map_values_object_ignores_a_halt_after_the_first_output_5791() -> Result
     // defined as `.[] |= f` (`_modify`), which only ever observes the *first* output of `f`, so
     // `jq -n '{"a":1} | map_values(2, halt_error(5))'` prints `{"a":2}` and exits 0 without
     // reaching `halt_error` (#5791; this test used to pin the halt as succinctly's own
-    // contract). The one leftover: the eager evaluation of `f` still fires `halt_error`'s
-    // stderr text (`1`), which jq never prints -- the side-effect rule documented at
-    // `eval.rs`'s "fires even" note, not part of this fix.
+    // contract). Since #7859 `f` stops at that first output here too, so `halt_error`'s stderr
+    // text (`1`), which jq never prints, is not written either.
     let (stdout, stderr, code) =
         run_jq_full(&["-n", r#"{"a":1} | map_values(2, halt_error(5))"#], None)?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "{\n  \"a\": 2\n}\n");
-    assert_eq!(stderr, "1\n");
+    assert_eq!(stderr, "");
     Ok(())
 }
 
@@ -15611,12 +15610,12 @@ fn test_map_values_array_propagates_bare_halt_from_element() -> Result<()> {
 #[test]
 fn test_map_values_array_ignores_a_halt_after_the_first_output_5791() -> Result<()> {
     // The array sibling of the object test above: real jq's `.[] |= f` only observes `f`'s first
-    // output, so `jq -n '[1] | map_values(2, halt_error(6))'` prints `[2]` and exits 0. The
-    // stderr text is the same leftover side effect (#5791).
+    // output, so `jq -n '[1] | map_values(2, halt_error(6))'` prints `[2]` and exits 0, with
+    // nothing on stderr (#5791, #7859).
     let (stdout, stderr, code) = run_jq_full(&["-n", "[1] | map_values(2, halt_error(6))"], None)?;
     assert_eq!(code, 0, "stdout: {stdout:?} stderr: {stderr:?}");
     assert_eq!(stdout, "[\n  2\n]\n");
-    assert_eq!(stderr, "1\n");
+    assert_eq!(stderr, "");
     Ok(())
 }
 

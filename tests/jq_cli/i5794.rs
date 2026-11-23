@@ -104,13 +104,15 @@ fn walk_reads_one_output_per_object_member_5794() -> Result<()> {
     Ok(())
 }
 
-/// The residual the limitations page records: jq never runs the member's later output, so its
-/// `halt_error` text does not appear; `succinctly jq` has already run it, so the member's value
-/// `1` is written to stderr before the parent's own `halt_error`. Stdout and the exit status match.
+/// jq never runs the member's later output, so its `halt_error` text does not appear: only the
+/// parent's own `halt_error` writes, the object itself. Since #7859 `succinctly jq` stops a member's
+/// `f` at its first output too, where it used to write the member's value `1` first.
 #[test]
-fn walk_still_fires_a_later_outputs_side_effect_5794() -> Result<()> {
+fn walk_does_not_fire_a_members_later_side_effect_5794() -> Result<()> {
     let (out, err, status) = run_jq_full(&["-c", "walk((., halt_error))"], Some("{\"a\":1}\n"))?;
-    assert_eq!((out.as_str(), status), ("{\"a\":1}\n", 5), "{err}");
-    assert!(err.starts_with("1\n"), "{err:?}");
+    assert_eq!(
+        (out.as_str(), err.as_str(), status),
+        ("{\"a\":1}\n", "{\"a\":1}\n", 5)
+    );
     Ok(())
 }
