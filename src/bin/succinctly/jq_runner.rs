@@ -5688,6 +5688,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     PROGRAM_READS_INPUTS.with(|reads| reads.set(program_reads_inputs));
     PROGRAM_PULLS_INPUTS.with(|pulls| pulls.set(jq::walk::pulls_inputs(&expr)));
     PROGRAM_HALTS.with(|halts| halts.set(jq::walk::can_halt(&expr)));
+    // #7859: whether a construction's argument may have an effect is a property of the program
+    // text, asked here once for the whole run instead of per record of every construction.
+    let _program_effects = jq::enter_program_effects_scope(&expr);
 
     // Configure output
     let output_config = OutputConfig::from_args(&args);

@@ -201,6 +201,9 @@ pub use eval::{
     VisibleDef, YqSemantics,
 };
 pub use eval::{eval_full, eval_owned_scalar_fast, eval_reindexed_document, with_stderr_muted};
+// #7859: the CLI driver decides once per program whether any node can have an effect.
+#[doc(hidden)]
+pub use eval::enter_program_effects_scope;
 #[doc(hidden)]
 pub use eval::{
     yq_encoder_prints_leading_block, yq_encoder_reads_spelling, yq_encoder_writes_comments,

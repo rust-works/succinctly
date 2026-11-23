@@ -19066,6 +19066,10 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
         // under `optional`, discarding what was built), and a generator's
         // trailing escape becomes a `Partial` after the objects already
         // built.
+        // #7859: an operand with an effect is read as each object is built, as `eval.rs` builds it.
+        Expr::Object(entries) if crate::jq::eval::object_runs_depth_first::<S>(entries) => {
+            collect_each_generic::<S, V>(expr, value, optional, cursor)
+        }
         Expr::Object(entries) => {
             object_construction_generic::<S, V>(entries, value, optional, cursor)
         }
@@ -19934,15 +19938,24 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // own: with a live input queue, an argument that reads `input`/
         // `inputs` still crosses to `eval.rs`, whose `Builtin::Inputs` arm
         // this module lacks (#1309).
+        //
+        // `any(cond)`/`all(cond)`/`isvalid(f)` (#2658, below) defer here too rather than from an
+        // arm of their own with this same guard and call: each such arm is a slot and a call's
+        // arguments in this frame in an unoptimised build, which every level of a recursion pays
+        // several times over (`r(12000; 7)` in `test_literal_dollar_argument_matches_jq_3260`).
         Expr::Builtin(
             Builtin::Skip(..)
             | Builtin::IsEmpty(_)
             | Builtin::AnyCond(..)
             | Builtin::AllCond(..)
             | Builtin::UpperIn(_)
-            | Builtin::UpperInSrc(..),
+            | Builtin::UpperInSrc(..)
+            | Builtin::AnyF(_)
+            | Builtin::AllF(_)
+            | Builtin::IsValid(_),
         ) if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) => {
             bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+            // patchcov: coverage tolerate-line reason="the CLI evaluates every program that uses input/inputs on the eager route (jq_runner's can_use_lazy_path excludes them), so this guard never fires today; kept for the day the lazy path admits such a program (#1309)"
         }
         Expr::Builtin(Builtin::IsEmpty(inner)) => {
             each_isempty_generic::<S, V>(inner, value, optional, cursor, sink)
@@ -19968,13 +19981,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // `bridge_to_full_evaluator_flow`'s `O(2^N)` ambient copy on an
         // alias fan-out. The `any`/`all`/`isvalid` verdicts are one item, so
         // they answer through the collecting arm and push it; the loops
-        // stream. Same live-input-queue deferral as the arms above (#1309).
-        Expr::Builtin(Builtin::AnyF(_) | Builtin::AllF(_) | Builtin::IsValid(_))
-            if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) =>
-        {
-            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
-            // patchcov: coverage tolerate-line reason="the CLI evaluates every program that uses input/inputs on the eager route (jq_runner's can_use_lazy_path excludes them), so this guard never fires today -- #2968's identical guards on the arms above are equally unfired; kept for the day the lazy path admits such a program (#1309)"
-        }
+        // stream. Same live-input-queue deferral as the arms above (#1309), taken in their arm.
         Expr::Builtin(Builtin::AnyF(cond)) if cursor.is_some() => drain_any_all_probe_generic::<V>(
             any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), true),
             sink,
@@ -20318,9 +20325,22 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // on `[1,2]` built 2^20 rows). It shares this arm rather than taking
         // one of its own, which grew this frame and took `r(12000; 7)` in
         // `test_literal_dollar_argument_matches_jq_3260` past the depth limit.
+        //
+        // #7859: `in(xs)` and `walk(f)` share it too, in a program with an effect somewhere, for an
+        // argument with one, which `eval_each` streams (`each_in`, `each_walk`); any other goes on
+        // to the wildcard's route. Any other program goes there from this one read. They share
+        // the arm, and its one call, for the reason `combinations` does: an arm of their own grew
+        // this frame by the call's arguments, seven times a level of that same `r(12000; 7)`,
+        // which the unoptimised arm64 build then refused some hundred levels short.
         Expr::Builtin(
-            Builtin::PathsFilter(_) | Builtin::Combinations | Builtin::CombinationsN(_),
-        ) => each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink),
+            Builtin::PathsFilter(_)
+            | Builtin::Combinations
+            | Builtin::CombinationsN(_)
+            | Builtin::In(_)
+            | Builtin::Walk(_),
+        ) if takes_paths_filter_dispatch(expr) => {
+            each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink)
+        }
 
         // #3448: jq's `=`/`op=`/`//=` run their right side as the outer
         // generator, so a consumer that stops after one document must stop
@@ -23505,8 +23525,9 @@ fn each_loop_generic<S: EvalSemantics, V: DocumentValue>(
         cond,
         update,
         optional,
-        stream: crate::jq::eval::loop_stream_budget(update),
-        cond_stream: crate::jq::eval::loop_stream_budget(cond),
+        // #7859: and an operand with an effect, as `eval::LoopOperand` streams it.
+        stream: crate::jq::eval::loop_operand_stream_budget::<S>(update),
+        cond_stream: crate::jq::eval::loop_operand_stream_budget::<S>(cond),
     };
     match loop_step_generic::<S, V>(spec, state, &mut counters.budget(), sink) {
         Ok(Demand::Continue) => Flow::Exhausted,
@@ -31521,9 +31542,21 @@ fn each_paths_filter_generic<S: EvalSemantics, V: DocumentValue>(
     Flow::Exhausted
 }
 
+/// Whether `eval_each_generic` hands `expr`, one of the five builtins its arm names, to
+/// [`each_paths_filter_dispatch`]: always, but for `in(xs)` and `walk(f)` only in a program with
+/// an effect somewhere (#7859), from one thread-local read. Asked of `expr` itself: a binding in
+/// the arm's pattern is a slot of `eval_each_generic`'s frame in an unoptimised build.
+#[inline]
+fn takes_paths_filter_dispatch(expr: &Expr) -> bool {
+    !matches!(expr, Expr::Builtin(Builtin::In(_) | Builtin::Walk(_)))
+        || crate::jq::eval::program_effects::may_have_effect()
+}
+
 /// Which producer `paths(f)` takes in `eval_each_generic` (#1342): the walk
 /// where duplicate keys survive, the owned bridge where they collapse anyway.
 /// `combinations` and `combinations(n)` always take the bridge (#7726).
+/// `in(xs)` and `walk(f)` take it when the argument has an effect (#7859), and otherwise the
+/// collected answer `eval_each_generic`'s wildcard gives them.
 /// A function of its own, with the same arguments the single bridge call it
 /// replaced took, so `eval_each_generic`'s native frame -- the one the
 /// recursion floor is read against -- is the size it was.
@@ -31538,6 +31571,11 @@ fn each_paths_filter_dispatch<S: EvalSemantics, V: DocumentValue>(
     match expr {
         Expr::Builtin(Builtin::PathsFilter(filter)) if !S::COLLAPSE_DUPLICATE_KEYS => {
             each_paths_filter_generic::<S, V>(filter, value, cursor, optional, sink)
+        }
+        Expr::Builtin(Builtin::In(arg) | Builtin::Walk(arg))
+            if !crate::jq::eval::generator_runs_depth_first::<S>(arg) =>
+        {
+            drain_result_generic(eval_single::<S, V>(expr, value, optional, cursor), sink)
         }
         _ => bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink),
     }
@@ -41221,7 +41259,12 @@ fn map_values_of_document_object<S: EvalSemantics, V: DocumentValue>(
     }
     let cursor = cursor?;
     let fields = value.as_object()?;
-    if needs_path_context(f) || crate::jq::eval::has_pattern_alternatives(f) {
+    // #7859: an `f` with an effect takes the bridge, whose `builtin_map_values` stops `f` at its
+    // first output for each member.
+    if needs_path_context(f)
+        || crate::jq::eval::has_pattern_alternatives(f)
+        || crate::jq::eval::generator_runs_depth_first::<S>(f)
+    {
         return None;
     }
     Some(map_values_of_fields::<S, V>(f, &fields, cursor))
