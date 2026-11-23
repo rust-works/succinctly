@@ -15988,6 +15988,8 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     let dash = files.first().is_some_and(|path| is_stdin_dash(path));
     // Whether the source is a terminal (#7742), asked only of a source read as a stream.
     let mut terminal = false;
+    // Its descriptor (#7812).
+    let mut terminal_fd: i32 = 0;
     let (mut reader, len): (Box<dyn std::io::Read>, Option<usize>) = match files.first() {
         // #7478: `-` is standard input, read below as an unnamed one is (named `<stdin>`), unless a
         // route before has read it whole already.
@@ -16014,6 +16016,10 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
                 Ok((true, _, Ok(len))) if len > front => (Box::new(file), Some(len)),
                 Ok((_, true, _)) => {
                     terminal = file.is_terminal();
+                    #[cfg(unix)]
+                    {
+                        terminal_fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+                    }
                     (Box::new(file), None)
                 }
                 _ => return Ok(LoneStart::Declined),
@@ -16044,6 +16050,7 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             rest: LazyRest {
                 windows: window::LineWindows::new(reader, None, lazy_window_bytes(), Vec::new())
                     .typed_into()
+                    .ready_on(terminal_fd)
                     .of_kind(window::SourceKind::Stream),
             },
             lead: 0,
@@ -16073,6 +16080,8 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     } else {
         front.min(LAZY_START_BYTES)
     };
+    // #7812: jq's parser over a long value the front of a stream is read on for ([`open_value_faults_in`]).
+    let mut front_check: Option<OpenValueCheck> = None;
     let more = loop {
         let read = reader
             .by_ref()
@@ -16170,8 +16179,19 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
             }
             // #7447: past the front, read on only while more text may end the first chunk: a fault
             // no byte can change, a BOM or text that is not UTF-8 is read whole at once, as before.
+            // #7812: in a stream, so is a fault inside a container or string that is still open, once jq's
+            // parser meets it (the scan's open tail is a bracket and quote count).
             Some((chunk, _))
-                if want >= front && chunk.end == ChunkEnd::Fault && !chunk.open_tail =>
+                if want >= front
+                    && chunk.end == ChunkEnd::Fault
+                    && (!chunk.open_tail
+                        || (streamed
+                            && open_value_faults_in(
+                                &bytes[bom..valid_end],
+                                chunk.spans.last().map_or(0, |&(_, end)| end),
+                                &mut front_check,
+                            )
+                            && window::judge_kind(kind) == window::SourceKind::Stream)) =>
             {
                 // #7738: a stream is not read to its end for its fault: the route starts on the front
                 // with no document scanned, and its scan meets the fault and reports it from what has
@@ -16956,6 +16976,8 @@ fn lazy_scan_on(
     // space is read past, and a file of nothing else holds no document, as a blank file of several holds
     // none on the route that reads them whole.
     let starts_on_a_window = more.rest.is_some() && more.scanned_to == 0;
+    // #7812: jq's parser over the value a stream is read on for, once it is long ([`open_value_faults`]).
+    let mut open_check: Option<OpenValueCheck> = None;
     loop {
         if more.rest.is_some() {
             let ahead = lazy.text.len() - more.scanned_to;
@@ -16997,6 +17019,16 @@ fn lazy_scan_on(
             ChunkEnd::Done if chunk.spans.is_empty() => read_on = true,
             ChunkEnd::Done => {
                 chunk.end = ChunkEnd::More;
+                break;
+            }
+            // #7812: a stream is read on for an open value only while jq's parser holds it open: a
+            // fault inside it ends the read there, as jq reports it.
+            ChunkEnd::Fault
+                if chunk.open_tail
+                    && later.is_empty()
+                    && open_value_faults(lazy, &mut more, &chunk, &mut open_check) =>
+            {
+                chunk.open_tail = false;
                 break;
             }
             ChunkEnd::Fault if chunk.open_tail => read_on = true,
@@ -17114,6 +17146,68 @@ fn lazy_scan_on(
     }
     false
 }
+
+/// jq's parser reading the value a lone stream is read on for (#7812): where the value starts in the text,
+/// the reader, and how far it has read.
+struct OpenValueCheck {
+    start: usize,
+    reader: jq::JqOpenTail,
+    read_to: usize,
+}
+
+/// Whether the value a lone stream's scan ends inside holds a fault jq's parser meets in what has been
+/// read (#7812). The scan's judgement of an open tail is a bracket and quote count, so a fault inside a
+/// container that is still open (`[tru,`, `{x`, `[1 2`, random bytes after a `{`) left it reading on for
+/// the close, which a stream may never bring: the run grew until killed, where jq reports the fault as its
+/// reader gets to it. jq's parser model ([`jq::JqOpenTail`], #7750) reads the value instead, a piece at a
+/// time as the stream is read on, and its first fault ends the read. It reads only a value open past
+/// [`OPEN_VALUE_CHECK_WINDOWS`] windows, as the plain route checks one past its look-ahead: a value shorter
+/// than that is read on to its close or its end as before, at no cost, and memory stays within that much
+/// past it. A regular file keeps its route: its length bounds the read.
+fn open_value_faults(
+    lazy: &LazyJsonInputs,
+    more: &mut LazyMore,
+    chunk: &LazyChunk,
+    check: &mut Option<OpenValueCheck>,
+) -> bool {
+    let from = chunk.spans.last().map_or(more.scanned_to, |&(_, end)| end);
+    // Asked of the source only once the value is long: a stream (standard input is judged by `fstat`).
+    open_value_faults_in(lazy.text.as_bytes(), from, check)
+        && more
+            .rest
+            .as_mut()
+            .is_some_and(|rest| rest.windows.is_stream())
+}
+
+/// [`open_value_faults`] over `text`, whose value open at its end starts at the first byte from `from`
+/// that is not white space: `false` while it is open for less than [`OPEN_VALUE_CHECK_WINDOWS`] windows.
+fn open_value_faults_in(text: &[u8], from: usize, check: &mut Option<OpenValueCheck>) -> bool {
+    let mut start = from;
+    while text
+        .get(start)
+        .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        start += 1;
+    }
+    if text.len().saturating_sub(start) < OPEN_VALUE_CHECK_WINDOWS * lazy_window_bytes() {
+        return false;
+    }
+    let check = match check {
+        Some(check) if check.start == start => check,
+        _ => check.insert(OpenValueCheck {
+            start,
+            reader: jq::JqOpenTail::new(),
+            read_to: start,
+        }),
+    };
+    let read = check.reader.read(&text[start..], check.read_to - start);
+    check.read_to = text.len();
+    read == jq::TailRead::Fault
+}
+
+/// How many windows a value a stream is read on for may be open past before jq's parser reads it (#7812):
+/// the plain route's look-ahead ([`window::LOOKAHEAD_WINDOWS`]).
+const OPEN_VALUE_CHECK_WINDOWS: usize = window::LOOKAHEAD_WINDOWS;
 
 /// The rest of a lone stream past the parse error the lazy route reported from what it had read (#7738):
 /// jq's reader goes on after a parse error that `input` raises, so a program that asks past it gets what

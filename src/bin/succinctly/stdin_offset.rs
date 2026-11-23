@@ -16,7 +16,7 @@
 //! input, reads it to its end, or reads a pipe makes no system call for it here; a pipe costs one
 //! `fstat` once it has stopped early.
 
-#![allow(unsafe_code)] // `read`, `fstat`, `lseek` and `pread` on descriptor 0
+#![allow(unsafe_code)] // `read`, `fstat`, `lseek` and `pread` on descriptor 0, and `poll` on a terminal (#7812)
 #![cfg_attr(not(unix), allow(dead_code))] // only Unix descriptors have an offset to put back
 
 use std::cell::{Cell, RefCell};
@@ -236,6 +236,25 @@ pub(crate) fn note_main_fault() {
 /// main-loop input or an `input` read: jq's reader handed out the error in its place.
 pub(crate) fn note_fault_was_taken() {
     FAULT_TAKEN.with(|f| f.set(true));
+}
+
+/// Whether descriptor `fd` has bytes to read now, without waiting (#7812): `poll` with no timeout. A
+/// terminal that streams lines has more ready than the line a read gives; one typed into does not.
+#[cfg(unix)]
+pub(crate) fn readable_now(fd: i32) -> bool {
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll` reads and writes the one `pollfd` it is given, and waits for nothing.
+    let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+    ready > 0 && poll.revents & libc::POLLIN != 0
+}
+
+#[cfg(not(unix))]
+pub(crate) fn readable_now(_fd: i32) -> bool {
+    false
 }
 
 /// Records that standard input has returned end of file to a read through another handle on descriptor 0
