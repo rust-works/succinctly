@@ -18205,7 +18205,8 @@ enum WalkedSeqSource {
 /// before: a run that stops early leaves its descriptor at the end, where the whole read leaves it. A
 /// path that is missing or will not open, `-s`, `--stream`, `--validate` and a program the main loop
 /// alone reads keep the routes they had, but for a main loop that can halt over a pipe
-/// ([`halting_seq_stdin`]).
+/// ([`halting_seq_stdin`]). So does a file with no RS the windowed route read to its end and handed
+/// on as where it ended (#7889): there are no bytes left to walk.
 fn walked_seq_sources(
     args: &JqCommand,
     track_eof: bool,
@@ -18225,6 +18226,11 @@ fn walked_seq_sources(
             || (files.is_empty() && PROGRAM_HALTS.with(std::cell::Cell::get)))
         || lazy_route_forced_off()
         || window::whole_file_forced()
+        // #7889: a file with no RS that the windowed route scanned to its end is handed on as no
+        // bytes and the place it ended (`HANDED_ON_NO_RS_END`), which only the route that reads the
+        // stream whole answers (`seq_no_rs_byte_position`): a walk of the empty stream would name
+        // line 1, column 0.
+        || HANDED_ON_NO_RS_END.with(|end| end.get().is_some())
     {
         return None;
     }
