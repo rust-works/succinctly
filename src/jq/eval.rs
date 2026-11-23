@@ -163471,6 +163471,13 @@ mod tests {
             ("2100-03-01", 1), // Monday; bug self-corrects here
             ("2200-02-15", 6), // Saturday; jq-macOS wrongly gives 5 (Friday)
             ("2300-02-15", 4), // Thursday; jq-macOS wrongly gives 3 (Wednesday)
+            // #7808: every century year not divisible by 400 is affected, not only these.
+            ("0100-01-01", 5), // Friday; jq-macOS wrongly gives 4 (Thursday)
+            ("1000-01-01", 3), // Wednesday; jq-macOS wrongly gives 2 (Tuesday)
+            ("1000-03-01", 6), // Saturday; March agrees
+            ("1700-02-28", 0), // Sunday; jq-macOS wrongly gives 6 (Saturday)
+            ("3000-01-31", 5), // Friday; jq-macOS wrongly gives 4 (Thursday)
+            ("9900-02-01", 4), // Thursday; jq-macOS wrongly gives 3 (Wednesday)
         ] {
             let input = format!("\"{date}\"");
             query!(input.as_bytes(), r#"strptime("%Y-%m-%d")[6]"#,

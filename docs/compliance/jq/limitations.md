@@ -11917,7 +11917,12 @@ This is the "matching would corrupt data" condition of ADR-0018: the pin's answe
 A sweep of every `%Y-%m-%d` date for years 1583 to 2400, months 1 to 12 and days 0 to 31 (314,112 dates) against the macOS pin found 384 differences.
 They are every day (0 to 31) of January and February in 1700, 1800, 1900, 2100, 2200 and 2300, the century years that are not leap years.
 The leap century years (1600, 2000, 2400), every other year and every March day agree, since the macOS routine corrects itself from March.
-The unit test `test_strptime_weekday_correct_for_century_non_leap_years_970` (`src/jq/eval.rs`) pins the calendar's weekday for those dates.
+A second sweep (#7808) took every valid `%Y-%m-%d` date of years 1 to 9999 (3,652,059 dates) through `strptime` and compared weekday and year day with the proleptic Gregorian calendar, on jq 1.7.1 and on jq 1.8.2, both on macOS.
+The two releases agree on the same 4,425 differences, all in the weekday (the year day agrees on every date): every day of January and February in the 75 century years that are not divisible by 400, one day before the calendar's.
+Those years are 100, 200, 300, 500, 600, 700, 900, 1000, 1100, 1300, 1400, 1500, 1700, 1800, 1900, 2100 and so on up to 9900; years 1 to 99, every other year and every March to December date agree.
+jq's own comment names only 1900 and 2100, but the error is not limited to those two: it is every such year.
+`succinctly jq` answers the calendar's weekday and year day on all 3,652,059 dates.
+The unit test `test_strptime_weekday_correct_for_century_non_leap_years_970` (`src/jq/eval.rs`) pins the calendar's weekday for those dates, and for dates in 100, 1000, 3000 and 9900 (#7808).
 The same routine is wrong for a negative year, which `%Y`, `%y` and `%C` read with a sign (#5947): `"-999-03-05" | strptime("%F")` is weekday `3` in jq and `4` here, the calendar's (proleptic Gregorian).
 The date itself agrees: a week number in a negative year is placed with the libc's own first-weekday formula in C's truncating arithmetic, as the pin does.
 
@@ -12149,7 +12154,8 @@ What differs from jq 1.7.1:
   `%C` and `%y` complete each other in the order the libc reads them: `%C` after `%Y` replaces the year with the century (`"2015 20" | strptime("%Y %C")` is year 2000), a `%C` and a `%y` give the year `century * 100 + y` whichever comes first and use each other up, and `%Y`, `%D` and `%F` clear a pending half (#5934).
   `%n` and `%t` read at least one white-space character, the whole run of it: `"2015" | strptime("%Y%n")` is no match, and so is `"2015  " | strptime("%Y %n")`, whose format space has taken the run already; the run is ASCII white space only, as the libc's `isspace` has it.
   That is the pin's libc: a glibc `jq` takes `%n` and `%t` as plain white-space directives that match none too.
-  Still different: a year of 1800, 1900 or 2100 gets the weekday jq's own routine computes, one off from the calendar's for the century years in January and February.
+  Still different: in January and February of a century year that is not divisible by 400 (75 years from 1 to 9999: 100, 200, 300, 500 and so on, 1000, 1700, 1800, 1900, 2100) jq's own routine gives a weekday one day before the calendar's.
+  This implementation gives the calendar's, as the section on that routine above records (#970, #7808).
   `strftime`'s `%y` and `%C` of a negative year follow the pin's libc (#6030): `%y` is the absolute value of the year's remainder by 100 (year -5 is `05`), and `%C` is `-0` when the century is 0 and the year negative.
   A glibc `jq` prints a negative year's `%y` and `%C` from the floored remainder and quotient (year -5 is `95` and `-1`, year -101 is `99` and `-2`), and also prints `%Y` of year -5 as `-5` and `%c` as `Sun Jan  1 00:00:00 -5`, where the pin and this implementation print `-005`; measured on Ubuntu 22.04 (glibc 2.35) with a source-built jq 1.7.1.
   The `strftime-negative-year-*` ledger entries record the two probes for Linux.
