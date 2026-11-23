@@ -146,6 +146,39 @@ MID_WIDTH_ROW = "mid512_map_length_add"
 MID_WIDTH_OBJECTS = 663
 MID_WIDTH_KEYS = 512
 
+# #7798: the fixtures of the per-record, multi-file, escape-heavy and fold rows, also written by
+# this script (`write_synthetic_fixtures`), so a `--baseline-binary` run reads byte-identical input
+# and a merge-base build measures every row. The pattern column of those rows names one of
+# `SYNTHETIC_PATTERNS`; their size column is a label, as for `MID_WIDTH_PATTERN`. Every row before
+# these reads one file and evaluates one program over it, so a cost paid once per record, per file
+# boundary, per backslash or per fold step passed the guard at +0.0% (see the #7798 rows below).
+#
+# The records are `RECORDS_COUNT` small objects (`id`, `name`, `age`, `active`, `score`, ~64 bytes
+# each, ~290 KB): small, so what a run pays per record is a large share of it, and past
+# `LAZY_PREFIX_BYTES` (256 KiB, `src/bin/succinctly/jq_runner.rs`), so NDJSON of them takes the lazy
+# route a 10 MB file does, a window at a time, rather than the read-it-whole route of a short file.
+# The escape-heavy NDJSON is past it too (`ESCAPES_BYTES`).
+RECORDS_COUNT = 4500
+ESCAPES_BYTES = 300 * 1024
+# The patterns: `records-ndjson` (one record per line), `records-doc` (`{"users":[...]}` of the same
+# records), `records-array-2`/`records-array-16` (the records as one JSON array, `[` + records
+# joined by `,\n` + `]`, cut into 2 or 16 files inside a record), `escapes-ndjson` (NDJSON whose
+# strings hold a backslash every few bytes) and `none` (no input file: a `-n` row that reads
+# nothing).
+SYNTHETIC_PATTERNS = (
+    "records-ndjson",
+    "records-doc",
+    "records-array-2",
+    "records-array-16",
+    "escapes-ndjson",
+    "none",
+)
+# How many times each of those rows is measured, where every other row takes the median of `--reps`
+# (3). One is enough: their counts were the same on every rep (3 reps of each of two builds on
+# x86_64, every row), and what a row adds to the job is mostly valgrind starting the binary, which
+# three reps would pay three times over.
+SYNTHETIC_REPS = 1
+
 # (id, generate-pattern, size, mode, filter) -- ids are the baseline file's
 # keys, so renaming one here orphans its old baseline entry (caught by
 # `--check`'s own "missing baseline entry" error) rather than silently
@@ -317,6 +350,74 @@ QUERIES = [
     # shows it. Its fixture is synthetic (`generate_mid_width_fixture`),
     # because `json generate` has no pattern that makes this shape.
     (MID_WIDTH_ROW, MID_WIDTH_PATTERN, "4mb", "jq", "map(length) | add"),
+    # #7798: five shapes no row above reaches. In each, a fix branch's own A/B found a cost (or a
+    # win) that this guard passed at +0.0%. The figures after each shape are what its rows read with
+    # that branch against its base (cachegrind on the AMD Ryzen 9 7950X box; every row against every
+    # branch is tabled in #7798). Fixtures: `SYNTHETIC_PATTERNS`; tighter thresholds:
+    # `QUERY_THRESHOLDS`.
+    #
+    # 1. One evaluation per record over many small NDJSON records. #7719's first branch made the
+    #    route check that runs once per document (`path_mode::route`) walk more, a cost per record
+    #    that grows with the program's node and field count: `nd_pipe30` +2.29%, `nd_two_defs` +2.74%,
+    #    `nd_select_name` +1.61%, `nd_id` +0.98%. A `-n inputs` row cannot see it (the route runs
+    #    once per program there). The branch as rebuilt decides it once per program: `nd_pipe30`
+    #    -9.58%, `nd_two_defs` -5.20%.
+    ("nd_id", "records-ndjson", "290kb", "jq", ".id"),
+    ("nd_select_name", "records-ndjson", "290kb", "jq", "select(.age > 30) | .name"),
+    ("nd_pipe30", "records-ndjson", "290kb", "jq",
+     ".id" + " | . + 1 | tostring | length | . * 3" * 7 + " | . + 1"),
+    ("nd_two_defs", "records-ndjson", "290kb", "jq",
+     "def old: .age > 30; def nm: .name; select(old and .active) | nm"),
+    # 2. One document split across files, cut inside a record at every boundary. #7750's first
+    #    branch ran jq's parser model over the whole open tail a file carried onto the next, at
+    #    every boundary, quadratic in the file count: `split2_length` +85.7%, `split16_length`
+    #    +221.6%, `split2_compact` +17.7%, `split16_compact` +135.4%. (NDJSON cut mid-line paid one
+    #    partial line per boundary there, +0.04% on these records cut into 16 files: no row of that
+    #    shape.)
+    ("split2_length", "records-array-2", "290kb", "jq", "length"),
+    ("split16_length", "records-array-16", "290kb", "jq", "length"),
+    ("split2_compact", "records-array-2", "290kb", "jq", "."),
+    ("split16_compact", "records-array-16", "290kb", "jq", "."),
+    # 3. Escape-heavy strings through the `-n inputs` routes, and `-e`. #7758's branch searched each
+    #    text for a backslash, at about 144 instructions a backslash: `esc_reduce_inputs` +13.97%,
+    #    `esc_inputs_id` +13.80% (plain text: +0.0%). #7757's made `-e` cheaper: `nd_e_iterate`
+    #    -11.25%, `nd_iterate` +0.00%. `nd_iterate` is the `-e` row's twin without it, so a change
+    #    to the `-e` route alone shows as the two rows parting.
+    ("esc_reduce_inputs", "escapes-ndjson", "300kb", "jq", "reduce inputs as $x (0; .+1)"),
+    ("esc_inputs_id", "escapes-ndjson", "300kb", "jq", "inputs | .id"),
+    ("nd_e_iterate", "records-ndjson", "290kb", "jq", ".[]"),
+    ("nd_iterate", "records-ndjson", "290kb", "jq", ".[]"),
+    # 4. Per-element boolean operators, object construction and string interpolation, with and
+    #    without a def, per record and over a document. #7787's branch asked a settle question on
+    #    every evaluation of every operator, object value and interpolation part:
+    #    `nd_select_and_or` +5.08%, `nd_two_defs` (above) +4.62%, `doc_select_and_or` +4.28%,
+    #    `doc_and_def` +3.10%, `nd_obj_interp_def` +2.20%, `nd_obj_interp` +1.07%. (Object
+    #    construction and interpolation over a document read +0.00% there: no row of that shape.)
+    ("nd_select_and_or", "records-ndjson", "290kb", "jq",
+     "select(.score > 500 and .age < 40 or .active and .age > 70) | .id"),
+    ("nd_obj_interp", "records-ndjson", "290kb", "jq",
+     '{n: .name, a: .age, s: "\\(.name): \\(.age)"}'),
+    ("nd_obj_interp_def", "records-ndjson", "290kb", "jq",
+     'def nm: .name; {n: nm, a: .age, s: "\\(nm)-\\(.id)"}'),
+    ("doc_select_and_or", "records-doc", "290kb", "jq",
+     "[.users[] | select(.score > 500 and .age < 40 or .active and .age > 70)] | length"),
+    ("doc_and_def", "records-doc", "290kb", "jq",
+     "def old: .age > 30; .users | map(select(old and .active)) | length"),
+    # 5. Fold steps, `-n` with no input. #7451 (a step's input-free operand), #7702 (a step whose
+    #    update calls a def) and #7721 (a step that reads a bound array with `getpath`) each took a
+    #    fold that copied its state or the container at every step, quadratic in the step count, to
+    #    one that does not: `fold_append` -93.82%, `fold_def_update` -94.76%, `fold_foreach`
+    #    -94.54%, `fold_bound_getpath` -94.85%. No row above runs `reduce` or `foreach`. A few
+    #    hundred steps are enough: going back to the quadratic step multiplies the row's count many
+    #    times over.
+    ("fold_append", "none", "-", "jq",
+     'reduce range(0; 800) as $t ([]; . + [$t | tostring | split("")]) | length'),
+    ("fold_def_update", "none", "-", "jq",
+     "def f($v): .a = $v; {x: [range(500)]} | reduce range(200) as $i (.; f($i)) | .a"),
+    ("fold_foreach", "none", "-", "jq",
+     "def f($v): .a = $v; {x: [range(500)]} | [foreach range(200) as $i (.; f($i); .a)] | length"),
+    ("fold_bound_getpath", "none", "-", "jq",
+     "[range(300)] as $a | reduce range(300) as $i (0; . + ($a | getpath([$i])))"),
 ]
 
 # Per-query extra CLI flags, inserted between the mode (`jq`/`yq`) and the
@@ -324,7 +425,7 @@ QUERIES = [
 # rather than a sixth `QUERIES` element: every existing row above stays a
 # plain 5-tuple with unchanged unpacking and unchanged behaviour (no flags),
 # and `measure_all`'s command construction stays a single obvious
-# `[binary, mode, *flags, filter_expr, fixture_path]` regardless of whether a
+# `[binary, mode, *flags, filter_expr, *fixture_paths]` regardless of whether a
 # given row uses this dict at all (#2608).
 QUERY_FLAGS = {
     "users_compact_identity": ["-c"],
@@ -342,6 +443,22 @@ QUERY_FLAGS = {
     # one: `users_yq_del_select` fell 41% in instructions because it stopped running the YAML
     # writer it exists to guard. `-o yaml` keeps the workload these rows were baselined on.
     "users_yq_del_select": ["-o", "yaml"],
+    # #7798: `-c` wherever a row prints records, so the rows measure the work per record rather than
+    # the pretty-printer; `-n` for the `inputs` and fold rows; `-e` for the `-e` row.
+    "nd_two_defs": ["-c"],
+    "split2_compact": ["-c"],
+    "split16_compact": ["-c"],
+    "esc_reduce_inputs": ["-n"],
+    "esc_inputs_id": ["-n", "-c"],
+    "nd_e_iterate": ["-e", "-c"],
+    "nd_iterate": ["-c"],
+    "nd_select_and_or": ["-c"],
+    "nd_obj_interp": ["-c"],
+    "nd_obj_interp_def": ["-c"],
+    "fold_append": ["-n"],
+    "fold_def_update": ["-n"],
+    "fold_foreach": ["-n"],
+    "fold_bound_getpath": ["-n"],
 }
 
 # Rows whose fixture is the base `users`/2mb document's records, one compact
@@ -602,8 +719,30 @@ DEFAULT_THRESHOLD = 5.0
 # exact: -4.3% x86_64 on this 2 MB row against a merge-base without it (every other row +0.0%). A
 # revert would read +4.5%, which the default 5.0 lets through. Memory and time are watched by the
 # `seq_field_bad_first` / `seq_field_bad_last` rows of `comparison/jq/queries/perf.tsv`.
+#
+# The per-record and per-element rows of #7798 (`nd_*` but the `-e` pair, `doc_select_and_or`,
+# `doc_and_def`) carry a TIGHTER threshold too, 2.0, for the same reason: the costs they were added
+# for are real and below the default. Cachegrind on the AMD Ryzen 9 7950X box, each branch against
+# its base: #7719's first branch +2.29% (`nd_pipe30`), +2.74% (`nd_two_defs`), +2.92%
+# (`nd_select_and_or`); #7787's +4.62% (`nd_two_defs`), +5.08% (`nd_select_and_or`), +2.20%
+# (`nd_obj_interp_def`), +4.28% (`doc_select_and_or`), +3.10% (`doc_and_def`). Their noise is far
+# below 2.0: two builds of one source count the same to within 7 instructions on every rep, and
+# between six `main` commits of the two days before these rows (43 to 94 commits apart) and the
+# `main` they were added on, the largest move on any of them is 0.22%. `nd_id`, `nd_select_name`
+# and `nd_obj_interp` read +0.98% / +1.61% / +1.49% on #7719's first branch, below any threshold
+# that noise allows; they are there for a larger cost per record: about 1,000 instructions added
+# to `path_mode::route`, which they pay once per record, moves them +10.48% / +6.16% / +2.83%.
 QUERY_THRESHOLDS = {
     "seq_name_bad_last": 3.0,
+    "nd_id": 2.0,
+    "nd_select_name": 2.0,
+    "nd_pipe30": 2.0,
+    "nd_two_defs": 2.0,
+    "nd_select_and_or": 2.0,
+    "nd_obj_interp": 2.0,
+    "nd_obj_interp_def": 2.0,
+    "doc_select_and_or": 2.0,
+    "doc_and_def": 2.0,
     "wide_keys_unsorted": 10.0,
     "users_yq_raw_test": 65.0,
     "users_yq_raw_slice": 90.0,
@@ -809,14 +948,106 @@ def generate_mid_width_fixture(out_path):
         out.write("[" + ",".join(objects) + "]\n")
 
 
-def run_cachegrind_once(valgrind_bin, binary, mode, flags, filter_expr, fixture_path):
+def synthetic_records():
+    """The `RECORDS_COUNT` compact records of the #7798 rows, in order. Seeded with `FIXTURE_SEED`, so
+    every run writes the same bytes. `score` is last, so `-e -c '.[]'` ends on a number (truthy) and
+    exits 0."""
+    rng = random.Random(FIXTURE_SEED)
+    records = []
+    for i in range(RECORDS_COUNT):
+        age = rng.randrange(18, 80)
+        active = "true" if rng.randrange(2) else "false"
+        score = rng.randrange(1000)
+        records.append(f'{{"id":{i},"name":"user{i}","age":{age},"active":{active},"score":{score}}}')
+    return records
+
+
+def cut_points(text, parts):
+    """Where `split_text` cuts `text` into `parts`: at `k * len / parts`, moved forward while the cut
+    would fall on or right after a newline or space, so a value spans every boundary (a record of the
+    array, or a line of the NDJSON) and each file but the last ends inside one (#7750's shape)."""
+    cuts = []
+    for k in range(1, parts):
+        c = k * len(text) // parts
+        while text[c - 1:c] in (b"\n", b" ") or text[c:c + 1] == b"\n":
+            c += 1
+        cuts.append(c)
+    return cuts
+
+
+def split_text(text, parts):
+    """`text` cut at `cut_points` into `parts` byte strings that concatenate back to it."""
+    bounds = [0] + cut_points(text, parts) + [len(text)]
+    return [text[bounds[i]:bounds[i + 1]] for i in range(parts)]
+
+
+# JSON source fragments of `escapes-ndjson`, already escaped; all but the three plain words hold a
+# backslash. No escape jq refuses (#7758's shape: a search for a refused escape pays per backslash).
+ESCAPE_FRAGMENTS = (
+    r"line\nbreak", r"say \"hi\"", r"C:\\path\\to", r"caf\u00e9", "café", r"smile \ud83d\ude00",
+    r"tab\there", r"a\/b", r"\"q\"", r"\\", r"\n", r"\ud83d\ude00\ud83d\ude00", "word", r"x\ty", "été",
+)
+
+
+def escapes_ndjson():
+    """`ESCAPES_BYTES` or a little more of NDJSON whose strings are dense with escapes, one object
+    per line (with an escaped key and nested object as well), seeded with `FIXTURE_SEED`."""
+    rng = random.Random(FIXTURE_SEED)
+
+    def text(n):
+        return " ".join(ESCAPE_FRAGMENTS[rng.randrange(len(ESCAPE_FRAGMENTS))] for _ in range(n))
+
+    lines = []
+    written = 0
+    i = 0
+    while written < ESCAPES_BYTES:
+        line = (
+            '{"id":%d,"name":"%s","text":"%s","tags":["%s","%s"],"k\\"ey":{"note\\n":"%s"},"score":%d}\n'
+            % (i, text(3), text(12), text(1), text(2), text(4), rng.randrange(1000))
+        ).encode()
+        lines.append(line)
+        written += len(line)
+        i += 1
+    return b"".join(lines)
+
+
+def write_synthetic_fixtures(tmp):
+    """Writes the fixtures of `SYNTHETIC_PATTERNS` under `tmp` and returns {pattern: [paths]}, the
+    files a row passes after its filter, in order (none for `none`). Pure Python and independent of
+    the binary under test (#7798)."""
+    records = synthetic_records()
+    ndjson = "".join(r + "\n" for r in records).encode()
+    array = ("[" + ",\n".join(records) + "]\n").encode()
+    doc = ('{"users":[' + ",".join(records) + "]}\n").encode()
+    texts = {
+        "records-ndjson": [ndjson],
+        "records-doc": [doc],
+        "records-array-2": split_text(array, 2),
+        "records-array-16": split_text(array, 16),
+        "escapes-ndjson": [escapes_ndjson()],
+        "none": [],
+    }
+    paths = {}
+    for pattern in SYNTHETIC_PATTERNS:
+        parts = texts[pattern]
+        paths[pattern] = []
+        for i, part in enumerate(parts):
+            # `.json`, as every fixture here: the extension is what format detection reads.
+            path = os.path.join(tmp, f"{pattern}" + (f".{i:02d}" if len(parts) > 1 else "") + ".json")
+            with open(path, "wb") as f:
+                f.write(part)
+            paths[pattern].append(path)
+    return paths
+
+
+def run_cachegrind_once(valgrind_bin, binary, mode, flags, filter_expr, fixture_paths):
     with tempfile.TemporaryDirectory() as tmp:
         log = os.path.join(tmp, "cg.log")
         cg_out = os.path.join(tmp, "cg.out")
         cmd = [
             valgrind_bin, "--tool=cachegrind", f"--log-file={log}",
             f"--cachegrind-out-file={cg_out}",
-            binary, mode, *flags, filter_expr, fixture_path,
+            binary, mode, *flags, filter_expr, *fixture_paths,
         ]
         # `--log-file` captures valgrind's own diagnostics; the *traced*
         # binary's stderr is separate and captured too (not discarded) so a
@@ -826,7 +1057,11 @@ def run_cachegrind_once(valgrind_bin, binary, mode, flags, filter_expr, fixture_
         # change on the runner can't silently alter how IR_PATTERN below
         # needs to parse it.
         env = {**os.environ, "LC_ALL": "C"}
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        # A row with no input file (#7798's `-n` fold rows) reads an empty stdin rather than
+        # whatever the guard itself was started with; a row with files keeps the stdin it had.
+        stdin = None if fixture_paths else subprocess.DEVNULL
+        result = subprocess.run(cmd, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env)
         if result.returncode != 0:
             sys.exit(
                 f"'{' '.join(cmd)}' exited {result.returncode}; stderr:\n{result.stderr}"
@@ -851,9 +1086,9 @@ def run_cachegrind_once(valgrind_bin, binary, mode, flags, filter_expr, fixture_
         return int(m.group(1).replace(",", ""))
 
 
-def measure_query(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, reps):
+def measure_query(valgrind_bin, binary, mode, flags, filter_expr, fixture_paths, reps):
     counts = [
-        run_cachegrind_once(valgrind_bin, binary, mode, flags, filter_expr, fixture_path)
+        run_cachegrind_once(valgrind_bin, binary, mode, flags, filter_expr, fixture_paths)
         for _ in range(reps)
     ]
     # `statistics.median` returns a float for an even-length input (the
@@ -901,7 +1136,7 @@ def measure_all(binary, valgrind_bin, reps, label="binary", baseline_run=False):
         fixture_paths = {}
         for _, pattern, size, _, _ in QUERIES:
             shape = (pattern, size)
-            if pattern == MID_WIDTH_PATTERN:
+            if pattern == MID_WIDTH_PATTERN or pattern in SYNTHETIC_PATTERNS:
                 continue  # synthesized below, not generated by the binary
             if shape not in fixture_paths:
                 # `succinctly json generate` always writes JSON; the `.json`
@@ -962,6 +1197,10 @@ def measure_all(binary, valgrind_bin, reps, label="binary", baseline_run=False):
         generate_mid_width_fixture(mid_width_path)
         derived_fixture_paths[MID_WIDTH_ROW] = mid_width_path
 
+        # #7798: the per-record, multi-file, escape-heavy and fold rows' fixtures, written by this
+        # script: a list of files per pattern (several for a split document, none for `none`).
+        synthetic_paths = write_synthetic_fixtures(tmp)
+
         # What valgrind starts, and so what `argv[0]` is: see `measured_path`. The fixtures above
         # are still written by `binary` itself, from wherever the caller put it.
         run_binary = measured_path(tmp, binary)
@@ -973,12 +1212,17 @@ def measure_all(binary, valgrind_bin, reps, label="binary", baseline_run=False):
         for query_id, pattern, size, mode, filter_expr in QUERIES:
             # Not `.get(query_id, fixture_paths[...])`: that evaluates the
             # default eagerly, and a derived row has no generated fixture.
-            fixture_path = derived_fixture_paths.get(query_id) or fixture_paths[(pattern, size)]
-            if fixture_path is None:
-                print(f"{query_id:<26} {'(pattern unknown to this binary)':>16}")
-                continue
+            if pattern in SYNTHETIC_PATTERNS:
+                inputs = synthetic_paths[pattern]
+            else:
+                fixture_path = derived_fixture_paths.get(query_id) or fixture_paths[(pattern, size)]
+                if fixture_path is None:
+                    print(f"{query_id:<26} {'(pattern unknown to this binary)':>16}")
+                    continue
+                inputs = [fixture_path]
             flags = QUERY_FLAGS.get(query_id, [])
-            ir = measure_query(valgrind_bin, run_binary, mode, flags, filter_expr, fixture_path, reps)
+            row_reps = SYNTHETIC_REPS if pattern in SYNTHETIC_PATTERNS else reps
+            ir = measure_query(valgrind_bin, run_binary, mode, flags, filter_expr, inputs, row_reps)
             measured[query_id] = ir
             print(f"{query_id:<26} {ir:>16,.0f}")
             sys.stdout.flush()

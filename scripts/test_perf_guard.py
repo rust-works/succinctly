@@ -121,9 +121,10 @@ class SeqLfLedRowTests(unittest.TestCase):
             with open(out_path, "w") as f:
                 f.write('{"users":[{"age":1,"score":1}]}')
 
-        def fake_measure(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, reps):
-            with open(fixture_path, "rb") as f:
-                seen[(filter_expr, tuple(flags))] = f.read(2)
+        def fake_measure(valgrind_bin, binary, mode, flags, filter_expr, fixture_paths, reps):
+            if fixture_paths:
+                with open(fixture_paths[0], "rb") as f:
+                    seen[(filter_expr, tuple(flags))] = f.read(2)
             return 1
 
         with contextlib.ExitStack() as stack:
@@ -205,8 +206,10 @@ class CensusRowTests(unittest.TestCase):
             with open(out_path, "w") as f:
                 f.write('{"users":[{"age":1,"score":1}]}')
 
-        def fake_measure(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, reps):
-            seen[filter_expr] = (fixture_path, os.path.getsize(fixture_path))
+        def fake_measure(valgrind_bin, binary, mode, flags, filter_expr, fixture_paths, reps):
+            # The first row with the filter: #7798's split rows run `length` too, after `wide_length`.
+            if fixture_paths:
+                seen.setdefault(filter_expr, (fixture_paths[0], os.path.getsize(fixture_paths[0])))
             return 1
 
         with contextlib.ExitStack() as stack:
@@ -282,7 +285,7 @@ class NewPatternRowTests(unittest.TestCase):
             with open(out_path, "w") as f:
                 f.write('{"users":[{"age":1,"score":1}]}')
 
-        def fake_measure(valgrind_bin, binary, mode, flags, filter_expr, fixture_path, reps):
+        def fake_measure(valgrind_bin, binary, mode, flags, filter_expr, fixture_paths, reps):
             measured_filters.append(filter_expr)
             return 1
 
@@ -346,13 +349,184 @@ class NewPatternRowTests(unittest.TestCase):
         self.assertLess(perf_guard.QUERY_THRESHOLDS["seq_name_bad_last"], 4.5)
 
 
+class SyntheticFixtureRowTests(unittest.TestCase):
+    """#7798: the per-record, multi-file, escape-heavy and fold rows read fixtures this script
+    writes. A fixture of the wrong shape (one file where the row names a split, a cut on a line
+    boundary, too few backslashes, a file under the lazy route's prefix) would still report an
+    instruction count, for a shape the row does not name."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        cls.paths = perf_guard.write_synthetic_fixtures(cls.tmp.name)
+
+    def read(self, pattern):
+        return [pathlib.Path(p).read_bytes() for p in self.paths[pattern]]
+
+    def rows(self):
+        return [q for q in perf_guard.QUERIES if q[1] in perf_guard.SYNTHETIC_PATTERNS]
+
+    def test_every_pattern_has_a_row_and_every_row_a_written_pattern(self):
+        used = {q[1] for q in self.rows()}
+        self.assertEqual(used, set(perf_guard.SYNTHETIC_PATTERNS))
+        self.assertEqual(set(self.paths), set(perf_guard.SYNTHETIC_PATTERNS))
+
+    def test_fixtures_are_deterministic(self):
+        with tempfile.TemporaryDirectory() as other:
+            again = perf_guard.write_synthetic_fixtures(other)
+            for pattern, paths in self.paths.items():
+                self.assertEqual([pathlib.Path(p).read_bytes() for p in again[pattern]],
+                                 self.read(pattern), pattern)
+
+    def test_the_records_are_past_the_lazy_prefix(self):
+        # 256 KiB is `LAZY_PREFIX_BYTES` (src/bin/succinctly/jq_runner.rs): a shorter file is read
+        # whole, where a 10 MB file of records is read a window at a time.
+        (ndjson,) = self.read("records-ndjson")
+        self.assertGreater(len(ndjson), 256 * 1024)
+        lines = ndjson.decode().splitlines()
+        self.assertEqual(len(lines), perf_guard.RECORDS_COUNT)
+        for line in lines[:50]:
+            self.assertEqual(list(json.loads(line)), ["id", "name", "age", "active", "score"])
+        (doc,) = self.read("records-doc")
+        self.assertEqual(len(json.loads(doc)["users"]), perf_guard.RECORDS_COUNT)
+
+    def test_a_split_document_concatenates_back_and_is_cut_inside_a_value(self):
+        whole = b"".join(self.read("records-array-2"))
+        array = json.loads(whole)
+        self.assertEqual(len(array), perf_guard.RECORDS_COUNT)
+        for pattern, parts in (("records-array-2", 2), ("records-array-16", 16)):
+            texts = self.read(pattern)
+            self.assertEqual(len(texts), parts, pattern)
+            self.assertEqual(b"".join(texts), whole, pattern)
+            for left, right in zip(texts, texts[1:]):
+                # Each boundary falls inside a record, never between two, so every file but the
+                # last ends inside a value and the run carries an open tail across each boundary.
+                self.assertFalse(left.endswith((b"\n", b" ", b",")), pattern)
+                self.assertFalse(right.startswith(b"\n"), pattern)
+                self.assertRaises(json.JSONDecodeError, json.loads, left)
+            # In order: the paths sort as the parts run.
+            self.assertEqual(self.paths[pattern], sorted(self.paths[pattern]))
+
+    def test_the_escapes_fixture_is_dense_in_backslashes(self):
+        (text,) = self.read("escapes-ndjson")
+        self.assertGreaterEqual(len(text), perf_guard.ESCAPES_BYTES)
+        self.assertGreater(text.count(b"\\") * 16, len(text))
+        for line in text.decode().splitlines():
+            json.loads(line)
+
+    def test_a_row_without_a_file_passes_dash_n(self):
+        for query_id, pattern, _, _, _ in self.rows():
+            if pattern == "none":
+                self.assertIn("-n", perf_guard.QUERY_FLAGS[query_id], query_id)
+        self.assertEqual(self.paths["none"], [])
+
+    def test_the_e_row_differs_from_its_twin_only_by_dash_e(self):
+        queries = {q[0]: q for q in perf_guard.QUERIES}
+        self.assertEqual(queries["nd_e_iterate"][1:], queries["nd_iterate"][1:])
+        self.assertEqual(perf_guard.QUERY_FLAGS["nd_e_iterate"],
+                         ["-e"] + perf_guard.QUERY_FLAGS["nd_iterate"])
+
+    def fake_cachegrind(self, fixture_paths):
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["cmd"], seen["stdin"] = cmd, kwargs.get("stdin")
+            log = next(a for a in cmd if a.startswith("--log-file=")).split("=", 1)[1]
+            pathlib.Path(log).write_text("==1== I   refs:      1,234\n")
+            return mock.Mock(returncode=0, stdout="1\n", stderr="")
+
+        with mock.patch.object(perf_guard.subprocess, "run", fake_run):
+            ir = perf_guard.run_cachegrind_once("valgrind", "bin", "jq", ["-n"], ".", fixture_paths)
+        self.assertEqual(ir, 1234)
+        return seen
+
+    def test_a_row_without_a_file_reads_an_empty_stdin(self):
+        seen = self.fake_cachegrind([])
+        self.assertEqual(seen["cmd"][-3:], ["jq", "-n", "."])
+        self.assertIs(seen["stdin"], perf_guard.subprocess.DEVNULL)
+
+    def test_a_row_with_files_passes_them_in_order_and_keeps_its_stdin(self):
+        seen = self.fake_cachegrind(["a.json", "b.json"])
+        self.assertEqual(seen["cmd"][-2:], ["a.json", "b.json"])
+        self.assertIsNone(seen["stdin"])
+
+    def test_the_synthetic_rows_take_one_rep_and_the_rest_the_reps_asked_for(self):
+        reps = {}
+
+        def fake_measure(valgrind_bin, binary, mode, flags, filter_expr, fixture_paths, n):
+            reps.setdefault(n, 0)
+            reps[n] += 1
+            return 1
+
+        with contextlib.ExitStack() as stack:
+            for name, fn in {
+                "generate_fixture": lambda *a: pathlib.Path(a[-1]).write_text("{}"),
+                "generate_compact_fixture": lambda *a: pathlib.Path(a[-1]).write_text(
+                    '{"users":[{"age":1,"score":1}]}'),
+                "generate_lines_fixture": lambda *a: pathlib.Path(a[-1]).write_text("{}"),
+                "measure_query": fake_measure,
+            }.items():
+                stack.enter_context(mock.patch.object(perf_guard, name, fn))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            perf_guard.measure_all("bin", "valgrind", 3)
+        self.assertEqual(reps, {3: len(perf_guard.QUERIES) - len(self.rows()),
+                                perf_guard.SYNTHETIC_REPS: len(self.rows())})
+
+    def test_the_tight_thresholds_are_below_the_costs_they_were_added_for(self):
+        # #7798's measured costs (cachegrind, AMD Ryzen 9 7950X, each branch against its base): the
+        # smallest one each row was added to catch. A threshold at or above it lets that cost back.
+        caught = {
+            "nd_pipe30": 2.29,          # #7719, first branch
+            "nd_two_defs": 2.74,        # #7719, first branch (#7787: +4.62)
+            "nd_select_and_or": 2.92,   # #7719, first branch (#7787: +5.08)
+            "nd_obj_interp_def": 2.20,  # #7787
+            "doc_select_and_or": 4.28,  # #7787
+            "doc_and_def": 3.10,        # #7787
+        }
+        for query_id, cost in caught.items():
+            threshold = perf_guard.QUERY_THRESHOLDS.get(query_id, perf_guard.DEFAULT_THRESHOLD)
+            self.assertLess(threshold, cost, query_id)
+
+    def test_measure_all_hands_each_row_its_files(self):
+        calls = []
+
+        def fake_measure(valgrind_bin, binary, mode, flags, filter_expr, fixture_paths, reps):
+            calls.append(list(fixture_paths))
+            return 1
+
+        def fake_generate(binary, pattern, size, seed, out_path):
+            pathlib.Path(out_path).write_text("{}")
+
+        def fake_derive(binary, source_path, out_path):
+            pathlib.Path(out_path).write_text('{"users":[{"age":1,"score":1}]}')
+
+        with contextlib.ExitStack() as stack:
+            for name, fn in {
+                "generate_fixture": fake_generate,
+                "generate_compact_fixture": fake_derive,
+                "generate_lines_fixture": fake_derive,
+                "measure_query": fake_measure,
+            }.items():
+                stack.enter_context(mock.patch.object(perf_guard, name, fn))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            perf_guard.measure_all("bin", "valgrind", 1)
+        self.assertEqual(len(calls), len(perf_guard.QUERIES))
+        for (query_id, pattern, _, _, _), paths in zip(perf_guard.QUERIES, calls):
+            if pattern in perf_guard.SYNTHETIC_PATTERNS:
+                names = [os.path.basename(p) for p in paths]
+                self.assertEqual(names, [os.path.basename(p) for p in self.paths[pattern]], query_id)
+            else:
+                self.assertEqual(len(paths), 1, query_id)
+
+
 class MeasuredPathTests(unittest.TestCase):
     """#6153: valgrind starts every measured binary from a path of one length."""
 
     def run_measure_all(self, binary):
         started = []
 
-        def fake_measure(valgrind_bin, run_binary, mode, flags, filter_expr, fixture_path, reps):
+        def fake_measure(valgrind_bin, run_binary, mode, flags, filter_expr, fixture_paths, reps):
             started.append(run_binary)
             return 1
 
