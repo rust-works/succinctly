@@ -38310,6 +38310,112 @@ fn build_regex<S: EvalSemantics>(
     compiled
 }
 
+/// Whether `refusal` is one Oniguruma makes of a look-behind's body, in `tune_tree`.
+#[cfg(feature = "regex")]
+fn is_look_behind_refusal(refusal: &EvalError) -> bool {
+    let message = refusal.to_string();
+    message.ends_with("invalid pattern in look-behind") || message.ends_with("undefined error code")
+}
+
+/// The refusal jq makes of `pattern` before it judges its look-behinds, if any (#7844).
+///
+/// Oniguruma refuses a look-behind's body in `tune_tree`, once it has parsed the whole pattern and
+/// checked its backreferences (`check_backrefs`) and calls (`tune_call`), so every error those make,
+/// wherever it stands, comes first: `\1(?<=(?=a))` is `invalid backref number/name` and
+/// `(?<=a(?=b)` is `end pattern with unmatched parenthesis`. The pattern is built again with each
+/// look-behind written as the look-ahead of the same sense, which parses as it does and has no
+/// such checks, and an error of that build is the one jq reports. The `regex` crate's own refusals
+/// are none of Oniguruma's, and leave the look-behind's.
+#[cfg(feature = "regex")]
+fn refusal_before_look_behinds<S: EvalSemantics>(
+    pattern: &str,
+    flags: Option<&str>,
+) -> Option<EvalError> {
+    let ahead = look_behinds_as_look_aheads(pattern)?;
+    let refusal = build_regex_uncached::<S>(&ahead, flags).err()?;
+    let message = refusal.to_string();
+    let own = ["regex parse error", "exceeds size limit", "not supported"];
+    (!is_look_behind_refusal(&refusal) && !own.iter().any(|own| message.contains(own)))
+        .then_some(refusal)
+}
+
+/// `pattern` with each look-behind opener (`(?<=`, `(?<!`) written as the look-ahead of the same
+/// sense (`(?=`, `(?!`), or `None` when it has none. An escaped character, a `\Q...\E` run, a
+/// `(?#...)` comment and a character class are passed over.
+#[cfg(feature = "regex")]
+fn look_behinds_as_look_aheads(pattern: &str) -> Option<String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = string_with_capacity(pattern.len());
+    let mut changed = false;
+    let mut class_depth = 0usize;
+    // Just after a class's `[` or `[^`, where a `]` is a member.
+    let mut class_start = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            if class_depth == 0 && chars.get(i + 1) == Some(&'Q') {
+                let mut j = i + 2;
+                while j < chars.len() && !(chars[j] == '\\' && chars.get(j + 1) == Some(&'E')) {
+                    j += 1;
+                }
+                let end = (j + 2).min(chars.len());
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+            let end = (i + 2).min(chars.len());
+            out.extend(&chars[i..end]);
+            class_start = false;
+            i = end;
+            continue;
+        }
+        if class_depth > 0 {
+            match c {
+                '[' => {
+                    class_depth += 1;
+                    class_start = true;
+                }
+                ']' if !class_start => class_depth -= 1,
+                '^' if class_start => {}
+                _ => class_start = false,
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match c {
+            '[' => {
+                class_depth = 1;
+                class_start = true;
+            }
+            '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
+                let end = chars[i..]
+                    .iter()
+                    .position(|&c| c == ')')
+                    .map_or(chars.len(), |close| i + close + 1);
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+            '(' if chars.get(i + 1) == Some(&'?')
+                && chars.get(i + 2) == Some(&'<')
+                && matches!(chars.get(i + 3), Some('=' | '!')) =>
+            {
+                out.push_str("(?");
+                out.push(chars[i + 3]);
+                changed = true;
+                i += 4;
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    changed.then_some(out)
+}
+
 #[cfg(feature = "regex")]
 fn build_regex_uncached<S: EvalSemantics>(
     pattern: &str,
@@ -38504,6 +38610,11 @@ fn build_regex_uncached<S: EvalSemantics>(
     }
 
     if let Some(refusal) = deferred_refusal {
+        if S::TAG != EvalTag::Yq && is_look_behind_refusal(&refusal) {
+            if let Some(earlier) = refusal_before_look_behinds::<S>(source, flags) {
+                return Err(earlier);
+            }
+        }
         return Err(refusal);
     }
 
