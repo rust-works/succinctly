@@ -34473,18 +34473,21 @@ fn translate_posix_brackets(
                 return Err(refusal);
             }
         }
-        if extended {
-            return translated;
-        }
     }
     let translated = translated?;
     // #6201: a look-behind with alternatives of different widths. #6519: the body's length as
     // Oniguruma's `tune_look_behind` sizes it, for the bodies `onig_look_behind` can read; the rest
     // are left to the shape rules of `look_behind_alternatives_differ`.
-    if (pattern.contains("(?<=") || pattern.contains("(?<!"))
-        && !extended
-        && !inline_extended(pattern)
-    {
+    if pattern.contains("(?<=") || pattern.contains("(?<!") {
+        // #7865: where the extended mode is on, from the `x` flag or an inline `(?x)`, the body is
+        // sized as Oniguruma reads it, without the blanks and comments the mode ignores.
+        let bare;
+        let pattern = if extended || inline_extended(pattern) {
+            bare = strip_extended(pattern, extended, ExtendedRuns::Dropped);
+            bare.as_str()
+        } else {
+            pattern
+        };
         let tuned = super::onig_look_behind::tune(pattern, ignore_case);
         if let Some(bad) = tuned.iter().find(|t| {
             matches!(
@@ -34519,6 +34522,27 @@ fn translate_posix_brackets(
 /// group or a group, so that a repeat after one is judged as it is.
 #[cfg(feature = "regex")]
 fn strip_extended_blanks(pattern: &str, extended: bool) -> String {
+    strip_extended(pattern, extended, ExtendedRuns::AsIgnoreCase)
+}
+
+/// What [`strip_extended`] writes for the `x` of an inline option run.
+#[cfg(feature = "regex")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtendedRuns {
+    /// An `i`, so that every run keeps its place and its kind: what the repeat checks read (#7852).
+    AsIgnoreCase,
+    /// Nothing, so that the text keeps the case mode it was written with: what the look-behind
+    /// checks read (#7865), which size a body by its case mode. A run that named only `x` goes
+    /// (`(?x)`, `(?-x)`), or stays an empty group where what follows would otherwise join what
+    /// stands before it (a digit after `\1`, a quantifier); a group that named only `x` is the
+    /// group of an option that changes no length (`(?x:` is `(?m:`). A brace that opens no interval
+    /// (`{1, 2}`, for the blank it holds) is written as the escaped literal it is.
+    Dropped,
+}
+
+/// [`strip_extended_blanks`], with the `x` of the inline option runs written as `runs` says.
+#[cfg(feature = "regex")]
+fn strip_extended(pattern: &str, extended: bool, runs: ExtendedRuns) -> String {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = string_with_capacity(pattern.len());
     // Whether the mode is on, one entry per open group.
@@ -34609,6 +34633,7 @@ fn strip_extended_blanks(pattern: &str, extended: bool) -> String {
             if letters > 0 && matches!(end, Some(')' | ':')) {
                 let mut inner = mode;
                 let mut sense = true;
+                let run_at = out.len();
                 out.push_str("(?");
                 for &letter in &chars[i + 2..i + 2 + letters] {
                     match letter {
@@ -34616,7 +34641,41 @@ fn strip_extended_blanks(pattern: &str, extended: bool) -> String {
                         'x' => inner = sense,
                         _ => {}
                     }
-                    out.push(if letter == 'x' { 'i' } else { letter });
+                    match runs {
+                        ExtendedRuns::AsIgnoreCase => {
+                            out.push(if letter == 'x' { 'i' } else { letter });
+                        }
+                        ExtendedRuns::Dropped if letter != 'x' => out.push(letter),
+                        ExtendedRuns::Dropped => {}
+                    }
+                }
+                if runs == ExtendedRuns::Dropped {
+                    // `(?i-x)` is `(?i)`: a `-` that switches nothing off goes with the `x`.
+                    while out.ends_with('-') {
+                        out.pop();
+                    }
+                    if out.len() == run_at + 2 && end == Some(':') {
+                        // An option group is not the plain group to Oniguruma (`(?<=(?x:a)+)` is
+                        // refused, `(?<=(?:a)+)` is not), so it stays one, of an option that changes
+                        // no length.
+                        out.push('m');
+                    } else if out.len() == run_at + 2 {
+                        // Nothing is left of the run. What follows it, past the blanks the mode
+                        // it leaves on ignores, decides whether an empty group stands in for it.
+                        let rest = &chars[i + 3 + letters..];
+                        let next = rest.iter().find(|c| !(inner && c.is_whitespace()));
+                        out.truncate(run_at);
+                        if next.is_some_and(|c| {
+                            c.is_ascii_digit() || matches!(c, '*' | '+' | '?' | '{')
+                        }) {
+                            out.push_str("(?:)");
+                        }
+                        if let Some(top) = on.last_mut() {
+                            *top = inner;
+                        }
+                        i += 3 + letters;
+                        continue;
+                    }
                 }
                 out.extend(end);
                 if end == Some(')') {
@@ -34640,6 +34699,22 @@ fn strip_extended_blanks(pattern: &str, extended: bool) -> String {
             }
             out.push(c);
             i += 1;
+            continue;
+        }
+        if runs == ExtendedRuns::Dropped && matches!(c, '{' | '}') {
+            // A brace that opens no interval as it is written, blanks and comments included, is the
+            // literal character, in the mode or out of it (#6068), and a look-behind counts it:
+            // `a{ 0}` is the four characters `a{0}` under `x`. Written as the escape, since the
+            // text is read by a parser that takes `{1, 2}` for an interval.
+            if c == '{' && opens_interval(&chars, i) {
+                let close = chars[i..].iter().position(|&n| n == '}').unwrap_or(0);
+                out.extend(&chars[i..=i + close]);
+                i += close + 1;
+            } else {
+                out.push('\\');
+                out.push(c);
+                i += 1;
+            }
             continue;
         }
         if !mode {
@@ -35243,6 +35318,10 @@ fn look_behind_alternatives_differ_but(pattern: &str, sized: &[usize]) -> bool {
                     }
                     _ => return None,
                 };
+                if count == 0 {
+                    // Repeated no times, it has no width whatever it is (#7865).
+                    return Some(0);
+                }
                 fixed(&repetition.ast, opaque, behind).map(|w| w.saturating_mul(count))
             }
         }
@@ -35269,9 +35348,15 @@ fn look_behind_alternatives_differ_but(pattern: &str, sized: &[usize]) -> bool {
 
     /// Whether `ast` is written as nothing at all (`a|`, `(?:)`), which is not the same as an
     /// assertion, whose width is none too: `(?<=(?:.|\b))` is refused, `(?<=(?:.|))` is not.
+    /// An item repeated no times is nothing either, whatever it is (#7865): `(?<=(?i:a)b|c{0})`
+    /// and `(?<=(?i:a)b|(c){0})` are accepted.
     fn written_empty(ast: &Ast) -> bool {
         match ast {
             Ast::Empty(_) => true,
+            Ast::Repetition(repetition) => matches!(
+                &repetition.op.kind,
+                RepetitionKind::Range(RepetitionRange::Exactly(0) | RepetitionRange::Bounded(0, 0))
+            ),
             Ast::Group(group) => written_empty(&group.ast),
             Ast::Concat(concat) => concat.asts.iter().all(written_empty),
             _ => false,
@@ -35316,7 +35401,10 @@ fn look_behind_alternatives_differ_but(pattern: &str, sized: &[usize]) -> bool {
             Ast::Group(group) => {
                 !opaque.contains(&group.span.start.offset) && differs(&group.ast, opaque, behind)
             }
-            Ast::Repetition(repetition) => differs(&repetition.ast, opaque, behind),
+            // What is repeated no times is not there to differ (#7865): `(?<=(?:a|bc){0})`.
+            Ast::Repetition(repetition) => {
+                !written_empty(ast) && differs(&repetition.ast, opaque, behind)
+            }
             Ast::Concat(concat) => concat.asts.iter().any(|ast| differs(ast, opaque, behind)),
             _ => false,
         }
@@ -164666,6 +164754,59 @@ mod tests {
             "(?<=a|bc",
         ] {
             assert!(!look_behind_alternatives_differ(pattern), "{pattern}");
+        }
+    }
+
+    /// #7865: the text the look-behind checks read where the extended mode is on.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn the_look_behind_checks_read_the_pattern_without_the_extended_mode_7865() {
+        for (pattern, extended, want) in [
+            // Blanks and comments go, an escaped blank and a class stay.
+            ("(?<= a | b c )", true, "(?<=a|bc)"),
+            ("(?<=a#k\n|b\\ [ ])", true, "(?<=a|b\\ [ ])"),
+            // A run that names only `x` goes; the mode it sets holds to the end of its group.
+            ("(?x)(?<= a | bc )", false, "(?<=a|bc)"),
+            ("(?-x)(?<=a| b)", true, "(?<=a| b)"),
+            ("(?<=a(?x) b)| c", false, "(?<=ab)| c"),
+            // The other options of a run stay, with no `-` left dangling.
+            ("(?ix)(?<=a)", false, "(?i)(?<=a)"),
+            ("(?i-x)(?<=a)", false, "(?i)(?<=a)"),
+            ("(?x-i)(?<=a)", false, "(?-i)(?<=a)"),
+            // A group that names only `x` stays an option group.
+            ("(?<=(?x:a b)+)", false, "(?<=(?m:ab)+)"),
+            ("(?<=(?-x: )|ab)", true, "(?<=(?m: )|ab)"),
+            ("(?<=(?ix: a))", false, "(?<=(?i:a))"),
+            // What follows a dropped run does not join what stands before it.
+            ("(a)(?<=\\1(?x) 0)", false, "(a)(?<=\\1(?:)0)"),
+            ("(?<=a(?x)*)", false, "(?<=a(?:)*)"),
+            // A brace that opens no interval is the literal, in the mode or out of it.
+            ("(?<=a{ 0}|b)", true, "(?<=a\\{0\\}|b)"),
+            ("(?<=a{1,#k\n2}|b)", true, "(?<=a\\{1,2\\}|b)"),
+            ("(?-x)(?<=a{1, 2}|b)", true, "(?<=a\\{1, 2\\}|b)"),
+            ("(?<=a{,2}|b{1,2}c{3})", true, "(?<=a\\{,2\\}|b{1,2}c{3})"),
+        ] {
+            assert_eq!(
+                strip_extended(pattern, extended, ExtendedRuns::Dropped),
+                want,
+                "{pattern}"
+            );
+        }
+        // The repeat checks' text keeps every run where it stands (#7852).
+        assert_eq!(
+            strip_extended_blanks("(?x) a (?-x: )", false),
+            "(?i)a(?-i: )"
+        );
+        // An item repeated no times is no part of a branch's width.
+        for pattern in [
+            "(?<=(?i:a)b|c{0})",
+            "(?<=(?i)(?:a|bc){0})",
+            "(?<=(?i:a)|(c){0,0})",
+        ] {
+            assert!(!look_behind_alternatives_differ(pattern), "{pattern}");
+        }
+        for pattern in ["(?<=(?i:x)(?:a|bc){0}|yz)", "(?<=(?i:a)b|c{0}d)"] {
+            assert!(look_behind_alternatives_differ(pattern), "{pattern}");
         }
     }
 
