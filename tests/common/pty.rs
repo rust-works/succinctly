@@ -213,6 +213,11 @@ fn resident_kib(pid: u32) -> Option<u64> {
 }
 
 impl Running {
+    /// The run's standard input, when the command was given a piped one, for a writer of the test's own.
+    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.stdin.take()
+    }
+
     /// Whether the run has ended within `wait`, without killing it if it has not.
     pub fn ended_within(&mut self, wait: Duration) -> bool {
         let start = Instant::now();

@@ -1,7 +1,8 @@
 //! The process locale behind `strftime`/`strflocaltime`'s localized specifiers (#5754).
 //!
-//! jq calls `setlocale(LC_ALL, "")`, so the weekday and month names, `%p`, and the
-//! `%c`/`%x`/`%X`/`%r` layouts follow `LC_ALL`, `LC_TIME` and `LANG`. This module
+//! jq calls `setlocale(LC_ALL, "")`, so the weekday and month names (the alternative ones
+//! `%OB` prints too, #7790), `%p`, and the `%c`/`%x`/`%X`/`%r` layouts follow `LC_ALL`,
+//! `LC_TIME` and `LANG`. This module
 //! resolves that locale once and renders those specifiers through the C library's
 //! `strftime_l`, so the names and layouts are the platform's own -- the pinned oracle's
 //! `nl_langinfo` disagrees with its own `strftime` on macOS (`%p`/`%r` print empty under
@@ -218,6 +219,7 @@ mod imp {
             weekday_abbr: weekdays("%a")?,
             month_full: months("%B")?,
             month_abbr: months("%b")?,
+            month_alt: months("%OB")?,
             am: render("%p", &at(1, 0, 0))?,
             pm: render("%p", &at(1, 0, 12))?,
         })
@@ -337,6 +339,10 @@ pub(crate) struct TimeNames {
     /// January first.
     pub(crate) month_full: [alloc::string::String; 12],
     pub(crate) month_abbr: [alloc::string::String; 12],
+    /// What `%OB` prints (#7790): the locale's alternative month names, the nominative ones a
+    /// month standing alone takes where `%B` is the genitive of a date (`leden`, `ledna` under
+    /// `cs_CZ`), and the full names where a locale has no others.
+    pub(crate) month_alt: [alloc::string::String; 12],
     /// What `%p` prints before and after noon. Either can be empty: macOS prints nothing for
     /// `%p` under `de_DE`, and its `strptime` then reads the empty string as the am marker.
     pub(crate) am: alloc::string::String,

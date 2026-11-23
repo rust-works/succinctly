@@ -35598,12 +35598,19 @@ fn translate_posix_brackets_scan(
             out.push(c);
             i += 1;
             continue;
-        } else if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
-            && extended_in.last().copied().unwrap_or(false)
-        {
+        } else if (c == '#' || c.is_whitespace()) && extended_in.last().copied().unwrap_or(false) {
             // Oniguruma's extended mode ignores blanks outside a class only; the `regex` crate
             // drops them inside one as well (`(?x:[a b])+` lost its space, #6133 review).
-            out.push_str(&format!("\\x{:02x}", c as u32));
+            // #7804: it also reads a `#` there as a comment, and every Unicode blank (U+3000) as
+            // ignored, so the class did not parse, and the pattern went to `fancy-regex`, whose
+            // route skips jq's one-byte step after an empty match (#6326). Both are literals here.
+            if c == '#' {
+                out.push_str("\\#");
+            } else if c.is_ascii() {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            } else {
+                out.push_str(&format!("\\x{{{:x}}}", c as u32));
+            }
             changed = true;
             at_start = false;
             i += 1;
@@ -35657,7 +35664,16 @@ fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
     }
     // The blanks and comments of the `x` flag are followed only where no inline flag changes them.
     let blanks = extended && !flag_switched_off(pattern) && !inline_extended(pattern);
-    if !blanks && inline_extended(pattern) && pattern.contains('#') {
+    // An escaped `\#` opens no comment: the translation writes a class's `#` so under `x` (#7804).
+    let holds_hash = || {
+        let mut escaped = false;
+        pattern.chars().any(|c| {
+            let hash = c == '#' && !escaped;
+            escaped = c == '\\' && !escaped;
+            hash
+        })
+    };
+    if !blanks && inline_extended(pattern) && holds_hash() {
         return None;
     }
     let chars: Vec<char> = pattern.chars().collect();
@@ -111391,7 +111407,9 @@ fn format_strftime(
                     }
                 }
             }
+            let mut alternative = false;
             if let Some(modifier @ ('E' | 'O')) = spec {
+                alternative = modifier == 'O';
                 spec = chars.next();
                 if spec.is_none() {
                     result.push(modifier);
@@ -111422,8 +111440,18 @@ fn format_strftime(
                 // month abbreviation (#7784). glibc has neither (its `strftime` prints them as
                 // written), and there the pinned libc's C layout stands.
                 // A time the C library cannot hold (a year past `int`) gets the C rendering.
+                // #7790: `%OB` is the locale's alternative month name in macOS's libc, the
+                // nominative one a month standing alone takes (`leden` where `%B` is `ledna` under
+                // `cs_CZ`), as jq prints it there; glibc's manual gives `%OB`, `%Ob` and `%Oh` as
+                // its alternative names (not checked against a glibc jq). Every other modified
+                // name or layout is the plain one in macOS's libc, under every locale it has.
                 if !matches!(letter, '+' | 'v') || cfg!(target_vendor = "apple") {
-                    if let Some(text) = locale_time::render(&format!("%{letter}"), &tm) {
+                    let spec = if alternative && matches!(letter, 'B' | 'b' | 'h') {
+                        format!("%O{letter}")
+                    } else {
+                        format!("%{letter}")
+                    };
+                    if let Some(text) = locale_time::render(&spec, &tm) {
                         result.push_str(&text);
                         continue;
                     }
@@ -112260,7 +112288,10 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                             None => (MONTH_FULL[i], MONTH_ABBR[i]),
                         };
                         if alternative_names {
-                            strptime_name_len(&input_iter, full, "").map(|len| (i, len))
+                            // #7790: the alternative names `%OB` prints (`leden` under `cs_CZ`,
+                            // where `%B` reads `ledna`), as macOS's libc reads them.
+                            let alt = names.map_or(full, |n| n.month_alt[i].as_str());
+                            strptime_name_len(&input_iter, alt, "").map(|len| (i, len))
                         } else {
                             strptime_name_len(&input_iter, full, abbr).map(|len| (i, len))
                         }
