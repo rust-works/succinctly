@@ -2696,6 +2696,9 @@ pub(crate) struct BinaryFanoutRules {
     /// `compareOperator` does not clone its context read-only, and
     /// `(.zzz | key) == "zzz"` is `true` there, not `false` (v4.53.3).
     pub(crate) read_only: bool,
+    /// Whether this is jq mode (#7787): an `and`/`or` settles two operands that call a def and
+    /// answer once (`operands_settle`) only there, as arithmetic does.
+    pub(crate) jq: bool,
 }
 
 impl BinaryFanoutRules {
@@ -2719,6 +2722,7 @@ pub(crate) fn binary_fanout_rules<S: EvalSemantics>(op: EmptyOperandOp) -> Binar
         left_major: S::BINARY_FANOUT_IS_LEFT_MAJOR,
         read_only: S::READ_ONLY_ABSENT_KEY_IS_EMPTY
             && matches!(op, EmptyOperandOp::Arith(_) | EmptyOperandOp::Boolean),
+        jq: S::TAG == EvalTag::Jq,
     }
 }
 
@@ -10736,6 +10740,42 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `eval_single` so a `?//` bind inside it sees a wrapping consumer's
 /// [`Demand::Stop`]. Captured live: `[first("\(1 as $x ?// $y | 1)")]` is
 /// `["1","1"]`, where the eager fallback answered `["1"]`.
+/// [`eval_each`], run to its value first when `expr` calls a def and answers once (#7787): an
+/// object's key or value and a string interpolation's part drive the rest of the construction from
+/// their output sink, so an unsettled call there held its native frames while the next part ran
+/// (`{a: t, b: t}`, `"\(t)\(t)"`).
+#[inline(always)]
+fn eval_each_settling<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    use super::tail_call::{may_hold_call, SPINE_DEPTH};
+    if S::TAG == EvalTag::Jq && may_hold_call(expr, SPINE_DEPTH) {
+        return eval_each_settling_call::<W, S>(expr, value, optional, sink);
+    }
+    eval_each::<W, S>(expr, value, optional, sink)
+}
+
+/// [`eval_each_settling`] for a part that holds a call on its spine.
+#[inline(never)]
+fn eval_each_settling_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    if super::tail_call::answers_once(expr, true) {
+        settle_then_replay(
+            |collect| eval_each::<W, S>(expr, value, optional, collect),
+            sink,
+        )
+    } else {
+        eval_each::<W, S>(expr, value, optional, sink)
+    }
+}
+
 fn each_string_parts<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     parts: &[StringPart],
     value: StandardJson<'a, W>,
@@ -10758,7 +10798,7 @@ fn each_string_parts<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
         StringPart::Expr(expr) => {
             let escape = StashedEscape::new();
-            let flow = eval_each::<W, S>(expr, value.clone(), optional, &mut |item| {
+            let flow = eval_each_settling::<W, S>(expr, value.clone(), optional, &mut |item| {
                 // #3293: a re-invocation after a stop is a `?//` retry inside the
                 // driven operand; it supersedes whatever the retried-past call decided.
                 escape.begin();
@@ -10847,7 +10887,7 @@ fn each_object_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         ObjectKey::Bare => unreachable!("a bare entry is collected, not streamed"), // patchcov: coverage tolerate-line reason="unreachable: the Expr::Object arm of eval_each sends a construction holding a bare entry down yq_object_route's Union route, so a bare entry never reaches the streaming fan-out (#2783)"
         ObjectKey::Expr(key_expr) => {
             let escape = StashedEscape::new();
-            let flow = eval_each::<W, S>(key_expr, value.clone(), optional, &mut |item| {
+            let flow = eval_each_settling::<W, S>(key_expr, value.clone(), optional, &mut |item| {
                 // #3293: a re-invocation after a stop is a `?//` retry inside the
                 // driven operand; it supersedes whatever the retried-past call decided.
                 escape.begin();
@@ -10901,7 +10941,7 @@ fn each_object_value<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     let escape = StashedEscape::new();
-    let flow = eval_each::<W, S>(value_expr, value.clone(), optional, &mut |item| {
+    let flow = eval_each_settling::<W, S>(value_expr, value.clone(), optional, &mut |item| {
         // #3293: a re-invocation after a stop is a `?//` retry inside the
         // driven operand; it supersedes whatever the retried-past call decided.
         escape.begin();
@@ -18394,7 +18434,10 @@ pub(crate) fn boolean_fanout_each(
     sink: &mut dyn FnMut(bool) -> Demand,
 ) -> Flow {
     // #3296: decided once per operator, as in `binary_fanout_each`.
-    if settles_both(left, right) {
+    // #7787: an `and`/`or` whose two operands each hold a call that may recurse (`t and t`) settles
+    // them, as arithmetic does; the right one is asked first, so `old and .active` asks only that
+    // `.active` is no call.
+    if settles_both(left, right) || (rules.jq && operands_both_hold_calls(left, right)) {
         boolean_fanout_each_with(
             settled_operand_strategy(each_operand),
             left,
@@ -73629,7 +73672,7 @@ fn count_literal_number(lit: &Literal) -> Option<f64> {
 /// `5 % 2`), or piped through `.` (`1 | . - 1`), which cannot raise, so a `limit` count of it is as fixed as
 /// a literal one (#4800). A `/` or `%` whose divisor is zero raises and is not folded; `%` is folded for
 /// whole operands only (jq truncates both to integers, so `5 % 0.5` raises there, where yq's float modulo does not).
-fn constant_number(e: &Expr) -> Option<f64> {
+pub(crate) fn constant_number(e: &Expr) -> Option<f64> {
     constant_number_at(e, None)
 }
 
@@ -120445,16 +120488,47 @@ pub(crate) fn settles_both(left: &Expr, right: &Expr) -> bool {
 /// and `.[1]`) ran each call inside the other operand's output sink, so every call ever made
 /// held its native frames and depth 13 (8,192 leaves) was refused.
 pub(crate) fn operands_settle<S: EvalSemantics>(left: &Expr, right: &Expr) -> bool {
-    // Only a call, a parenthesis or a pipe can be one (`call_head_settles`): told apart here, so
-    // the operators of a level that are no such thing (`$n == 0`, `$n - 1`) ask nothing more.
-    let may_be_a_call =
-        |e: &Expr| matches!(e, Expr::DefCall { .. } | Expr::Paren(_) | Expr::Pipe(_));
-    settles_both(left, right)
-        || (S::TAG == EvalTag::Jq
-            && may_be_a_call(left)
-            && may_be_a_call(right)
-            && super::tail_call::call_head_settles(left, true)
-            && super::tail_call::call_head_settles(right, true))
+    settles_both(left, right) || (S::TAG == EvalTag::Jq && operand_pair_settles(left, right))
+}
+
+/// The jq-mode half of [`operands_settle`] (#7787): one operand calls a def and answers once
+/// (`call_head_settles`), and the other answers once (`tail_call::answers_once`), whichever side
+/// the call is on. With an unsettled call operand the other operand, and everything after the
+/// operator, ran inside the call's output sink: `t + (t // 0)`, `first(t) + first(t)`,
+/// `getpath(["a"]) + t`.
+#[inline(always)]
+pub(crate) fn operand_pair_settles(left: &Expr, right: &Expr) -> bool {
+    use super::tail_call::{may_hold_call, SPINE_DEPTH};
+    // The shape test first, on both sides and inline: an operator whose operands hold no call on
+    // their spine (`.age > 30`, `$n - 1`) answers here, without a call.
+    let (left_calls, right_calls) = (
+        may_hold_call(left, SPINE_DEPTH),
+        may_hold_call(right, SPINE_DEPTH),
+    );
+    (left_calls || right_calls) && operand_pair_answers_once(left, right, left_calls, right_calls)
+}
+
+/// Whether both operands hold a call that may recurse on their spine and answer once (#7787): the
+/// `and`/`or` half of [`operand_pair_settles`].
+#[inline(always)]
+fn operands_both_hold_calls(left: &Expr, right: &Expr) -> bool {
+    use super::tail_call::{may_hold_call, SPINE_DEPTH};
+    may_hold_call(right, SPINE_DEPTH)
+        && may_hold_call(left, SPINE_DEPTH)
+        && operand_pair_answers_once(left, right, true, true)
+}
+
+/// [`operand_pair_settles`] past its shape test: the operand that holds a call and the other one
+/// both answer once.
+#[inline(never)]
+fn operand_pair_answers_once(
+    left: &Expr,
+    right: &Expr,
+    left_calls: bool,
+    right_calls: bool,
+) -> bool {
+    use super::tail_call::answers_once;
+    (left_calls || right_calls) && answers_once(left, true) && answers_once(right, true)
 }
 
 /// How many nodes the probe in [`settles_both`] spends on an operand before
@@ -120765,7 +120839,16 @@ impl<I> SettledOutputs<I> {
 
     /// Feed every output to `sink` in order, stopping where it does.
     fn replay(self, mut sink: impl FnMut(I) -> Demand) -> Demand {
-        for item in self.first.into_iter().chain(self.rest) {
+        if let Some(first) = self.first {
+            if matches!(sink(first), Demand::Stop) {
+                return Demand::Stop;
+            }
+        }
+        // #7787: the common case (one output) builds no iterator over an empty `rest`.
+        if self.rest.is_empty() {
+            return Demand::Continue;
+        }
+        for item in self.rest {
             if matches!(sink(item), Demand::Stop) {
                 return Demand::Stop;
             }

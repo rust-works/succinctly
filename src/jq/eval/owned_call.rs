@@ -16,10 +16,11 @@
 //!   [`each_def_tail_loop`]) and runs the body over the value;
 //! - **a definition** installs itself over what follows it, as `eval_each`'s arm does;
 //! - **a pipe led by an assignment** writes in place and runs the rest of the pipe over the answer;
-//! - **a pipe led by a call that settles**
-//!   ([`call_head_settles`](crate::jq::tail_call::call_head_settles)) runs the call to its outputs
+//! - **a pipe led by a call that answers once**
+//!   ([`call_answers_once`](crate::jq::tail_call::call_answers_once)) runs the call to its outputs
 //!   and then the rest of the pipe over each, as [`eval_each_pipe`]'s settled route does, the rest
-//!   through the same [`RestPipe`] that route's driver builds;
+//!   through the same [`RestPipe`] that route's driver builds (that route settles only a call that
+//!   may recurse, #7787; the door settles a helper's too, which is what writes in place);
 //! - **an `if`** whose condition the tree answers ([`owned_cond_verdict`]) runs the branch it picks;
 //! - **an `as` whose source never reads `.`**, the binding of a `$` parameter, binds its one value
 //!   as [`each_as`] binds a value with no node behind it.
@@ -219,7 +220,7 @@ fn door_shape(expr: &Expr) -> bool {
         Expr::Pipe(stages) => match stages.as_slice() {
             [only] => door_shape(only),
             [first, _, ..] => {
-                crate::jq::tail_call::call_head_settles(first, true)
+                crate::jq::tail_call::call_answers_once(first, true)
                     || is_owned_assign(unwrap_paren(first))
             }
             [] => false,
@@ -473,7 +474,7 @@ fn call_pipe<S: EvalSemantics>(
         bound,
     } = unwrap_paren(first)
     else {
-        return Err(input); // patchcov: coverage tolerate-line reason="unreachable: door_shape admits a pipe only when call_head_settles, which takes only a call (#7483)"
+        return Err(input); // patchcov: coverage tolerate-line reason="unreachable: door_shape admits a pipe only when call_answers_once, which takes only a call (#7483)"
     };
     let mut outputs: Vec<OwnedValue> = Vec::new();
     let upstream = call::<S>(def, args, *frames, bound, input, optional, &mut |value| {

@@ -32619,11 +32619,19 @@ fn test_recursion_refuses_before_the_native_stack_runs_out_3262() -> Result<()> 
         "def g(x): x - 1 | select(true); def f(n): if n == 0 then 0 else f(g(n)) end;".to_string(),
     ] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", &format!("{body} f(3000)")], None)?;
-        assert_eq!(code, 5, "{body}: stdout: {stdout:?} stderr: {stderr:?}");
-        assert!(
-            stderr.contains("exceeded maximum recursion depth"),
-            "{body}: stderr: {stderr:?}"
-        );
+        // #7787: a nested `def` closing over the parameter, or a helper `def` in the argument, is
+        // run to its value before the call that reads it, so the recursion reaches further before
+        // the floor and may answer 3,000 levels, as jq does; what this pins is that it never
+        // aborts.
+        if code == 0 {
+            assert_eq!(stdout.trim_end(), "0", "{body}");
+        } else {
+            assert_eq!(code, 5, "{body}: stdout: {stdout:?} stderr: {stderr:?}");
+            assert!(
+                stderr.contains("exceeded maximum recursion depth"),
+                "{body}: stderr: {stderr:?}"
+            );
+        }
 
         let (stdout, stderr, code) = run_jq_full(&["-nc", &format!("{body} f(50)")], None)?;
         assert_eq!(code, 0, "{body}: stderr: {stderr:?}");
