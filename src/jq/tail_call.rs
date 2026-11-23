@@ -776,6 +776,17 @@ pub(crate) fn call_head_settles(expr: &Expr, jq: bool) -> bool {
     may_hold_call(expr, SPINE_DEPTH) && answers_once(expr, jq)
 }
 
+/// Whether `expr` is a call to a def (inside parentheses or not) that answers at most once, whether
+/// or not the def may recurse: the owned-call door's question for a pipe a call leads (#7483,
+/// #7702), which runs the call to its outputs and the rest of the pipe over each with the value
+/// handed down. [`call_head_settles`] also asks that the call may recurse (#7787), which is a
+/// question of native stack depth: a door that settles a helper's call writes in place where the
+/// re-index bridge would copy, whatever the helper's depth. Asked only by the door
+/// (`eval::owned_call`), which asked `call_head_settles` the same question before #7787.
+pub(crate) fn call_answers_once(expr: &Expr, jq: bool) -> bool {
+    matches!(super::eval::unwrap_paren(expr), Expr::DefCall { .. }) && answers_once(expr, jq)
+}
+
 /// Whether `expr` answers at most once and leaves nothing observable to run after its output
 /// (#7787): the call-head question without its requirement that a def be called, for the other
 /// operand of an operator whose one operand is such a call (`eval::operand_pair_settles`).
