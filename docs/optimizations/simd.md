@@ -1047,7 +1047,7 @@ rustc --crate-type=lib -O --target x86_64-unknown-linux-gnu -C target-feature=+p
 
 (rustc 1.99.0; the same on `x86_64-apple-darwin`.)
 
-**Measured (#5035).** terminus (AMD Ryzen 9 7950X), rustc 1.99.0, one source tree built twice with
+**Measured (#5035).** AMD Ryzen 9 7950X, rustc 1.99.0, one source tree built twice with
 `cargo build --release --features cli,bench-runner`: the default build (0 `popcnt` instructions in the binary)
 and `RUSTFLAGS="-C target-feature=+popcnt"` (182). Every comparison alternates the two builds within each
 repetition ([A/B method](../guides/benchmarking.md#ab-benchmarking-method)).

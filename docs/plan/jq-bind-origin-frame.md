@@ -195,7 +195,7 @@ Three findings, in order of what they cost:
   the one row the third round moved backwards — until the marker was made lazy (built on the
   first occurrence): **+0.55%**.
 - **CI's x86 perf-guard read +5.3% / +5.2% on the two identity queries** against its merge-base
-  build, while the ARM guard on the same head read −0.0 … −0.3% and terminus read +0.0% on the
+  build, while the ARM guard on the same head read −0.0 … −0.3% and the AMD Ryzen 9 7950X read +0.0% on the
   same two trees. Holding the source constant and changing only
   `CARGO_PROFILE_RELEASE_CODEGEN_UNITS` (16 → 1) reproduces exactly those two queries at
   +5.6% / +5.4%, and `cg_annotate` puts the whole delta in `json/light.rs`, `trees/bp.rs`,

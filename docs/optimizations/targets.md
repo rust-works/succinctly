@@ -200,7 +200,7 @@ use std::arch::aarch64::*;
 
 ### Benchmarking Example
 
-A complete example lives on the SVE2 benchmark node, outside this repository (`/home/ubuntu/sve_benchmark/`); it shows:
+A complete example lives on the SVE2 benchmark node, outside this repository (`~/sve_benchmark/`); it shows:
 - Vector addition performance comparison
 - Matrix multiplication benchmarks
 - Verification of SVE instruction generation

@@ -396,7 +396,7 @@ Safety argument and tests: `canonical_compact_jq_span_end`'s own doc comment, pl
 
 The echo itself is free; everything the gate costs is spent deciding whether it may echo. The first draft called `raw_bytes()`, whose `text_range` walks the whole container a second time just to find the closing bracket the scan is about to reach anyway — 28% of the gate. Moving UTF-8 validation out of the scan's string arm (it decoded every byte ≥ 0x80 through `decode_code_point`) bought only 0.63 Ir/byte on this near-ASCII corpus; the byte-at-a-time loop, not the decode, is the string arm's cost.
 
-**Results**, interleaved wall-clock vs `main` (no gate), min / median, 9 reps, control floor ±2–4% (measured 2026-09-19 on `terminus` = AMD Ryzen 9 7950X and `johns-mac-mini` = Apple M4 Pro):
+**Results**, interleaved wall-clock vs `main` (no gate), min / median, 9 reps, control floor ±2–4% (measured 2026-09-19 on an AMD Ryzen 9 7950X and an Apple M4 Pro):
 
 | Row                                                      | 7950X             | M4 Pro            |
 |----------------------------------------------------------|-------------------|-------------------|
@@ -808,7 +808,7 @@ Instructions on the same 2 MB `wide` file: 7950X cachegrind `Ir` `to_entries | l
 
 The 1.55 M row reproduced at +3.9% median / +3.1% min over 41 reps with its holdout at -0.1%, and the bump is in the prefilter binary's own times (182.9 ms at 1.77 M keys, 181.9 ms at 1.88 M), so it is not layout. The keys hold no duplicate, the bitsets are the same 2 MB each from 1.05 M to 2.1 M hashes, and the M4 Pro has no profiler to isolate it; with the best case near 2% on either box the sort stays. The two materializing sites showed no such band at the same sizes on the same box.
 
-Pinned by `repeated_hashes_tests`, which now checks `any_hash_repeats` against a full sort and `hashes_repeat` on every input it checks `repeated_hashes` on (forcing the boolean to `false` when candidates exist fails two of them). A differential of base against this change on terminus (unique, duplicate, escaped-duplicate and mostly-duplicate keys, 2 to 900,000 keys, objects and arrays of objects, 14 queries) matched stdout, stderr and exit code on all 742 comparisons.
+Pinned by `repeated_hashes_tests`, which now checks `any_hash_repeats` against a full sort and `hashes_repeat` on every input it checks `repeated_hashes` on (forcing the boolean to `false` when candidates exist fails two of them). A differential of base against this change on an AMD Ryzen 9 7950X (unique, duplicate, escaped-duplicate and mostly-duplicate keys, 2 to 900,000 keys, objects and arrays of objects, 14 queries) matched stdout, stderr and exit code on all 742 comparisons.
 
 #### A band where the gain disappears on an M4 Pro (#4322)
 

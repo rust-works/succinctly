@@ -159,8 +159,8 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 **Sources ingested:**
 - `any_hash_repeats`, `prefilter_candidates`, `keys_repeat` and `object_keys_repeat` in
   `src/jq/document.rs`; `spans_repeat` in `src/bin/succinctly/jq_runner.rs`
-- Interleaved wall-clock A/B with a control and a holdout on terminus (7950X) and johns-mac-mini
-  (M4 Pro) over `wide` 2-100 MB, a 1.0-2.0 M-key `keys_unsorted` sweep and arrays of equal
+- Interleaved wall-clock A/B with a control and a holdout on an AMD Ryzen 9 7950X and an Apple M4
+  Pro over `wide` 2-100 MB, a 1.0-2.0 M-key `keys_unsorted` sweep and arrays of equal
   objects; cachegrind `Ir`; `time -l` instructions retired; peak RSS
 
 **Pages updated:**
@@ -174,8 +174,8 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 **Sources ingested:**
 - `KeyHashes::has_repeat` in `src/jq/document.rs` and `scan_canonical_object_wide` in
   `src/json/light.rs` (#3333), against a sort-based variant of the same tier
-- Interleaved wall-clock A/B (2 runs, 21 reps, plus `--control`) on terminus (7950X) and
-  johns-mac-mini (M4 Pro) over arrays of objects of 17 to 128,000 keys and the `wide` files
+- Interleaved wall-clock A/B (2 runs, 21 reps, plus `--control`) on an AMD Ryzen 9 7950X and
+  an Apple M4 Pro over arrays of objects of 17 to 128,000 keys and the `wide` files
 
 **Pages updated:**
 - [parsing/json.md](parsing/json.md) — the "Rejected: sort the collected hashes" paragraph of
@@ -188,7 +188,7 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 **Sources ingested:**
 - `census`, `repeated_hashes`, `key_hash_and_end_of` and `DistinctKeyCursors::next` in
   `src/jq/document.rs`; `StandardJson::key_raw_unescaped_with_end` in `src/json/light.rs`
-- Interleaved wall-clock A/B on terminus (7950X) and johns-mac-mini (M4 Pro) over `wide` 2-100 MB,
+- Interleaved wall-clock A/B on an AMD Ryzen 9 7950X and an Apple M4 Pro over `wide` 2-100 MB,
   many-small-objects, `users` and `wide-escaped-keys`; cachegrind `Ir`; `time -l` instructions
   retired; `scripts/perf-guard.py --check` against a base binary
 
@@ -204,7 +204,7 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 - `settles_both`, `settled_operand_strategy`, `settle_then_replay` in `src/jq/eval.rs` and the
   generic evaluator's `binary_fanout_each_generic`
 - Interleaved wall-clock A/B (shipped / analysis disabled / widened rule, plus a control copy) on
-  terminus (7950X) and johns-mac-mini (M4 Pro), cachegrind `Ir` and D1 misses with a D1-size sweep,
+  an AMD Ryzen 9 7950X and an Apple M4 Pro, cachegrind `Ir` and D1 misses with a D1-size sweep,
   and `time -l` instructions retired
 
 **Pages updated:**
@@ -219,7 +219,7 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 - `scan_canonical_object` / `scan_canonical_object_wide` in `src/json/light.rs` and
   `KeyHashes::has_repeat` / `SATURATING_KEYS` in `src/jq/document.rs`
 - Callgrind line attribution of `KeyHashes::insert`, cachegrind `Ir`, and interleaved wall-clock A/B
-  with a never-taking holdout on terminus (7950X) and johns-mac-mini (M4 Pro), plus a sort-based
+  with a never-taking holdout on an AMD Ryzen 9 7950X and an Apple M4 Pro, plus a sort-based
   alternative measured on both
 
 **Pages updated:**
@@ -231,8 +231,8 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 **Sources ingested:**
 - `src/util/simd/specials.rs` (new: `SpecialMask`, `classify_64`) and `scan_json_string_span` /
   `canonical_escape_len` in `src/json/light.rs`
-- Interleaved wall-clock A/B with a never-calling holdout on terminus (7950X) and johns-mac-mini
-  (M4 Pro), cachegrind `Ir` and `time -l` instructions retired, over #3168's corpus, the #2608 corpus
+- Interleaved wall-clock A/B with a never-calling holdout on an AMD Ryzen 9 7950X and an Apple
+  M4 Pro, cachegrind `Ir` and `time -l` instructions retired, over #3168's corpus, the #2608 corpus
   and the generator patterns
 
 **Pages updated:**
@@ -246,7 +246,7 @@ Tracks updates to the knowledge wiki pages in `docs/`.
 **Sources ingested:**
 - The #2608 commit `c74f11a66` (`find_jq_escape`, a jq-table `define_escape_scanner!`), re-applied on
   `60e74bcd9`, with a once-per-string holdout and 0/8/16-byte scalar-prefix variants
-- Cachegrind and interleaved wall-clock A/B on terminus (7950X) and johns-mac-mini (M4 Pro),
+- Cachegrind and interleaved wall-clock A/B on an AMD Ryzen 9 7950X and an Apple M4 Pro,
   2026-09-27, over a new corpus: tiny, 4-64-byte strings, escape-dense strings, short-key records,
   plus the #2608 `data`/`users` files
 
@@ -268,8 +268,8 @@ Tracks updates to the knowledge wiki pages in `docs/`.
   `test_invalid_utf8_in_string_survives_the_echo_gate_2608`,
   `test_ascii_output_still_escapes_through_new_echo_gate_2608` (`tests/jq_cli_tests.rs`) — verified
   each name exists before citing it
-- Callgrind and interleaved wall-clock A/B measurements supplied for this task (7950X `terminus`,
-  M4 Pro `johns-mac-mini`, 2026-09-19): gate cost per input byte across the #2919-as-reviewed,
+- Callgrind and interleaved wall-clock A/B measurements supplied for this task (an AMD Ryzen 9 7950X,
+  an Apple M4 Pro, 2026-09-19): gate cost per input byte across the #2919-as-reviewed,
   `text_range`-rescan-removed, and final UTF-8-single-pass revisions; canonical/late-fail/early-fail/
   pretty/`--preserve-input` result rows; the reverted `define_escape_scanner!` SIMD attempt on
   `scan_json_string_span`
