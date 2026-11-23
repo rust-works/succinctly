@@ -20,9 +20,8 @@ static ROWS: &[(&str, &str)] = &[
     (r"(?<=\X)\1", "invalid backref number/name"),
     (r"(?<=a|bc)\1", "invalid backref number/name"),
     (r"(?<=a*)\1", "invalid backref number/name"),
-    // An undefined `\k<name>` or `\g<n>` after or inside a look-around (`(?=a)\k<n>`) is still
-    // refused in the `regex` crate's words, a difference of its own, so `(?<=\k<n>(?=a))` and its
-    // kin are not pinned here.
+    // An undefined `\k<name>` or `\g<n>` beside a look-around, `(?<=\k<n>(?=a))` and its kin, is
+    // pinned in `i7858.rs`.
     (r"(?<=a(?=b)", "end pattern with unmatched parenthesis"),
     (r"(?<=a+)(", "end pattern with unmatched parenthesis"),
     (r"(?<=(?=a)))", "unmatched close parenthesis"),
