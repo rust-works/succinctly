@@ -5586,6 +5586,19 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     all_vars.extend(args_value.as_ref().map(|value| ("ARGS", value)));
     all_vars.extend(context.named.iter().map(|(k, v)| (k.as_str(), v)));
 
+    // #7880: whether the run spells jq's label value is noted here, from the program as written
+    // and (only for a program that raises with `error`) the argument values and the environment,
+    // so that the route walk below does not read every string of the substituted program: a
+    // `--rawfile` value is one of them.
+    let sentinel_note =
+        jq::path_mode::SentinelNote::of(&expr, all_vars.iter().map(|&(_, value)| value), || {
+            // Lossy is enough: `__jq` is ASCII, and a replaced byte spells nothing.
+            let spells = |text: &std::ffi::OsStr| {
+                jq::path_mode::text_spells_sentinel(text.to_string_lossy().as_bytes())
+            };
+            std::env::vars_os().any(|(name, value)| spells(&name) || spells(&value))
+        });
+
     let mut expr = jq::substitute_named_args(&expr, all_vars);
 
     // #1473: resolve every function call against the `def`s, parameters and
@@ -5622,14 +5635,19 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // interpreter does not run is refused once, at jq's compile-error status
     // (jq rejects the extension itself, `key/0 is not defined`), not once per
     // document by the evaluator entries, which refuse it too for the library.
-    if let Some(message) = jq::path_mode::refusal(&expr) {
-        eprintln!("jq: error: {message}");
-        eprintln!("jq: 1 compile error");
-        return Ok(exit_codes::COMPILE_ERROR);
-    }
+    //
     // #7719: the evaluator entries ask for the program's route once per document; decide it once
     // for the run. `expr` stays where it is until this function returns.
-    let _route_pin = jq::path_mode::pin_route(&expr);
+    //
+    // #7880: one walk of the program answers both.
+    let _route_pin = match jq::path_mode::pin_route_noted(&expr, sentinel_note) {
+        Ok(pin) => pin,
+        Err(message) => {
+            eprintln!("jq: error: {message}");
+            eprintln!("jq: 1 compile error");
+            return Ok(exit_codes::COMPILE_ERROR);
+        }
+    };
 
     // Whether the filter references `input`/`inputs`/`input_line_number`
     // (#723), which decides below whether the shared input queue gets seeded

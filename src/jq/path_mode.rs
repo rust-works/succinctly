@@ -1435,11 +1435,17 @@ pub(crate) fn route(program: &Expr) -> Route {
 /// [`route`] decided afresh: the walk a run whose program [`pin_route`] did not
 /// pin makes per document.
 fn route_unpinned(program: &Expr) -> Route {
+    route_walked(program, LabelHints::default())
+}
+
+/// [`route_unpinned`]'s walk, starting from `labels`: a caller that already
+/// knows whether the run spells jq's label value ([`SentinelNote`]) says so
+/// there, and the walk then reads no name or string for it.
+fn route_walked(program: &Expr, mut labels: LabelHints) -> Route {
     // One walk of the program: the entries ask once per document. It ends at
     // the first node the shipped route keeps, whatever else the program holds.
     let mut dynamic = false;
     let mut extension = None;
-    let mut labels = LabelHints::default();
     let shipped_only = any_subexpr(program, &mut |e| {
         dynamic |= is_dynamic_path_target(e);
         labels.note(e);
@@ -1539,9 +1545,35 @@ impl Drop for RoutePin {
 /// must stay where it is for that time: the pin names it by address. A refused
 /// program is not pinned (the CLI reports [`refusal`] and runs nothing).
 pub fn pin_route(program: &Expr) -> RoutePin {
+    pin(program, &route_unpinned(program))
+}
+
+/// [`pin_route`] for a program whose named arguments were substituted into it
+/// (#7880), or [`refusal`]'s message for a program that is refused: one walk
+/// answers both.
+///
+/// `note` is [`SentinelNote::of`] the program before the substitution, so the
+/// walk reads the names and strings of neither the program nor the argument
+/// values spliced into it. A `--rawfile` value is one string literal of the
+/// substituted program, and reading it for `__jq` cost a pass over the file
+/// for each walk of every run.
+pub fn pin_route_noted(program: &Expr, note: SentinelNote) -> Result<RoutePin, String> {
+    let labels = LabelHints {
+        sentinel: note.0,
+        sentinel_noted: true,
+        ..LabelHints::default()
+    };
+    match route_walked(program, labels) {
+        Route::Refused(error) => Err(error.message),
+        route => Ok(pin(program, &route)),
+    }
+}
+
+/// Pin `route` as `program`'s, for [`pin_route`].
+fn pin(program: &Expr, route: &Route) -> RoutePin {
     #[cfg(feature = "std")]
     {
-        let code = match route_unpinned(program) {
+        let code = match route {
             Route::Interpreter => PIN_INTERPRETER,
             Route::Shipped => PIN_SHIPPED,
             Route::Refused(_) => PIN_NONE,
@@ -1549,8 +1581,97 @@ pub fn pin_route(program: &Expr) -> RoutePin {
         PINNED_ROUTE.with(|pin| pin.set((program as *const Expr as usize, code)));
     }
     #[cfg(not(feature = "std"))]
-    let _ = program;
+    let _ = (program, route);
     RoutePin(())
+}
+
+/// Whether a run spells `__jq`, the key of jq's label value, where the program
+/// can see it (#7880): what [`pin_route_noted`] takes in place of reading the
+/// substituted program for it.
+#[derive(Clone, Copy, Debug)]
+pub struct SentinelNote(bool);
+
+impl SentinelNote {
+    /// The note for `program`, as parsed and before its named arguments are
+    /// substituted, run with `arguments` (the values of `--arg`, `--argjson`,
+    /// `--slurpfile`, `--rawfile` and of `$ARGS`); `environment` says whether
+    /// a name or a value of the process environment holds `__jq`
+    /// ([`text_spells_sentinel`]).
+    ///
+    /// The program's own text is read as [`route`] reads it: `__jq` in a
+    /// string, a key or a field name. An argument's value is data, and is read
+    /// only when the program holds an `error`, the one way a jq program raises
+    /// a value that is not a string: without one, no `__jq` in a value can
+    /// reach a label as an error, so a program that only measures or prints a
+    /// 10 MB `--rawfile` does not pay a pass over it. With one, a value that
+    /// holds `__jq` in a string or a key counts as spelled, as it did while the
+    /// walk read the literal the value was substituted as: jq's label stops on
+    /// `--argjson v '{"__jq":0}'`'s `error($v)` as on the same object written
+    /// in the program. The environment is asked only by a program that holds
+    /// an `error` and reads it (`$ENV`, `env`).
+    pub fn of<'a, I>(program: &Expr, arguments: I, environment: impl FnOnce() -> bool) -> Self
+    where
+        I: IntoIterator<Item = &'a OwnedValue>,
+    {
+        let mut text = LabelHints::default();
+        let mut raises = false;
+        let mut reads_environment = false;
+        let spelled = any_subexpr(program, &mut |e| {
+            text.note(e);
+            match e {
+                Expr::Error(_) => raises = true,
+                // `error` written where a `def error` may shadow it.
+                Expr::FuncCall { name, .. } => raises |= name == "error",
+                Expr::Env
+                | Expr::Builtin(
+                    Builtin::Env | Builtin::EnvVar(_) | Builtin::EnvObject(_) | Builtin::StrEnv(_),
+                ) => reads_environment = true,
+                _ => {}
+            }
+            text.sentinel
+        });
+        Self(
+            spelled
+                || (raises
+                    && (arguments.into_iter().any(value_spells_sentinel)
+                        || (reads_environment && environment()))),
+        )
+    }
+}
+
+/// Whether `text` holds `__jq` (#7880): [`SentinelNote::of`]'s question of one
+/// name or value of the environment.
+pub fn text_spells_sentinel(text: &[u8]) -> bool {
+    text.windows(SENTINEL.len())
+        .any(|w| w == SENTINEL.as_bytes())
+}
+
+/// Whether `value` holds `__jq` in a string or an object key at any depth
+/// (#7880): what [`LabelHints::note`] found in the literal a named argument
+/// was substituted as. A loop over a stack of its own, as a value may be
+/// nested deeper than the native stack allows.
+fn value_spells_sentinel(value: &OwnedValue) -> bool {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            OwnedValue::String(text) => {
+                if text.as_str().contains(SENTINEL) {
+                    return true;
+                }
+            }
+            OwnedValue::Array(items) => pending.extend(items.iter()),
+            OwnedValue::Object(fields) => {
+                for (key, field) in fields {
+                    if key.contains(SENTINEL) {
+                        return true;
+                    }
+                    pending.push(field);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// What [`route`]'s one walk notes for [`LabelHints::observes_label_values`].
@@ -1560,6 +1681,9 @@ struct LabelHints {
     label: bool,
     /// The program spells `__jq` in a string, a key or a field name.
     sentinel: bool,
+    /// `sentinel` was decided before the walk ([`pin_route_noted`]), which
+    /// then reads no name or string for it.
+    sentinel_noted: bool,
     /// The program holds a `?//` destructuring alternation.
     alternation: bool,
 }
@@ -1569,6 +1693,7 @@ impl LabelHints {
         match expr {
             Expr::Label { .. } => self.label = true,
             Expr::AsPattern { patterns, .. } => self.alternation |= patterns.len() > 1,
+            _ if self.sentinel_noted => {}
             Expr::Field(name) => self.sentinel |= spells_sentinel(name),
             Expr::Literal(Literal::String(text)) => self.sentinel |= spells_sentinel(text.as_str()),
             Expr::StringInterpolation(parts) => {
@@ -1596,7 +1721,8 @@ impl LabelHints {
     /// can tell apart unless it
     ///
     /// - spells `__jq` (a hand-made `error({"__jq": 0})`, or a handler that
-    ///   reads `.__jq`);
+    ///   reads `.__jq`), or raises with `error` while an argument's value
+    ///   holds it ([`SentinelNote`], #7880);
     /// - catches a `break` in a `try` whose handler reads its input (`catch
     ///   .`, `catch type`, `catch error`, whose re-raise only the label stops);
     /// - nests a label inside another of the same name, so that a `break` the
@@ -1666,8 +1792,11 @@ impl LabelHints {
 /// Whether `text` holds `__jq`, the key of jq's label value (#7719): a byte
 /// scan, as this runs on every name and string of a program that is not pinned.
 fn spells_sentinel(text: &str) -> bool {
-    text.len() >= 4 && text.as_bytes().windows(4).any(|w| w == b"__jq")
+    text.len() >= 4 && text_spells_sentinel(text.as_bytes())
 }
+
+/// The key of jq's label value, `{"__jq": n}`.
+const SENTINEL: &str = "__jq";
 
 /// Whether `expr` is a builtin jq runs through a `label` of its own (`first/1`,
 /// `limit`, `nth/2`, `isempty`, `any`/`all`, `IN`, per jq 1.7.1's and 1.8.2's

@@ -3339,3 +3339,116 @@ fn route_takes_programs_that_observe_label_values_7719() {
         );
     }
 }
+
+/// #7880: whether a run spells `__jq` is noted from the program as written, and from an
+/// argument's value only for a program that holds an `error`; the route walk of the substituted
+/// program then reads no name or string, so a `--rawfile` value is not read at all by a program
+/// that only measures it.
+#[test]
+fn sentinel_note_reads_argument_values_only_for_a_program_that_raises_7880() {
+    let object = |key: &str| {
+        let mut fields = IndexMap::new();
+        fields.insert(key.to_string(), OwnedValue::Int(0));
+        OwnedValue::Object(fields.into())
+    };
+    let note = |filter: &str, values: &[OwnedValue]| {
+        SentinelNote::of(&parse(filter).expect("parses"), values, || false).0
+    };
+    // The environment is asked only by a program that raises and reads it.
+    let asks = |filter: &str| {
+        let mut asked = false;
+        let noted = SentinelNote::of(&parse(filter).expect("parses"), &[], || {
+            asked = true;
+            true
+        });
+        assert_eq!(noted.0, asked, "{filter}");
+        asked
+    };
+    for filter in [
+        "error($ENV.K)",
+        "error(env.K)",
+        "$ENV | error",
+        "try error catch env",
+    ] {
+        assert!(asks(filter), "{filter} may raise the environment");
+    }
+    for filter in ["$ENV.K", "env | length", "error(1)", "error($s)"] {
+        assert!(!asks(filter), "{filter} does not ask");
+    }
+    // The program's own text, as `route` reads it.
+    for filter in [
+        ".__jq",
+        r#"error({"__jq":0})"#,
+        r#""\(1)__jq""#,
+        "{__jq: 0}",
+    ] {
+        assert!(note(filter, &[]), "{filter} spells the sentinel");
+    }
+    assert!(!note("$s | length", &[]));
+    assert!(!note("error($s)", &[]));
+    // A value: in a string, in a key, at any depth; only beside an `error`.
+    let nested = OwnedValue::Array(
+        vec![string("a"), OwnedValue::Array(vec![object("x__jq")].into())].into(),
+    );
+    for value in [string("__jq"), string("a__jqb"), object("__jq"), nested] {
+        let values = [OwnedValue::Null, value];
+        for filter in [
+            "$s | length",
+            "$s",
+            "[limit(3; 1, $s, 2)]",
+            "label $f | $s, break $f",
+        ] {
+            assert!(!note(filter, &values), "{filter} cannot raise {values:?}");
+        }
+        for filter in [
+            "[limit(3; 1, error($s), 2)]",
+            "$s | error",
+            "try error catch $s",
+            "def error: 1; $s | error",
+            "def f: error; 1",
+        ] {
+            assert!(note(filter, &values), "{filter} may raise {values:?}");
+        }
+    }
+    for value in [
+        string("__j"),
+        string("_jq__"),
+        object("__jx"),
+        OwnedValue::Int(0),
+    ] {
+        assert!(!note("error($s)", &[value]));
+    }
+
+    // The walk takes the note's word and reads no string: a program that spells the sentinel
+    // keeps the shipped route when the note says it does not, and the reverse. `no_std` pins
+    // nothing, so there `route` walks the program afresh and reads its text.
+    let spelled = parse(r#""__jq" | length"#).expect("parses");
+    let plain = parse("[limit(3; 1, error(1), 2)]").expect("parses");
+    for (program, noted, interpreter) in [
+        (&spelled, false, false),
+        (&spelled, true, true),
+        (&plain, false, false),
+        (&plain, true, true),
+    ] {
+        let pin = pin_route_noted(program, SentinelNote(noted)).expect("not refused");
+        if cfg!(feature = "std") {
+            assert_eq!(
+                matches!(route(program), Route::Interpreter),
+                interpreter,
+                "noted {noted}"
+            );
+        }
+        drop(pin);
+    }
+    // Unpinned, the walk reads the program's text as before.
+    assert!(matches!(route(&spelled), Route::Interpreter));
+    assert!(matches!(route(&plain), Route::Shipped));
+
+    // A refused program is refused by the same walk, with `refusal`'s message.
+    let refused = parse("del(.[key])").expect("parses");
+    assert_eq!(
+        pin_route_noted(&refused, SentinelNote(false)).err(),
+        refusal(&refused)
+    );
+    assert!(refusal(&refused).is_some());
+}
