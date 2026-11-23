@@ -20323,15 +20323,17 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // one of its own, which grew this frame and took `r(12000; 7)` in
         // `test_literal_dollar_argument_matches_jq_3260` past the depth limit.
         //
-        // #7859: `in(xs)` and `walk(f)` share it too, for an argument with an effect, which
-        // `eval_each` streams (`each_in`, `each_walk`); any other goes on to the wildcard's route.
+        // #7859: `in(xs)` and `walk(f)` share it too, in a program with an effect somewhere, for an
+        // argument with one, which `eval_each` streams (`each_in`, `each_walk`); any other goes on
+        // to the wildcard's route. Any other program goes there from this one read.
         Expr::Builtin(
-            Builtin::PathsFilter(_)
-            | Builtin::Combinations
-            | Builtin::CombinationsN(_)
-            | Builtin::In(_)
-            | Builtin::Walk(_),
+            Builtin::PathsFilter(_) | Builtin::Combinations | Builtin::CombinationsN(_),
         ) => each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink),
+        Expr::Builtin(Builtin::In(_) | Builtin::Walk(_))
+            if crate::jq::eval::program_effects::may_have_effect() =>
+        {
+            each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink)
+        }
 
         // #3448: jq's `=`/`op=`/`//=` run their right side as the outer
         // generator, so a consumer that stops after one document must stop

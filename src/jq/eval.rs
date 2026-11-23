@@ -1024,6 +1024,157 @@ fn yq_recursive_node_equal<S: EvalSemantics>(a: &OwnedValue, b: &OwnedValue, dep
 /// `#[cfg(feature = "std")]` only, same limitation as its two siblings named
 /// above: a `no_std` embedding has no `thread_local!`, so the scope is never
 /// active there and a missing key reads back as the ordinary `null` node.
+/// Whether the program being run can have an effect at all (#7859): an input read, a read of the
+/// input state, a `debug`/`stderr` write or a halt, anywhere in it. Decided once per program by the
+/// CLI driver ([`enter_program_effects_scope`]), never per record: [`generator_runs_depth_first`]
+/// and [`object_runs_depth_first`] are asked once per evaluation of the construction they guard, an
+/// object slot or `walk`'s argument once per record, and each would otherwise walk its argument
+/// for an effect there. Outside a scope (a library caller, a unit test, `no_std`) every program
+/// may have one, so each node is asked as before: the scope only ever skips a walk whose answer it
+/// already knows.
+pub(crate) mod program_effects {
+    #[cfg(feature = "std")]
+    use std::cell::Cell;
+
+    #[cfg(feature = "std")]
+    std::thread_local! {
+        static EFFECT_FREE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether a node of the running program may have an effect: `false` only inside a scope
+    /// whose program has none.
+    #[inline]
+    pub(crate) fn may_have_effect() -> bool {
+        #[cfg(feature = "std")]
+        {
+            !EFFECT_FREE.with(Cell::get)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            true
+        }
+    }
+
+    /// Restores the previous answer on drop, so a scope never outlives its program.
+    #[must_use]
+    pub struct ProgramEffectsScope {
+        #[cfg(feature = "std")]
+        previous: bool,
+    }
+
+    /// Enter the scope of `program`: [`may_have_effect`] answers `false` within it when nothing in
+    /// `program` has an effect.
+    pub fn enter(program: &super::Expr) -> ProgramEffectsScope {
+        #[cfg(feature = "std")]
+        {
+            let free = !super::program_holds_an_effect(program);
+            ProgramEffectsScope {
+                previous: EFFECT_FREE.with(|c| c.replace(free)),
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = program;
+            ProgramEffectsScope {}
+        }
+    }
+
+    impl Drop for ProgramEffectsScope {
+        fn drop(&mut self) {
+            #[cfg(feature = "std")]
+            EFFECT_FREE.with(|c| c.set(self.previous));
+        }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod program_effects_tests {
+    use super::{program_effects, program_holds_an_effect, JqSemantics};
+
+    fn holds(src: &str) -> bool {
+        program_holds_an_effect(&crate::jq::parse(src).expect("parses"))
+    }
+
+    /// #7859: the effects the scope looks for, wherever they sit, including inside a `def`
+    /// body reached only through a call; a program without one has none.
+    #[test]
+    fn a_program_holds_an_effect_where_it_reads_input_writes_or_halts_7859() {
+        for src in [
+            "inputs",
+            "[.[] | input]",
+            "def f: input_line_number; {a: (1, f)}",
+            "walk(debug)",
+            "map_values(stderr)",
+            "input_filename",
+            "first(halt_error)",
+            "debug(\"m\")",
+        ] {
+            assert!(holds(src), "{src}");
+        }
+        for src in [
+            ".",
+            "[.users[] | {a: (.id, .score)}]",
+            "def f: .a; walk(f)",
+            "error(\"x\")",
+        ] {
+            assert!(!holds(src), "{src}");
+        }
+    }
+
+    /// The scope answers for its program only while it lives, and restores what was there.
+    #[test]
+    fn the_scope_answers_for_its_program_and_restores_the_previous_answer_7859() {
+        let free = crate::jq::parse("[.[] | {a: (.x, .y)}]").expect("parses");
+        let reads = crate::jq::parse("[inputs]").expect("parses");
+        let fanning = crate::jq::parse("(1, 2)").expect("parses");
+        assert!(program_effects::may_have_effect());
+        {
+            let _outer = program_effects::enter(&free);
+            assert!(!program_effects::may_have_effect());
+            assert!(!super::generator_runs_depth_first::<JqSemantics>(&fanning));
+            {
+                let _inner = program_effects::enter(&reads);
+                assert!(program_effects::may_have_effect());
+            }
+            assert!(!program_effects::may_have_effect());
+        }
+        assert!(program_effects::may_have_effect());
+    }
+}
+
+/// Enter the [`program_effects`] scope of the program a run evaluates, for as long as it runs
+/// (#7859). Every node of `program`, and every node evaluation derives from it, is then asked
+/// whether it has an effect from one thread-local read when `program` has none.
+#[doc(hidden)]
+pub fn enter_program_effects_scope(program: &Expr) -> program_effects::ProgramEffectsScope {
+    program_effects::enter(program)
+}
+
+/// Whether anything in `program` has an effect or reads the input state, as
+/// [`stage_may_have_effect`] counts them, for [`program_effects`]. A call of a definition
+/// ([`Expr::FuncCall`]) is not one: the body it calls is a `def` of the same program, or of a
+/// module the driver has inlined into it, and the walk meets it there. A namespaced call names a
+/// module body the tree does not hold, so it counts.
+fn program_holds_an_effect(program: &Expr) -> bool {
+    any_subexpr(program, &mut |e| {
+        matches!(
+            e,
+            Expr::Builtin(
+                Builtin::Debug
+                    | Builtin::DebugMsg(_)
+                    | Builtin::Stderr
+                    | Builtin::Input
+                    | Builtin::Inputs
+                    | Builtin::Halt
+                    | Builtin::HaltError
+                    | Builtin::HaltErrorCode(_)
+                    | Builtin::InputLineNumber
+                    | Builtin::InputFilename
+            ) | Expr::NamespacedCall { .. }
+        )
+    })
+}
+
 #[cfg(feature = "std")]
 pub(crate) mod yq_read_only_context {
     use std::cell::Cell;
@@ -6326,9 +6477,14 @@ pub(crate) fn streams_escaped_generator_prefix<S: EvalSemantics>() -> bool {
 /// pulls a fanning target itself rather than calling back into `eval_index_expr`, so the two
 /// cannot recurse into each other; `each_as`/`each_as_pattern` never call back into the eager
 /// `eval_as`/`eval_as_pattern`.
+///
+/// A program with no effect anywhere answers `false` for every node from one thread-local read
+/// ([`program_effects`], #7859), so the per-record constructions that ask (an object slot, `walk`'s
+/// argument, `in`'s) walk nothing.
 pub(crate) fn generator_runs_depth_first<S: EvalSemantics>(target: &Expr) -> bool {
     S::TAG == EvalTag::Jq
         && S::PIPE_EFFECTS_RUN_DEPTH_FIRST
+        && program_effects::may_have_effect()
         && !yields_at_most_one_value(target)
         && !streams_unbounded(target)
         && stage_may_have_effect(target)
@@ -6376,6 +6532,7 @@ pub(crate) fn object_runs_depth_first<S: EvalSemantics>(
         ) && generator_runs_depth_first::<S>(slot)
     };
     S::TAG == EvalTag::Jq
+        && program_effects::may_have_effect()
         && entries.iter().any(|entry| {
             fans_with_effect(&entry.value)
                 || matches!(&entry.key, ObjectKey::Expr(key) if fans_with_effect(key))
@@ -22615,12 +22772,12 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut check_escape: Option<EvalEscape> = None;
     let mut check = |obj_owned: OwnedValue| -> Demand {
         match in_verdict::<S>(&key_owned, key_idx, &obj_owned) {
-            Ok(found) => {
+            Some(found) => {
                 results.push(OwnedValue::Bool(found));
                 Demand::Continue
             }
-            Err(e) => {
-                check_escape = Some(EvalEscape::Error(e));
+            None => {
+                check_escape = Some(EvalEscape::Error(in_mismatch(&key_owned, &obj_owned)));
                 Demand::Stop
             }
         }
@@ -22663,15 +22820,17 @@ fn builtin_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
 /// `has($x)` of one candidate `xs` produced for `in(xs)`, with `key` the input `$x` and `key_idx`
 /// its [`numeric_key_to_array_index`]: [`builtin_in`]'s check and [`each_in`]'s, one definition.
-#[inline]
+/// `None` is a mismatch, which [`in_mismatch`] spells out: the check returns no error value, so
+/// the loop over the candidates moves a byte, not an `EvalError`.
+#[inline(always)]
 fn in_verdict<S: EvalSemantics>(
     key: &OwnedValue,
     key_idx: Option<i64>,
     candidate: &OwnedValue,
-) -> Result<bool, EvalError> {
+) -> Option<bool> {
     match (key, candidate) {
         (OwnedValue::String(key), OwnedValue::Object(fields)) => {
-            Ok(fields.keys().any(|k| k == key))
+            Some(fields.keys().any(|k| k == key))
         }
         // jq returns false for negative indices, yq returns true if in
         // range. Any numeric key type is accepted here, not just Int --
@@ -22681,7 +22840,7 @@ fn in_verdict<S: EvalSemantics>(
         (
             OwnedValue::Int(_) | OwnedValue::Float(_) | OwnedValue::NumberLiteral(..),
             OwnedValue::Array(elements),
-        ) => Ok(match key_idx {
+        ) => Some(match key_idx {
             None => false,
             Some(idx) => index_in_array_bounds::<S>(idx, elements.len() as i64),
         }),
@@ -22689,16 +22848,19 @@ fn in_verdict<S: EvalSemantics>(
         // type -- matches `builtin_has`'s own `(StandardJson::Null, _)`
         // short-circuit (#908 review; confirmed against jq 1.7.1:
         // `"a" | in(null)` is `false`, not an error).
-        (_, OwnedValue::Null) => Ok(false),
+        (_, OwnedValue::Null) => Some(false),
         // Real yq never raises a type-mismatch error here either --
         // see `builtin_has`'s matching arm (#917) for the
         // real-yq-verified rationale. jq keeps erroring.
-        _ if has_type_mismatch_is_permissive::<S>() => Ok(false),
-        _ => Err(EvalError::cannot_check_has(
-            candidate.type_name(),
-            key.type_name(),
-        )),
+        _ if has_type_mismatch_is_permissive::<S>() => Some(false),
+        _ => None,
     }
+}
+
+/// [`in_verdict`]'s mismatch: `has` of a key its candidate cannot hold.
+#[cold]
+fn in_mismatch(key: &OwnedValue, candidate: &OwnedValue) -> EvalError {
+    EvalError::cannot_check_has(candidate.type_name(), key.type_name())
 }
 
 /// `in(xs)` with each verdict handed to `sink` as `xs` produces its candidate (#7859), as jq's
@@ -22726,9 +22888,9 @@ fn each_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             false,
             Reentry::REBUILT,
             &mut |candidate| match in_verdict::<S>(&key, key_idx, &candidate) {
-                Ok(found) => sink(Item::Owned(OwnedValue::Bool(found))),
-                Err(e) => {
-                    refusal = Some(Control::Error(e));
+                Some(found) => sink(Item::Owned(OwnedValue::Bool(found))),
+                None => {
+                    refusal = Some(Control::Error(in_mismatch(&key, &candidate)));
                     Demand::Stop
                 }
             },
@@ -103402,13 +103564,29 @@ fn walk_impl<S: EvalSemantics>(
     value: OwnedValue,
     optional: bool,
 ) -> (Vec<OwnedValue>, Option<Control>) {
-    walk_impl_at_depth::<S>(f, value, optional, 0, walk_members_take_first::<S>(f))
+    if walk_members_take_first::<S>(f) {
+        return walk_effectful::<S>(f, value, optional);
+    }
+    walk_impl_at_depth::<S, false>(f, value, optional, 0)
+}
+
+/// [`walk_impl`] for an `f` whose members take its first output ([`walk_members_take_first`]),
+/// out of line so that the ordinary walk's code is the one it was.
+#[cold]
+#[inline(never)]
+fn walk_effectful<S: EvalSemantics>(
+    f: &Expr,
+    value: OwnedValue,
+    optional: bool,
+) -> (Vec<OwnedValue>, Option<Control>) {
+    walk_impl_at_depth::<S, true>(f, value, optional, 0)
 }
 
 /// Whether `walk(f)`'s object members run `f` only up to its first output (#7859), as jq's
 /// `map_values(w)` asks it: an `f` with an effect ([`generator_runs_depth_first`]) and no `?//`
 /// retry, which may run `f` again after a stop. Any other `f` answers the same when its later
 /// outputs are computed and dropped, which is how they are computed for it.
+#[inline]
 fn walk_members_take_first<S: EvalSemantics>(f: &Expr) -> bool {
     generator_runs_depth_first::<S>(f) && !has_pattern_alternatives(f)
 }
@@ -103428,8 +103606,12 @@ fn each_walk<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(v) => v,
         Err(e) => return drain_result(suppress_or_raise(e, optional), sink),
     };
-    let take_first = walk_members_take_first::<S>(f);
-    let flow = match walk_members_out_of_line::<S>(f, owned, optional, 0, take_first) {
+    let members = if walk_members_take_first::<S>(f) {
+        walk_members_out_of_line::<S, true>(f, owned, optional, 0)
+    } else {
+        walk_members_out_of_line::<S, false>(f, owned, optional, 0)
+    };
+    let flow = match members {
         Ok(processed) => {
             eval_each_owned::<S>(f, &processed, optional, Reentry::REBUILT, &mut |v| {
                 sink(Item::Owned(v))
@@ -103453,7 +103635,7 @@ fn walk_member_first<S: EvalSemantics>(
     optional: bool,
     depth: usize,
 ) -> (Vec<OwnedValue>, Option<Control>) {
-    let processed = match walk_members_out_of_line::<S>(f, value, optional, depth, true) {
+    let processed = match walk_members_out_of_line::<S, true>(f, value, optional, depth) {
         Ok(processed) => processed,
         Err(control) => return (Vec::new(), Some(control)),
     };
@@ -103491,14 +103673,16 @@ fn walk_member_raises(member_values: &[OwnedValue]) -> bool {
 
 /// Panics past [`MAX_VALUE_TREE_DEPTH`](crate::jq::value::MAX_VALUE_TREE_DEPTH)
 /// levels of nesting (#1021, following #1005's precedent).
-fn walk_impl_at_depth<S: EvalSemantics>(
+///
+/// `TAKE_FIRST` is [`walk_members_take_first`]'s answer, a constant of each copy, so the ordinary
+/// walk (`false`) carries no flag from level to level.
+fn walk_impl_at_depth<S: EvalSemantics, const TAKE_FIRST: bool>(
     f: &Expr,
     value: OwnedValue,
     optional: bool,
     depth: usize,
-    take_first: bool,
 ) -> (Vec<OwnedValue>, Option<Control>) {
-    let processed = match walk_members::<S>(f, value, optional, depth, take_first) {
+    let processed = match walk_members::<S, TAKE_FIRST>(f, value, optional, depth) {
         Ok(processed) => processed,
         Err(control) => return (Vec::new(), Some(control)),
     };
@@ -103512,27 +103696,25 @@ fn walk_impl_at_depth<S: EvalSemantics>(
 /// [`walk_members`] for the cold callers ([`each_walk`], [`walk_member_first`]), so that the one
 /// inlined copy is [`walk_impl_at_depth`]'s.
 #[inline(never)]
-fn walk_members_out_of_line<S: EvalSemantics>(
+fn walk_members_out_of_line<S: EvalSemantics, const TAKE_FIRST: bool>(
     f: &Expr,
     value: OwnedValue,
     optional: bool,
     depth: usize,
-    take_first: bool,
 ) -> Result<OwnedValue, Control> {
-    walk_members::<S>(f, value, optional, depth, take_first)
+    walk_members::<S, TAKE_FIRST>(f, value, optional, depth)
 }
 
 /// `walk`'s `if type == "object" then map_values(w) elif type == "array" then map(w) else . end`:
-/// `value` with every member walked, or the control that aborted the container. `take_first` is
+/// `value` with every member walked, or the control that aborted the container. `TAKE_FIRST` is
 /// [`walk_members_take_first`]'s answer, passed down. Inlined, so that a level of the walk is
 /// still one frame of [`walk_impl_at_depth`].
 #[inline(always)]
-fn walk_members<S: EvalSemantics>(
+fn walk_members<S: EvalSemantics, const TAKE_FIRST: bool>(
     f: &Expr,
     value: OwnedValue,
     optional: bool,
     depth: usize,
-    take_first: bool,
 ) -> Result<OwnedValue, Control> {
     assert_value_tree_depth(depth);
     let processed = match value {
@@ -103549,7 +103731,7 @@ fn walk_members<S: EvalSemantics>(
             for at in 0..len {
                 let v = core::mem::replace(&mut items[at], OwnedValue::Null);
                 let (mut vs, control) =
-                    walk_impl_at_depth::<S>(f, v, optional, depth + 1, take_first);
+                    walk_impl_at_depth::<S, TAKE_FIRST>(f, v, optional, depth + 1);
                 if let Some(control) = control {
                     return Err(control);
                 }
@@ -103586,10 +103768,10 @@ fn walk_members<S: EvalSemantics>(
         OwnedValue::Object(obj) if obj.has_shadows() => {
             let mut new_obj = obj.clone();
             for (k, v) in obj {
-                let (vs, control) = if take_first {
+                let (vs, control) = if TAKE_FIRST {
                     walk_member_first::<S>(f, v, optional, depth + 1)
                 } else {
-                    walk_impl_at_depth::<S>(f, v, optional, depth + 1, false)
+                    walk_impl_at_depth::<S, false>(f, v, optional, depth + 1)
                 };
                 if let Some(control) = control {
                     if walk_member_raises(&vs) {
@@ -103617,10 +103799,10 @@ fn walk_members<S: EvalSemantics>(
             for at in 0..map.len() {
                 let slot = map.get_index_mut(at).expect("in bounds").1;
                 let v = core::mem::replace(slot, OwnedValue::Null);
-                let (vs, control) = if take_first {
+                let (vs, control) = if TAKE_FIRST {
                     walk_member_first::<S>(f, v, optional, depth + 1)
                 } else {
-                    walk_impl_at_depth::<S>(f, v, optional, depth + 1, false)
+                    walk_impl_at_depth::<S, false>(f, v, optional, depth + 1)
                 };
                 if let Some(control) = control {
                     if walk_member_raises(&vs) {
