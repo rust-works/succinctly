@@ -501,6 +501,8 @@ In the same way the fault event that follows the array under `--stream-errors -s
 A directory or a file that did not open in the middle of the list kept the 1.7.1 model of the slurp loop until #7807, and reads as 1.8.2 reads it since: `jq -c -s --stream . dir one.json` over `[1]` is `[[[0],1],[[0]]]`, where 1.7.1 lost the `[[0]]`.
 `succinctly yq` is not changed.
 Pinned by `tests/jq_cli/i7523.rs` and `tests/jq_cli/i7807.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+`scripts/jq-stream-errors-oracle-sweep.py`, which compares with the pinned 1.7.1, does not compare a `-s` row that jq 1.7.1 itself runs the program more than once for (`oracle_reruns_slurped_program`, #7890): that second run is the event or fault 1.8.2 keeps in the array.
+It prints how many rows that was and exits 2 when it is more than 0.75% of the run.
 
 ## After the last input has been read to its end, the position is jq 1.7.1's, not jq 1.8.2's (#7607)
 
@@ -13716,6 +13718,7 @@ jq: parse error: Invalid numeric literal at line 1, column 6
 ```
 `succinctly yq` is unchanged: its JSON input goes through the YAML parser, which never read these spellings as numbers.
 The ledger entry `cli:shtest-cve-2023-50268-nan-payload` records the one `succinctly dev compare jq` probe that reads a payload (`Nan4000`), as `newer-than-primary`.
+`scripts/jq-stream-errors-oracle-sweep.py` writes no payload: its generator joins tokens, and a `nan` directly before a digit is given a space (`separate_nan_payload`, #7890), so the rows still run and still compare with jq 1.7.1.
 
 **A parsed NaN compared with itself — closed by
 [#3309](https://github.com/rust-works/succinctly/issues/3309); a container compared with
