@@ -107,6 +107,8 @@ HEAVY_TESTS=(
   per_issue::i5526::test_built_value_past_the_native_stack_floor_is_a_refusal_not_a_panic_5526 # 25
   per_issue::i5554c::a_walk_past_the_native_stack_floor_refuses_at_exit_5_5554 # 17
   per_issue::i5526::test_built_value_past_the_native_stack_floor_on_document_input_5526 # 17
+  # #7856: about thirty runs, each climbing to three quarters of the debug thread's native stack.
+  per_issue::i7856::a_recursion_climbing_through_an_object_refuses_instead_of_aborting_7856
 )
 
 # What the `deep-recursion` leg runs, and every other leg skips.

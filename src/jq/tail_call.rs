@@ -948,7 +948,9 @@ pub(crate) fn def_may_recurse(def: &FuncDefData) -> bool {
 }
 
 /// [`def_may_recurse`]'s walk: whether `expr` holds a call that may recurse, out of `budget`
-/// nodes, answering yes when they run out.
+/// nodes, answering yes when they run out. Out of line: `def_may_recurse` is asked by every
+/// evaluator's `DefCall` arm (#7856), whose frame each level of a recursion pays for.
+#[inline(never)]
 fn holds_recursion(expr: &Expr, budget: &mut u32) -> bool {
     let mut out_of_budget = false;
     let found = search_subexpr(expr, &mut |e: &Expr| {

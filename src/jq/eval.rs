@@ -120938,6 +120938,184 @@ pub(crate) fn native_stack_exhausted() -> bool {
     origin != 0 && origin.abs_diff(stack_address()) > reach
 }
 
+/// The floors a `DefCall` arm checks (#7856): `None` when the floor a recursion's descent stops at
+/// is spent (ADR-0025, what [`native_stack_exhausted`] asks), and otherwise the lowest stack
+/// address an output of the call may be handed on from ([`output_past`]), `0` on a thread that
+/// registered no stack.
+///
+/// A recursion's outputs climb back up through every level's consumer on top of the descent's
+/// frames, with no `DefCall` or `Shared` evaluated on the way: `{k: f($n - 1), v: (foreach (1, 2)
+/// as $x (0; . + $x))}` runs the object's value for each output of the call, from inside that
+/// call, so a recursion admitted at 9,000 levels spent the second half of the stack on the climb
+/// and aborted. The climb is checked a quarter of the stack further down than the floor, which a
+/// descent never reaches: a recursion that answered with room to spare still does, and the last
+/// quarter covers the bounded work one level's consumer may do (ADR-0025's list). The stack grows
+/// downward on every target the crate builds for (ADR-0025), so the address is a plain bound, read
+/// once per call: an output pays a compare.
+#[inline]
+pub(crate) fn def_call_floors() -> Option<usize> {
+    let (origin, reach) = native_stack::budget();
+    if origin == 0 {
+        return Some(0);
+    }
+    if origin.abs_diff(stack_address()) > reach {
+        return None;
+    }
+    Some(origin.saturating_sub(reach + reach / 2))
+}
+
+/// Whether the caller's frame lies below `limit`, the bound [`def_call_floors`] gave its call
+/// (#7856): the address of a local, not a call, since it is asked for every output.
+#[inline(always)]
+pub(crate) fn output_past(limit: usize) -> bool {
+    let marker = 0u8;
+    (core::hint::black_box(core::ptr::addr_of!(marker)) as usize) < limit
+}
+
+/// A `DefCall` arm's failure to bind or enter the call, as its flow: out of line and cold, so the
+/// error's room is not in the frame of the arm, which every level of a recursion pays for (#7856).
+#[cold]
+#[inline(never)]
+pub(crate) fn def_call_failed(e: EvalError) -> Flow {
+    Flow::Escaped(Control::Error(e))
+}
+
+/// The refusal of a call whose output [`checked_def_output`] stopped, or that a `DefCall` arm found
+/// at the floor itself (#7856): out of line and cold, so its message's formatting takes no room in
+/// the frame of the arm that raises it, which every level of a recursion pays for.
+#[cold]
+#[inline(never)]
+pub(crate) fn def_output_refusal(def: &FuncDefData) -> Flow {
+    Flow::Escaped(Control::Error(def_call_depth_refusal(def)))
+}
+
+/// `sink`, checking [`output_past`] against `limit` before each output of a call to a def that
+/// may recurse reaches it (#7856); `refused` is set when the check fails, and the caller turns the
+/// stop into [`def_output_refusal`] once the body has returned.
+#[inline(always)]
+pub(crate) fn checked_def_output<T>(
+    limit: usize,
+    refused: &mut bool,
+    sink: &mut dyn FnMut(T) -> Demand,
+    item: T,
+) -> Demand {
+    if output_past(limit) {
+        *refused = true;
+        return Demand::Stop;
+    }
+    sink(item)
+}
+
+/// #7856: the outputs of a recursion climb through every level's consumer, and the climb is
+/// checked, so the depth ladder reaches the refusal without overflowing the thread's stack.
+#[cfg(all(test, feature = "std"))]
+mod def_output_floor_tests_7856 {
+    use super::*;
+    use crate::jq::eval_generic::GenericResult;
+    use crate::jq::parse;
+    use crate::json::JsonIndex;
+
+    const STACK: usize = 32 * 1024 * 1024;
+
+    /// Four streamed `foreach` stages: a consumer that takes far more stack for each output it
+    /// passes on than a level of the descent takes, in a debug build as in a release one.
+    const HEAVY: &str = "foreach (1,2) as $x (.; . + $x) | foreach (1,2) as $y (.; . + $y) \
+                         | foreach (1,2) as $z (.; . + $z) | foreach (1,2) as $w (.; . + $w)";
+
+    /// The issue's recursion through an object's value, and the same through a string
+    /// interpolation and a pipe, each with [`HEAVY`] as the consumer of the call's outputs, and
+    /// what jq 1.7.1 answers.
+    fn shapes() -> [(String, &'static str); 3] {
+        let leaf = format!("(0 | {HEAVY})");
+        [
+            (
+                format!(
+                    "def f($n): if $n <= 0 then {leaf} else {{k: f($n - 1), v: {leaf}}} end; \
+                     first(f(N)) | length"
+                ),
+                "2",
+            ),
+            (
+                format!(
+                    "def f($n): if $n <= 0 then {leaf} else \"\\(f($n - 1))\\({leaf})\" end; \
+                     first(f(N)) | length > 0"
+                ),
+                "true",
+            ),
+            (
+                format!(
+                    "def f($n): if $n <= 0 then 0 else f($n - 1) | {HEAVY} end; first(f(N)) | . > 0"
+                ),
+                "true",
+            ),
+        ]
+    }
+
+    /// What one evaluation answered: its outputs as JSON, or the error's message.
+    fn answer(program: &str, generic: bool) -> Result<Vec<String>, String> {
+        let expr = parse(program).expect("parses");
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        with_stack_budget(STACK, || {
+            let outputs = if generic {
+                match crate::jq::eval_generic::eval(&expr, root.value()) {
+                    GenericResult::Error(e) => return Err(e.message),
+                    other => other.collect_owned::<JqSemantics>(),
+                }
+            } else {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, root) {
+                    QueryResult::Error(e) => return Err(e.message),
+                    other => other.collect_owned_checked::<JqSemantics>(),
+                }
+            };
+            Ok(outputs
+                .expect("decodes")
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect())
+        })
+    }
+
+    /// Climb depths 3% apart until the recursion is refused: every depth below answers as jq does,
+    /// and none overflows the stack (before #7856 the first route aborted a little short of the
+    /// floor's refusal).
+    fn climb(shape: &str, want: &str, generic: bool) -> u32 {
+        let mut depth = 1u32;
+        loop {
+            let program = shape.replace('N', &depth.to_string());
+            match answer(&program, generic) {
+                Ok(out) => assert_eq!(out, [want], "{program}"),
+                Err(message) => {
+                    assert!(
+                        message.ends_with("exceeded maximum recursion depth"),
+                        "{program}: {message}"
+                    );
+                    return depth;
+                }
+            }
+            assert!(depth < 1_000_000, "never refused: {shape}");
+            depth = (depth + 1).max(depth + depth / 33);
+        }
+    }
+
+    #[test]
+    fn a_recursion_climbing_through_its_consumers_refuses_instead_of_overflowing_7856() {
+        for (shape, want) in shapes() {
+            for generic in [false, true] {
+                let owned = shape.clone();
+                let refused = std::thread::Builder::new()
+                    .stack_size(STACK)
+                    .spawn(move || climb(&owned, want, generic))
+                    .expect("spawns")
+                    .join()
+                    .expect("refuses instead of overflowing");
+                assert!(refused > 1, "{shape}: answers at depth 1");
+            }
+        }
+    }
+}
+
 /// Run `f` with this thread's native-stack floor lifted (#7676), for a parse of fixed text the
 /// crate supplies itself: a path-mode prelude definition on its first use, the `_nwise` template.
 /// Either can be reached anywhere, the floor included, and since #7475 the parser refuses there,
@@ -121074,15 +121252,21 @@ pub(crate) fn enter_def_call_in(
     if native_stack_exhausted() {
         return Err(def_call_depth_refusal(def));
     }
+    Ok(def_call_guard(frames, hot))
+}
+
+/// [`enter_def_call`] once its floor check has passed: infallible, so a `DefCall` arm that checks
+/// the floor itself holds no `Result` across the call (#7856).
+pub(crate) fn def_call_guard(frames: u32, hot: bool) -> DefCallGuard {
     let scope = if hot {
         retention_scope::Scope::Hot
     } else {
         retention_scope::Scope::Cold
     };
-    Ok(DefCallGuard {
+    DefCallGuard {
         _depth: enter_def_call_frame(frames),
         _retained: retention_scope::enter(scope),
-    })
+    }
 }
 
 /// What [`enter_def_call`] holds for one `DefCall` evaluation. Field order is
@@ -122052,8 +122236,28 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    match bind_def_call(def, args, frames, bound) {
-        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => each_def_tail_loop::<W, S>(
+    // #7856: an output of a call that may recurse climbs back through every level's consumer, so
+    // it checks the stack on its way out (`def_call_floors`). The wrapper's room is paid for in
+    // this frame, which every level of a recursion pays: the arm's error paths are out of line
+    // (`def_call_failed`, `def_output_refusal`), and it checks the floor itself so that it holds
+    // the call's guard, not a `Result` of one.
+    let body = match bind_def_call(def, args, frames, bound) {
+        Ok(body) => body,
+        Err(e) => return def_call_failed(e),
+    };
+    let Some(limit) = def_call_floors() else {
+        return def_output_refusal(def);
+    };
+    let mut refused = false;
+    let mut checked;
+    let sink: &mut dyn FnMut(Item<'a, W>) -> Demand = if super::tail_call::def_may_recurse(def) {
+        checked = |item| checked_def_output(limit, &mut refused, sink, item);
+        &mut checked
+    } else {
+        sink
+    };
+    let flow = if tail_reachable(def, S::TAG == EvalTag::Jq) {
+        each_def_tail_loop::<W, S>(
             def,
             frames,
             bound,
@@ -122061,13 +122265,15 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             TailValue::Borrowed(value),
             optional,
             sink,
-        ),
-        Ok(body) => match enter_def_call(def, frames, bound) {
-            Ok(_guard) => eval_each::<W, S>(&body, value, optional, sink),
-            Err(e) => Flow::Escaped(Control::Error(e)),
-        },
-        Err(e) => Flow::Escaped(Control::Error(e)),
+        )
+    } else {
+        let _guard = def_call_guard(frames, bound.is_hot());
+        eval_each::<W, S>(&body, value, optional, sink)
+    };
+    if refused {
+        return def_output_refusal(def);
     }
+    flow
 }
 
 /// What a tail loop carries from one round to the next (#5379): the value
