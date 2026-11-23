@@ -14469,22 +14469,39 @@ fn bare_token_lost_to_fault(
         && parse_error_detection(bytes, malformed, stream) == end
 }
 
-/// Whether the malformed value at `malformed` is the stream's last byte, a `[` or `{`, straight after
-/// the bare number or literal at `span`: the one shape where jq's parser has completed that token
-/// when it meets the end of input (#6004). A number or literal completes on the byte after it, and
-/// here that byte is the opener the end of input leaves unfinished, so the token is a value before
-/// the fault is raised. The read that completed it is the read that reached the end, so the fault
-/// is named `<unknown>`. (jq 1.7.1's slurp held the token too, `printf '1[' | jq -cs .` printing
-/// `[1]` before the error; jq 1.8.2 prints the error alone, and so does `succinctly jq` since
-/// #7807.) With white space between (`1 [`), or after a string or container (`"a"[`, `[1][`),
-/// the value was complete in an earlier read and the fault is named after the file as usual.
-/// Oracle-verified against jq 1.7.1.
+/// Whether the malformed value at `malformed` is the stream's last byte, a `[`, `{` or `"`, straight
+/// after the bare number or literal at `span`: the shape where jq's parser has completed that token
+/// when it meets the end of input (#6004, #7810). A number or literal completes on the byte after
+/// it, and here that byte opens the container or string the end of input leaves unfinished, so the
+/// token is a value before the fault is raised. When the read that completed it is the read that
+/// reached the end ([`final_read_holds_last_byte`]), the fault is named `<unknown>`. (jq 1.7.1's
+/// slurp held the token too, `printf '1[' | jq -cs .` printing `[1]` before the error; jq 1.8.2
+/// prints the error alone, and so does `succinctly jq` since #7807.) With white space between
+/// (`1 [`, `2 "`), after a string or container (`"a"[`, `"a""`), or with text after the quote
+/// (`2"abc`), the value was complete before the read met the fault, and the fault is named after
+/// the file as usual. Oracle-verified against jq 1.7.1.
 fn bare_token_before_final_opener(bytes: &[u8], span: (usize, usize), malformed: usize) -> bool {
     let (start, end) = span;
     end == malformed
         && malformed + 1 == bytes.len()
-        && matches!(bytes[malformed], b'[' | b'{')
+        && matches!(bytes[malformed], b'[' | b'{' | b'"')
         && !matches!(bytes.get(start), Some(b'"' | b'[' | b'{'))
+}
+
+/// Whether jq's read that reaches the end of a source holds the source's last byte, which it
+/// does unless the last line fills its [`JQ_READ_CHUNK`]-byte reads exactly and leaves an empty
+/// final read ([`EofTail::final_read_start`]). Then the token
+/// [`bare_token_before_final_opener`] finds was completed by a read before the one that reached
+/// the end, and the fault keeps the file's name: 4,093 spaces then `2[` (4,095 bytes, one full
+/// read) is named `<stdin>:0`, where 4,092 or 4,094 spaces are named `<unknown>` (#7810). jq's
+/// reads count the bytes as read, before the invalid-UTF-8 substitution (#5964), and the first
+/// `seam.base` bytes were moved onto this source from an earlier one (#4316).
+fn final_read_holds_last_byte(text: &[u8], seam: &Seam, lossy: Option<&LossySource>) -> bool {
+    let (read, base) = match lossy {
+        Some(lossy) => (lossy.original.as_slice(), lossy.original_offset(seam.base)),
+        None => (text, seam.base),
+    };
+    EofTail::final_read_start(read, base.min(read.len())) < read.len()
 }
 
 /// The byte at which jq detects the fault in the malformed value starting at
@@ -15104,8 +15121,8 @@ fn read_json_tail(
         };
         let (detected, mut line, resume) =
             meet_fault(&mut faults, raw.as_bytes(), start, cx.stream);
-        // #6004: a bare token straight before the last byte, an opener, completes in the read that
-        // reaches the end, so jq names the fault `<unknown>`.
+        // #6004, #7810: a bare token straight before the last byte, an opener or a quote, completes
+        // in the read that reaches the end, so jq names the fault `<unknown>`.
         if cx.ends_stream
             && !cx.stream
             && read
@@ -15114,6 +15131,7 @@ fn read_json_tail(
                 .is_some_and(|&(s, e)| {
                     bare_token_before_final_opener(raw.as_bytes(), (offset + s, offset + e), start)
                 })
+            && final_read_holds_last_byte(raw.as_bytes(), cx.seam, cx.lossy)
         {
             line = UNKNOWN_LINE as usize;
         }

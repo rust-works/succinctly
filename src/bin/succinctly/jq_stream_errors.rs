@@ -135,6 +135,9 @@ pub(crate) struct Refill {
     newline: bool,
     /// Whether this refill is the last one, `read_more`'s return value.
     is_last: bool,
+    /// Whether this refill's `fgets` hit the end of the last file: the refill jq 1.7.1 took for the
+    /// last one, which `is_last` says too unless [`RefillSource::reads_to_close`] (#7810).
+    hit_end: bool,
 }
 
 /// Where jq's refills come from: the sources' bytes already read ([`MemorySources`]), or files and
@@ -218,6 +221,7 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> RefillSource for MemorySources<S> {
             source: refill.source,
             newline: refill.newline,
             is_last: refill.is_last,
+            hit_end: refill.hit_end,
         })
     }
 
@@ -413,6 +417,7 @@ impl RefillSource for ChunkedSources {
                             source,
                             newline: false,
                             is_last: false,
+                            hit_end: false,
                         });
                     }
                     continue;
@@ -438,6 +443,7 @@ impl RefillSource for ChunkedSources {
                     source,
                     newline: false,
                     is_last: last_source,
+                    hit_end: last_source,
                 });
             }
             let newline = buf.ends_with(b"\n");
@@ -458,6 +464,7 @@ impl RefillSource for ChunkedSources {
                 source,
                 newline,
                 is_last,
+                hit_end: is_last,
             });
         }
         // What a missing last file says is said on the first read past the last source. A
@@ -477,6 +484,7 @@ impl RefillSource for ChunkedSources {
                     source: if self.tail_is_source { count } else { source },
                     newline: false,
                     is_last: true,
+                    hit_end: true,
                 });
             }
         }
@@ -536,6 +544,8 @@ struct CursorRefill<'a> {
     bytes: &'a [u8],
     newline: bool,
     is_last: bool,
+    /// See [`Refill::hit_end`].
+    hit_end: bool,
 }
 
 impl RefillCursor {
@@ -547,6 +557,7 @@ impl RefillCursor {
                 bytes: &[],
                 newline: false,
                 is_last: false,
+                hit_end: false,
             });
         }
         while let Some((_, raw)) = sources.get(self.source) {
@@ -561,6 +572,7 @@ impl RefillCursor {
                     bytes: &[],
                     newline: false,
                     is_last,
+                    hit_end: last_source,
                 });
             }
             // The first chunk of a source held its BOM too.
@@ -586,7 +598,8 @@ impl RefillCursor {
             let newline = chunk.ends_with(b"\n");
             let hit_eof = !newline && len < room;
             let bytes = &chunk[..fgets_visible_len(chunk)];
-            let is_last = last_source && at_end && hit_eof && !self.reads_to_close;
+            let hit_end = last_source && at_end && hit_eof;
+            let is_last = hit_end && !self.reads_to_close;
             self.last = Some((source, is_last));
             if at_end && !last_source && !newline && len == room {
                 self.empty_after = Some(source);
@@ -596,6 +609,7 @@ impl RefillCursor {
                 bytes,
                 newline,
                 is_last,
+                hit_end,
             });
         }
         if !self.closed {
@@ -606,6 +620,7 @@ impl RefillCursor {
                     bytes: &[],
                     newline: false,
                     is_last: true,
+                    hit_end: true,
                 });
             }
         }
@@ -674,6 +689,12 @@ pub(crate) struct Reader<R: RefillSource> {
     /// ([`Reader::terminal_fault`]'s first half, kept for the closing refill under
     /// [`RefillSource::reads_to_close`]).
     last_bytes_errored: bool,
+    /// Whether the last refill with bytes hit the end of the last file ([`Refill::hit_end`]), so
+    /// that jq 1.7.1 took it for its last refill (#7810). When it did not (the last line filled its
+    /// 4095-byte reads exactly, or an empty file came after it), jq 1.7.1's last refill was an
+    /// empty one after it, read with the input still open, which is where 1.8.2's closing refill
+    /// stands too.
+    last_bytes_hit_end: bool,
 }
 
 /// Where a paused refill reads on from, and what [`Reader::step`] knew of it.
@@ -729,6 +750,7 @@ impl<R: RefillSource> Reader<R> {
             paused: None,
             last_bytes_ended_call: false,
             last_bytes_errored: false,
+            last_bytes_hit_end: false,
         }
     }
 
@@ -778,12 +800,16 @@ impl<R: RefillSource> Reader<R> {
         let closing = refill.is_last && self.buf.is_empty() && self.source.reads_to_close();
         let parser = &mut self.parser;
         parser.strip_bom(&mut self.buf);
+        if !self.buf.is_empty() {
+            self.last_bytes_hit_end = refill.hit_end;
+        }
         if refill.is_last {
             self.values_before_last_refill = parser.yielded;
         }
-        if closing && self.last_bytes_ended_call {
+        if closing && self.last_bytes_hit_end && self.last_bytes_ended_call {
             // #7718: jq 1.8.2's closing refill is the call jq 1.7.1 made after its last refill
             // returned, which had closed the input when it answered (#7607 keeps that position).
+            // That is so only when the refill with the last bytes was jq 1.7.1's last (#7810).
             parser.closed = true;
         }
         if parser.source != refill.source {
@@ -866,17 +892,18 @@ impl<R: RefillSource> Reader<R> {
             }
             // A call that returned an error was followed by another that read again, and the read
             // after the last one closes jq's input.
-            self.terminal_fault = if self.buf.is_empty() && self.source.reads_to_close() {
-                // #7718: the closing refill jq 1.8.2 reads; the position the array is named at is
-                // jq 1.7.1's (#7607), whose terminal call was the last refill with bytes, and ran
-                // the EOF branch itself unless its last byte had ended a call.
-                self.last_bytes_errored
-                    || (!self.last_bytes_ended_call
-                        && self.errors_end_call
-                        && parser.errors > errors_after_feed)
-            } else {
-                self.errors_end_call && (fed.errored || parser.errors > errors_after_feed)
-            };
+            self.terminal_fault =
+                if self.buf.is_empty() && self.source.reads_to_close() && self.last_bytes_hit_end {
+                    // #7718: the closing refill jq 1.8.2 reads; the position the array is named
+                    // at is jq 1.7.1's (#7607), whose terminal call was the last refill with bytes,
+                    // and ran the EOF branch itself unless its last byte had ended a call.
+                    self.last_bytes_errored
+                        || (!self.last_bytes_ended_call
+                            && self.errors_end_call
+                            && parser.errors > errors_after_feed)
+                } else {
+                    self.errors_end_call && (fed.errored || parser.errors > errors_after_feed)
+                };
             self.inside = Some(parser.yielded);
             self.slurp_at = (parser.source, parser.lines_read);
         }
