@@ -15136,7 +15136,7 @@ jq reports module errors in *reverse* include order (closed by
 [#3313](https://github.com/rust-works/succinctly/issues/3313)), and a main-*body* error
 suppresses def errors entirely (closed by [#3391](https://github.com/rust-works/succinctly/issues/3391)).
 
-### `--slurpfile`'s malformed-JSON detail text is succinctly's own, not jq's (#3051) — accepted divergence
+### `--slurpfile`'s and a data import's malformed-JSON detail is jq's (#3051, #7769)
 
 A bad `--slurpfile`/`--rawfile`/`--argjson` argument now exits 2 (jq's usage-error code) with
 a single `jq: ...` line instead of routing through `anyhow`'s generic exit-1 `Error: .../Caused
@@ -15153,22 +15153,18 @@ $ jq  -nc 1 --argjson x '[1,'             # jq: invalid JSON text passed to --ar
 $ sjq -nc 1 --argjson x '[1,'             # byte-identical
 ```
 
-Only `--slurpfile`'s own malformed-JSON *inner* detail (after the wrapper's second `: `)
-diverges:
+The detail after the wrapper's second `: ` for a `--slurpfile` file that is not JSON, and after `error loading data file <path>: ` for a data import (`import "d" as $d;`), was `serde_json`'s or the splitter's wording until [#7769](https://github.com/rust-works/succinctly/issues/7769) (`Invalid JSON in stream: EOF while parsing a value at line 1 column 3`).
+It is now the message of jq's parser and the line and column it stops at, from the crate's model of that parser (`jq_stream_fault`, the one the input routes word their faults with), reading the file's bytes as jq reads them: past the one byte-order mark jq skips, and with each byte that is not UTF-8 one column.
 
 ```console
-$ jq  -nc 1 --slurpfile x t1.json   # jq: Bad JSON in --slurpfile x t1.json: Unfinished JSON term at EOF at line 2, column 5
-$ sjq -nc 1 --slurpfile x t1.json   # jq: Bad JSON in --slurpfile x t1.json: Invalid JSON in stream: EOF while parsing a value at line 2 column 5
+$ printf '[1,\n' > t1.json
+$ jq  -nc 1 --slurpfile x t1.json   # jq: Bad JSON in --slurpfile x t1.json: Unfinished JSON term at EOF at line 2, column 0
+$ sjq -nc 1 --slurpfile x t1.json   # byte-identical
 ```
 
-jq's own line/column diagnostic comes from its own hand-written JSON reader; succinctly's
-`Invalid JSON in stream: <serde_json detail>` comes from `anyhow`'s context chain over
-`serde_json`'s own `Display` for the same failure (`parse_json_stream`'s
-`.context("Invalid JSON in stream")` — the chain is preserved via `anyhow::Error`'s alternate
-`{:#}` Display, not dropped). Reproducing jq's exact wording there would mean re-deriving its
-parser's own error-position/message rules for this one CLI-arg error path — out of proportion
-to this issue's own "Low severity" scope, which was the exit code and the reporting channel,
-not this detail text.
+A number with a NUL glued to it ends at the NUL, as jq's number parser reads a C string (`1.5e3`, a NUL, is `[1.5E+3]`), where both routes refused such a file before #7769.
+jq 1.8.2 answers as 1.7.1 does except in two places, where 1.7.1 stays the reference: a quote it refuses is worded `Invalid string literal; expected ", but got '` (a 1.8 rewording), and its parse depth is 10,000 levels where 1.7.1's, and succinctly's, is 256.
+A NaN with a payload (`nan1`) is refused in jq 1.8.2's words (`Invalid numeric literal at EOF at line 1, column 4`), as on the input routes ([#7522](https://github.com/rust-works/succinctly/issues/7522), recorded above), where jq 1.7.1 reads it as `null`.
 
 A `--rawfile`, `--slurpfile` or `-f` file with a byte that is not valid UTF-8 was refused with that wrapper (`Could not open <file>: stream did not contain valid UTF-8`, exit 2) until [#7436](https://github.com/rust-works/succinctly/issues/7436); jq reads it with U+FFFD, and so does `succinctly jq` now.
 jq's `jv_load_file` reads `-f` and `--rawfile` 4,096 bytes at a time, reads on to the end of a character the last byte of a full read starts, and decodes each read on its own, so a sequence cut short by the end of a read is one U+FFFD to that end, and that is matched (`jq_raw_file_text`).
