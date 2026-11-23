@@ -15669,9 +15669,10 @@ Also fixed with it, where both releases agree: `strflocaltime`'s `%s` of a readi
 `succinctly yq` is not changed: real yq has none of these builtins, and `--jq-extensions` reaches the jq code above.
 Pinned by `tests/jq_cli/i7606.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`) on macOS, with jq 1.7.1's (`/usr/bin/jq`) answers in its comments where they differ.
 
-A reading in a skipped hour where `isdst` stays 0 is carried past the skip here and is not by the macOS jq (#7809).
-The macOS C library's `mktime` with `tm_isdst = -1` fails for a reading in a gap whose standard-time offset changes, as a zone moving its standard offset does: `Europe/Moscow` on 2011-03-27 at 02:00 (UTC+3 to UTC+4), `Pacific/Chatham` in 1946 and `America/Santiago` in 1916.
+A reading in a skipped hour where `isdst` stays 0 is carried past the skip here and is not by jq, on macOS or on Linux (#7809).
+The C library's `mktime` with `tm_isdst = -1`, Apple's and glibc's alike, fails for a reading in a gap whose standard-time offset changes, as a zone moving its standard offset does: `Europe/Moscow` on 2011-03-27 at 02:00 (UTC+3 to UTC+4), `Pacific/Chatham` in 1946 and `America/Santiago` in 1916.
 jq 1.7.1 and jq 1.8.2 then print the fields as given and `%s` as `-1`, a time the zone never had.
+The strings below are the macOS ones; jq 1.7.1 on Linux (glibc, Ubuntu 22.04, tzdata 2026e) prints the same three jq 1.7.1 strings, and the same `-1` for the `Asia/Kabul` and `Europe/Andorra` readings `tests/jq_cli/i7809.rs` pins (jq 1.8.2 was not captured on Linux).
 `TZ=Europe/Moscow`, `[2011,2,27,2,30,0,0,85] | strflocaltime("%Y-%m-%d %H:%M:%S %Z %s")` is `"2011-03-27 02:30:00 MSK -1"` in both and `"2011-03-27 03:30:00 MSK 1301182200"` here.
 `TZ=Pacific/Chatham`, `[1946,0,1,0,15,0,0,0]` is `"1946-01-01 00:15:00 +1245 -1"` in jq 1.7.1, `"1946-01-01 00:15:00 +1215 -1"` in jq 1.8.2 and `"1946-01-01 00:45:00 +1245 -757425600"` here.
 `TZ=America/Santiago`, `[1916,6,1,0,10,0,0,182]` is `"1916-07-01 00:10:00 -04 -1"`, `"1916-07-01 00:10:00 SMT -1"` and `"1916-07-01 00:27:15 SMT -1688410200"`.
@@ -15684,9 +15685,11 @@ In the 12,483 where `isdst` is 1 on either side, the macOS `mktime` succeeds.
 `succinctly jq` keeps its answer: the pin's is a time the zone never had with the epoch of a failure, ADR-0018's "matching would corrupt data" condition, and the gap rule above gives a reading the zone skipped the instant past the skip.
 A narrower difference came out of the same scan, which is only recorded: in 207 of those 12,483 gaps (the ones that are not a whole hour of daylight saving time) `mktime` succeeds on macOS but lands on another instant from `succinctly jq` for at least one of the three readings, with the same epoch seconds in jq 1.7.1 and jq 1.8.2.
 `TZ=Pacific/Apia`, `[2011,11,30,0,0,0,0,363]` (Samoa skipped 2011-12-30) is `"2011-12-29 01:00:00 -10 1325156400"` in jq 1.8.2 and `"2011-12-31 00:00:00 +14 1325239200"` here.
-`TZ=Antarctica/McMurdo`, `[1928,9,14,2,0,0,0,287]` (a half-hour gap) is `"1928-10-14 03:00:00 NZST -1300698000"` and `"1928-10-14 02:30:00 NZST -1300699800"`.
-This is the Apple C library's: a glibc jq was not captured, so what a Linux jq prints for any of these readings is unknown (it may well be `succinctly jq`'s answer).
-Pinned by `tests/jq_cli/i7809.rs`, whose rows are `succinctly jq`'s answers, with the macOS jq answers in its comments; the scan was run on macOS with the time zone set only in the child process's environment.
+`TZ=Pacific/Auckland`, `[1928,9,14,2,0,0,0,287]` (a half-hour gap) is `"1928-10-14 03:00:00 NZST -1300698000"` and `"1928-10-14 02:30:00 NZST -1300699800"`.
+The scan found that gap as `Antarctica/McMurdo`, which the macOS zone database links to `Pacific/Auckland`; Ubuntu's zone database (on 22.04 and on the CI runners) has it as a zone of its own (UTC, `-00`, until 1956), so there 02:00 on 1928-10-14 is an ordinary reading and `succinctly jq` answers `"1928-10-14 02:00:00 -00 -1300658400"`, with the epoch seconds jq 1.7.1 prints there.
+This narrower difference is mostly the Apple C library's: jq 1.7.1 on Linux (glibc) prints the fields as given with `succinctly jq`'s epoch seconds for the `Pacific/Apia` and `Pacific/Auckland` readings (`1325239200`, `-1300699800`), and the macOS epoch seconds for the `Asia/Hong_Kong` one in `tests/jq_cli/i7809.rs` (`-884250000`, where `succinctly jq` answers `-884248200`).
+The scan itself was not repeated on Linux.
+Pinned by `tests/jq_cli/i7809.rs`, whose rows are `succinctly jq`'s answers on both platforms, with the jq answers in its comments; the scan was run on macOS with the time zone set only in the child process's environment.
 
 ## `mktime` near the C `int` limits: what jq decides is matched, what macOS's `timegm` decides is not (#7722, #7723)
 
