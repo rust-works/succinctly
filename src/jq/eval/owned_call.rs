@@ -61,7 +61,7 @@ pub(super) fn door_borrowed<S: EvalSemantics>(
     reentry: Reentry,
     sink: &mut dyn FnMut(OwnedValue) -> Demand,
 ) -> Option<Flow> {
-    if reentry != Reentry::REBUILT || !door_shape(expr) || !door_open::<S>(expr, false) {
+    if !entry_reentry(reentry) || !door_shape(expr) || !door_open::<S>(expr, false) {
         return None;
     }
     // An `if` is decided on the borrowed value: a condition the tree cannot answer declines with
@@ -79,20 +79,67 @@ pub(super) fn door_borrowed<S: EvalSemantics>(
 }
 
 /// Whether `expr`'s node is one [`door_shape`] can take at all, on its discriminant alone: the check
-/// [`eval_each_owned_past_front_doors_in`] makes inline before it calls the cold door, so the
+/// bridges (`owned_bridge`, `eval_owned_input_bridge`) and the fold steps make inline before they call the cold door, so the
 /// programs that reach the bridge with another node (an empty rest, `Pipe([])`, once per element
 /// of `map(length) | .[]`) pay a compare, not a call (64 instructions per element before).
 #[inline(always)]
 pub(super) fn door_candidate(expr: &Expr) -> bool {
-    match expr {
-        Expr::DefCall { .. }
-        | Expr::FuncDef { .. }
-        | Expr::If { .. }
-        | Expr::As { .. }
-        | Expr::Paren(_) => true,
-        Expr::Pipe(stages) => !stages.as_slice().is_empty(),
+    match unwrap_paren(expr) {
+        Expr::DefCall { .. } | Expr::FuncDef { .. } | Expr::If { .. } | Expr::As { .. } => true,
+        // A pipe the door can take is led by a call or an assignment, or is one such stage: the
+        // first stage's discriminant says so, so a pipe of other stages (the input-free operand of
+        // #7451's fold step, `$t | tostring | split("")`, evaluated once per step) pays a compare
+        // and no call (#7702: 160 instructions per step through the door's own shape check).
+        Expr::Pipe(stages) => match stages.as_slice() {
+            [] => false,
+            [only] => matches!(
+                unwrap_paren(only),
+                Expr::DefCall { .. } | Expr::FuncDef { .. } | Expr::If { .. } | Expr::As { .. }
+            ),
+            [first, ..] => matches!(
+                unwrap_paren(first),
+                Expr::DefCall { .. }
+                    | Expr::Assign { .. }
+                    | Expr::Update { .. }
+                    | Expr::CompoundAssign { .. }
+                    | Expr::AlternativeAssign { .. }
+                    | Expr::Alternative(..)
+                    | Expr::As { .. }
+            ),
+        },
         _ => false,
     }
+}
+
+/// The door for a fold or loop step whose UPDATE no by-value step answered (#7702): the state is
+/// the loop's own, replaced by what the step answers, so it is handed down rather than borrowed and
+/// a write in a call's body lands in place. `Err(state)`, untouched, when the door declines: the
+/// caller then takes its usual route, the re-index bridge for a call, over the same state.
+///
+/// `reentry` is the step's: [`Reentry::Proven`] for an UPDATE the fold demoted once for the whole
+/// run, [`Reentry::REBUILT`] otherwise. Both are taken, as [`door_borrowed`] takes them: under the
+/// gates of [`door_open`] a re-entry's reroot changes nothing in `expr`, so whichever the bridge
+/// would have done, its parts see the expression as written.
+#[cold]
+#[inline(never)]
+pub(super) fn door_moved<S: EvalSemantics>(
+    expr: &Expr,
+    state: OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Result<Flow, OwnedValue> {
+    if !entry_reentry(reentry) || !door_shape(expr) || !door_open::<S>(expr, false) {
+        return Err(state);
+    }
+    door::<S>(expr, state, optional, sink)
+}
+
+/// The re-entries the door is taken under: [`Reentry::REBUILT`] (no node backs the value, the
+/// embed table having proved none) and [`Reentry::Proven`] (the markers were rerooted upstream, a
+/// fold's or a loop's UPDATE, #7702). A value an embed-table entry witnesses is the bridge's.
+fn entry_reentry(reentry: Reentry) -> bool {
+    reentry == Reentry::REBUILT || reentry == Reentry::Proven
 }
 
 /// The owned evaluator for a value nothing else holds: [`eval_each_owned`] over `input`, except
@@ -755,5 +802,40 @@ pub(super) mod tests {
             Demand::Continue
         });
         assert_eq!(entries(), before, "yq mode entered the door");
+    }
+    /// #7702: a fold or loop step whose UPDATE is a call to a `def` runs through the door with the
+    /// state handed down, so the run re-indexes the state a fixed number of times however many steps
+    /// it takes; with the door closed it re-indexes the state at every step, as before. Every row
+    /// answers as the route it replaces: `reduce`, `foreach` with and without an EXTRACT (a call
+    /// too), `until`, `while`, `recurse` and `limit`, and a pipe of a call and a write.
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // STYLE-0004: jq object literals, not format strings
+    fn fold_and_loop_steps_that_call_a_def_take_the_door_7702() {
+        let defs = "def f($v): .a = $v; def g: .a; ";
+        for (program, steps) in [
+            ("{x:[range(200)]} | reduce range(60) as $i (.; f($i)) | .a", 60),
+            ("{x:[range(200)]} | [foreach range(60) as $i (.; f($i); .a)] | length", 60),
+            ("{x:[range(200)]} | [foreach range(60) as $i (.; f($i); g)] | add", 60),
+            ("{x:[range(200)], a:0} | until(.a >= 60; f(.a + 1)) | .a", 60),
+            ("{x:[range(200)], a:0} | [while(.a < 60; f(.a + 1)) | .a] | length", 60),
+            ("{x:[range(200)], a:0} | [recurse(if .a < 60 then f(.a + 1) else empty end) | .a] | length", 60),
+            ("{x:[range(200)], a:0} | last(limit(60; recurse(f(.a + 1)))) | .a", 60),
+            ("{x:[range(200)], n:0} | reduce range(60) as $i (.; f($i) | .n += 1) | .n", 60),
+        ] {
+            let program = format!("{defs}{program}");
+            let count = |door: bool| {
+                let before = crate::jq::value::reindex_count::get();
+                let answer = run(&program, &OwnedValue::Null, door);
+                (answer, crate::jq::value::reindex_count::get() - before)
+            };
+            let (bridged, bridged_reindexes) = count(false);
+            let (answered, reindexes) = count(true);
+            assert_eq!(answered, bridged, "{program}");
+            assert!(
+                bridged_reindexes >= steps,
+                "{program}: the closed door re-indexed {bridged_reindexes} times"
+            );
+            assert!(reindexes <= 4, "{program}: {reindexes} re-indexes over {steps} steps");
+        }
     }
 }
