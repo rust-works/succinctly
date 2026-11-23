@@ -157,7 +157,7 @@ pub(crate) trait RefillSource {
     fn bom_cut(&self) -> bool;
 
     /// Whether the empty closing refill always follows the last bytes, as jq 1.8.2 reads a `--seq`
-    /// stream ([`RefillCursor::reads_to_close`], #7718).
+    /// stream and a slurp ([`RefillCursor::reads_to_close`], #7718, #7807).
     fn reads_to_close(&self) -> bool {
         false
     }
@@ -201,8 +201,8 @@ impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> MemorySources<S> {
 }
 
 impl<S: AsRef<[(Option<usize>, Vec<u8>)]>> MemorySources<S> {
-    /// The same sources read as jq 1.8.2 reads a `--seq` stream: the empty closing refill always
-    /// follows the last bytes ([`RefillCursor::reads_to_close`], #7718).
+    /// The same sources read as jq 1.8.2 reads a `--seq` stream (#7718) and a slurp (#7807): the
+    /// empty closing refill always follows the last bytes ([`RefillCursor::reads_to_close`]).
     fn reading_to_close(mut self) -> Self {
         self.cursor.reads_to_close = true;
         self
@@ -517,8 +517,8 @@ struct RefillCursor {
     /// Whether the refill that holds the last bytes is never the last one, as in jq 1.8.2, which
     /// reports the end only once the last file is closed, one refill later (jqlang/jq#3279, #7718):
     /// the empty closing refill always follows. jq 1.7.1 took the refill that hit the end of the last
-    /// file for the last one. `--seq` reads this way; plain `--stream` keeps 1.7.1's refills, with
-    /// #7523's closing event moved into a slurp's array instead.
+    /// file for the last one. `--seq` and every `--slurp` read this way ([`slurp_sources`], #7807);
+    /// plain `--stream` without `-s` keeps 1.7.1's refills.
     reads_to_close: bool,
 }
 
@@ -926,7 +926,7 @@ pub(crate) fn opens_with_malformed_bom(sources: &[(Option<usize>, Vec<u8>)]) -> 
 /// Read `sources` (each source's bytes as read, a leading BOM already removed) the way
 /// `jq --stream-errors` does.
 pub(crate) fn read(sources: &[(Option<usize>, Vec<u8>)]) -> StreamErrorsRead {
-    read_keeping(sources, usize::MAX, false)
+    read_keeping(Reader::new(sources), usize::MAX, false)
 }
 
 /// The bytes [`first_event_completes_in`] tries after a file in turn: one that continues a number
@@ -989,21 +989,71 @@ const SLURP_TAIL: usize = 8;
 /// With `stop_at_fault` the read ends at the first parse error, whose message is
 /// [`StreamErrorsRead::first_fault`]: `--slurp` without `--stream-errors` raises it and prints
 /// nothing else, so what follows is never read.
+///
+/// The read is jq 1.8.2's ([`slurp_sources`]): `failed_tail` is its exception.
 pub(crate) fn read_for_slurp(
     sources: &[(Option<usize>, Vec<u8>)],
     stop_at_fault: bool,
+    failed_tail: bool,
 ) -> StreamErrorsRead {
-    read_keeping(sources, SLURP_TAIL, stop_at_fault)
+    read_keeping(
+        Reader::from_source(slurp_sources(sources, failed_tail)),
+        SLURP_TAIL,
+        stop_at_fault,
+    )
 }
 
-/// [`read`], keeping the location of the last `keep` values only, and stopping at the first parse
-/// error if asked to.
-fn read_keeping(
+/// [`read_for_slurp`], keeping every location: for the read a slurp with more values after its
+/// array than [`SLURP_TAIL`] takes again.
+pub(crate) fn read_whole_slurp(
     sources: &[(Option<usize>, Vec<u8>)],
+    failed_tail: bool,
+) -> StreamErrorsRead {
+    read_keeping(
+        Reader::from_source(slurp_sources(sources, failed_tail)),
+        usize::MAX,
+        false,
+    )
+}
+
+/// The refills a `--slurp` read takes from `sources`: jq 1.8.2's, which always end in the empty
+/// closing refill (#7807).
+///
+/// jq 1.7.1's slurp loop closed its array at the call that emptied the refill that hit the end of
+/// the last file, so what that call's parser still held came out after the array, from a call of its
+/// own: the closing event of a container that ends the text (#7523), and the fault of a text that
+/// ends in one when the last byte completed a value (`2"`, `1[`, and `[1,` under `--stream`), which
+/// printed the array and then the error.
+/// jq 1.8.2 reads the empty closing refill before it closes the array (jqlang/jq#3279, commit
+/// 4e3088f, "Fix `--slurp --stream` when input has no trailing newline character"), so that call is
+/// the array's last: a value it yields is in the array, and a fault it meets is met before the array
+/// closes, which `-s` then never prints (`-n -s` raises it from the first `input`, before the array).
+/// `succinctly jq` follows 1.8.2 on every route that slurps: this reader for `--stream -s`,
+/// `--stream-errors -s` and `--seq` (#7718), and the documents' route, which prints no array once it
+/// meets a fault (`slurp_documents` and the slurp branch of `read_inputs` in `jq_runner`).
+///
+/// The exception is `failed_tail`, a list that ends in a file that did not open or in a directory:
+/// the failed read is the last refill in both releases, and what jq 1.8.2 reads past a last
+/// directory is #7607's, which keeps jq 1.7.1's answers.
+fn slurp_sources(
+    sources: &[(Option<usize>, Vec<u8>)],
+    failed_tail: bool,
+) -> MemorySources<&[(Option<usize>, Vec<u8>)]> {
+    let memory = MemorySources::new(sources);
+    if failed_tail {
+        memory
+    } else {
+        memory.reading_to_close()
+    }
+}
+
+/// What `reader` yields, as [`read`] reports it, keeping the location of the last `keep` values
+/// only, and stopping at the first parse error if asked to.
+fn read_keeping<R: RefillSource>(
+    mut reader: Reader<R>,
     keep: usize,
     stop_at_fault: bool,
 ) -> StreamErrorsRead {
-    let mut reader = Reader::new(sources);
     let mut values = Vec::new();
     let mut locations = std::collections::VecDeque::new();
     let mut first_fault = None;
@@ -1083,13 +1133,8 @@ pub(crate) fn read_seq(
     errors_are_events: bool,
     failed_tail: bool,
 ) -> SeqRead {
-    let memory = MemorySources::new(sources);
     let mut reader = Reader::with_seq(
-        if failed_tail {
-            memory
-        } else {
-            memory.reading_to_close()
-        },
+        slurp_sources(sources, failed_tail),
         Some(SeqMode { errors_are_events }),
     );
     // Each event and each fault with its place in the sequence of inputs jq yielded.
@@ -1193,11 +1238,13 @@ pub(crate) enum Afterwards {
 ///
 /// Memory is the events and one entry per fault, as [`read_for_slurp`]'s is: the location of only
 /// the last [`SLURP_TAIL`] events is kept, since the inputs after the array are among them.
+///
+/// The read is jq 1.8.2's ([`slurp_sources`]): `failed_tail` is its exception.
 pub(crate) fn read_for_deferred_slurp(
     sources: &[(Option<usize>, Vec<u8>)],
-    closer_in_array: bool,
+    failed_tail: bool,
 ) -> DeferredSlurp {
-    let mut reader = Reader::new(sources);
+    let mut reader = Reader::from_source(slurp_sources(sources, failed_tail));
     // Every event, and the faults with where they came in the sequence of inputs jq yielded.
     let mut events = Vec::new();
     let mut faults: Vec<(usize, String, (usize, usize))> = Vec::new();
@@ -1236,31 +1283,12 @@ pub(crate) fn read_for_deferred_slurp(
         }
     }
     after.sort_by_key(|(at, _)| *at);
-    // jq 1.8 reads once more after the last byte before it closes the array (jqlang/jq#3279,
-    // #7523), so the closing event its parser still held at that point is in the array. jq 1.7.1
-    // gave it out after the array, as an input of its own. A run with a file that did not open keeps
-    // the 1.7.1 reads (`closer_in_array` is false), and so does one whose text ends in a fault.
-    if closer_in_array
-        && after.len() == 1
-        && matches!(after.first(), Some((_, Afterwards::Value(value, _))) if is_closing_event(value))
-    {
-        if let (_, Afterwards::Value(value, _)) = after.remove(0) {
-            events.push(value);
-        }
-    }
     DeferredSlurp {
         array: events,
         slurp_at: end.slurp_at,
         before,
         after: after.into_iter().map(|(_, item)| item).collect(),
     }
-}
-
-/// Whether `value` is a container's closing event, `[path]`: not a leaf (`[path, value]`) and not a
-/// fault (`[message, path]`).
-pub(crate) fn is_closing_event(value: &OwnedValue) -> bool {
-    matches!(value, OwnedValue::Array(parts)
-        if parts.len() == 1 && matches!(parts[0], OwnedValue::Array(_)))
 }
 
 /// What [`Parser::feed_from`] did with a refill.
@@ -2509,7 +2537,7 @@ mod tests {
     fn a_read_for_slurp_keeps_the_tail_of_the_locations_5498() {
         let events: String = (0..40).map(|n| format!("[{n}]\n")).collect();
         let sources = [(None, events.into_bytes())];
-        let (full, slurp) = (read(&sources), read_for_slurp(&sources, false));
+        let (full, slurp) = (read(&sources), read_for_slurp(&sources, false, false));
         let json = |read: &StreamErrorsRead| {
             read.values
                 .iter()
@@ -2526,8 +2554,8 @@ mod tests {
         // The first error's message and location are kept wherever it falls, and a read told to stop
         // there reads no further.
         let broken = [(None, b"[1]\n}\n[2]\n}\n".to_vec())];
-        let (full, slurp) = (read(&broken), read_for_slurp(&broken, false));
-        let stopped = read_for_slurp(&broken, true);
+        let (full, slurp) = (read(&broken), read_for_slurp(&broken, false, false));
+        let stopped = read_for_slurp(&broken, true, false);
         let first = full.first_error.expect("a fault");
         assert_eq!(
             full.first_fault.as_ref().map(|f| f.1),
@@ -2566,7 +2594,7 @@ mod tests {
             "\"x\"",
             "[\"a\",\"b\"]\n[\"c\"]",
         ] {
-            let read = read_for_slurp(&[(None, stream.as_bytes().to_vec())], false);
+            let read = read_for_slurp(&[(None, stream.as_bytes().to_vec())], false, false);
             assert!(read.inside >= read.locations_from, "{stream:?}");
             assert!(read.values.len() - read.inside <= SLURP_TAIL, "{stream:?}");
         }
@@ -3048,7 +3076,8 @@ mod tests {
                 .enumerate()
                 .map(|(i, bytes)| (Some(i), bytes.to_vec()))
                 .collect();
-            read_for_deferred_slurp(&sources, false)
+            // jq 1.7.1's reads, which a list that ends in a file that did not open keeps.
+            read_for_deferred_slurp(&sources, true)
         };
         let shape = |read: &DeferredSlurp| {
             let after: Vec<String> = read
@@ -3066,22 +3095,29 @@ mod tests {
         // A clean stream is the array, and the close of the last container that jq 1.7.1's loop
         // still held when it closed the array.
         assert_eq!(shape(&read(&[b"1 [2]"])), (2, 0, vec!["value".to_string()]));
-        // jq 1.8 puts that close in the array (#7523), unless a file did not open.
+        // jq 1.8 puts that close in the array (#7523), unless the list ends in a file that did not
+        // open.
         let sources = vec![(Some(0), b"1 [2]".to_vec())];
         assert_eq!(
-            shape(&read_for_deferred_slurp(&sources, true)),
+            shape(&read_for_deferred_slurp(&sources, false)),
             (3, 0, vec![])
         );
         // A fault in the middle comes before the array, which holds the events around it.
         assert_eq!(shape(&read(&[b"1 2 }\n3"])), (3, 1, vec![]));
         // Two faults are two calls before the array.
         assert_eq!(shape(&read(&[b"1 }\n2 }\n3"])), (3, 2, vec![]));
-        // A fault at the end of the stream is the call after the array.
+        // A fault at the end of the stream is the call after the array, in jq 1.7.1.
         let eof = read(&[b"1 [2,"]);
         assert_eq!(eof.array.len(), 2);
         assert_eq!(eof.before.len(), 0);
         assert!(
             matches!(eof.after.as_slice(), [Afterwards::Fault(m, _)] if m.starts_with("Unfinished JSON term"))
+        );
+        // jq 1.8 meets that fault before the array closes (#7807): it is raised first.
+        let sources = vec![(Some(0), b"1 [2,".to_vec())];
+        assert_eq!(
+            shape(&read_for_deferred_slurp(&sources, false)),
+            (2, 1, vec![])
         );
         // Only faults: an empty array, and each fault before it.
         assert_eq!(shape(&read(&[b"}\n}"])), (0, 2, vec![]));

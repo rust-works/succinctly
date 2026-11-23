@@ -6031,15 +6031,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // loop derives from a file (its name, its source tag, the line a
         // diagnostic names) is carried here instead, since the one document
         // no longer belongs to any single file.
-        let (raw_inputs, mut slurped) = if args.slurp {
-            match slurp_documents(
-                raw_inputs,
-                &originals,
-                &files,
-                args.validate,
-                &seams,
-                failures.iter().any(|&(at, _)| at >= files.len()),
-            ) {
+        let (raw_inputs, slurped) = if args.slurp {
+            match slurp_documents(raw_inputs, &originals, &files, args.validate, &seams) {
                 Ok(mut slurped) => (vec![std::mem::take(&mut slurped.combined)], Some(slurped)),
                 // `--validate` already printed its own report.
                 Err(SlurpFailure::Validation(exit_code)) => return Ok(exit_code),
@@ -6073,8 +6066,6 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         } else {
             (raw_inputs, None)
         };
-        // #6004: the error jq raises once the slurped array is out.
-        let slurp_deferred_fault = slurped.as_mut().and_then(|s| s.fault.take());
         // #5576: a malformed member this route meets when the filter reads it is worded as jq's
         // parser words it, from the stream's first fault. The buffers are shared with the loop
         // below, not copied; a slurped stream's are gone, so it is read again from its files.
@@ -6738,12 +6729,6 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         if !run_stopped {
             failures.append(&mut noted);
             report_open_failures(&failures[next_failure..], &mut open_failed);
-        }
-        // #6004: the fault a slurped stream ended in, after the array it holds.
-        if let (false, Some(message)) = (run_stopped, slurp_deferred_fault) {
-            out.flush()?;
-            sink.report_parse_error(&message);
-            return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
         }
         // A run that stopped reads no further, as jq's main loop does.
         seq_tail_handed_on = !run_stopped
@@ -8887,7 +8872,7 @@ fn read_inputs(
         if args.slurp && args.null_input && stream_by_reader {
             let read = crate::cli::jq_stream_errors::read_for_deferred_slurp(
                 &raw_bytes,
-                !any_open_failure,
+                unopened_tail || last_is_directory,
             );
             let place = |at| stream_location(&raw_bytes, at);
             let fault = |message: String, at: (usize, usize)| {
@@ -8928,7 +8913,11 @@ fn read_inputs(
             return Ok(Ok((values, locations, None, resumed)));
         }
         let mut read = if args.slurp {
-            crate::cli::jq_stream_errors::read_for_slurp(&raw_bytes, stream_by_reader)
+            crate::cli::jq_stream_errors::read_for_slurp(
+                &raw_bytes,
+                stream_by_reader,
+                unopened_tail || last_is_directory,
+            )
         } else {
             crate::cli::jq_stream_errors::read(&raw_bytes)
         };
@@ -8937,10 +8926,11 @@ fn read_inputs(
         // there.
         if let (true, Some((message, (source, line)))) = (stream_by_reader, read.first_fault.take())
         {
-            // #6061: jq closes the slurp array at the call that consumes the last byte, so a fault
-            // met by a later call (a bare token or a `,` last in the input completes its event in
-            // the call before) comes after the array, which holds the events read. A fault met
-            // before the array closes is the whole result.
+            // #6061: jq closes the slurp array at the call that reads the closing refill (#7807:
+            // jq 1.7.1's closed it at the call that consumed the last byte, so a bare token or a `,`
+            // last in the input put the fault after the array), so a fault met by a later call
+            // comes after the array, which holds the events read. A fault met before the array
+            // closes is the whole result.
             // #6481: with a file that did not open after the last one that did, the call that
             // consumes the last byte is not the last call: jq's reader goes on to the missing
             // file, and the fault is met before the array closes, so it is the whole result.
@@ -8950,7 +8940,7 @@ fn read_inputs(
             if args.slurp {
                 let deferred = crate::cli::jq_stream_errors::read_for_deferred_slurp(
                     &raw_bytes,
-                    !any_open_failure,
+                    unopened_tail || last_is_directory,
                 );
                 if deferred.before.is_empty() {
                     let place = |at| stream_location(&raw_bytes, at);
@@ -8996,31 +8986,17 @@ fn read_inputs(
         // The slurp read keeps the last few locations only: more values after the array than that
         // (none seen) are read again with all of them.
         if args.slurp && read.inside < read.locations_from {
-            read = crate::cli::jq_stream_errors::read(&raw_bytes);
+            read = crate::cli::jq_stream_errors::read_whole_slurp(
+                &raw_bytes,
+                unopened_tail || last_is_directory,
+            );
         }
         let mut values = read.values;
         let mut value_locations = read.locations;
-        // `--slurp` closes its array at the call that empties jq's buffer, so what that call left
-        // behind comes out after the array as inputs of their own.
-        //
-        // jq 1.8 reads once more after the last byte before it closes the array (jqlang/jq#3279,
-        // #7523), so the closing event of a top-level container that ends the text, which 1.7.1's
-        // parser still held at that point and gave out after the array, is in the array: `printf
-        // '[1,2]' | jq -c -s --stream .` is one array of all three events. That is `--stream -s`
-        // and `--stream-errors -s`. `--seq` keeps the 1.7.1 model of the loop, and so does a run
-        // with a file that did not open and one whose text ends in a fault, which jq 1.8.2 reads
-        // differently too (an uncaught fault, a closed input's name), unchecked here.
-        let inside = if (args.stream || args.stream_errors) && !args.seq && !any_open_failure {
-            read.inside
-                + usize::from(
-                    values.len() == read.inside + 1
-                        && values
-                            .get(read.inside)
-                            .is_some_and(crate::cli::jq_stream_errors::is_closing_event),
-                )
-        } else {
-            read.inside
-        };
+        // `--slurp` closes its array at the call that reads jq 1.8.2's closing refill
+        // ([`jq_stream_errors::slurp_sources`], #7523, #7807), so what that call left behind comes out
+        // after the array as inputs of their own.
+        let inside = read.inside;
         let after_array = args.slurp.then(|| {
             let outside = values.split_off(inside);
             let outside_locations = value_locations.split_off(inside - read.locations_from);
@@ -9650,42 +9626,21 @@ fn read_inputs(
                 // slurped stream it could not finish parsing. The error goes
                 // out in jq's channel at exit 5, like every other malformed
                 // document, rather than through `anyhow` at exit 1.
-                // ... except for one shape (#6004): a bare number or literal straight before the
-                // stream's last byte, an opener, is a value by the time jq meets the fault, so
-                // the array holds it and the error follows the array.
-                let mut slurp_keeps_prefix = false;
+                // #7807: that includes a bare number or literal straight before the stream's last
+                // byte, an opener (`1[`), which jq 1.7.1 put in the array before the error (#6004):
+                // jq 1.8.2 reads the closing refill before it closes the array, and meets the fault
+                // there ([`jq_stream_errors::slurp_sources`]).
                 if args.slurp {
                     if let Some(error) = &parse_error {
-                        // Only where the stream ends in this file's last byte.
-                        if pos == last && !unopened_tail && !args.stream && !args.seq {
-                            let (spans, split_error) = split_json_values(raw.as_bytes());
-                            let malformed_start = spans
-                                .get(parsed.len())
-                                .map(|&(start, _)| start)
-                                .or(split_error);
-                            slurp_keeps_prefix = parsed
-                                .len()
-                                .checked_sub(1)
-                                .and_then(|i| spans.get(i).copied())
-                                .zip(malformed_start)
-                                .is_some_and(|(span, malformed)| {
-                                    bare_token_before_final_opener(raw.as_bytes(), span, malformed)
-                                });
-                        }
-                        if !slurp_keeps_prefix {
-                            let malformed = MalformedJsonError::new(error.clone());
-                            // #5555: the read that met the fault, as the resuming route places it.
-                            return Ok(Err(match slurp_fault_at(
-                                &raw,
-                                seam,
-                                parsed.len(),
-                                args.stream,
-                            ) {
+                        let malformed = MalformedJsonError::new(error.clone());
+                        // #5555: the read that met the fault, as the resuming route places it.
+                        return Ok(Err(
+                            match slurp_fault_at(&raw, seam, parsed.len(), args.stream) {
                                 Some(line) => malformed.at_stream_fault(src, line),
                                 None => malformed, // patchcov: coverage tolerate-line reason="unreachable: the prefix parse stopped at value `parsed`, which the splitter either delimits or stopped at, so a read is found; kept so a disagreement falls back to line 0 (#5555)"
                             }
-                            .into()));
-                        }
+                            .into(),
+                        ));
                     }
                 }
                 // Skipped under `--slurp` (#1541) -- see the DSV branch above.
@@ -9748,11 +9703,7 @@ fn read_inputs(
                     trailing_error = Some(TrailingParseError {
                         error,
                         source: u32::try_from(src).unwrap_or(u32::MAX),
-                        line: if slurp_keeps_prefix {
-                            UNKNOWN_LINE
-                        } else {
-                            error_line as u64
-                        },
+                        line: error_line as u64,
                         seq_warning: false,
                         as_parse_error: false,
                     });
@@ -14481,8 +14432,9 @@ fn bare_token_lost_to_fault(
 /// when it meets the end of input (#6004). A number or literal completes on the byte after it, and
 /// here that byte is the opener the end of input leaves unfinished, so the token is a value before
 /// the fault is raised. The read that completed it is the read that reached the end, so the fault
-/// is named `<unknown>`, and a slurp holds the token (`printf '1[' | jq -cs .` prints `[1]` and
-/// then fails). With white space between (`1 [`), or after a string or container (`"a"[`, `[1][`),
+/// is named `<unknown>`. (jq 1.7.1's slurp held the token too, `printf '1[' | jq -cs .` printing
+/// `[1]` before the error; jq 1.8.2 prints the error alone, and so does `succinctly jq` since
+/// #7807.) With white space between (`1 [`), or after a string or container (`"a"[`, `[1][`),
 /// the value was complete in an earlier read and the fault is named after the file as usual.
 /// Oracle-verified against jq 1.7.1.
 fn bare_token_before_final_opener(bytes: &[u8], span: (usize, usize), malformed: usize) -> bool {
@@ -18406,9 +18358,6 @@ struct SlurpedInput {
     /// The last source's own newline count at EOF, the line jq's `(at ...)`
     /// marker names for a value slurped out of the whole stream (#1520).
     eof_line: usize,
-    /// The parse error jq raises after the slurped array when the stream ends in a bare token
-    /// straight before one last opener (#6004): the array holds the token, the error follows it.
-    fault: Option<String>,
 }
 
 /// The bytes of the regular file `path`, read again, or `None` when it cannot be (#6628): a named
@@ -18552,7 +18501,6 @@ fn slurp_documents(
     files: &[PathBuf],
     validate: bool,
     seams: &[Seam],
-    unopened_tail: bool,
 ) -> core::result::Result<SlurpedInput, SlurpFailure> {
     let last = raw_inputs.len().saturating_sub(1);
     // #7576: the join is a second copy of the input; when there is no room for it, the answer is jq's
@@ -18567,7 +18515,6 @@ fn slurp_documents(
     let mut eof_line = 0;
     combined.push(b'[');
     let mut wrote_value = false;
-    let mut fault = None;
     // Where the current file starts in jq's input, which counts lines across files (#5555).
     let mut origin = StreamOrigin::ALONE.file;
     for (idx, raw) in raw_inputs.into_iter().enumerate() {
@@ -18589,19 +18536,12 @@ fn slurp_documents(
                     files, idx, read, origin,
                 )));
             }
-            let message = slurp_fault(files, idx, read, origin);
-            // #6004: a bare token straight before the stream's last byte, an opener, is a value
-            // by the time jq meets the fault: the array keeps it and the error follows.
-            let keeps_prefix = idx == last
-                && !unopened_tail
-                && message.is_some()
-                && spans
-                    .last()
-                    .is_some_and(|&span| bare_token_before_final_opener(&raw, span, offset));
-            if !keeps_prefix {
-                return Err(SlurpFailure::Unsplittable(message));
-            }
-            fault = message;
+            // #7807: a bare token straight before the stream's last byte, an opener (`1[`), is no
+            // exception: jq 1.7.1 put it in the array before the error (#6004), and jq 1.8.2 meets
+            // the fault before it closes the array ([`jq_stream_errors::slurp_sources`]).
+            return Err(SlurpFailure::Unsplittable(slurp_fault(
+                files, idx, read, origin,
+            )));
         }
         if idx != last {
             // The next file starts where jq's line and column counts leave off here.
@@ -18632,7 +18572,6 @@ fn slurp_documents(
         combined,
         last_source: last,
         eof_line,
-        fault,
     })
 }
 
@@ -29511,7 +29450,7 @@ mod tests {
     fn slurp_documents_joins_every_value_in_file_order_2847() {
         let join_with = |files: &[&str], validate: bool| {
             let raw = files.iter().map(|f| f.as_bytes().to_vec()).collect();
-            match slurp_documents(raw, &[], &[], validate, &[], false) {
+            match slurp_documents(raw, &[], &[], validate, &[]) {
                 Ok(s) => Ok((
                     String::from_utf8(s.combined).unwrap(),
                     s.last_source,

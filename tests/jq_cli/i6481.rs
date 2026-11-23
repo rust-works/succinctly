@@ -1,8 +1,9 @@
 //! #6481: a slurped `--stream` or `--seq` input whose stream ends in a fault, with a file that does not
 //! open. jq's reader moves on to that file in the call that consumes the last byte, so the fault is
 //! that call's result and the main loop, which reads no further once a file has failed, never gets
-//! to the array: stdout is empty and the run exits 2. Without a file that failed, the array comes out
-//! first and the fault after it. Every row was captured from jq 1.7.1.
+//! to the array: stdout is empty and the run exits 2. Without a file that failed, jq 1.7.1 printed the
+//! array first and the fault after it, and jq 1.8.2 prints the fault alone, which `succinctly jq`
+//! follows since #7807. Every other row was captured from jq 1.7.1.
 
 use anyhow::Result;
 
@@ -29,7 +30,8 @@ fn a_slurped_stream_ending_in_a_fault_loses_its_array_beside_an_unopened_file_64
         (&["-c", "-s", "--stream", "."][..], &["t1", "gone", "nums"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: parse error: Expected separator between values at line 3, column 0\n", 2),
         (&["-c", "-s", "--stream", "."][..], &["t1", "adir"][..], "", "jq: parse error: Unfinished JSON term at EOF at line 1, column 3\n", 2),
         (&["-c", "-s", "--stream", "."][..], &["nums", "gone"][..], "[[[],1],[[],2],[[],3]]\n", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\n", 2),
-        (&["-c", "-s", "--stream", "."][..], &["t1"][..], "[[[0],1]]\n", "jq: parse error: Unfinished JSON term at EOF at line 1, column 3\n", 5),
+        // jq 1.7.1 printed `[[[0],1]]` first; jq 1.8.2 meets the fault before it closes the array (#7807).
+        (&["-c", "-s", "--stream", "."][..], &["t1"][..], "", "jq: parse error: Unfinished JSON term at EOF at line 1, column 3\n", 5),
         (&["-c", "-s", "--seq", "."][..], &["t1", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 3\n", 2),
         (&["-c", "-s", "--seq", "."][..], &["gone", "t1"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Unfinished abandoned text at EOF at line 1, column 3\n", 2),
         (&["-c", "-s", "--seq", "."][..], &["t4", "gone"][..], "", "jq: error: Could not open file @DIR@/gone.json: No such file or directory\njq: ignoring parse error: Unfinished abandoned text at EOF at line 2, column 3\n", 2),
