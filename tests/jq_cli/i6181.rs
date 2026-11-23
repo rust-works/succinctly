@@ -125,16 +125,16 @@ fn test_an_empty_option_group_keeps_its_own_refusal_6181() -> Result<()> {
     Ok(())
 }
 
-/// An inline `(?x)` makes the scan stand down (it cannot see the mode's ignored blanks), so these
-/// stay as they were. jq refuses all three (`target of repeat operator is not specified`): an
-/// unfixed gap, recorded in `docs/compliance/jq/limitations.md`, so this pins what is.
+/// An inline `(?x)` no longer makes the scan stand down: since #7852 the repeat checks also read
+/// the pattern without the blanks the mode ignores, so these are refused as jq refuses them
+/// (`target of repeat operator is not specified`, jq 1.7.1 and 1.8.2).
 #[test]
-fn test_the_extended_mode_is_left_alone_6181() -> Result<()> {
+fn test_an_inline_extended_mode_is_judged_too_6181() -> Result<()> {
     for pattern in ["(?x)(?i)*a", "(?x) a(?i)+", "(?i)(?x)*a"] {
         let (stdout, stderr, code) = run_jq_full(&["-nc", &filter(pattern)], None)?;
-        assert_eq!(
-            (stdout.trim_end(), code),
-            ("true", 0),
+        assert_eq!((stdout.as_str(), code), ("", 5), "{pattern}: {stderr:?}");
+        assert!(
+            stderr.contains("Regex failure: target of repeat operator is not specified"),
             "{pattern}: {stderr:?}"
         );
     }

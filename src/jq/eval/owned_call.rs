@@ -338,15 +338,27 @@ fn call<S: EvalSemantics>(
             Ok(body) if unrewritten::<S>(&body) => {}
             Ok(_) => return Err(input),
             // A bind that fails is the call's error, which the document route raises the same way.
-            Err(error) => return Ok(Flow::Escaped(Control::Error(error))),
+            Err(error) => return Ok(def_call_failed(error)),
         }
     }
     let body = match bind_def_call(def, args, frames, bound) {
         Ok(body) => body,
-        Err(error) => return Ok(Flow::Escaped(Control::Error(error))), // patchcov: coverage tolerate-line reason="unreachable while the probe above succeeded: binding is a pure function of the node, and the probe left the body in its cache (#7483)"
+        Err(error) => return Ok(def_call_failed(error)), // patchcov: coverage tolerate-line reason="unreachable while the probe above succeeded: binding is a pure function of the node, and the probe left the body in its cache (#7483)"
     };
-    if tail_reachable(def, true) {
-        return Ok(each_def_tail_loop::<Vec<u64>, S>(
+    // #7856: see `eval::each_def_call`, whose error paths are out of line for the same reason.
+    let Some(limit) = def_call_floors() else {
+        return Ok(def_output_refusal(def));
+    };
+    let mut refused = false;
+    let mut checked;
+    let sink: &mut dyn FnMut(OwnedValue) -> Demand = if crate::jq::tail_call::def_may_recurse(def) {
+        checked = |item| checked_def_output(limit, &mut refused, sink, item);
+        &mut checked
+    } else {
+        sink
+    };
+    let flow = if tail_reachable(def, true) {
+        each_def_tail_loop::<Vec<u64>, S>(
             def,
             frames,
             bound,
@@ -354,12 +366,15 @@ fn call<S: EvalSemantics>(
             TailValue::Owned(input),
             optional,
             &mut |item| sink(owned_item::<S>(item)),
-        ));
+        )
+    } else {
+        let _guard = def_call_guard(frames, bound.is_hot());
+        eval_moved_in::<S>(&body, input, optional, true, sink)
+    };
+    if refused {
+        return Ok(def_output_refusal(def));
     }
-    Ok(match enter_def_call(def, frames, bound) {
-        Ok(_guard) => eval_moved_in::<S>(&body, input, optional, true, sink),
-        Err(error) => Flow::Escaped(Control::Error(error)),
-    })
+    Ok(flow)
 }
 
 /// An output of a tail loop that started on an owned value. Every value such a loop hands on is

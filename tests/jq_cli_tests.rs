@@ -230,6 +230,12 @@ use cargo_run_exit::{
 #[path = "common/fifo_feed.rs"]
 mod fifo_feed;
 
+// A child ended on purpose by a fatal signal leaves no core dump, even to a piped `core_pattern`
+// (#7869).
+#[cfg(unix)]
+#[path = "common/no_core_dump.rs"]
+mod no_core_dump;
+
 // The windowed routes over small fixtures: the debug build's window knob (#7376).
 #[path = "common/small_window.rs"]
 mod small_window;

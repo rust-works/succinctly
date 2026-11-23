@@ -21178,18 +21178,58 @@ fn each_def_call_generic<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    match bind_def_call(def, args, frames, bound) {
+    // #7856: see `eval::each_def_call`, whose frame keeps the wrapper's room the same way.
+    let body = match bind_def_call(def, args, frames, bound) {
+        Ok(body) => body,
+        Err(e) => return crate::jq::eval::def_call_failed(e),
+    };
+    let Some(limit) = crate::jq::eval::def_call_floors() else {
+        return crate::jq::eval::def_output_refusal(def);
+    };
+    let mut checked = CheckedDefOutput {
+        sink,
+        limit,
+        refused: false,
+    };
+    let sink: &mut dyn Sink<V> = if crate::jq::tail_call::def_may_recurse(def) {
+        &mut checked
+    } else {
+        &mut *checked.sink
+    };
+    let flow = if tail_reachable(def, S::TAG == EvalTag::Jq) {
         // #5379: see `eval::each_def_tail_loop`.
-        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => {
-            each_def_tail_loop_generic::<S, V>(
-                def, frames, bound, body, value, optional, cursor, sink,
-            )
+        each_def_tail_loop_generic::<S, V>(def, frames, bound, body, value, optional, cursor, sink)
+    } else {
+        let _guard = crate::jq::eval::def_call_guard(frames, bound.is_hot());
+        eval_each_generic::<S, V>(&body, value, optional, cursor, sink)
+    };
+    if checked.refused {
+        return crate::jq::eval::def_output_refusal(def);
+    }
+    flow
+}
+
+/// A call's sink that checks the stack before each output of the call reaches it (#7856):
+/// `eval::output_past`, for a call to a def that may recurse. Transparent otherwise,
+/// its budget included.
+struct CheckedDefOutput<'s, V: DocumentValue> {
+    sink: &'s mut dyn Sink<V>,
+    /// `eval::def_call_floors`'s bound for the call.
+    limit: usize,
+    refused: bool,
+}
+
+impl<V: DocumentValue> Sink<V> for CheckedDefOutput<'_, V> {
+    fn push(&mut self, item: GenericItem<V>) -> Demand {
+        if crate::jq::eval::output_past(self.limit) {
+            self.refused = true;
+            return Demand::Stop;
         }
-        Ok(body) => match enter_def_call(def, frames, bound) {
-            Ok(_guard) => eval_each_generic::<S, V>(&body, value, optional, cursor, sink),
-            Err(e) => Flow::Escaped(Control::Error(e)),
-        },
-        Err(e) => Flow::Escaped(Control::Error(e)),
+        self.sink.push(item)
+    }
+
+    fn budget(&self) -> Budget {
+        self.sink.budget()
     }
 }
 
