@@ -59498,6 +59498,14 @@ pub(crate) enum PathPrefix {
     },
 }
 
+/// What [`PathPrefix::graft`] has built onto one prefix: each source chain
+/// node it rebuilt, held alive, and the node it became (#7789).
+#[derive(Default)]
+struct PathGraft {
+    prefix: Option<Rc<PathPrefix>>,
+    memo: BTreeMap<usize, (Rc<PathPrefix>, Rc<PathPrefix>)>,
+}
+
 impl PathPrefix {
     /// The innermost component, or `None` at the root.
     fn last(&self) -> Option<&Expr> {
@@ -59571,6 +59579,54 @@ impl PathPrefix {
     /// assembled elsewhere as a `Vec<Expr>` (a static fast path, or a test).
     fn from_components(components: impl IntoIterator<Item = Expr>) -> Rc<Self> {
         Self::extend_many(&Self::root(), components)
+    }
+
+    /// `prefix` extended by every component of `chain`, as
+    /// `extend_many(prefix, chain.to_vec())` builds it, but sharing what an
+    /// earlier chain given to the same `graft` already built (#7789).
+    ///
+    /// A descent's results share their chains with one another (every node a
+    /// `..` reaches extends its parent's), and rebuilding each one from its
+    /// components gave every result a private copy of its whole chain: a path
+    /// list linear in the paths' total length instead of in the nodes they
+    /// name, which made `del(.. | f)` hold several times the memory jq does. A
+    /// chain grafted onto the root is the chain itself. Elsewhere `graft`
+    /// remembers each source node it rebuilt, keeping the source alive so its
+    /// address cannot be handed to another node while it is a key. That memo
+    /// is pure cost where no two results share a node, which is why
+    /// `resolve_seq_stage` grafts only a descent stage's results.
+    fn graft(prefix: &Rc<Self>, chain: &Rc<Self>, graft: &mut PathGraft) -> Rc<Self> {
+        if prefix.depth() == 0 {
+            return Rc::clone(chain);
+        }
+        if !graft.prefix.as_ref().is_some_and(|p| Rc::ptr_eq(p, prefix)) {
+            graft.prefix = Some(Rc::clone(prefix));
+            graft.memo.clear();
+        }
+        let mut pending: Vec<(&Rc<Self>, &Expr)> = Vec::new();
+        let mut cur = chain;
+        let mut base = loop {
+            if let Some((_, grafted)) = graft.memo.get(&(Rc::as_ptr(cur) as usize)) {
+                break Rc::clone(grafted);
+            }
+            match &**cur {
+                Self::Root => break Rc::clone(prefix),
+                Self::Node {
+                    parent, component, ..
+                } => {
+                    pending.push((cur, component));
+                    cur = parent;
+                }
+            }
+        };
+        while let Some((node, component)) = pending.pop() {
+            base = Self::extend(&base, component.clone());
+            graft.memo.insert(
+                Rc::as_ptr(node) as usize,
+                (Rc::clone(node), Rc::clone(&base)),
+            );
+        }
+        base
     }
 
     /// The one O(depth) operation: flatten the chain into an owned
@@ -89506,6 +89562,14 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             peel_register_through_calls(element),
             Expr::Alternative(..) | Expr::If { .. }
         );
+    // #7789: in jq mode a result placed onto the root is its own chain, which costs nothing.
+    // Below the root only a descent's results extend one another's chains, so only a descent stage
+    // grafts there, and the memo is built on its first graft. Every other stage, and every stage
+    // in yq mode, rebuilds each result's path as it always did. Whether the stage is a descent is
+    // asked on its first result below the root that navigated, so a stage that only filters asks
+    // nothing.
+    let mut descent_stage: Option<bool> = None;
+    let mut graft: Option<PathGraft> = None;
     let mut place_step = |step: PathBranch<'a>| -> Demand {
         // #3293: only a `?//` retry re-invokes this after a stop.
         downstream.begin();
@@ -89598,6 +89662,18 @@ fn resolve_seq_stage<'a, S: EvalSemantics>(
             reestablishes_register::<S>(&facts, register_entering, &stage_frame, &resulting);
         let path = if reestablished {
             Rc::clone(&prefix)
+        } else if S::TAG == EvalTag::Jq && prefix.depth() == 0 {
+            // Placed onto the root, a result's chain is its path already (#7789).
+            components
+        } else if S::TAG == EvalTag::Jq
+            && facts.navigated
+            && *descent_stage.get_or_insert_with(|| is_descent_stage(element))
+        {
+            PathPrefix::graft(
+                &prefix,
+                &components,
+                graft.get_or_insert_with(PathGraft::default),
+            )
         } else {
             PathPrefix::extend_many(&prefix, components.to_vec())
         };
@@ -90901,6 +90977,23 @@ fn static_path_key(path: &Expr) -> Option<Vec<u8>> {
         }
     }
     Some(key)
+}
+
+/// Whether a pipe stage is a recursion (`..`, any `recurse`), bare or under a wrapper that only
+/// bounds or guards it (`first(..)`, `limit(n; ..)`, `..?`): the one stage whose results extend
+/// one another's chains, so the one [`resolve_seq_stage`] grafts (#7789). Asked once per stage
+/// run, so it stays a shape match rather than a walk.
+fn is_descent_stage(element: &Expr) -> bool {
+    matches!(
+        peel_register_transparent(element),
+        Expr::RecursiveDescent
+            | Expr::Builtin(
+                Builtin::Recurse
+                    | Builtin::RecurseDown
+                    | Builtin::RecurseF(_)
+                    | Builtin::RecurseCond(..)
+            )
+    )
 }
 
 /// Whether `expr` holds a recursive descent that yq's alias rule applies to: `..`, bare
@@ -103296,6 +103389,33 @@ pub(crate) fn builtin_path_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantic
     owned: &OwnedValue,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #7789: jq mode streams through `each_path_on_owned`, the `path(f)` every
+    // other jq route takes, and collects here: holding the resolved paths, the
+    // walked ones and the path values all at once made `delpaths([path(f)])`
+    // over many paths hold several times what `[path(f)] as $p | delpaths($p)`
+    // does. Same paths, same order and the same error precedence (a walk error
+    // beats a resolution error, both after the paths already produced).
+    if S::TAG == EvalTag::Jq {
+        let mut paths = Vec::new();
+        return match each_path_on_owned::<S>(expr, owned, optional, &mut |path| {
+            paths.push(path);
+            Demand::Continue
+        }) {
+            Flow::Escaped(control) => partial(paths, control),
+            Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(paths),
+        };
+    }
+    builtin_path_collected::<W, S>(expr, owned, optional)
+}
+
+/// [`builtin_path_on_owned`] as it collects every resolved path before walking
+/// them: yq mode's route, and the reference the jq-mode route is tested against
+/// (#7789).
+fn builtin_path_collected<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    owned: &OwnedValue,
+    optional: bool,
+) -> QueryResult<'a, W> {
     // Computed keys must become static components before the tracker runs — it
     // ignores anything it does not recognise, so an unresolved one would
     // silently yield no paths at all.
@@ -105868,7 +105988,7 @@ fn delete_at_path_through_absent(
 
 /// One array-level step of a `del` path: a bare index, or a slice.
 ///
-/// The two share one [`DeleteTrieNode`] `indices` map because they name
+/// The two share one [`DeleteTrieEdges`] `indices` map because they name
 /// elements of the same array and have to reach [`delete_keys`] in one batch —
 /// see [`DeleteTrieBuilder::child_of`] on why splitting them would compound
 /// overlapping ranges instead of unioning them.
@@ -105942,13 +106062,122 @@ struct DeleteTrieNode {
     /// key jq wouldn't reach (`[[1,2]] | del(.[0], .[0][-5])` raises
     /// "index [-5] out of range" in yq, confirmed live).
     terminal: bool,
+    /// The edges to this node's children: `None` for a leaf, which is most nodes of a large
+    /// match set (every resolved path ends at one), so a leaf is a few words rather than the
+    /// two maps and three lists a node with children carries (#7789).
+    edges: Option<Box<DeleteTrieEdges>>,
+    /// Where this node hangs off its parent, so gaining a first child can
+    /// append this node to the right one of the parent's two `*_groups`
+    /// lists. `DELETE_TRIE_ROOT` has no parent and these are meaningless.
+    parent: u32,
+    slot: usize,
+    keyed_by_field: bool,
+    /// Whether any resolved path reaching this node carried a `?` at this
+    /// step — the pre-#1690 `delete_expr_array_paths`'s `paths.iter().any(|p|
+    /// p[start].optional)`, precomputed. Only read by a `debug_assert!`;
+    /// see there for why the claim it guards is narrower than it looks
+    /// (#1331).
+    optional: bool,
+}
+
+/// A [`DeleteTrieEdges`] map from a step to a child node, in insertion order:
+/// a short list while a node has few children, as nearly every node of a large
+/// match set has one or two, and an [`IndexMap`] past [`FEW_EDGES`], so a wide
+/// node (an array's elements) is still looked up in constant time (#7789). The
+/// subset of `IndexMap`'s interface the trie uses, with its meaning.
+enum EdgeMap<K> {
+    Few(Vec<(K, u32)>),
+    Many(IndexMap<K, u32>),
+}
+
+/// How many edges an [`EdgeMap`] keeps in a list before it builds an `IndexMap`.
+const FEW_EDGES: usize = 8;
+
+impl<K: core::hash::Hash + Eq> EdgeMap<K> {
+    fn new() -> Self {
+        Self::Few(Vec::new())
+    }
+
+    fn get<Q>(&self, key: &Q) -> Option<&u32>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: core::hash::Hash + Eq + ?Sized,
+    {
+        match self {
+            Self::Few(edges) => edges
+                .iter()
+                .find(|(k, _)| k.borrow() == key)
+                .map(|(_, id)| id),
+            Self::Many(edges) => edges.get(key),
+        }
+    }
+
+    /// Adds an edge for a key the map does not hold yet.
+    fn insert(&mut self, key: K, id: u32) {
+        match self {
+            Self::Few(edges) if edges.len() < FEW_EDGES => {
+                // Grow one, two, four, eight: most nodes never hold a second edge.
+                if edges.len() == edges.capacity() {
+                    // Fallible, as everywhere in this file: on failure `push` grows as usual.
+                    let _ = edges.try_reserve_exact(edges.len().max(1));
+                }
+                edges.push((key, id));
+            }
+            Self::Few(edges) => {
+                let mut many: IndexMap<K, u32> = core::mem::take(edges).into_iter().collect();
+                many.insert(key, id);
+                *self = Self::Many(many);
+            }
+            Self::Many(edges) => {
+                edges.insert(key, id);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Few(edges) => edges.len(),
+            Self::Many(edges) => edges.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get_index(&self, slot: usize) -> Option<(&K, &u32)> {
+        match self {
+            Self::Few(edges) => edges.get(slot).map(|(k, id)| (k, id)),
+            Self::Many(edges) => edges.get_index(slot),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &u32)> + '_ {
+        let (few, many) = match self {
+            Self::Few(edges) => (Some(edges.iter().map(|(k, id)| (k, id))), None),
+            Self::Many(edges) => (None, Some(edges.iter())),
+        };
+        few.into_iter().flatten().chain(many.into_iter().flatten())
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &K> + '_ {
+        self.iter().map(|(k, _)| k)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &u32> + '_ {
+        self.iter().map(|(_, id)| id)
+    }
+}
+
+/// A [`DeleteTrieNode`]'s edges to its children, allocated when it gains its first (#7789).
+struct DeleteTrieEdges {
     /// Child edges keyed by object field name, in first-occurrence order
     /// across the resolved paths — the pre-#1690 `delete_expr_object_paths`'s `terminal`
     /// `IndexSet` and `groups` `IndexMap` merged into one map, with
     /// `terminal` above and `field_groups` below recovering each half.
-    fields: IndexMap<String, u32>,
+    fields: EdgeMap<String>,
     /// Child edges keyed by array index/slice, same ordering contract.
-    indices: IndexMap<ArrayStep, u32>,
+    indices: EdgeMap<ArrayStep>,
     /// Positions within `fields` of the children that have children of their
     /// own, in the order they first acquired one.
     ///
@@ -105968,29 +106197,13 @@ struct DeleteTrieNode {
     /// (`.["5"]`) is a `fields` edge; yq's batch `del()` of one array needs all three (see
     /// [`yq_delete_index_sequence`]). Empty in jq mode.
     terminal_order: Vec<u32>,
-    /// Where this node hangs off its parent, so gaining a first child can
-    /// append this node to the right one of the parent's two `*_groups`
-    /// lists. `DELETE_TRIE_ROOT` has no parent and these are meaningless.
-    parent: u32,
-    slot: usize,
-    keyed_by_field: bool,
-    /// Whether any resolved path reaching this node carried a `?` at this
-    /// step — the pre-#1690 `delete_expr_array_paths`'s `paths.iter().any(|p|
-    /// p[start].optional)`, precomputed. Only read by a `debug_assert!`;
-    /// see there for why the claim it guards is narrower than it looks
-    /// (#1331).
-    optional: bool,
 }
 
 impl DeleteTrieNode {
     fn new(parent: u32, slot: usize, keyed_by_field: bool, optional: bool) -> Self {
         Self {
             terminal: false,
-            fields: IndexMap::new(),
-            indices: IndexMap::new(),
-            field_groups: Vec::new(),
-            index_groups: Vec::new(),
-            terminal_order: Vec::new(),
+            edges: None,
             parent,
             slot,
             keyed_by_field,
@@ -105999,7 +106212,47 @@ impl DeleteTrieNode {
     }
 
     fn is_leaf(&self) -> bool {
-        self.fields.is_empty() && self.indices.is_empty()
+        self.edges.as_deref().map_or(true, |edges| {
+            edges.fields.is_empty() && edges.indices.is_empty()
+        })
+    }
+
+    /// The edges of a node that has children: every node the apply walks below
+    /// [`delete_trie_apply`]'s leaf check.
+    fn edges(&self) -> &DeleteTrieEdges {
+        self.edges
+            .as_deref()
+            .expect("a trie node with children has its edges")
+    }
+
+    /// This node's edges, allocated on first use.
+    fn edges_mut(&mut self) -> &mut DeleteTrieEdges {
+        self.edges.get_or_insert_with(|| {
+            Box::new(DeleteTrieEdges {
+                fields: EdgeMap::new(),
+                indices: EdgeMap::new(),
+                field_groups: Vec::new(),
+                index_groups: Vec::new(),
+                terminal_order: Vec::new(),
+            })
+        })
+    }
+
+    fn has_fields(&self) -> bool {
+        self.edges
+            .as_deref()
+            .is_some_and(|edges| !edges.fields.is_empty())
+    }
+
+    fn has_indices(&self) -> bool {
+        self.edges
+            .as_deref()
+            .is_some_and(|edges| !edges.indices.is_empty())
+    }
+
+    /// The field edge at `slot`, if this node has one there.
+    fn field_edge(&self, slot: usize) -> Option<(&String, &u32)> {
+        self.edges.as_deref()?.fields.get_index(slot)
     }
 }
 
@@ -106079,7 +106332,7 @@ impl DeleteTrie {
     /// path in insertion order, when there are at least two and every one is a plain index or a
     /// string spelling one. `None` when a slice or any other name is among them, or fewer than two
     /// paths end here, which keep [`delete_keys`]'s batch.
-    fn yq_terminal_index_sequence(&self, node: &DeleteTrieNode) -> Option<Vec<i64>> {
+    fn yq_terminal_index_sequence(&self, node: &DeleteTrieEdges) -> Option<Vec<i64>> {
         if node.terminal_order.len() < 2 {
             return None;
         }
@@ -106116,11 +106369,13 @@ struct DeleteTrieBuilder {
     trie: DeleteTrie,
     /// `Rc<PathPrefix>` address -> trie node id.
     ///
-    /// Pointer identity is sound here *only* because every chain stays alive
-    /// for the whole build: the caller holds the `Vec<PathBranch>`, whose
-    /// leaves keep their ancestors alive through `PathPrefix::Node.parent`,
-    /// and nothing is dropped before the builder is finished — so no address
-    /// recorded here can be freed and handed back out to a different node.
+    /// Pointer identity is sound here *only* because no address recorded here
+    /// can be handed back out to a different node that is still to be looked
+    /// up: every chain is built before the trie is, building allocates no
+    /// `PathPrefix`, and every chain still to be inserted is alive, so none of
+    /// its nodes can sit at the address of one released earlier. The caller
+    /// may therefore release each chain once inserted (jq mode does, #7789),
+    /// but must not build chains while the trie grows.
     /// The map is only ever an accelerator: correctness comes from the
     /// `IndexMap` keying in [`Self::child_of`], which merges two chains that
     /// spell the same path without sharing an allocation just as happily.
@@ -106162,16 +106417,19 @@ impl DeleteTrieBuilder {
     /// both step kinds in the same bucket on purpose -- see that arm's own
     /// comment for why.
     fn array_child(&mut self, parent: u32, step: ArrayStep, optional: bool) -> u32 {
-        let map = &self.trie.nodes[parent as usize].indices;
-        match map.get(&step) {
+        let edges = self.trie.nodes[parent as usize].edges.as_deref();
+        match edges.and_then(|edges| edges.indices.get(&step)) {
             Some(&id) => {
                 self.trie.nodes[id as usize].optional |= optional;
                 id
             }
             None => {
-                let slot = map.len();
+                let slot = edges.map_or(0, |edges| edges.indices.len());
                 let id = self.push_node(parent, slot, false, optional);
-                self.trie.nodes[parent as usize].indices.insert(step, id);
+                self.trie.nodes[parent as usize]
+                    .edges_mut()
+                    .indices
+                    .insert(step, id);
                 id
             }
         }
@@ -106194,16 +106452,17 @@ impl DeleteTrieBuilder {
         let parent_was_leaf = self.trie.node(parent).is_leaf();
         let id = match component {
             Expr::Field(name) => {
-                let map = &self.trie.nodes[parent as usize].fields;
-                match map.get(name.as_str()) {
+                let edges = self.trie.nodes[parent as usize].edges.as_deref();
+                match edges.and_then(|edges| edges.fields.get(name.as_str())) {
                     Some(&id) => {
                         self.trie.nodes[id as usize].optional |= optional;
                         id
                     }
                     None => {
-                        let slot = map.len();
+                        let slot = edges.map_or(0, |edges| edges.fields.len());
                         let id = self.push_node(parent, slot, true, optional);
                         self.trie.nodes[parent as usize]
+                            .edges_mut()
                             .fields
                             .insert(name.clone(), id);
                         id
@@ -106275,9 +106534,9 @@ impl DeleteTrieBuilder {
             let (grandparent, slot, by_field) = (node.parent, node.slot, node.keyed_by_field);
             let gp = &mut self.trie.nodes[grandparent as usize];
             if by_field {
-                gp.field_groups.push(slot);
+                gp.edges_mut().field_groups.push(slot);
             } else {
-                gp.index_groups.push(slot);
+                gp.edges_mut().index_groups.push(slot);
             }
         }
         Ok(id)
@@ -106433,7 +106692,7 @@ impl DeleteTrieBuilder {
 
     /// Record that a resolved path ends at node `id`.
     ///
-    /// In yq mode an array edge also joins its parent's [`DeleteTrieNode::terminal_order`], which
+    /// In yq mode an array edge also joins its parent's [`DeleteTrieEdges::terminal_order`], which
     /// is the one place a repeated index and the order of the `del()` batch survive the interning
     /// (#4749).
     fn mark_terminal(&mut self, id: u32) {
@@ -106445,13 +106704,15 @@ impl DeleteTrieBuilder {
             // name stays out of the list, which keeps an object's many keys out of it.
             if by_field
                 && !self.trie.nodes[parent as usize]
-                    .fields
-                    .get_index(slot)
+                    .field_edge(slot)
                     .is_some_and(|(name, _)| yq_field_name_as_index::<YqSemantics>(name).is_some())
             {
                 return;
             }
-            self.trie.nodes[parent as usize].terminal_order.push(id);
+            self.trie.nodes[parent as usize]
+                .edges_mut()
+                .terminal_order
+                .push(id);
         }
     }
 
@@ -106591,12 +106852,12 @@ fn delete_trie_apply(
     // same batch as its index edges, so `del(.["0"], .[1])` resolves both against the array as it
     // entered.
     let mut named_terminals = Vec::new();
-    if yq_mode && !node.fields.is_empty() && matches!(value, OwnedValue::Array(_)) {
+    if yq_mode && node.has_fields() && matches!(value, OwnedValue::Array(_)) {
         (value, named_terminals) = delete_trie_array_by_names(value, trie, id)?;
-    } else if !node.fields.is_empty() {
+    } else if node.has_fields() {
         value = delete_trie_object(value, trie, id, yq_mode)?;
     }
-    if !node.indices.is_empty() || !named_terminals.is_empty() {
+    if node.has_indices() || !named_terminals.is_empty() {
         value = delete_trie_array(value, trie, id, yq_mode, &named_terminals)?;
     }
     Ok(value)
@@ -106632,7 +106893,7 @@ fn delete_trie_object(
     id: u32,
     yq_mode: bool,
 ) -> Result<OwnedValue, EvalError> {
-    let node = trie.node(id);
+    let node = trie.node(id).edges();
     // `null` tolerates any field key unconditionally — `null | del(.a)` is
     // `null` (#476) — but the exemption is per *step*, so the tails are still
     // walked (#527).
@@ -106716,7 +106977,7 @@ fn delete_trie_array_by_names(
     trie: &DeleteTrie,
     id: u32,
 ) -> Result<(OwnedValue, Vec<OwnedValue>), EvalError> {
-    let node = trie.node(id);
+    let node = trie.node(id).edges();
     for &slot in &node.field_groups {
         let (name, &child) = node
             .fields
@@ -106786,7 +107047,7 @@ fn delete_trie_array(
     // #4404: the terminal elements `Field` edges named by an integer string add to this node's own.
     named_terminals: &[OwnedValue],
 ) -> Result<OwnedValue, EvalError> {
-    let node = trie.node(id);
+    let node = trie.node(id).edges();
     // #2323: real yq auto-vivifies a `null` root into `[]` ahead of an
     // array-level step here too, the comma-grouped sibling of
     // `delete_path_steps`'s own `Expr::Index`/`Expr::Iterate` arms --
@@ -108348,7 +108609,35 @@ fn del_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // (`del(.. | select(cond))` where `cond` rejects `.`) cost O(d^2).
     // Measured at a fixed depth of 240, the per-branch marginal cost drops
     // from ~37.5us to ~5.9us. See `DeleteTrie`.
+    // #7789: a jq-mode `del` of many paths builds its trie from each branch's path chain alone, so
+    // the branches themselves (each with its value and register) are released before the trie
+    // grows rather than after it. yq mode and an alias table read more of each branch below.
+    let (resolved, mut chains) = match resolved {
+        DelPaths::Branches(branches)
+            if branches.len() > 1 && S::TAG != EvalTag::Yq && !alias_identity::active() =>
+        {
+            let mut chains = vec_with_capacity(branches.len());
+            chains.extend(branches.into_iter().map(|branch| branch.path));
+            (DelPaths::Branches(Vec::new()), Some(chains))
+        }
+        other => (other, None),
+    };
     let trie = match &resolved {
+        _ if chains.is_some() => {
+            let mut builder = DeleteTrieBuilder::new(false);
+            // Each chain is released once inserted, so the trie grows into the memory the
+            // chains held (#7789); see `DeleteTrieBuilder::memo` for why its keys stay sound.
+            let inserted = chains
+                .take()
+                .into_iter()
+                .flatten()
+                .try_for_each(|chain| builder.insert_branch(&chain));
+            match inserted {
+                Err(_) if optional => return QueryResult::None,
+                Err(e) => return QueryResult::Error(e),
+                Ok(()) => Some(builder.finish()),
+            }
+        }
         DelPaths::Branches(branches) if branches.len() > 1 => {
             // yq mode's two extra `del()` slice rules both need a flat
             // `Expr`, so the branches that can actually use one — and only
@@ -108423,6 +108712,7 @@ fn del_on_owned<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // Releases the borrow the branches hold on `result`, so the apply
         // walk below can take it by value.
         drop(resolved);
+        drop(chains);
         return match delete_trie_apply(result, &trie, DELETE_TRIE_ROOT, S::TAG == EvalTag::Yq) {
             Ok(mut result) => {
                 if let Some(pre) = &del_pre {
@@ -174387,7 +174677,7 @@ mod tests {
         // The prefix that *was* supported is still interned, so the failure
         // is a clean abort partway through one branch rather than a poisoned
         // builder.
-        assert_eq!(builder.trie.node(DELETE_TRIE_ROOT).fields.len(), 1);
+        assert_eq!(builder.trie.node(DELETE_TRIE_ROOT).edges().fields.len(), 1);
     }
 
     #[test]
@@ -191127,5 +191417,167 @@ mod array_window_routes_6659 {
             ),
             (vec!["10".into()], None)
         );
+    }
+}
+
+/// #7789: the memory a `del` or `delpaths` of many paths holds.
+#[cfg(all(test, feature = "std"))]
+mod del_path_memory_tests_7789 {
+    use super::*;
+
+    fn json(s: &str) -> OwnedValue {
+        parse_complete_json(s, false).unwrap()
+    }
+
+    /// `count` chains of `depth` nested objects, each level `{"n":0,"a":...}`.
+    fn nested_chains(count: usize, depth: usize) -> OwnedValue {
+        let chain = format!(
+            "{}null{}",
+            "{\"n\":0,\"a\":".repeat(depth),
+            "}".repeat(depth)
+        );
+        json(&format!("[{}]", vec![chain; count].join(",")))
+    }
+
+    /// The distinct chain nodes the branches' paths are made of.
+    fn distinct_nodes(branches: &[PathBranch<'_>]) -> usize {
+        let mut seen = BTreeSet::new();
+        for branch in branches {
+            let mut cur = &branch.path;
+            while seen.insert(Rc::as_ptr(cur) as usize) {
+                match &**cur {
+                    PathPrefix::Root => break,
+                    PathPrefix::Node { parent, .. } => cur = parent,
+                }
+            }
+        }
+        seen.len()
+    }
+
+    /// Each result of a descent shares the chain of the node it extends, whether the stage runs
+    /// at the root or below a step, so the paths take memory linear in the nodes they name rather
+    /// than in their total length.
+    #[test]
+    fn a_descent_stages_results_share_their_chains_7789() {
+        let input = nested_chains(20, 60);
+        for (filter, paths) in [(".. | numbers", 20 * 60), (".[] | .. | .n?", 20 * 61)] {
+            let expr = crate::jq::parse(filter).unwrap();
+            let Ok(branches) =
+                resolve_terminal::<JqSemantics>(&expr, &input, false, Untracked::Refuse)
+            else {
+                panic!("{filter} resolves");
+            };
+            assert_eq!(branches.len(), paths, "{filter}");
+            let total: usize = branches.iter().map(|b| b.path.depth()).sum();
+            let nodes = distinct_nodes(&branches);
+            // At most one node per place the paths name (the root, 20 elements, 121 steps down
+            // each chain); a copy of each path's chain would be about `total` nodes.
+            assert!(nodes <= 21 + 20 * 121, "{filter}: {nodes} chain nodes");
+            assert!(
+                total > 10 * nodes,
+                "{filter}: {total} steps over {nodes} nodes"
+            );
+        }
+    }
+
+    /// Only a recursion grafts its results: `..` and every `recurse`, bare or bounded, and no
+    /// stage whose results cannot share a chain, which keeps the graft memo off ordinary
+    /// `del(.users[] | select(f))`-shaped writes.
+    #[test]
+    fn only_a_recursion_is_a_descent_stage_7789() {
+        for (filter, descent) in [
+            ("..", true),
+            ("..?", true),
+            ("recurse", true),
+            ("recurse(.a?)", true),
+            ("recurse(.a; . != null)", true),
+            ("first(..)", true),
+            ("limit(2; ..)", true),
+            ("try ..", true),
+            (".[]", false),
+            (".a", false),
+            ("select(.score < 100)", false),
+            (".a[]", false),
+            ("(.a, .b)", false),
+            ("paths", false),
+        ] {
+            let expr = crate::jq::parse(filter).unwrap();
+            assert_eq!(is_descent_stage(&expr), descent, "{filter}");
+        }
+    }
+
+    /// An edge map keeps insertion order and answers lookups the same on both sides of the point
+    /// where it builds its index.
+    #[test]
+    fn an_edge_map_keeps_order_past_its_list_7789() {
+        let mut edges: EdgeMap<String> = EdgeMap::new();
+        for i in 0..20u32 {
+            edges.insert(format!("k{}", 19 - i), i);
+            assert_eq!(edges.len(), i as usize + 1);
+            for j in 0..=i {
+                assert_eq!(edges.get(format!("k{}", 19 - j).as_str()), Some(&j));
+                let (key, id) = edges.get_index(j as usize).unwrap();
+                assert_eq!((key.as_str(), *id), (format!("k{}", 19 - j).as_str(), j));
+            }
+            assert_eq!(edges.get("absent"), None);
+            assert_eq!(
+                edges.keys().cloned().collect::<Vec<_>>(),
+                (0..=i).map(|j| format!("k{}", 19 - j)).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                edges.values().copied().collect::<Vec<_>>(),
+                (0..=i).collect::<Vec<_>>()
+            );
+        }
+        assert!(matches!(edges, EdgeMap::Many(_)));
+    }
+
+    /// jq mode's `path(f)` for a builtin argument streams through `each_path_on_owned` and
+    /// collects; it answers as the route that resolves every path before walking them, outputs,
+    /// order and errors alike.
+    #[test]
+    fn a_streamed_path_list_answers_as_the_collected_one_7789() {
+        let docs = [
+            r#"[{"id":1,"pad":"p","n":{"a":[1,2,{"b":"x","c":null,"pad":3}]}},{"id":2,"n":{"pad":[4]}},"s",null,[{"pad":null}]]"#,
+            r#"{"a":{"b":[1,{"c":2}]},"d":"s","e":null}"#,
+            "null",
+            "[]",
+        ];
+        let filters = [
+            ".. | .pad?",
+            "..",
+            ".. | strings",
+            ".. | select(. == null)",
+            ".[]?",
+            ".a, .d[0]",
+            ".a.b[1].c, error(\"boom\")",
+            ".[0].pad, .[2][0]",
+            "getpath([\"a\",\"b\"]) | .[]",
+            ".a?.b?[]?",
+            "first(.. | numbers)",
+            "limit(2; ..)",
+            ".[1:]",
+            "recurse(.a?; . != null)",
+        ];
+        for doc in docs {
+            let input = json(doc);
+            for filter in filters {
+                let expr = crate::jq::parse(filter).unwrap();
+                for optional in [false, true] {
+                    let streamed = format!(
+                        "{:?}",
+                        builtin_path_on_owned::<Vec<u64>, JqSemantics>(&expr, &input, optional)
+                    );
+                    let collected = format!(
+                        "{:?}",
+                        builtin_path_collected::<Vec<u64>, JqSemantics>(&expr, &input, optional)
+                    );
+                    assert_eq!(
+                        streamed, collected,
+                        "{doc} | path({filter}), optional {optional}"
+                    );
+                }
+            }
+        }
     }
 }
