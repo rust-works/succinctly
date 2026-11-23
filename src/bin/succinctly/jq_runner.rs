@@ -4034,6 +4034,26 @@ fn trim_ascii_ws(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
+/// What `-e` keeps of an output a route has just written: whether it was truthy (#3009), which
+/// is all the exit status reads of it (`jq_exit_code`, [`FinishedInputs`]).
+///
+/// Every route that writes its outputs through [`route_write_error`] records them here, once the
+/// write has succeeded, so `-e` only observes the outputs: it materializes nothing, reports nothing
+/// and cannot stop or continue a document differently from the run without it, as in jq, where
+/// `-e` changes the exit status alone (#7757). The lazy route's `-e` used to materialize each result
+/// before writing it, and on a fault report it and go on with the document, which printed the
+/// outputs after the fault (`[2,]` under `.,1`) and raised on a string the run without `-e`
+/// forwards (#5308). `truthy` is asked only under `-e`.
+fn observe_exit_status(
+    exit_status: bool,
+    last_output: &mut Option<OwnedValue>,
+    truthy: impl FnOnce() -> bool,
+) {
+    if exit_status {
+        *last_output = Some(OwnedValue::Bool(truthy()));
+    }
+}
+
 /// Determine the `-e`/`--exit-status` value for a raw JSON token emitted on the
 /// identity fast path. Only the bare `null` and `false` literals are falsy; a
 /// quoted `"false"`/`"null"` string or any number stays truthy.
@@ -5770,15 +5790,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         &output_config,
                         &mut |sink, result| {
                             had_output = true;
-                            if args.exit_status {
-                                last_output = Some(result.clone());
-                            }
                             let stop = route_write_error(
                                 sink,
                                 &mut out,
                                 || at.resolve(),
                                 |o| write_output_owned_value(o, &result, &output_config),
                             )?;
+                            if !stop {
+                                observe_exit_status(args.exit_status, &mut last_output, || {
+                                    result.is_truthy()
+                                });
+                            }
                             Ok(!stop)
                         },
                     )?;
@@ -6366,19 +6388,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         &output_config,
                         &mut |sink, result| {
                             had_output = true;
-                            // Its truthiness, as the lazy route records an owned result's.
-                            if args.exit_status {
-                                last_output = Some(OwnedValue::Bool(!matches!(
-                                    result,
-                                    OwnedValue::Null | OwnedValue::Bool(false)
-                                )));
-                            }
                             let stop = route_write_error(
                                 sink,
                                 &mut out,
                                 || at.resolve(),
                                 |o| write_output_owned_value(o, &result, &output_config),
                             )?;
+                            if !stop {
+                                observe_exit_status(args.exit_status, &mut last_output, || {
+                                    result.is_truthy()
+                                });
+                            }
                             Ok(!stop)
                         },
                     )?;
@@ -6553,47 +6573,6 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     let mut on_value =
                         |sink: &mut ErrorSink, result: OutputItem<'_>| -> Result<bool> {
                             had_output = true;
-                            // For exit_status tracking, we need to check the last value
-                            if args.exit_status {
-                                match &result {
-                                    // `-e` is the flag that forces materialization at
-                                    // all, so it is where a decode failure first
-                                    // becomes observable here (#1247). Report and skip
-                                    // the value rather than letting an undecodable
-                                    // string count as a truthiness answer; `sink`
-                                    // drives the exit code. `try_materialize`, not
-                                    // `materialize` (#2850): this call used to leak
-                                    // Rust's raw panic backtrace to stderr past
-                                    // `MAX_NESTING_DEPTH`/`MAX_VALUE_TREE_DEPTH`
-                                    // levels of nesting, ahead of the clean,
-                                    // correctly exit-5'd diagnostic this `match`
-                                    // already produces below -- a CLI-output
-                                    // boundary has no business panicking for input
-                                    // depth alone.
-                                    OutputItem::Lazy(v) => match v.try_materialize() {
-                                        Ok(owned) => last_output = Some(owned),
-                                        Err(e) => {
-                                            sink.report(DiagStyle::Jq, &e, at.get());
-                                            return Ok(true);
-                                        }
-                                    },
-                                    // An owned result records its *truthiness*, not
-                                    // itself (#3009). Both readers of `last_output`
-                                    // only ever ask `matches!(last, Null |
-                                    // Bool(false))`, which is why the M2 path
-                                    // already synthesizes a `Bool` here rather than
-                                    // materializing (`record_exit_status`). There is
-                                    // no `Err` counterpart: an owned value cannot fail
-                                    // to materialize, and its writer bounds its own
-                                    // depth.
-                                    OutputItem::Owned(v) => {
-                                        last_output = Some(OwnedValue::Bool(!matches!(
-                                            v,
-                                            OwnedValue::Null | OwnedValue::Bool(false)
-                                        )));
-                                    }
-                                }
-                            }
                             // A malformed document is a data error, not an I/O
                             // one: it belongs in jq's diagnostic channel (exit 5)
                             // rather than aborting the process through `anyhow`
@@ -6621,6 +6600,16 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                                     }
                                 },
                             )?;
+                            // #7757: `-e` observes what was written, after the write, so
+                            // a fault ends the document as it does without `-e`.
+                            if !stop {
+                                observe_exit_status(args.exit_status, &mut last_output, || {
+                                    match &result {
+                                        OutputItem::Lazy(v) => v.is_truthy(),
+                                        OutputItem::Owned(v) => v.is_truthy(),
+                                    }
+                                });
+                            }
                             Ok(!stop)
                         };
                     evaluate_bytes_streaming(
@@ -6924,13 +6913,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     &output_config,
                     &mut |sink, result| {
                         had_output = true;
-                        last_output = Some(result.clone());
                         let stop = route_write_error(
                             sink,
                             &mut out,
                             || ErrorAt::Live(&locations).resolve(),
                             |o| write_output_owned_value(o, &result, &output_config),
                         )?;
+                        if !stop {
+                            observe_exit_status(args.exit_status, &mut last_output, || {
+                                result.is_truthy()
+                            });
+                        }
                         Ok(!stop)
                     },
                 )?;
@@ -7050,13 +7043,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         &output_config,
                         &mut |sink, result| {
                             had_output = true;
-                            last_output = Some(result.clone());
                             let stop = route_write_error(
                                 sink,
                                 &mut out,
                                 || ErrorAt::Live(&locations).resolve(),
                                 |o| write_output_owned_value(o, &result, &output_config),
                             )?;
+                            if !stop {
+                                observe_exit_status(args.exit_status, &mut last_output, || {
+                                    result.is_truthy()
+                                });
+                            }
                             Ok(!stop)
                         },
                     )?;
@@ -7192,13 +7189,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     owned_route,
                     &mut |sink, result| {
                         had_output = true;
-                        last_output = Some(result.clone());
                         let stop = route_write_error(
                             sink,
                             &mut out,
                             || at.resolve(),
                             |o| write_output_owned_value(o, &result, &output_config),
                         )?;
+                        if !stop {
+                            observe_exit_status(args.exit_status, &mut last_output, || {
+                                result.is_truthy()
+                            });
+                        }
                         Ok(!stop)
                     },
                 )?;
