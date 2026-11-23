@@ -200,10 +200,12 @@ timeout_s = 300
 
 # `--jq-gate` adds DIFF to the script's own ACCEPT_WRONG gate. About one row in 40 of the 1,215,396-row
 # grid (30,446 rows, 71 s); the whole grid is about 53 minutes on an M4 Pro.
+# Its rows that call `last(` are judged against jq 1.8.2 (`--jq-latest`), whose `last` of an empty
+# generator succinctly follows (#7518); the rest against the primary.
 [[sweep]]
 id = "fold-body-register-grid"
 script = "scripts/jq-fold-body-register-grid-sweep.py"
-args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-gate", "--sample", "40"]
+args = ["--bin", "{subject}", "--jq", "{jq}", "--jq-latest", "{jq_secondary}", "--jq-gate", "--sample", "40"]
 timeout_s = 900
 
 [[sweep]]
@@ -302,18 +304,20 @@ args = ["{subject}", "{subject}", "--jq", "{jq}", "--jq-gate"]
 timeout_s = 300
 
 # The jq-mode half only (`--jq-only`): the yq half needs the pinned yq, which this harness does not have.
+# Its cases that call `last(` are judged against jq 1.8.2 (`--jq-latest`, #7518), as in fold-body-register-grid.
 [[sweep]]
 id = "path-context"
 script = "scripts/jq-path-context-oracle-sweep.sh"
-args = ["--jq-only", "{subject}"]
+args = ["--jq-only", "--jq-latest={jq_secondary}", "{subject}"]
 timeout_s = 600
 
 # `--jq-gate`, a 20,000-row sample of the 63.6M-row grid drawn while it is generated, plus the 27 chain
 # rows (55 s, 80 MB; listing the grid first took about 15 GB).
+# Its rows that call `last(` are judged against jq 1.8.2 (`--jq-latest`, #7518), as in fold-body-register-grid.
 [[sweep]]
 id = "path-register"
 script = "scripts/jq-path-register-sweep.py"
-args = ["--candidate", "{subject}", "--jq", "{jq}", "--jq-gate", "--sample", "20000", "--seed", "7"]
+args = ["--candidate", "{subject}", "--jq", "{jq}", "--jq-latest", "{jq_secondary}", "--jq-gate", "--sample", "20000", "--seed", "7"]
 timeout_s = 900
 
 # `--jq-gate`, as for foreach-update-if-arm. Every 4th row of the 108,864-row grid: the whole grid is

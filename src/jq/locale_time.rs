@@ -1,7 +1,8 @@
 //! The process locale behind `strftime`/`strflocaltime`'s localized specifiers (#5754).
 //!
-//! jq calls `setlocale(LC_ALL, "")`, so the weekday and month names, `%p`, and the
-//! `%c`/`%x`/`%X`/`%r` layouts follow `LC_ALL`, `LC_TIME` and `LANG`. This module
+//! jq calls `setlocale(LC_ALL, "")`, so the weekday and month names (the alternative ones
+//! `%OB` prints too, #7790), `%p`, and the `%c`/`%x`/`%X`/`%r` layouts follow `LC_ALL`,
+//! `LC_TIME` and `LANG`. This module
 //! resolves that locale once and renders those specifiers through the C library's
 //! `strftime_l`, so the names and layouts are the platform's own -- the pinned oracle's
 //! `nl_langinfo` disagrees with its own `strftime` on macOS (`%p`/`%r` print empty under
@@ -147,7 +148,46 @@ mod imp {
             date: item(libc::D_FMT)?,
             time: item(libc::T_FMT)?,
             time_ampm: t_ampm,
+            date_fmt: date_fmt(handle),
         })
+    }
+
+    /// The layout macOS's libc expands `%+` to in `strftime` and `strptime` (#7784): the
+    /// locale's `date_fmt`, which `nl_langinfo` does not report. The libc reads it from line 44
+    /// of the locale's `LC_TIME` file (FreeBSD's `lc_time_T` order: 12 + 12 month names, 7 + 7
+    /// day names, `%X`, `%x` and `%c`, am and pm, then `date_fmt`), under `$PATH_LOCALE` or
+    /// `/usr/share/locale`, in the directory `querylocale` names for the handle's `LC_TIME`.
+    /// `None` where the file or the line is missing, which leaves C's layout.
+    #[cfg(target_vendor = "apple")]
+    fn date_fmt(handle: &Handle) -> Option<String> {
+        // SAFETY: `handle.0` is a live `locale_t`; the result is a NUL-terminated name owned by
+        // the locale (or null), copied before returning.
+        let name = unsafe { libc::querylocale(libc::LC_TIME_MASK, handle.0) };
+        if name.is_null() {
+            return None;
+        }
+        // SAFETY: non-null and NUL-terminated, per above.
+        let name = unsafe { core::ffi::CStr::from_ptr(name) }
+            .to_str()
+            .ok()?
+            .to_string();
+        if is_c_name(&name) || name.contains('/') {
+            return None;
+        }
+        let root = std::env::var_os("PATH_LOCALE").unwrap_or_else(|| "/usr/share/locale".into());
+        let mut path = std::path::PathBuf::from(root);
+        path.push(&name);
+        path.push("LC_TIME");
+        let text = std::fs::read(path).ok()?;
+        let text = String::from_utf8_lossy(&text);
+        text.split('\n').nth(43).map(str::to_string)
+    }
+
+    /// glibc has no `%+`: its `strftime` prints `%+` as written and its `strptime` cannot read it.
+    /// `succinctly jq` follows the pinned macOS libc's C layout there.
+    #[cfg(not(target_vendor = "apple"))]
+    fn date_fmt(_handle: &Handle) -> Option<String> {
+        None
     }
 
     /// The locale's day, month and am/pm names, rendered by `strftime_l` -- the same source
@@ -179,6 +219,7 @@ mod imp {
             weekday_abbr: weekdays("%a")?,
             month_full: months("%B")?,
             month_abbr: months("%b")?,
+            month_alt: months("%OB")?,
             am: render("%p", &at(1, 0, 0))?,
             pm: render("%p", &at(1, 0, 12))?,
         })
@@ -298,6 +339,10 @@ pub(crate) struct TimeNames {
     /// January first.
     pub(crate) month_full: [alloc::string::String; 12],
     pub(crate) month_abbr: [alloc::string::String; 12],
+    /// What `%OB` prints (#7790): the locale's alternative month names, the nominative ones a
+    /// month standing alone takes where `%B` is the genitive of a date (`leden`, `ledna` under
+    /// `cs_CZ`), and the full names where a locale has no others.
+    pub(crate) month_alt: [alloc::string::String; 12],
     /// What `%p` prints before and after noon. Either can be empty: macOS prints nothing for
     /// `%p` under `de_DE`, and its `strptime` then reads the empty string as the am marker.
     pub(crate) am: alloc::string::String,
@@ -319,6 +364,8 @@ pub(crate) struct Layouts {
     pub(crate) time: alloc::string::String,
     /// Empty where the locale's own is (macOS `de_DE`): `%r` then reads nothing.
     pub(crate) time_ampm: alloc::string::String,
+    /// `%+`'s layout, macOS's `date_fmt` (#7784); `None` uses C's.
+    pub(crate) date_fmt: Option<alloc::string::String>,
 }
 
 /// The locale's `%c`/`%x`/`%X`/`%r` layouts, or `None` when `strptime` should use C's.

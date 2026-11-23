@@ -135,6 +135,22 @@ class EvaluateTests(unittest.TestCase):
         self.assertEqual(calls, [sweep.ORACLE, "/b", "/c"])
         self.assertEqual(set(rec["classes"].values()), {"MATCH"})
 
+    def test_a_row_that_calls_last_is_judged_against_jq_latest_7518(self):
+        # `last(f)` of an empty `f` follows jq 1.8.2 (#7518): with `--jq-latest` such a row runs
+        # that jq as its oracle, and every other row, and every row without it, the pinned one.
+        calls = []
+        saved = (sweep.run_one, sweep.LATEST)
+        sweep.run_one = lambda argv, doc, timeout: (calls.append(argv[0]), ("[]\n", 0))[1]
+        try:
+            sweep.LATEST = "/jq-1.8.2"
+            for program in ("del(last(empty) and .a)", "path(.a)"):
+                sweep.evaluate(("ctx|x", "null", program), [("candidate", "/c")], 1)
+            sweep.LATEST = None
+            sweep.evaluate(("ctx|x", "null", "del(last(empty) and .a)"), [("candidate", "/c")], 1)
+        finally:
+            sweep.run_one, sweep.LATEST = saved
+        self.assertEqual(calls, ["/jq-1.8.2", "/c", sweep.ORACLE, "/c", sweep.ORACLE, "/c"])
+
 
 class ClassifyTests(unittest.TestCase):
     def test_a_capped_oracle_is_skipped_and_a_capped_build_is_a_timeout(self):

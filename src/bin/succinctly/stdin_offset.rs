@@ -181,6 +181,27 @@ fn opened_anew(path: &std::path::Path) -> Option<std::fs::File> {
     Some(opened)
 }
 
+/// Whether a new open of `path`, a path naming the regular file standard input is open on (`/dev/stdin`,
+/// `/dev/fd/0`, `/proc/self/fd/0`, the file's own name), has an offset of its own: Linux's
+/// `/proc/self/fd` links open the file again from its start, as any other name of it does, so reading it
+/// by that open leaves descriptor 0 where it stands, as jq's `fopen` of the path does (#7698). `false`
+/// where the open shares descriptor 0's offset (macOS duplicates the descriptor for `/dev/stdin` and
+/// `/dev/fd/0`), where descriptor 0's offset cannot be read, or where the path does not open. Asked as
+/// [`shares_offset`] asks, which leaves both offsets where they stood.
+#[cfg(unix)]
+pub(crate) fn opens_apart_from_stdin(path: &std::path::Path) -> bool {
+    // SAFETY: `lseek` with `SEEK_CUR` and a zero offset reads the offset and moves nothing.
+    let seekable = unsafe { libc::lseek(libc::STDIN_FILENO, 0, libc::SEEK_CUR) } >= 0;
+    seekable
+        && std::fs::File::open(path)
+            .is_ok_and(|opened| shares_offset(&opened, libc::STDIN_FILENO).is_none())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn opens_apart_from_stdin(_: &std::path::Path) -> bool {
+    true
+}
+
 #[cfg(not(unix))]
 fn opens_as_stdin(_: &std::path::Path) -> bool {
     false
