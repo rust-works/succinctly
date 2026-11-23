@@ -34064,35 +34064,24 @@ fn translate_posix_brackets(
     extended: bool,
     ignore_case: bool,
 ) -> Result<std::borrow::Cow<'_, str>, EvalError> {
-    let translated = translate_posix_brackets_scan(pattern, extended, ignore_case)?;
-    // #6215: under the `x` flag the blanks and comments hide what a quantifier follows, so the same
-    // two checks run over the pattern without them. Only their refusals count: an earlier error of
-    // the scan above is the one jq reports first.
-    if extended && !inline_extended(pattern) {
-        let bare = strip_extended_blanks(pattern);
+    let translated = translate_posix_brackets_scan(pattern, extended, ignore_case);
+    // #6215: under the `x` flag the blanks and comments hide what a quantifier follows, so the scan's
+    // repeat checks (#6127 among them) run again over the pattern without them, and so they do where
+    // an inline `(?x)` turns the mode on (#7852). Only their refusals count, and they come first: that
+    // scan stops at the first error, so a repeat refusal of it stands before any error the scan above
+    // meets, which is otherwise the one reported.
+    if extended || inline_extended(pattern) {
+        let bare = strip_extended_blanks(pattern, extended);
         if let Err(refusal) = translate_posix_brackets_scan(&bare, false, ignore_case) {
             if refusal.to_string().contains("target of repeat operator") {
                 return Err(refusal);
             }
         }
-        if bare.contains('(') && repeats_assertion_group(&bare.chars().collect::<Vec<_>>()) {
-            return Err(EvalError::new(
-                "Regex failure: target of repeat operator is invalid",
-            ));
+        if extended {
+            return translated;
         }
-        return Ok(translated);
     }
-    // #6127: a repeated group whose body Oniguruma reads as an assertion. After the scan, so that an
-    // error earlier in the pattern (jq reports the first in parse order) is the one reported.
-    if pattern.contains('(')
-        && !extended
-        && !inline_extended(pattern)
-        && repeats_assertion_group(&pattern.chars().collect::<Vec<_>>())
-    {
-        return Err(EvalError::new(
-            "Regex failure: target of repeat operator is invalid",
-        ));
-    }
+    let translated = translated?;
     // #6201: a look-behind with alternatives of different widths. #6519: the body's length as
     // Oniguruma's `tune_look_behind` sizes it, for the bodies `onig_look_behind` can read; the rest
     // are left to the shape rules of `look_behind_alternatives_differ`.
@@ -34126,12 +34115,18 @@ fn translate_posix_brackets(
     Ok(translated)
 }
 
-/// `pattern` without what the `x` flag ignores: blanks and `#` comments outside a class, an escape,
-/// a `\Q..\E` run and a `(?#...)` comment (#6215). An escaped blank stays, as the literal it is.
+/// `pattern` without what the extended mode ignores: blanks and `#` comments outside a class, an
+/// escape, a `\Q..\E` run and a `(?#...)` comment (#6215). An escaped blank stays, as the literal it
+/// is. The mode is `extended` (the `x` flag) to start with, and follows the inline option runs
+/// group by group (`(?x)`, `(?x:...)`, `(?-x)`), whose `x` is written `i` so that the text has no
+/// extended mode left to hide anything (#7852): the runs keep their place and their kind, an option
+/// group or a group, so that a repeat after one is judged as it is.
 #[cfg(feature = "regex")]
-fn strip_extended_blanks(pattern: &str) -> String {
+fn strip_extended_blanks(pattern: &str, extended: bool) -> String {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = string_with_capacity(pattern.len());
+    // Whether the mode is on, one entry per open group.
+    let mut on = vec![extended];
     let mut class_depth = 0usize;
     let mut class_start = false;
     let mut i = 0;
@@ -34180,6 +34175,11 @@ fn strip_extended_blanks(pattern: &str) -> String {
                 _ => class_start = false,
             }
             out.push(c);
+            // A class's `(?x` is no option run, which the scan of this text would take for one
+            // (#7852): `\?` is the same member.
+            if c == '(' && chars.get(i + 1) == Some(&'?') {
+                out.push('\\');
+            }
             i += 1;
             continue;
         }
@@ -34197,6 +34197,62 @@ fn strip_extended_blanks(pattern: &str) -> String {
                 out.push(')');
                 i += 1;
             }
+            continue;
+        }
+        let mode = on.last().copied().unwrap_or(extended);
+        if c == '(' {
+            let letters = if chars.get(i + 1) == Some(&'?') {
+                chars[i + 2..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_alphabetic() || **c == '-')
+                    .count()
+            } else {
+                0
+            };
+            let end = chars.get(i + 2 + letters).copied();
+            if letters > 0 && matches!(end, Some(')' | ':')) {
+                let mut inner = mode;
+                let mut sense = true;
+                out.push_str("(?");
+                for &letter in &chars[i + 2..i + 2 + letters] {
+                    match letter {
+                        '-' => sense = false,
+                        'x' => inner = sense,
+                        _ => {}
+                    }
+                    out.push(if letter == 'x' { 'i' } else { letter });
+                }
+                out.extend(end);
+                if end == Some(')') {
+                    if let Some(top) = on.last_mut() {
+                        *top = inner;
+                    }
+                } else {
+                    on.push(inner);
+                }
+                i += 3 + letters;
+                continue;
+            }
+            on.push(mode);
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ')' {
+            if on.len() > 1 {
+                on.pop();
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if !mode {
+            if c == '[' {
+                class_depth = 1;
+                class_start = true;
+            }
+            out.push(c);
+            i += 1;
             continue;
         }
         match c {
@@ -35091,13 +35147,23 @@ fn translate_posix_brackets_scan(
     // item to jq: a repeat operator after it has nothing to repeat.
     let mut prev_option_group = false;
     let mut group_facts: Option<GroupFacts> = None;
-    // A refusal Oniguruma makes only after reading the whole pattern (#7689).
+    // A refusal Oniguruma makes only after reading the whole pattern (#7689): a backreference or a
+    // conditional to a group number the pattern does not have, which `check_backrefs` refuses (see
+    // [`OnigPass`]).
     let mut late_refusal: Option<EvalError> = None;
+    // The names of the groups opened so far, which a `\k<name>` is looked up among (#7852).
+    let mut names_opened: Vec<String> = Vec::new();
     // The extended mode's ignored blanks are invisible to this scan (`^ *` is a repeated
     // assertion there), so a pattern in that mode is not judged as written: `translate_posix_brackets`
     // runs the scan again over the pattern without the blanks and comments (#6215, #6249) and keeps
-    // only its repeat-operator refusals. A pattern with an inline `(?x)` is judged by neither.
+    // only its repeat-operator refusals, and so it does for a pattern with an inline `(?x)` (#7852).
     let check_repetition = !extended && !inline_extended(pattern);
+    // #6127: a repeated group whose body Oniguruma reads as an assertion, refused at its repeat
+    // operator as the parse reads it, so that an error before it is the one reported and an error
+    // after it is not (#7852).
+    let invalid_repeat = (check_repetition && pattern.contains('('))
+        .then(|| first_invalid_repeat(&chars))
+        .flatten();
     // One entry per open group: whether the extended mode is on inside it, from the `x` flag and
     // from inline `(?x)`, `(?x:...)` and `(?-x)` (#5550).
     let mut extended_in = vec![extended];
@@ -35120,6 +35186,11 @@ fn translate_posix_brackets_scan(
     });
     let mut i = 0;
     while i < chars.len() {
+        if invalid_repeat.is_some_and(|at| i >= at) {
+            return Err(EvalError::new(
+                "Regex failure: target of repeat operator is invalid",
+            ));
+        }
         let c = chars[i];
         let was_assertion = std::mem::take(&mut prev_assertion);
         let after_pipe = std::mem::take(&mut prev_pipe);
@@ -35212,6 +35283,18 @@ fn translate_posix_brackets_scan(
                 return Err(EvalError::new(
                     "Regex failure: invalid pattern in look-behind",
                 ));
+            }
+            // #7852: a backreference `\k<..>` is read where it stands, as Oniguruma's parse reads it.
+            if depth == 0 && chars.get(i + 1) == Some(&'k') {
+                if let Some(late) = backreference_refusal(
+                    &chars,
+                    i,
+                    &names_opened,
+                    groups_opened,
+                    &mut group_facts,
+                )? {
+                    late_refusal.get_or_insert(late);
+                }
             }
             // #6070: the escapes Oniguruma reads that the `regex` crate refuses or reads another way.
             // #7689: a backreference to a group the pattern does not have is refused once the
@@ -35490,7 +35573,9 @@ fn translate_posix_brackets_scan(
             // #6133: an option run that repeats `-` or ends on one, which the `regex` crate refuses.
             if c == '(' && chars.get(i + 1) == Some(&'?') {
                 if let Some(run) = single_minus_option_run(&chars[i + 2..]) {
-                    let opened = open_group(&chars, i, &mut group_facts)?;
+                    let opened = open_group(&chars, i, &mut group_facts, &names_opened)?;
+                    late_refusal = late_refusal.or(opened.late);
+                    names_opened.extend(opened.name);
                     groups_opened += usize::from(opened.captures);
                     body_start = opened.body_start;
                     let outer = extended_in.last().copied().unwrap_or(false);
@@ -35529,6 +35614,19 @@ fn translate_posix_brackets_scan(
                     continue;
                 }
             }
+            // #7852: a callout (`(*name)`) is refused where it stands, as the parse reads it; one of
+            // jq's builtin callouts has no refusal (#7689).
+            if c == '(' && chars.get(i + 1) == Some(&'*') {
+                let rest: String = chars[i + 2..].iter().collect();
+                if let Some(message) = callout_refusal(&rest) {
+                    return Err(EvalError::new(format!("Regex failure: {message}")));
+                }
+            }
+            // #7852: an absent operator's or a conditional's header that ends the pattern (`(?~`,
+            // `(?~|`, `(?(1)`) is cut short.
+            if c == '(' && group_header_ends_pattern(&chars[i..]) {
+                return Err(EvalError::new("Regex failure: end pattern in group"));
+            }
             // #6070: `(*FAIL)` is the verb that never matches, `(?!)` here.
             if c == '(' && chars[i + 1..].starts_with(&['*', 'F', 'A', 'I', 'L', ')']) {
                 // Not `NEVER_MATCHES`: a verb cannot be repeated in jq (`(*FAIL)+` is `target of
@@ -35539,7 +35637,9 @@ fn translate_posix_brackets_scan(
                 continue;
             }
             let name_end = if c == '(' {
-                let opened = open_group(&chars, i, &mut group_facts)?;
+                let opened = open_group(&chars, i, &mut group_facts, &names_opened)?;
+                late_refusal = late_refusal.or(opened.late);
+                names_opened.extend(opened.name);
                 groups_opened += usize::from(opened.captures);
                 body_start = opened.body_start;
                 opened.header_end
@@ -35639,44 +35739,35 @@ fn translate_posix_brackets_scan(
                 // error later in the pattern (`)\` ends at an escape, `\2)` names a group the
                 // pattern does not have, which Oniguruma checks once it has read it all). An error
                 // before it that a later pass words (`\k<x>)`, `(*a))`) still comes first.
-                let mut before: String = if extended {
-                    "(?x)".into()
-                } else {
-                    String::new()
-                };
-                before.extend(&chars[..i]);
-                const LATE: [&str; 5] = [
-                    "end pattern with unmatched parenthesis",
-                    "end pattern in group",
-                    "invalid backref number/name",
-                    "undefined group",
-                    "never ending recursion",
-                ];
                 // The text before it is read whole, with the checks that follow this scan (a
                 // repeated assertion, `(?=a)*)`; under `x`, a repeat with no target, `*+)`), then in
-                // the words of the pass after it. A call `\g<x>` is resolved once the pattern has been
-                // read, so its refusal is a late one.
+                // the words of the pass after it, in Oniguruma's order. Only a parse error counts:
+                // the later passes run once the pattern has been read (#7852). The cut leaves the
+                // groups open that the `)` would close, which is no error of the pattern.
                 let prefix: String = chars[..i].iter().collect();
-                let calls_only = |message: &String| {
-                    message
-                        .strip_prefix("undefined name <")
-                        .is_some_and(|rest| {
-                            let name = rest.split('>').next().unwrap_or_default();
-                            !prefix.contains(&format!("\\k<{name}>"))
-                                && !prefix.contains(&format!("\\k'{name}'"))
+                let refuse = |text: &str| {
+                    translate_posix_brackets(text, extended, ignore_case)
+                        .err()
+                        .or_else(|| {
+                            let read = if extended {
+                                format!("(?x){text}")
+                            } else {
+                                text.to_string()
+                            };
+                            oniguruma_refusal(&read)
+                                .map(|message| EvalError::new(format!("Regex failure: {message}")))
                         })
                 };
-                let earlier = translate_posix_brackets(&prefix, extended, ignore_case)
-                    .err()
-                    .and_then(|refusal| {
-                        refusal
-                            .to_string()
-                            .strip_prefix("Regex failure: ")
-                            .map(String::from)
-                    })
-                    .or_else(|| oniguruma_refusal(&before))
+                const CUT: [&str; 2] = [
+                    "end pattern with unmatched parenthesis",
+                    "end pattern in group",
+                ];
+                let earlier = refuse(&prefix)
+                    .map(|first| refusal_in_onig_order(&prefix, first, refuse).to_string())
+                    .and_then(|refusal| refusal.strip_prefix("Regex failure: ").map(String::from))
                     .filter(|message| {
-                        !LATE.iter().any(|late| message.contains(late)) && !calls_only(message)
+                        onig_pass(message, &prefix) == OnigPass::Parse
+                            && !CUT.iter().any(|cut| message.contains(cut))
                     });
                 return Err(EvalError::new(format!(
                     "Regex failure: {}",
@@ -35812,6 +35903,18 @@ fn translate_posix_brackets_scan(
     } else {
         std::borrow::Cow::Borrowed(pattern)
     })
+}
+
+/// Whether `rest`, from a `(`, is an absent operator's or a conditional's group header and nothing
+/// after it (`(?~`, `(?~|`, `(?(1)`, `(?(<n>)`), which Oniguruma refuses as `end pattern in group`
+/// (#7852).
+#[cfg(feature = "regex")]
+fn group_header_ends_pattern(rest: &[char]) -> bool {
+    match rest {
+        ['(', '?', '~'] | ['(', '?', '~', '|'] => true,
+        ['(', '?', '(', condition @ .., ')'] => !condition.contains(&')'),
+        _ => false,
+    }
 }
 
 /// Whether `rest` holds a `]` at all, which decides whether a `]` first in a class is a member or
@@ -36186,6 +36289,8 @@ fn rewrite_onig_escape(
     match next {
         'h' | 'H' | 'i' | 'j' | 'l' | 'm' | 'q' | 'u' | 'C' | 'E' | 'F' | 'I' | 'J' | 'L' | 'M'
         | 'T' | 'U' | 'V' => literal(next),
+        // #7852: in a class they are the letters (`[\k<n>]` holds `k`, `<`, `n` and `>`).
+        'g' | 'k' if in_class => literal(next),
         'g' if !matches!(after, Some('<' | '\'' | '0'..='9' | '-' | '+')) => literal(next),
         'k' if !matches!(after, Some('<' | '\'')) => literal(next),
         'o' | 'p' | 'P' if after != Some('{') && after != Some('^') => literal(next),
@@ -36906,7 +37011,9 @@ fn group_facts_of(chars: &[char]) -> GroupFacts {
 #[cfg(feature = "regex")]
 fn group_header(chars: &[char], i: usize) -> (bool, Option<String>, usize) {
     match (chars.get(i + 1), chars.get(i + 2)) {
+        // #7852: an absent operator's body starts after its `~` (`(?~*)` repeats nothing).
         (Some('?'), Some(':' | '=' | '!' | '>')) => (false, None, i + 3),
+        (Some('?'), Some('~')) if chars.get(i + 3) != Some(&'|') => (false, None, i + 3),
         (Some('?'), Some('<')) if matches!(chars.get(i + 3), Some('=' | '!')) => {
             (false, None, i + 4)
         }
@@ -36947,36 +37054,144 @@ struct GroupOpen {
     body_start: usize,
     /// For a named group, the index just past the closing delimiter of its name (#7805).
     header_end: Option<usize>,
+    /// The group's name, for a named group.
+    name: Option<String>,
+    /// A refusal of a later pass than the parse (see [`OnigPass`]): a conditional on a group
+    /// number the pattern does not have, which `check_backrefs` refuses once the pattern is read.
+    late: Option<EvalError>,
+}
+
+/// The refusal of the backreference `\k<..>` or `\k'..'` at `chars[i]` (#7852), which Oniguruma's
+/// parse reads where it stands: `Err` for one the parse refuses (an empty or a malformed name, a
+/// name no group opened before it carries, group 0 or a group before the first), `Ok(Some(..))`
+/// for one to a group number past the last, which `check_backrefs` refuses once the whole pattern
+/// has been read, and `Ok(None)` for one jq reads, or leaves to a later reading of the pattern
+/// (a name of other characters than letters, digits and `_`). `names` are the names of the groups
+/// opened before it, and `groups_opened` their count.
+#[cfg(feature = "regex")]
+fn backreference_refusal(
+    chars: &[char],
+    i: usize,
+    names: &[String],
+    groups_opened: usize,
+    facts: &mut Option<GroupFacts>,
+) -> Result<Option<EvalError>, EvalError> {
+    let close = match chars.get(i + 2) {
+        Some('<') => '>',
+        Some('\'') => '\'',
+        _ => return Ok(None),
+    };
+    let refused = |message: String| EvalError::new(format!("Regex failure: {message}"));
+    let rest = &chars[i + 3..];
+    let Some(len) = rest.iter().position(|&c| c == close) else {
+        if rest.is_empty() {
+            return Err(refused("group name is empty".into()));
+        }
+        // The name runs to the end of the pattern.
+        let name: String = rest.iter().collect();
+        return Err(refused(format!("invalid group name <{name}>")));
+    };
+    let name: String = rest[..len].iter().collect();
+    if name.is_empty() {
+        return Err(refused("group name is empty".into()));
+    }
+    let backref = || refused("invalid backref number/name".into());
+    let numbered = name.strip_prefix(['-', '+']).unwrap_or(&name);
+    if !numbered.is_empty() && numbered.bytes().all(|b| b.is_ascii_digit()) {
+        let count: usize = numbered.parse().unwrap_or(usize::MAX);
+        // A signed zero names no group (`\k<+0>`).
+        if count == 0 && numbered != name {
+            return Err(refused(format!("invalid group name <{name}>")));
+        }
+        // `\k<-n>` is the `n`th group before it, `\k<+n>` the `n`th after (`backref_rel_to_abs`).
+        let number = match name.as_bytes()[0] {
+            b'-' => (groups_opened + 1).checked_sub(count),
+            b'+' => groups_opened.checked_add(count),
+            _ => Some(count),
+        };
+        let total = facts.get_or_insert_with(|| group_facts_of(chars)).total;
+        return match number {
+            None | Some(0) => Err(backref()),
+            Some(n) if n > total => Ok(Some(backref())),
+            Some(_) => Ok(None),
+        };
+    }
+    // `\k<n+1>` names group `n` at a recursion level.
+    let base = match name.rfind(['+', '-']) {
+        Some(sign)
+            if sign > 0
+                && sign + 1 < name.len()
+                && name[sign + 1..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            &name[..sign]
+        }
+        _ => name.as_str(),
+    };
+    if base.is_empty() || !base.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Ok(None);
+    }
+    if base.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err(refused(format!("invalid group name <{base}>")));
+    }
+    if !names.iter().any(|known| known == base) {
+        return Err(refused(format!("undefined name <{base}> reference")));
+    }
+    Ok(None)
 }
 
 /// A `(` at `chars[i]`: what it opens, refusing what Oniguruma refuses (#6070). A group name that
 /// is empty or starts with a digit is an error, and so is a conditional on a group the pattern
 /// does not have. The `regex` crate and `fancy-regex` accept the first two, and the conditional
-/// panicked inside `fancy-regex`.
+/// panicked inside `fancy-regex`. A conditional's name is looked up among `names`, those of the
+/// groups opened before it, as Oniguruma's parse looks it up where it stands (#7852).
 #[cfg(feature = "regex")]
 fn open_group(
     chars: &[char],
     i: usize,
     facts: &mut Option<GroupFacts>,
+    names: &[String],
 ) -> Result<GroupOpen, EvalError> {
-    // The parenthesis that opens a conditional's condition, `(?(1)`, is not a group.
+    // The parenthesis that opens a conditional's condition, `(?(1)`, is not a group. #7852: what the
+    // conditional holds starts after a group number's or a name's `)`; any other condition is read
+    // as a pattern, which starts at once (`(?(?=a)b)` and `(?(1)*)` repeat nothing).
     if opens_condition(chars, i) {
+        let close = chars[i + 1..].iter().position(|&c| c == ')');
+        let checks_group = close.is_some_and(|n| {
+            let condition = &chars[i + 1..i + 1 + n];
+            let named = matches!(
+                (condition.first(), condition.last()),
+                (Some('<'), Some('>')) | (Some('\''), Some('\''))
+            ) && condition.len() > 2;
+            named || (!condition.is_empty() && condition.iter().all(char::is_ascii_digit))
+        });
         return Ok(GroupOpen {
             captures: false,
-            body_start: usize::MAX,
+            body_start: match close {
+                Some(n) if checks_group => i + n + 2,
+                _ => i + 1,
+            },
             header_end: None,
+            name: None,
+            late: None,
         });
     }
+    let mut late = None;
     let header_end = onig_group_name_end(chars, i)?;
-    let (captures, _, body_start) = group_header(chars, i);
+    let (captures, name, body_start) = group_header(chars, i);
     if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'(') {
         if let Some(n) = chars[i + 3..].iter().position(|&c| c == ')') {
             let condition: String = chars[i + 3..i + 3 + n].iter().collect();
             let facts = facts.get_or_insert_with(|| group_facts_of(chars));
             if !condition.is_empty() && condition.chars().all(|c| c.is_ascii_digit()) {
                 let number = condition.parse::<usize>().unwrap_or(usize::MAX);
-                if number == 0 || number > facts.total {
-                    return Err(EvalError::new("Regex failure: invalid backref number/name"));
+                // Group 0 is refused as the parse reads it; a number past the last group only
+                // once the pattern has been read (#7852).
+                let refusal = || EvalError::new("Regex failure: invalid backref number/name");
+                if number == 0 {
+                    return Err(refusal());
+                }
+                if number > facts.total {
+                    late = Some(refusal());
                 }
             } else if let Some(name) = condition
                 .strip_prefix('<')
@@ -36987,7 +37202,7 @@ fn open_group(
                         .and_then(|c| c.strip_suffix('\''))
                 })
             {
-                if !facts.names.iter().any(|known| known == name) {
+                if !names.iter().any(|known| known == name) {
                     return Err(EvalError::new(format!(
                         "Regex failure: undefined name <{name}> reference"
                     )));
@@ -36999,6 +37214,8 @@ fn open_group(
         captures,
         body_start,
         header_end,
+        name,
+        late,
     })
 }
 
@@ -37120,8 +37337,9 @@ fn inline_extended(pattern: &str) -> bool {
     })
 }
 
-/// Whether `pattern` repeats a group Oniguruma reads as an assertion, which it refuses with
-/// `target of repeat operator is invalid` (#6127).
+/// Where `chars` first repeats a group Oniguruma reads as an assertion, which it refuses with
+/// `target of repeat operator is invalid` (#6127): the index of the repeat operator, where its
+/// parse meets it (#7852), or `None`.
 ///
 /// Oniguruma decides from the parsed node (`is_invalid_quantifier_target`, `regparse.c`): an
 /// assertion (`^ $ \A \z \Z \G \K \b \B`, a look-ahead or look-behind) is an invalid target; a
@@ -37133,7 +37351,7 @@ fn inline_extended(pattern: &str) -> bool {
 ///
 /// Anything this scan is unsure of reads as a valid target, which is what it was before.
 #[cfg(feature = "regex")]
-fn repeats_assertion_group(chars: &[char]) -> bool {
+fn first_invalid_repeat(chars: &[char]) -> Option<usize> {
     struct Scan<'a> {
         chars: &'a [char],
         at: usize,
@@ -37151,8 +37369,8 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
             self.chars.get(self.at).copied()
         }
         /// The body of a group or of the whole pattern, up to its `)` (not consumed): whether it is
-        /// an invalid repeat target, or `Err` at a repeat of one.
-        fn body(&mut self, depth: usize) -> Result<bool, ()> {
+        /// an invalid repeat target, or `Err` with the index of a repeat of one.
+        fn body(&mut self, depth: usize) -> Result<bool, usize> {
             // Deeper than any real pattern: leave it to the crate, the whole pattern with it (resuming
             // mid-pattern would read later groups at the wrong depth).
             if depth > 200 {
@@ -37184,12 +37402,15 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
                     continue;
                 };
                 trailing_option = false;
+                // #7852: a comment between them is no item, so the repeat after it is the item's
+                // (`(?=a)(?#c)*` repeats the look-ahead).
+                self.skip_comments();
                 let mut target_invalid = item;
                 // Repetitions stack (`a**` is valid): the first one is checked, the rest follow it.
                 let mut repeated = false;
                 while starts_repetition(self.chars.get(self.at..).unwrap_or(&[])) {
                     if !repeated && target_invalid {
-                        return Err(());
+                        return Err(self.at);
                     }
                     repeated = true;
                     target_invalid = false;
@@ -37219,7 +37440,7 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
         /// The item at `at`, consumed: `Some(true)` for an invalid repeat target, `Some(false)` for
         /// any other, `None` for text that is no item (a comment, or an inline option group
         /// `(?i)`, which sets `option` and is no item unless nothing follows it in its alternative).
-        fn item(&mut self, depth: usize, option: &mut bool) -> Result<Option<bool>, ()> {
+        fn item(&mut self, depth: usize, option: &mut bool) -> Result<Option<bool>, usize> {
             let c = self.chars[self.at];
             match c {
                 '^' | '$' => {
@@ -37277,6 +37498,11 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
             }
         }
 
+        /// The comments `(?#...)` at `at`, any number of them.
+        fn skip_comments(&mut self) {
+            self.at = skip_comments(self.chars, self.at);
+        }
+
         /// A character class, nested classes and escapes included.
         fn skip_class(&mut self) {
             let mut depth = 0usize;
@@ -37309,7 +37535,7 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
             }
         }
 
-        fn group(&mut self, depth: usize, option: &mut bool) -> Result<Option<bool>, ()> {
+        fn group(&mut self, depth: usize, option: &mut bool) -> Result<Option<bool>, usize> {
             let rest = self.chars.get(self.at..).unwrap_or(&[]);
             let starts = |prefix: &str| {
                 prefix
@@ -37366,7 +37592,10 @@ fn repeats_assertion_group(chars: &[char]) -> bool {
         at: 0,
         abandoned: false,
     };
-    scan.body(0).is_err() && !scan.abandoned
+    match scan.body(0) {
+        Err(at) if !scan.abandoned => Some(at),
+        _ => None,
+    }
 }
 
 /// Whether `chars` begins with a repetition operator as Oniguruma's Perl syntax reads one: `*`,
@@ -38437,40 +38666,233 @@ fn build_regex<S: EvalSemantics>(
     compiled
 }
 
-/// Whether `refusal` is one Oniguruma makes of a look-behind's body, in `tune_tree`.
+/// The pass of Oniguruma's `onig_compile` that makes a refusal (#7852), in the order they run
+/// (`parse_and_tune`, `regcomp.c`): the parse reads the whole pattern and refuses each error where
+/// it stands; `check_backrefs` then refuses a numbered backreference or conditional to a group the
+/// pattern does not have; `tune_call` a call to a group it does not have;
+/// `infinite_recursive_call_check_trav` a call that never ends; and `tune_tree` a look-behind's
+/// body. A refusal of a later pass never comes before one of an earlier pass, wherever the two
+/// stand: `\1(?=a)*` is `target of repeat operator is invalid`.
 #[cfg(feature = "regex")]
-fn is_look_behind_refusal(refusal: &EvalError) -> bool {
-    let message = refusal.to_string();
-    message.ends_with("invalid pattern in look-behind") || message.ends_with("undefined error code")
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum OnigPass {
+    Parse,
+    Backrefs,
+    Calls,
+    Recursion,
+    Tune,
 }
 
-/// The refusal jq makes of `pattern` before it judges its look-behinds, if any (#7844).
-///
-/// Oniguruma refuses a look-behind's body in `tune_tree`, once it has parsed the whole pattern and
-/// checked its backreferences (`check_backrefs`) and calls (`tune_call`), so every error those make,
-/// wherever it stands, comes first: `\1(?<=(?=a))` is `invalid backref number/name` and
-/// `(?<=a(?=b)` is `end pattern with unmatched parenthesis`. The pattern is built again with each
-/// look-behind written as the look-ahead of the same sense, which parses as it does and has no
-/// such checks, and an error of that build is the one jq reports. The `regex` crate's own refusals
-/// are none of Oniguruma's, and leave the look-behind's.
+/// The pass that makes `message`, a refusal of `pattern` in jq's words (with or without its
+/// `Regex failure: ` prefix). Oniguruma words some refusals alike in two passes, so the pattern
+/// says which: an undefined name is the parse's when a backreference or a conditional names it
+/// (`\k<n>`, looked up where it stands) and `tune_call`'s when only calls do (`\g<n>`), and an
+/// undefined group is the parse's when a relative call reaches before the pattern (`\g<-3>`). A
+/// group 0 backreference (`\k<0>`, `(?(0)..)`) is the parse's too, though worded as
+/// `check_backrefs` words a missing group; it is read as the later pass, which changes nothing,
+/// since [`refusal_in_onig_order`] then finds it again where it stands.
 #[cfg(feature = "regex")]
-fn refusal_before_look_behinds<S: EvalSemantics>(
+fn onig_pass(message: &str, pattern: &str) -> OnigPass {
+    let message = message.strip_prefix("Regex failure: ").unwrap_or(message);
+    if message == "invalid pattern in look-behind" || message == "undefined error code" {
+        return OnigPass::Tune;
+    }
+    if message == "invalid backref number/name" {
+        return OnigPass::Backrefs;
+    }
+    if message == "never ending recursion" {
+        return OnigPass::Recursion;
+    }
+    if let Some(group) = message
+        .strip_prefix("undefined group <")
+        .and_then(|rest| rest.strip_suffix("> reference"))
+    {
+        return if group.starts_with('-') {
+            OnigPass::Parse
+        } else {
+            OnigPass::Calls
+        };
+    }
+    if let Some(name) = message
+        .strip_prefix("undefined name <")
+        .and_then(|rest| rest.strip_suffix("> reference"))
+    {
+        // A reference or a condition that names it, read as the pre-pass reads them: `\\k<n>` and
+        // `[\k<n>]` are none.
+        let mut referenced = false;
+        rewrite_onig_constructs(pattern, |chars, i| {
+            let opener = match (chars[i], chars.get(i + 1), chars.get(i + 2)) {
+                ('\\', Some('k'), Some('<' | '\'')) => Some(3),
+                ('(', Some('?'), Some('(')) if matches!(chars.get(i + 3), Some('<' | '\'')) => {
+                    Some(4)
+                }
+                _ => None,
+            };
+            if let Some(from) = opener {
+                let after = chars.get(i + from..).unwrap_or_default();
+                let len = name.chars().count();
+                referenced |= after.iter().take(len).copied().eq(name.chars())
+                    && matches!(after.get(len), Some('>' | '\'' | '+' | '-'));
+            }
+            None
+        });
+        return if referenced {
+            OnigPass::Parse
+        } else {
+            OnigPass::Calls
+        };
+    }
+    OnigPass::Parse
+}
+
+/// The refusal jq reports for `pattern`, of which `refusal` is the first that a reading of it met
+/// (#7852, #7844): the first in Oniguruma's order ([`OnigPass`]). A refusal of a later pass than
+/// the parse waits for every error of the passes before it, so the pattern is read again by
+/// `refuse` with the constructs that pass refuses written as ones that parse the same way and that
+/// it accepts ([`without_pass_refusals`]); a refusal of that reading from an earlier pass, in
+/// Oniguruma's own words, takes its place, and the rule runs again on it, so each later pass yields
+/// in turn: `\1(?<=(?=a))(` is `end pattern with unmatched parenthesis`. Only a refused pattern
+/// runs it.
+#[cfg(feature = "regex")]
+fn refusal_in_onig_order(
     pattern: &str,
-    flags: Option<&str>,
-) -> Option<EvalError> {
-    let ahead = look_behinds_as_look_aheads(pattern)?;
-    let refusal = build_regex_uncached::<S>(&ahead, flags).err()?;
-    let message = refusal.to_string();
-    let own = ["regex parse error", "exceeds size limit", "not supported"];
-    (!is_look_behind_refusal(&refusal) && !own.iter().any(|own| message.contains(own)))
-        .then_some(refusal)
+    mut refusal: EvalError,
+    refuse: impl Fn(&str) -> Option<EvalError>,
+) -> EvalError {
+    let mut read = std::borrow::Cow::Borrowed(pattern);
+    loop {
+        let pass = onig_pass(&refusal.to_string(), &read);
+        if pass == OnigPass::Parse {
+            return refusal;
+        }
+        let Some(written) = without_pass_refusals(&read, pass) else {
+            return refusal;
+        };
+        match refuse(&written) {
+            Some(earlier)
+                if is_oniguruma_refusal(&earlier)
+                    && onig_pass(&earlier.to_string(), &written) < pass =>
+            {
+                refusal = earlier;
+                read = std::borrow::Cow::Owned(written);
+            }
+            _ => return refusal,
+        }
+    }
 }
 
-/// `pattern` with each look-behind opener (`(?<=`, `(?<!`) written as the look-ahead of the same
-/// sense (`(?=`, `(?!`), or `None` when it has none. An escaped character, a `\Q...\E` run, a
-/// `(?#...)` comment and a character class are passed over.
+/// Whether `refusal` is in Oniguruma's words, not the `regex` crate's own (its parse errors, its
+/// size limit, a construct it does not support), which no pattern jq refuses is answered with.
 #[cfg(feature = "regex")]
-fn look_behinds_as_look_aheads(pattern: &str) -> Option<String> {
+fn is_oniguruma_refusal(refusal: &EvalError) -> bool {
+    let message = refusal.to_string();
+    !["regex parse error", "exceeds size limit", "not supported"]
+        .iter()
+        .any(|own| message.contains(own))
+}
+
+/// `pattern` with the constructs that `pass` refuses written as ones that parse the same way and
+/// that it accepts, or `None` when it has none ([`refusal_in_onig_order`]):
+///
+/// - [`OnigPass::Tune`]: each look-behind opener (`(?<=`, `(?<!`) as the look-ahead of the same
+///   sense (`(?=`, `(?!`), whose body `tune_tree` does not judge.
+/// - [`OnigPass::Backrefs`]: each backreference `\1`..`\9` to a group the pattern does not have as
+///   an empty group `(?:)`, and each conditional on such a group (`(?(5)`) as a plain group `(?:`.
+#[cfg(feature = "regex")]
+fn without_pass_refusals(pattern: &str, pass: OnigPass) -> Option<String> {
+    match pass {
+        OnigPass::Tune => rewrite_onig_constructs(pattern, |chars, i| {
+            let at = |n: usize| chars.get(i + n).copied();
+            match (at(0), at(1), at(2), at(3)) {
+                (Some('('), Some('?'), Some('<'), Some('=')) => Some(("(?=", 4)),
+                (Some('('), Some('?'), Some('<'), Some('!')) => Some(("(?!", 4)),
+                _ => None,
+            }
+        }),
+        OnigPass::Backrefs => {
+            let total = group_facts_of(&pattern.chars().collect::<Vec<_>>()).total;
+            rewrite_onig_constructs(pattern, |chars, i| {
+                let at = |n: usize| chars.get(i + n).copied();
+                let missing = |n: usize| n > 0 && n > total;
+                match (at(0), at(1), at(2)) {
+                    // A longer number is a backreference only to a group the pattern has
+                    // (`rewrite_onig_escape`).
+                    (Some('\\'), Some(digit), _)
+                        if digit.to_digit(10).is_some_and(|n| missing(n as usize))
+                            && !at(2).is_some_and(|c| c.is_ascii_digit()) =>
+                    {
+                        Some(("(?:)", 2))
+                    }
+                    // `\k<5>`, `\k'5'`, `\k<+2>`: see `backreference_refusal`.
+                    (Some('\\'), Some('k'), Some(open @ ('<' | '\''))) => {
+                        let close = if open == '<' { '>' } else { '\'' };
+                        let len = chars[i + 3..].iter().position(|&c| c == close)?;
+                        let name: String = chars[i + 3..i + 3 + len].iter().collect();
+                        let numbered = name.strip_prefix('+').unwrap_or(&name);
+                        if numbered.is_empty() || !numbered.bytes().all(|b| b.is_ascii_digit()) {
+                            return None;
+                        }
+                        let count: usize = numbered.parse().ok()?;
+                        let number = if numbered == name {
+                            count
+                        } else {
+                            group_facts_of(&chars[..i]).total.checked_add(count)?
+                        };
+                        missing(number).then_some(("(?:)", 4 + len))
+                    }
+                    (Some('('), Some('?'), Some('(')) => {
+                        let digits = chars[i + 3..]
+                            .iter()
+                            .take_while(|c| c.is_ascii_digit())
+                            .count();
+                        let number = chars[i + 3..i + 3 + digits]
+                            .iter()
+                            .collect::<String>()
+                            .parse()
+                            .ok();
+                        (at(3 + digits) == Some(')') && number.is_some_and(missing))
+                            .then_some(("(?:", 4 + digits))
+                    }
+                    _ => None,
+                }
+            })
+        }
+        OnigPass::Parse | OnigPass::Calls | OnigPass::Recursion => None,
+    }
+}
+
+/// `pattern` with each look-around, atomic group, absent operator and conditional opened as a plain
+/// group `(?:` instead (`(?=`, `(?<!`, `(?>`, `(?~`, `(?(1)`), or `None` when it has none: the same groups, parsed the
+/// same way by the `regex` crate's parser, which refuses those openers before it reads on (#7858).
+#[cfg(feature = "regex")]
+fn assertions_as_plain_groups(pattern: &str) -> Option<String> {
+    rewrite_onig_constructs(pattern, |chars, i| {
+        let at = |n: usize| chars.get(i + n).copied();
+        if at(0) != Some('(') || at(1) != Some('?') {
+            return None;
+        }
+        match (at(2), at(3)) {
+            // An absent operator is left as written only when it is not closed (`(?~a`).
+            (Some('=' | '!' | '>' | '~'), _) => Some(("(?:", 3)),
+            (Some('<'), Some('=' | '!')) => Some(("(?:", 4)),
+            (Some('('), _) => {
+                let close = chars[i + 3..].iter().position(|&c| c == ')')?;
+                Some(("(?:", 4 + close))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// `pattern` with the constructs `rewrite` writes another way, or `None` when it writes none.
+/// `rewrite` is asked at each character outside a character class, a `\Q...\E` run and a `(?#...)`
+/// comment, an escape at its backslash, and answers the text to write and how many characters of
+/// the pattern it stands for. Those are passed over as the jq pre-pass reads them.
+#[cfg(feature = "regex")]
+fn rewrite_onig_constructs(
+    pattern: &str,
+    mut rewrite: impl FnMut(&[char], usize) -> Option<(&'static str, usize)>,
+) -> Option<String> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out = string_with_capacity(pattern.len());
     let mut changed = false;
@@ -38480,6 +38902,14 @@ fn look_behinds_as_look_aheads(pattern: &str) -> Option<String> {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
+        if class_depth == 0 && !(c == '(' && chars[i + 1..].starts_with(&['?', '#'])) {
+            if let Some((text, used)) = rewrite(&chars, i) {
+                out.push_str(text);
+                changed = true;
+                i += used.max(1);
+                continue;
+            }
+        }
         if c == '\\' {
             if class_depth == 0 && chars.get(i + 1) == Some(&'Q') {
                 let mut j = i + 2;
@@ -38516,23 +38946,10 @@ fn look_behinds_as_look_aheads(pattern: &str) -> Option<String> {
                 class_depth = 1;
                 class_start = true;
             }
-            '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
-                let end = chars[i..]
-                    .iter()
-                    .position(|&c| c == ')')
-                    .map_or(chars.len(), |close| i + close + 1);
+            '(' if chars[i + 1..].starts_with(&['?', '#']) => {
+                let end = comment_end(&chars, i);
                 out.extend(&chars[i..end]);
                 i = end;
-                continue;
-            }
-            '(' if chars.get(i + 1) == Some(&'?')
-                && chars.get(i + 2) == Some(&'<')
-                && matches!(chars.get(i + 3), Some('=' | '!')) =>
-            {
-                out.push_str("(?");
-                out.push(chars[i + 3]);
-                changed = true;
-                i += 4;
                 continue;
             }
             _ => {}
@@ -38737,10 +39154,10 @@ fn build_regex_uncached<S: EvalSemantics>(
     }
 
     if let Some(refusal) = deferred_refusal {
-        if S::TAG != EvalTag::Yq && is_look_behind_refusal(&refusal) {
-            if let Some(earlier) = refusal_before_look_behinds::<S>(source, flags) {
-                return Err(earlier);
-            }
+        if S::TAG != EvalTag::Yq {
+            return Err(refusal_in_onig_order(source, refusal, |written| {
+                build_regex_uncached::<S>(written, flags).err()
+            }));
         }
         return Err(refusal);
     }
@@ -39174,6 +39591,11 @@ fn callout_refusal(rest: &str) -> Option<String> {
     let Some(first) = rest.chars().next() else {
         return Some("invalid callout pattern".into());
     };
+    // #7852: the name runs to a `)`, `[` or `{`, or to the end of the pattern, whatever it holds
+    // (`(*a(`, `(*1`, `(*\` end in it), before it is judged (`(*{2}` is no name).
+    if !rest.contains([')', '[', '{']) {
+        return Some("end pattern in group".into());
+    }
     if !(first.is_ascii_alphabetic() || first == '_') {
         return Some("invalid callout name".into());
     }
@@ -39209,10 +39631,11 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
             .checked_sub(1)
             .and_then(|left| oniguruma_refusal_within(&rewritten, left))
     };
-    // A call's own refusal, which Oniguruma makes only after reading the whole pattern: a later
-    // one of these does not come before an earlier call's.
-    let is_late = |message: &String| {
-        message.starts_with("undefined group") || message == "never ending recursion"
+    // #7852: a refusal Oniguruma makes after reading the whole pattern (a missing group's
+    // backreference, a call) waits for the errors of the passes before its own ([`OnigPass`]):
+    // `written`, the pattern with the construct read past, is looked at again for one.
+    let earlier = |written: String, pass: OnigPass| {
+        retry(written.clone()).filter(|message| onig_pass(message, &written) < pass)
     };
     let chars_before = |offset: usize| -> Vec<char> {
         pattern.get(..offset).unwrap_or_default().chars().collect()
@@ -39248,6 +39671,16 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                     if at(start).starts_with('#') && !at(start).contains(')') =>
                 {
                     Some("end pattern in group".into())
+                }
+                // #7852: a closed one, which the crate does not read either: read on without it.
+                ErrorKind::FlagUnrecognized
+                    if at(start).starts_with('#') && pattern.get(..start)?.ends_with("(?") =>
+                {
+                    let chars: Vec<char> = pattern.chars().collect();
+                    let open = pattern[..start - 2].chars().count();
+                    let end = comment_end(&chars, open);
+                    let rest: String = chars[end..].iter().collect();
+                    retry(format!("{}{rest}", &pattern[..start - 2]))
                 }
                 // `(?<x`: the name runs to the end of the pattern.
                 ErrorKind::GroupNameUnexpectedEof => {
@@ -39294,22 +39727,41 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                     let rewritten = || format!("{}(?:){}", &pattern[..start], at(end));
                     let numbered = name.strip_prefix(['-', '+']).unwrap_or(name);
                     if !numbered.is_empty() && numbered.bytes().all(|b| b.is_ascii_digit()) {
-                        if at(start).starts_with("\\k") {
-                            return Some("invalid backref number/name".into());
-                        }
-                        // `\g<n>` calls group `n`, `\g<-n>` the `n`th before it, `\g<+n>` the
-                        // `n`th after it; `\g<0>` is the whole pattern, which never ends.
                         let count: usize = numbered.parse().unwrap_or(usize::MAX);
                         let total = group_facts_of(&pattern.chars().collect::<Vec<_>>()).total;
                         let before = group_facts_of(&chars_before(start)).total;
+                        // `\k<-n>` is the `n`th group before it and `\k<+n>` the `n`th after
+                        // (`backref_rel_to_abs`): one before the pattern, or group 0, is refused as
+                        // the parse reads it; one past the last group by `check_backrefs` (#7852).
+                        if at(start).starts_with("\\k") {
+                            let refused = || Some("invalid backref number/name".into());
+                            let number = match name.as_bytes()[0] {
+                                b'-' => (before + 1).checked_sub(count),
+                                b'+' => before.checked_add(count),
+                                _ => Some(count),
+                            };
+                            return match number {
+                                None | Some(0) => refused(),
+                                Some(n) if n > total => {
+                                    earlier(rewritten(), OnigPass::Backrefs).or_else(refused)
+                                }
+                                Some(_) => retry(rewritten()),
+                            };
+                        }
+                        // `\g<n>` calls group `n`, `\g<-n>` the `n`th before it, `\g<+n>` the
+                        // `n`th after it; `\g<0>` is the whole pattern, which never ends.
                         // Oniguruma resolves a call after reading the whole pattern, so an error
-                        // later in it comes first.
+                        // later in it comes first; a relative call that reaches before the pattern
+                        // is refused as the parse reads it.
                         // A signed zero names no group (`\g<+0>`).
                         if count == 0 && name != numbered {
                             return Some(format!("invalid group name <{name}>"));
                         }
                         let late = match name.as_bytes()[0] {
                             _ if count == 0 => "never ending recursion".into(),
+                            b'-' if count > before + 1 => {
+                                return Some(format!("undefined group <{name}> reference"));
+                            }
                             b'-' if count > before => "never ending recursion".into(),
                             b'+' if count > total - before => {
                                 format!("undefined group <{name}> reference")
@@ -39319,7 +39771,8 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                             }
                             _ => return retry(rewritten()),
                         };
-                        return retry(rewritten()).filter(|m| !is_late(m)).or(Some(late));
+                        let pass = onig_pass(&late, pattern);
+                        return earlier(rewritten(), pass).or(Some(late));
                     }
                     // `\k<x-1>` names group `x` at a recursion level.
                     let base = match name.rfind(['+', '-']) {
@@ -39344,11 +39797,15 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                         (true, _) => retry(rewritten()),
                         // A call is resolved after the whole pattern is read (see above); a
                         // back-reference to a name no group has before it is refused at once.
-                        (false, true) => retry(rewritten())
-                            .filter(|m| !is_late(m) && !m.starts_with("undefined name"))
-                            .or(Some(undefined)),
+                        (false, true) => earlier(rewritten(), OnigPass::Calls).or(Some(undefined)),
                         (false, false) => Some(undefined),
                     }
+                }
+                // #7852: another escape jq reads that the crate does not (`\K`, `\R`, `\G`): read on
+                // past it, as an empty group.
+                ErrorKind::EscapeUnrecognized if at(start).starts_with('\\') => {
+                    let escape = at(start).chars().take(2).map(char::len_utf8).sum::<usize>();
+                    retry(format!("{}(?:){}", &pattern[..start], at(start + escape)))
                 }
                 // Oniguruma lets several groups carry one name; the crate does not, so a later one is
                 // renamed to look on.
@@ -39372,8 +39829,18 @@ fn oniguruma_refusal_within(pattern: &str, retries: usize) -> Option<String> {
                         )),
                     }
                 }
-                // A look-around or an atomic group the crate cannot read, left open.
+                // A reference to a group the pattern has, which the crate does not read: read on
+                // past it, as an empty group (#7852).
+                ErrorKind::UnsupportedBackreference => {
+                    let end = error.span().end.offset;
+                    retry(format!("{}(?:){}", &pattern[..start], at(end)))
+                }
+                // A look-around, an atomic group or a conditional the crate cannot read: read on
+                // with each of them opened as a plain group (#7858), and otherwise one left open.
                 ErrorKind::UnsupportedLookAround | ErrorKind::FlagUnrecognized => {
+                    if let Some(found) = assertions_as_plain_groups(pattern).and_then(retry) {
+                        return Some(found);
+                    }
                     match fancy_regex::Expr::parse_tree(pattern) {
                         Err(fancy_regex::Error::ParseError(
                             _,
@@ -120517,6 +120984,184 @@ pub(crate) fn native_stack_exhausted() -> bool {
     origin != 0 && origin.abs_diff(stack_address()) > reach
 }
 
+/// The floors a `DefCall` arm checks (#7856): `None` when the floor a recursion's descent stops at
+/// is spent (ADR-0025, what [`native_stack_exhausted`] asks), and otherwise the lowest stack
+/// address an output of the call may be handed on from ([`output_past`]), `0` on a thread that
+/// registered no stack.
+///
+/// A recursion's outputs climb back up through every level's consumer on top of the descent's
+/// frames, with no `DefCall` or `Shared` evaluated on the way: `{k: f($n - 1), v: (foreach (1, 2)
+/// as $x (0; . + $x))}` runs the object's value for each output of the call, from inside that
+/// call, so a recursion admitted at 9,000 levels spent the second half of the stack on the climb
+/// and aborted. The climb is checked a quarter of the stack further down than the floor, which a
+/// descent never reaches: a recursion that answered with room to spare still does, and the last
+/// quarter covers the bounded work one level's consumer may do (ADR-0025's list). The stack grows
+/// downward on every target the crate builds for (ADR-0025), so the address is a plain bound, read
+/// once per call: an output pays a compare.
+#[inline]
+pub(crate) fn def_call_floors() -> Option<usize> {
+    let (origin, reach) = native_stack::budget();
+    if origin == 0 {
+        return Some(0);
+    }
+    if origin.abs_diff(stack_address()) > reach {
+        return None;
+    }
+    Some(origin.saturating_sub(reach + reach / 2))
+}
+
+/// Whether the caller's frame lies below `limit`, the bound [`def_call_floors`] gave its call
+/// (#7856): the address of a local, not a call, since it is asked for every output.
+#[inline(always)]
+pub(crate) fn output_past(limit: usize) -> bool {
+    let marker = 0u8;
+    (core::hint::black_box(core::ptr::addr_of!(marker)) as usize) < limit
+}
+
+/// A `DefCall` arm's failure to bind or enter the call, as its flow: out of line and cold, so the
+/// error's room is not in the frame of the arm, which every level of a recursion pays for (#7856).
+#[cold]
+#[inline(never)]
+pub(crate) fn def_call_failed(e: EvalError) -> Flow {
+    Flow::Escaped(Control::Error(e))
+}
+
+/// The refusal of a call whose output [`checked_def_output`] stopped, or that a `DefCall` arm found
+/// at the floor itself (#7856): out of line and cold, so its message's formatting takes no room in
+/// the frame of the arm that raises it, which every level of a recursion pays for.
+#[cold]
+#[inline(never)]
+pub(crate) fn def_output_refusal(def: &FuncDefData) -> Flow {
+    Flow::Escaped(Control::Error(def_call_depth_refusal(def)))
+}
+
+/// `sink`, checking [`output_past`] against `limit` before each output of a call to a def that
+/// may recurse reaches it (#7856); `refused` is set when the check fails, and the caller turns the
+/// stop into [`def_output_refusal`] once the body has returned.
+#[inline(always)]
+pub(crate) fn checked_def_output<T>(
+    limit: usize,
+    refused: &mut bool,
+    sink: &mut dyn FnMut(T) -> Demand,
+    item: T,
+) -> Demand {
+    if output_past(limit) {
+        *refused = true;
+        return Demand::Stop;
+    }
+    sink(item)
+}
+
+/// #7856: the outputs of a recursion climb through every level's consumer, and the climb is
+/// checked, so the depth ladder reaches the refusal without overflowing the thread's stack.
+#[cfg(all(test, feature = "std"))]
+mod def_output_floor_tests_7856 {
+    use super::*;
+    use crate::jq::eval_generic::GenericResult;
+    use crate::jq::parse;
+    use crate::json::JsonIndex;
+
+    const STACK: usize = 32 * 1024 * 1024;
+
+    /// Four streamed `foreach` stages: a consumer that takes far more stack for each output it
+    /// passes on than a level of the descent takes, in a debug build as in a release one.
+    const HEAVY: &str = "foreach (1,2) as $x (.; . + $x) | foreach (1,2) as $y (.; . + $y) \
+                         | foreach (1,2) as $z (.; . + $z) | foreach (1,2) as $w (.; . + $w)";
+
+    /// The issue's recursion through an object's value, and the same through a string
+    /// interpolation and a pipe, each with [`HEAVY`] as the consumer of the call's outputs, and
+    /// what jq 1.7.1 answers.
+    fn shapes() -> [(String, &'static str); 3] {
+        let leaf = format!("(0 | {HEAVY})");
+        [
+            (
+                format!(
+                    "def f($n): if $n <= 0 then {leaf} else {{k: f($n - 1), v: {leaf}}} end; \
+                     first(f(N)) | length"
+                ),
+                "2",
+            ),
+            (
+                format!(
+                    "def f($n): if $n <= 0 then {leaf} else \"\\(f($n - 1))\\({leaf})\" end; \
+                     first(f(N)) | length > 0"
+                ),
+                "true",
+            ),
+            (
+                format!(
+                    "def f($n): if $n <= 0 then 0 else f($n - 1) | {HEAVY} end; first(f(N)) | . > 0"
+                ),
+                "true",
+            ),
+        ]
+    }
+
+    /// What one evaluation answered: its outputs as JSON, or the error's message.
+    fn answer(program: &str, generic: bool) -> Result<Vec<String>, String> {
+        let expr = parse(program).expect("parses");
+        let json = b"null";
+        let index = JsonIndex::build(json);
+        let root = index.root(json);
+        with_stack_budget(STACK, || {
+            let outputs = if generic {
+                match crate::jq::eval_generic::eval(&expr, root.value()) {
+                    GenericResult::Error(e) => return Err(e.message),
+                    other => other.collect_owned::<JqSemantics>(),
+                }
+            } else {
+                match eval_full::<Vec<u64>, JqSemantics>(&expr, root) {
+                    QueryResult::Error(e) => return Err(e.message),
+                    other => other.collect_owned_checked::<JqSemantics>(),
+                }
+            };
+            Ok(outputs
+                .expect("decodes")
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect())
+        })
+    }
+
+    /// Climb depths 3% apart until the recursion is refused: every depth below answers as jq does,
+    /// and none overflows the stack (before #7856 the first route aborted a little short of the
+    /// floor's refusal).
+    fn climb(shape: &str, want: &str, generic: bool) -> u32 {
+        let mut depth = 1u32;
+        loop {
+            let program = shape.replace('N', &depth.to_string());
+            match answer(&program, generic) {
+                Ok(out) => assert_eq!(out, [want], "{program}"),
+                Err(message) => {
+                    assert!(
+                        message.ends_with("exceeded maximum recursion depth"),
+                        "{program}: {message}"
+                    );
+                    return depth;
+                }
+            }
+            assert!(depth < 1_000_000, "never refused: {shape}");
+            depth = (depth + 1).max(depth + depth / 33);
+        }
+    }
+
+    #[test]
+    fn a_recursion_climbing_through_its_consumers_refuses_instead_of_overflowing_7856() {
+        for (shape, want) in shapes() {
+            for generic in [false, true] {
+                let owned = shape.clone();
+                let refused = std::thread::Builder::new()
+                    .stack_size(STACK)
+                    .spawn(move || climb(&owned, want, generic))
+                    .expect("spawns")
+                    .join()
+                    .expect("refuses instead of overflowing");
+                assert!(refused > 1, "{shape}: answers at depth 1");
+            }
+        }
+    }
+}
+
 /// Run `f` with this thread's native-stack floor lifted (#7676), for a parse of fixed text the
 /// crate supplies itself: a path-mode prelude definition on its first use, the `_nwise` template.
 /// Either can be reached anywhere, the floor included, and since #7475 the parser refuses there,
@@ -120653,15 +121298,21 @@ pub(crate) fn enter_def_call_in(
     if native_stack_exhausted() {
         return Err(def_call_depth_refusal(def));
     }
+    Ok(def_call_guard(frames, hot))
+}
+
+/// [`enter_def_call`] once its floor check has passed: infallible, so a `DefCall` arm that checks
+/// the floor itself holds no `Result` across the call (#7856).
+pub(crate) fn def_call_guard(frames: u32, hot: bool) -> DefCallGuard {
     let scope = if hot {
         retention_scope::Scope::Hot
     } else {
         retention_scope::Scope::Cold
     };
-    Ok(DefCallGuard {
+    DefCallGuard {
         _depth: enter_def_call_frame(frames),
         _retained: retention_scope::enter(scope),
-    })
+    }
 }
 
 /// What [`enter_def_call`] holds for one `DefCall` evaluation. Field order is
@@ -121631,8 +122282,28 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
-    match bind_def_call(def, args, frames, bound) {
-        Ok(body) if tail_reachable(def, S::TAG == EvalTag::Jq) => each_def_tail_loop::<W, S>(
+    // #7856: an output of a call that may recurse climbs back through every level's consumer, so
+    // it checks the stack on its way out (`def_call_floors`). The wrapper's room is paid for in
+    // this frame, which every level of a recursion pays: the arm's error paths are out of line
+    // (`def_call_failed`, `def_output_refusal`), and it checks the floor itself so that it holds
+    // the call's guard, not a `Result` of one.
+    let body = match bind_def_call(def, args, frames, bound) {
+        Ok(body) => body,
+        Err(e) => return def_call_failed(e),
+    };
+    let Some(limit) = def_call_floors() else {
+        return def_output_refusal(def);
+    };
+    let mut refused = false;
+    let mut checked;
+    let sink: &mut dyn FnMut(Item<'a, W>) -> Demand = if super::tail_call::def_may_recurse(def) {
+        checked = |item| checked_def_output(limit, &mut refused, sink, item);
+        &mut checked
+    } else {
+        sink
+    };
+    let flow = if tail_reachable(def, S::TAG == EvalTag::Jq) {
+        each_def_tail_loop::<W, S>(
             def,
             frames,
             bound,
@@ -121640,13 +122311,15 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             TailValue::Borrowed(value),
             optional,
             sink,
-        ),
-        Ok(body) => match enter_def_call(def, frames, bound) {
-            Ok(_guard) => eval_each::<W, S>(&body, value, optional, sink),
-            Err(e) => Flow::Escaped(Control::Error(e)),
-        },
-        Err(e) => Flow::Escaped(Control::Error(e)),
+        )
+    } else {
+        let _guard = def_call_guard(frames, bound.is_hot());
+        eval_each::<W, S>(&body, value, optional, sink)
+    };
+    if refused {
+        return def_output_refusal(def);
     }
+    flow
 }
 
 /// What a tail loop carries from one round to the next (#5379): the value
@@ -162918,7 +163591,7 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn repeats_assertion_group_reads_any_text_6127() {
-        let scan = |p: &str| repeats_assertion_group(&p.chars().collect::<Vec<_>>());
+        let scan = |p: &str| first_invalid_repeat(&p.chars().collect::<Vec<_>>()).is_some();
         for (pattern, refused) in [
             (r"(?:\b)*", true),
             (r"(?:a|\b)+", true),
@@ -162962,7 +163635,7 @@ mod tests {
                     alphabet[((s >> 33) as usize) % alphabet.len()]
                 })
                 .collect();
-            let _ = repeats_assertion_group(&text);
+            let _ = first_invalid_repeat(&text);
         }
     }
 
