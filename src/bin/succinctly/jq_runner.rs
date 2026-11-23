@@ -5526,6 +5526,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     let uses_input_builtins = program_reads_inputs || seq_faults_by_queue(&args);
     PROGRAM_READS_INPUTS.with(|reads| reads.set(program_reads_inputs));
     PROGRAM_PULLS_INPUTS.with(|pulls| pulls.set(jq::walk::pulls_inputs(&expr)));
+    PROGRAM_HALTS.with(|halts| halts.set(jq::walk::can_halt(&expr)));
 
     // Configure output
     let output_config = OutputConfig::from_args(&args);
@@ -5879,13 +5880,17 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // route reads its file (#6920), so the run holds a window where it held the file; #7164: a pipe
     // too, up to its first record that is not that framing; #7322: and past such a record, when
     // plain records follow it.
-    let mut seq_windowed = if args.seq && lazy_route_open {
+    // #7775: a main loop that can halt over a pipe is walked as it is read (`walked_seq_sources`), so it
+    // answers at the record it halts on, as jq does, where the windows wait for 4 MiB or the pipe's end.
+    let halting_stdin = args.seq && lazy_route_open && halting_seq_stdin(&args);
+    let mut seq_windowed = if args.seq && lazy_route_open && !halting_stdin {
         windowed_seq_file(&args)
     } else {
         None
     };
     let mut seq_plain: Option<PreparedInputs> = if args.seq
         && lazy_route_open
+        && !halting_stdin
         && seq_windowed.is_none()
         && !args.validate
         && !args.null_input
@@ -7825,6 +7830,7 @@ fn read_inputs(
     LAZY_RAW_WINDOWS.with(|slot| *slot.borrow_mut() = None);
     LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
     LAZY_SEQ_INPUTS.with(|slot| *slot.borrow_mut() = None);
+    LAZY_SEQ_WALKS.with(|slot| *slot.borrow_mut() = None);
     defer_open_failures(Vec::new(), false);
     RAW_OPEN_FAILURES_POSSIBLE.with(|possible| possible.set(false));
     LAZY_OPEN_FAILED.with(|seen| seen.set(false));
@@ -7989,6 +7995,22 @@ fn read_inputs(
             // patchcov: coverage tolerate-line reason="untestable: stdin failing part-way"
             Err(e) => return Ok(Err(e)),
         }
+    }
+
+    // #7775: a `--seq` stream the `input` queue reads is walked as it is read, so a program that reads
+    // its first records reads only the bytes they are in, as jq does: every value, fault and place is
+    // the whole walk's. Anything the gate turns down is read whole below.
+    if let Some(sources) = walked_seq_sources(args, track_eof, &files) {
+        opened.clone_from(&files);
+        let mut locations = InputLocations::new(input_names(&files));
+        // How the stream ends is settled when the producer gets there.
+        locations.eof_tail = Some(EofTail {
+            newlines: 0,
+            unknown: true,
+        });
+        LAZY_SEQ_WALKS.with(|slot| *slot.borrow_mut() = Some(WalkedSeqInputs::new(sources)));
+        window::note_route("seq-walk");
+        return Ok(Ok((Vec::new(), locations, None, Vec::new())));
     }
 
     // Collect raw input from files or stdin. Read as bytes and decode below
@@ -10910,6 +10932,9 @@ thread_local! {
     /// [`PROGRAM_READS_INPUTS`] that reads the text after the read it is in. `input_line_number`
     /// asks where the read stands and reads nothing, so a warning it cannot reach is not said.
     static PROGRAM_PULLS_INPUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the program calls `halt` or `halt_error` (#7775), so its main loop can stop before the
+    /// last input: [`windowed_seq_file`] then reads no file whole before the first record runs.
+    static PROGRAM_HALTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The name of the last file named, when it did not open (#6480), for [`get_inputs`] to give a
     /// source of its own.
     static UNOPENED_TAIL_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -12832,7 +12857,18 @@ fn windowed_seq_file(args: &JqCommand) -> Option<WindowedSource> {
             reread,
         ));
     }
-    let plain = reread.plain_seq_files();
+    // #7775: a program that can halt can stop at its first record, where jq has read no further, so no
+    // file is read whole first to vouch for it: each is judged as the run reaches it, a lone one by
+    // the gate of #7262, several as from a first file that is not plain (#7341).
+    let plain = if PROGRAM_HALTS.with(std::cell::Cell::get) {
+        if files.len() < 2 {
+            drop(reader);
+            return gated_seq_source(files);
+        }
+        0
+    } else {
+        reread.plain_seq_files()
+    };
     // #7341: the first file not plain may be the first of all: the files from it are judged as the run
     // reaches them, and one that opens with an RS is read by a gate of its own.
     if files.len() > 1 && plain < files.len() {
@@ -17386,7 +17422,12 @@ fn seed_input_queue(
     trailing_error: Option<TrailingParseError>,
     resumed_errors: Vec<(usize, TrailingParseError)>,
 ) {
-    if let Some(lazy) = LAZY_SEQ_INPUTS.with(|slot| slot.borrow_mut().take()) {
+    if let Some(walked) = LAZY_SEQ_WALKS.with(|slot| slot.borrow_mut().take()) {
+        // #7775: a `--seq` stream walked as the program reads it.
+        debug_assert!(inputs.is_empty() && trailing_error.is_none() && resumed_errors.is_empty());
+        jq::seed_remaining_inputs_from(walked.into_producer());
+        locations.count_reads_past_end(slurp);
+    } else if let Some(lazy) = LAZY_SEQ_INPUTS.with(|slot| slot.borrow_mut().take()) {
         // #6500: a `--seq` stream's records, converted as the program reads them, with the
         // reader's faults between them. `inputs` is empty and the faults are in `lazy`.
         debug_assert!(inputs.is_empty() && trailing_error.is_none() && resumed_errors.is_empty());
@@ -17692,6 +17733,338 @@ impl LazySeqInputs {
     }
 }
 
+/// A source [`WalkedSeqInputs`] reads, with its tag: standard input (or the bytes a probe of it read),
+/// with whether a read of it never waits; or a file named on the command line, opened when the walk
+/// reaches it, as jq's reader opens each file only once it has used every byte of the one before.
+enum WalkedSeqSource {
+    Reader(Box<dyn Read>, bool),
+    File {
+        path: PathBuf,
+        /// Whether it is the last file named: jq's reader does not report a directory there (#6472).
+        last: bool,
+    },
+}
+
+/// The sources of a `--seq` stream the `input` queue reads, when it can be walked as it is read
+/// (#7775): every file named is a regular file or a named pipe that `stat` finds and the run may read
+/// ([`readable`]; no directory, no `-`, no `/dev/fd/N`, none of the run's own descriptors), or
+/// standard input is a pipe, a socket or a terminal. Nothing is opened here: a file is opened when the
+/// walk reaches it, as jq's reader opens it, so a run that stops early never touches the files after
+/// the records it read, a named pipe among them. A regular file on standard input is read whole, as
+/// before: a run that stops early leaves its descriptor at the end, where the whole read leaves it. A
+/// path that is missing or will not open, `-s`, `--stream`, `--validate` and a program the main loop
+/// alone reads keep the routes they had, but for a main loop that can halt over a pipe
+/// ([`halting_seq_stdin`]).
+fn walked_seq_sources(
+    args: &JqCommand,
+    track_eof: bool,
+    files: &[PathBuf],
+) -> Option<Vec<(Option<usize>, WalkedSeqSource)>> {
+    if !args.seq
+        || args.raw_input
+        || args.input_dsv.is_some()
+        || args.stream
+        || args.stream_errors
+        || args.slurp
+        || args.validate
+        || !track_eof
+        // A program the main loop alone reads keeps its routes, but for one that can halt over
+        // standard input (`halting_seq_stdin`): only `input` and `halt` stop early.
+        || !(PROGRAM_READS_INPUTS.with(std::cell::Cell::get)
+            || (files.is_empty() && PROGRAM_HALTS.with(std::cell::Cell::get)))
+        || lazy_route_forced_off()
+        || window::whole_file_forced()
+    {
+        return None;
+    }
+    if files.is_empty() {
+        if crate::cli::stdin_access::unreadable() {
+            return None;
+        }
+        if let Some(bytes) = STDIN_PUSHBACK.with(|slot| slot.borrow_mut().take()) {
+            if STDIN_PUSHBACK_ERROR.with(|slot| slot.borrow().is_some()) {
+                STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = Some(bytes));
+                return None;
+            }
+            let source = WalkedSeqSource::Reader(Box::new(std::io::Cursor::new(bytes)), true);
+            return Some(vec![(None, source)]);
+        }
+        let source = WalkedSeqSource::Reader(Box::new(stdin_unless_regular()?), false);
+        return Some(vec![(None, source)]);
+    }
+    let run = RunFiles::new();
+    for path in files {
+        if is_stdin_dash(path) || path.starts_with("/dev/fd/") {
+            return None;
+        }
+        let meta = std::fs::metadata(path).ok()?;
+        if !walked_seq_file_kind(&meta) || run.names(&meta) || !readable(path) {
+            return None;
+        }
+    }
+    Some(
+        files
+            .iter()
+            .enumerate()
+            .map(|(at, path)| {
+                let source = WalkedSeqSource::File {
+                    path: path.clone(),
+                    last: at + 1 == files.len(),
+                };
+                (Some(at), source)
+            })
+            .collect(),
+    )
+}
+
+/// Whether the run may read `path`, asked of `access(2)`, which opens nothing: a file that will not
+/// open is the whole-file route's, which reports it where jq does (#6480, #7197). One that passes and
+/// then will not open when the walk reaches it (it was replaced in between) is said as jq says it,
+/// then, and the run exits 2.
+fn readable(path: &Path) -> bool {
+    crate::cli::stdin_access::readable(path)
+}
+
+/// Whether a file `stat` describes so is one [`walked_seq_sources`] walks: a regular file or a named
+/// pipe.
+#[cfg(unix)]
+fn walked_seq_file_kind(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    meta.is_file() || meta.file_type().is_fifo()
+}
+
+#[cfg(not(unix))]
+fn walked_seq_file_kind(meta: &std::fs::Metadata) -> bool {
+    meta.is_file()
+}
+
+/// Standard input as a file of its own (a duplicate of descriptor 0) when it is a pipe, a socket or a
+/// terminal, which [`WalkedSeqInputs`] reads a `read` at a time (#7775). A regular file, a directory
+/// and anything else keep the routes they had.
+#[cfg(unix)]
+fn stdin_unless_regular() -> Option<std::fs::File> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileTypeExt;
+    let file = std::fs::File::from(std::io::stdin().as_fd().try_clone_to_owned().ok()?);
+    let kind = file.metadata().ok()?.file_type();
+    (kind.is_fifo() || kind.is_socket() || kind.is_char_device()).then_some(file)
+}
+
+#[cfg(not(unix))]
+fn stdin_unless_regular() -> Option<std::fs::File> {
+    None
+}
+
+/// Whether a `--seq` main loop that can halt reads standard input that is not a regular file, with
+/// no file named (#7775): [`walked_seq_sources`] then walks it as it is read, so the run answers at
+/// the record it halts on, where the windowed pipe (#7164) and the probe of a clean stream (#5674)
+/// read 4 MiB, or the whole pipe, first. A regular file keeps its routes, which stop at the window
+/// the run halts in (#7262's gate, [`windowed_seq_file`]).
+fn halting_seq_stdin(args: &JqCommand) -> bool {
+    args.seq
+        && !args.null_input
+        && !args.slurp
+        && !args.validate
+        && PROGRAM_HALTS.with(std::cell::Cell::get)
+        && get_input_files(args).is_empty()
+        && !lazy_route_forced_off()
+        && !window::whole_file_forced()
+        && !crate::cli::stdin_access::unreadable()
+        && STDIN_PUSHBACK.with(|slot| slot.borrow().is_none())
+        && stdin_unless_regular().is_some()
+}
+
+/// A `--seq` stream read and walked as the `input` queue asks for its records (#7775): the bytes of
+/// each source are read a block at a time, and [`crate::cli::jq_seq_reader::SeqStreamWalker`] walks
+/// them, so the records the program reads, and the faults before them, are all that is read; and
+/// each record is taken out of the walk as it is handed on, so what is held is what jq's reader
+/// holds, however long the stream.
+struct WalkedSeqInputs {
+    walk: crate::cli::jq_seq_reader::SeqStreamWalker,
+    /// The sources not yet read to their end, the one being read first.
+    sources: std::collections::VecDeque<(Option<usize>, WalkedSeqSource)>,
+    /// The front source once it is open, with whether a read of it never waits.
+    reading: Option<(Box<dyn Read>, bool)>,
+    /// How many bytes the next read asks for: a small first read, doubling to a window
+    /// ([`window::window_bytes`]).
+    want: usize,
+    /// Whether the end of every source has been read and the walk has finished.
+    ended: bool,
+}
+
+impl WalkedSeqInputs {
+    fn new(sources: Vec<(Option<usize>, WalkedSeqSource)>) -> Self {
+        Self {
+            walk: crate::cli::jq_seq_reader::SeqStreamWalker::new(),
+            sources: sources.into(),
+            reading: None,
+            want: 1 << 16,
+            ended: false,
+        }
+    }
+
+    /// Reads the next block of the stream into the walk and walks it, opening the next source when
+    /// the one before has been read to its end.
+    fn read_more(&mut self) {
+        loop {
+            let Some((tag, source)) = self.sources.front_mut() else {
+                self.walk.end();
+                self.walk.advance();
+                self.ended = true;
+                return;
+            };
+            let tag = *tag;
+            if self.reading.is_none() {
+                self.walk.start_source(tag);
+                let opened = match source {
+                    WalkedSeqSource::Reader(reader, regular) => Ok((
+                        std::mem::replace(reader, Box::new(std::io::empty())),
+                        *regular,
+                    )),
+                    WalkedSeqSource::File { path, .. } => {
+                        window::open_not_a_directory(path).map(|(file, meta)| {
+                            let reader: Box<dyn Read> = Box::new(file);
+                            (reader, meta.is_file())
+                        })
+                    }
+                };
+                match opened {
+                    Ok(reading) => self.reading = Some(reading),
+                    Err(error) => {
+                        // It passed `access` and was replaced since ([`readable`]): jq's reader says
+                        // so as it moves on to the next file, which is now, the file reads as no
+                        // bytes, and the run exits 2.
+                        if let WalkedSeqSource::File { path, last } = source {
+                            InputFileOpenError::from_io(path, &error, *last).report();
+                            LAZY_OPEN_FAILED.with(|seen| seen.set(true));
+                        }
+                        self.end_source();
+                        continue;
+                    }
+                }
+            }
+            let Some((reader, regular)) = self.reading.as_mut() else {
+                continue;
+            };
+            match self.walk.read_from(reader.as_mut(), self.want, *regular) {
+                Ok(0) => {
+                    self.end_source();
+                    if self.sources.is_empty() {
+                        continue;
+                    }
+                    self.walk.advance();
+                    return;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // A source that failed part-way ended there: jq reports it and exits 2 (#5498).
+                    abort_if_out_of_memory(&error);
+                    if tag.is_some() {
+                        report_input_read_failure(&error);
+                    } else {
+                        note_stdin_read_failed();
+                    }
+                    self.end_source();
+                    continue;
+                }
+            }
+            self.want = (self.want * 2).min(window::window_bytes().max(1 << 16));
+            self.walk.advance();
+            return;
+        }
+    }
+
+    /// The front source has been read to its end: its descriptor is given back now.
+    fn end_source(&mut self) {
+        self.walk.end_source();
+        self.sources.pop_front();
+        self.reading = None;
+    }
+
+    /// The next record or fault, or `None` once both are out and the stream has ended. The order is
+    /// [`LazySeqInputs::next`]'s.
+    fn next(&mut self) -> Option<jq::ProducedInput> {
+        loop {
+            if let Some(fault) = self.walk.peek_fault() {
+                if fault.values_before <= self.walk.taken()
+                    || (self.ended && !self.walk.has_value())
+                {
+                    let fault = self.walk.pop_fault()?;
+                    let tag = self.tag_of(fault.source);
+                    let (source, line) = if fault.position_lost {
+                        (NO_SOURCE, UNKNOWN_LINE)
+                    } else {
+                        (tag, fault.line as u64)
+                    };
+                    return Some(jq::ProducedInput::Error(
+                        EvalError::new(fault.body),
+                        (source, line),
+                    ));
+                }
+            }
+            if let Some(((start, end), (source, line))) = self.walk.pop_value() {
+                let tag = self.tag_of(source);
+                let cuts = self.walk.cuts_for(start, end);
+                let (data, base) = self.walk.window();
+                let first_invalid = self.walk.utf8_up_to().saturating_sub(base);
+                // A record the checked materializer refuses is dropped, with its place.
+                if let Some(value) =
+                    seq_record_value(data, first_invalid, start - base, end - base, &cuts)
+                {
+                    return Some(jq::ProducedInput::Document(value, tag, line as u64));
+                }
+                continue;
+            }
+            if self.ended {
+                return None;
+            }
+            self.read_more();
+        }
+    }
+
+    /// The tag the input queue names source `index` by, as [`LazySeqInputs::new`] gives it.
+    fn tag_of(&self, index: usize) -> u32 {
+        self.walk
+            .sources()
+            .get(index)
+            .and_then(|&(tag, _)| tag)
+            .map_or(0, |tag| u32::try_from(tag).unwrap_or(u32::MAX))
+    }
+
+    /// Where an `input` past the end of the stream stands (#6146, [`seq_eof_tail`]): the last
+    /// source's newlines, or no position when the read that reached the end completed the last value.
+    fn exhausted(&self) -> Option<(u32, u64)> {
+        let sources = self.walk.sources();
+        let Some(&(tag, last_start)) = sources.last() else {
+            return Some((0, 0));
+        };
+        let (newlines, line_start) = self.walk.last_source_lines();
+        // [`EofTail::final_read_start`] of the last source, from where its last line starts.
+        let total = self.walk.total();
+        let final_read_start = total - (total - line_start) % JQ_READ_CHUNK;
+        let unknown = self
+            .walk
+            .last_value()
+            .is_some_and(|(first, end)| EofTail::completes_at_byte(first, end) >= final_read_start);
+        debug_assert!(final_read_start >= last_start);
+        let base = if sources.len() == 1 {
+            crate::cli::jq_seq_reader::seeded_line_base()
+        } else {
+            0
+        };
+        let tag = tag.map_or(0, |tag| u32::try_from(tag).unwrap_or(u32::MAX));
+        (!unknown).then(|| (tag, (newlines + base) as u64))
+    }
+
+    /// The producer the `input` queue pulls the stream from.
+    fn into_producer(mut self) -> jq::InputProducer {
+        Box::new(move || {
+            self.next()
+                .unwrap_or_else(|| jq::ProducedInput::End(self.exhausted()))
+        })
+    }
+}
+
 /// `--stream` and `--stream-errors` inputs read as the program asks for them (#5498): jq's streaming parser over
 /// the sources' bytes, and what its source indices mean.
 struct LazyStreamInputs {
@@ -17808,6 +18181,10 @@ thread_local! {
     /// Set by [`get_inputs`] for a `--seq` stream (#6500): its records, converted as the program
     /// reads them, which the call site that seeds the `input` queue takes.
     static LAZY_SEQ_INPUTS: std::cell::RefCell<Option<LazySeqInputs>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set by [`get_inputs`] for a `--seq` stream walked as it is read (#7775), which the call site
+    /// that seeds the `input` queue takes.
+    static LAZY_SEQ_WALKS: std::cell::RefCell<Option<WalkedSeqInputs>> =
         const { std::cell::RefCell::new(None) };
 }
 

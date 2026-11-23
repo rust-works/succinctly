@@ -2549,7 +2549,9 @@ impl FileIdentity {
 
 /// The file `path` names now, opened, with its metadata. A directory opens on Unix and fails at its first
 /// read, so it fails here, as `EISDIR`.
-fn open_not_a_directory(path: &std::path::Path) -> io::Result<(File, std::fs::Metadata)> {
+pub(super) fn open_not_a_directory(
+    path: &std::path::Path,
+) -> io::Result<(File, std::fs::Metadata)> {
     let file = File::open(path)?;
     let meta = file.metadata()?;
     if meta.is_dir() {
