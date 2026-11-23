@@ -10724,6 +10724,123 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     escape.resume(flow, direct_pattern_retry(key))
 }
 
+/// [`eval_each`], run to its value first when `expr` calls a def and answers once (#7787): an
+/// object's key or value and a string interpolation's part drive the rest of the construction from
+/// their output sink, so an unsettled call there held its native frames while the next part ran
+/// (`{a: t, b: t}`, `"\(t)\(t)"`).
+///
+/// The question is answered before the evaluation, out of line ([`part_answers_once`]), and a part
+/// that does not settle is evaluated from this inline frame (#7846). Asked around the evaluation, in
+/// a frame of its own, it put that frame under every streamed part: a part that streams is what
+/// holds the recursion's native frames while the rest of the construction runs, so a tree recursion
+/// over a leaf with two outputs (`(foreach (1, 2) as $x (0; . + $x))`) was refused a level earlier
+/// than before #7787, where jq answers.
+#[inline(always)]
+fn eval_each_settling<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    use super::tail_call::{may_hold_call, SPINE_DEPTH};
+    if S::TAG == EvalTag::Jq && may_hold_call(expr, SPINE_DEPTH) && part_answers_once(expr) {
+        return eval_each_settled::<W, S>(expr, value, optional, sink);
+    }
+    eval_each::<W, S>(expr, value, optional, sink)
+}
+
+/// Whether a part that holds a call on its spine answers once (`tail_call::answers_once`, jq
+/// mode): out of line, so its walk takes no room in the frame of the construction that asks it, and
+/// that frame is gone before the part runs (#7846). Asked by both evaluators' settling parts.
+#[inline(never)]
+pub(crate) fn part_answers_once(expr: &Expr) -> bool {
+    super::tail_call::answers_once(expr, true)
+}
+
+/// [`eval_each_settling`] for a part that answers once: run to its value, then replayed.
+#[inline(never)]
+fn eval_each_settled<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    settle_then_replay(
+        |collect| eval_each::<W, S>(expr, value, optional, collect),
+        sink,
+    )
+}
+
+/// The parts the settle question is asked of (#7846), shared with `eval_generic`'s twin test.
+#[cfg(test)]
+pub(crate) mod settling_part_tests_7846 {
+    use super::*;
+    use crate::jq::tail_call::{may_hold_call, SPINE_DEPTH};
+
+    /// `src`'s last expression with every def it declares bound into it, as the evaluator binds
+    /// them: a call to a recursive def is an `Expr::DefCall` whose body still calls it by name.
+    pub(crate) fn bound(src: &str) -> Expr {
+        let mut program = crate::jq::parse(src).expect("parses");
+        let mut defs: Vec<Rc<FuncDefData>> = Vec::new();
+        while let Expr::FuncDef {
+            name,
+            params,
+            body,
+            then,
+            ..
+        } = program
+        {
+            let body = defs
+                .iter()
+                .fold(*body, |e, d| install_def_calls(&e, d, 0, false));
+            defs.push(Rc::new(FuncDefData::new(name, params, body)));
+            program = *then;
+        }
+        defs.iter()
+            .fold(program, |e, d| install_def_calls(&e, d, 0, false))
+    }
+
+    /// A call to a recursive def whose leaf yields two outputs: on the spine, and streaming.
+    pub(crate) const STREAMED: &str =
+        "def t: if . then (foreach (1, 2) as $x (0; . + $x)) else t end; t";
+    /// The same with a leaf that yields one: settled.
+    pub(crate) const SETTLED: &str = "def t: if . then 1 else t end; t";
+
+    #[test]
+    fn the_question_is_unchanged_by_where_it_is_asked_7846() {
+        let streamed = bound(STREAMED);
+        assert!(may_hold_call(&streamed, SPINE_DEPTH));
+        assert!(!part_answers_once(&streamed));
+        let settled = bound(SETTLED);
+        assert!(may_hold_call(&settled, SPINE_DEPTH));
+        assert!(part_answers_once(&settled));
+    }
+
+    /// A part that streams reaches its consumer at the stack depth the plain evaluation reaches it
+    /// at: the settle question leaves no frame under it. With one (#7787's out-of-line wrapper
+    /// around the evaluation), every suspended level of a tree recursion through a string
+    /// interpolation or an object paid for it, and `"\(f($n - 1))\(f($n - 1))"` over a two-output
+    /// leaf was refused at depth 12, where jq answers.
+    #[test]
+    fn a_streamed_part_reaches_its_consumer_as_deep_as_the_plain_evaluation_7846() {
+        let part = bound(STREAMED);
+        let doc = b"true";
+        let index = crate::json::JsonIndex::build(doc);
+        let cursor = index.root(doc);
+        let mut seen: Vec<usize> = Vec::new();
+        let mut probe = |_: Item<'_, Vec<u64>>| {
+            seen.push(stack_address());
+            Demand::Continue
+        };
+        let plain = eval_each::<Vec<u64>, JqSemantics>(&part, cursor.value(), false, &mut probe);
+        let settling =
+            eval_each_settling::<Vec<u64>, JqSemantics>(&part, cursor.value(), false, &mut probe);
+        assert!(matches!(plain, Flow::Exhausted) && matches!(settling, Flow::Exhausted));
+        assert_eq!(seen.len(), 4, "two outputs each");
+        assert_eq!(seen[..2], seen[2..], "the settling route adds no frame");
+    }
+}
+
 /// Demand-forwarding twin of [`build_string_parts`] (#2180 WP2b), jq mode
 /// only -- yq mode's own string interpolation isn't a fan-out generator at
 /// all (see [`eval_string_interpolation`]'s own doc comment), so it never
@@ -10740,42 +10857,6 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 /// `eval_single` so a `?//` bind inside it sees a wrapping consumer's
 /// [`Demand::Stop`]. Captured live: `[first("\(1 as $x ?// $y | 1)")]` is
 /// `["1","1"]`, where the eager fallback answered `["1"]`.
-/// [`eval_each`], run to its value first when `expr` calls a def and answers once (#7787): an
-/// object's key or value and a string interpolation's part drive the rest of the construction from
-/// their output sink, so an unsettled call there held its native frames while the next part ran
-/// (`{a: t, b: t}`, `"\(t)\(t)"`).
-#[inline(always)]
-fn eval_each_settling<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    expr: &Expr,
-    value: StandardJson<'a, W>,
-    optional: bool,
-    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
-) -> Flow {
-    use super::tail_call::{may_hold_call, SPINE_DEPTH};
-    if S::TAG == EvalTag::Jq && may_hold_call(expr, SPINE_DEPTH) {
-        return eval_each_settling_call::<W, S>(expr, value, optional, sink);
-    }
-    eval_each::<W, S>(expr, value, optional, sink)
-}
-
-/// [`eval_each_settling`] for a part that holds a call on its spine.
-#[inline(never)]
-fn eval_each_settling_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    expr: &Expr,
-    value: StandardJson<'a, W>,
-    optional: bool,
-    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
-) -> Flow {
-    if super::tail_call::answers_once(expr, true) {
-        settle_then_replay(
-            |collect| eval_each::<W, S>(expr, value, optional, collect),
-            sink,
-        )
-    } else {
-        eval_each::<W, S>(expr, value, optional, sink)
-    }
-}
-
 fn each_string_parts<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     parts: &[StringPart],
     value: StandardJson<'a, W>,

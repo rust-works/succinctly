@@ -27956,18 +27956,14 @@ fn stream_owned_outputs_generic<S: EvalSemantics, V: DocumentValue>(
     (out, control)
 }
 
-/// `eval_each_generic`, except that an `expr` which
-/// `eval::settles_before_consumer` is evaluated to completion before its
-/// output reaches `sink` (#3296) -- so a bound source's consumer, often the
-/// rest of a recursion (`f(n - 1) as $a | f(n - 2) as $b | $a + $b`), does not
-/// run on top of the source's own frames.
 /// [`eval_each_generic`], run to its value first when `expr` calls a def and answers once, jq mode
 /// only (#7787): `eval::eval_each_settling`'s rule, for an object's key or value and a string
 /// interpolation's part.
 ///
 /// Inline, with only the shape test (`tail_call::may_hold_call`) in front of the plain evaluation:
 /// a part that holds no call on its spine (`.name`, `.age`) costs one test, and the rest of the
-/// question is asked out of line.
+/// question is asked out of line (`eval::part_answers_once`). A part that does not settle is
+/// evaluated from this inline frame, with no frame of the question's under it (#7846).
 #[inline(always)]
 fn each_generic_settling<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
@@ -27977,32 +27973,71 @@ fn each_generic_settling<S: EvalSemantics, V: DocumentValue>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     use crate::jq::tail_call::{may_hold_call, SPINE_DEPTH};
-    if S::TAG == EvalTag::Jq && may_hold_call(expr, SPINE_DEPTH) {
-        return each_generic_settling_call::<S, V>(expr, value, optional, cursor, sink);
+    if S::TAG == EvalTag::Jq
+        && may_hold_call(expr, SPINE_DEPTH)
+        && crate::jq::eval::part_answers_once(expr)
+    {
+        return each_generic_settled::<S, V>(expr, value, optional, cursor, sink);
     }
     eval_each_generic::<S, V>(expr, value, optional, cursor, sink)
 }
 
-/// [`each_generic_settling`] for a part that holds a call on its spine.
+/// [`each_generic_settling`] for a part that answers once: run to its value, then replayed.
 #[inline(never)]
-fn each_generic_settling_call<S: EvalSemantics, V: DocumentValue>(
+fn each_generic_settled<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
     optional: bool,
     cursor: Option<V::Cursor>,
     sink: &mut dyn Sink<V>,
 ) -> Flow {
-    if crate::jq::tail_call::answers_once(expr, true) {
-        return settle_then_replay(
-            |collect| {
-                eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| collect(item))
-            },
-            |item| sink.push(item),
-        );
-    }
-    eval_each_generic::<S, V>(expr, value, optional, cursor, sink)
+    settle_then_replay(
+        |collect| {
+            eval_each_generic::<S, V>(expr, value, optional, cursor, &mut |item| collect(item))
+        },
+        |item| sink.push(item),
+    )
 }
 
+/// `eval::settling_part_tests_7846`'s stack test for the generic evaluator's settling part.
+#[cfg(test)]
+mod settling_part_tests_7846 {
+    use super::*;
+    use crate::jq::eval::settling_part_tests_7846::{bound, STREAMED};
+
+    /// An address in the caller's native stack frame.
+    #[inline(never)]
+    fn stack_address() -> usize {
+        let marker = 0u8;
+        core::hint::black_box(core::ptr::addr_of!(marker)) as usize
+    }
+
+    #[test]
+    fn a_streamed_part_reaches_its_consumer_as_deep_as_the_plain_evaluation_7846() {
+        let part = bound(STREAMED);
+        let doc = b"true";
+        let index = crate::json::JsonIndex::build(doc);
+        let mut seen: Vec<usize> = Vec::new();
+        let mut probe = |_: GenericItem<crate::json::StandardJson<'_, Vec<u64>>>| {
+            seen.push(stack_address());
+            Demand::Continue
+        };
+        let value = index.root(doc).value();
+        let plain =
+            eval_each_generic::<JqSemantics, _>(&part, value.clone(), false, None, &mut probe);
+        let settling =
+            each_generic_settling::<JqSemantics, _>(&part, value, false, None, &mut probe);
+        assert!(matches!(plain, Flow::Exhausted) && matches!(settling, Flow::Exhausted));
+        assert_eq!(seen.len(), 4, "two outputs each");
+        assert_eq!(seen[..2], seen[2..], "the settling route adds no frame");
+    }
+}
+
+/// `eval_each_generic`, except that an `expr` which
+/// `eval::settles_before_consumer` is evaluated to completion before its
+/// output reaches `sink` (#3296) -- so a bound source's consumer, often the
+/// rest of a recursion (`f(n - 1) as $a | f(n - 2) as $b | $a + $b`), does not
+/// run on top of the source's own frames.
 fn settled_each_generic<S: EvalSemantics, V: DocumentValue>(
     expr: &Expr,
     value: V,
