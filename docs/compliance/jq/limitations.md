@@ -13845,6 +13845,8 @@ The routes that read several files a window at a time skip a mark at the front o
 `--stream` and `--stream-errors` read with a model of jq's streaming parser that matches the mark as `jv_parser_set_buf` does, and since [#7603](https://github.com/rust-works/succinctly/issues/7603) they answer a mark that breaks off as jq does: `jq: parse error: Malformed BOM`, exit 5, with no event, and under `-n` the error `Malformed BOM` from every `input`, since jq's parser never reads past it.
 Before #7603 `--stream-errors` turned it into a numeric-literal event and exited 0 (`printf '\xef1\n' | jq -c --stream-errors .` printed `["Invalid numeric literal at line 2, column 0",[]]`), and `--stream` worded it as that numeric literal.
 Only the plain routes, which do not read with the streaming parser, keep the numeric-literal wording.
+Only the first read of that fault has the wording: jq's parser stays in the fault, so on the plain routes too every read after it (`input` a second time, `inputs`, `first(inputs)`) says `Malformed BOM` at the same `(at FILE:LINE)`, and the text after the mark is never read (#7863).
+Pinned by `tests/jq_cli/i7863.rs`.
 
 ### A leading BOM is read in jq's first 4,095-byte read, as jq 1.7.1 reads it; jq 1.8.2 reads 4,091 bytes (#7569)
 
