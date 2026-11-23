@@ -457,11 +457,17 @@ jq 1.8.2 reads once more before it closes the array (jqlang/jq#3279, commit 4e30
 `succinctly jq` follows 1.8.2 for `--stream -s` and `--stream-errors -s`, with and without `-n`, over standard input and files, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
 This replaces the rule #5548 added, which matched 1.7.1.
 `input_filename` and `input_line_number` read where the array was closed, as they did.
-What the same upstream change does not reach here: a text that ends in a fault (`printf '[1,' | jq -s --stream .`) is raised without the array in 1.8.2, where 1.7.1 printed the array and then raised, and `succinctly jq` still prints the array first; with `--stream-errors -s` the fault event that follows the array reads `input_filename` as the last file in 1.8.2 and as `null` here, and in that case the closing event keeps the 1.7.1 place too.
+The same reading decides a text whose last byte completes a value while the parser still holds an unfinished one (#7807): a number or literal straight before a `"`, `[` or `{` that ends the text (`2"`, `1 2"`, `true[`), and under `--stream` also a `,` or a closer the text ends on inside a container (`[1,`, `{"a":1,`, `[[1]`).
+jq 1.7.1 printed the array and then raised the fault its next call met (`printf '2"' | jq -c -s .` printed `[2]`, and `printf '[1,' | jq -c -s --stream .` printed `[[[0],1]]`), and jq 1.8.2 meets the fault before it closes the array and prints the error alone, at exit 5.
+`succinctly jq` follows 1.8.2 there on every route that slurps, standard input, files and a pipe read in windows alike, with one decision for all of them (`slurp_sources` in `src/bin/succinctly/jq_stream_errors.rs`): plain `-s`, which had followed 1.8.2 for `2"` and 1.7.1 for `1[` (#6004), `--stream -s`, which had followed 1.7.1 for both (#6061), `--stream-errors -s`, whose array now ends in the fault event, and `-n -s`, whose first `input` raises the fault and whose second returns the array.
+A value the closing call yields is still in the array and the fault comes after it, in both releases: `printf '[[1]' | jq -c -s --stream .` prints `[[[0,0],1],[[0,0]]]` and then the error, where 1.7.1 printed `[[0,0]]` after the array.
+A file that did not open before the text no longer hides the fault, which jq 1.7.1's main loop never read once the array was out: `jq -c -s --stream . missing.json two.json` over `2"` printed `[[[],2]]` and exited 2 with only the open failure on stderr, and jq 1.8.2 and `succinctly jq` print the parse error after it.
+A list that ends in a file that did not open, or in a directory, keeps jq 1.7.1's reads, as for `--seq` (#7718), and the positions stay jq 1.7.1's (#7607): the fault an `input` raises under `-n -s --stream` names `(at <unknown>)`, the closed input jq 1.7.1 met it at, where jq 1.8.2 names `(at <stdin>:0)`.
+In the same way the fault event that follows the array under `--stream-errors -s` (`[[1]` again) reads `input_filename` as `null`, where jq 1.8.2 names the last file.
 `--seq --stream -s` follows 1.8.2 too since #7718, which adopts the same commit's reading for `--seq` (below).
-The cases that read a directory in the middle of the file list keep the 1.7.1 model of the slurp loop.
+A directory or a file that did not open in the middle of the list kept the 1.7.1 model of the slurp loop until #7807, and reads as 1.8.2 reads it since: `jq -c -s --stream . dir one.json` over `[1]` is `[[[0],1],[[0]]]`, where 1.7.1 lost the `[[0]]`.
 `succinctly yq` is not changed.
-Pinned by `tests/jq_cli/i7523.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+Pinned by `tests/jq_cli/i7523.rs` and `tests/jq_cli/i7807.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 
 ## After the last input has been read to its end, the position is jq 1.7.1's, not jq 1.8.2's (#7607)
 
@@ -11212,11 +11218,10 @@ reads) plus two consequences of the route:
   with no output and jq's own parse error (`jq: parse error: Unfinished JSON term at EOF at line 3, column 0`, [#5555](https://github.com/rust-works/succinctly/issues/5555)).
   `-n -s` with `inputs` raises it as jq does, `jq: error (at <file>:<line>): …` at the position jq's parser stood on.
   Under `-n -s` jq reads on the first `input`, and so does succinctly since [#6019](https://github.com/rust-works/succinctly/issues/6019): each fault the stream holds is the error of one call, all of them ahead of the array, which holds every value read (the ones after a fault too, since jq goes on with the next line); `try input catch "E"` on `1 2 }` prints `"E"`, and a program that never calls `input` prints its result.
-  A stream that ends in a bare token and the one character that ends it (`1[`, `true{`) closes jq's array before the end-of-file fault, which then comes after the array and names `<unknown>`.
-  So does succinctly since [#6004](https://github.com/rust-works/succinctly/issues/6004): `printf '1[' | jq -cs .` prints `[1]` and then the parse error, and an `input` that meets the fault names `(at <unknown>)`.
-  Only that shape does, and only where it ends the whole stream: `1 [`, `"a"[` and `[1][` keep the all-or-nothing slurp and the file in the marker, as in jq, and so does a token followed by a file that would not open.
-  `--stream -s` does the same since [#6061](https://github.com/rust-works/succinctly/issues/6061), and for every fault met by a call after the one that closes its array: jq closes the array at the call that consumes the last byte, so an event that byte completes is in it (`printf '1[' | jq -cs --stream .` is `[[[],1]]`, `[1,` is `[[[0],1]]`, `[{}` is `[[[0],{}]]`) and the end-of-input fault comes after it.
-  A fault met by that call or an earlier one is still the whole result (`[1,2`, `1 [`).
+  A stream that ends in a bare token and the one character that ends it (`1[`, `true{`) closed jq 1.7.1's array before the end-of-file fault, which then came after the array and named `<unknown>`.
+  So did succinctly from [#6004](https://github.com/rust-works/succinctly/issues/6004), and `--stream -s` from [#6061](https://github.com/rust-works/succinctly/issues/6061) for every fault met by a call after the one that closed its array (`[1,` printed `[[[0],1]]` first).
+  jq 1.8.2 meets that fault before it closes the array, and so does succinctly since [#7807](https://github.com/rust-works/succinctly/issues/7807): the slurp is all-or-nothing for these shapes too (the `--stream --slurp` section of #7523 above has the rows).
+  An `input` under `-n -s` that meets the fault still names `(at <unknown>)`, jq 1.7.1's position (#7607).
   A file earlier than the one the splitter stopped in is read again from disk to find a fault ahead of it, since its buffer is gone.
 - A value jq rejects as undecodable (`"\ud800"`, `"\x"`) is echoed raw, as on the default
   route ([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)), where
