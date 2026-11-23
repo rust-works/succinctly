@@ -269,14 +269,14 @@ jq -R '.'` drops the byte even though the file's own trailing newline follows). 
 "the whole buffer's own end" in a realistic multi-field document or multi-line file, and
 jq's trigger is not rare — it fires on *any* string/line ending in the right byte shape,
 however much more content follows elsewhere in the file — so a whole-file caller would
-essentially never reproduce it. Every caller is now scoped the way jq scopes it:
+essentially never reproduce it. Every caller but the last is now scoped the way jq scopes it:
 
 | Caller                                                 | Scope                                                          | Issue |
 |--------------------------------------------------------|----------------------------------------------------------------|-------|
 | `@base64d`/yq `@urid` (`..._from_decoded_bytes`)       | One decoded string, already                                    | #1719 |
 | `--raw-input` (non-slurp)                              | Per line, split before substituting                            | #1742 |
 | JSON document / `--slurp` / `--seq`                    | Per JSON string                                                | #1743 |
-| `--raw-input --slurp`                                  | Whole buffer — **matching real jq**, which has one string here | —     |
+| `--raw-input --slurp`                                  | Each file whole — jq's scope is each `fgets` read (see below)  | #7866 |
 
 `--input-dsv` also stays whole-buffer: DSV is not JSON (its fields are `""`-doubled, not
 backslash-escaped), and neither oracle reads DSV at all.
@@ -313,6 +313,39 @@ substitution into the more sensible WHATWG-consistent shape. See
 [docs/plan/decode-failure-routing.md](../../plan/decode-failure-routing.md) for the fuller
 substitution-mechanism history and
 [#1717](https://github.com/rust-works/succinctly/issues/1717) for the algorithm fix itself.
+
+## Under `-R -s`, a truncated lead byte just before a line break keeps the line break (#7866)
+
+The `--raw-input --slurp` row of the table above used to say that the whole buffer is jq's scope too, and that was wrong.
+jq builds the slurped string by appending each `fgets` read to it, and a read ends at a line break (or after 4095 bytes of a longer line), so the slice its `len - pos < seq_len` rule sees ends just after every line break.
+A 3- or 4-byte lead byte with fewer bytes than it declares between it and the end of that read therefore takes the line break into its one U+FFFD, and the two lines become one.
+jq 1.7.1 (`/usr/bin/jq`) and jq 1.8.2 (`/opt/homebrew/bin/jq`) agree on every short-line row here.
+`succinctly jq` substitutes each input file as one slice, so in the middle of a file the lead byte becomes U+FFFD and the line break stays.
+That is a deliberate difference: matching would delete a line break that is in the input and merge two lines of the user's text, which [ADR-0018](../../adrs/adr-0018.md) does not ask for (its condition (b), matching would corrupt data).
+
+```bash
+$ printf 'a\n\xef\nb\n' | jq -R -s -c '[., length]'          # jq 1.7.1 and 1.8.2: the second line break is gone
+["a\n�b\n",5]
+$ printf 'a\n\xef\nb\n' | sjq -R -s -c '[., length]'
+["a\n�\nb\n",6]
+$ printf 'a\xf0\r\nb' | jq -R -s -c 'explode'                # jq: a CR LF goes whole
+[97,65533,98]
+$ printf 'a\xf0\r\nb' | sjq -R -s -c 'explode'
+[97,65533,13,10,98]
+```
+
+The rows that differ are those where the lead byte declares more bytes than remain up to and including the line break: `\xe1\n`, `\xef\n`, `\xed\n`, `\xf0\n`, `\xf0\x9f\n`, `\xf4\x90\n` and `\xf0\r\n`.
+Each such line loses its line break in jq, so `a\xe1\n\xe1\n\xe1\nz` is one line of five characters there and four lines here, and a valid character that starts the next line (`a\xe1\n\xc3\xa9b`) is kept by both.
+The rows that agree are those where enough bytes remain, because both tools then replace the lead byte alone: a 2-byte lead (`\xc3\n`), a lead one byte short (`\xe1\x80\n`, `\xef\xbb\n`, `\xf0\x9f\x98\n`, `\xe1\r\n`, `\xf0\x9f\r\n`), and a byte that is no lead at all (`\xff\n`, `\x80\n`).
+At the end of a file the two tools agree as well, because there jq's read and succinctly's slice end at the same byte: `a\xe1\n` as the whole input is `"a\ufffd"` in all three, with the final line break taken, and so is a file that ends that way when another file follows it on the command line.
+Nothing but `--raw-input --slurp` is affected: `-R` alone, `-nR 'input'` and `-nR '[inputs]'` split the lines before substituting (#1742), and a JSON string under `--slurp` or `--seq` is its own scope (#1743).
+
+Where the truncated lead byte sits within a few bytes of a 4095-byte read boundary of a long line, the two jq versions stop agreeing with each other, since each also splits the line there.
+With a lead byte at byte 4094 of the first line and the line break after it, jq 1.7.1 keeps the line break and jq 1.8.2 takes it; with the lead byte at 4090, jq 1.8.2 keeps it and jq 1.7.1 takes it.
+With the lead byte at 4093 and an ordinary character after it (`\xe1X`), jq 1.7.1 takes the `X` and jq 1.8.2 keeps it.
+`succinctly jq` keeps the line break and the `X` in all of these, which is what one of the two versions prints in each.
+
+Pinned by `tests/jq_cli/i7866.rs`, whose comments carry the output captured from both jq versions on macOS.
 
 ## A character that straddles jq 1.7.1's 4095-byte `-R` read is kept, as jq 1.8.2 keeps it (#5476)
 
@@ -8364,9 +8397,15 @@ Three differences remain.
   Over five draws of 2,000 generated look-behinds (10,000 in all) against jq 1.7.1, 1,717 differ from jq without this rule and 86 with it, and none that agreed without it differs now.
   What it does not follow keeps the older shape rules of #6201: an alternation whose branches are of fixed, differing widths is refused here as in jq (`(?<=a|bc)`, `(?<!a(?:b|cd))`, `(?<=(?:a|bc){2})`), wherever it sits in a body this does not read.
   The bodies it does not read are those with a case-insensitive flag, a backreference, a nested lookaround, an atomic group or a comment, `\K`, `\G`, `\Z` or `\R`, a character that is not ASCII, a flag group, a quantified group that Oniguruma merges with another quantifier in a way the table of `onig_reduce_nested_quantifier` does not settle, a repeated class whose possessive reading depends on what the class holds (`(?<=\w*\d)`), and two groups of one name.
-  Left accepted here though jq refuses them: `(?<=\R|a)` (`\R` is one or two characters), a branch with an anchor beside a character (`(?<=a|b\z)`), and any look-behind under the `x` flag or an inline `(?x)`, whose blanks the check cannot see.
+  Left accepted here though jq refuses them: `(?<=\R|a)` (`\R` is one or two characters) and a branch with an anchor beside a character (`(?<=a|b\z)`).
+  Under the `x` flag or an inline `(?x)` the same rules read the pattern without the blanks and `#` comments the mode ignores, following the mode group by group (`(?x)`, `(?x:...)`, `(?-x)`), since [#7865](https://github.com/rust-works/succinctly/issues/7865): `(?x)(?<=a|bc)`, `(?-x)(?<=a|bc)` and `(?<= a | bc )` under `x` are refused as `(?<=a|bc)` is, and `(?<=a b|bc)` under `x` is accepted.
+  Before, a pattern under `x` or with an inline flag group naming `x` skipped them and was answered.
+  A brace that opens no interval for the blank it holds is the literal characters the mode leaves (`a{ 0}` is the four characters `a{0}`), and an option group that names only `x` is read as the option group it is, so its body is one of those the reader does not follow (`(?<=(?x:a)+)` is refused by jq and answered here, as `(?<=(?m:a)+)` is).
+  An item repeated no times has no length and is nothing to differ over, in or out of the mode: `(?<=(?i:a)b|c{0})` and `(?<=(?:a|bc){0})` under `i` are accepted, as in jq, where the shape rules refused them.
+  Over four draws of 550 generated look-behinds, each written ten ways (plain, under `x`, with blanks and comments, behind `(?x)`, inside `(?x:...)`, after `(?-x)`, under `ix`; 22,000 rows) against jq 1.7.1 and 1.8.2, which agree on every row, 5,424 of the 17,600 rows in the extended mode differed from jq before and 2,647 do now, and no row that agreed differs.
+  Those that still differ hold a body from the list above that the reader does not follow, or a brace with a blank outside the mode (`(?<=[^a]\w{1, 2})` is the literal text in jq and read as an interval here), or are refused in other words (`(?<=b*x*?|$cb{2,})` is `invalid pattern in look-behind` in jq and `undefined error code` here, with or without `x`).
   The part about a lookahead inside a look-behind (`(?<=(?=a)a)`) is #6197.
-  Pinned by `test_lookbehind_oniguruma_refuses_is_refused_5502` and `tests/jq_cli/i6519.rs`.
+  Pinned by `test_lookbehind_oniguruma_refuses_is_refused_5502`, `tests/jq_cli/i6519.rs` and `tests/jq_cli/i7865.rs`.
 - **A `\K` that ends a look-behind match ends the global search here; jq's never ends.**
   `"cab" | [match("(?<=a\\Kb)";"g")]` never answers in jq 1.7.1: the match is `[2,3)`, jq resumes at its end (3), and the look-behind finds the same match from there, so the search pushes it for ever and grows without bound.
   Matching that would take the host process down, so a match that begins before the offset the search resumed from and ends at it is skipped, and the search moves on one character: the answer is `["b"]` ([#6169](https://github.com/rust-works/succinctly/issues/6169)).
@@ -15664,20 +15703,6 @@ distinguishing it from a real null even though the printed word is identical. su
 matches both: `default_colors::NULL` uses `0;90`, and `colorize_json` recognizes a NaN's
 render (an internal marker text `format_json` substitutes for `null` only when colorizing,
 stripped before any byte reaches the user) to apply the same double wrap.
-
-## `map_values(f)` still fires the side effects of outputs of `f` after the first ([#5791](https://github.com/rust-works/succinctly/issues/5791))
-
-jq's `map_values(f)` is `.[] |= f`, which reads the first output of `f` and goes no further.
-Since #5791 `succinctly jq` takes the same value and no longer raises an error (or halts, or breaks) that `f` produces after it: `[1] | map_values((1, error("x")))` is `[1]`.
-It still evaluates `f` to its end before taking that value, so a side effect of a later output fires where jq never reaches it.
-`jq -n '[1] | map_values(2, halt_error(6))'` prints `[2]` and exits 0 with nothing on stderr; `succinctly jq` prints `[2]`, exits 0, and writes `1` to stderr.
-`debug` and `stderr` after the first output are the same, as is `input` (it consumes a document jq leaves).
-`succinctly yq` raises the later error, as real yq does.
-Pinned by `test_map_values_object_ignores_a_halt_after_the_first_output_5791`.
-`walk(f)` on an object is `map_values(w)` in jq, so since [#5794](https://github.com/rust-works/succinctly/issues/5794) a member keeps the first output of its own subtree the same way, and has the same residual.
-`{"a":1} | walk((., halt_error))` prints `{"a":1}` and exits 5 in jq with `{"a":1}` on stderr; `succinctly jq` prints the same on stdout and writes `1` to stderr first, for the member's later output.
-`succinctly yq --jq-extensions` takes jq's rule here, since real yq has no `walk` to follow.
-Pinned by `walk_still_fires_a_later_outputs_side_effect_5794`.
 
 ## A path through a named argument: assignments, `$ARGS` and scalars ([#5692](https://github.com/rust-works/succinctly/issues/5692))
 
