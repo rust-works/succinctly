@@ -18098,6 +18098,23 @@ fn lazy_json_scan_chunk(raw: &str, from: usize, budget: usize) -> LazyChunk {
             spans.truncate(checked + agreed);
         }
     }
+    // #7758: serde's `IgnoredAny` reads a `\u` escape without looking at the code it names, so a
+    // high surrogate with no low one after it, which jq's parser refuses, passed both parsers and
+    // queued a document whose conversion then failed uncatchably (and a key with one converted
+    // to its source span). It ends the lazy prefix: the eager reader names jq's fault, catchable
+    // by the read that reaches it, and reads on after it as jq does. The one pass declines every
+    // lone surrogate escape (`plain_value_end`), so only the documents after its run are looked at.
+    if let (Some(&(first, _)), Some(&(_, last))) = (spans.get(checked), spans.last()) {
+        if let Some(at) = jq::jq_refused_escape_offset(&bytes[first..last]) {
+            let clean = spans[checked..]
+                .iter()
+                .take_while(|&&(_, end)| end <= first + at)
+                .count();
+            fault = true;
+            open_tail = false;
+            spans.truncate(checked + clean);
+        }
+    }
     // A document too deep to convert lazily ends the lazy prefix there.
     // The documents the one pass checked are no deeper than it follows, which is within the limit.
     const _: () = assert!(jq::PLAIN_END_MAX_DEPTH <= LAZY_JSON_MAX_DEPTH);
@@ -18817,6 +18834,14 @@ fn parse_json_stream(s: &str) -> Result<Vec<OwnedValue>> {
         Ok(values) => Ok(values),
         Err(e) => {
             let bytes = s.as_bytes();
+            // #7758: a text the strict pass refuses for an escape jq's parser refuses, or one whose
+            // fallback below would accept it (a key that does not decode becomes its source
+            // span), is refused in the words of jq's parser for the first fault it meets.
+            if jq::jq_refused_escape_offset(bytes).is_some() {
+                if let Some(message) = jq::jq_stream_fault([text], 1, 0) {
+                    return Err(anyhow::anyhow!(message));
+                }
+            }
             match find_json_values(bytes) {
                 Ok(spans) => spans
                     .into_iter()
@@ -18874,6 +18899,10 @@ fn parse_json_stream_prefix_ending(
     if let Ok(values) = parse_json_stream_strict(s, origin, text, lead) {
         return (values, None, None);
     }
+    // #7758: the first escape jq's parser refuses. The strict pass refuses a text with one, and the
+    // walk below stops at the document that holds it: a key that does not decode becomes its source
+    // span, so that document would convert.
+    let escape_fault = jq::jq_refused_escape_offset(s.as_bytes());
     // #5555: jq's parser names the first fault of the text, which can sit inside a value the
     // splitter delimits and the delimiter walk rejects, ahead of the one the splitter stopped at.
     // It reads the text as written: the newline after a bare token is part of its fault.
@@ -18887,6 +18916,13 @@ fn parse_json_stream_prefix_ending(
     let (spans, split_error) = split_json_values(bytes);
     let mut values = Vec::with_capacity(spans.len());
     for (start, end) in spans {
+        // #7758: jq stops at the document that holds the escape, whether or not it converts.
+        if escape_fault.is_some_and(|at| end > at) {
+            return match jq_fault() {
+                Some((message, end)) => (values, Some(EvalError::new(message)), Some(end)),
+                None => (values, Some(EvalError::new("Invalid JSON text")), None),
+            };
+        }
         match stream_document_checked(&bytes[start..end], origin, text, lead + start) {
             Ok(value) => values.push(value),
             Err(error) if error.is_decode_failure() => {
@@ -18939,6 +18975,13 @@ fn parse_json_stream_strict(
     // position stays its own.
     if let Some(values) = jq::parse_plain_stream(s) {
         return Ok(values);
+    }
+    // #7758: serde's `IgnoredAny` reads a `\u` escape without looking at the code it names, and a
+    // key that does not decode becomes its source span, so a text with an escape jq's parser
+    // refuses (a high surrogate with no low one after it) would pass. The one-pass reader declines
+    // every such text, so only one it declined is searched, and the callers' fallbacks word it.
+    if jq::jq_refused_escape_offset(s.as_bytes()).is_some() {
+        anyhow::bail!("Invalid JSON text: an escape jq refuses");
     }
     parse_json_stream_serde(s, origin, text, lead)
 }
@@ -26543,8 +26586,10 @@ mod tests {
             "1.000 1E2 -0 -0.0 1e1000 100000000000000000000 0.1 1 2 3\n".to_string(),
             // Duplicate keys, an empty container, and a key that needs unescaping.
             "{\"a\":1,\"a\":2,\"b\":{}} [] {\"\\u0041\":[1,[2,[3]]]}\n".to_string(),
-            // A lone surrogate and an escaped pair, a long string and a multi-byte character.
-            "\"\\ud800\" \"\\ud83d\\ude00\" \"é𝄞\" \"x\"\n".to_string(),
+            // A lone low surrogate (U+FFFD; a lone high one is a fault jq's parser stops on and
+            // the lazy route leaves to the eager one, #7758) and an escaped pair, a long string
+            // and a multi-byte character.
+            "\"\\udc00\" \"\\ud83d\\ude00\" \"é𝄞\" \"x\"\n".to_string(),
             // Bare tokens and strings around containers: the roots of the batch's index.
             "null true false \"s\" 0 [null] {\"k\":null} \"t\"\n".to_string(),
             // Blank lines, CRLF and indentation between documents.
