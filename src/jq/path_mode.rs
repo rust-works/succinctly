@@ -2297,6 +2297,17 @@ impl<'e> Interp<'e> {
             // `@text` is `f_tostring`, which returns a string input itself.
             Expr::Format(format) if format_keeps_input(format, &input) => sink(input, reg),
             Expr::Format(_) | Expr::Env => emit_delegated(expr, &input, &[], &reg, sink),
+            // #7843: `inside(xs)` as the parser binds a generator `xs` for the value evaluators
+            // (#7474, #3487), `xs as $v | inside($v)`. jq's `def inside(xs): . as $x | xs |
+            // contains($x);` runs `xs` as a path expression, not as a subexp, so the call runs as
+            // written: `path(inside(.b |= 1))` raises the update's own path error, as in jq.
+            Expr::As {
+                expr: source,
+                var,
+                body,
+            } if is_bound_inside(var, body) => {
+                self.call_prelude("_sp_inside", &[source], env, input, reg, sink)
+            }
             // `gen_destructure` with a plain `$var`: the source is a subexp,
             // and the body starts from the register at entry.
             Expr::As {
@@ -5140,6 +5151,16 @@ fn builtin_args(builtin: &Builtin) -> Vec<&Expr> {
         BuiltinKids::Two(a, b) => vec![a, b],
         BuiltinKids::Three(a, b, c) => vec![a, b, c],
     }
+}
+
+/// Whether `E as $var | body` is the parser's binding of `inside(E)` (`parser::bind_value_args`,
+/// #7474): `body` is `inside($var)` with `$var` one of the parser's unspellable argument
+/// variables. `inside` is the one bound builtin whose jq definition takes a closure, not a
+/// `$`-parameter, so only it has a path-mode answer the binding changes (#7843).
+fn is_bound_inside(var: &str, body: &Expr) -> bool {
+    super::parser::is_value_arg_var(var)
+        && matches!(body, Expr::Builtin(Builtin::Inside(arg))
+            if matches!(&**arg, Expr::Var(name) if name == var))
 }
 
 /// The jq-defined builtins the prelude implements, as `(definition, args)`.
