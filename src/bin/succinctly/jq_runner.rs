@@ -5833,7 +5833,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             let (files, mut raw_inputs, failures) = if files.is_empty() {
                 (files, vec![read_stdin_bytes()?], Vec::new())
             } else {
-                read_input_files(&files, false)
+                read_input_files(&files, false, false)
             };
             join_dsv_records_across_files(&mut raw_inputs, dsv_config(delimiter).quote_char);
             // #6585: as `-R`'s main loop does (#6531), a file that did not open is reported when
@@ -6077,8 +6077,9 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                     } else {
                         // #7478: a named pipe the windowed gate read and found short hands its
                         // bytes on here, since it gives them once.
-                        take_named_pushback(&files)
-                            .unwrap_or_else(|| read_input_files(&files, false))
+                        take_named_pushback(&files).unwrap_or_else(|| {
+                            read_input_files(&files, false, stops_at_broken_mark(&args))
+                        })
                     }
                 }
             },
@@ -8242,7 +8243,7 @@ fn read_inputs(
             .or_else(|| take_named_pushback(&files));
         let (files, raws, failures) = match preread {
             Some(prepared) => prepared,
-            None => read_input_files(&files, failed_as_sources),
+            None => read_input_files(&files, failed_as_sources, stops_at_broken_mark(args)),
         };
         unopened_tail = failures.iter().any(|&(at, _)| at >= files.len());
         last_is_directory = ends_in_last_directory(&failures);
@@ -12630,14 +12631,21 @@ type OpenFailures = Vec<(usize, InputFileOpenError)>;
 /// the index is how many files opened before it: the position it sits at among them. It is
 /// the caller that reports it ([`report_open_failures`]), because jq reports a file when its
 /// reader reaches it, and the run can end before that.
+///
+/// With `stops_at_broken_mark` (the routes jq's JSON parser reads, [`stops_at_broken_mark`]) the
+/// read stops at a file the byte-order mark at the front of the stream breaks off in (#7851): jq's
+/// parser faults there with `Malformed BOM`, its main loop stops, and its reader never opens the
+/// files after it, so none of them is reported and a `(at FILE:0)` names that file.
 fn read_input_files(
     files: &[PathBuf],
     failed_as_sources: bool,
+    stops_at_broken_mark: bool,
 ) -> (Vec<PathBuf>, Vec<Vec<u8>>, OpenFailures) {
     let mut opened = Vec::with_capacity(files.len());
     let mut raws = Vec::with_capacity(files.len());
     let mut failures = Vec::new();
     let mut dash_seen = false;
+    let mut mark = crate::cli::front_matter::StreamBomMatch::default();
     for (at, path) in files.iter().enumerate() {
         let read = if is_stdin_dash(path) {
             // `-` is standard input: the first one holds it all, a later one is empty.
@@ -12652,8 +12660,12 @@ fn read_input_files(
         };
         match read {
             Ok(raw) => {
+                let broke = stops_at_broken_mark && mark.breaks_in(&raw);
                 opened.push(path.clone());
                 raws.push(raw);
+                if broke {
+                    break;
+                }
             }
             // #6472: a directory is an input file that has no bytes, and what jq says of it
             // comes once its reader moves on, so it stands between this file and the next.
@@ -12674,6 +12686,13 @@ fn read_input_files(
         }
     }
     (opened, raws, failures)
+}
+
+/// Whether [`read_input_files`] stops at a file the byte-order mark at the front of the stream breaks
+/// off in (#7851): the routes jq's JSON parser reads, `--stream` included. `--seq` goes on past a
+/// parse fault, `-R` and `--input-dsv` have no mark to match, and `--validate` checks each file.
+fn stops_at_broken_mark(args: &JqCommand) -> bool {
+    reads_plain_json(args)
 }
 
 /// A source that failed part-way ends there: jq reports it and exits 2 (#5498).
@@ -13777,7 +13796,7 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
         None => tail.index,
     };
     let at = files.len();
-    let (rest, rest_raws, rest_failures) = read_input_files(&named[from..], false);
+    let (rest, rest_raws, rest_failures) = read_input_files(&named[from..], false, false);
     files.extend(rest);
     raws.extend(rest_raws);
     failures.extend(
@@ -18658,7 +18677,7 @@ fn seq_plain_json_inputs(args: &JqCommand) -> Result<Option<PreparedInputs>> {
     let (files, mut raws, failures) = if from_stdin {
         (named.clone(), vec![read_stdin_bytes()?], Vec::new())
     } else {
-        read_input_files(&named, false)
+        read_input_files(&named, false, false)
     };
     // Stdin is one source that always opens, so a file list is all that can fail this.
     if raws.len() != 1 || !failures.is_empty() {

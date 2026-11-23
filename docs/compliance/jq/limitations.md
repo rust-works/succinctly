@@ -13790,6 +13790,7 @@ jq's parser reports a text that opens with part of the UTF-8 BOM (`EF`, or `EF B
 `fromjson` and `tonumber` word it that way here (`"\ufffd" | try fromjson catch .` is `"Malformed BOM (while parsing ...)"`).
 The primary input stream does not: `printf '\xef\xbf\xbd1' | jq .` is `jq: parse error: Malformed BOM` in jq and `jq: parse error: Invalid numeric literal at EOF at line 1, column 4` here.
 Both exit 5 with no output, so only the message differs, when the mark breaks off at a byte that is not the next one of it.
+The read stops in the file the mark breaks off in, as jq's read does, since jq's main loop stops at the parser's fault: the files after it are not opened (#7851), so one that does not open or is a directory is not reported and does not make the run exit 2, and the `(at FILE:0)` of `-n input` names that file.
 A mark that breaks off because the input ends (`printf '\xef' | jq .`, or `EF BB`) is no fault in jq: its parser keeps its place in the mark across a refill, so the input is empty, `.` prints nothing and `-s .` prints `[]`, both with exit 0 (#7454).
 `succinctly jq` does the same, on standard input and in files, when the stream's only bytes are the start of the mark, with files without bytes before or after it, and when that start is cut across files (`EF` in one and `BB` in the next).
 A mark cut across the first files (`EF BB` in one and `BF [2]` in the next, or a byte in each of three) is skipped as jq skips it, since jq's parser matches the mark a byte at a time whichever file each byte comes from (#7566).
