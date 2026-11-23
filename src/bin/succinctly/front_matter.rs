@@ -83,6 +83,41 @@ pub(crate) fn stream_bom_cuts<'a>(sources: impl IntoIterator<Item = &'a [u8]>) -
     cuts
 }
 
+/// jq's parser matching the UTF-8 byte-order mark at the front of a stream, fed one source at a time
+/// (#7851): it says in which source the mark breaks off, the source jq's parser faults in with
+/// `Malformed BOM` (`jv_parser_set_buf`). jq's main loop stops at that fault, so its reader never
+/// opens a file after that source, and a `(at FILE:0)` names that source.
+#[derive(Debug, Default)]
+pub(crate) struct StreamBomMatch {
+    /// How many of the mark's bytes the stream has matched so far.
+    matched: usize,
+    /// Whether the stream has settled it: the whole mark, no mark, or one that broke off.
+    settled: bool,
+}
+
+impl StreamBomMatch {
+    /// Feed the stream's next source; `true` when the mark breaks off in it: the stream started
+    /// with part of the mark and this source holds the first byte that departs from it. A source
+    /// with no bytes (an empty file, a directory, a file that did not open) changes nothing.
+    pub(crate) fn breaks_in(&mut self, source: &[u8]) -> bool {
+        if self.settled {
+            return false;
+        }
+        for &byte in source {
+            if byte != UTF8_BOM[self.matched] {
+                self.settled = true;
+                return self.matched > 0;
+            }
+            self.matched += 1;
+            if self.matched == UTF8_BOM.len() {
+                self.settled = true;
+                return false;
+            }
+        }
+        false
+    }
+}
+
 /// The cut [`stream_bom_cuts`] gives source `at`, 0 past the sources it covers.
 pub(crate) fn bom_cut_at(cuts: &[usize], at: usize) -> usize {
     cuts.get(at).copied().unwrap_or(0)
@@ -232,6 +267,35 @@ mod tests {
         }
         assert_eq!(bom_cut_at(&[], 4), 0);
         assert_eq!(bom_cut_at(&[1, 2], 1), 2);
+    }
+
+    /// #7851: the source the mark breaks off in is the one holding the first byte that departs from
+    /// it, past sources with no bytes; a whole mark, no mark and a stream that ends inside the mark
+    /// break off nowhere.
+    #[test]
+    fn stream_bom_match_names_the_source_the_mark_breaks_off_in_7851() {
+        let breaks = |sources: &[&[u8]]| {
+            let mut mark = StreamBomMatch::default();
+            sources
+                .iter()
+                .map(|source| mark.breaks_in(source))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(breaks(&[b"\xEF", b"\xEF", b"[1]"]), [false, true, false]);
+        assert_eq!(breaks(&[b"\xEF", b"", b"\xBB1"]), [false, false, true]);
+        assert_eq!(breaks(&[b"\xEF\xBB", b"\xEF"]), [false, true]);
+        assert_eq!(breaks(&[b"", b"\xEF1", b"\xEF"]), [false, true, false]);
+        assert_eq!(breaks(&[b"\xEF\xBB\x41"]), [true]);
+        for sources in [
+            &[&b"[2]"[..], b"\xEF"][..],
+            &[b"\xEF\xBB\xBF[1]", b"\xEF"],
+            &[b"\xEF", b"\xBB", b"\xBF", b"\xEF"],
+            &[b"\xEF", b"\xBB"],
+            &[b"", b""],
+            &[b"\xBB\xBF"],
+        ] {
+            assert!(breaks(sources).iter().all(|&broke| !broke), "{sources:?}");
+        }
     }
 
     /// (input, front matter text, body) as yq v4.53.3 splits them (#6910): the front matter is the text
