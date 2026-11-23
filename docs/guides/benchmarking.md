@@ -205,6 +205,36 @@ commit had made. `measure_all` now starts both from a symlink `/tmp/tmpXXXXXXXX/
 valgrind A/B of two binaries should start both from paths of one length too; a counting run that
 differs only in where the binary lives is not a result.
 
+**What the rows cover.** `QUERIES` in `scripts/perf-guard.py` lists every row with the regression
+that made it necessary. Until #7798 each row read one file and, apart from the `-R` and `--seq`
+rows, evaluated one program over one large document, so a cost paid once per record, per file
+boundary, per backslash or per fold step read +0.0% however large it was. #7798 added rows of those
+shapes, over fixtures the script writes itself (`write_synthetic_fixtures`, so both binaries of a
+`--baseline-binary` run read the same bytes, and a merge-base build measures every row):
+
+| Shape                                          | Rows                                                                                         | Fixture                                                          | Cost it would have caught (cachegrind, 7950X)                |
+|------------------------------------------------|----------------------------------------------------------------------------------------------|------------------------------------------------------------------|--------------------------------------------------------------|
+| One evaluation per small NDJSON record         | `nd_id`, `nd_select_name`, `nd_pipe30`, `nd_two_defs`                                        | 4,500 five-member records, one per line (~290 KB)                | #7719's per-document route check: +2.3% to +2.7%             |
+| One document split across files                | `split2_length`, `split16_length`, `split2_compact`, `split16_compact`                       | the records as one array, cut inside a record into 2 or 16 files | #7750's per-boundary rescan: +18% to +222%                   |
+| Escape-heavy `-n inputs`; `-e`                 | `esc_reduce_inputs`, `esc_inputs_id`; `nd_e_iterate` and its twin `nd_iterate`               | NDJSON with a backslash every 8 bytes (~300 KB); the records     | #7758's per-backslash search: +14%; #7757's `-e` route: -11% |
+| Per-element `and`/`or`, objects, interpolation | `nd_select_and_or`, `nd_obj_interp`, `nd_obj_interp_def`, `doc_select_and_or`, `doc_and_def` | the records, per line and as `{"users":[...]}`                   | #7787's settle check per operator: +2.2% to +5.1%            |
+| Fold steps                                     | `fold_append`, `fold_def_update`, `fold_foreach`, `fold_bound_getpath`                       | none (`-n`, a few hundred steps)                                 | #7451, #7702, #7721 made quadratic folds linear: -94%        |
+
+The inputs are small on purpose: an instruction count needs no large file, only enough records,
+files or steps to reach the route (both NDJSON files are past the 256 KiB below which a file is read
+whole instead of a window at a time) and to make the per-unit cost a large share of the run. Each
+of these rows is measured once (`SYNTHETIC_REPS`), not three times: their counts are the same on
+every rep, and most of what a row costs the job is valgrind starting the binary, which three reps
+would pay three times over.
+The per-record and per-element rows carry a 2.0% threshold, because the costs they were added for
+are 2.2% to 5.1%; their noise between `main` commits two days apart is at most 0.22%. `nd_id`,
+`nd_select_name` and `nd_obj_interp` read 1.0% to 1.6% on #7719's first branch, under any threshold
+the noise allows; they watch for a larger cost per record.
+
+The checked-in fallback baseline has no entries for these rows (nor for the three `seq_*_bad_last`
+rows), so a `--check` against the file alone stops at its "missing entries" error, as it already
+did; every CI run compares against a binary instead.
+
 To deliberately update that file after a real, understood cost change:
 
 ```bash
