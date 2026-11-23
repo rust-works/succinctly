@@ -269,14 +269,14 @@ jq -R '.'` drops the byte even though the file's own trailing newline follows). 
 "the whole buffer's own end" in a realistic multi-field document or multi-line file, and
 jq's trigger is not rare — it fires on *any* string/line ending in the right byte shape,
 however much more content follows elsewhere in the file — so a whole-file caller would
-essentially never reproduce it. Every caller is now scoped the way jq scopes it:
+essentially never reproduce it. Every caller but the last is now scoped the way jq scopes it:
 
 | Caller                                                 | Scope                                                          | Issue |
 |--------------------------------------------------------|----------------------------------------------------------------|-------|
 | `@base64d`/yq `@urid` (`..._from_decoded_bytes`)       | One decoded string, already                                    | #1719 |
 | `--raw-input` (non-slurp)                              | Per line, split before substituting                            | #1742 |
 | JSON document / `--slurp` / `--seq`                    | Per JSON string                                                | #1743 |
-| `--raw-input --slurp`                                  | Whole buffer — **matching real jq**, which has one string here | —     |
+| `--raw-input --slurp`                                  | Each file whole — jq's scope is each `fgets` read (see below)  | #7866 |
 
 `--input-dsv` also stays whole-buffer: DSV is not JSON (its fields are `""`-doubled, not
 backslash-escaped), and neither oracle reads DSV at all.
@@ -313,6 +313,39 @@ substitution into the more sensible WHATWG-consistent shape. See
 [docs/plan/decode-failure-routing.md](../../plan/decode-failure-routing.md) for the fuller
 substitution-mechanism history and
 [#1717](https://github.com/rust-works/succinctly/issues/1717) for the algorithm fix itself.
+
+## Under `-R -s`, a truncated lead byte just before a line break keeps the line break (#7866)
+
+The `--raw-input --slurp` row of the table above used to say that the whole buffer is jq's scope too, and that was wrong.
+jq builds the slurped string by appending each `fgets` read to it, and a read ends at a line break (or after 4095 bytes of a longer line), so the slice its `len - pos < seq_len` rule sees ends just after every line break.
+A 3- or 4-byte lead byte with fewer bytes than it declares between it and the end of that read therefore takes the line break into its one U+FFFD, and the two lines become one.
+jq 1.7.1 (`/usr/bin/jq`) and jq 1.8.2 (`/opt/homebrew/bin/jq`) agree on every short-line row here.
+`succinctly jq` substitutes each input file as one slice, so in the middle of a file the lead byte becomes U+FFFD and the line break stays.
+That is a deliberate difference: matching would delete a line break that is in the input and merge two lines of the user's text, which [ADR-0018](../../adrs/adr-0018.md) does not ask for (its condition (b), matching would corrupt data).
+
+```bash
+$ printf 'a\n\xef\nb\n' | jq -R -s -c '[., length]'          # jq 1.7.1 and 1.8.2: the second line break is gone
+["a\n�b\n",5]
+$ printf 'a\n\xef\nb\n' | sjq -R -s -c '[., length]'
+["a\n�\nb\n",6]
+$ printf 'a\xf0\r\nb' | jq -R -s -c 'explode'                # jq: a CR LF goes whole
+[97,65533,98]
+$ printf 'a\xf0\r\nb' | sjq -R -s -c 'explode'
+[97,65533,13,10,98]
+```
+
+The rows that differ are those where the lead byte declares more bytes than remain up to and including the line break: `\xe1\n`, `\xef\n`, `\xed\n`, `\xf0\n`, `\xf0\x9f\n`, `\xf4\x90\n` and `\xf0\r\n`.
+Each such line loses its line break in jq, so `a\xe1\n\xe1\n\xe1\nz` is one line of five characters there and four lines here, and a valid character that starts the next line (`a\xe1\n\xc3\xa9b`) is kept by both.
+The rows that agree are those where enough bytes remain, because both tools then replace the lead byte alone: a 2-byte lead (`\xc3\n`), a lead one byte short (`\xe1\x80\n`, `\xef\xbb\n`, `\xf0\x9f\x98\n`, `\xe1\r\n`, `\xf0\x9f\r\n`), and a byte that is no lead at all (`\xff\n`, `\x80\n`).
+At the end of a file the two tools agree as well, because there jq's read and succinctly's slice end at the same byte: `a\xe1\n` as the whole input is `"a\ufffd"` in all three, with the final line break taken, and so is a file that ends that way when another file follows it on the command line.
+Nothing but `--raw-input --slurp` is affected: `-R` alone, `-nR 'input'` and `-nR '[inputs]'` split the lines before substituting (#1742), and a JSON string under `--slurp` or `--seq` is its own scope (#1743).
+
+Where the truncated lead byte sits within a few bytes of a 4095-byte read boundary of a long line, the two jq versions stop agreeing with each other, since each also splits the line there.
+With a lead byte at byte 4094 of the first line and the line break after it, jq 1.7.1 keeps the line break and jq 1.8.2 takes it; with the lead byte at 4090, jq 1.8.2 keeps it and jq 1.7.1 takes it.
+With the lead byte at 4093 and an ordinary character after it (`\xe1X`), jq 1.7.1 takes the `X` and jq 1.8.2 keeps it.
+`succinctly jq` keeps the line break and the `X` in all of these, which is what one of the two versions prints in each.
+
+Pinned by `tests/jq_cli/i7866.rs`, whose comments carry the output captured from both jq versions on macOS.
 
 ## A character that straddles jq 1.7.1's 4095-byte `-R` read is kept, as jq 1.8.2 keeps it (#5476)
 
