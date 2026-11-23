@@ -12098,6 +12098,9 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
                 // it stops at.
                 note_open_failure_at(opened.len());
                 opened.push(path.clone());
+                // A source with no bytes, which the mark goes on past (#7842: the cuts are taken
+                // by opener, so every opener has a front).
+                fronts.push(Vec::new());
                 // jq counts the failure when its read of the directory fails, and says so on the
                 // read after it: the run fails once the reader gets here, whether or not it goes on.
                 openers.push(report_unopened_before(
@@ -12116,6 +12119,7 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
             Err(e) if at + 1 < files.len() => {
                 note_open_failure_at(opened.len());
                 opened.push(path.clone());
+                fronts.push(Vec::new());
                 openers.push(report_unopened_before(
                     std::mem::take(&mut unopened),
                     Box::new(move || {
@@ -12136,6 +12140,8 @@ fn open_chunked_inputs(files: &[PathBuf]) -> Result<ChunkedInputs> {
     let tail_is_source = unopened
         .last()
         .is_some_and(|failure| !failure.is_directory());
+    // The reader takes source `n`'s cut by its opener's index (#7842).
+    debug_assert_eq!(fronts.len(), openers.len());
     let cuts = crate::cli::front_matter::stream_bom_cuts(fronts.iter().map(Vec::as_slice));
     // #6531: and `input_filename` names it from there on, once `get_inputs` hands it to the
     // locations.
