@@ -2551,9 +2551,11 @@ fn spawn_eval_thread() -> Result<std::thread::JoinHandle<Result<()>>> {
     let mut last_error = None;
     let start = eval_stack_start(EVAL_STACK_SIZE, address_space::cap());
     for size in eval_stack_sizes(start, MIN_EVAL_STACK_SIZE) {
-        let spawned = std::thread::Builder::new()
-            .stack_size(size)
-            .spawn(move || succinctly::jq::with_stack_budget(size, run_main));
+        let spawned = std::thread::Builder::new().stack_size(size).spawn(move || {
+            // The main thread blocked SIGPIPE so that this thread, which writes, takes it (#7847).
+            sigpipe::unblock_on_this_thread();
+            succinctly::jq::with_stack_budget(size, run_main)
+        });
         match spawned {
             Ok(child) => return Ok(child),
             Err(e) => last_error = Some(e),
@@ -2578,11 +2580,21 @@ pub fn main() -> Result<()> {
     // recursion of any shape refuses once it has spent half of it instead of
     // overflowing -- registered first thing, where the stack still available
     // and the thread's size agree.
+    //
+    // #7847: SIGPIPE is blocked here while that thread runs, so that macOS, which raises a write's
+    // SIGPIPE on the whole process, hands it to the thread that wrote rather than to this one.
+    // Lifted again before this thread runs or writes anything itself.
+    sigpipe::block_on_main_thread();
     let child = match spawn_eval_thread() {
         Ok(child) => child,
-        Err(failed) => return run_main_on_this_thread(failed),
+        Err(failed) => {
+            sigpipe::unblock_on_this_thread();
+            return run_main_on_this_thread(failed);
+        }
     };
-    match child.join() {
+    let joined = child.join();
+    sigpipe::unblock_on_this_thread();
+    match joined {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
     }
