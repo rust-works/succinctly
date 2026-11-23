@@ -16,6 +16,8 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::no_core_dump::without_core_dump;
+
 /// jq 1.7.1's whole stderr for an allocation that fails.
 const CANNOT_ALLOCATE: &str = "jq: error: cannot allocate memory\n";
 
@@ -31,19 +33,20 @@ fn sparse_file(dir: &Path, len: u64) -> Option<PathBuf> {
 }
 
 /// Run `succinctly jq <args>` with `stdin`, under `ulimit -v <kib>` when one is given and with core
-/// dumps off: `(stdout, stderr, terminating signal)`.
+/// dumps off (`RLIMIT_CORE` of 1 byte, which a piped `core_pattern` honours where it does not honour
+/// `ulimit -c 0`, #7869; the wrapper must not set `-c` itself): `(stdout, stderr, terminating signal)`.
 fn run(kib: Option<usize>, args: &[&str], stdin: Stdio) -> (String, String, Option<i32>) {
     let cap = kib.map_or(String::new(), |kib| format!("ulimit -v {kib} && "));
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
-        .arg(format!("ulimit -c 0; {cap}exec \"$0\" jq \"$@\""))
+        .arg(format!("{cap}exec \"$0\" jq \"$@\""))
         .arg(env!("CARGO_BIN_EXE_succinctly"))
         .args(args)
         .stdin(stdin)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("ran");
+        .stderr(Stdio::piped());
+    let output = without_core_dump(&mut command).output().expect("ran");
     (
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
