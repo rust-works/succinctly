@@ -457,11 +457,17 @@ jq 1.8.2 reads once more before it closes the array (jqlang/jq#3279, commit 4e30
 `succinctly jq` follows 1.8.2 for `--stream -s` and `--stream-errors -s`, with and without `-n`, over standard input and files, because upstream calls the 1.7.1 behaviour a bug, and so the difference from the pinned 1.7.1 stands as `newer-than-primary`.
 This replaces the rule #5548 added, which matched 1.7.1.
 `input_filename` and `input_line_number` read where the array was closed, as they did.
-What the same upstream change does not reach here: a text that ends in a fault (`printf '[1,' | jq -s --stream .`) is raised without the array in 1.8.2, where 1.7.1 printed the array and then raised, and `succinctly jq` still prints the array first; with `--stream-errors -s` the fault event that follows the array reads `input_filename` as the last file in 1.8.2 and as `null` here, and in that case the closing event keeps the 1.7.1 place too.
+The same reading decides a text whose last byte completes a value while the parser still holds an unfinished one (#7807): a number or literal straight before a `"`, `[` or `{` that ends the text (`2"`, `1 2"`, `true[`), and under `--stream` also a `,` or a closer the text ends on inside a container (`[1,`, `{"a":1,`, `[[1]`).
+jq 1.7.1 printed the array and then raised the fault its next call met (`printf '2"' | jq -c -s .` printed `[2]`, and `printf '[1,' | jq -c -s --stream .` printed `[[[0],1]]`), and jq 1.8.2 meets the fault before it closes the array and prints the error alone, at exit 5.
+`succinctly jq` follows 1.8.2 there on every route that slurps, standard input, files and a pipe read in windows alike, with one decision for all of them (`slurp_sources` in `src/bin/succinctly/jq_stream_errors.rs`): plain `-s`, which had followed 1.8.2 for `2"` and 1.7.1 for `1[` (#6004), `--stream -s`, which had followed 1.7.1 for both (#6061), `--stream-errors -s`, whose array now ends in the fault event, and `-n -s`, whose first `input` raises the fault and whose second returns the array.
+A value the closing call yields is still in the array and the fault comes after it, in both releases: `printf '[[1]' | jq -c -s --stream .` prints `[[[0,0],1],[[0,0]]]` and then the error, where 1.7.1 printed `[[0,0]]` after the array.
+A file that did not open before the text no longer hides the fault, which jq 1.7.1's main loop never read once the array was out: `jq -c -s --stream . missing.json two.json` over `2"` printed `[[[],2]]` and exited 2 with only the open failure on stderr, and jq 1.8.2 and `succinctly jq` print the parse error after it.
+A list that ends in a file that did not open, or in a directory, keeps jq 1.7.1's reads, as for `--seq` (#7718), and the positions stay jq 1.7.1's (#7607): the fault an `input` raises under `-n -s --stream` names `(at <unknown>)`, the closed input jq 1.7.1 met it at, where jq 1.8.2 names `(at <stdin>:0)`.
+In the same way the fault event that follows the array under `--stream-errors -s` (`[[1]` again) reads `input_filename` as `null`, where jq 1.8.2 names the last file.
 `--seq --stream -s` follows 1.8.2 too since #7718, which adopts the same commit's reading for `--seq` (below).
-The cases that read a directory in the middle of the file list keep the 1.7.1 model of the slurp loop.
+A directory or a file that did not open in the middle of the list kept the 1.7.1 model of the slurp loop until #7807, and reads as 1.8.2 reads it since: `jq -c -s --stream . dir one.json` over `[1]` is `[[[0],1],[[0]]]`, where 1.7.1 lost the `[[0]]`.
 `succinctly yq` is not changed.
-Pinned by `tests/jq_cli/i7523.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+Pinned by `tests/jq_cli/i7523.rs` and `tests/jq_cli/i7807.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
 
 ## After the last input has been read to its end, the position is jq 1.7.1's, not jq 1.8.2's (#7607)
 
@@ -472,9 +478,11 @@ jq 1.8.2 keeps the name and the count past the end of the last file and makes on
 A last line with its newline keeps the position in both releases (`(at nl.json:2)`).
 Both changes come from upstream commit 4e3088f ([jqlang/jq#3279](https://github.com/jqlang/jq/pull/3279), "Fix behavior of `--slurp --stream` when input has no trailing newline character"), which moves the reset of the name and the count to the branch that opens the next file and makes `read_more` report the end only once `current_input` is closed.
 Its message, its PR text and its test name only the `--slurp --stream` fix, which `succinctly jq` follows (#7523, above); neither effect described here is called a bug or a fix upstream, so `succinctly jq` keeps jq 1.7.1's answers, the reference ADR-0018 pins, and the rules modelled on 1.7.1's reader (#2947, #3003, #6146, the directory-last family #6472, #6604, #6625, #6661, #6775, #6789) stand.
+One more such answer is the fault after a number or literal directly before the text's last byte, a `"`, `[` or `{` (`2"`, `true"`, `1 2[`; #6004, #7810): that byte completes the value, so the read that reached the end returned it and the next call meets the fault with the file closed, and jq 1.7.1's `input` names `(at <unknown>)` where jq 1.8.2 names `(at <stdin>:0)`.
+It holds only when that read is a short one: a last line that fills its 4095-byte reads exactly leaves an empty last read, and then both releases name the file.
 Whether to follow jq 1.8.2 here is a question for the owners (#7607); #7461's true line number and #7472's 64-bit count are unaffected either way.
 `succinctly yq` is not affected: these are jq's reader rules.
-Pinned by `tests/jq_cli/i7607.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`), with jq 1.8.2's (`/opt/homebrew/bin/jq`) answers in its comments.
+Pinned by `tests/jq_cli/i7607.rs` and `tests/jq_cli/i7810.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`), with jq 1.8.2's (`/opt/homebrew/bin/jq`) answers in its comments.
 
 ## A standard input that cannot be read: matched, with these differences (#7126)
 
@@ -6979,7 +6987,11 @@ Measured against the pinned `/usr/bin/jq` on the scalar documents `"\x"`, `"\ud8
 | `succinctly json validate`                                         | (not applicable)    | rejects with a located diagnostic, exit 1                           |
 
 Inside a container the filter has to reach the string to be affected: over `["\x"]` or `{"a":"\ud800"}`, `length` and `type` answer (`1`, `"array"`), `.[]` forwards the string, and `tostring` raises.
+`-e` reads nothing of an output but whether it is truthy, so it forwards the string as the run without it does and exits 0 for it ([#7757](https://github.com/rust-works/succinctly/issues/7757)).
+Before #7757 it materialized every output to learn that, which raised here (`jq: parse error: Invalid escape ...`, exit 5): jq's answer, but one the same program without `-e` did not give.
 A lone *low* surrogate is not part of this: jq accepts it and substitutes U+FFFD, and so does succinctly ([#2008](https://github.com/rust-works/succinctly/issues/2008)).
+The documents `input` and `inputs` read, and the files `--slurpfile` reads, are not part of it either: those routes convert each document whole, so an escape jq refuses, in a string or in a key, is refused as jq refuses it, with jq's message and position ([#7758](https://github.com/rust-works/succinctly/issues/7758)).
+Under `input` and `inputs` it is the error of the read that reaches the document, which `try` and `?` catch, and the reads after it go on with the next document, as in jq; before #7758 a high surrogate there raised `invalid unicode escape sequence`, which nothing could catch, and an undecodable key went through as its source text.
 
 This is recorded on the same footing as the #2103 entry above, and adds no reasoning of its own.
 It is a divergence from a reference that rejects, not a licence: [ADR-0018](../../adrs/adr-0018.md)'s decision order still applies, and the cost argument (always-on validation is two thirds of a cheap navigation query) is context, not a condition it accepts.
@@ -7553,8 +7565,12 @@ A first document longer than that is read to its end first ([#7447](https://gith
 Since [#7478](https://github.com/rust-works/succinctly/issues/7478) a lone input named on the command line that gives its bytes once is read the way standard input is: `-`, a FIFO or a socket by its path (`mkfifo`, `<(cmd)`), and `/dev/stdin` or `/dev/fd/N` naming one.
 Since [#7737](https://github.com/rust-works/succinctly/issues/7737) so is every other source that is not a regular file or a directory (`read_as_stream`), named or on standard input: a character device (`/dev/urandom`, a terminal, a serial line) and a block device.
 Until then `-R -n 'input|length' /dev/urandom`, `-c . < /dev/urandom` and `-c halt` over a terminal that kept streaming lines read the device to its end first, growing until killed, where jq answers at once.
-A terminal typed into is a quiet source of this kind: the plain filter and `-R` answer at its `^D` (before it holds a window it is handed to the route that reads it whole), and `-n input` named on it at its `^D` or once 256 KiB are typed, where jq answers each line as it is typed.
-A program that calls `input`/`inputs` starts on its front (`lone_lazy_start`), the plain filter reads it a window at a time once it holds two windows and `-R` once it holds one, so `-n first(inputs)`, `-n input`, `limit`, `halt` and `-R -n input` over a producer that never ends its stream answer at once, as jq does, where each read such a source to its end first (its memory grew until `timeout` killed it).
+A terminal typed into is a quiet source of this kind: the plain filter and `-R` answer at its `^D` (before it holds a window it is handed to the route that reads it whole), where jq answers each line as it is typed.
+Since [#7742](https://github.com/rust-works/succinctly/issues/7742) `-n` with no input files reads a terminal on standard input when `input`/`inputs` asks, as jq does; from #723 it was left unread, so `input` raised `break` and `[inputs]` printed `[]` before anything was typed.
+A terminal (on standard input, named as `-` or by its path) is read by the lazy `input`/`inputs` route a line at a time, and only once the program asks for its first input (`LineWindows::typed_into`, which skips a BOM at its front as jq does): `-n input` answers the first line as it is typed, and a program that never gets to `input` never waits for the terminal, as in jq.
+`-R -n` and `--stream -n` read more of a terminal than a line before the program runs: `-R` up to its `^D` or a window (256 KiB) of typing, `--stream` its first 3 bytes, where jq answers each line as it is typed (`what_waits_for_more_than_a_line_on_a_terminal_7742` pins it).
+A line typed at a terminal that does not parse (`tru`) or is not UTF-8 was read on to the `^D` before the lazy route reported its parse error; since [#7738](https://github.com/rust-works/succinctly/issues/7738) it is reported as the line is typed, as in jq.
+A program that calls `input`/`inputs` starts on its front (`lone_lazy_start`), the plain filter reads it a window at a time once it holds two windows and `-R` once it holds one, so `-n first(inputs)`, `-n input`, `limit`, `halt` and `-R -n input` over a producer that never ends its stream answer at once, as jq does, where each read such a source to its end first (1.4 to 2.0 GB before `timeout` killed it at 5 s).
 Such a source is opened once (the open waits for its writer, as jq's does) and never turned back once read: a pipe that ends before a windowed route would take it hands its bytes to the route that reads it whole (`hand_back_short_pipe`), as standard input's are handed on.
 `--seq` (`--seq -n input <(yes ...)` still waits for the end of the stream) and a list of several files with a pipe among them still read such a source whole; `--stream` and `--stream-errors` read it a chunk at a time, as before.
 The cause on the other routes is that `read_stdin_bytes` is `read_to_end`, and the plain route then splits the whole text into values before its loop.
@@ -7592,6 +7608,10 @@ A 10 MB stream with 5 MB of lines that only warn in its middle held 1059-1101 Mi
 The rest is still held only from a stretch line the windows cannot end in: a line over 4 MiB with no RS at a line start in it, or one that draws over 65536 warnings.
 Since [#7218](https://github.com/rust-works/succinctly/issues/7218) and [#7221](https://github.com/rust-works/succinctly/issues/7221) it no longer does for `--seq` over several regular files of 4 MiB or more between them while each file is that framing and ends in an LF: from the first that is not, that file and the ones after it are held (below).
 Since #7341 a file that is not, and that opens with an RS, is read by a gate of its own as a lone file is, and only what its gate cannot carry on after is held, with the files after it.
+Since [#7775](https://github.com/rust-works/succinctly/issues/7775) a `--seq` program that calls `input`/`inputs` walks the stream as it reads it, 64 to 256 KiB at a time, from named files (each opened only when the walk reaches it, as jq's reader opens it) or a pipe on standard input, and lets go of each record once the program has it, so it holds the records not yet read and a read or two however long the stream: one that stops early (`-n 'first(inputs)'`, `limit(n; inputs)`, `input | halt`) reads only the blocks its records are in, as jq reads no further, and one that reads every record (`reduce inputs as $x (...)`) holds no more than one that stops.
+A regular file on standard input is still read whole by such a program and left at its end, as before: `--seq` is one of the shapes whose offset #7455 does not put back (below), and a walk that stopped early would leave it at neither jq's place nor the end.
+A main loop that can halt (`.id, halt`) reads its files a window at a time without first reading each whole to vouch for it (#7262's gate, from the first record), so it stops at the window it halts in.
+Over a pipe (or a socket or a terminal) such a main loop is walked as it is read, so it answers at the record it halts on, where the windowed pipe waited for 4 MiB or the pipe's end, and one that never halts holds a few reads however long the stream, as the windows did.
 Every other route that reads the input still holds all of it: `--seq` over a stream that is not that framing (on a pipe, in one regular file or in a file of several that opens with an RS, from the stretch line the windows cannot end in, #7322 and #7341; over several files, also from the first file that is neither that framing nor opens with an RS), `--input-dsv`, `--stream-errors -s`, standard input that is a terminal or a pipe under 4 MiB (for the plain filter and for `-R`), and the programs that call `input`/`inputs` over several files one of which is not UTF-8, or past a hand-off to the eager reader (below) (`reduce inputs` peaked at 32.8 MiB against 14.6 for one file, on two 11 MB files, until #7024, and `-R length a b` at 30.7 against 12.7).
 A plain `--stream-errors` walk (no `-n`, no `-s`) no longer does since [#7571](https://github.com/rust-works/succinctly/issues/7571): it reads its events through the stream reader a chunk at a time, as `--stream` has since #5498, where it held every event as a value, a large multiple of the input (now flat in the input's size: 3.7 to 3.8 MiB at 1, 10 and 100 MB of `--stream-errors -c .` on an Apple M4 Pro).
 That is a known limitation, not supported at this stage: it is outside the three reasons ADR-0018 permits a divergence for, so it is a deferred gap and not a deliberate behaviour.
@@ -7661,6 +7681,13 @@ What holds the memory, from the slope between 10 and 100 MiB (MiB of peak per Mi
   A container or string left open at a window's end (the splitter found no end to it) reads the source on, twice as far each time, so a stream whose last document never closes is read to its end once, as it was before.
   Since [#7447](https://github.com/rust-works/succinctly/issues/7447) the start reads on the same way when the first document is longer than the 256 KiB front, for a lone source and for the first of several files with a document: until then such a start was turned down and the whole stream read, so an NDJSON file whose first line is a 300 KB string held the file (`-n 'reduce inputs as $x (0;.+1)'`: peak RSS about the size of the file at 100 MiB, 300 MiB and 1 GiB; 305 MiB at 300 MiB on the 7950X), where the same line anywhere later held a window, and is flat in the size of the source since (6.1 MiB at 300 MiB on the 7950X).
   A first chunk that cannot end in more text (a fault no byte can change, a BOM, a byte that is not UTF-8) still reads the source whole, as before.
+  Since [#7738](https://github.com/rust-works/succinctly/issues/7738) that holds for a regular file only, named or redirected onto standard input, whose length bounds the read.
+  A stream (a pipe, a FIFO, a device, a terminal) is not read to its end for such a byte: one that is not UTF-8 is jq's substitution of it a window at a time (`append_lossy_window`; a window ends at a line break, so no character is cut across two), and a fault is reported from what has been read (`fault_tail`), so `-n input`, `first(inputs)` and `limit` over `cat /dev/urandom |` answer as jq does at once, where each read the stream until killed.
+  Three things remain: a stream whose text has been substituted keeps all of it from there to its end (`slide_lazy_window` drops nothing, as the substitution's offsets point into it), so its memory grows with what is read past the first bad byte; a program that asks for an input past a fault reads the stream to its end first (`LazyAfterFault`), where jq reads on a line at a time; and a stream whose first 256 KiB hold a bad byte and no line break is read on until one comes.
+  Since [#7812](https://github.com/rust-works/succinctly/issues/7812) a fault inside a container or string that is still open (`[tru,`, `{x`, `[1 2`, random bytes after a `{`) no longer reads a stream on for a close that never comes: the scan's judgement of an open value is a bracket and quote count, so a value a stream is read on for past the look-ahead (eight windows, 2 MiB) is read by jq's parser model (`JqOpenTail`, from #7750) as it goes, on the plain filter's route (`WindowedFile::open_value_faults`) and the lazy route (`open_value_faults`, its front included), and its first fault ends the read with jq's message.
+  Until then `-c .`, `-n input` and `-n '[inputs]'` over such a stream never answered and grew until killed, where jq reports the fault at once; about 1 run in 128 of `jq -c . /dev/urandom` did.
+  A value shorter than the look-ahead is read on to its close or to the fault as before, so the memory past the fault is the look-ahead's at most; a valid value longer than it is read by that parser too, once, as it is read on; `-s` still reads its input whole (recorded above), and a regular file keeps the route its length bounds.
+  A terminal that streams lines is read on past a line while it has more ready (`LineWindows::ready_on`, a `poll` with no wait), so a value open over many lines is not scanned again at every line; one typed into still hands on each line as it is typed.
   Since [#7502](https://github.com/rust-works/succinctly/issues/7502) the start's buffer is no longer sized for the whole file: that reservation, never written past the front, aborted the run (`memory allocation of <file size> bytes failed`, exit 134) under a `ulimit -v` smaller than the file, where the route reads a window at a time and jq streams.
 - **A span per document, about 0.15 per MiB more, on the plain route (fixed for a regular file by #6920).**
   `-c .`, `.name` and `select` sloped at 1.15 to 1.17.
@@ -7688,6 +7715,8 @@ Dropping the span vector alone would take about 0.15 per MiB off the plain route
 The route judges the path by `stat` and opens nothing it declines: a named pipe (`<(cmd)`) would otherwise pair with its writer and lose its bytes.
 A lone path that names a descriptor the run holds (`/dev/fd/7 7<f`, `/dev/stdin < f`) is read a window at a time from where that descriptor's offset stands, since macOS opens such a path as the descriptor itself, sharing its offset, and jq reads it from there; Linux opens the file again, from its start, in both tools (#7446).
 Its fault is worded from the same place, by position, and `/dev/fd/1` and `/dev/fd/2` are left to the route that reads them whole.
+On Linux, where the `stat` of `/dev/stdin`, `/dev/fd/0` and `/proc/self/fd/0` is the file's own, those paths were read whole until [#7698](https://github.com/rust-works/succinctly/issues/7698), and so was a file named by its own path with the same file on standard input (`f < f`), on every platform.
+Each is now read a window at a time wherever a new open of it does not share standard input's offset, and standard input is left where it stood, as jq leaves it.
 A window is about 256 KiB (1 MiB before [#7412](https://github.com/rust-works/succinctly/issues/7412)) and ends at a line break, so the read that completes each document, and with it jq's line for the document, is inside it.
 Since #7412 every size this section and the ones below give in MiB for the windowed routes is that of the 1 MiB window, and each is now a quarter of it: a file (or several, between them) is read in windows from 1 MiB, a pipe once it holds 512 KiB, and a document is read on to eight windows (2 MiB) before the end of the file.
 A file under 4 MiB whose window ends inside a document is read on to its end at once instead, as the whole-file route read it before #7412.
@@ -8472,7 +8501,11 @@ A brace in a class, a quoted run `\Q…\E`, a comment or a braced escape (`\x{10
 An error before the brace comes first, as Oniguruma reads in order (`{2,}{4294967296` is `target of repeat operator is not specified`), except one Oniguruma meets only at the end of the pattern or after reading it (an unclosed group, an undefined call), which the count comes before.
 A call `\g<n>` to a group the pattern does not have is `undefined group <n> reference` (`\g<+1>` too), and `\g<0>` or one that reaches before the first group (`\g<-1>`) is `never ending recursion`.
 Past a construct the crate cannot read but jq accepts (`(?'name'…)`, a reference to a group the pattern has, a second group of the same name), the pattern is read on for a later error (`(?<x>a)\k<x>(` is `end pattern with unmatched parenthesis`).
-Still in the crate's words: an error inside a look-around other than a count (`(?=a{3,2})`), and Oniguruma's cut of a multibyte group name running to the end (`(?<ßx` is `invalid group name <ß>` in jq, `<ßx>` here).
+Still in the crate's words: an error inside a look-around other than a count (`(?=a{3,2})`).
+A group's name is read as Oniguruma's `fetch_name` reads one it defines ([#7805](https://github.com/rust-works/succinctly/issues/7805)): its first character must be a word character that is not an ASCII digit (`(?<(>x)` and `(?<€>x)` are `invalid char in group name`, `(?<-a>x)` is `invalid group name`), and any later character up to the delimiter is part of the name and no pattern text (`(?<a[>a)` is a group named `a[`).
+A `)` or the end of the pattern before the delimiter is `invalid group name`, with Oniguruma's cut of the name: one character short of the end when the first character was accepted (`(?<ßx` is `<ß>`), up to the end when it was refused and the delimiter ends the pattern (`(?<(>` is `<(>>`).
+The rule is not applied yet to a name in a reference, a call or a condition (`\k<(>`, `\g<(>`, `(?(<(>)…)`), which keep the crate's words or `undefined name`.
+A name that holds pattern syntax is not yet skipped by every rewrite that runs before the engines: `(?~(?<a[>x))` is refused, and `"xxy" | match("(?<a[>x)\\Ky"; "l")` finds nothing where jq finds `y`, while `(?<a[>x)[b]`, `(?<a[>x){0}y` and `(?<a$>x)$` answer as in jq.
 A refusal of a construct jq accepts (a call `\g<a>` to a group the pattern has, a range cutter `(?~|…)`) has no Oniguruma message, and keeps the crate's rendered parse error after the prefix.
 Since the wider regex fuzz of [#7689](https://github.com/rust-works/succinctly/issues/7689) these are worded as in jq too: a reference or call with no name (`\k<`, `\k<>`, `\g<>`, `\k''`, `(?'`) is `group name is empty`; a sign after `(?` that opens no group (`(?}`, `(??`, `(?|`, `(?[`, `(? `) is `undefined group option`; a callout by name (`(*`) is `invalid callout pattern` when nothing follows, `invalid callout name` for a name that does not start with a letter or `_` or does not end in `)`, `[` or `{`, `end pattern in group` when it runs to the end, and `undefined callout name` for one jq does not have (jq's own, `(*FAIL)`, `(*MAX{2})` and the rest, are answered or refused as before); and an empty property name (`\p{}`) is `invalid character property name {}` where it stands.
 Errors now come in Oniguruma's order in three more places: a `)` that closes no group is refused where it stands (`)\` is `unmatched close parenthesis`, not `end pattern at escape`), a backreference to a group the pattern does not have is refused only after the rest of the pattern is read (`\2)` is `unmatched close parenthesis`, `\2\` is `end pattern at escape`), and the possessive scan's own refusal (`possessive quantifier is not supported`) never hides an error jq makes (`*+a` is `target of repeat operator is not specified`).
@@ -9457,6 +9490,19 @@ jq's lexer sets the location of every match it makes, whitespace and comments in
 jq 1.8.2 names the same line except where a comment is followed by a newline and more whitespace: its Tcl-style comments (jqlang/jq#2989, listed among the new features of its NEWS.md) end a comment with its newline, so the last whitespace run starts on the next line (`1 + # c` and two newlines is line 1 in jq 1.7.1 and here, line 2 in 1.8.2), and 1.7.1 stays the reference.
 Of 3,000 generated programs (upstream `jq.test` programs cut short, re-spaced and given trailing blank lines and comments), 2,638 are a compile error in both tools, and the first error's line now agrees with jq 1.7.1 in all but 35, none of them a placement at the end: in 33 jq's bison parser and ours stop at different places mid-program, and in 2 jq reads further than our parser does (`. a`, `try . catc`) and stops at the end.
 
+**Closed for a malformed object key (#7716).**
+jq's grammar recovers from a syntax error in an object construction's entry with rules of its own (`MkDictPair: error ':' ExpD`, `MkDict: error ',' MkDict`, `Term: '{' error '}'`), and from one in a destructuring pattern's key with `ObjPat: error ':' Pattern`.
+Bison drops the tokens after the error up to the first one such a rule accepts: at a `:` it reads the value and then fails with `May need parentheses around object key expression`, so `{1+2:3}`, `{.a:1}`, `{a.b:1}`, `{"a"+"b":1}` and `. as {1:$a} | $a` are two errors, the syntax error and that hint.
+`succinctly jq` stopped at the syntax error; it now recovers the same way (`recover_object_entry` in `src/jq/parser.rs`) and parses on, so the errors after it are reported and counted too: `{1:3, 2:4}` is four, `{1} | {2:3}` three, `{1:2} 3` three.
+Bison also reports no syntax error until it has shifted three tokens past the one it resumed at, and that is followed: `{1:}`, `{1}` and `{a:1, 2}` are one error, `{1:2 3}` and `{1:{2:3}}` have no second syntax error (the second has a second hint).
+The syntax errors keep succinctly's wording (the first bullet below); the hint is jq's, on the line of the entry it names.
+A recovery never goes past the parser running out of room: `memory exhausted` ends the parse and is reported whatever recovery is under way, as bison's is (jq 1.7.1 runs out at a few thousand nested objects, this parser where it did before).
+A constant non-string key's error (`Cannot use number (1) as object key`, #5510) is the pair's action in jq too, so it now comes after the errors in the pair's value and is not raised when the value fails: `{(1):{,}}` is the syntax error then the key's, `{(1):}` the syntax error alone.
+What is not followed: an error inside a pair's value that jq recovers from at a bracket of its own (`{1:[2:3]}` is three errors in jq, two here: the value's syntax error stops the parse), or at one of its other recovery rules (`if`, `try`, `.`, `break`), and an error this parser meets inside one of jq's tokens after a value jq has finished (`{..:"s" ..:"s"}`, where `"s" ..` is read as a field access that fails at the second `.`; jq finishes `"s"`, reports its hint, then fails at `..`).
+Over 4,000 generated programs of nested malformed objects, keys and patterns, the errors and their count now agree with jq 1.7.1 on all but 80 (they differed on 2,643 before), and those are of the shapes above.
+jq 1.8.2's parser differs on six of the pinned programs: it reports a hint where 1.7.1 does not in `{1, a:2}` and `{a:1, 2, b:3}`, an extra error in `{1: 2+3 4}` and `{1:2,, a:3}`, and words the syntax error differently in `{a: 1 + 2: 3}` and `{1:[2:3]}`; 1.7.1 stays the reference.
+Pinned by `tests/jq_cli/i7716.rs`, whose rows are jq 1.7.1's errors in order and their lines.
+
 **What remains open, all three narrower than the shape gap:**
 
 - **Message wording is succinctly's own.** A syntax error reads `jq: error: unexpected end of
@@ -9480,8 +9526,11 @@ Of 3,000 generated programs (upstream `jq.test` programs cut short, re-spaced an
   `1 2`, `if then`, `?` gives no consistent rule); the reporter points at the error column
   instead, so where the two differ it is only in trailing whitespace.
 - **jq can report *multiple* compile errors from one malformed filter** (e.g. `if 1 then`
-  → 2 errors); succinctly's parser returns a single `Result<_, ParseError>` and has no
-  architecture for accumulating more than one — a separate, larger gap than the wording.
+  → 2 errors); succinctly's parser stops at the first syntax error, except in an object
+  construction or pattern entry (#7716, above), where it recovers as jq's grammar does. jq's
+  other recovery rules (`'(' error ')'`, `'[' error ']'`, `"if" Exp "then" error` with its
+  `Possibly unterminated 'if' statement`, `"try" Exp "catch" error`, `'.' error`, `BREAK
+  error`) are not followed — a separate, larger gap than the wording.
 
 All four paths now share the same `jq: error:` prefix, the same `jq: N compile error(s)`
 trailer discriminator, and exit 3, so a script that greps or counts `compile error` to tell
@@ -9616,6 +9665,11 @@ Three differences remain, none of which aborts the process:
   A pipe whose first stage is such a call (`f($n - 1) | f($n - 1)`, a depth-first walk that threads its state through the value) ran the rest of the pipe inside the call's output sink the same way, and was refused after about 8,000 calls at depth 13 where jq answers; since [#7460](https://github.com/rust-works/succinctly/issues/7460) a call whose arguments and body answer once (the tail-call loop's test of a stage it runs ahead of its call, #5379, with the definition's own calls and bare parameters taken to, by induction) is run to its value before the rest of the pipe (and so is an `as` source that is such a call), and the stack again holds the recursion's depth.
   That test read only the stage shapes a tail loop runs ahead of its call, so a tree recursion whose definition's body (or a helper it calls) used a `try`, `?`, `label`, `reduce`, an object, `first`, `//` with a builtin, a def declared in the body or a call with arguments, or that recursed through a pipe operand (`def count: if type == "array" then (.[0] | count) + (.[1] | count) else 1 end`), was still refused at about 8,192 leaves where jq answers.
   Since [#7713](https://github.com/rust-works/succinctly/issues/7713) the question a call at a pipe's head (or an operand) is asked also reads those shapes when they answer at most once, a pipe that ends in such a call, and a call to another def by the same question, and an operator settles two operands that are such calls.
+  That was still a list of shapes, and a recursion over any other one (`[1] | first`, `limit(1; 1, 2)`, `foreach`, `until`, a local def with parameters, `env`, `input_line_number`, `IN`, an object, `getpath`, `//` or `label` around a call, `and`, `or`, a string interpolation or an `if` condition over calls) was refused at about 8,192 leaves.
+  Since [#7787](https://github.com/rust-works/succinctly/issues/7787) the question reads every form of the language by what it yields: an expression is run to its value first when a call to a def that may recurse sits on its spine (the expression itself, or what a parenthesis, a pipe, `//`, `first`, `try`, `label`, an `if`, an `as`, an object or a string interpolation holds), it yields at most one output, and it leaves nothing to run after that output but an `empty`, a `break` or an error with a constant message (so a `debug`, an `input` or a second output after it keeps the streaming route); at a pipe's head, as an operand of an arithmetic or comparison operator (when the other operand answers once too) or of `and`/`or` (when both operands hold such a call), as an `as` source or argument, and as an object's key or value or a string interpolation's part.
+  Running such an expression first changes nothing jq shows: its effects all happen before its one output, as they do on the streaming route, and an error after it is raised after its output reaches the consumer.
+  Two kinds of leaf are still refused at about 8,192 leaves where jq answers, because their output count depends on the values they read and running them first could run a generator further than a consumer that stops early would have: a filtered generator (`(1, 2) | select(. == 1)`, `.[] as $v | $v` over a one-element array, `tostream | select(...)`, `splits("x")? // 1`), and a destructuring bind with alternatives (`[1] as [$x] ?// $x | $x`), which a failure raised after the call has to be able to retry (jq retries it through `first`, `limit`, `try`, `label`, an object, `as`, `if` and the operators, and not through `last`, `[...]` or `reduce`).
+  The same question reaches a linear recursion's argument chain: a nested `def` closing over a bare parameter, or a helper `def` in the argument, whose link calls a builtin (`def h: n - 1 | select(true); ... f(h)`, `f(g(n))`) is run to its value where it is read, and answers 3,000 levels where it stopped at about 150; a link written inline (`f(n - 1 | select(true))`) keeps the demand-driven path described above.
   Two Rosetta Code programs the issue names still stop there, for other reasons not yet looked into: the cube-free primes (`out/1`, an `until` loop) and the Sudan function (lazy bare-parameter arguments nested in arguments).
 - **A recursively-built value can exceed `MAX_VALUE_TREE_DEPTH` (384) where jq has no such
   limit.** `def deep(m): if m == 0 then . else [[…]]deep(m-1)[[…]] end; deep(60)` builds
@@ -9801,6 +9855,23 @@ bytes that came from more than one file (an empty or all-tail file handed them o
 the counter's own first read; the read holding a fault in moved bytes ends at a newline or the seam but not at a
 4095-byte chunk, since where the previous file's line started is not known; and streams over shapes this does not
 model still differ from jq in about one run in forty of a deliberately nasty differential; not yet traced.
+
+**A container or string is carried only when jq's parser holds it open at the end of its file ([#7750](https://github.com/rust-works/succinctly/issues/7750)).**
+The stitch judged a file's open tail by its brackets and quotes, so a fault followed by a stray quote on its line (`0 [x"]` then `1\n2\n` in the same file) looked like a string the next file goes on with.
+jq's parser stops at the `x`, drops the rest of its read (through the newline) and parses on from the next line of the same file, so none of it reaches the next file.
+The fault and every value after it were read from the next file instead: `input_filename` named that file ([#7751](https://github.com/rust-works/succinctly/issues/7751)), a file that did not open between the two was reported before the fault and the run exited 2 where jq raises the fault and exits 5 ([#7753](https://github.com/rust-works/succinctly/issues/7753)), and a program reading past the fault with `try input` met that failure one value later and stopped, losing the rest of the input ([#7750](https://github.com/rust-works/succinctly/issues/7750)).
+Since #7750 a tail the brackets leave open is carried only if jq's parser, reading it, meets no fault before the end of the file (`token_runs_to_end`), so only a file that ends inside a container or string pays for that read.
+The parser's state goes on with the carry, and the next file is read from where it stopped, so a value spread over many files is read once in all ([#7792](https://github.com/rust-works/succinctly/issues/7792)); a plain JSON value is read by a scan of RFC 8259's grammar, and jq's parser model reads the value again from its first byte only at a byte that scan cannot vouch for.
+Before, every file boundary scanned, validated and copied all of the value before it again, on the route that reads the files whole and on the one that reads them a window at a time: `length` over one 10 MB array cut into 40 files took 4.83 G instructions, where the same array in one file takes 0.26 G (cachegrind on the x86_64 box).
+It now takes 0.42 to 0.53 G whether the array is cut into 2, 8, 40 or 200 files; what is left over one file is that scan, about two dozen instructions for each byte of the files before the last.
+Pinned by `tests/jq_cli/i7750.rs`, `i7751.rs` and `i7753.rs`.
+`scripts/jq-filelist-differential.py` cuts random texts with faults into 2-40 files, puts a missing file, a directory or a mode-000 file at random places in the list, and compares stdout, stderr and the exit status with jq under 36 programs.
+
+**Where a file cut falls can decide whether a lookup meets a fault it steps over.**
+A lookup reads only what it returns ("Every M2 filter streams" below, and #7448), so `type` over `[1,\n}2]\n` in one file answers `"array"` and `.a` answers `Cannot index array with string "a"`, where jq 1.7.1 and 1.8.2 refuse the text with `jq: parse error: Unmatched '}' at line 2, column 1`.
+Cut into `[1,\n}2` and `]\n`, the same text raises jq's parse error for both programs: the fault is in the first file and jq's parser holds nothing open at its end, so nothing is carried, and that file's document is read as one that does not close.
+That answer is jq's own, so it is kept: over a list of files a lookup can report a fault that the same text in one file lets it step over.
+Pinned by `a_cut_after_a_fault_a_lookup_steps_over_is_recorded_7750` in `tests/jq_cli/i7750.rs`.
 
 The seam machinery is checked with `scripts/jq-multifile-stitch-differential.py`, which splits random token streams
 at random bytes into two or three files and compares what each build reads under `try input catch` (and the
@@ -11160,9 +11231,10 @@ that half.)
 The `-n`/`input` bridge stays materializing — `input` must hand the evaluator an owned
 value it can return from a builtin by construction, so validating what it materializes there
 is the rule working as intended, not an accident left to close. (`-s` was the other route
-left behind here; #2847's paragraph just below moves it.) `-e` streams like the default but materializes each *output* to decide the exit
-status, so `-e '.,.'` on `{"\ud800":1,"\ud800":2}` still raises the collision where `-c
-'.,.'` echoes — unaffected by this change, `-e` was never one of the routes being moved.
+left behind here; #2847's paragraph just below moves it.) `-e` streams like the default and
+reads only whether each *output* is truthy (#7757), so `-e '.,.'` on `{"\ud800":1,"\ud800":2}`
+echoes as `-c '.,.'` does; before #7757 it materialized each output to decide the exit status
+and raised the collision.
 Pinned by `test_materializing_flag_routes_still_validate_2103` (rewritten for the new
 `-S`/`-a`/`-C` behavior, then for `-s`; the `-n` rows are unchanged).
 
@@ -11200,11 +11272,10 @@ reads) plus two consequences of the route:
   with no output and jq's own parse error (`jq: parse error: Unfinished JSON term at EOF at line 3, column 0`, [#5555](https://github.com/rust-works/succinctly/issues/5555)).
   `-n -s` with `inputs` raises it as jq does, `jq: error (at <file>:<line>): …` at the position jq's parser stood on.
   Under `-n -s` jq reads on the first `input`, and so does succinctly since [#6019](https://github.com/rust-works/succinctly/issues/6019): each fault the stream holds is the error of one call, all of them ahead of the array, which holds every value read (the ones after a fault too, since jq goes on with the next line); `try input catch "E"` on `1 2 }` prints `"E"`, and a program that never calls `input` prints its result.
-  A stream that ends in a bare token and the one character that ends it (`1[`, `true{`) closes jq's array before the end-of-file fault, which then comes after the array and names `<unknown>`.
-  So does succinctly since [#6004](https://github.com/rust-works/succinctly/issues/6004): `printf '1[' | jq -cs .` prints `[1]` and then the parse error, and an `input` that meets the fault names `(at <unknown>)`.
-  Only that shape does, and only where it ends the whole stream: `1 [`, `"a"[` and `[1][` keep the all-or-nothing slurp and the file in the marker, as in jq, and so does a token followed by a file that would not open.
-  `--stream -s` does the same since [#6061](https://github.com/rust-works/succinctly/issues/6061), and for every fault met by a call after the one that closes its array: jq closes the array at the call that consumes the last byte, so an event that byte completes is in it (`printf '1[' | jq -cs --stream .` is `[[[],1]]`, `[1,` is `[[[0],1]]`, `[{}` is `[[[0],{}]]`) and the end-of-input fault comes after it.
-  A fault met by that call or an earlier one is still the whole result (`[1,2`, `1 [`).
+  A stream that ends in a bare token and the one character that ends it (`1[`, `true{`) closed jq 1.7.1's array before the end-of-file fault, which then came after the array and named `<unknown>`.
+  So did succinctly from [#6004](https://github.com/rust-works/succinctly/issues/6004), and `--stream -s` from [#6061](https://github.com/rust-works/succinctly/issues/6061) for every fault met by a call after the one that closed its array (`[1,` printed `[[[0],1]]` first).
+  jq 1.8.2 meets that fault before it closes the array, and so does succinctly since [#7807](https://github.com/rust-works/succinctly/issues/7807): the slurp is all-or-nothing for these shapes too (the `--stream --slurp` section of #7523 above has the rows).
+  An `input` under `-n -s` that meets the fault still names `(at <unknown>)`, jq 1.7.1's position (#7607).
   A file earlier than the one the splitter stopped in is read again from disk to find a fault ahead of it, since its buffer is gone.
 - A value jq rejects as undecodable (`"\ud800"`, `"\x"`) is echoed raw, as on the default
   route ([`docs/plan/decode-failure-routing.md`](../../plan/decode-failure-routing.md)), where
@@ -11898,7 +11969,12 @@ This is the "matching would corrupt data" condition of ADR-0018: the pin's answe
 A sweep of every `%Y-%m-%d` date for years 1583 to 2400, months 1 to 12 and days 0 to 31 (314,112 dates) against the macOS pin found 384 differences.
 They are every day (0 to 31) of January and February in 1700, 1800, 1900, 2100, 2200 and 2300, the century years that are not leap years.
 The leap century years (1600, 2000, 2400), every other year and every March day agree, since the macOS routine corrects itself from March.
-The unit test `test_strptime_weekday_correct_for_century_non_leap_years_970` (`src/jq/eval.rs`) pins the calendar's weekday for those dates.
+A second sweep (#7808) took every valid `%Y-%m-%d` date of years 1 to 9999 (3,652,059 dates) through `strptime` and compared weekday and year day with the proleptic Gregorian calendar, on jq 1.7.1 and on jq 1.8.2, both on macOS.
+The two releases agree on the same 4,425 differences, all in the weekday (the year day agrees on every date): every day of January and February in the 75 century years that are not divisible by 400, one day before the calendar's.
+Those years are 100, 200, 300, 500, 600, 700, 900, 1000, 1100, 1300, 1400, 1500, 1700, 1800, 1900, 2100 and so on up to 9900; years 1 to 99, every other year and every March to December date agree.
+jq's own comment names only 1900 and 2100, but the error is not limited to those two: it is every such year.
+`succinctly jq` answers the calendar's weekday and year day on all 3,652,059 dates.
+The unit test `test_strptime_weekday_correct_for_century_non_leap_years_970` (`src/jq/eval.rs`) pins the calendar's weekday for those dates, and for dates in 100, 1000, 3000 and 9900 (#7808).
 The same routine is wrong for a negative year, which `%Y`, `%y` and `%C` read with a sign (#5947): `"-999-03-05" | strptime("%F")` is weekday `3` in jq and `4` here, the calendar's (proleptic Gregorian).
 The date itself agrees: a week number in a negative year is placed with the libc's own first-weekday formula in C's truncating arithmetic, as the pin does.
 
@@ -12063,7 +12139,7 @@ Before 1900 the macOS jq's `%s` is `-1`, as succinctly's is by the `timegm` rule
 ### `strftime`/`strflocaltime` localize through the C library where there is one (#5754)
 
 jq calls `setlocale(LC_ALL, "")`, so `strftime` and `strflocaltime` follow `LC_ALL`, `LC_TIME` and `LANG`.
-`succinctly jq` does the same for `%a %A %b %B %h %p %c %x %X %r`: the `locale-time` feature (on in `cli`) renders them through the C library's `strftime_l` in the locale `newlocale(LC_ALL_MASK, "")` resolves.
+`succinctly jq` does the same for `%a %A %b %B %h %p %c %x %X %r` and `%OB`: the `locale-time` feature (on in `cli`) renders them through the C library's `strftime_l` in the locale `newlocale(LC_ALL_MASK, "")` resolves.
 The locale is resolved once per process, on the first conversion.
 jq's all-or-nothing rule holds: a locale that is not installed, or any one invalid category, leaves the whole process in C (`LANG=de_DE.UTF-8 LC_MESSAGES=xx_XX` prints `Thursday`).
 An unset, `C`, `POSIX` or `C.*` environment never leaves the evaluator's own English tables.
@@ -12079,8 +12155,11 @@ What differs from jq 1.7.1:
 - **The numeric specifiers, `%z`, `%Z` and `%s` are not localized.**
   They stay in the evaluator, so the zone-label rules above are unchanged under any locale.
   A locale layout that prints the zone itself (glibc's `en_GB` `%c` ends in `%Z`) takes the same zone labels.
-- **`%E*` and `%O*` follow the plain specifier.**
+- **`%E*` and `%O*` follow the plain specifier, but for the alternative month names.**
   Under a locale whose C library has alternative era or digit forms (`ja_JP` on glibc) the plain form is printed.
+  `%OB` is the locale's alternative month name (#7790), the nominative one a month standing alone takes, where `%B` is the genitive of a date: `LC_ALL=cs_CZ.UTF-8`, `0 | strftime("%OB")` is `"leden"` and `strftime("%B")` is `"ledna"`, as jq prints them on macOS.
+  macOS's libc has such names under `be_BY`, `cs_CZ`, `el_GR`, `kk_KZ`, `lt_LT`, `mn_MN`, `pl_PL`, `ru_RU` and `uk_UA`, and prints the full name for `%OB` under every other locale; every other `%E` and `%O` form is the plain one there under every locale it has (checked against jq 1.7.1 and 1.8.2 on macOS for each letter after either modifier, in all 84 UTF-8 locales, at three instants).
+  glibc's `strftime(3)` gives `%OB`, `%Ob` and `%Oh` as its alternative month names (since glibc 2.27), and `succinctly jq` renders all three through `strftime_l`, so a Linux build prints what glibc prints for them; that was not checked against a glibc `jq`.
 - **An empty result for a format that is not empty, or one past jq's buffer, is an error; an empty format is not (#7542).**
   jq hands the library a buffer of `strlen(fmt) + 100` bytes and raises `strftime/1: unknown system failure` (`strflocaltime/1:` for the local-zone one) when `strftime` returns 0.
   So does this: `%p` under `de_DE` (the library prints nothing there, macOS and glibc alike) and a result of `strlen(fmt) + 100` bytes or more (five `%c`) are that error, and `strftime("...")?` is empty.
@@ -12121,12 +12200,14 @@ What differs from jq 1.7.1:
   `%Z` with a width reads exactly that many capitals: `"GMT" | strptime("%3Z")` is read, `%4Z` and `%2Z` are no match.
   Checked against `/usr/bin/jq` 1.7.1 (macOS) over 24,000 prefix-and-specifier rows and 9,000 random formats; a glibc `jq` was not checked.
   The pin's libc reads `%OB` from the alternative month names, which C holds as the full names alone, so `%OB` takes `March` but not `Mar`, and `%Ob` and `%Oh` take neither; a glibc `jq` reads the abbreviation with `%O` as it does without.
+  Under another locale they are the names `strftime("%OB")` prints (#7790): `"leden" | strptime("%OB")` is January under `cs_CZ`, and `"ledna"`, which `%B` reads, is no match, as in jq on macOS.
   The pin's libc puts no limit on which specifier a modifier precedes; glibc reads `%E` only before `c C x X y Y` and `%O` only before `d e H I m M S U V W w y`, so a glibc `jq` rejects `"03" | strptime("%Em")`.
   `%k` and `%l` are read as `%H` and `%I`.
   `%C` and `%y` complete each other in the order the libc reads them: `%C` after `%Y` replaces the year with the century (`"2015 20" | strptime("%Y %C")` is year 2000), a `%C` and a `%y` give the year `century * 100 + y` whichever comes first and use each other up, and `%Y`, `%D` and `%F` clear a pending half (#5934).
   `%n` and `%t` read at least one white-space character, the whole run of it: `"2015" | strptime("%Y%n")` is no match, and so is `"2015  " | strptime("%Y %n")`, whose format space has taken the run already; the run is ASCII white space only, as the libc's `isspace` has it.
   That is the pin's libc: a glibc `jq` takes `%n` and `%t` as plain white-space directives that match none too.
-  Still different: a year of 1800, 1900 or 2100 gets the weekday jq's own routine computes, one off from the calendar's for the century years in January and February.
+  Still different: in January and February of a century year that is not divisible by 400 (75 years from 1 to 9999: 100, 200, 300, 500 and so on, 1000, 1700, 1800, 1900, 2100) jq's own routine gives a weekday one day before the calendar's.
+  This implementation gives the calendar's, as the section on that routine above records (#970, #7808).
   `strftime`'s `%y` and `%C` of a negative year follow the pin's libc (#6030): `%y` is the absolute value of the year's remainder by 100 (year -5 is `05`), and `%C` is `-0` when the century is 0 and the year negative.
   A glibc `jq` prints a negative year's `%y` and `%C` from the floored remainder and quotient (year -5 is `95` and `-1`, year -101 is `99` and `-2`), and also prints `%Y` of year -5 as `-5` and `%c` as `Sun Jan  1 00:00:00 -5`, where the pin and this implementation print `-005`; measured on Ubuntu 22.04 (glibc 2.35) with a source-built jq 1.7.1.
   The `strftime-negative-year-*` ledger entries record the two probes for Linux.
@@ -13898,8 +13979,8 @@ Reading it behaves as an array's does, with these specifics. `.k`, a chain that 
 contents, and a member that is a node comes back as the node (`{a: .bad} | .a | length` counts its
 members, `| tojson` raises). Printing, `tojson`, `to_entries`, `has`, an index key or slice bound
 (`.u[{a: .bad}:]`) and every other consumer read the whole object and raise on a node that fails
-to decode, writing nothing; `-e`, `-S`, `-a` and `-C` materialize it first, as they do an
-array. Any stage after the object that is not one of those reads takes the object as the owned
+to decode, writing nothing; `-S`, `-a` and `-C` materialize it first, as they do an
+array (`-e` reads only whether it is truthy, #7757). Any stage after the object that is not one of those reads takes the object as the owned
 value it stands for, through the arm that has always handled one, so a `?//` retry, a bounded
 consumer and a generator after it behave as they did. `try`/`?`, `isempty`, `skip` and `isvalid`
 do not read the object (they do not read an array's nodes either, but they force a `LazySeq`), so
@@ -14501,6 +14582,32 @@ in `tests/jq_cli_tests.rs`, `test_type_selectors_keep_what_the_owned_round_trip_
 `tests/yq_cli_tests.rs`, and `test_type_selectors_do_not_reindex_3690` in
 `src/jq/eval_generic.rs`.
 
+### A program that can see jq's label values runs on the path-mode interpreter; the rest keep a `break` that a `catch` sees as `null` (#7719, #7724, #7736)
+
+jq implements `break $x` as raising the error `{"__jq":N}` and `label $x | BODY` as `try BODY catch if . == $x then empty else error end` (`gen_label` in `compile.c`), where `$x` is the value `GENLABEL` made when that label instance was entered: `{"__jq":N}`, `N` read from one counter that jq creates once per run (`jq_init`) and never resets between inputs.
+So a `try` between a `break` and its label catches that object (`[label $f | try break $f catch .]` is `[{"__jq":0}]`), a handler that re-raises it is stopped by the label (`label $f | try (1, break $f) catch error` prints `1` and exits 0), a hand-made `error({"__jq":0})` is the break of the label numbered 0 (`_equal` compares, so `{"__jq":0.0}` matches and `{"__jq":0,"x":1}` does not), and a `break` is bound to the label instance in scope where it is written, not to the innermost active label of its name.
+The labels jq's `builtin.jq` enters advance the same counter: `first/1`, `limit/2` (a positive count only), `isempty`, `all`/`any`, `nth/2`, `IN`, and `_modify` once per path, so every `|=`, arithmetic update-assignment, `//=` and `map_values` (`[first(1), (label $f | try break $f catch .)]` is `[1,{"__jq":1}]`; `{a:1,b:2} | .[] |= 1` enters two).
+jq 1.7.1 and 1.8.2 agree on every row captured for #7719 (198 programs and input shapes), except `limit` with a negative count, which 1.8.2 refuses (the pinned 1.7.1 answer is kept, as elsewhere).
+
+The shipped evaluator unwinds a `break` by name to the innermost active `label` of that name and hands a `catch` `null` for it; that costs nothing on the programs that cannot tell the difference, which is almost all of them.
+Since [#7719](https://github.com/rust-works/succinctly/issues/7719) `path_mode::route` sends a jq-mode program that can tell to the path-mode interpreter, which runs `label` and `break` as jq compiles them and the jq-defined builtins from `builtin.jq` (ADR-0026), the route a program with a dynamic path target already takes.
+A program goes there when it spells `__jq` in a string, key or field name, or holds a `label` and a `break` and also one of: a `try` whose handler is not a literal or `empty` around a `break` or a call; a label nested inside another of the same name; or a `break` passed as an argument while some definition holds a label (a recursive call's label is then not the one the `break` names, #7724).
+A `?//` destructuring alternation is the other place a caught `break` shows ([#7736](https://github.com/rust-works/succinctly/issues/7736)): jq's `DESTRUCTURE_ALT` retries the next alternative on any error raised after it, so a `break` of a label outside the binding runs the other alternatives too (`[1] | [limit(3; while(. as [$x] ?// $x | $x; .))]` is six `[1]`s in jq 1.7.1 and 1.8.2).
+The shipped evaluator already retries a `?//` after the stop of its native `first`, `limit`, `nth`, `isempty`, `any`/`all` and `IN` (#1519), except through the loop of a `while` or `repeat`, where it gave three `[1]`s; a program with such a builtin over a `while` or `repeat` holding a `?//` now takes the interpreter.
+On the interpreter such a `while` runs jq's own recursive `_while`, which stops at the interpreter's recursion limit (`_while/0 exceeded maximum recursion depth`, exit 5) somewhere between 1,000 and 10,000 rounds, where jq runs on in constant stack; the shipped evaluator answered the loop wrongly at every length (half of jq's outputs, and it ran on to its loop cap).
+A `?//` in the update of `|=` (and of `map_values` and `walk`, which are `|=` in jq) stays on the shipped route, which answers most such updates as jq does in linear time, where jq's retry through `_modify`'s label makes jq and the interpreter quadratic in the number of paths.
+Its remaining difference is recorded: `{"a":[1],"b":2} | .[] |= select((. as [$x] ?// $x | $x) != null)` and the same `select` in `walk` are `{"a":[1]}` in jq 1.7.1 and 1.8.2 and still raise `Paths must be specified as an array` (exit 5) here.
+Every other program walks the same route as before.
+The CLI decides the route once per program and pins it for the run (`path_mode::pin_route`), so a stream of records pays one pointer compare per record and no walk of the program; a library caller that does not pin walks the program per document, as before, plus the checks above.
+The counter is kept per thread for the documents of one program (`LabelNumbers`), so `[label $f | try break $f catch .]` over `1 2 3` is `[{"__jq":0}]`, `[{"__jq":1}]`, `[{"__jq":2}]`, as in jq; a `no_std` build has no thread-local and numbers each document from 0.
+
+What stays on the shipped route answers as before:
+- a sentinel the program does not spell, built from data or computed (`{"__jq":0}` as the input of `[label $f | 1, error(.), 2]`, or `{("__" + "jq"): 0}`): jq's label stops on it, succinctly raises it (exit 5);
+- a program that also uses a succinctly extension the interpreter declines (`key`, `file_index`, `line`, `at_offset`, ...), whose caught `break` is still `null`;
+- a `break` shadowed by a `def error:`, whose handler sees the ambient value (the section below): the interpreter receives that program as the call it was rewritten into, and runs it the same way.
+
+Pinned by `tests/jq_cli/i7719.rs` and `tests/jq_cli/i7736.rs` (every row against jq 1.7.1) and `route_takes_programs_that_observe_label_values_7719` in `src/jq/path_mode/tests.rs` (which programs take which route).
+
 ### `break $x` shadowed by a `def error:` observes arbitrary ambient pipe state, not jq's own context-independent `{"__jq":N}` sentinel (#2687, #2840)
 
 [#2687](https://github.com/rust-works/succinctly/issues/2687): real jq does not treat `break`
@@ -14570,6 +14677,7 @@ declines `Halt`/uncatchable errors, in every arm that walks `Expr::Label`.
 already documents for a *directly* shadowed `break $x` applies identically to a break
 intercepted through #2840's re-raise (`def error: .; label $a | (def f: break $a; label $b | f)`
 sees `null` where jq sees the sentinel) — the same #562 choice, not a new divergence.
+An unshadowed `break` that a `catch` reads is jq's `{"__jq":N}` since #7719 (the section above); a shadowed one still sees what this section describes, on either route.
 
 **A narrower gap found while fixing #2840 — closed by #2964 meanwhile.** With `error` in
 scope at `f`'s own lexical position rather than only at the label's, #2687's shadowing
@@ -15102,7 +15210,7 @@ jq reports module errors in *reverse* include order (closed by
 [#3313](https://github.com/rust-works/succinctly/issues/3313)), and a main-*body* error
 suppresses def errors entirely (closed by [#3391](https://github.com/rust-works/succinctly/issues/3391)).
 
-### `--slurpfile`'s malformed-JSON detail text is succinctly's own, not jq's (#3051) — accepted divergence
+### `--slurpfile`'s and a data import's malformed-JSON detail is jq's (#3051, #7769)
 
 A bad `--slurpfile`/`--rawfile`/`--argjson` argument now exits 2 (jq's usage-error code) with
 a single `jq: ...` line instead of routing through `anyhow`'s generic exit-1 `Error: .../Caused
@@ -15119,22 +15227,18 @@ $ jq  -nc 1 --argjson x '[1,'             # jq: invalid JSON text passed to --ar
 $ sjq -nc 1 --argjson x '[1,'             # byte-identical
 ```
 
-Only `--slurpfile`'s own malformed-JSON *inner* detail (after the wrapper's second `: `)
-diverges:
+The detail after the wrapper's second `: ` for a `--slurpfile` file that is not JSON, and after `error loading data file <path>: ` for a data import (`import "d" as $d;`), was `serde_json`'s or the splitter's wording until [#7769](https://github.com/rust-works/succinctly/issues/7769) (`Invalid JSON in stream: EOF while parsing a value at line 1 column 3`).
+It is now the message of jq's parser and the line and column it stops at, from the crate's model of that parser (`jq_stream_fault`, the one the input routes word their faults with), reading the file's bytes as jq reads them: past the one byte-order mark jq skips, and with each byte that is not UTF-8 one column.
 
 ```console
-$ jq  -nc 1 --slurpfile x t1.json   # jq: Bad JSON in --slurpfile x t1.json: Unfinished JSON term at EOF at line 2, column 5
-$ sjq -nc 1 --slurpfile x t1.json   # jq: Bad JSON in --slurpfile x t1.json: Invalid JSON in stream: EOF while parsing a value at line 2 column 5
+$ printf '[1,\n' > t1.json
+$ jq  -nc 1 --slurpfile x t1.json   # jq: Bad JSON in --slurpfile x t1.json: Unfinished JSON term at EOF at line 2, column 0
+$ sjq -nc 1 --slurpfile x t1.json   # byte-identical
 ```
 
-jq's own line/column diagnostic comes from its own hand-written JSON reader; succinctly's
-`Invalid JSON in stream: <serde_json detail>` comes from `anyhow`'s context chain over
-`serde_json`'s own `Display` for the same failure (`parse_json_stream`'s
-`.context("Invalid JSON in stream")` — the chain is preserved via `anyhow::Error`'s alternate
-`{:#}` Display, not dropped). Reproducing jq's exact wording there would mean re-deriving its
-parser's own error-position/message rules for this one CLI-arg error path — out of proportion
-to this issue's own "Low severity" scope, which was the exit code and the reporting channel,
-not this detail text.
+A number with a NUL glued to it ends at the NUL, as jq's number parser reads a C string (`1.5e3`, a NUL, is `[1.5E+3]`), where both routes refused such a file before #7769.
+jq 1.8.2 answers as 1.7.1 does except in two places, where 1.7.1 stays the reference: a quote it refuses is worded `Invalid string literal; expected ", but got '` (a 1.8 rewording), and its parse depth is 10,000 levels where 1.7.1's, and succinctly's, is 256.
+A NaN with a payload (`nan1`) is refused in jq 1.8.2's words (`Invalid numeric literal at EOF at line 1, column 4`), as on the input routes ([#7522](https://github.com/rust-works/succinctly/issues/7522), recorded above), where jq 1.7.1 reads it as `null`.
 
 A `--rawfile`, `--slurpfile` or `-f` file with a byte that is not valid UTF-8 was refused with that wrapper (`Could not open <file>: stream did not contain valid UTF-8`, exit 2) until [#7436](https://github.com/rust-works/succinctly/issues/7436); jq reads it with U+FFFD, and so does `succinctly jq` now.
 jq's `jv_load_file` reads `-f` and `--rawfile` 4,096 bytes at a time, reads on to the end of a character the last byte of a full read starts, and decodes each read on its own, so a sequence cut short by the end of a read is one U+FFFD to that end, and that is matched (`jq_raw_file_text`).
@@ -15668,6 +15772,28 @@ The zone the macOS jq 1.8.2 names for such a date under `TZ=Europe/Paris` (`PMT 
 Also fixed with it, where both releases agree: `strflocaltime`'s `%s` of a reading that is `-1` seconds from the epoch as UTC (`1969-12-31 23:59:59`) is the instant that reading names in the local zone, `"-3601"` under `TZ=Europe/Paris`, where `succinctly jq` printed `"-1"`, `timegm`'s failure value.
 `succinctly yq` is not changed: real yq has none of these builtins, and `--jq-extensions` reaches the jq code above.
 Pinned by `tests/jq_cli/i7606.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`) on macOS, with jq 1.7.1's (`/usr/bin/jq`) answers in its comments where they differ.
+
+A reading in a skipped hour where `isdst` stays 0 is carried past the skip here and is not by jq, on macOS or on Linux (#7809).
+The C library's `mktime` with `tm_isdst = -1`, Apple's and glibc's alike, fails for a reading in a gap whose standard-time offset changes, as a zone moving its standard offset does: `Europe/Moscow` on 2011-03-27 at 02:00 (UTC+3 to UTC+4), `Pacific/Chatham` in 1946 and `America/Santiago` in 1916.
+jq 1.7.1 and jq 1.8.2 then print the fields as given and `%s` as `-1`, a time the zone never had.
+The strings below are the macOS ones; jq 1.7.1 on Linux (glibc, Ubuntu 22.04, tzdata 2026e) prints the same three jq 1.7.1 strings, and the same `-1` for the `Asia/Kabul` and `Europe/Andorra` readings `tests/jq_cli/i7809.rs` pins (jq 1.8.2 was not captured on Linux).
+`TZ=Europe/Moscow`, `[2011,2,27,2,30,0,0,85] | strflocaltime("%Y-%m-%d %H:%M:%S %Z %s")` is `"2011-03-27 02:30:00 MSK -1"` in both and `"2011-03-27 03:30:00 MSK 1301182200"` here.
+`TZ=Pacific/Chatham`, `[1946,0,1,0,15,0,0,0]` is `"1946-01-01 00:15:00 +1245 -1"` in jq 1.7.1, `"1946-01-01 00:15:00 +1215 -1"` in jq 1.8.2 and `"1946-01-01 00:45:00 +1245 -757425600"` here.
+`TZ=America/Santiago`, `[1916,6,1,0,10,0,0,182]` is `"1916-07-01 00:10:00 -04 -1"`, `"1916-07-01 00:10:00 SMT -1"` and `"1916-07-01 00:27:15 SMT -1688410200"`.
+The zone abbreviations that differ between the two releases are the C library's and are recorded above (#7606, #3203); the time and the `%s` are the subject here.
+A reading before the skip or at its end is the same in all three (`[2011,2,27,1,59,59,0,85]` and `[2011,2,27,3,0,0,0,85]` under `TZ=Europe/Moscow`).
+A gap where `isdst` changes works as the paragraph above says: `TZ=America/New_York`, `[2024,2,10,2,30,0,0,69]` is `"2024-03-10 03:30:00 EDT 1710055800"` in jq 1.8.2 and here.
+A scan of the 418 zones of the macOS zone database (tzdata 2026f, the zones of `zone.tab`) for every gap from 1901 to 2037, reading the first, the middle and the last skipped second of each, found 13,036 gaps.
+In the 553 whose `isdst` is 0 before and after, every probed reading is `-1` in both macOS releases, and `succinctly jq` answers a real instant for all of them.
+In the 12,483 where `isdst` is 1 on either side, the macOS `mktime` succeeds.
+`succinctly jq` keeps its answer: the pin's is a time the zone never had with the epoch of a failure, ADR-0018's "matching would corrupt data" condition, and the gap rule above gives a reading the zone skipped the instant past the skip.
+A narrower difference came out of the same scan, which is only recorded: in 207 of those 12,483 gaps (the ones that are not a whole hour of daylight saving time) `mktime` succeeds on macOS but lands on another instant from `succinctly jq` for at least one of the three readings, with the same epoch seconds in jq 1.7.1 and jq 1.8.2.
+`TZ=Pacific/Apia`, `[2011,11,30,0,0,0,0,363]` (Samoa skipped 2011-12-30) is `"2011-12-29 01:00:00 -10 1325156400"` in jq 1.8.2 and `"2011-12-31 00:00:00 +14 1325239200"` here.
+`TZ=Pacific/Auckland`, `[1928,9,14,2,0,0,0,287]` (a half-hour gap) is `"1928-10-14 03:00:00 NZST -1300698000"` and `"1928-10-14 02:30:00 NZST -1300699800"`.
+The scan found that gap as `Antarctica/McMurdo`, which the macOS zone database links to `Pacific/Auckland`; Ubuntu's zone database (on 22.04 and on the CI runners) has it as a zone of its own (UTC, `-00`, until 1956), so there 02:00 on 1928-10-14 is an ordinary reading and `succinctly jq` answers `"1928-10-14 02:00:00 -00 -1300658400"`, with the epoch seconds jq 1.7.1 prints there.
+This narrower difference is mostly the Apple C library's: jq 1.7.1 on Linux (glibc) prints the fields as given with `succinctly jq`'s epoch seconds for the `Pacific/Apia` and `Pacific/Auckland` readings (`1325239200`, `-1300699800`), and the macOS epoch seconds for the `Asia/Hong_Kong` one in `tests/jq_cli/i7809.rs` (`-884250000`, where `succinctly jq` answers `-884248200`).
+The scan itself was not repeated on Linux.
+Pinned by `tests/jq_cli/i7809.rs`, whose rows are `succinctly jq`'s answers on both platforms, with the jq answers in its comments; the scan was run on macOS with the time zone set only in the child process's environment.
 
 ## `mktime` near the C `int` limits: what jq decides is matched, what macOS's `timegm` decides is not (#7722, #7723)
 

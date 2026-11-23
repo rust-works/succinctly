@@ -21,7 +21,13 @@ which the ACCEPT_WRONG rule does not see). No DIFF is documented today, and it i
 --dimension sweeps` runs this script (#5552), over `--sample K`: about one row in K of the 1.2M-row grid, chosen
 by a hash of the row's index and `--seed` while the grid is generated.
 
-Usage: scripts/jq-fold-body-register-grid-sweep.py --bin BIN [--base BIN] [--jq JQ] [--show N]
+Which jq a row is judged against (#7518): `last(f)` of an `f` that yields nothing yields nothing, as in jq 1.8.2
+(jqlang/jq#3179), where jq 1.7.1 answers its `null` seed. `--jq-latest JQ` (jq 1.8.2; `succinctly dev compare jq`
+passes its secondary reference) judges the rows whose program calls `last(` (the `rd-last-*` outers) against it and
+the rest against `--jq`. Without it every row is judged against `--jq`, and against jq 1.7.1 the `last` rows over an
+empty source are ACCEPT_WRONG or DIFF by design.
+
+Usage: scripts/jq-fold-body-register-grid-sweep.py --bin BIN [--base BIN] [--jq JQ] [--jq-latest JQ] [--show N]
                                                    [--only SUBSTR[,SUBSTR...]] [--only-source SUBSTR[,SUBSTR...]]
                                                    [--jobs N] [--wrapped | --deep] [--dump FILE]
                                                    [--sample K] [--seed S] [--jq-gate]
@@ -340,6 +346,12 @@ KNOWN_ACCEPT_WRONG = {
 }
 
 
+def oracle_for(prog, jq, jq_latest):
+    """The jq a row is judged against: `jq_latest` (jq 1.8.2) for a program that calls `last(`, whose
+    empty-generator answer succinctly takes from jq 1.8 (#7518), when it is given; `jq` otherwise."""
+    return jq_latest if jq_latest and "last(" in prog else jq
+
+
 def run(prefix, prog, doc, timeout=10):
     cmd = [*prefix, "-c", prog]
     try:
@@ -392,6 +404,10 @@ def main():
     ap.add_argument("--bin", required=True, help="succinctly build under test")
     ap.add_argument("--base", help="reference succinctly build; a lost match against it fails")
     ap.add_argument("--jq", default="/usr/bin/jq", help="the pinned oracle (jq 1.7.1)")
+    ap.add_argument(
+        "--jq-latest",
+        help="jq 1.8.2, the oracle of the rows that call `last(` (#7518); default: --jq",
+    )
     ap.add_argument("--show", type=int, default=20, help="max rows printed per section")
     ap.add_argument("--only", default="", help="restrict to rows whose name contains this (comma-separated: any of)")
     ap.add_argument("--only-source", default="", help="restrict to sources whose name contains this (comma-separated: any of)")
@@ -437,7 +453,7 @@ def main():
 
     def work(row):
         name, sn, prog, doc = row
-        oracle = run([args.jq], prog, doc)
+        oracle = run([oracle_for(prog, args.jq, args.jq_latest)], prog, doc)
         if oracle[0] == "TIMEOUT":
             return None
         cand = run([args.bin, "jq"], prog, doc)

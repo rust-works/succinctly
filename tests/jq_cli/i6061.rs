@@ -1,10 +1,13 @@
-//! #6061: `-s --stream` closes its array at the call that consumes the last byte of the input, so
-//! a fault the stream ends in is met by a later call and comes after the array, which holds every
-//! event read: a bare token before a last opener (`1[`), and a `,` or a closing bracket that
-//! completes an event as the last byte (`[1,`, `[{}`). A fault met by the call that consumes the
-//! last byte, or before it, is the whole result (`[1,2`, `1 [`). Every row is what `/usr/bin/jq`
-//! 1.7.1 printed for the same stdin (stdout with its newlines as `\n`, the exit code, and the first
-//! line of stderr).
+//! #6061: jq 1.7.1's `-s --stream` closed its array at the call that consumed the last byte of the
+//! input, so a fault the stream ended in was met by a later call and came after the array, which
+//! held every event read: a bare token before a last opener (`1[`), and a `,` or a closing bracket
+//! that completes an event as the last byte (`[1,`, `[{}`). jq 1.8.2 reads the empty closing refill
+//! before it closes the array, so that fault is the whole result there, and `succinctly jq`
+//! follows it since #7807: those rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`) and say
+//! what 1.7.1 printed. A value the closing call yields is still in the array, with the fault after
+//! it (`[[1]`). A fault met by the call that consumes the last byte, or before it, is the whole
+//! result in both (`[1,2`, `1 [`). Every other row is what `/usr/bin/jq` 1.7.1 printed for the same
+//! stdin (stdout with its newlines as `\n`, the exit code, and the first line of stderr).
 
 use anyhow::Result;
 
@@ -14,87 +17,101 @@ use crate::{run_jq_full, run_jq_over_files};
 type Row = (&'static str, &'static str, i32, &'static str);
 
 const ROWS: &[Row] = &[
+    // jq 1.7.1: `[[[],1]]` first.
     (
         "1[",
-        "[[[],1]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 2",
     ),
+    // jq 1.7.1: `[[[],1]]` first.
     (
         "1{",
-        "[[[],1]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 2",
     ),
+    // jq 1.7.1: `[[[],12]]` first.
     (
         "12[",
-        "[[[],12]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 3",
     ),
+    // jq 1.7.1: `[[[],1],[[],2]]` first.
     (
         "1 2[",
-        "[[[],1],[[],2]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 4",
     ),
+    // jq 1.7.1: `[[[],"a"],[[],1]]` first.
     (
         "\"a\"1[",
-        "[[[],\"a\"],[[],1]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 5",
     ),
+    // jq 1.7.1: `[[[],true]]` first.
     (
         "true[",
-        "[[[],true]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 5",
     ),
+    // jq 1.7.1: `[[[0],1]]` first.
     (
         "[1,",
-        "[[[0],1]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 3",
     ),
+    // jq 1.7.1: `[[[0],1],[[1],2]]` first.
     (
         "[1,2,",
-        "[[[0],1],[[1],2]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 5",
     ),
+    // jq 1.7.1: `[[["a"],1]]` first.
     (
         "{\"a\":1,",
-        "[[[\"a\"],1]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 7",
     ),
+    // jq 1.7.1: `[[[0],{}]]` first.
     (
         "[{}",
-        "[[[0],{}]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 3",
     ),
+    // jq 1.7.1: `[[[0,0],1]]\n[[0,0]]` first.
     (
         "[[1]",
-        "[[[0,0],1]]\\n[[0,0]]",
+        "[[[0,0],1],[[0,0]]]",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 4",
     ),
+    // jq 1.7.1: `[[[],1],[[0],1]]` first.
     (
         "1 [1,",
-        "[[[],1],[[0],1]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 5",
     ),
+    // jq 1.7.1: `[[[0],1],[[1],"a"]]` first.
     (
         "[1,\"a\",",
-        "[[[0],1],[[1],\"a\"]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 7",
     ),
+    // jq 1.7.1: `[[[0],1],[[1],true]]` first.
     (
         "[1,true,",
-        "[[[0],1],[[1],true]]",
+        "",
         5,
         "jq: parse error: Unfinished JSON term at EOF at line 1, column 8",
     ),
@@ -205,23 +222,141 @@ type ShapeRow = (
 );
 
 const SHAPE_ROWS: &[ShapeRow] = &[
-    ("-cs", ".", "[1,\n}\n1 2", "", 5, "jq: parse error: Expected another key:value pair at line 2, column 1"),
-    ("-cs", ".", "[1,\n}\n1", "", 5, "jq: parse error: Expected another key:value pair at line 2, column 1"),
-    ("-cs", ".", "[1,\n1[", "", 5, "jq: parse error: Expected a separator between values at line 2, column 2"),
-    ("-cs", ".", "[1,\n}\n[2]", "", 5, "jq: parse error: Expected another key:value pair at line 2, column 1"),
-    ("-cs", ".", "[1,\n2,\n}\n3", "", 5, "jq: parse error: Expected another key:value pair at line 3, column 1"),
-    ("-cs", ".", "[1,}2", "", 5, "jq: parse error: Expected another key:value pair at line 1, column 4"),
-    ("-cs", ".", "1 ]2", "", 5, "jq: parse error: Unmatched ']' at the top-level at line 1, column 3"),
-    ("-cs", ".", "[1,2,3,4,5,6,7,8,9,10,11,12,", "[[[0],1],[[1],2],[[2],3],[[3],4],[[4],5],[[5],6],[[6],7],[[7],8],[[8],9],[[9],10],[[10],11],[[11],12]]", 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 28"),
-    ("-cs", ".", "1 2 3 4 5 6 7 8 9 10 11 12 [", "", 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 28"),
-    ("-cs", "input", "1[", "", 5, "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 2"),
-    ("-cs", "input", "[1,", "", 5, "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 3"),
-    ("-cs", "[inputs]", "[1,", "", 5, "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 3"),
-    ("-cs", "try input catch .", "1[", "\"Unfinished JSON term at EOF at line 1, column 2\"", 0, ""),
-    ("-cse", ".", "1[", "[[[],1]]", 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 2"),
-    ("-cse", ".", "[1,2", "", 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 4"),
-    ("-cs", "length", "1[", "1", 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 2"),
-
+    (
+        "-cs",
+        ".",
+        "[1,\n}\n1 2",
+        "",
+        5,
+        "jq: parse error: Expected another key:value pair at line 2, column 1",
+    ),
+    (
+        "-cs",
+        ".",
+        "[1,\n}\n1",
+        "",
+        5,
+        "jq: parse error: Expected another key:value pair at line 2, column 1",
+    ),
+    (
+        "-cs",
+        ".",
+        "[1,\n1[",
+        "",
+        5,
+        "jq: parse error: Expected a separator between values at line 2, column 2",
+    ),
+    (
+        "-cs",
+        ".",
+        "[1,\n}\n[2]",
+        "",
+        5,
+        "jq: parse error: Expected another key:value pair at line 2, column 1",
+    ),
+    (
+        "-cs",
+        ".",
+        "[1,\n2,\n}\n3",
+        "",
+        5,
+        "jq: parse error: Expected another key:value pair at line 3, column 1",
+    ),
+    (
+        "-cs",
+        ".",
+        "[1,}2",
+        "",
+        5,
+        "jq: parse error: Expected another key:value pair at line 1, column 4",
+    ),
+    (
+        "-cs",
+        ".",
+        "1 ]2",
+        "",
+        5,
+        "jq: parse error: Unmatched ']' at the top-level at line 1, column 3",
+    ),
+    // jq 1.7.1: "[[[0],1],[[1],2],[[2],3],[[3],4],[[4],5],[[5],6],[[6],7],[[7],8],[[8],9],[[9],10],[[10],11],[[11],12]]", exit 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 28".
+    (
+        "-cs",
+        ".",
+        "[1,2,3,4,5,6,7,8,9,10,11,12,",
+        "",
+        5,
+        "jq: parse error: Unfinished JSON term at EOF at line 1, column 28",
+    ),
+    (
+        "-cs",
+        ".",
+        "1 2 3 4 5 6 7 8 9 10 11 12 [",
+        "",
+        5,
+        "jq: parse error: Unfinished JSON term at EOF at line 1, column 28",
+    ),
+    // jq 1.7.1: "", exit 5, "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 2".
+    (
+        "-cs",
+        "input",
+        "1[",
+        "",
+        5,
+        "jq: parse error: Unfinished JSON term at EOF at line 1, column 2",
+    ),
+    // jq 1.7.1: "", exit 5, "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 3".
+    (
+        "-cs",
+        "input",
+        "[1,",
+        "",
+        5,
+        "jq: parse error: Unfinished JSON term at EOF at line 1, column 3",
+    ),
+    // jq 1.7.1: "", exit 5, "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 3".
+    (
+        "-cs",
+        "[inputs]",
+        "[1,",
+        "",
+        5,
+        "jq: parse error: Unfinished JSON term at EOF at line 1, column 3",
+    ),
+    // jq 1.7.1: "\"Unfinished JSON term at EOF at line 1, column 2\"", exit 0, "".
+    (
+        "-cs",
+        "try input catch .",
+        "1[",
+        "",
+        5,
+        "jq: parse error: Unfinished JSON term at EOF at line 1, column 2",
+    ),
+    // jq 1.7.1: "[[[],1]]", exit 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 2".
+    (
+        "-cse",
+        ".",
+        "1[",
+        "",
+        5,
+        "jq: parse error: Unfinished JSON term at EOF at line 1, column 2",
+    ),
+    (
+        "-cse",
+        ".",
+        "[1,2",
+        "",
+        5,
+        "jq: parse error: Unfinished JSON term at EOF at line 1, column 4",
+    ),
+    // jq 1.7.1: "1", exit 5, "jq: parse error: Unfinished JSON term at EOF at line 1, column 2".
+    (
+        "-cs",
+        "length",
+        "1[",
+        "",
+        5,
+        "jq: parse error: Unfinished JSON term at EOF at line 1, column 2",
+    ),
 ];
 
 #[test]
@@ -244,13 +379,16 @@ fn a_stream_slurp_fault_after_the_array_reads_as_jq_does_across_lines_programs_a
     Ok(())
 }
 
-/// jq reads the files as one stream, so the array closes at the last byte of the last one.
+/// jq reads the files as one stream, so the array closes after the last byte of the last one.
 #[test]
-fn a_stream_slurp_over_several_files_closes_its_array_at_the_last_byte_of_the_last() -> Result<()> {
+fn a_stream_slurp_over_several_files_closes_its_array_after_the_last() -> Result<()> {
     let rows: &[(&str, &str, &str, i32)] = &[
-        ("[1]", "[2,", "[[[0],1],[[0]],[[0],2]]", 5),
-        ("[1,", "[2]", "[[[0],1],[[1,0],2]]\\n[[1,0]]", 5),
-        ("1", "2[", "[[[],12]]", 5),
+        // jq 1.7.1: "[[[0],1],[[0]],[[0],2]]".
+        ("[1]", "[2,", "", 5),
+        // jq 1.7.1: "[[[0],1],[[1,0],2]]\\n[[1,0]]".
+        ("[1,", "[2]", "[[[0],1],[[1,0],2],[[1,0]]]", 5),
+        // jq 1.7.1: "[[[],12]]".
+        ("1", "2[", "", 5),
         ("[1]\n", "}\n3", "", 5),
         ("1 2", "3 [", "", 5),
     ];

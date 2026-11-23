@@ -260,9 +260,9 @@ pub use lazy::JqValue;
 #[doc(hidden)]
 pub use parse_message::{
     blank_nul_number_tails, find_nul, is_jq_depth_fault, jq_depth_fault_offset,
-    jq_input_depth_fault, jq_stream_fault, jq_stream_fault_chunk, jq_stream_fault_end,
-    jq_stream_fault_offset, jq_stream_prefix_fault, scan_utf8_and_nul, InputSource, JqStreamFaults,
-    TextScan, JQ_MAX_PARSING_DEPTH,
+    jq_input_depth_fault, jq_refused_escape_offset, jq_stream_fault, jq_stream_fault_chunk,
+    jq_stream_fault_end, jq_stream_fault_offset, jq_stream_prefix_fault, scan_utf8_and_nul,
+    InputSource, JqOpenTail, JqStreamFaults, TailRead, TextScan, JQ_MAX_PARSING_DEPTH,
 };
 pub use parser::{
     collect_break_sites, collect_call_sites, collect_def_sites, collect_var_sites, parse,

@@ -1,10 +1,12 @@
 //! #6004: a bare number or literal straight before the last byte of the input, a `[` or `{`, is a
 //! value by the time jq's parser meets the end of input: it completes on the byte after it, which
-//! is the opener the end leaves unfinished. So a slurp holds it (`printf '1[' | jq -cs .` prints
-//! `[1]` and then fails), and the fault is named `<unknown>`, since the read that completed the
-//! value is the read that reached the end. Space before the opener (`1 [`), or a string or
+//! is the opener the end leaves unfinished. So jq 1.7.1's slurp held it (`printf '1[' | jq -cs .`
+//! printed `[1]` and then failed), and the fault is named `<unknown>`, since the read that completed
+//! the value is the read that reached the end. Space before the opener (`1 [`), or a string or
 //! container before it (`"a"[`, `[1][`), leaves the value complete in an earlier read, so those
-//! keep the old behaviour. Every row is what `/usr/bin/jq` 1.7.1 printed for the same stdin.
+//! keep the old behaviour. Every row is what `/usr/bin/jq` 1.7.1 printed for the same stdin, except
+//! the slurped arrays: jq 1.8.2 meets the fault before it closes the array and prints the error
+//! alone, which `succinctly jq` follows since #7807 (each such row says what 1.7.1 printed).
 
 use anyhow::Result;
 
@@ -28,61 +30,70 @@ fn check(args: &[&str], rows: &[Row]) -> Result<()> {
 }
 
 #[test]
-fn a_slurp_holds_a_bare_token_that_ends_before_a_final_opener() -> Result<()> {
+fn a_slurp_over_a_bare_token_before_a_final_opener_prints_the_error_alone() -> Result<()> {
     check(
         &["-cs", "."],
         &[
+            // jq 1.7.1: `[1]` first.
             (
                 "1[",
-                "[1]",
+                "",
                 5,
                 "jq: parse error: Unfinished JSON term at EOF at line 1, column 2",
             ),
+            // jq 1.7.1: `[12]` first.
             (
                 "12{",
-                "[12]",
+                "",
                 5,
                 "jq: parse error: Unfinished JSON term at EOF at line 1, column 3",
             ),
+            // jq 1.7.1: `[-1.5]` first.
             (
                 "-1.5[",
-                "[-1.5]",
+                "",
                 5,
                 "jq: parse error: Unfinished JSON term at EOF at line 1, column 5",
             ),
+            // jq 1.7.1: `[true]` first.
             (
                 "true[",
-                "[true]",
+                "",
                 5,
                 "jq: parse error: Unfinished JSON term at EOF at line 1, column 5",
             ),
+            // jq 1.7.1: `[null]` first.
             (
                 "null{",
-                "[null]",
+                "",
                 5,
                 "jq: parse error: Unfinished JSON term at EOF at line 1, column 5",
             ),
+            // jq 1.7.1: `["a",1]` first.
             (
                 "\"a\"1[",
-                "[\"a\",1]",
+                "",
                 5,
                 "jq: parse error: Unfinished JSON term at EOF at line 1, column 5",
             ),
+            // jq 1.7.1: `[1,2]` first.
             (
                 "1 2[",
-                "[1,2]",
+                "",
                 5,
                 "jq: parse error: Unfinished JSON term at EOF at line 1, column 4",
             ),
+            // jq 1.7.1: `[[1],1]` first.
             (
                 "[1]1{",
-                "[[1],1]",
+                "",
                 5,
                 "jq: parse error: Unfinished JSON term at EOF at line 1, column 5",
             ),
+            // jq 1.7.1: `[1,"a",1]` first.
             (
                 "1 \"a\"1[",
-                "[1,\"a\",1]",
+                "",
                 5,
                 "jq: parse error: Unfinished JSON term at EOF at line 1, column 7",
             ),
@@ -246,7 +257,8 @@ fn the_shape_counts_only_at_the_end_of_the_whole_stream() -> Result<()> {
         (
             &["-cs", "."],
             &["two", "a"],
-            "[21]",
+            // jq 1.7.1: `[21]` first.
+            "",
             5,
             "jq: parse error: Unfinished JSON term at EOF at line 1, column 3",
         ),
@@ -267,7 +279,8 @@ fn the_shape_counts_only_at_the_end_of_the_whole_stream() -> Result<()> {
         (
             &["-cs", "."],
             &["empty", "a"],
-            "[1]",
+            // jq 1.7.1: `[1]` first.
+            "",
             5,
             "jq: parse error: Unfinished JSON term at EOF at line 1, column 2",
         ),
@@ -302,7 +315,8 @@ fn the_shape_counts_only_at_the_end_of_the_whole_stream() -> Result<()> {
         (
             &["-cs", "."],
             &["three", "b"],
-            "[31,2]",
+            // jq 1.7.1: `[31,2]` first.
+            "",
             5,
             "jq: parse error: Unfinished JSON term at EOF at line 1, column 5",
         ),

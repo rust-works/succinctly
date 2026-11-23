@@ -2759,17 +2759,17 @@ fn a_program_hands_out_keys_only_through_each_or_keys_7489() {
     });
 }
 
-/// [`KEY_HANDING_PRELUDE_DEFS`] is what [`reaches_a_key`] answers over every
-/// parsed [`PRELUDE`] definition, looking inside each definition it calls
-/// (#7489): the walk is the one definition of the answer, and the table only
-/// spares a run parsing the prelude to find it.
-#[test]
-fn the_key_handing_prelude_table_is_derived_from_the_prelude_7489() {
-    /// Whether the prelude definition `name/arity` can hand a key out, `seen`
-    /// the definitions already being looked inside (a recursive one is looked
-    /// inside once).
+/// A walk over an expression that asks its second argument about each prelude definition the
+/// expression calls ([`reaches_a_key`], [`reaches_a_descent`]).
+type PreludeWalk = fn(&Expr, &mut dyn FnMut(&str, usize) -> bool) -> bool;
+
+/// The prelude definitions whose body `walk` answers `true` for, looking inside each definition
+/// it calls (a recursive one is looked inside once), sorted: how [`KEY_HANDING_PRELUDE_DEFS`]
+/// and [`DESCENDING_PRELUDE_DEFS`] are derived.
+fn derive_prelude_table(prelude: &Prelude, walk: PreludeWalk) -> Vec<(&'static str, usize)> {
     fn reaches(
         prelude: &Prelude,
+        walk: PreludeWalk,
         name: &str,
         arity: usize,
         seen: &mut Vec<(&'static str, usize)>,
@@ -2781,19 +2781,47 @@ fn the_key_handing_prelude_table_is_derived_from_the_prelude_7489() {
             return false;
         }
         seen.push((def.name, def.arity));
-        reaches_a_key(def.expr(), &mut |name, arity| {
-            reaches(prelude, name, arity, seen)
+        walk(def.expr(), &mut |name, arity| {
+            reaches(prelude, walk, name, arity, seen)
         })
     }
+    let mut derived: Vec<(&'static str, usize)> = prelude
+        .defs
+        .iter()
+        .filter(|def| reaches(prelude, walk, def.name, def.arity, &mut Vec::new()))
+        .map(|def| (def.name, def.arity))
+        .collect();
+    derived.sort_unstable();
+    derived
+}
+
+/// #7697: [`DESCENDING_PRELUDE_DEFS`] is what [`reaches_a_descent`] answers over every parsed
+/// [`PRELUDE`] definition, as [`KEY_HANDING_PRELUDE_DEFS`] is for [`reaches_a_key`].
+#[test]
+fn the_descending_prelude_table_is_derived_from_the_prelude_7697() {
     on_big_stack(|| {
         let prelude = Prelude::new();
-        let mut derived: Vec<(&str, usize)> = prelude
-            .defs
-            .iter()
-            .filter(|def| reaches(&prelude, def.name, def.arity, &mut Vec::new()))
-            .map(|def| (def.name, def.arity))
-            .collect();
-        derived.sort_unstable();
+        let derived = derive_prelude_table(&prelude, reaches_a_descent);
+        assert!(derived.contains(&("_sp_paths", 0)), "{derived:?}");
+        assert!(!derived.contains(&("_sp_to_entries", 0)), "{derived:?}");
+        assert_eq!(
+            DESCENDING_PRELUDE_DEFS,
+            derived.as_slice(),
+            "DESCENDING_PRELUDE_DEFS disagrees with the prelude; the derived table is\n{derived:?}"
+        );
+        assert!(DESCENDING_PRELUDE_DEFS.windows(2).all(|w| w[0] < w[1]));
+    });
+}
+
+/// [`KEY_HANDING_PRELUDE_DEFS`] is what [`reaches_a_key`] answers over every
+/// parsed [`PRELUDE`] definition, looking inside each definition it calls
+/// (#7489): the walk is the one definition of the answer, and the table only
+/// spares a run parsing the prelude to find it.
+#[test]
+fn the_key_handing_prelude_table_is_derived_from_the_prelude_7489() {
+    on_big_stack(|| {
+        let prelude = Prelude::new();
+        let derived = derive_prelude_table(&prelude, reaches_a_key);
         assert!(derived.contains(&("_sp_to_entries", 0)), "{derived:?}");
         assert!(prelude.find("_sp_first", 1).is_some());
         assert!(!derived.contains(&("_sp_first", 1)), "{derived:?}");
@@ -3165,4 +3193,149 @@ fn the_grow_step_answers_as_jq_7610() {
             err(&[], r#"Invalid path expression with result "s""#),
         ),
     ]);
+}
+
+/// #7697: a run asked to keep its document leaves a handle on the whole tree it ran on,
+/// whatever the program let go of, for the CLI to forget at the end of the process; the
+/// answers do not move, a write copies what the handle shares, and a request is used up by
+/// the one run that took it.
+#[cfg(feature = "std")]
+#[test]
+fn a_run_asked_to_keep_its_document_leaves_the_whole_tree_7697() {
+    on_big_stack(|| {
+        let doc = r#"{"meta":{"n":[1,2]},"data":[{"name":"a"},{"x":1},{"name":"b"}]}"#;
+        let materialize = || {
+            let index = JsonIndex::build(doc.as_bytes());
+            to_owned::<JqSemantics, _>(&index.root(doc.as_bytes()).value()).expect("doc")
+        };
+        let run_on_doc = |filter: &str, keep: bool| {
+            let program = compile(filter).expect("compiles");
+            if keep {
+                kept_document::keep_next();
+            }
+            let mut outputs = Vec::new();
+            let control = run_program(&program, materialize(), &mut |v| {
+                outputs.push(v.to_json_jq_preserve());
+                true
+            });
+            assert!(control.is_none(), "{filter}");
+            (outputs, kept_document::take())
+        };
+        // `.data` lets go of `meta` as it reads `data`; the handle keeps both.
+        let (outputs, kept) = run_on_doc("[path(.data[] | .name // empty)]", true);
+        assert_eq!(outputs, [r#"[["data",0,"name"],["data",2,"name"]]"#]);
+        assert_eq!(kept, Some(materialize()));
+        // A write through what the handle shares copies it: the kept tree is the document.
+        let (outputs, kept) = run_on_doc("(.data[] | .name // empty) |= 1 | .data", true);
+        assert_eq!(outputs, [r#"[{"name":1},{"x":1},{"name":1}]"#]);
+        assert_eq!(kept, Some(materialize()));
+        // Nothing is kept unasked, and a request is not left for a later run.
+        let (_, kept) = run_on_doc("[path(.data[] | .name // empty)]", false);
+        assert_eq!(kept, None);
+        kept_document::keep_next();
+        let (_, kept) = run_on_doc("[path(.data[] | .name // empty)]", false);
+        assert_eq!(kept, Some(materialize()));
+        let (_, kept) = run_on_doc("[path(.data[] | .name // empty)]", false);
+        assert_eq!(kept, None);
+    });
+}
+
+/// #7697: the CLI keeps the document only for a program that cannot walk it with
+/// [`Interp::recurse`], which frees a document it owns as it walks it.
+#[test]
+fn walks_recursively_names_every_way_to_run_a_descent_7697() {
+    on_big_stack(|| {
+        let walks = |filter: &str| walks_recursively(&compile(filter).expect("compiles"));
+        for filter in [
+            r#"[path(.. | if type == "string" then . else empty end)] | length"#,
+            "(.. | select(type == \"string\") // empty) |= . + \"x\" | length",
+            "[path(recurse(.[]?; . != null) | .a? // empty)]",
+            "[path(recurse(.a) | .b // empty)]",
+            "[paths] | length",
+            "[paths(type == \"number\")] | length",
+            "[leaf_paths] | length",
+            "def p: path(.. | .a? // empty); [p]",
+            "[path(.data[] | .name // empty)] | [recurse] | length",
+        ] {
+            assert!(walks(filter), "{filter}");
+        }
+        for filter in [
+            "[path(.data[] | .name // empty)] | length",
+            "(.data[] | .name // empty) |= 1 | .data | length",
+            "[path(.data[] | to_entries[] | .value // empty)] | length",
+            ". as $d | path($d)",
+        ] {
+            assert!(!walks(filter), "{filter}");
+        }
+    });
+}
+
+/// #7719, #7736: a jq-mode program that can observe jq's label values runs on
+/// this interpreter, and every other program keeps the shipped route.
+#[test]
+fn route_takes_programs_that_observe_label_values_7719() {
+    for filter in [
+        // A handler that reads a caught `break`.
+        "label $f | try (1, break $f) catch error",
+        "[label $f | try break $f catch type]",
+        // A call in the `try` body may break.
+        "label $f | def g: break $f; try g catch .",
+        // `__jq` spelled: a hand-made label value, or a read of one.
+        r#"[limit(3; 1, error({"__jq":0}), 2)]"#,
+        "{__jq: 0} | error",
+        ".__jq",
+        r#""\(1)__jq""#,
+        // A `break` through a same-named label.
+        "[label $f | (def g: break $f; label $f | g), 3]",
+        // A `break` passed to a definition that holds a label.
+        "def f(g): label $out | g; [label $out | f(break $out), 2]",
+        // A `?//` in a `while`/`repeat` that feeds a label-entering builtin: its retry
+        // catches the `break` (#7736).
+        "1 | [limit(3; while(. as [$x] ?// $x | $x; .))]",
+        "[limit(4; [1] | repeat(. as [$x] ?// $x | $x))]",
+        "[1] | first(while(. as [$x] ?// $x | $x; .))",
+        "isempty(while(. as [$x] ?// $x | $x; .))",
+    ] {
+        let expr = parse(filter).expect("parses");
+        assert!(
+            matches!(route(&expr), Route::Interpreter),
+            "{filter} runs on the interpreter"
+        );
+    }
+    for filter in [
+        ".a",
+        "first(.[])",
+        "limit(2; .[])",
+        "try error(\"x\") catch .",
+        "label $out | foreach .[] as $x (0; . + $x; if . > 3 then ., break $out else empty end)",
+        // No `break` to catch, or a handler that ignores what it catches.
+        "label $f | try .a catch .",
+        "label $f | try (1, break $f) catch \"c\"",
+        "label $f | try (1, break $f) catch empty",
+        "label $f | (1, break $f)?",
+        // Two labels of one name side by side, not nested.
+        "[label $f | 1, break $f], [label $f | 2, break $f]",
+        // A `break` in an argument, but no definition holds a label.
+        "label $f | first(1, break $f)",
+        // A `?//` with nothing that enters a label, and a label-entering builtin without one.
+        ". as [$x] ?// $x | $x + 1",
+        // A `?//` the shipped evaluator already retries after a native stop (#1519), or in the
+        // update of `|=`, which stays shipped (#7736).
+        "[limit(1; [1] as [$x] ?// $x | $x)]",
+        "[label $f | [1] as [$x] ?// $x | $x, break $f]",
+        ".[] |= (. as [$x] ?// $x | $x)",
+        ".[] |= select((. as [$x] ?// $x | $x) != null)",
+        "walk(select((. as [$x] ?// $x | $x) != null))",
+        // A `while` with a `?//` that no label-entering builtin consumes.
+        "[while(. as [$x] ?// $x | $x; .)] | length",
+        "first(.[] as [$x] | $x)",
+        // An extension the interpreter declines keeps the shipped route.
+        "label $f | try (key, break $f) catch .",
+    ] {
+        let expr = parse(filter).expect("parses");
+        assert!(
+            matches!(route(&expr), Route::Shipped),
+            "{filter} keeps the shipped route"
+        );
+    }
 }
