@@ -139,6 +139,46 @@ pub(super) const fn window_bytes() -> usize {
     WINDOW_BYTES
 }
 
+/// The environment variable that has a run read every input whole (#7688): a regular file, a
+/// descriptor, a pipe, standard input and a named pipe each decline the windowed routes' gates, as
+/// `/dev/fd/N` once did by accident. The differential fuzz (`scripts/jq-windowed-file-fuzz.py`) sets it
+/// on its oracle, so the oracle stays the whole-file route however the gates change; unlike
+/// [`DEBUG_WINDOW_ENV`] it is in a release build too, since the fuzz runs against one. Any non-empty
+/// value but `0` forces it.
+pub(super) const WHOLE_FILE_ENV: &str = "SUCCINCTLY_DEBUG_JQ_WHOLE_FILE";
+
+/// The environment variable naming a file each windowed route a run takes appends its name to, one
+/// line each (#7688): the fuzz reads it to learn that the side under test went windowed and that its
+/// oracle did not, so a case that compares a route with itself is no longer a silent pass.
+pub(super) const ROUTE_LOG_ENV: &str = "SUCCINCTLY_DEBUG_JQ_ROUTE_LOG";
+
+/// Whether `value`, the content of [`WHOLE_FILE_ENV`], forces the whole-file route.
+fn forces_whole_file(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Whether the run reads every input whole ([`WHOLE_FILE_ENV`]). Asked by the gates every windowed
+/// route goes through, which a run that never reaches one does not pay for.
+pub(super) fn whole_file_forced() -> bool {
+    forces_whole_file(std::env::var_os(WHOLE_FILE_ENV).as_deref())
+}
+
+/// Records that the run took the windowed route `route` ([`ROUTE_LOG_ENV`]); nothing when the
+/// variable is not set. A run's routes are decided once, before its first window is read.
+pub(super) fn note_route(route: &str) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os(ROUTE_LOG_ENV) else {
+        return;
+    };
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(log, "{route}");
+    }
+}
+
 /// The smallest file the route reads a window at a time, four windows (1 MiB in every build that
 /// ships, 4 MiB before #7412): below this it is not worth the second route, and the file is read whole
 /// as before.
@@ -1162,7 +1202,7 @@ impl WindowedFile {
                 &mut self.buf[from..self.validated],
                 Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
                 lead,
-                &[],
+                &mut [],
             );
         }
     }
@@ -3049,6 +3089,21 @@ fn last_line_break(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// One read of `reader` onto the end of `bytes`, of at most `n` bytes (and at most 64 KiB, more than a
+/// terminal's line holds): what a terminal gives a read is the line typed (#7742).
+fn read_once(reader: &mut dyn Read, bytes: &mut Vec<u8>, n: usize) -> io::Result<usize> {
+    let start = bytes.len();
+    bytes.resize(start + n.min(64 << 10), 0);
+    let read = loop {
+        match reader.read(&mut bytes[start..]) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            read => break read,
+        }
+    };
+    bytes.truncate(start + *read.as_ref().unwrap_or(&0));
+    read
+}
+
 /// A source read as whole lines, a window at a time (#7023): `-R`'s file, and the rest of a lone source
 /// the lazy `inputs` route started on the front of. A line is no more than a line break away from its
 /// end, so there is nothing to scan and nothing to carry across a window but the bytes after its last
@@ -3070,6 +3125,10 @@ pub(super) struct LineWindows {
     /// The most the next window reads, once (#7264): a source started on a few KiB reads up to where
     /// a start on the whole front would have ended, so its windows then fall where they always did.
     first_ask: Option<usize>,
+    /// A terminal, typed into a line at a time ([`typed_into`](Self::typed_into), #7742).
+    typed: bool,
+    /// The terminal has not been read yet: a BOM at the front of its first line is the one jq skips.
+    typed_front: bool,
 }
 
 impl LineWindows {
@@ -3088,7 +3147,20 @@ impl LineWindows {
             carried,
             eof: false,
             first_ask: None,
+            typed: false,
+            typed_front: false,
         }
+    }
+
+    /// The source is a terminal (#7742): a window ends at the first line break a read brings, so each line
+    /// is handed on as it is typed, where a window of a block would wait for a block's worth of lines or
+    /// for the end of the input. A read of no bytes is the end (a `^D`), and nothing is read after it. A
+    /// BOM at the front of the first line is dropped, as jq's parser skips it: nothing was read of the
+    /// terminal to find it before the run started.
+    pub(super) fn typed_into(mut self) -> Self {
+        self.typed = true;
+        self.typed_front = true;
+        self
     }
 
     /// The first window reads no more than `bytes`.
@@ -3190,7 +3262,22 @@ impl LineWindows {
                 continue;
             }
             // patchcov: coverage end
-            match self.reader.by_ref().take(n as u64).read_to_end(&mut bytes) {
+            let read = if self.typed {
+                read_once(self.reader.as_mut(), &mut bytes, n)
+            } else {
+                self.reader.by_ref().take(n as u64).read_to_end(&mut bytes)
+            };
+            match read {
+                // A terminal ends at a read of nothing; what it gave before is a line, or the text of
+                // one a `^D` handed on without its line break.
+                Ok(0) if self.typed => self.eof = true,
+                Ok(_) if self.typed => {
+                    if std::mem::take(&mut self.typed_front)
+                        && bytes[before..].starts_with(b"\xEF\xBB\xBF")
+                    {
+                        bytes.drain(before..before + 3);
+                    }
+                }
                 // A short read is the end: a source of unknown length, or a file that shrank.
                 Ok(read) if read < n => self.eof = true,
                 Ok(read) => {
@@ -3758,6 +3845,22 @@ mod tests {
             fault,
             lines,
         }
+    }
+
+    /// #7688: the switch that has a run read every input whole is any non-empty value but `0`, and
+    /// the route log's name is the one the fuzz script sets.
+    #[test]
+    fn the_whole_file_switch_is_a_non_empty_value_but_zero_7688() {
+        use std::ffi::OsStr;
+        assert!(!forces_whole_file(None));
+        for value in ["", "0"] {
+            assert!(!forces_whole_file(Some(OsStr::new(value))), "{value:?}");
+        }
+        for value in ["1", "true", "yes", "00"] {
+            assert!(forces_whole_file(Some(OsStr::new(value))), "{value:?}");
+        }
+        assert_eq!(WHOLE_FILE_ENV, "SUCCINCTLY_DEBUG_JQ_WHOLE_FILE");
+        assert_eq!(ROUTE_LOG_ENV, "SUCCINCTLY_DEBUG_JQ_ROUTE_LOG");
     }
 
     /// #7312: a `--seq` file is read a megabyte at a time only when its first byte, from where the run

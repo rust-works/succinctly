@@ -1821,6 +1821,12 @@ impl FuncDefData {
         };
         memo(slot, || classify(&self.body))
     }
+
+    /// Whether `body` reads any of the parameters by its bare name, computing it with `classify` on
+    /// the first call (#7699): when it does not, binding a call substitutes nothing into it.
+    pub(crate) fn reads_bare_param_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
+        memo(&self.tail.bare_param_read, || classify(&self.body))
+    }
 }
 
 /// Deliberately leaves out the remembered answer (the trailing `..`), so a
@@ -1859,6 +1865,8 @@ struct TailMemo {
     /// (`tail_call::call_head_settles`, #7460), in jq and yq mode.
     call_jq: core::cell::Cell<Option<bool>>,
     call_yq: core::cell::Cell<Option<bool>>,
+    /// Whether the body reads a parameter by its bare name (`eval::bind_def_call_body`, #7699).
+    bare_param_read: core::cell::Cell<Option<bool>>,
 }
 
 impl Clone for TailMemo {

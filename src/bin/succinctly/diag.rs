@@ -25,7 +25,8 @@
 //! jq's `jq: error: writing output failed: <strerror>`, exit 2. A closed descriptor is a failed
 //! write too (std would treat `EBADF` as success). A closed pipe (`| head`) is not an error report:
 //! where there is a SIGPIPE the run dies of it, as `succinctly jq` and jq do (#5547); elsewhere it
-//! exits quietly.
+//! exits quietly. A process started with SIGPIPE ignored keeps it ignored, as jq does, and reports
+//! the closed pipe as the failed write it then is (`writing output failed: Broken pipe`, #7732).
 //!
 //! The panic hook is not changed: the standard library's own hook already ignores a failed write
 //! of the panic message, so a panic on a dead standard error is still exit 101, not an abort. Nor is
@@ -140,6 +141,11 @@ fn try_write_stdout(args: std::fmt::Arguments<'_>) -> Result<(), StdoutFailure> 
 #[cfg(not(test))]
 fn stdout_write_failed(failure: StdoutFailure) -> ! {
     match failure {
+        // Started with SIGPIPE ignored, the closed pipe is a failed write like any other, as it is
+        // to jq, which keeps that disposition (#7732).
+        StdoutFailure::BrokenPipe if super::sigpipe::inherited_ignored() => {
+            stdout_write_failed(StdoutFailure::Other("Broken pipe".to_string()))
+        }
         StdoutFailure::BrokenPipe => {
             // Die of SIGPIPE as jq does (#5547): restore the default action, then write again.
             super::sigpipe::restore_default();

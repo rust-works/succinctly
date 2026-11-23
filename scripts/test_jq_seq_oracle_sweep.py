@@ -15,6 +15,7 @@ Imported via `importlib` rather than `import`: the script's filename has hyphens
 """
 
 import importlib.util
+import json
 import pathlib
 import unittest
 
@@ -96,6 +97,88 @@ class UnwrittenTokenbufTests(unittest.TestCase):
         # `main()` calls `artifact()` only without `--expect-artifacts`; the stream still runs there.
         self.assertTrue(sweep.artifact(b"\x1en\n"))
         self.assertFalse(sweep.artifact(b"\x1enan n\n"))
+
+
+class ReadsPastLastBufferTests(unittest.TestCase):
+    """#7718: jq 1.8.2 reads one more, empty, buffer after the last bytes, and `succinctly jq` follows
+    it, so against the pinned 1.7.1 the sweep skips the streams 1.7.1 reads in its last buffer: an
+    RS scanned there without `-s` (its end-of-stream drop, #2998), and a byte-order mark that breaks
+    off (whose EOF report 1.8.2 wipes)."""
+
+    def test_the_issue_rows_are_skipped(self):
+        for data in (b'\x1e"a"\n\x1e"b"', b"\x1e[1]\n\x1e[2]", b"\x1e1\n\x1etrue", b"\x1e\x1etrue"):
+            self.assertTrue(sweep.reads_past_last_buffer(data, False), data)
+            self.assertTrue(sweep.artifact(data), data)
+
+    def test_a_last_buffer_that_is_empty_reads_alike(self):
+        # (The last of these has data in its last buffer, and no RS there.)
+        for data in (b"\x1e1\n\x1etrue\n", b"\x1e1\n", b"\x1e1\n" + b" " * 4094):
+            self.assertFalse(sweep.reads_past_last_buffer(data, False), data)
+        # A chunk that fills jq's 4095-byte buffer is followed by an empty read in 1.7.1 too.
+        self.assertFalse(sweep.reads_past_last_buffer(b"\x1e1" + b" " * 4093, False))
+
+    def test_the_first_rs_of_the_stream_only_opens_a_record(self):
+        self.assertFalse(sweep.reads_past_last_buffer(b"\x1e1 2", False))
+        self.assertFalse(sweep.reads_past_last_buffer(b"\x1e[1,", False))
+
+    def test_slurp_never_dropped(self):
+        self.assertFalse(sweep.reads_past_last_buffer(b"\x1e1\n\x1etrue", True))
+        self.assertFalse(sweep.artifact(b"\x1e1\n\x1e2{", slurp=True))
+
+    def test_a_mark_that_breaks_off_is_skipped_in_both_modes(self):
+        for slurp in (False, True):
+            self.assertTrue(sweep.reads_past_last_buffer(b"\xef\xbb1 2", slurp))
+            self.assertFalse(sweep.reads_past_last_buffer(b"\xef\xbb1 2\n", slurp))
+
+    def test_the_last_buffer_is_what_the_parser_sees(self):
+        # A chunk with no newline ends at its first NUL (#7340), and an RS past it is never scanned.
+        self.assertFalse(sweep.reads_past_last_buffer(b"\x1e1\n\x002\x1e3", False))
+        self.assertEqual(sweep.final_buffer(b"\x1e1\nab"), (3, b"ab"))
+        self.assertEqual(sweep.final_buffer(b"\x1e1\nab\n"), (6, b""))
+
+
+class ProbeInputsTests(unittest.TestCase):
+    """#7391: `comparison/jq/probes/*.tsv` feeds the same jq 1.7.1 parser, so a probe whose stdin has a bare
+    `n` before any token has written `tokenbuf[1]` makes the reference answer from uninitialised heap: the
+    `man-streaming-errors-example` probe (`["a",n]`) failed `Ledger drift` on one run in several and passed
+    on the re-run. A probe may name a bare `n` only after a token that settled index 1, and the one
+    shape that `reads_unwritten_tokenbuf` skips on purpose, a string of two or more bytes before it
+    (`"iu" n`, whose second byte is a `u` that 1.7.1 reads deterministically), is listed here."""
+
+    # The probes that put a `u` at index 1 on purpose (#7525): 1.7.1 says "Invalid literal", always.
+    DELIBERATE = {"stream-bare-n-after-u", "stream-errors-bare-n-after-u", "inputs-bare-n-after-u"}
+
+    @staticmethod
+    def parsed_by_jq(args):
+        # `-R` reads lines, which no JSON parser sees.
+        return not any(
+            isinstance(a, str) and (a == "--raw-input" or (a.startswith("-") and not a.startswith("--") and "R" in a))
+            for a in args
+        )
+
+    def exposed_probes(self):
+        found = set()
+        for path in sorted((pathlib.Path(__file__).parent.parent / "comparison" / "jq" / "probes").glob("*.tsv")):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                fields = line.split("\t")
+                if line.startswith("#") or len(fields) < 4 or fields[3] == "-":
+                    continue
+                try:
+                    args, stdin = json.loads(fields[2]), json.loads(fields[3])
+                except ValueError:
+                    continue
+                if isinstance(stdin, str) and self.parsed_by_jq(args):
+                    # An RS first: it puts the stream's parser at its start, as a stream's first byte does.
+                    if sweep.reads_unwritten_tokenbuf(b"\x1e" + stdin.encode("utf-8")):
+                        found.add(fields[0])
+        return found
+
+    def test_no_probe_reads_jqs_uninitialised_byte_but_the_deliberate_ones(self):
+        self.assertEqual(self.exposed_probes(), self.DELIBERATE)
+
+    def test_the_manual_example_probe_is_settled_by_an_earlier_token(self):
+        self.assertTrue(sweep.reads_unwritten_tokenbuf(b'\x1e["a",n]'))
+        self.assertFalse(sweep.reads_unwritten_tokenbuf(b'\x1e["a",1,n]'))
 
 
 if __name__ == "__main__":

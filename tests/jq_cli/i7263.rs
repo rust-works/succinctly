@@ -119,12 +119,13 @@ fn text_before_the_first_rs_keeps_every_position_7263() -> Result<()> {
             "jq: error (at long:1): Unfinished abandoned text at EOF at line 2, column 5000\n",
             5,
         ),
-        // jq's end-of-stream drop (#2998): the truncated last record is in the final buffer.
+        // jq 1.7.1 ended the stream at the RS of the truncated last record (#2998) and said
+        // nothing; jq 1.8.2 reads it and reports it (#7718). These two rows are 1.8.2's.
         (
             &["--seq", "-c", "."],
             &["longrs"],
             "\u{1e}{\"a\":1}\n",
-            "",
+            "jq: ignoring parse error: Unfinished JSON term at EOF at line 3, column 4\n",
             0,
         ),
         (
@@ -137,9 +138,9 @@ fn text_before_the_first_rs_keeps_every_position_7263() -> Result<()> {
         (
             &["--seq", "-n", "-c", "[inputs]"],
             &["longrs"],
-            "\u{1e}[{\"a\":1}]\n",
             "",
-            0,
+            "jq: error (at longrs:2): Unfinished JSON term at EOF at line 3, column 4\n",
+            5,
         ),
     ];
     for (args, files, stdout, stderr, code) in rows {

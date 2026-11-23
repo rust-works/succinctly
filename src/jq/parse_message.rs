@@ -245,16 +245,21 @@ fn token_state(bytes: &[u8], mut in_string: bool, mut escaped: bool) -> (bool, b
     (in_string, escaped, token_start)
 }
 
-/// Blanks to spaces what jq's number parser never reads of a number token that holds a NUL byte
-/// (#7437), and says whether it blanked anything.
+/// Rewrites a number token that holds a NUL byte into the number jq's parser reads of it, padded
+/// with spaces in front to the token's length (#7437, #7749), and says whether it rewrote anything.
 ///
 /// jq's tokenizer reads a NUL into a bare token like any other byte, so `1`, a NUL and `abc` are
 /// one token, and `check_literal` hands the token to its number parser as a C string, which stops
 /// at the NUL: the token is the number `1` when what comes before the NUL is one jq accepts (the
 /// port of `check_literal` above). Anything else is left as it is: a token jq refuses (`-`, `1e`,
 /// `true`, a NUL at a token's start), and a NUL inside a string, which is a control character jq
-/// refuses. Blanking the tail keeps every offset, so a line, a column or a later fault is placed as
-/// jq places it.
+/// refuses. The rewrite keeps every offset, so a line or a later fault is placed as jq places it.
+///
+/// The number goes at the token's END, the spaces before it (`[[1]1`, NUL, `]` becomes `[[1] 1]`):
+/// jq ends the token at the next byte that ends one, not at the NUL, and acts on it there, so an
+/// error it raises then (`Expected separator between values`, an unmatched closer) is at that
+/// byte's column, and a top-level number jq never finishes (`1`, NUL, `}`) is not a document ended
+/// by a space. Blanking the tail instead (#7437's first form) ended the token at the NUL.
 ///
 /// `fgets_chunk` is jq's read of its input stream: a line is handed to the parser that many bytes
 /// at a time, and a read that ends without a newline only up to its first NUL (#5654), so a NUL in
@@ -263,7 +268,10 @@ fn token_state(bytes: &[u8], mut in_string: bool, mut escaped: bool) -> (bool, b
 /// before `text` starts (a byte-order mark taken off it), so that line's reads fall where jq's do.
 /// `line_head` is the part of `text`'s first line that came before it, in an earlier file of the
 /// same stream: the string or token open at its end goes on in `text`. jq reads each file from its
-/// start, so the reads of `text` start at `text`, whatever `line_head` holds.
+/// start, so the reads of `text` start at `text`, whatever `line_head` holds. A number token that
+/// starts in `line_head` is rewritten over both: its bytes in `line_head` become spaces, or part of
+/// the number where the token's part in `text` is too short to hold it, and the caller writes
+/// `line_head` back to the files it came from.
 ///
 /// A JSON string holds no line break, so the scan for strings starts afresh at each line: a text
 /// where one does is refused by jq at that string whatever this does. Costs one search for a NUL
@@ -272,16 +280,16 @@ pub fn blank_nul_number_tails(
     text: &mut [u8],
     fgets_chunk: Option<usize>,
     lead: usize,
-    line_head: &[u8],
+    line_head: &mut [u8],
 ) -> bool {
     let mut changed = false;
     let Some(first) = find_nul(text) else {
         return false;
     };
     // The scan state, at `scanned`: inside a string (and after a backslash there), and where the
-    // bare token being read starts, which is in `line_head` (at `head_token`) when it is `0`.
+    // bare token being read starts, which is in `line_head` (from `head_token`) while `head` is set.
     let (mut in_string, mut escaped, head_token) = token_state(line_head, false, false);
-    let mut head = &line_head[head_token..];
+    let mut head = head_token < line_head.len();
     let (mut scanned, mut token_start, mut line_start) = (0, 0, 0);
     let mut nul = first;
     loop {
@@ -289,12 +297,12 @@ pub fn blank_nul_number_tails(
         if let Some(last) = text[scanned..nul].iter().rposition(|&b| b == b'\n') {
             line_start = scanned + last + 1;
             (scanned, in_string, escaped, token_start, head) =
-                (line_start, false, false, line_start, &[]);
+                (line_start, false, false, line_start, false);
         }
         let (string, escape, start) = token_state(&text[scanned..nul], in_string, escaped);
         if start > 0 || string != in_string {
             token_start = scanned + start;
-            head = &[];
+            head = false;
         }
         (in_string, escaped, scanned) = (string, escape, nul);
         // A NUL in a string is a byte of the string: the search goes on after it.
@@ -315,18 +323,25 @@ pub fn blank_nul_number_tails(
             });
             // The first NUL of the token decides it: one later in it is part of the same tail.
             let number = |token: &[u8]| !token.is_empty() && literal(token).is_ok();
-            let accepted = seen
-                && if head.is_empty() {
-                    number(&text[token_start..token_end])
-                } else {
-                    number(&[head, &text[token_start..token_end]].concat())
-                };
-            if accepted {
-                text[nul..token_end].fill(b' ');
-                changed = true;
+            // A NUL jq never reads (`seen` false) rewrites nothing.
+            if seen && !head {
+                if number(&text[token_start..token_end]) {
+                    right_align_number(&mut text[token_start..token_end], nul - token_start);
+                    changed = true;
+                }
+            } else if seen {
+                let mut token = [&line_head[head_token..], &text[..token_end]].concat();
+                if number(&token) {
+                    let digits = line_head.len() - head_token + nul;
+                    right_align_number(&mut token, digits);
+                    let (in_head, in_text) = token.split_at(line_head.len() - head_token);
+                    line_head[head_token..].copy_from_slice(in_head);
+                    text[..token_end].copy_from_slice(in_text);
+                    changed = true;
+                }
             }
             // The token's bytes up to its end are bare bytes of the same token.
-            (scanned, token_start, head) = (token_end, token_end, &[]);
+            (scanned, token_start, head) = (token_end, token_end, false);
             token_end.max(nul + 1)
         };
         match find_nul(&text[search..]) {
@@ -334,6 +349,14 @@ pub fn blank_nul_number_tails(
             None => return changed,
         }
     }
+}
+
+/// A bare token whose first `digits` bytes are the number jq reads of it, rewritten as that number at
+/// the token's end with spaces before it ([`blank_nul_number_tails`]).
+fn right_align_number(token: &mut [u8], digits: usize) {
+    let pad = token.len() - digits;
+    token.copy_within(..digits, pad);
+    token[..pad].fill(b' ');
 }
 
 fn hex4(digits: &[u8]) -> Option<u32> {
@@ -1447,8 +1470,18 @@ mod tests {
 
     /// #7437: what [`blank_nul_number_tails`] makes of a text, `None` for one it leaves as it is.
     fn blanked(text: &[u8], chunk: Option<usize>, lead: usize, head: &[u8]) -> Option<Vec<u8>> {
-        let mut text = text.to_vec();
-        blank_nul_number_tails(&mut text, chunk, lead, head).then_some(text)
+        blanked_with_head(text, chunk, lead, head).map(|(text, _)| text)
+    }
+
+    /// [`blanked`], with what the rewrite made of the line head too (#7749).
+    fn blanked_with_head(
+        text: &[u8],
+        chunk: Option<usize>,
+        lead: usize,
+        head: &[u8],
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let (mut text, mut head) = (text.to_vec(), head.to_vec());
+        blank_nul_number_tails(&mut text, chunk, lead, &mut head).then_some((text, head))
     }
 
     /// What the scan must answer: the whole text's UTF-8 verdict and whether [`find_nul`] finds one.
@@ -1552,20 +1585,24 @@ mod tests {
 
     #[test]
     fn a_nul_tail_of_a_number_token_is_blanked_and_nothing_else_7437() {
+        // #7749: the number goes at the token's end, where jq's tokenizer ends the token.
         let cases: &[(&[u8], Option<&[u8]>)] = &[
-            (b"[1\0x,2]\n", Some(b"[1  ,2]\n")),
-            (b"1\0\0\0\n", Some(b"1   \n")),
-            (b"{\"a\":12\0\"b\"}\n", Some(b"{\"a\":12 \"b\"}\n")),
-            (b"nan\0 1.5\0e3\n", Some(b"nan  1.5   \n")),
+            (b"[1\0x,2]\n", Some(b"[  1,2]\n")),
+            (b"1\0\0\0\n", Some(b"   1\n")),
+            (b"{\"a\":12\0\"b\"}\n", Some(b"{\"a\": 12\"b\"}\n")),
+            (b"nan\0 1.5\0e3\n", Some(b" nan    1.5\n")),
             // Every NUL of a token after the first is part of the same tail.
-            (b"1\0a\0b 2\0\n", Some(b"1     2 \n")),
+            (b"1\0a\0b 2\0\n", Some(b"    1  2\n")),
+            // Before a closer: jq ends the token at the closer (#7749).
+            (b"[[1]1\0]\n", Some(b"[[1] 1]\n")),
+            (b"1\0}\n", Some(b" 1}\n")),
             // Refused tokens, a NUL at a token's start and one in a string stay.
             (b"[true\0,-\0,1e\0,\0,nu\0]\n", None),
             (b"[\"1\0\",\"a\\\"1\0\"]\n", None),
             // A string closed on the line before the NUL does not hide it.
-            (b"[\"a\\\\\",1\0]\n", Some(b"[\"a\\\\\",1 ]\n")),
+            (b"[\"a\\\\\",1\0]\n", Some(b"[\"a\\\\\", 1]\n")),
             // A line break ends a string jq would refuse, and the next line is read afresh.
-            (b"\"a\n1\0\n", Some(b"\"a\n1 \n")),
+            (b"\"a\n1\0\n", Some(b"\"a\n 1\n")),
             // No newline after the NUL in its read: jq never sees it.
             (b"[1\0,2]", None),
         ];
@@ -1579,7 +1616,7 @@ mod tests {
         // `fromjson` reads its text whole, newline or not.
         assert_eq!(
             blanked(b"[1\0,2]", None, 0, &[]).as_deref(),
-            Some(&b"[1 ,2]"[..])
+            Some(&b"[ 1,2]"[..])
         );
     }
 
@@ -1600,10 +1637,16 @@ mod tests {
 
     #[test]
     fn a_token_or_string_open_in_the_line_head_goes_on_7437() {
-        // The token started in an earlier file: `1` there and `2`, a NUL, `x` here are `12`.
+        // The token started in an earlier file: `1` there and `2`, a NUL, `x` here are `12`, which
+        // goes at the token's end, over both (#7749).
         assert_eq!(
-            blanked(b"2\0x]\n", Some(4095), 0, b"[1").as_deref(),
-            Some(&b"2  ]\n"[..])
+            blanked_with_head(b"2\0x]\n", Some(4095), 0, b"[1"),
+            Some((b" 12]\n".to_vec(), b"[ ".to_vec()))
+        );
+        // A part here too short for the number: some of it stays in the head.
+        assert_eq!(
+            blanked_with_head(b"\0]\n", Some(4095), 0, b"[123"),
+            Some((b"3]\n".to_vec(), b"[ 12".to_vec()))
         );
         // `e` there and `5` here are `e5`, which jq refuses.
         assert_eq!(blanked(b"5\0x]\n", Some(4095), 0, b"[e"), None);

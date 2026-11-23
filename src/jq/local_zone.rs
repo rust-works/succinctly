@@ -64,6 +64,13 @@ pub(crate) fn at_instant(utc_secs: i64) -> LocalZone {
     backend::at_instant(utc_secs)
 }
 
+/// [`at_instant`] without renaming `tzname`: the zone `mktime` reads a broken-down time in, which
+/// is not a `localtime_r` conversion (#7606: `strflocaltime` of an array leaves `%Z`'s names to
+/// `strptime` alone, in jq 1.8.2 as in jq 1.7.1).
+pub(crate) fn zone_at(utc_secs: i64) -> LocalZone {
+    backend::zone_at(utc_secs)
+}
+
 /// The zone describing a local wall-clock reading given as fields rather than
 /// an instant (`[2024,6,3,18,46,40,3,184] | strflocaltime(...)`). `month` is
 /// 1-12; the fields are as given, may be out of range, and are normalised the
@@ -140,6 +147,10 @@ mod backend_utc {
     use super::LocalZone;
 
     pub(super) fn at_instant(_utc_secs: i64) -> LocalZone {
+        LocalZone::utc()
+    }
+
+    pub(super) fn zone_at(_utc_secs: i64) -> LocalZone {
         LocalZone::utc()
     }
 
@@ -230,7 +241,8 @@ mod backend_jiff {
             return TimeZone::UTC;
         }
         name.to_str()
-            .and_then(|text| with_default_rule(text).or_else(|| TimeZone::posix(text).ok()))
+            .map(|text| canonical_posix(text).unwrap_or_else(|| text.to_string()))
+            .and_then(|text| with_default_rule(&text).or_else(|| TimeZone::posix(&text).ok()))
             .unwrap_or(TimeZone::UTC)
     }
 
@@ -270,6 +282,10 @@ mod backend_jiff {
             offset_secs: i64::from(info.offset().seconds()),
             name: info.abbreviation().to_string(),
         }
+    }
+
+    pub(super) fn zone_at(utc_secs: i64) -> LocalZone {
+        zone_in(system(), utc_secs)
     }
 
     pub(super) fn named_at(name: &str, utc_secs: i64) -> Option<LocalZone> {
@@ -429,6 +445,136 @@ mod backend_jiff {
         TimeZone::posix(&format!("{tz},{DEFAULT_RULE}")).ok()
     }
 
+    /// `tz` respelled with the digit counts jiff's POSIX parser takes, when it is a POSIX string
+    /// that both C libraries read the same way (#7783). POSIX gives no digit count for the hours,
+    /// minutes and seconds of an offset or a rule time, and tzcode's `getnum` and glibc's `sscanf`
+    /// read any number of digits whose value is in range: `XYZ5:30:5`, `XYZ005`, `XYZ+005:00`,
+    /// `XYZ5:030`, `EST5EDT4:5` and `M3.2.0/2:3` all apply in both, where jiff takes exactly two
+    /// digits for minutes and seconds and at most two for an offset's hours. So an offset's hours
+    /// (0 to 24), minutes and seconds (0 to 59), and a rule time's hours (0 to 167), are written
+    /// with two digits each, and a rule's numbers without leading zeros.
+    ///
+    /// `None` for anything else, which is left to jiff as written: a name of fewer than three
+    /// letters, a minute or second past 59, an empty field after a `:`, a signed rule time, or a
+    /// rule time of 168 hours or more. The two C libraries disagree on those (macOS applies a short
+    /// name and refuses the rest; glibc refuses a short name and reads the rest), and POSIX
+    /// requires a name of three or more characters.
+    pub(super) fn canonical_posix(tz: &str) -> Option<alloc::string::String> {
+        use alloc::string::String;
+        fn digits(s: &str) -> Option<(u64, &str)> {
+            let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+            if end == 0 {
+                return None;
+            }
+            let value = s[..end].bytes().fold(0u64, |n, d| {
+                n.saturating_mul(10).saturating_add(u64::from(d - b'0'))
+            });
+            Some((value, &s[end..]))
+        }
+        fn name<'a>(s: &'a str, out: &mut String) -> Option<&'a str> {
+            if let Some(quoted) = s.strip_prefix('<') {
+                let end = quoted.find('>')?;
+                if end < 3 {
+                    return None;
+                }
+                out.push_str(&s[..end + 2]);
+                return Some(&quoted[end + 1..]);
+            }
+            let letters = s
+                .find(|c: char| !c.is_ascii_alphabetic())
+                .unwrap_or(s.len());
+            if letters < 3 {
+                return None;
+            }
+            out.push_str(&s[..letters]);
+            Some(&s[letters..])
+        }
+        // `[+-]h[:m[:s]]`, hours at most `max_hours`; a rule time takes no sign.
+        fn clock<'a>(
+            s: &'a str,
+            out: &mut String,
+            max_hours: u64,
+            signed: bool,
+        ) -> Option<&'a str> {
+            let mut rest = s;
+            if let Some(sign) = rest.chars().next().filter(|c| matches!(c, '+' | '-')) {
+                if !signed {
+                    return None;
+                }
+                out.push(sign);
+                rest = &rest[1..];
+            }
+            let (hours, after) = digits(rest)?;
+            if hours > max_hours {
+                return None;
+            }
+            out.push_str(&alloc::format!("{hours:02}"));
+            rest = after;
+            for _ in 0..2 {
+                let Some(after_colon) = rest.strip_prefix(':') else {
+                    break;
+                };
+                let (value, after) = digits(after_colon)?;
+                if value > 59 {
+                    return None;
+                }
+                out.push_str(&alloc::format!(":{value:02}"));
+                rest = after;
+            }
+            Some(rest)
+        }
+        // `Jn`, `n` or `Mm.w.d`, then an optional `/time`.
+        fn transition<'a>(s: &'a str, out: &mut String) -> Option<&'a str> {
+            let mut rest = s;
+            if let Some(after) = rest.strip_prefix('J') {
+                let (day, after) = digits(after)?;
+                if !(1..=365).contains(&day) {
+                    return None;
+                }
+                out.push_str(&alloc::format!("J{day}"));
+                rest = after;
+            } else if let Some(after) = rest.strip_prefix('M') {
+                let (month, after) = digits(after)?;
+                let (week, after) = digits(after.strip_prefix('.')?)?;
+                let (weekday, after) = digits(after.strip_prefix('.')?)?;
+                if !(1..=12).contains(&month) || !(1..=5).contains(&week) || weekday > 6 {
+                    return None;
+                }
+                out.push_str(&alloc::format!("M{month}.{week}.{weekday}"));
+                rest = after;
+            } else {
+                let (day, after) = digits(rest)?;
+                if day > 365 {
+                    return None;
+                }
+                out.push_str(&alloc::format!("{day}"));
+                rest = after;
+            }
+            if let Some(after) = rest.strip_prefix('/') {
+                out.push('/');
+                rest = clock(after, out, 167, false)?;
+            }
+            Some(rest)
+        }
+        let mut out = String::new();
+        let mut rest = clock(name(tz, &mut out)?, &mut out, 24, true)?;
+        if rest.is_empty() {
+            return Some(out);
+        }
+        rest = name(rest, &mut out)?;
+        if !rest.is_empty() && !rest.starts_with(',') {
+            rest = clock(rest, &mut out, 24, true)?;
+        }
+        if rest.is_empty() {
+            return Some(out);
+        }
+        out.push(',');
+        rest = transition(rest.strip_prefix(',')?, &mut out)?;
+        out.push(',');
+        rest = transition(rest.strip_prefix(',')?, &mut out)?;
+        rest.is_empty().then_some(out)
+    }
+
     /// Whether `tz` is `std offset dst [offset]` with no `,rule` after it
     /// (`EST5EDT`, `CET-1CEST`, `<-03>3<-02>`), the form POSIX leaves without a
     /// rule. A name is three or more letters or a `<...>` quoted name; an
@@ -467,8 +613,8 @@ mod backend_jiff {
     #[cfg(test)]
     mod tests {
         use super::{
-            from_tz, is_rule_less_posix, offset_in, tzname_in, wall_clock_in, with_default_rule,
-            zone_in, TimeZone,
+            canonical_posix, from_tz, is_rule_less_posix, offset_in, tzname_in, wall_clock_in,
+            with_default_rule, zone_in, TimeZone,
         };
 
         /// New York's rule as a POSIX string: needs no tz database on the
@@ -575,6 +721,44 @@ mod backend_jiff {
             // A day or an hour too large for a span, not just a month.
             let zone = wall_clock_in(&ny, 2024, 7, i64::MAX, 0, 0, 0);
             assert_eq!(zone.offset_secs, -18_000);
+        }
+
+        #[test]
+        fn a_posix_string_is_respelled_with_two_digit_fields_7783() {
+            for (tz, want) in [
+                ("XYZ5:30:5", Some("XYZ05:30:05")),
+                ("XYZ005", Some("XYZ05")),
+                ("XYZ+005:00", Some("XYZ+05:00")),
+                ("XYZ5:030", Some("XYZ05:30")),
+                ("<+05>-5", Some("<+05>-05")),
+                (
+                    "EST5EDT4:5,M3.2.0,M11.1.0",
+                    Some("EST05EDT04:05,M3.2.0,M11.1.0"),
+                ),
+                (
+                    "EST5EDT,M03.02.00/2:3,J060/167",
+                    Some("EST05EDT,M3.2.0/02:03,J60/167"),
+                ),
+                ("EST5EDT,60/1:5,300", Some("EST05EDT,60/01:05,300")),
+                ("CET-1CEST", Some("CET-01CEST")),
+                // Left to jiff as written: the C libraries disagree, or the string is no POSIX one.
+                ("XY5", None),
+                ("<AB>-5", None),
+                ("XYZ5D", None),
+                ("XYZ5:60", None),
+                ("XYZ5:", None),
+                ("XYZ:5", None),
+                ("XYZ025", None),
+                ("EST5EDT,M3.2.0/-1,M11.1.0", None),
+                ("EST5EDT,M3.2.0/168,M11.1.0", None),
+                ("EST5EDT,M13.2.0,M11.1.0", None),
+                ("EST5EDT,J0,J300", None),
+                ("EST5EDT,M3.2.0", None),
+                ("Asia/Tokyo", None),
+                ("", None),
+            ] {
+                assert_eq!(canonical_posix(tz).as_deref(), want, "{tz}");
+            }
         }
 
         #[test]
@@ -714,6 +898,10 @@ mod backend_posix {
     }
 
     pub(super) fn at_instant(_utc_secs: i64) -> LocalZone {
+        current()
+    }
+
+    pub(super) fn zone_at(_utc_secs: i64) -> LocalZone {
         current()
     }
 

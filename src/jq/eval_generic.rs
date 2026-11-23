@@ -20310,9 +20310,17 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // sees both occurrences of a mapping key; `each_paths_filter_generic`
         // keeps the demand-forwarding and sends only a live `input`/`inputs`
         // queue to the bridge below, which every jq-mode call still takes.
-        Expr::Builtin(Builtin::PathsFilter(_)) => {
-            each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink)
-        }
+        //
+        // #7726: `combinations` takes the same bridge, in both modes: it
+        // streams its rows from `eval_each` (`each_combinations`), so a
+        // consumer that stops after one row stops the walk, where the wildcard
+        // below collected the whole product first (`first(combinations(20))`
+        // on `[1,2]` built 2^20 rows). It shares this arm rather than taking
+        // one of its own, which grew this frame and took `r(12000; 7)` in
+        // `test_literal_dollar_argument_matches_jq_3260` past the depth limit.
+        Expr::Builtin(
+            Builtin::PathsFilter(_) | Builtin::Combinations | Builtin::CombinationsN(_),
+        ) => each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink),
 
         // #3448: jq's `=`/`op=`/`//=` run their right side as the outer
         // generator, so a consumer that stops after one document must stop
@@ -23160,12 +23168,32 @@ fn any_all_f_generic<S: EvalSemantics, V: DocumentValue>(
         if let Err(err) = empty_elements_tail_gap_ok(&elements, Some(&cursor)) {
             return GenericResult::Error(err);
         }
+        // #7555: and the gap checks `.[]` makes as it walks
+        // (`each_lazy_array_iterate_sink`): the `,` before each element it
+        // probes, and the one before the `]` once the walk runs out. jq
+        // defines `all(f)` as `all(.[]; f)`, which raised on `[1,]` and
+        // `[1 2]` where this walk answered, reading `2` across the missing
+        // comma. An early decision stops before the rest, as `.[]` does.
         let mut elems = elements;
+        let mut is_first = true;
+        let mut last_cursor = None;
         while let Some((elem_cursor, rest)) = elems.uncons_cursor() {
+            if !elem_cursor.element_gap_ok(is_first) {
+                let error = Control::Error(elements.malformed_element_error());
+                return counted(matches, Flow::Escaped(error));
+            }
             if let Some(result) = probe(elem_cursor, &mut matches) {
                 return result;
             }
+            is_first = false;
+            last_cursor = Some(elem_cursor);
             elems = rest;
+        }
+        if let Some(last) = last_cursor {
+            if !trailing_element_gap_ok(&last, b']') {
+                let error = Control::Error(elements.malformed_element_error());
+                return counted(matches, Flow::Escaped(error));
+            }
         }
         counted(matches, Flow::Exhausted)
     } else if let Some(fields) = value.as_object() {
@@ -26326,8 +26354,9 @@ fn binary_fanout_each_generic<V: DocumentValue, S: EvalSemantics>(
     sink: &mut dyn Sink<V>,
 ) -> Flow {
     // #3296: decided once per operator, as in `eval::binary_fanout_each`;
-    // #4132 measured it, see docs/optimizations/jq-settled-operands.md.
-    if settles_both(left, right) {
+    // #4132 measured it, see docs/optimizations/jq-settled-operands.md. #7713: and calls that
+    // answer once, as there.
+    if crate::jq::eval::operands_settle::<S>(left, right) {
         binary_fanout_each_generic_with::<V, S>(
             settled_operand_strategy_generic(each_operand),
             left,
@@ -27115,7 +27144,7 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
                 ) =>
             {
                 // #5292: handed over a batch at a time, as `each_range` does.
-                let end = each_range_batches(
+                let end = each_range_batches::<S>(
                     from_val,
                     to_val,
                     step_val,
@@ -31372,6 +31401,7 @@ fn each_paths_filter_generic<S: EvalSemantics, V: DocumentValue>(
 
 /// Which producer `paths(f)` takes in `eval_each_generic` (#1342): the walk
 /// where duplicate keys survive, the owned bridge where they collapse anyway.
+/// `combinations` and `combinations(n)` always take the bridge (#7726).
 /// A function of its own, with the same arguments the single bridge call it
 /// replaced took, so `eval_each_generic`'s native frame -- the one the
 /// recursion floor is read against -- is the size it was.
@@ -41004,6 +41034,12 @@ fn any_all_generic<S: EvalSemantics, V: DocumentValue>(
         if S::TAG == EvalTag::Yq {
             return yq_reject_non_array();
         }
+        // #7555: the zero-member `{,}` the checked walk below cannot see,
+        // which it refuses with a member (`{"a":1,}`) -- the #2594 check the
+        // `cond` forms (`any_all_f_generic`) already make.
+        if let Err(err) = empty_fields_tail_gap_ok(&fields, Some(&cursor)) {
+            return GenericResult::Error(err);
+        }
         match effective_value_cursors_checked(&fields, S::COLLAPSE_DUPLICATE_KEYS, false) {
             Ok(cursors) => {
                 for value_cursor in cursors {
@@ -42343,6 +42379,19 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
+                // #7554: jq defines `first` as `.[0]`, and `Expr::Index`'s
+                // array arm resolves every index through `len_checked` (#2261),
+                // so `.[0]` refuses a stray, doubled or missing `,` anywhere in
+                // the array (`[,1]`, `[1,]`, `[1 2]`). `first` answered from
+                // `get_cursor(0)` alone and printed an element jq never reads,
+                // so it now makes `.[0]`'s walk too, on a format whose index
+                // can hold such a gap; one without delimiter checks (YAML)
+                // keeps the O(1) read, which the walk could not change.
+                if <V::Cursor as DocumentCursor>::HAS_DELIMITER_CHECKS {
+                    if let Err(err) = crate::jq::array_index::len_checked_memoized(&elements) {
+                        return GenericResult::Error(err);
+                    }
+                }
                 match elements.get_cursor(0) {
                     Some(c) => GenericResult::OneCursor(c),
                     None => GenericResult::Owned(OwnedValue::Null),
@@ -42367,12 +42416,11 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 if let Err(err) = empty_elements_tail_gap_ok(&elements, cursor.as_ref()) {
                     return GenericResult::Error(err);
                 }
-                // #2261: `len_checked`, not the bare `len()` -- unlike
-                // `Builtin::First` just above (genuinely O(1) via
-                // `get_cursor(0)`, left unchecked per #1629's precedent),
-                // `last` already has to walk the whole array to find its
-                // own length, so the #1677/#2261 gap checks ride along for
-                // free on that same mandatory walk.
+                // #2261: `len_checked`, not the bare `len()` -- `last`
+                // already has to walk the whole array to find its own
+                // length, so the #1677/#2261 gap checks ride along for free
+                // on that same mandatory walk (`Builtin::First` just above
+                // makes the same walk since #7554, as `.[0]` does).
                 let len = match crate::jq::array_index::len_checked_memoized(&elements) {
                     Ok(len) => len,
                     Err(err) => return GenericResult::Error(err),
