@@ -35368,11 +35368,14 @@ fn translate_posix_brackets_scan(
                 i += 7;
                 continue;
             }
-            if c == '(' {
+            let name_end = if c == '(' {
                 let opened = open_group(&chars, i, &mut group_facts)?;
                 groups_opened += usize::from(opened.captures);
                 body_start = opened.body_start;
-            }
+                opened.header_end
+            } else {
+                None
+            };
             // Follow the extended mode through the groups, to know where `#` starts a comment.
             if c == '(' {
                 // #6197: what Oniguruma refuses inside a look-behind.
@@ -35432,6 +35435,12 @@ fn translate_posix_brackets_scan(
                                 continue;
                             }
                             wrapped.push(false);
+                            // #7805: a group's name is no pattern text (`(?<a[>`, `(?<a$>`).
+                            if let Some(end) = name_end {
+                                out.extend(&chars[i..end]);
+                                i = end;
+                                continue;
+                            }
                         }
                     }
                 } else {
@@ -35740,6 +35749,12 @@ fn keep_zero_count_groups(pattern: &str, extended: bool) -> Option<String> {
         } else if c == '(' {
             let captures = !opens_condition(&chars, i) && group_header(&chars, i).0;
             open.push((out.len(), captures));
+            // #7805: a group's name is no pattern text (`(?<a[>x){0}`).
+            if let Some(end) = onig_group_name_end(&chars, i).ok().flatten() {
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
         } else if c == ')' {
             out.push(c);
             i += 1;
@@ -36760,6 +36775,8 @@ fn group_header(chars: &[char], i: usize) -> (bool, Option<String>, usize) {
 struct GroupOpen {
     captures: bool,
     body_start: usize,
+    /// For a named group, the index just past the closing delimiter of its name (#7805).
+    header_end: Option<usize>,
 }
 
 /// A `(` at `chars[i]`: what it opens, refusing what Oniguruma refuses (#6070). A group name that
@@ -36777,19 +36794,11 @@ fn open_group(
         return Ok(GroupOpen {
             captures: false,
             body_start: usize::MAX,
+            header_end: None,
         });
     }
-    let (captures, name, body_start) = group_header(chars, i);
-    if let Some(name) = &name {
-        if name.is_empty() {
-            return Err(EvalError::new("Regex failure: group name is empty"));
-        }
-        if name.starts_with(|c: char| c.is_ascii_digit()) {
-            return Err(EvalError::new(format!(
-                "Regex failure: invalid group name <{name}>"
-            )));
-        }
-    }
+    let header_end = onig_group_name_end(chars, i)?;
+    let (captures, _, body_start) = group_header(chars, i);
     if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'(') {
         if let Some(n) = chars[i + 3..].iter().position(|&c| c == ')') {
             let condition: String = chars[i + 3..i + 3 + n].iter().collect();
@@ -36819,7 +36828,94 @@ fn open_group(
     Ok(GroupOpen {
         captures,
         body_start,
+        header_end,
     })
+}
+
+/// Whether Oniguruma counts `c` as a word character (`ONIGENC_IS_CODE_WORD` for UTF-8): Unicode's
+/// alphabetic characters, marks, decimal digits and connector punctuation, and below U+0100 its
+/// ISO-8859-1 table, which adds U+00B2, U+00B3, U+00B9 and U+00BC-U+00BE (see [`JQ_WORD_CLASS`]).
+#[cfg(feature = "regex")]
+fn is_onig_word_char(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphanumeric() || c == '_';
+    }
+    static WORD: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    WORD.get_or_init(|| regex::Regex::new(&format!("^[{JQ_WORD_CLASS}]$")).ok())
+        .as_ref()
+        .is_some_and(|word| word.is_match(c.encode_utf8(&mut [0; 4])))
+}
+
+/// The name of the group `(?<name>` or `(?'name'` opened by the `(` at `chars[i]`, read as
+/// Oniguruma's `fetch_name` reads a name it defines (#7805): the index just past its closing
+/// delimiter, `None` for any other group, or Oniguruma's refusal.
+///
+/// The first character is checked alone: an ASCII digit, `+` or `-` is `invalid group name`, and
+/// any other character that is not a word character ([`is_onig_word_char`]) is
+/// `invalid char in group name`. The rest of the name runs to the closing delimiter, and any
+/// character is accepted there (`fetch_name` notes a later non-word character and then returns
+/// success all the same), so `(?<a[>a)` and `(?<a(>a)` are groups named `a[` and `a(`. A `)`, or
+/// the end of the pattern, before the delimiter is `invalid group name`. The name in the message
+/// is the text from the first character to the delimiter, the `)` or the end; where the first
+/// character was fine and the pattern ends inside the name, it stops one character short of the
+/// end (`(?<ab` is `invalid group name <a>`), and where the first was refused and the delimiter is
+/// the pattern's last character, it takes the delimiter in (`(?<(>` is `<(>>`), both as in jq.
+#[cfg(feature = "regex")]
+fn onig_group_name_end(chars: &[char], i: usize) -> Result<Option<usize>, EvalError> {
+    let close = match (chars.get(i + 1), chars.get(i + 2), chars.get(i + 3)) {
+        (Some('?'), Some('<'), Some('=' | '!')) => return Ok(None),
+        (Some('?'), Some('<'), _) => '>',
+        (Some('?'), Some('\''), _) => '\'',
+        _ => return Ok(None),
+    };
+    let start = i + 3;
+    let refuse = |message: &str, end: usize| -> Result<Option<usize>, EvalError> {
+        let name: String = chars[start..end].iter().collect();
+        Err(EvalError::new(format!("Regex failure: {message} <{name}>")))
+    };
+    // `(?<` that ends the pattern is an unclosed group to Oniguruma, which reads one more character
+    // to tell a look-behind from a name; `(?'` is an empty name.
+    let Some(&first) = chars.get(start) else {
+        return Err(EvalError::new(if close == '>' {
+            "Regex failure: end pattern with unmatched parenthesis"
+        } else {
+            "Regex failure: group name is empty"
+        }));
+    };
+    if first == close {
+        return Err(EvalError::new("Regex failure: group name is empty"));
+    }
+    let first_refused = if first.is_ascii_digit() || first == '+' || first == '-' {
+        Some("invalid group name")
+    } else if !is_onig_word_char(first) {
+        Some("invalid char in group name")
+    } else {
+        None
+    };
+    if let Some(message) = first_refused {
+        // The name runs to the delimiter or a `)`; when that is the last character of the pattern
+        // (or there is none), the name runs to the end.
+        let stop = chars[start + 1..]
+            .iter()
+            .position(|&c| c == close || c == ')')
+            .map_or(chars.len(), |at| start + 1 + at);
+        let end = if stop + 1 >= chars.len() {
+            chars.len()
+        } else {
+            stop
+        };
+        return refuse(message, end);
+    }
+    match chars[start + 1..]
+        .iter()
+        .position(|&c| c == close || c == ')')
+    {
+        Some(at) if chars[start + 1 + at] == close => Ok(Some(start + 2 + at)),
+        Some(at) => refuse("invalid group name", start + 1 + at),
+        // The pattern ends inside the name: Oniguruma's last read leaves the last character out,
+        // unless the name is that one character.
+        None => refuse("invalid group name", (chars.len() - 1).max(start + 1)),
+    }
 }
 
 /// Whether `pattern` could hold an assertion `starts_repetition` has to look after: `^`, `$` or
@@ -40740,6 +40836,23 @@ fn scan_fancy_pattern(pattern: &str) -> Option<(String, bool)> {
                         .map_or(chars.len(), |n| i + 2 + n + 1);
                     out.extend(&chars[i..end]);
                     i = end;
+                    continue;
+                }
+                // #7805: a group's name is no pattern text (`(?<a$>`, `(?'a{'`): copied through.
+                let close = match (rest.first(), rest.get(1)) {
+                    (Some('<'), Some(c)) if !matches!(c, '=' | '!') => Some('>'),
+                    (Some('\''), Some(_)) => Some('\''),
+                    _ => None,
+                };
+                if let Some(end) =
+                    close.and_then(|close| rest[1..].iter().position(|&c| c == close))
+                {
+                    // The delimiter is at `i + 3 + end`.
+                    let close_at = i + 3 + end;
+                    groups.push(flags);
+                    out.extend(&chars[i..=close_at]);
+                    at_start = false;
+                    i = close_at + 1;
                     continue;
                 }
                 let letters = rest
