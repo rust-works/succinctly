@@ -1467,6 +1467,18 @@ pub fn pulls_inputs(expr: &Expr) -> bool {
     contains_builtin(expr, |b| matches!(b, Builtin::Input | Builtin::Inputs))
 }
 
+/// Whether `expr` calls `halt` or `halt_error` anywhere (#7775): a main loop that can stop before its
+/// last input, as jq's then reads no further. Same expanded-program requirement as
+/// [`uses_input_builtins`].
+pub fn can_halt(expr: &Expr) -> bool {
+    contains_builtin(expr, |b| {
+        matches!(
+            b,
+            Builtin::Halt | Builtin::HaltError | Builtin::HaltErrorCode(_)
+        )
+    })
+}
+
 /// Whether `expr` references a builtin whose answer comes from the *cursor*
 /// rather than from the value, anywhere (#1504).
 ///

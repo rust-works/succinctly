@@ -4435,15 +4435,18 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
 
     for (label, doc, expect_stderr) in cases {
         assert_jq_raises(label, "-Sc .bad", &["-Sc"], ".bad", doc, 5, expect_stderr);
-        assert_jq_raises(
-            label,
-            "-e .bad (cursor_to_owned_at_depth, lazy.rs)",
-            &["-e"],
-            ".bad",
-            doc,
-            5,
-            expect_stderr,
+        // #7757: `-e` reads only whether an output is truthy, so it left this battery: it
+        // prints what the run without it prints, and exits as that run does.
+        let plain = run_jq_full(&[".bad"], Some(doc))?;
+        let exit_status = run_jq_full(&["-e", ".bad"], Some(doc))?;
+        assert_eq!(
+            (&exit_status.0, &exit_status.1),
+            (&plain.0, &plain.1),
+            "{label}: -e .bad"
         );
+        if plain.2 != 0 {
+            assert_eq!(exit_status.2, plain.2, "{label}: -e .bad exit");
+        }
         // #2350: two more consumers of the same validation gate (#1755/
         // #2069, #1953), added alongside the original three so this fixed
         // list's own coverage doesn't lag the generated fuzzer's.
@@ -4461,9 +4464,9 @@ fn test_select_and_materialize_agree_on_corruption_1645() -> Result<()> {
         // value's truthiness, which `is_falsy` answers without decoding it
         // (#2692). Every corruption in this list lives inside `.bad`'s
         // value, so both now follow the rule `.keep` on these same documents
-        // always did. The three rows above keep the gate: `-Sc`/`-e`
-        // materialize, and `sort_by` materializes the comparison key of an
-        // element it only reorders.
+        // always did. The rows above keep the gate: `-Sc` materializes, and
+        // `sort_by` materializes the comparison key of an element it only
+        // reorders.
         //
         // Keeping both in this list rather than deleting them is the point:
         // the list's job is pinning that every consumer of one document
@@ -4706,15 +4709,15 @@ proptest! {
         let label = format!("{path:?}/{malformation:?}");
 
         assert_jq_raises(&label, "-Sc .bad", &["-Sc"], ".bad", &doc, 5, expect_stderr);
-        assert_jq_raises(
-            &label,
-            "-e .bad (cursor_to_owned_at_depth, lazy.rs)",
-            &["-e"],
-            ".bad",
-            &doc,
-            5,
-            expect_stderr,
-        );
+        // #7757: `-e` reads only whether an output is truthy, so it no longer materializes
+        // `.bad` (it was in the battery above): it prints what the run without it prints, and
+        // exits 5 where that run does.
+        let plain = run_jq_full(&[".bad"], Some(&doc)).unwrap();
+        let exit_status = run_jq_full(&["-e", ".bad"], Some(&doc)).unwrap();
+        prop_assert_eq!((&exit_status.0, &exit_status.1), (&plain.0, &plain.1), "[{}] -e .bad", label);
+        if plain.2 != 0 {
+            prop_assert_eq!(exit_status.2, plain.2, "[{}] -e .bad exit", label);
+        }
         assert_jq_raises(&label, "sort_by(.bad)", &[], "sort_by(.bad)", &doc, 5, expect_stderr);
         // The consumers that left the "must raise" battery above, each for
         // its own half of the same rule. `path(.bad)` names a position and
@@ -4722,7 +4725,7 @@ proptest! {
         // value's truthiness without decoding it (#2692). Every corruption
         // this fuzzer builds lives *inside* `.bad`'s value, so both answer --
         // the same rule `.keep` on these documents has always followed. The
-        // three consumers above keep the gate: `-Sc`/`-e` materialize, and
+        // consumers above keep the gate: `-Sc` materializes, and
         // `sort_by` materializes the key of an element it only reorders.
         //
         // The `path` row is what caught the mismatch when #2168 landed: the
@@ -6663,15 +6666,18 @@ fn test_materializing_flag_routes_still_validate_2103() -> Result<()> {
         }
     }
 
-    // `-e` materializes the outputs, not the input: `1+1` answers, `.,.`
-    // (whose output *is* the colliding document) raises.
+    // `-e` reads only whether each output is truthy (#7757): `1+1` answers, and `.,.` (whose
+    // output *is* the colliding document) echoes as the default route does. It materialized the
+    // outputs before #7757, and raised here.
     let (out, _, code) = run_jq_full(&["-ce", "1+1"], Some(colliding))?;
     assert_eq!((out.as_str(), code), ("2\n", 0));
-    let (out, err, code) = run_jq_full(&["-ce", ".,."], Some(colliding))?;
-    assert_eq!(code, 5, "out {out:?} stderr {err}");
-    assert!(err.contains("ambiguous"), "stderr: {err}");
-    let (out, _, code) = run_jq_full(&["-c", ".,."], Some(colliding))?;
-    assert_eq!(code, 0, "control: the default route echoes, out {out:?}");
+    let plain = run_jq_full(&["-c", ".,."], Some(colliding))?;
+    assert_eq!(
+        plain.2, 0,
+        "control: the default route echoes, out {:?}",
+        plain.0
+    );
+    assert_eq!(run_jq_full(&["-ce", ".,."], Some(colliding))?, plain);
 
     Ok(())
 }
@@ -6911,29 +6917,25 @@ fn test_user_error_matching_colliding_key_suffix_stays_catchable_1813() -> Resul
     Ok(())
 }
 
-/// #1642 follow-up: `-e`/`--exit-status` forces `JqValue::materialize()` on
-/// every result before `jq_runner.rs`'s own guarded `print_json` path ever
-/// runs (see `cursor_to_owned`'s doc comment in `src/jq/lazy.rs`) -- a
-/// second, independent materializer from the `-S`/`-s`/`.,.`  routes the
-/// test above covers, with its own `DisplayKeyGuard` call site that a fix
-/// touching only the other three left unexercised. Without `-e`, the same
-/// document streams both colliding keys through untouched (#1385: a
-/// decode-failure key is never a duplicate, so nothing raises); `-e` alone
-/// is what forces the raise.
+/// #1642 follow-up: `-e`/`--exit-status` used to force `JqValue::materialize()` on every result,
+/// a second materializer with its own `DisplayKeyGuard` call site, so `-e` alone raised on two
+/// colliding decode-failure keys that the default route streams through (#1385: such a key is
+/// never a duplicate). Since #7757 `-e` reads only whether each output is truthy, so it answers
+/// as the default route does.
 #[test]
-fn test_exit_status_materialize_route_raises_on_colliding_decode_failure_keys_1642() -> Result<()> {
+fn test_exit_status_streams_colliding_decode_failure_keys_as_the_default_route_1642() -> Result<()>
+{
     let dup_doc = r#"{"\ud800":1,"\ud800":2}"#;
 
     let (out, code) = run_jq_stdin(".", dup_doc, &["-c"])?;
     assert_eq!(code, 0, "no -e: both keys should stream through untouched");
     assert_eq!(out.trim(), r#"{"\ud800":1,"\ud800":2}"#);
 
+    // #7757: `-e` no longer materializes its outputs (it reads only whether each is truthy), so
+    // it streams the same keys through, and nothing is dropped.
     let (out, err, code) = run_jq_full(&["-e", "-c", "."], Some(dup_doc))?;
-    assert_ne!(
-        code, 0,
-        "-e should raise rather than silently drop a value, out: {out:?}"
-    );
-    assert!(names_fault(&err, "ambiguous"), "stderr: {err}");
+    assert_eq!(code, 0, "stderr: {err}");
+    assert_eq!(out.trim(), r#"{"\ud800":1,"\ud800":2}"#);
 
     Ok(())
 }

@@ -2549,7 +2549,9 @@ impl FileIdentity {
 
 /// The file `path` names now, opened, with its metadata. A directory opens on Unix and fails at its first
 /// read, so it fails here, as `EISDIR`.
-fn open_not_a_directory(path: &std::path::Path) -> io::Result<(File, std::fs::Metadata)> {
+pub(super) fn open_not_a_directory(
+    path: &std::path::Path,
+) -> io::Result<(File, std::fs::Metadata)> {
     let file = File::open(path)?;
     let meta = file.metadata()?;
     if meta.is_dir() {
@@ -3089,6 +3091,48 @@ fn last_line_break(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// `kind` with standard input judged (#7738): [`SourceKind::Stream`] or [`SourceKind::File`] by `fstat`.
+pub(super) fn judge_kind(kind: SourceKind) -> SourceKind {
+    match kind {
+        SourceKind::Stdin if stdin_is_a_stream() => SourceKind::Stream,
+        SourceKind::Stdin => SourceKind::File,
+        kind => kind,
+    }
+}
+
+/// Whether standard input is a stream by [`super::read_as_stream`] (#7738), by `fstat` on a duplicate of
+/// descriptor 0.
+#[cfg(unix)]
+fn stdin_is_a_stream() -> bool {
+    use std::os::fd::AsFd;
+    std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .and_then(|fd| File::from(fd).metadata().ok())
+        .is_some_and(|meta| super::read_as_stream(meta.file_type()))
+}
+
+#[cfg(not(unix))]
+fn stdin_is_a_stream() -> bool {
+    false
+}
+
+/// One read of `reader` onto the end of `bytes`, of at most `n` bytes (and at most 64 KiB, more than a
+/// terminal's line holds): what a terminal gives a read is the line typed (#7742).
+fn read_once(reader: &mut dyn Read, bytes: &mut Vec<u8>, n: usize) -> io::Result<usize> {
+    let start = bytes.len();
+    bytes.resize(start + n.min(64 << 10), 0);
+    let read = loop {
+        match reader.read(&mut bytes[start..]) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            read => break read,
+        }
+    };
+    bytes.truncate(start + *read.as_ref().unwrap_or(&0));
+    read
+}
+
 /// A source read as whole lines, a window at a time (#7023): `-R`'s file, and the rest of a lone source
 /// the lazy `inputs` route started on the front of. A line is no more than a line break away from its
 /// end, so there is nothing to scan and nothing to carry across a window but the bytes after its last
@@ -3110,6 +3154,26 @@ pub(super) struct LineWindows {
     /// The most the next window reads, once (#7264): a source started on a few KiB reads up to where
     /// a start on the whole front would have ended, so its windows then fall where they always did.
     first_ask: Option<usize>,
+    /// A terminal, typed into a line at a time ([`typed_into`](Self::typed_into), #7742).
+    typed: bool,
+    /// The terminal has not been read yet: a BOM at the front of its first line is the one jq skips.
+    typed_front: bool,
+    /// What the source is, for a fault or a byte that is not UTF-8 ([`is_stream`](Self::is_stream), #7738).
+    kind: SourceKind,
+}
+
+/// Whether a source read in [`LineWindows`] is a stream: what decides, at a fault or at a byte that is
+/// not UTF-8, whether the lazy route reads the rest of it whole (a regular file, whose length bounds the
+/// read) or goes on reading it a window at a time (a pipe, a device, a terminal: it may never end, #7738).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceKind {
+    /// A regular file, or a source the caller has not judged: read whole at a failure, as before.
+    File,
+    /// A source judged a stream when it was opened.
+    Stream,
+    /// Standard input, judged by `fstat` the first time a failure asks, so that a run that meets none
+    /// makes no system call for it.
+    Stdin,
 }
 
 impl LineWindows {
@@ -3128,13 +3192,41 @@ impl LineWindows {
             carried,
             eof: false,
             first_ask: None,
+            typed: false,
+            typed_front: false,
+            kind: SourceKind::File,
         }
+    }
+
+    /// The source is a terminal (#7742): a window ends at the first line break a read brings, so each line
+    /// is handed on as it is typed, where a window of a block would wait for a block's worth of lines or
+    /// for the end of the input. A read of no bytes is the end (a `^D`), and nothing is read after it. A
+    /// BOM at the front of the first line is dropped, as jq's parser skips it: nothing was read of the
+    /// terminal to find it before the run started.
+    pub(super) fn typed_into(mut self) -> Self {
+        self.typed = true;
+        self.typed_front = true;
+        self
     }
 
     /// The first window reads no more than `bytes`.
     pub(super) fn with_first_window(mut self, bytes: usize) -> Self {
         self.first_ask = Some(bytes);
         self
+    }
+
+    /// What the source is (#7738): see [`SourceKind`].
+    pub(super) fn of_kind(mut self, kind: SourceKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Whether the source is a stream (#7738): not a regular file. Standard input is judged by `fstat`
+    /// here, once, on the first failure that asks; a descriptor whose type cannot be read is a file, which
+    /// keeps the route it had.
+    pub(super) fn is_stream(&mut self) -> bool {
+        self.kind = judge_kind(self.kind);
+        self.kind == SourceKind::Stream
     }
 
     /// Whether the last window is the last: no byte is left to read or carried.
@@ -3230,7 +3322,22 @@ impl LineWindows {
                 continue;
             }
             // patchcov: coverage end
-            match self.reader.by_ref().take(n as u64).read_to_end(&mut bytes) {
+            let read = if self.typed {
+                read_once(self.reader.as_mut(), &mut bytes, n)
+            } else {
+                self.reader.by_ref().take(n as u64).read_to_end(&mut bytes)
+            };
+            match read {
+                // A terminal ends at a read of nothing; what it gave before is a line, or the text of
+                // one a `^D` handed on without its line break.
+                Ok(0) if self.typed => self.eof = true,
+                Ok(_) if self.typed => {
+                    if std::mem::take(&mut self.typed_front)
+                        && bytes[before..].starts_with(b"\xEF\xBB\xBF")
+                    {
+                        bytes.drain(before..before + 3);
+                    }
+                }
                 // A short read is the end: a source of unknown length, or a file that shrank.
                 Ok(read) if read < n => self.eof = true,
                 Ok(read) => {

@@ -1424,13 +1424,25 @@ pub(crate) enum Route {
 /// route, as before #5233: only that evaluator makes the rewrites, when it
 /// re-enters a part of a program already routed to it, whose targets were
 /// static before a `$x` was substituted or a `def` bound into them.
+#[inline]
 pub(crate) fn route(program: &Expr) -> Route {
+    match pinned_route(program) {
+        Some(route) => route,
+        None => route_unpinned(program),
+    }
+}
+
+/// [`route`] decided afresh: the walk a run whose program [`pin_route`] did not
+/// pin makes per document.
+fn route_unpinned(program: &Expr) -> Route {
     // One walk of the program: the entries ask once per document. It ends at
     // the first node the shipped route keeps, whatever else the program holds.
     let mut dynamic = false;
     let mut extension = None;
+    let mut labels = LabelHints::default();
     let shipped_only = any_subexpr(program, &mut |e| {
         dynamic |= is_dynamic_path_target(e);
+        labels.note(e);
         match declined_construct(e) {
             Some(Declined::Extension(name)) => {
                 extension.get_or_insert(name);
@@ -1440,8 +1452,18 @@ pub(crate) fn route(program: &Expr) -> Route {
             None => false,
         }
     });
-    if !dynamic || shipped_only {
+    if shipped_only {
         return Route::Shipped;
+    }
+    if !dynamic {
+        // #7719: a program that can observe jq's label values runs here too,
+        // where `label` and `break` are jq's; one this interpreter cannot run
+        // keeps the shipped route, which models a caught `break` as `null`.
+        return if extension.is_none() && labels.observes_label_values(program) {
+            Route::Interpreter
+        } else {
+            Route::Shipped
+        };
     }
     extension
         .map(|name| {
@@ -1454,13 +1476,245 @@ pub(crate) fn route(program: &Expr) -> Route {
         })
 }
 
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// The route of the program a run evaluates, decided once (#7719).
+    ///
+    /// The evaluator entries ask [`route`] once per document, and the CLI runs one
+    /// program over every document of a run, so it decides the route once when the
+    /// program is compiled and pins it here for that program, per thread: a stream
+    /// of small records then pays a pointer compare per record instead of a walk of
+    /// the program. The pin holds while the [`RoutePin`] lives; a program it does
+    /// not name (a library caller, or a part of a program a bridge hands over) is
+    /// walked as before. `no_std` has no `thread_local!`, so there nothing is
+    /// pinned.
+    static PINNED_ROUTE: Cell<(usize, u8)> = const { Cell::new((0, PIN_NONE)) };
+}
+
+#[cfg(feature = "std")]
+const PIN_NONE: u8 = 0;
+#[cfg(feature = "std")]
+const PIN_INTERPRETER: u8 = 1;
+#[cfg(feature = "std")]
+const PIN_SHIPPED: u8 = 2;
+
+/// The pinned route of `program`, if [`pin_route`] pinned this program.
+#[inline]
+fn pinned_route(program: &Expr) -> Option<Route> {
+    #[cfg(feature = "std")]
+    {
+        let (key, code) = PINNED_ROUTE.with(Cell::get);
+        if key == program as *const Expr as usize {
+            return match code {
+                PIN_INTERPRETER => Some(Route::Interpreter),
+                PIN_SHIPPED => Some(Route::Shipped),
+                _ => None,
+            };
+        }
+        None
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = program;
+        None
+    }
+}
+
+/// Keeps [`pin_route`]'s pin for as long as it lives.
+#[must_use = "the route stays pinned only while the pin lives"]
+#[derive(Debug)]
+pub struct RoutePin(());
+
+impl Drop for RoutePin {
+    fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        PINNED_ROUTE.with(|pin| pin.set((0, PIN_NONE)));
+    }
+}
+
+/// Decide `program`'s route once and pin it for this thread (#7719).
+///
+/// While the returned [`RoutePin`] lives, the evaluator entries, which ask per
+/// document, find the route instead of walking the program again. `program`
+/// must stay where it is for that time: the pin names it by address. A refused
+/// program is not pinned (the CLI reports [`refusal`] and runs nothing).
+pub fn pin_route(program: &Expr) -> RoutePin {
+    #[cfg(feature = "std")]
+    {
+        let code = match route_unpinned(program) {
+            Route::Interpreter => PIN_INTERPRETER,
+            Route::Shipped => PIN_SHIPPED,
+            Route::Refused(_) => PIN_NONE,
+        };
+        PINNED_ROUTE.with(|pin| pin.set((program as *const Expr as usize, code)));
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = program;
+    RoutePin(())
+}
+
+/// What [`route`]'s one walk notes for [`LabelHints::observes_label_values`].
+#[derive(Default)]
+struct LabelHints {
+    /// The program holds a `label`.
+    label: bool,
+    /// The program spells `__jq` in a string, a key or a field name.
+    sentinel: bool,
+    /// The program holds a `?//` destructuring alternation.
+    alternation: bool,
+}
+
+impl LabelHints {
+    fn note(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Label { .. } => self.label = true,
+            Expr::AsPattern { patterns, .. } => self.alternation |= patterns.len() > 1,
+            Expr::Field(name) => self.sentinel |= spells_sentinel(name),
+            Expr::Literal(Literal::String(text)) => self.sentinel |= spells_sentinel(text.as_str()),
+            Expr::StringInterpolation(parts) => {
+                self.sentinel |= parts
+                    .iter()
+                    .any(|part| matches!(part, StringPart::Literal(text) if spells_sentinel(text)));
+            }
+            Expr::Object(entries) => {
+                self.sentinel |= entries
+                    .iter()
+                    .any(|entry| matches!(&entry.key, ObjectKey::Literal(k) if spells_sentinel(k)));
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `program` can tell jq's `label`/`break` from the shipped
+    /// evaluator's (#7719). jq's `break $x` raises the error `{"__jq": n}`,
+    /// `n` the number `GENLABEL` gave the label instance `$x` names when it
+    /// was entered (one counter for the run, which the `label`s jq's
+    /// `builtin.jq` enters for `first`, `limit`, `isempty`, `_modify` and the
+    /// rest also advance), and a `label` stops on any error equal to its own
+    /// value. The shipped evaluator unwinds a `break` by name to the innermost
+    /// active label of that name and hands a `catch` `null`, which no program
+    /// can tell apart unless it
+    ///
+    /// - spells `__jq` (a hand-made `error({"__jq": 0})`, or a handler that
+    ///   reads `.__jq`);
+    /// - catches a `break` in a `try` whose handler reads its input (`catch
+    ///   .`, `catch type`, `catch error`, whose re-raise only the label stops);
+    /// - nests a label inside another of the same name, so that a `break` the
+    ///   outer one binds unwinds through the inner one; or
+    /// - passes a `break` as an argument to a definition that holds a label,
+    ///   whose own instance (a recursive call's, say) is not the one the
+    ///   `break` names; or
+    /// - runs a `?//` alternation inside a `while` or `repeat` that feeds a
+    ///   builtin jq runs through a label of its own (#7736). `DESTRUCTURE_ALT`
+    ///   retries the next alternative on any error raised after it, a `break`
+    ///   included, so `limit(3; while(. as [$x] ?// $x | $x; .))` runs the other
+    ///   alternative after each of `limit`'s breaks. The shipped evaluator
+    ///   retries the same way after its own native `first`/`limit`/... stop
+    ///   (#1519), except through the loops of `while` and `repeat`.
+    ///
+    /// A `?//` in the update of a `|=` (`map_values`, `walk`) is left on the
+    /// shipped route although jq retries there too: the shipped evaluator
+    /// answers most such updates as jq does, in linear time, where the retry
+    /// makes both jq and the interpreter quadratic in the number of paths.
+    ///
+    /// Each needs a user `label`, `__jq` spelled, or a `?//`, so every other
+    /// program pays only [`Self::note`]'s match, and a pinned run
+    /// ([`pin_route`]) not even that.
+    fn observes_label_values(&self, program: &Expr) -> bool {
+        if self.sentinel {
+            return true;
+        }
+        if self.alternation && any_subexpr(program, &mut alternation_in_a_broken_loop) {
+            return true;
+        }
+        if !self.label {
+            return false;
+        }
+        let breaks = any_subexpr(program, &mut |e| matches!(e, Expr::Break(_)));
+        if !breaks {
+            return false;
+        }
+        let label_in_def = any_subexpr(program, &mut |e| {
+            matches!(e, Expr::FuncDef { body, .. }
+                if any_subexpr(body, &mut |b| matches!(b, Expr::Label { .. })))
+        });
+        any_subexpr(program, &mut |e| match e {
+            Expr::Try {
+                expr,
+                catch: Some(handler),
+            } => {
+                !ignores_input(handler)
+                    && any_subexpr(expr, &mut |b| {
+                        matches!(b, Expr::Break(_) | Expr::FuncCall { .. })
+                    })
+            }
+            Expr::Label { name, body } => any_subexpr(
+                body,
+                &mut |b| matches!(b, Expr::Label { name: inner, .. } if inner == name),
+            ),
+            Expr::FuncCall { args, .. } => {
+                label_in_def
+                    && args
+                        .iter()
+                        .any(|arg| any_subexpr(arg, &mut |b| matches!(b, Expr::Break(_))))
+            }
+            _ => false,
+        })
+    }
+}
+
+/// Whether `text` holds `__jq`, the key of jq's label value (#7719): a byte
+/// scan, as this runs on every name and string of a program that is not pinned.
+fn spells_sentinel(text: &str) -> bool {
+    text.len() >= 4 && text.as_bytes().windows(4).any(|w| w == b"__jq")
+}
+
+/// Whether `expr` is a builtin jq runs through a `label` of its own (`first/1`,
+/// `limit`, `nth/2`, `isempty`, `any`/`all`, `IN`, per jq 1.7.1's and 1.8.2's
+/// builtin.jq) whose generator holds a `while` or `repeat` with a `?//` inside
+/// (#7736): see [`LabelHints::observes_label_values`].
+fn alternation_in_a_broken_loop(expr: &Expr) -> bool {
+    use Builtin as B;
+    let generators: [Option<&Expr>; 2] = match expr {
+        Expr::Limit { expr, .. } | Expr::NthExpr { expr, .. } => [Some(expr), None],
+        Expr::FirstExpr(g) => [Some(g), None],
+        Expr::Builtin(builtin) => match builtin {
+            B::IsEmpty(g) | B::AnyF(g) | B::AllF(g) | B::UpperIn(g) | B::NthStream(_, g) => {
+                [Some(g), None]
+            }
+            B::AnyCond(g, c) | B::AllCond(g, c) | B::UpperInSrc(g, c) => [Some(g), Some(c)],
+            _ => return false,
+        },
+        _ => return false,
+    };
+    generators.into_iter().flatten().any(|g| {
+        any_subexpr(g, &mut |e| {
+            matches!(e, Expr::While { .. } | Expr::Repeat(_))
+                && any_subexpr(
+                    e,
+                    &mut |a| matches!(a, Expr::AsPattern { patterns, .. } if patterns.len() > 1),
+                )
+        })
+    })
+}
+
+/// Whether a `catch` handler answers the same whatever error it is handed: a
+/// literal, or `empty`.
+fn ignores_input(handler: &Expr) -> bool {
+    match handler {
+        Expr::Literal(_) | Expr::Builtin(Builtin::Empty) => true,
+        Expr::Paren(inner) => ignores_input(inner),
+        _ => false,
+    }
+}
+
 /// Why `succinctly jq` refuses `program`, if it does (#5233).
 ///
 /// A dynamic path target beside an extension builtin the path-mode interpreter
 /// does not run is refused: the CLI reports this message once, as a compile
 /// error, before any input is read.
 pub fn refusal(program: &Expr) -> Option<String> {
-    match route(program) {
+    match route_unpinned(program) {
         Route::Refused(error) => Some(error.message),
         Route::Interpreter | Route::Shipped => None,
     }
@@ -1698,6 +1952,7 @@ fn run_program_seeing(
 ) -> Option<Control> {
     with_prelude(|prelude| {
         let interp = Interp::new(prelude);
+        interp.next_label.set(LabelNumbers::resume(program));
         let mut input = input;
         interp.prepare(program, &mut input);
         see(&input);
@@ -1708,6 +1963,7 @@ fn run_program_seeing(
                 Err(Raise::Stop)
             }
         });
+        LabelNumbers::keep(program, interp.next_label.get());
         match result {
             Ok(()) | Err(Raise::Stop) => None,
             Err(raise) => match Interp::outcome(raise) {
@@ -1792,6 +2048,50 @@ pub(crate) mod kept_document {
         });
         LEFT.with(|left| *left.borrow_mut() = kept);
         control
+    }
+}
+
+/// jq's label counter across the documents of one run (#7719).
+///
+/// `GENLABEL` numbers label instances from one counter in `jq_state`, which jq
+/// creates once per run, so the `n` of `{"__jq": n}` keeps counting from one
+/// input to the next (`[label $f | try break $f catch .]` over `1 2 3` is
+/// `[{"__jq":0}]`, `[{"__jq":1}]`, `[{"__jq":2}]` in jq 1.7.1 and 1.8.2).
+/// [`run_program`] runs each document on a fresh [`Interp`], so the count it
+/// reached is kept here, per thread and keyed by the program, for the next
+/// document of the same program; another program starts again at 0. `no_std`
+/// has no `thread_local!`, so there every document starts at 0.
+struct LabelNumbers;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    static LABEL_NUMBERS: Cell<(usize, u64)> = const { Cell::new((0, 0)) };
+}
+
+impl LabelNumbers {
+    /// Where `program`'s next document starts counting.
+    fn resume(program: &Expr) -> u64 {
+        #[cfg(feature = "std")]
+        {
+            let key = program as *const Expr as usize;
+            LABEL_NUMBERS.with(|cell| match cell.get() {
+                (seen, next) if seen == key => next,
+                _ => 0,
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = program;
+            0
+        }
+    }
+
+    /// Record where `program`'s document left the count.
+    fn keep(program: &Expr, next: u64) {
+        #[cfg(feature = "std")]
+        LABEL_NUMBERS.with(|cell| cell.set((program as *const Expr as usize, next)));
+        #[cfg(not(feature = "std"))]
+        let _ = (program, next);
     }
 }
 

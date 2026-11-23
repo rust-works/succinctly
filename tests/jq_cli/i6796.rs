@@ -102,8 +102,12 @@ fn the_slurps_other_loops_still_match_jq_6796() -> Result<()> {
         // jq 1.8.2 names a file and line here; the position is jq 1.7.1's (#7607).
         (&["--seq", "-s", "--stream", "input"], &["trunc", "obj"], "", "jq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 11\n", 5),
         (&["-n", "--seq", "-s", "--stream", "[inputs]"], &["trunc", "gone", "obj"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error (at <unknown>): Unfinished JSON term at EOF at line 1, column 11\n", 2),
-        (&["-s", "--stream", "input"], &["obj", "gone", "obj"], "[[\"a\"]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
-        (&["-s", "--stream-errors", "input"], &["obj", "gone", "obj"], "[[\"a\"]]\n", "jq: error: Could not open file @D@/gone: No such file or directory\n", 2),
+        // jq 1.7.1: `[["a"]]`, the closing event its array left out; jq 1.8.2 keeps it in the array, so
+        // `input` has nothing left (#7807), and names a file and line where the position is 1.7.1's (#7607).
+        (&["-s", "--stream", "input"], &["obj", "gone", "obj"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error (at <unknown>): break\n", 2),
+        // jq 1.7.1: `[["a"]]`, the closing event its array left out; jq 1.8.2 keeps it in the array, so
+        // `input` has nothing left (#7807), and names a file and line where the position is 1.7.1's (#7607).
+        (&["-s", "--stream-errors", "input"], &["obj", "gone", "obj"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error (at <unknown>): break\n", 2),
         (&["-s", "input"], &["obj", "gone", "obj"], "", "jq: error: Could not open file @D@/gone: No such file or directory\njq: error (at <unknown>): break\n", 2),
     ])
 }

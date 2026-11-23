@@ -6,9 +6,11 @@
 //! holds a window, and is read whole as before.
 //!
 //! Every expected output below is jq 1.7.1's (`/usr/bin/jq` on macOS, `~/.local/bin/jq` on Linux), and
-//! jq 1.8.2 agrees on each. Random bytes give random parse errors, so the `/dev/urandom` rows pin the
-//! shape of the answer (an exit status, a number, the start of jq's message), and that it comes at once
-//! in little memory: every run here is killed and fails past [`MAX_KIB`] or the deadline instead of growing.
+//! jq 1.8.2 agrees on each. The device that never ends is a terminal the test streams a fixed line into,
+//! not `/dev/urandom`: random bytes open a container (`{`, `[`) about 2 times in 256, and a fault inside a
+//! container that never closes is still read on looking for the close (#7812), so a row over them failed
+//! about one run in a hundred (the merge-queue failure of `plain_filter_over_dev_urandom_..._7737`). Every
+//! run here is killed and fails past [`MAX_KIB`] or the deadline instead of growing.
 
 #![cfg(unix)]
 
@@ -31,60 +33,68 @@ fn jq(args: &[&str]) -> Command {
     command
 }
 
-/// `/dev/urandom` as the run's lone input three ways: named, on standard input, and as `/dev/stdin`.
-fn over_urandom(args: &[&str]) -> Vec<(&'static str, pty::Ran)> {
+/// A character device that never ends, three ways: a terminal the test streams `line` into without end,
+/// named by its device path, on standard input, and as `/dev/stdin`. Its device path is `TTY` in what the
+/// run says.
+fn over_a_streaming_device(
+    args: &[&str],
+    line: &'static [u8],
+) -> Vec<(&'static str, (String, String, i32))> {
     ["named", "stdin", "/dev/stdin"]
         .into_iter()
         .map(|route| {
+            let terminal = pty::Pty::open();
+            let _streaming = terminal.stream(line);
             let mut command = jq(args);
             match route {
-                "named" => {
-                    command.arg("/dev/urandom").stdin(Stdio::null());
-                }
-                "stdin" => {
-                    command.stdin(std::fs::File::open("/dev/urandom").expect("open /dev/urandom"));
-                }
-                _ => {
-                    command
-                        .arg("/dev/stdin")
-                        .stdin(std::fs::File::open("/dev/urandom").expect("open /dev/urandom"));
-                }
-            }
-            let what = format!("jq {} over /dev/urandom ({route})", args.join(" "));
-            let ran = pty::spawn(&mut command).wait_within(&what, pty::DEADLINE, Some(MAX_KIB));
-            (route, ran)
+                "named" => command.arg(terminal.path()).stdin(Stdio::null()),
+                "stdin" => command.stdin(terminal.stdin()),
+                _ => command.arg("/dev/stdin").stdin(terminal.stdin()),
+            };
+            let what = format!("jq {} over a streaming terminal ({route})", args.join(" "));
+            let (stdout, stderr, code) = pty::spawn(&mut command)
+                .wait_within(&what, pty::DEADLINE, Some(MAX_KIB))
+                .triple();
+            let name = terminal.path().display().to_string();
+            (route, (stdout, stderr.replace(&name, "TTY"), code))
         })
         .collect()
 }
 
-/// jq 1.7.1: `-R -n 'input|length' /dev/urandom` prints the length of the first line (533, 446, 139 in
-/// three runs) and exits 0, on every route. succinctly read the device whole first.
+/// jq 1.7.1: `-R -n 'input|length'` over an endless device prints the length of its first line and exits 0,
+/// on every route. succinctly read the device whole first.
 #[test]
-fn raw_input_over_dev_urandom_answers_the_first_line_7737() {
-    for (route, ran) in over_urandom(&["-R", "-n", "input|length"]) {
-        let (stdout, stderr, code) = ran.triple();
-        assert_eq!((stderr.as_str(), code), ("", 0), "{route}: {stdout:?}");
-        assert!(
-            stdout.ends_with('\n') && stdout.trim_end().parse::<u64>().is_ok(),
-            "{route}: {stdout:?}"
-        );
+fn raw_input_over_an_endless_device_answers_the_first_line_7737() {
+    for (route, ran) in over_a_streaming_device(&["-R", "-n", "-c", "input|length"], b"1 tru\n") {
+        assert_eq!(ran, ("5\n".to_string(), String::new(), 0), "{route}");
     }
 }
 
-/// jq 1.7.1: `-c . /dev/urandom` stops at the first byte that is not JSON, `jq: parse error: Invalid
-/// numeric literal at line 1, column 6` (the column is the bytes'), exit 5.
+/// jq 1.7.1: `-c .` over an endless device stops at its first fault, after the values before it, with jq's
+/// line and column, exit 5.
 #[test]
-fn plain_filter_over_dev_urandom_stops_at_its_first_fault_7737() {
-    for (route, ran) in over_urandom(&["-c", "."]) {
-        let (_, stderr, code) = ran.triple();
-        assert_eq!(code, 5, "{route}: {stderr:?}");
-        assert!(
-            stderr
-                .lines()
-                .last()
-                .is_some_and(|line| line.starts_with("jq: parse error: ")),
-            "{route}: {stderr:?}"
-        );
+fn plain_filter_over_an_endless_device_stops_at_its_first_fault_7737() {
+    for (line, want) in [
+        (
+            &b"1 tru\n"[..],
+            (
+                "1\n".to_string(),
+                "jq: parse error: Invalid literal at line 2, column 0\n".to_string(),
+                5,
+            ),
+        ),
+        (
+            &b"tru 1\n"[..],
+            (
+                String::new(),
+                "jq: parse error: Invalid literal at line 1, column 4\n".to_string(),
+                5,
+            ),
+        ),
+    ] {
+        for (route, ran) in over_a_streaming_device(&["-c", "."], line) {
+            assert_eq!(ran, want, "{route} {:?}", String::from_utf8_lossy(line));
+        }
     }
 }
 
