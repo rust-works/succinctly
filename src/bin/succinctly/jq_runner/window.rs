@@ -3089,6 +3089,33 @@ fn last_line_break(bytes: &[u8]) -> Option<usize> {
     None
 }
 
+/// `kind` with standard input judged (#7738): [`SourceKind::Stream`] or [`SourceKind::File`] by `fstat`.
+pub(super) fn judge_kind(kind: SourceKind) -> SourceKind {
+    match kind {
+        SourceKind::Stdin if stdin_is_a_stream() => SourceKind::Stream,
+        SourceKind::Stdin => SourceKind::File,
+        kind => kind,
+    }
+}
+
+/// Whether standard input is a stream by [`super::read_as_stream`] (#7738), by `fstat` on a duplicate of
+/// descriptor 0.
+#[cfg(unix)]
+fn stdin_is_a_stream() -> bool {
+    use std::os::fd::AsFd;
+    std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .and_then(|fd| File::from(fd).metadata().ok())
+        .is_some_and(|meta| super::read_as_stream(meta.file_type()))
+}
+
+#[cfg(not(unix))]
+fn stdin_is_a_stream() -> bool {
+    false
+}
+
 /// One read of `reader` onto the end of `bytes`, of at most `n` bytes (and at most 64 KiB, more than a
 /// terminal's line holds): what a terminal gives a read is the line typed (#7742).
 fn read_once(reader: &mut dyn Read, bytes: &mut Vec<u8>, n: usize) -> io::Result<usize> {
@@ -3129,6 +3156,22 @@ pub(super) struct LineWindows {
     typed: bool,
     /// The terminal has not been read yet: a BOM at the front of its first line is the one jq skips.
     typed_front: bool,
+    /// What the source is, for a fault or a byte that is not UTF-8 ([`is_stream`](Self::is_stream), #7738).
+    kind: SourceKind,
+}
+
+/// Whether a source read in [`LineWindows`] is a stream: what decides, at a fault or at a byte that is
+/// not UTF-8, whether the lazy route reads the rest of it whole (a regular file, whose length bounds the
+/// read) or goes on reading it a window at a time (a pipe, a device, a terminal: it may never end, #7738).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceKind {
+    /// A regular file, or a source the caller has not judged: read whole at a failure, as before.
+    File,
+    /// A source judged a stream when it was opened.
+    Stream,
+    /// Standard input, judged by `fstat` the first time a failure asks, so that a run that meets none
+    /// makes no system call for it.
+    Stdin,
 }
 
 impl LineWindows {
@@ -3149,6 +3192,7 @@ impl LineWindows {
             first_ask: None,
             typed: false,
             typed_front: false,
+            kind: SourceKind::File,
         }
     }
 
@@ -3167,6 +3211,20 @@ impl LineWindows {
     pub(super) fn with_first_window(mut self, bytes: usize) -> Self {
         self.first_ask = Some(bytes);
         self
+    }
+
+    /// What the source is (#7738): see [`SourceKind`].
+    pub(super) fn of_kind(mut self, kind: SourceKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Whether the source is a stream (#7738): not a regular file. Standard input is judged by `fstat`
+    /// here, once, on the first failure that asks; a descriptor whose type cannot be read is a file, which
+    /// keeps the route it had.
+    pub(super) fn is_stream(&mut self) -> bool {
+        self.kind = judge_kind(self.kind);
+        self.kind == SourceKind::Stream
     }
 
     /// Whether the last window is the last: no byte is left to read or carried.
