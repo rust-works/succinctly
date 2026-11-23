@@ -141,9 +141,9 @@ fn try_write_stdout(args: std::fmt::Arguments<'_>) -> Result<(), StdoutFailure> 
 #[cfg(not(test))]
 fn stdout_write_failed(failure: StdoutFailure) -> ! {
     match failure {
-        // Started with SIGPIPE ignored, the closed pipe is a failed write like any other, as it is
-        // to jq, which keeps that disposition (#7732).
-        StdoutFailure::BrokenPipe if super::sigpipe::inherited_ignored() => {
+        // Started with SIGPIPE ignored or blocked, the closed pipe is a failed write like any other,
+        // as it is to jq, which keeps that disposition and that mask (#7732, #7857).
+        StdoutFailure::BrokenPipe if super::sigpipe::closed_pipe_is_a_failed_write() => {
             stdout_write_failed(StdoutFailure::Other("Broken pipe".to_string()))
         }
         StdoutFailure::BrokenPipe => {

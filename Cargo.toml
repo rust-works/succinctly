@@ -148,7 +148,8 @@ jiff = { version = "0.2", default-features = false, features = ["std"], optional
 # `libc` for the CLI's two `signal` calls: `SIGPIPE` back to its default (#5547), as Rust starts a
 # process with it ignored and jq and yq die of it, so `tool | head -n1` is quiet and exits 141,
 # unless the process inherited it ignored, which a `sigaction` query before `main` reads (#7732);
-# `pthread_sigmask`, so that macOS hands a write's SIGPIPE to the thread that wrote (#7847);
+# `pthread_sigmask`, so that macOS hands a write's SIGPIPE to the thread that wrote (#7847), and
+# to read an inherited block of it, which jq keeps and yq lifts (#7857);
 # and the benchmark suites' `SIGINT` flag (#5551), which `ctrlc` did at the price of linking
 # Foundation on macOS.
 # Already in the tree through `getrandom` and `memmap2`, so no new crate.
