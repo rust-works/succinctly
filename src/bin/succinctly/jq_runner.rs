@@ -8004,6 +8004,7 @@ fn read_inputs(
     SLURP_DIRECTORY_READ.with(|slurp| slurp.set(false));
     LAST_DIRECTORY_READ.with(|read| read.set(false));
     SLURP_READ_SEEN.with(|seen| seen.set(false));
+    BROKEN_MARK_STREAM.with(|broken| broken.set(false));
     UNOPENED_TAIL_NAME.with(|tail| *tail.borrow_mut() = None);
     LAST_VALUE_AT_TAIL.with(|at| at.set(false));
     FAULT_AT_TAIL.with(|at| at.set(false));
@@ -8558,6 +8559,18 @@ fn read_inputs(
     } else {
         Vec::new()
     };
+    // #7863: the plain reader (`--stream` has its own, #7603) that meets a mark broken off at the
+    // front of the stream is in jq's fault for good, whichever source it breaks off in.
+    if json_input_mode
+        && reads_plain_json(args)
+        && !args.stream
+        && !args.stream_errors
+        && bom_cuts.iter().all(|&cut| cut == 0)
+    {
+        let mut mark = crate::cli::front_matter::StreamBomMatch::default();
+        let broken = raw_bytes.iter().any(|(_, raw)| mark.breaks_in(raw));
+        BROKEN_MARK_STREAM.with(|flag| flag.set(broken));
+    }
     // #7569: the stream reader's chunks of these sources held the cut bytes.
     crate::cli::jq_stream_errors::STREAM_BOM_LEADS
         .with(|leads| leads.borrow_mut().clone_from(&bom_cuts));
@@ -11102,6 +11115,10 @@ thread_local! {
     /// Whether the program calls `halt` or `halt_error` (#7775), so its main loop can stop before the
     /// last input: [`windowed_seq_file`] then reads no file whole before the first record runs.
     static PROGRAM_HALTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the plain JSON stream [`get_inputs`] read opens with part of the byte-order mark and
+    /// departs from it (#7863): jq's parser stays in that fault, so every read of `input` after
+    /// the first meets `Malformed BOM` again, and [`seed_input_queue`] arms the queue to do so.
+    static BROKEN_MARK_STREAM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The name of the last file named, when it did not open (#6480), for [`get_inputs`] to give a
     /// source of its own.
     static UNOPENED_TAIL_NAME: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -16138,6 +16155,11 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
         }
         // The scan reads the text after the BOM jq skips (#5291), as `get_inputs` strips it.
         let bom = crate::cli::front_matter::leading_bom_len(&bytes);
+        // #7863: a mark that breaks off in the front is jq's fault for good, which the substituted
+        // text the route reads would hide (`EF 31` is `U+FFFD` and `1` there).
+        if crate::cli::front_matter::StreamBomMatch::default().breaks_in(&bytes) {
+            BROKEN_MARK_STREAM.with(|flag| flag.set(true));
+        }
         // The front validated and searched for a NUL in one read of it (#7437).
         let scan = succinctly::jq::scan_utf8_and_nul(&bytes[bom..]);
         // #7748: the number tokens' NUL tails of the front, as the route that reads the source whole
@@ -17936,6 +17958,11 @@ fn seed_input_queue(
         // move on from it as jq's do. A slurp read the whole stream to build its one value, so
         // every read past that value is already past the end: line 0 and `<unknown>` (#6145).
         locations.count_reads_past_end(slurp);
+    }
+    // #7863: after a mark that breaks off, jq's parser never leaves its fault, so every later read
+    // of `input` fails again, worded as jq words it (the first read keeps the documented wording).
+    if BROKEN_MARK_STREAM.with(std::cell::Cell::get) {
+        jq::repeat_input_fault_at_end("Malformed BOM");
     }
     install_open_failure_hook();
 }
