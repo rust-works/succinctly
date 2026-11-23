@@ -111407,7 +111407,9 @@ fn format_strftime(
                     }
                 }
             }
+            let mut alternative = false;
             if let Some(modifier @ ('E' | 'O')) = spec {
+                alternative = modifier == 'O';
                 spec = chars.next();
                 if spec.is_none() {
                     result.push(modifier);
@@ -111438,8 +111440,18 @@ fn format_strftime(
                 // month abbreviation (#7784). glibc has neither (its `strftime` prints them as
                 // written), and there the pinned libc's C layout stands.
                 // A time the C library cannot hold (a year past `int`) gets the C rendering.
+                // #7790: `%OB` is the locale's alternative month name in macOS's libc, the
+                // nominative one a month standing alone takes (`leden` where `%B` is `ledna` under
+                // `cs_CZ`), as jq prints it there; glibc's manual gives `%OB`, `%Ob` and `%Oh` as
+                // its alternative names (not checked against a glibc jq). Every other modified
+                // name or layout is the plain one in macOS's libc, under every locale it has.
                 if !matches!(letter, '+' | 'v') || cfg!(target_vendor = "apple") {
-                    if let Some(text) = locale_time::render(&format!("%{letter}"), &tm) {
+                    let spec = if alternative && matches!(letter, 'B' | 'b' | 'h') {
+                        format!("%O{letter}")
+                    } else {
+                        format!("%{letter}")
+                    };
+                    if let Some(text) = locale_time::render(&spec, &tm) {
                         result.push_str(&text);
                         continue;
                     }
@@ -112276,7 +112288,10 @@ fn parse_strptime(input: &str, fmt: &str) -> Result<(BrokenDownTime, String), St
                             None => (MONTH_FULL[i], MONTH_ABBR[i]),
                         };
                         if alternative_names {
-                            strptime_name_len(&input_iter, full, "").map(|len| (i, len))
+                            // #7790: the alternative names `%OB` prints (`leden` under `cs_CZ`,
+                            // where `%B` reads `ledna`), as macOS's libc reads them.
+                            let alt = names.map_or(full, |n| n.month_alt[i].as_str());
+                            strptime_name_len(&input_iter, alt, "").map(|len| (i, len))
                         } else {
                             strptime_name_len(&input_iter, full, abbr).map(|len| (i, len))
                         }

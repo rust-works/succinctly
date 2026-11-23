@@ -12075,7 +12075,7 @@ Before 1900 the macOS jq's `%s` is `-1`, as succinctly's is by the `timegm` rule
 ### `strftime`/`strflocaltime` localize through the C library where there is one (#5754)
 
 jq calls `setlocale(LC_ALL, "")`, so `strftime` and `strflocaltime` follow `LC_ALL`, `LC_TIME` and `LANG`.
-`succinctly jq` does the same for `%a %A %b %B %h %p %c %x %X %r`: the `locale-time` feature (on in `cli`) renders them through the C library's `strftime_l` in the locale `newlocale(LC_ALL_MASK, "")` resolves.
+`succinctly jq` does the same for `%a %A %b %B %h %p %c %x %X %r` and `%OB`: the `locale-time` feature (on in `cli`) renders them through the C library's `strftime_l` in the locale `newlocale(LC_ALL_MASK, "")` resolves.
 The locale is resolved once per process, on the first conversion.
 jq's all-or-nothing rule holds: a locale that is not installed, or any one invalid category, leaves the whole process in C (`LANG=de_DE.UTF-8 LC_MESSAGES=xx_XX` prints `Thursday`).
 An unset, `C`, `POSIX` or `C.*` environment never leaves the evaluator's own English tables.
@@ -12091,8 +12091,11 @@ What differs from jq 1.7.1:
 - **The numeric specifiers, `%z`, `%Z` and `%s` are not localized.**
   They stay in the evaluator, so the zone-label rules above are unchanged under any locale.
   A locale layout that prints the zone itself (glibc's `en_GB` `%c` ends in `%Z`) takes the same zone labels.
-- **`%E*` and `%O*` follow the plain specifier.**
+- **`%E*` and `%O*` follow the plain specifier, but for the alternative month names.**
   Under a locale whose C library has alternative era or digit forms (`ja_JP` on glibc) the plain form is printed.
+  `%OB` is the locale's alternative month name (#7790), the nominative one a month standing alone takes, where `%B` is the genitive of a date: `LC_ALL=cs_CZ.UTF-8`, `0 | strftime("%OB")` is `"leden"` and `strftime("%B")` is `"ledna"`, as jq prints them on macOS.
+  macOS's libc has such names under `be_BY`, `cs_CZ`, `el_GR`, `kk_KZ`, `lt_LT`, `mn_MN`, `pl_PL`, `ru_RU` and `uk_UA`, and prints the full name for `%OB` under every other locale; every other `%E` and `%O` form is the plain one there under every locale it has (checked against jq 1.7.1 and 1.8.2 on macOS for each letter after either modifier, in all 84 UTF-8 locales, at three instants).
+  glibc's `strftime(3)` gives `%OB`, `%Ob` and `%Oh` as its alternative month names (since glibc 2.27), and `succinctly jq` renders all three through `strftime_l`, so a Linux build prints what glibc prints for them; that was not checked against a glibc `jq`.
 - **An empty result for a format that is not empty, or one past jq's buffer, is an error; an empty format is not (#7542).**
   jq hands the library a buffer of `strlen(fmt) + 100` bytes and raises `strftime/1: unknown system failure` (`strflocaltime/1:` for the local-zone one) when `strftime` returns 0.
   So does this: `%p` under `de_DE` (the library prints nothing there, macOS and glibc alike) and a result of `strlen(fmt) + 100` bytes or more (five `%c`) are that error, and `strftime("...")?` is empty.
@@ -12133,6 +12136,7 @@ What differs from jq 1.7.1:
   `%Z` with a width reads exactly that many capitals: `"GMT" | strptime("%3Z")` is read, `%4Z` and `%2Z` are no match.
   Checked against `/usr/bin/jq` 1.7.1 (macOS) over 24,000 prefix-and-specifier rows and 9,000 random formats; a glibc `jq` was not checked.
   The pin's libc reads `%OB` from the alternative month names, which C holds as the full names alone, so `%OB` takes `March` but not `Mar`, and `%Ob` and `%Oh` take neither; a glibc `jq` reads the abbreviation with `%O` as it does without.
+  Under another locale they are the names `strftime("%OB")` prints (#7790): `"leden" | strptime("%OB")` is January under `cs_CZ`, and `"ledna"`, which `%B` reads, is no match, as in jq on macOS.
   The pin's libc puts no limit on which specifier a modifier precedes; glibc reads `%E` only before `c C x X y Y` and `%O` only before `d e H I m M S U V W w y`, so a glibc `jq` rejects `"03" | strptime("%Em")`.
   `%k` and `%l` are read as `%H` and `%I`.
   `%C` and `%y` complete each other in the order the libc reads them: `%C` after `%Y` replaces the year with the century (`"2015 20" | strptime("%Y %C")` is year 2000), a `%C` and a `%y` give the year `century * 100 + y` whichever comes first and use each other up, and `%Y`, `%D` and `%F` clear a pending half (#5934).
