@@ -28933,7 +28933,7 @@ fn eval_index_expr<S: EvalSemantics, V: DocumentValue>(
     cursor: Option<V::Cursor>,
 ) -> GenericResult<V> {
     // #7572: a target with an effect runs depth-first, as in `eval::eval_index_expr`.
-    if crate::jq::eval::index_target_runs_depth_first::<S>(target) {
+    if crate::jq::eval::generator_runs_depth_first::<S>(target) {
         return collect_drive_generic::<S, V>(|sink| {
             each_index_expr_generic::<S, V>(target, key, value, optional, cursor, sink)
         });

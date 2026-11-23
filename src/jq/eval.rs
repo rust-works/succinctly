@@ -4903,6 +4903,16 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Expr::Format(format_type) => eval_format::<W, S>(format_type, value, optional),
 
         // Phase 8: Variables and Advanced Control Flow
+        // #7845: a source with an effect runs depth-first, each value through the body before the
+        // next is pulled, as jq runs `E as $v | B`: collecting every output of `inputs` first read
+        // the whole input before the body's first error, which then named `<unknown>` and left the
+        // main loop nothing to read. #7474's binding of a builtin's generator argument (`join(inputs)`
+        // is `inputs as $v | join($v)`) reaches here.
+        Expr::As { expr, var, body } if generator_runs_depth_first::<S>(expr) => {
+            collect_depth_first::<W, S>(|sink| {
+                each_as::<W, S>(expr, var, body, value, optional, sink)
+            })
+        }
         Expr::As { expr, var, body } => eval_as::<W, S>(expr, var, body, value, optional),
         Expr::Var(name) => {
             // Variable references without context should error
@@ -4979,6 +4989,14 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
 
         // Phase 9: Variables & Definitions
+        // #7845: as `Expr::As` above, for a destructuring source.
+        Expr::AsPattern {
+            expr,
+            patterns,
+            body,
+        } if generator_runs_depth_first::<S>(expr) => collect_depth_first::<W, S>(|sink| {
+            each_as_pattern::<W, S>(expr, patterns, body, value, optional, sink)
+        }),
         Expr::AsPattern {
             expr,
             patterns,
@@ -6262,23 +6280,51 @@ pub(crate) fn streams_escaped_generator_prefix<S: EvalSemantics>() -> bool {
     S::TAG != EvalTag::Yq
 }
 
-/// Whether the eager `E[K]` (`eval_index_expr`, both evaluators) runs its target depth-first
-/// through the demand-driven `each_index_expr` instead (#7572): jq mode, a target that can fan
-/// out, and one with an effect or a read of the input state ([`stage_may_have_effect`], the
-/// pipe's #4293 rule). `inputs[.]` then indexes each input as it is read, as jq does, so an index
-/// error names the line of the input it raised on and leaves the rest unread. Every other target
-/// keeps the eager fold, which keeps a document's nodes borrowed; `repeat` keeps it too, for the
-/// iteration cap only that route has ([`streams_unbounded`]).
+/// Whether an eager construct runs the generator it consumes depth-first, through its
+/// demand-driven twin, instead of collecting the generator first: jq mode, a generator that can
+/// fan out, and one with an effect or a read of the input state ([`stage_may_have_effect`], the
+/// pipe's #4293 rule). The constructs are `E[K]`'s target (`eval_index_expr`, both evaluators,
+/// #7572) and `E as $v | B`'s source (`eval_as`/`eval_as_pattern`, #7845). `inputs[.]` then
+/// indexes each input as it is read, and `[inputs as $v | B]` runs `B` on each input as it is
+/// read, as jq does, so an error raised on one names the line of the input it raised on and
+/// leaves the rest unread for the main loop. Every other generator keeps the eager fold, which
+/// keeps a document's nodes borrowed; `repeat` keeps it too, for the iteration cap only that
+/// route has ([`streams_unbounded`]).
 ///
 /// `S::TAG == EvalTag::Jq` is the condition under which `each_index_expr` (and its generic twin)
 /// pulls a fanning target itself rather than calling back into `eval_index_expr`, so the two
-/// cannot recurse into each other.
-pub(crate) fn index_target_runs_depth_first<S: EvalSemantics>(target: &Expr) -> bool {
+/// cannot recurse into each other; `each_as`/`each_as_pattern` never call back into the eager
+/// `eval_as`/`eval_as_pattern`.
+pub(crate) fn generator_runs_depth_first<S: EvalSemantics>(target: &Expr) -> bool {
     S::TAG == EvalTag::Jq
         && S::PIPE_EFFECTS_RUN_DEPTH_FIRST
         && !yields_at_most_one_value(target)
         && !streams_unbounded(target)
         && stage_may_have_effect(target)
+}
+
+/// An eager construct's [`generator_runs_depth_first`] route: its demand-driven twin, run by
+/// `drive` through a sink that collects every output, as the eager result. An output that cannot
+/// be decoded ends the run with its error after the outputs before it, and an escape keeps the
+/// outputs already produced ([`partial`]), as the eager fold does. Out of line, so that its
+/// locals stay out of the frame of `eval_single`, which recurses once per nesting level.
+#[inline(never)]
+fn collect_depth_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    drive: impl FnOnce(&mut dyn FnMut(Item<'a, W>) -> Demand) -> Flow,
+) -> QueryResult<'a, W> {
+    let mut outputs = Vec::new();
+    let mut conversion_error = None;
+    let flow = drive(&mut |item| match item.into_owned::<S>() {
+        Ok(item) => {
+            outputs.push(item);
+            Demand::Continue
+        }
+        Err(error) => stop_with_escape(&mut conversion_error, Control::Error(error)),
+    });
+    match resume_from_escape(conversion_error, flow) {
+        Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
+        Flow::Escaped(control) => partial(outputs, control),
+    }
 }
 
 /// The one definition of the four-step tail every indexing-like construct's
@@ -38391,6 +38437,112 @@ fn build_regex<S: EvalSemantics>(
     compiled
 }
 
+/// Whether `refusal` is one Oniguruma makes of a look-behind's body, in `tune_tree`.
+#[cfg(feature = "regex")]
+fn is_look_behind_refusal(refusal: &EvalError) -> bool {
+    let message = refusal.to_string();
+    message.ends_with("invalid pattern in look-behind") || message.ends_with("undefined error code")
+}
+
+/// The refusal jq makes of `pattern` before it judges its look-behinds, if any (#7844).
+///
+/// Oniguruma refuses a look-behind's body in `tune_tree`, once it has parsed the whole pattern and
+/// checked its backreferences (`check_backrefs`) and calls (`tune_call`), so every error those make,
+/// wherever it stands, comes first: `\1(?<=(?=a))` is `invalid backref number/name` and
+/// `(?<=a(?=b)` is `end pattern with unmatched parenthesis`. The pattern is built again with each
+/// look-behind written as the look-ahead of the same sense, which parses as it does and has no
+/// such checks, and an error of that build is the one jq reports. The `regex` crate's own refusals
+/// are none of Oniguruma's, and leave the look-behind's.
+#[cfg(feature = "regex")]
+fn refusal_before_look_behinds<S: EvalSemantics>(
+    pattern: &str,
+    flags: Option<&str>,
+) -> Option<EvalError> {
+    let ahead = look_behinds_as_look_aheads(pattern)?;
+    let refusal = build_regex_uncached::<S>(&ahead, flags).err()?;
+    let message = refusal.to_string();
+    let own = ["regex parse error", "exceeds size limit", "not supported"];
+    (!is_look_behind_refusal(&refusal) && !own.iter().any(|own| message.contains(own)))
+        .then_some(refusal)
+}
+
+/// `pattern` with each look-behind opener (`(?<=`, `(?<!`) written as the look-ahead of the same
+/// sense (`(?=`, `(?!`), or `None` when it has none. An escaped character, a `\Q...\E` run, a
+/// `(?#...)` comment and a character class are passed over.
+#[cfg(feature = "regex")]
+fn look_behinds_as_look_aheads(pattern: &str) -> Option<String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = string_with_capacity(pattern.len());
+    let mut changed = false;
+    let mut class_depth = 0usize;
+    // Just after a class's `[` or `[^`, where a `]` is a member.
+    let mut class_start = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            if class_depth == 0 && chars.get(i + 1) == Some(&'Q') {
+                let mut j = i + 2;
+                while j < chars.len() && !(chars[j] == '\\' && chars.get(j + 1) == Some(&'E')) {
+                    j += 1;
+                }
+                let end = (j + 2).min(chars.len());
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+            let end = (i + 2).min(chars.len());
+            out.extend(&chars[i..end]);
+            class_start = false;
+            i = end;
+            continue;
+        }
+        if class_depth > 0 {
+            match c {
+                '[' => {
+                    class_depth += 1;
+                    class_start = true;
+                }
+                ']' if !class_start => class_depth -= 1,
+                '^' if class_start => {}
+                _ => class_start = false,
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match c {
+            '[' => {
+                class_depth = 1;
+                class_start = true;
+            }
+            '(' if chars.get(i + 1) == Some(&'?') && chars.get(i + 2) == Some(&'#') => {
+                let end = chars[i..]
+                    .iter()
+                    .position(|&c| c == ')')
+                    .map_or(chars.len(), |close| i + close + 1);
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+            '(' if chars.get(i + 1) == Some(&'?')
+                && chars.get(i + 2) == Some(&'<')
+                && matches!(chars.get(i + 3), Some('=' | '!')) =>
+            {
+                out.push_str("(?");
+                out.push(chars[i + 3]);
+                changed = true;
+                i += 4;
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
+        i += 1;
+    }
+    changed.then_some(out)
+}
+
 #[cfg(feature = "regex")]
 fn build_regex_uncached<S: EvalSemantics>(
     pattern: &str,
@@ -38585,6 +38737,11 @@ fn build_regex_uncached<S: EvalSemantics>(
     }
 
     if let Some(refusal) = deferred_refusal {
+        if S::TAG != EvalTag::Yq && is_look_behind_refusal(&refusal) {
+            if let Some(earlier) = refusal_before_look_behinds::<S>(source, flags) {
+                return Err(earlier);
+            }
+        }
         return Err(refusal);
     }
 
@@ -45360,24 +45517,12 @@ fn eval_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // with an effect before its last stage is run (#4293): collecting every output of `inputs`
     // before indexing the first read the whole input, so an index error named the end of the
     // input (`<unknown>`) and the inputs jq leaves for the main loop were gone.
-    if index_target_runs_depth_first::<S>(target) {
-        let mut outputs = Vec::new();
-        let mut conversion_error = None;
-        let flow = each_index_expr::<W, S>(target, key, value, optional, &mut |item| match item
-            .into_owned::<S>()
-        {
-            Ok(item) => {
-                outputs.push(item);
-                Demand::Continue
-            }
-            Err(error) => stop_with_escape(&mut conversion_error, Control::Error(error)),
-        });
+    if generator_runs_depth_first::<S>(target) {
         // Not `finish_fork_from_flow`: `.[k]?` covers the index step alone, which
         // `each_index_expr` has already applied, so a target's error is raised either way.
-        return match resume_from_escape(conversion_error, flow) {
-            Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
-            Flow::Escaped(control) => partial(outputs, control),
-        };
+        return collect_depth_first::<W, S>(|sink| {
+            each_index_expr::<W, S>(target, key, value, optional, sink)
+        });
     }
     let sum_or_merge = yq_sum_or_merge_read::<S>(target);
     // (3) Keys first: an empty key stream must not evaluate the target.
