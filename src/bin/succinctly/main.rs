@@ -2593,7 +2593,7 @@ pub fn main() -> Result<()> {
         }
     };
     let joined = child.join();
-    sigpipe::unblock_on_this_thread();
+    sigpipe::unblock_after_the_run();
     match joined {
         Ok(result) => result,
         Err(panic) => std::panic::resume_unwind(panic),
