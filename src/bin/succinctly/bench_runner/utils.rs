@@ -21,7 +21,7 @@ pub fn now_utc_fmt(format: &str) -> String {
 /// The current time in the system zone through a `strftime` format. UTC where the zone is
 /// unknown (Windows, or an unreadable system zone).
 pub fn now_local_fmt(format: &str) -> String {
-    jiff::Zoned::now().strftime(format).to_string()
+    jiff::ZonedDateTime::now().strftime(format).to_string()
 }
 
 /// Get CPU information for the current system.
