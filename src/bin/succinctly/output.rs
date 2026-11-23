@@ -573,17 +573,18 @@ impl JqStdout {
     /// What a failed write becomes. `Interrupted` is retried by the caller of `write`, and a closed pipe keeps its own
     /// handling (SIGPIPE on Unix, #5547; the `BrokenPipe` report elsewhere); anything else is jq's failed write.
     ///
-    /// A closed pipe is jq's failed write too when the process was started with SIGPIPE ignored (#7732): jq keeps
-    /// that disposition, so its write fails `EPIPE` and it reports `writing output failed: Broken pipe`, exit 2.
+    /// A closed pipe is jq's failed write too when the process was started with SIGPIPE ignored (#7732) or blocked
+    /// (#7857): jq keeps that disposition and that mask, so its write fails `EPIPE` and it reports `writing output
+    /// failed: Broken pipe`, exit 2.
     fn tag(e: std::io::Error) -> std::io::Error {
-        Self::tag_with(e, super::sigpipe::inherited_ignored())
+        Self::tag_with(e, super::sigpipe::closed_pipe_is_a_failed_write())
     }
 
-    /// [`Self::tag`] with the inherited disposition passed in, so a test can read both.
-    fn tag_with(e: std::io::Error, sigpipe_inherited_ignored: bool) -> std::io::Error {
+    /// [`Self::tag`] with what the process inherited passed in, so a test can read both.
+    fn tag_with(e: std::io::Error, closed_pipe_is_a_failed_write: bool) -> std::io::Error {
         match e.kind() {
             std::io::ErrorKind::Interrupted => return e,
-            std::io::ErrorKind::BrokenPipe if !sigpipe_inherited_ignored => return e,
+            std::io::ErrorKind::BrokenPipe if !closed_pipe_is_a_failed_write => return e,
             _ => {}
         }
         let text = e.to_string();
