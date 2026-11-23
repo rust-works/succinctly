@@ -8000,6 +8000,35 @@ Peak resident set size, in MiB, `--seq -c .` over 100 MiB of records (993,416 re
 The x86_64 figures are `/usr/bin/time -f %M` on `terminus` (at 10 MiB 33.2 and 10.3), the aarch64 ones `wait4`'s `ru_maxrss` on `johns-mac-mini` (at 10 MiB 32.9 and 5.8), medians of 3 interleaved with the base, release builds with `--features cli`, base `main` @ `650bf39ea`.
 The output, standard error included, and the exit status of every row are the base binary's, and the 100 plain files print what the one file of the same records prints.
 
+## Costs that still grow past jq's (#7848)
+
+Two costs that [#7483](https://github.com/rust-works/succinctly/issues/7483) and [#7789](https://github.com/rust-works/succinctly/issues/7789) cut are not yet down to jq's.
+The answers are jq's in both; only the time or the memory differs.
+
+### A recursion that binds a member of its state between two calls (#7483)
+
+Since #7483 a call to a `def`, a pipe a call leads, an `if` whose condition the value answers and the binding of a `$` parameter run on the value the program built, handed down, so a recursion that threads a state through its calls no longer writes the state out as JSON and indexes it again at each call (`def f($n): if $n == 0 then .a = 1 else f($n - 1) | f($n - 1) | .a += 1 end; {x: [range(k)]} | f(12)` takes the same time at every `k`, as in jq).
+An `as` whose source reads the state is not one of those forms (the owned evaluator's door, `src/jq/eval/owned_call.rs`, declines it), so a recursion that binds a member of its state between its two calls still re-indexes the whole state at every binding.
+`def f($n): if $n == 0 then .a = 1 else f($n - 1) | .a as $p | f($n - 1) | .a = $p + .a end; {x: [range(k)]} | f(12) | .a` prints `4096`, as jq 1.7.1 and 1.8.2 do, but its time grows linearly with `k`, the length of a member it never touches, where jq's stays flat.
+The answer of that shape is pinned by the third row of `tests/jq_cli/i7483.rs` (at depth 3), and the in-place route it misses by `def_call_recursion_writes_the_state_in_place_7483` in `src/jq/eval/owned_call.rs`; no test pins the cost of the binding.
+
+### `del(.. | f)` holds more memory than jq (#7789)
+
+Since #7789 a stage after a descent shares the path chain of the node it extends, the delete trie is smaller, and `delpaths([path(f)])` holds its paths once, so the programs below peak 17-51% lower than before, and `del(.. | .n?)` lower than jq on a deeply nested document.
+Over many small records they still peak above jq.
+Measured for PR [#7838](https://github.com/rust-works/succinctly/pull/7838) (release builds, interleaved with the commit before it, exclusive holds, outputs identical to jq 1.7.1's), over arrays of 22,500 to 501,000 small records (2, 18 and 45 MB), peak RSS against jq 1.7.1's on the same machine is:
+
+| program                                   | AMD Ryzen 9 7950X | Apple M4 Pro |
+|-------------------------------------------|------------------:|-------------:|
+| `del(.. \| .pad?) \| length`              |        1.53-1.64x |   1.86-1.91x |
+| `del(..\|strings) \| length`              |        1.53-1.64x |   1.59-1.64x |
+| `del(.. \| select(. == null)) \| length`  |        1.65-1.76x |   1.67-1.69x |
+| `delpaths([path(.. \| .pad?)]) \| length` |        1.22-1.35x |   1.05-1.08x |
+
+Over 300 chains of 120 nested objects `del(.. | .n?) | tojson | length` peaks at 0.60x jq 1.7.1's on the AMD Ryzen 9 7950X and 0.67x on the Apple M4 Pro, and `delpaths([path(.. | .n?)]) | tojson | length` at 2.29x and 1.66x.
+What is left is the size of a path: each distinct path node such a delete names is a `PathPrefix` of 112 bytes on a 64-bit target (its component is a 96-byte `Expr`), held with a node of the delete trie and its edges for as long as the document, and shrinking it needs a compact path-component type through the path resolver.
+The answers are pinned by `tests/jq_cli/i7789.rs`, and the sharing by the unit tests in `del_path_memory_tests_7789` (`src/jq/eval.rs`).
+
 ## Nesting depth (#5497)
 
 [#5497](https://github.com/rust-works/succinctly/issues/5497) decided each row under ADR-0018.
@@ -9669,6 +9698,9 @@ Three differences remain, none of which aborts the process:
   Since [#7787](https://github.com/rust-works/succinctly/issues/7787) the question reads every form of the language by what it yields: an expression is run to its value first when a call to a def that may recurse sits on its spine (the expression itself, or what a parenthesis, a pipe, `//`, `first`, `try`, `label`, an `if`, an `as`, an object or a string interpolation holds), it yields at most one output, and it leaves nothing to run after that output but an `empty`, a `break` or an error with a constant message (so a `debug`, an `input` or a second output after it keeps the streaming route); at a pipe's head, as an operand of an arithmetic or comparison operator (when the other operand answers once too) or of `and`/`or` (when both operands hold such a call), as an `as` source or argument, and as an object's key or value or a string interpolation's part.
   Running such an expression first changes nothing jq shows: its effects all happen before its one output, as they do on the streaming route, and an error after it is raised after its output reaches the consumer.
   Two kinds of leaf are still refused at about 8,192 leaves where jq answers, because their output count depends on the values they read and running them first could run a generator further than a consumer that stops early would have: a filtered generator (`(1, 2) | select(. == 1)`, `.[] as $v | $v` over a one-element array, `tostream | select(...)`, `splits("x")? // 1`), and a destructuring bind with alternatives (`[1] as [$x] ?// $x | $x`), which a failure raised after the call has to be able to retry (jq retries it through `first`, `limit`, `try`, `label`, an object, `as`, `if` and the operators, and not through `last`, `[...]` or `reduce`).
+  A `foreach` whose source yields more than once is a generator leaf too (`(foreach (1, 2) as $x (0; . + $x))` yields `1` and `3`), and a tree recursion over it streams through its combiner: `def f($n): if $n <= 0 then (foreach (1, 2) as $x (0; . + $x)) else COMBINER end; first(0 | f(13)) | tojson | length` is refused with `f/1 exceeded maximum recursion depth` under `+`, `-`, `*` and a string interpolation, and already at depth 12 under `and`, an object (`{k: f($n - 1), v: f($n - 1)}`) and an `as` pair (`f($n - 1) as $x | f($n - 1) | [$x, .]`), where jq 1.7.1 and 1.8.2 answer (at depth 13: `4`, `4`, `98293`, `32765` and `8194` for `+`, `and`, the object, the `as` pair and the interpolation).
+  A `foreach` over a source that yields once (`(foreach (1) as $x (0; . + $x))`) answers under each of them, since #7787.
+  Since [#7846](https://github.com/rust-works/succinctly/issues/7846) the question an object's key or value or a string interpolation's part is asked runs before the part, so a part that streams holds no frame of the question's: from #7787 to #7846 it did, and the same recursion through a string interpolation over the parenthesised leaf was refused at depth 12, where the build before #7787 answered (pinned by `tests/jq_cli/i7846.rs` and `settling_part_tests_7846` in `src/jq/eval.rs` and `src/jq/eval_generic.rs`).
   The same question reaches a linear recursion's argument chain: a nested `def` closing over a bare parameter, or a helper `def` in the argument, whose link calls a builtin (`def h: n - 1 | select(true); ... f(h)`, `f(g(n))`) is run to its value where it is read, and answers 3,000 levels where it stopped at about 150; a link written inline (`f(n - 1 | select(true))`) keeps the demand-driven path described above.
   Two Rosetta Code programs the issue names still stop there, for other reasons not yet looked into: the cube-free primes (`out/1`, an `until` loop) and the Sudan function (lazy bare-parameter arguments nested in arguments).
 - **A recursively-built value can exceed `MAX_VALUE_TREE_DEPTH` (384) where jq has no such

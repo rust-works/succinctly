@@ -18,8 +18,21 @@
 //!
 //! Restored for the two query subcommands only. The benchmark orchestrator and the generators
 //! keep the ignored disposition they handle `EPIPE` under.
+//!
+//! The signal has to reach the thread that wrote (#7847). macOS raises a write's SIGPIPE on the
+//! process, not on the writing thread, and the kernel hands a process-wide signal to the first
+//! thread that does not block it: the main thread, which waits in `join` while the evaluation
+//! thread runs the query. The writer got `EPIPE` back and carried on, and when it ended the process
+//! itself (`process::exit` with the run's status) before the main thread was scheduled to act on
+//! the signal, the run exited normally: `debug` to a closed standard error now and then exited 0
+//! under load, where jq, which has one thread, dies of SIGPIPE before its write returns.
+//! [`block_on_main_thread`] blocks SIGPIPE on the main thread before it starts the evaluation
+//! thread and [`unblock_on_this_thread`] lifts it there, first thing, so the evaluation thread is
+//! the one the kernel picks and the write itself ends the process. Linux raises SIGPIPE on the
+//! writing thread already. A mask that already blocked SIGPIPE when the process started is left
+//! alone, so that run's writes fail `EPIPE` as jq's do.
 
-#![allow(unsafe_code)] // `signal(2)`, `sigaction(2)`, and one initialiser the loader runs before `main`
+#![allow(unsafe_code)] // `signal(2)`, `sigaction(2)`, `pthread_sigmask(3)`, and one initialiser the loader runs before `main`
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -87,5 +100,111 @@ pub fn restore_default() {
 pub fn restore_inherited() {
     if !inherited_ignored() {
         restore_default();
+    }
+}
+
+/// Whether [`block_on_main_thread`] blocked SIGPIPE, so [`unblock_on_this_thread`] lifts it again.
+#[cfg(unix)]
+static BLOCKED_ON_MAIN_THREAD: AtomicBool = AtomicBool::new(false);
+
+/// The set holding SIGPIPE alone.
+#[cfg(unix)]
+fn sigpipe_set() -> libc::sigset_t {
+    // SAFETY: `sigemptyset` initialises the set and `sigaddset` adds a valid signal number to it;
+    // all-zero bytes are a valid `sigset_t` to start from.
+    unsafe {
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGPIPE);
+        set
+    }
+}
+
+/// Block SIGPIPE on the calling thread, the main thread before it starts the evaluation thread, so
+/// that a write's SIGPIPE is handed to the thread that wrote (#7847, see the module docs). A no-op
+/// when the inherited mask already blocks it, and where there is no SIGPIPE (Windows). The thread it
+/// starts inherits the mask and calls [`unblock_on_this_thread`] first thing.
+pub fn block_on_main_thread() {
+    #[cfg(unix)]
+    {
+        let set = sigpipe_set();
+        // SAFETY: `pthread_sigmask` changes only the calling thread's mask and writes the old one
+        // into `old`, a valid `sigset_t`; `sigismember` reads it.
+        let newly_blocked = unsafe {
+            let mut old: libc::sigset_t = core::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) == 0
+                && libc::sigismember(&old, libc::SIGPIPE) == 0
+        };
+        BLOCKED_ON_MAIN_THREAD.store(newly_blocked, Ordering::Relaxed);
+    }
+}
+
+/// Lift [`block_on_main_thread`]'s block on the calling thread: the evaluation thread before it runs
+/// anything, and the main thread once that thread has ended or could not be started, before it
+/// writes. A no-op when nothing was blocked.
+pub fn unblock_on_this_thread() {
+    #[cfg(unix)]
+    if BLOCKED_ON_MAIN_THREAD.load(Ordering::Relaxed) {
+        let set = sigpipe_set();
+        // SAFETY: as in `block_on_main_thread`; no old mask is asked for.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, core::ptr::null_mut());
+        }
+    }
+}
+
+/// Whether SIGPIPE is blocked on the calling thread.
+#[cfg(all(test, unix))]
+fn blocked_on_this_thread() -> bool {
+    // SAFETY: a null new set only reads the calling thread's mask into `mask`.
+    unsafe {
+        let mut mask: libc::sigset_t = core::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, core::ptr::null(), &mut mask);
+        libc::sigismember(&mask, libc::SIGPIPE) == 1
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// #7847: the main thread blocks SIGPIPE, the thread it starts inherits the block and lifts it,
+    /// and the main thread lifts its own afterwards. A mask that already blocked SIGPIPE stays as it
+    /// was on both threads. Each half runs on a thread of its own, which stands in for the main
+    /// thread, so the test harness's threads keep their masks; one test, as both halves set the flag.
+    #[test]
+    fn the_main_thread_blocks_sigpipe_and_the_evaluation_thread_does_not_7847() {
+        /// The two threads' masks: the started thread's before and after it lifts the block, then
+        /// the starting thread's while it runs and once it has lifted its own.
+        fn masks() -> (bool, bool, bool, bool) {
+            block_on_main_thread();
+            let evaluation = std::thread::spawn(|| {
+                let inherited = blocked_on_this_thread();
+                unblock_on_this_thread();
+                (inherited, blocked_on_this_thread())
+            });
+            let (inherited, lifted) = evaluation.join().expect("joined");
+            let main_during = blocked_on_this_thread();
+            unblock_on_this_thread();
+            (inherited, lifted, main_during, blocked_on_this_thread())
+        }
+        let unblocked = std::thread::spawn(|| {
+            assert!(!blocked_on_this_thread());
+            masks()
+        });
+        assert_eq!(
+            unblocked.join().expect("joined"),
+            (true, false, true, false)
+        );
+        let already_blocked = std::thread::spawn(|| {
+            let set = sigpipe_set();
+            // SAFETY: as in `block_on_main_thread`, on this test's own thread.
+            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, core::ptr::null_mut()) };
+            masks()
+        });
+        assert_eq!(
+            already_blocked.join().expect("joined"),
+            (true, true, true, true)
+        );
     }
 }
