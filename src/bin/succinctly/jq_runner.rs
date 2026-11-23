@@ -14859,15 +14859,47 @@ fn stitch_json_file_seams_onto<'a>(
     let mut stitcher = SeamStitcher::default();
     for (index, raw) in raws.iter_mut().enumerate() {
         let carry = stitcher.take_carry(&mut seams[index]);
+        let own_from = carry.len();
         if !carry.is_empty() {
+            // #7750: the file goes on the end of the carry, which is the longer of the two when one
+            // value spans many files: only the file's own bytes are copied.
             // Exact, not amortized: a doubled capacity on a multi-gigabyte file is the cost.
-            raw.reserve_exact(carry.len());
-            raw.splice(0..0, carry);
+            let mut joined = carry;
+            joined.reserve_exact(raw.len());
+            joined.extend_from_slice(raw);
+            **raw = joined;
         }
+        let reader = stitcher.take_reader();
         if index < last {
-            if let Some(start) = open_tail_start(raw, resumes, seams[index].clone(), stream) {
-                let tail = raw.split_off(start);
+            // #7750: a value carried from the files before, which jq's parser has read up to this
+            // file, goes on with this file's own bytes only. A file it is still open at the end of is
+            // all tail, as `open_tail_start` finds it; one it closes or faults in is read whole by it,
+            // once, so each byte of a value spread over every file is read once in all, not again at
+            // every file boundary from the value's first byte.
+            let continued = reader.filter(|_| own_from > 0).and_then(|mut reader| {
+                (reader.read(raw, own_from) == jq::TailRead::Open).then_some(reader)
+            });
+            let tail = match continued {
+                Some(reader) => {
+                    let text: &[u8] = raw;
+                    debug_assert!(
+                        text.len() > 1 << 20
+                            || open_tail_start(text, resumes, seams[index].clone(), stream)
+                                == Some(0),
+                        "the reader of a carried value answers as a scan of the file from its front"
+                    );
+                    Some((0, Some(reader)))
+                }
+                None => open_tail_start_reading(raw, resumes, seams[index].clone(), stream),
+            };
+            if let Some((start, reader)) = tail {
+                let tail = if start == 0 {
+                    std::mem::take(&mut **raw)
+                } else {
+                    raw.split_off(start)
+                };
                 stitcher.move_tail(index, &mut seams[index], start, tail, raw, resumes);
+                stitcher.reader = reader;
             }
         }
     }
@@ -14883,9 +14915,19 @@ struct SeamStitcher {
     /// The files `carry` was cut from, front to back (#5936), each with the newlines in it ahead
     /// of its share: one file nearly always, more when an empty or all-tail file handed it on.
     carry_parts: Vec<SeamPart>,
+    /// jq's parser after reading `carry`, when that is one container or string still open
+    /// (#7750): the next file is read on from it, not from the value's first byte again.
+    reader: Option<jq::JqOpenTail>,
+    /// The windowed route's mark that `carry` is text it validated whole ([`window::Place`]).
+    carry_validated: bool,
 }
 
 impl SeamStitcher {
+    /// The reader of the carry [`take_carry`](Self::take_carry) handed out last, if it has one.
+    fn take_reader(&mut self) -> Option<jq::JqOpenTail> {
+        self.reader.take()
+    }
+
     /// The bytes to put on the front of the next file, whose seam records them: empty when the
     /// last file left none.
     fn take_carry(&mut self, seam: &mut Seam) -> Vec<u8> {
@@ -14972,6 +15014,17 @@ impl SeamStitcher {
 /// it ([`split_json_values_strict`]), since a fault the lenient splitter lets through moves
 /// where jq resumes. Without it, the first value the splitter refuses ends the search.
 fn open_tail_start(raw: &[u8], resumes: bool, seam: Seam, stream: bool) -> Option<usize> {
+    open_tail_start_reading(raw, resumes, seam, stream).map(|(start, _)| start)
+}
+
+/// [`open_tail_start`], and jq's parser after reading the tail when the tail is a container or string
+/// it holds open (#7750), for the next file to be read on from ([`SeamStitcher`]).
+fn open_tail_start_reading(
+    raw: &[u8],
+    resumes: bool,
+    seam: Seam,
+    stream: bool,
+) -> Option<(usize, Option<jq::JqOpenTail>)> {
     let mut faults = LineCounter::at_seam(raw, seam);
     let mut offset = 0;
     loop {
@@ -14992,8 +15045,8 @@ fn open_tail_start(raw: &[u8], resumes: bool, seam: Seam, stream: bool) -> Optio
             .0
             .last()
             .map(|&(start, end)| (offset + start, offset + end));
-        if let Some(start) = open_tail_after_split(raw, fault, last) {
-            return Some(start);
+        if let Some(tail) = open_tail_after_split_reading(raw, fault, last) {
+            return Some(tail);
         }
         // Whole, or malformed at a byte no later file can repair, after which jq resumes.
         let start = fault.filter(|_| resumes)?;
@@ -15011,14 +15064,21 @@ fn open_tail_start(raw: &[u8], resumes: bool, seam: Seam, stream: bool) -> Optio
 /// `None`), at the bare number or keyword at the very end, which only the next byte delimits. `last` is
 /// the span of the last value. Shared with the windowed route, which makes the same cut at the end of
 /// a file (#7024).
-fn open_tail_after_split(
+///
+/// #7750: with jq's parser after reading a container or string tail it holds open ([`tail_cut_off`]),
+/// for the next file to be read on from.
+fn open_tail_after_split_reading(
     raw: &[u8],
     fault: Option<usize>,
     last: Option<(usize, usize)>,
-) -> Option<usize> {
+) -> Option<(usize, Option<jq::JqOpenTail>)> {
     match fault {
-        Some(start) => token_runs_to_end(&raw[start..]).then_some(start),
-        None => bare_token_at_end(raw, last),
+        Some(start) => match tail_cut_off(&raw[start..]) {
+            TailCut::Malformed => None,
+            TailCut::Open(reader) => Some((start, Some(reader))),
+            TailCut::BareToken => Some((start, None)),
+        },
+        None => bare_token_at_end(raw, last).map(|start| (start, None)),
     }
 }
 
@@ -15033,7 +15093,50 @@ fn bare_token_at_end(raw: &[u8], last: Option<(usize, usize)>) -> Option<usize> 
 /// Whether `tail`, which starts at the first byte of a token the splitter could not finish,
 /// is cut off by the end of the file rather than malformed: an unclosed container or string,
 /// or a bare token with no byte after it to end it.
+///
+/// #7750: a container or string is cut off only if jq's parser, reading it, meets no fault before
+/// the end. The brackets and quotes alone cannot tell: in `[x"]` + `1\n2\n` the stray quote looks
+/// like a string the next file goes on with, but jq's parser stops at the `x`, drops the rest of its
+/// read and parses on from the next line of this file. Carried onto the next file, the fault and the
+/// values after it were read there, so `input_filename` named that file (#7751), a file that did not
+/// open between the two was met before the fault (#7753), and a program reading past the fault ran
+/// into the failure and stopped (#7750). The brackets are checked first, so only a text that ends
+/// inside a container or string pays for the parser, and it reads each byte once: the reader goes on
+/// with the next file's bytes from where it stopped ([`tail_cut_off`]).
 fn token_runs_to_end(tail: &[u8]) -> bool {
+    !matches!(tail_cut_off(tail), TailCut::Malformed)
+}
+
+/// How a token the splitter could not finish ends, by [`tail_cut_off`].
+enum TailCut {
+    /// Not cut off by the end of the file: malformed.
+    Malformed,
+    /// A container or string jq's parser holds open and has met no fault in, with the parser after
+    /// reading it.
+    Open(jq::JqOpenTail),
+    /// A bare token with no byte after it to end it.
+    BareToken,
+}
+
+/// [`token_runs_to_end`], with jq's parser after reading a container or string it holds open.
+fn tail_cut_off(tail: &[u8]) -> TailCut {
+    match tail.first() {
+        Some(b'{' | b'[' | b'"') => {
+            let mut reader = jq::JqOpenTail::new();
+            if reader.read(tail, 0) == jq::TailRead::Open {
+                TailCut::Open(reader)
+            } else {
+                TailCut::Malformed
+            }
+        }
+        _ if brackets_run_to_end(tail) => TailCut::BareToken,
+        _ => TailCut::Malformed,
+    }
+}
+
+/// [`token_runs_to_end`] by the brackets and quotes alone: a container or string still open by them,
+/// or a bare token with no boundary after it.
+fn brackets_run_to_end(tail: &[u8]) -> bool {
     match tail.first() {
         Some(b'{' | b'[') => {
             let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
@@ -29569,6 +29672,81 @@ mod tests {
             Some(8)
         );
         assert_eq!(open_tail_start(b"1 ]\n", false, Seam::NONE, false), None);
+    }
+
+    /// #7750: the stitch carries the parser that read a file's open tail on to the next file, and
+    /// reads only that file's own bytes with it. It must cut every file as the scan of each file from
+    /// its front (`open_tail_start` alone, the stitch before #7750) cuts it, over texts with and
+    /// without faults cut at random bytes into two to six files.
+    #[test]
+    fn stitch_reading_on_from_the_carry_cuts_as_a_scan_from_the_front_7750() {
+        fn from_scratch(raws: &mut [Vec<u8>], resumes: bool) -> Vec<Seam> {
+            let mut seams = vec![Seam::NONE; raws.len()];
+            let last = raws.len() - 1;
+            let mut stitcher = SeamStitcher::default();
+            for (index, raw) in raws.iter_mut().enumerate() {
+                let carry = stitcher.take_carry(&mut seams[index]);
+                if !carry.is_empty() {
+                    raw.splice(0..0, carry);
+                }
+                if index < last {
+                    if let Some(start) = open_tail_start(raw, resumes, seams[index].clone(), false)
+                    {
+                        let tail = raw.split_off(start);
+                        stitcher.move_tail(index, &mut seams[index], start, tail, raw, resumes);
+                    }
+                }
+            }
+            seams
+        }
+        let pieces: [&[u8]; 16] = [
+            b"[1,2,{\"a\":[3,\"s\\\"]\"]}]",
+            b"{\"k\":\"\\u00e9\\ud83d\\ude00 x\"}",
+            b"\"plain string with spaces\"",
+            b"[[[[]]]]",
+            b"12",
+            b"true",
+            b"\n",
+            b" ",
+            b"[x\"]",
+            b"{\"a\",",
+            b"{y",
+            b"\"a\tb\"",
+            b"[1 2]",
+            b"\"\\ud83dX\"",
+            b"}",
+            b"\"\xc3\xa9\xff\"",
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for _ in 0..4000 {
+            let mut text = Vec::new();
+            for _ in 0..=next(8) {
+                text.extend_from_slice(pieces[next(pieces.len())]);
+            }
+            let files = 2 + next(5);
+            let mut cuts: Vec<usize> = (1..files).map(|_| next(text.len() + 1)).collect();
+            cuts.sort_unstable();
+            let mut raws = Vec::new();
+            let mut from = 0;
+            for cut in cuts.into_iter().chain([text.len()]) {
+                raws.push(text[from..cut].to_vec());
+                from = cut;
+            }
+            for resumes in [false, true] {
+                let mut expected = raws.clone();
+                let want = from_scratch(&mut expected, resumes);
+                let mut got = raws.clone();
+                let seams = stitch_json_file_seams(got.iter_mut(), resumes, false);
+                assert_eq!(got, expected, "{text:?} cut as {raws:?}, resumes {resumes}");
+                assert_eq!(seams, want, "{text:?} cut as {raws:?}, resumes {resumes}");
+            }
+        }
     }
 
     /// #4305: what [`token_runs_to_end`] calls cut off by the end of the file.
