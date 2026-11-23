@@ -13121,7 +13121,9 @@ fn stream_branch_results<C: DocumentCursor + Copy>(
 /// diagnostic `run_jq` already gives it, exiting with yq's own error status;
 /// any other panic is re-raised unchanged.
 pub fn run_yq(args: YqCommand) -> Result<i32> {
-    super::sigpipe::restore_default();
+    // yq dies of SIGPIPE on a closed standard output or error whatever it inherited, a blocked
+    // mask included (#7732, #7857).
+    super::sigpipe::restore_default_on_this_thread();
     super::jq_runner::silence_depth_guard_panic_line();
     JSON_STREAM_TAIL_ERROR.with(|e| *e.borrow_mut() = None);
     // `-e` exits 1 for "no match" too, which says nothing about the stream's bad value.
