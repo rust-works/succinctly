@@ -5022,7 +5022,7 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 
         // #7859: an operand with an effect is negated as each value is read, as `E[K]` is (#7572).
         Expr::Negate(operand) if generator_runs_depth_first::<S>(operand) => {
-            collect_depth_first::<W, S>(|sink| each_negate::<W, S>(operand, value, optional, sink))
+            negate_depth_first::<W, S>(operand, value, optional)
         }
         Expr::Negate(operand) => eval_negate::<W, S>(operand, value, optional),
 
@@ -5044,9 +5044,9 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             cond,
             then_branch,
             else_branch,
-        } if generator_runs_depth_first::<S>(cond) => collect_depth_first::<W, S>(|sink| {
-            each_if::<W, S>(cond, then_branch, else_branch, value, optional, sink)
-        }),
+        } if generator_runs_depth_first::<S>(cond) => {
+            if_depth_first::<W, S>(cond, then_branch, else_branch, value, optional)
+        }
         Expr::If {
             cond,
             then_branch,
@@ -6512,6 +6512,35 @@ fn collect_depth_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Flow::Exhausted | Flow::Stopped { .. } => owned_vec_to_result(outputs),
         Flow::Escaped(control) => partial(outputs, control),
     }
+}
+
+/// `eval_single`'s [`generator_runs_depth_first`] route for `-E`: [`each_negate`], collected. A
+/// function of its own, as [`object_depth_first`] is, so that the closure and its captures are not
+/// slots of `eval_single`'s frame, which an unoptimised build pays at every level of a recursion.
+#[cold]
+#[inline(never)]
+fn negate_depth_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    operand: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    collect_depth_first::<W, S>(|sink| each_negate::<W, S>(operand, value, optional, sink))
+}
+
+/// `eval_single`'s [`generator_runs_depth_first`] route for `if`: [`each_if`], collected. Out of
+/// line for [`negate_depth_first`]'s reason.
+#[cold]
+#[inline(never)]
+fn if_depth_first<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    cond: &Expr,
+    then_branch: &Expr,
+    else_branch: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+) -> QueryResult<'a, W> {
+    collect_depth_first::<W, S>(|sink| {
+        each_if::<W, S>(cond, then_branch, else_branch, value, optional, sink)
+    })
 }
 
 /// Whether an object construction builds its objects depth-first (#7859): a key or value that
@@ -8609,11 +8638,12 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // #7859: `in(xs)` and `walk(f)` hand each output on as jq's definitions make it, when the
         // argument has an effect: `first(in(inputs))` and `first(walk(f))` stop reading input at
         // the first output, where the collecting builtins ran the argument to its end first.
-        Expr::Builtin(Builtin::In(xs)) if generator_runs_depth_first::<S>(xs) => {
-            each_in::<W, S>(xs, value, optional, sink)
-        }
-        Expr::Builtin(Builtin::Walk(f)) if generator_runs_depth_first::<S>(f) => {
-            each_walk::<W, S>(f, value, optional, sink)
+        // One arm and one call for the two: each arm is a slot and a call's arguments in this
+        // frame in an unoptimised build, at every level of a recursion.
+        Expr::Builtin(Builtin::In(arg) | Builtin::Walk(arg))
+            if generator_runs_depth_first::<S>(arg) =>
+        {
+            each_in_or_walk::<W, S>(expr, arg, value, optional, sink)
         }
         Expr::Builtin(Builtin::TruncateStream(f)) => {
             each_truncate_stream_of::<W, S>(f, value, optional, sink)
@@ -22903,6 +22933,23 @@ fn each_in<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     match control {
         Control::Error(e) if suppresses(&e, optional) => Flow::Exhausted,
         control => Flow::Escaped(control),
+    }
+}
+
+/// `eval_each`'s one call for `in(xs)` and `walk(f)` with an effect in the argument `arg`
+/// (#7859): [`each_walk`] for `walk`, [`each_in`] for `in`.
+#[inline(never)]
+fn each_in_or_walk<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    expr: &Expr,
+    arg: &Expr,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    if matches!(expr, Expr::Builtin(Builtin::Walk(_))) {
+        each_walk::<W, S>(arg, value, optional, sink)
+    } else {
+        each_in::<W, S>(arg, value, optional, sink)
     }
 }
 

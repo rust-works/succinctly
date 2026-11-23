@@ -19938,15 +19938,24 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // own: with a live input queue, an argument that reads `input`/
         // `inputs` still crosses to `eval.rs`, whose `Builtin::Inputs` arm
         // this module lacks (#1309).
+        //
+        // `any(cond)`/`all(cond)`/`isvalid(f)` (#2658, below) defer here too rather than from an
+        // arm of their own with this same guard and call: each such arm is a slot and a call's
+        // arguments in this frame in an unoptimised build, which every level of a recursion pays
+        // several times over (`r(12000; 7)` in `test_literal_dollar_argument_matches_jq_3260`).
         Expr::Builtin(
             Builtin::Skip(..)
             | Builtin::IsEmpty(_)
             | Builtin::AnyCond(..)
             | Builtin::AllCond(..)
             | Builtin::UpperIn(_)
-            | Builtin::UpperInSrc(..),
+            | Builtin::UpperInSrc(..)
+            | Builtin::AnyF(_)
+            | Builtin::AllF(_)
+            | Builtin::IsValid(_),
         ) if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) => {
             bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
+            // patchcov: coverage tolerate-line reason="the CLI evaluates every program that uses input/inputs on the eager route (jq_runner's can_use_lazy_path excludes them), so this guard never fires today; kept for the day the lazy path admits such a program (#1309)"
         }
         Expr::Builtin(Builtin::IsEmpty(inner)) => {
             each_isempty_generic::<S, V>(inner, value, optional, cursor, sink)
@@ -19972,13 +19981,7 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // `bridge_to_full_evaluator_flow`'s `O(2^N)` ambient copy on an
         // alias fan-out. The `any`/`all`/`isvalid` verdicts are one item, so
         // they answer through the collecting arm and push it; the loops
-        // stream. Same live-input-queue deferral as the arms above (#1309).
-        Expr::Builtin(Builtin::AnyF(_) | Builtin::AllF(_) | Builtin::IsValid(_))
-            if crate::jq::input_queue_is_active() && crate::jq::walk::uses_input_builtins(expr) =>
-        {
-            bridge_to_each_owned_flow::<S, V>(expr, value, cursor, optional, sink)
-            // patchcov: coverage tolerate-line reason="the CLI evaluates every program that uses input/inputs on the eager route (jq_runner's can_use_lazy_path excludes them), so this guard never fires today -- #2968's identical guards on the arms above are equally unfired; kept for the day the lazy path admits such a program (#1309)"
-        }
+        // stream. Same live-input-queue deferral as the arms above (#1309), taken in their arm.
         Expr::Builtin(Builtin::AnyF(cond)) if cursor.is_some() => drain_any_all_probe_generic::<V>(
             any_all_f_generic::<S, V>(cond, &value, optional, cursor.expect("guarded"), true),
             sink,
@@ -20325,13 +20328,17 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         //
         // #7859: `in(xs)` and `walk(f)` share it too, in a program with an effect somewhere, for an
         // argument with one, which `eval_each` streams (`each_in`, `each_walk`); any other goes on
-        // to the wildcard's route. Any other program goes there from this one read.
+        // to the wildcard's route. Any other program goes there from this one read. They share
+        // the arm, and its one call, for the reason `combinations` does: an arm of their own grew
+        // this frame by the call's arguments, seven times a level of that same `r(12000; 7)`,
+        // which the unoptimised arm64 build then refused some hundred levels short.
         Expr::Builtin(
-            Builtin::PathsFilter(_) | Builtin::Combinations | Builtin::CombinationsN(_),
-        ) => each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink),
-        Expr::Builtin(Builtin::In(_) | Builtin::Walk(_))
-            if crate::jq::eval::program_effects::may_have_effect() =>
-        {
+            Builtin::PathsFilter(_)
+            | Builtin::Combinations
+            | Builtin::CombinationsN(_)
+            | Builtin::In(_)
+            | Builtin::Walk(_),
+        ) if takes_paths_filter_dispatch(expr) => {
             each_paths_filter_dispatch::<S, V>(expr, value, cursor, optional, sink)
         }
 
@@ -31533,6 +31540,16 @@ fn each_paths_filter_generic<S: EvalSemantics, V: DocumentValue>(
         }
     }
     Flow::Exhausted
+}
+
+/// Whether `eval_each_generic` hands `expr`, one of the five builtins its arm names, to
+/// [`each_paths_filter_dispatch`]: always, but for `in(xs)` and `walk(f)` only in a program with
+/// an effect somewhere (#7859), from one thread-local read. Asked of `expr` itself: a binding in
+/// the arm's pattern is a slot of `eval_each_generic`'s frame in an unoptimised build.
+#[inline]
+fn takes_paths_filter_dispatch(expr: &Expr) -> bool {
+    !matches!(expr, Expr::Builtin(Builtin::In(_) | Builtin::Walk(_)))
+        || crate::jq::eval::program_effects::may_have_effect()
 }
 
 /// Which producer `paths(f)` takes in `eval_each_generic` (#1342): the walk
