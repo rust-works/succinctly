@@ -13,6 +13,7 @@
 
 mod categories;
 mod cli;
+mod core_limit;
 mod docs;
 mod env;
 mod exec;
@@ -344,6 +345,8 @@ fn repo_root() -> Result<PathBuf> {
 }
 
 pub fn run(args: CompareJqArgs) -> Result<i32> {
+    // Before anything is spawned: every child inherits the limit (#7891).
+    core_limit::apply();
     if args.render_docs {
         render_docs(&repo_root()?)?;
         return Ok(0);
