@@ -285,12 +285,39 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    const ROLE: &str = "COMPARE_ROBUST_ROLE";
+
+    /// A tool that dies on a signal that the kernel would dump: this test binary, re-run for the
+    /// test below with [`ROLE`] set, where it lowers its core limit as a run does and aborts. A
+    /// `sh -c 'kill -SEGV $$'` here handed a dump of the shell to a piped `core_pattern` handler
+    /// on every run of these tests (#7891).
+    #[cfg(unix)]
+    fn crashing_tool() -> Tool {
+        let me = super::super::core_limit::testing::rerun(
+            module_path!(),
+            "a_subject_crash_is_a_mismatch_and_is_classified",
+        );
+        Tool {
+            name: "crash".into(),
+            program: "env".into(),
+            prefix: [format!("{ROLE}=crash"), me.program]
+                .into_iter()
+                .chain(me.prefix)
+                .collect(),
+        }
+    }
+
     /// The gate must be able to fail on a crash the reference does not have.
+    #[cfg(unix)]
     #[test]
     fn a_subject_crash_is_a_mismatch_and_is_classified() {
+        if std::env::var(ROLE).as_deref() == Ok("crash") {
+            super::super::core_limit::testing::die_on_a_signal_without_a_dump();
+        }
         let probes = parse_probes("p\tx\t[]\t-\t-\n").unwrap();
         let ok = sh("echo 1");
-        let crash = sh("kill -SEGV $$");
+        let crash = crashing_tool();
         let rows = run(&ok, &crash, &probes, None, Path::new(".")).unwrap();
         assert!(!rows[0].matches);
         assert_eq!(
