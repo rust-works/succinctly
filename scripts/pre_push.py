@@ -50,6 +50,10 @@ LEDGER_PATHS = (
 )
 RUST_PATHS = ("*.rs", "Cargo.toml", "Cargo.lock", "rust-toolchain*", "clippy.toml", ".cargo/*")
 
+# What can leave `fuzz/Cargo.lock` or `bench-compare/Cargo.lock` behind its manifest (#7467): both
+# crates depend on the main crate by path, so its manifest counts as theirs.
+NESTED_LOCK_PATHS = ("Cargo.toml", "fuzz/Cargo.*", "bench-compare/Cargo.*")
+
 RELEASE_FEATURES = "cli,simd,regex,serde,bench-runner"  # comparison/jq/manifest.toml
 
 # What the CLI's `bench-runner` unit tests (`--lib cli::` since #7384) read or are: the `compare` and `bench_runner` modules
@@ -137,6 +141,17 @@ GATES = (
         ("./scripts/fmt-per-issue.sh",),
         (r"^\./scripts/fmt-per-issue\.sh$",),
         paths=("tests/*", "Cargo.toml", "scripts/fmt-per-issue.sh"),
+        cost=1,
+    ),
+    Gate(
+        "nested-locks",
+        "fast",
+        (
+            "cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null",
+            "cargo metadata --locked --format-version 1 --manifest-path bench-compare/Cargo.toml > /dev/null",
+        ),
+        (r"^cargo metadata --locked --format-version 1 --manifest-path (fuzz|bench-compare)/Cargo\.toml > /dev/null$",),
+        paths=NESTED_LOCK_PATHS,
         cost=1,
     ),
     Gate(
@@ -260,7 +275,7 @@ NOT_MIRRORED = (
 )
 
 PREFIXES = re.compile(
-    r"^(cargo (fmt|clippy|doc|check|test|build|bench)\b|python3 scripts/|\./?scripts/|\./target/release/succinctly)"
+    r"^(cargo (fmt|clippy|doc|check|test|build|bench|metadata)\b|python3 scripts/|\./?scripts/|\./target/release/succinctly)"
 )
 
 

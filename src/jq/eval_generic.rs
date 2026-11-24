@@ -21190,15 +21190,19 @@ fn each_def_call_generic<S: EvalSemantics, V: DocumentValue>(
         Ok(body) => body,
         Err(e) => return crate::jq::eval::def_call_failed(e),
     };
-    let Some(limit) = crate::jq::eval::def_call_floors() else {
-        return crate::jq::eval::def_output_refusal(def);
-    };
+    // #7893: unless the sink is the wrapper of the call that handed it on unchanged
+    // (`eval::DefOutputWatch::unchecked`). The watch is the wrapper's own field, so the two take
+    // the room in this frame that the wrapper alone took.
+    let unchecked = crate::jq::eval::DefOutputWatch::unchecked(def, sink);
     let mut checked = CheckedDefOutput {
         sink,
-        limit,
-        refused: false,
+        watch: crate::jq::eval::DefOutputWatch::idle(),
     };
-    let sink: &mut dyn Sink<V> = if crate::jq::tail_call::def_may_recurse(def) {
+    if !checked.watch.admits() {
+        return crate::jq::eval::def_output_refusal(def);
+    }
+    let sink: &mut dyn Sink<V> = if unchecked {
+        checked.watch.begin(&checked);
         &mut checked
     } else {
         &mut *checked.sink
@@ -21210,7 +21214,7 @@ fn each_def_call_generic<S: EvalSemantics, V: DocumentValue>(
         let _guard = crate::jq::eval::def_call_guard(frames, bound.is_hot());
         eval_each_generic::<S, V>(&body, value, optional, cursor, sink)
     };
-    if checked.refused {
+    if checked.watch.end() {
         return crate::jq::eval::def_output_refusal(def);
     }
     flow
@@ -21221,15 +21225,15 @@ fn each_def_call_generic<S: EvalSemantics, V: DocumentValue>(
 /// its budget included.
 struct CheckedDefOutput<'s, V: DocumentValue> {
     sink: &'s mut dyn Sink<V>,
-    /// `eval::def_call_floors`'s bound for the call.
-    limit: usize,
-    refused: bool,
+    /// The call's bound, and where a refused output is recorded
+    /// (`eval::DefOutputWatch::admits`, `refuse`).
+    watch: crate::jq::eval::DefOutputWatch,
 }
 
 impl<V: DocumentValue> Sink<V> for CheckedDefOutput<'_, V> {
     fn push(&mut self, item: GenericItem<V>) -> Demand {
-        if crate::jq::eval::output_past(self.limit) {
-            self.refused = true;
+        if crate::jq::eval::output_past(self.watch.limit.get()) {
+            self.watch.refuse();
             return Demand::Stop;
         }
         self.sink.push(item)

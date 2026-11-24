@@ -6173,7 +6173,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // substitution below takes the verdict of.
         let scans = reads_plain_json(&args).then(|| scan_sources(&raw_inputs));
         if let Some(scans) = &scans {
-            blank_nul_number_tails_in(raw_inputs.iter_mut(), Some(scans));
+            blank_nul_number_tails_in(raw_inputs.iter_mut(), Some(scans), false, false);
         }
         // #5291: jq skips a BOM at the start of its input, `--validate` included.
         let bom_cuts = strip_leading_json_bom(raw_inputs.iter_mut());
@@ -8567,10 +8567,26 @@ fn read_inputs(
     // #6115: `--seq` with `--stream` or `--stream-errors` reads with jq's streaming parser in its
     // record-sequence mode: the program reads the events a record produces, not its document.
     let seq_by_stream_reader = seq_by_stream_reader(args);
+    // #5498: plain `--stream`, under `-n`, reads the way `--stream-errors` does (jq's streaming
+    // parser, which carries a token over a file boundary itself) and raises each fault as the
+    // error jq raises; the rest of `--stream` keeps its own route for now.
+    // `-s` (#5498) reads the same way, whether or not the program reads `input`: the array holds
+    // the events, and the first fault is the error jq raises.
+    let stream_by_reader =
+        json_input_mode && args.stream && !args.stream_errors && (track_eof || args.slurp);
     // `--seq` keeps the mark: its reader removes it as jq's does, and reacts to one that breaks off.
     let bom_cuts = if json_input_mode {
-        if reads_plain_json(args) {
-            blank_nul_number_tails_in(raw_bytes.iter_mut().map(|(_, raw)| raw), None);
+        // #7897: not for the bytes jq's streaming parser reads here (`--stream-errors`, and
+        // `--stream` by the reader): it ends a number token at a NUL itself, a refill at a time
+        // (`jq_stream_errors::Parser::check_literal`), and the rewrite moves digits between the
+        // refills it reads, which differ once a fault has dropped the rest of one.
+        if reads_plain_json(args) && !args.stream_errors && !stream_by_reader {
+            blank_nul_number_tails_in(
+                raw_bytes.iter_mut().map(|(_, raw)| raw),
+                None,
+                track_eof,
+                args.stream,
+            );
         }
         // #5291: jq skips a BOM at the start of its input.
         strip_leading_json_bom(raw_bytes.iter_mut().map(|(_, raw)| raw))
@@ -8596,13 +8612,6 @@ fn read_inputs(
     // a file continues in the next one.
     // `--validate` is strict per file (an empty file is rejected too), so it reads the files as
     // written.
-    // #5498: plain `--stream`, under `-n`, reads the way `--stream-errors` does (jq's streaming
-    // parser, which carries a token over a file boundary itself) and raises each fault as the
-    // error jq raises; the rest of `--stream` keeps its own route for now.
-    // `-s` (#5498) reads the same way, whether or not the program reads `input`: the array holds
-    // the events, and the first fault is the error jq raises.
-    let stream_by_reader =
-        json_input_mode && args.stream && !args.stream_errors && (track_eof || args.slurp);
     // #5857: several files the lazy route may take, when every one is UTF-8 and `--validate` (strict
     // per file) is off. #6455: their stitch waits for the route to turn the stream down or hand its
     // rest to the eager reader, so a program that stops early does not scan every file but the last
@@ -12386,11 +12395,20 @@ pub(super) fn abort_if_out_of_memory(error: &std::io::Error) {
 /// next: a string or token open there is handed on, and only for a file whose first line holds a
 /// NUL is that line's start looked for in the files before it.
 ///
+/// What is handed on is what jq's parser still holds of the earlier files when it reaches this
+/// one, not all of their last line (#7897, [`open_tail_len_before`]): a fault drops the rest of the
+/// read it is met in, so `l 12` and then a file of a NUL and a newline are a fault and a second
+/// fault to an `input` that reads on, where rewriting `12` and the NUL as one number moved its last
+/// digit into the second file and gave out `2`. `resumes` and `stream` are what
+/// [`stitch_json_file_seams`] is called with for the same files.
+///
 /// `scans` are the sources' [`scan_sources`], when they were made: a source they say holds no NUL
 /// is not searched again.
 fn blank_nul_number_tails_in<'a>(
     raws: impl Iterator<Item = &'a mut Vec<u8>>,
     scans: Option<&[succinctly::jq::TextScan]>,
+    resumes: bool,
+    stream: bool,
 ) {
     let mut raws: Vec<&mut Vec<u8>> = raws.collect();
     let front = raws.iter().position(|raw| !raw.is_empty());
@@ -12428,6 +12446,18 @@ fn blank_nul_number_tails_in<'a>(
                     break;
                 }
             }
+            if !head.is_empty() {
+                // #7897: only the end of it that jq's parser still holds.
+                let mut held = open_tail_len_before(before, resumes, stream).min(head.len());
+                head.drain(..head.len() - held);
+                parts.retain_mut(|(index, from)| {
+                    let len = before[*index].len() - *from;
+                    let take = len.min(held);
+                    *from += len - take;
+                    held -= take;
+                    take > 0
+                });
+            }
         }
         let rewrote = succinctly::jq::blank_nul_number_tails(
             &mut raw[bom..],
@@ -12446,6 +12476,22 @@ fn blank_nul_number_tails_in<'a>(
             }
         }
     }
+}
+
+/// How many bytes at the end of the files `before` jq's parser still holds when it reaches the
+/// file after them (#7897): the token, string or container open there, which is what
+/// [`stitch_json_file_seams`] moves onto that file, so the answer is the stitch's own, over a copy.
+/// Nothing when the last file ends between values, and nothing when a fault dropped the rest of
+/// the read the open token is in (with `resumes`; without, the run ends at the fault).
+///
+/// Only for a file whose first line holds a NUL and goes on from the file before it
+/// ([`blank_nul_number_tails_in`]), where it costs a copy and a scan of the files before.
+fn open_tail_len_before(before: &[&mut Vec<u8>], resumes: bool, stream: bool) -> usize {
+    let mut copies: Vec<Vec<u8>> = before.iter().map(|raw| (**raw).clone()).collect();
+    copies.push(Vec::new());
+    strip_leading_json_bom(copies.iter_mut());
+    let seams = stitch_json_file_seams(copies.iter_mut(), resumes, stream);
+    seams.last().map_or(0, |seam| seam.base)
 }
 
 /// Each source validated as UTF-8 and searched for a NUL in one read of it (#7437,
@@ -25705,13 +25751,18 @@ mod tests {
     fn the_lone_file_gate_test_ignores_an_open_stdin_pipe_7746() {
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
+        // The other test's path is taken from this module's (libtest's names leave the crate out),
+        // and the child has to say that it ran one test: a name that matches nothing runs no test
+        // and exits 0, which would pass here without reading anything (#7896).
+        let module = module_path!();
+        let name = format!(
+            "{}::windowed_plain_file_takes_only_regular_files_big_enough_6920_7024",
+            module.split_once("::").map_or(module, |(_, rest)| rest)
+        );
         let mut child = Command::new(std::env::current_exe().expect("this test binary"))
-            .args([
-                "windowed_plain_file_takes_only_regular_files_big_enough_6920_7024",
-                "--test-threads=1",
-            ])
+            .args(["--exact", &name, "--test-threads=1"])
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("the test binary runs");
@@ -25730,7 +25781,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         let status = status.expect("the child read standard input and never returned");
-        assert!(status.success(), "{status}");
+        // A few lines, so the child was never held up writing them to a pipe nobody was reading.
+        let mut text = String::new();
+        let mut stdout = child.stdout.take().expect("the child's standard output");
+        std::io::Read::read_to_string(&mut stdout, &mut text).expect("the child's report");
+        assert!(status.success(), "{status}\n{text}");
+        assert!(
+            text.contains("running 1 test\n") && text.contains("test result: ok. 1 passed;"),
+            "the child did not run exactly one test under the name {name}:\n{text}"
+        );
     }
 
     /// #7262: a lone `--seq` file the whole-file route could not hold is that route's, which reports it before
