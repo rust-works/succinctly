@@ -114,6 +114,11 @@ jobs:
         [ -n "$log" ] || log="no link-order log"
         echo "$log"
         case "$log" in *ordered*) ;; *) echo "::warning::release binary linked without the function order: $log" ;; esac
+        # #7894: a warning, not a failure, at release time: ci.yml's perf-guard job is the gate. The
+        # bound is of the x86_64 Linux link (the macOS one never resolves the x86-only names).
+        if [ "${{ matrix.build }}" = linux-x64 ]; then
+          python3 scripts/link-order/generate.py stale "target/${{ matrix.target }}/release" || echo "::warning::scripts/link-order/symbols.txt is stale: regenerate it before a release (docs/guides/release.md)"
+        fi
 
     - name: Strip release binary (linux and macos)
       if: matrix.build != 'windows'

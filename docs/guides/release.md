@@ -49,6 +49,41 @@ cargo bench
 
 **Note**: For major releases, run full benchmark suite on all platforms. See [benchmarking.md](benchmarking.md#when-to-run-benchmarks) for details.
 
+#### Regenerate the link-order list (the last code change before the tag)
+
+`scripts/link-order/symbols.txt` is the order the release binary's functions are linked in (#7260): the functions a
+run executes come first, so they share pages.
+It holds function names, and every merge that renames, splits or adds a function on a hot path leaves that function
+outside the ordered block, where it keeps a page of the binary resident in every run that calls it (64 KB or a large
+folio on Linux).
+Over the 222 merges between two measurements of #7894 that cost a median 1.29 MB of peak RSS per small run on an AMD
+Ryzen 9 7950X.
+So regenerate the list as the **last code-affecting merge** before the release, in two passes, each from a release
+build made *inside* a tree at that commit (`cargo build --release --locked --features cli,simd,regex,serde`; cargo
+reads `.cargo/config.toml`, and with it the linker wrapper, from the working directory):
+
+```bash
+# 1. x86_64 Linux with valgrind (about a minute on 16 cores): the whole list
+python3 scripts/link-order/generate.py linux target/release/succinctly data/compare/inputs > linux.txt
+# 2. Apple silicon: add the NEON / aarch64 / Apple-only functions, which a Linux binary does not have
+python3 scripts/link-order/generate.py macos target/release/succinctly linux.txt > scripts/link-order/symbols.txt
+```
+
+- [ ] Keep the comment header of `symbols.txt` and update its commit and date.
+- [ ] Rebuild on both platforms and read `target/release/deps/succinctly-*.link-order.log`
+      (`N listed, M found, K symbols ordered`): the names not found should be the other platform's only.
+- [ ] `python3 scripts/link-order/generate.py stale target/release` passes.
+      CI's perf-guard job runs the same check on every PR and fails once more than 5% of the listed names no
+      longer resolve; a PR that trips it regenerates the list the same way.
+- [ ] Only then re-run the jq comparison whose figures the release quotes
+      ([reproducing-the-jq-comparison.md](reproducing-the-jq-comparison.md)), and the memory figures of
+      [docs/benchmarks/jq.md](../benchmarks/jq.md#memory) with the shipped feature list passed as `--subject`.
+      A list regenerated after the comparison changes where every hot function sits, so its timings would be of
+      another binary.
+
+The Linux pass traces what runs; the macOS pass does not (it adds every platform-named function the binary defines,
+#7826), and a list from the Linux pass alone would drop those names from the macOS binary's order.
+
 ### 2. Update Version
 
 Update the version in `Cargo.toml`:

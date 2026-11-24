@@ -3,8 +3,8 @@
 
     # Linux x86_64 with valgrind: the whole list, from a release binary built from this tree
     python3 scripts/link-order/generate.py linux target/release/succinctly data/compare/inputs > symbols.txt
-    # macOS: add the arm64/macOS-only functions the Linux trace cannot see
-    python3 scripts/link-order/generate.py macos target/release/succinctly data/compare/inputs symbols.txt > new.txt
+    # macOS: add the arm64/macOS-only functions the Linux trace cannot see (all of them: not a sample)
+    python3 scripts/link-order/generate.py macos target/release/succinctly symbols.txt > new.txt
 
 `linux` runs every row of `comparison/jq/queries/perf.tsv` at 1 MB (and two startup-only runs)
 under valgrind. The startup runs (`jq -n 1`, `jq .` on empty input) give the first block, in the
@@ -17,21 +17,32 @@ two dozen functions kept three or four large folios of text resident in every st
     # Add that 10 MB tail to an existing list without reordering it
     python3 scripts/link-order/generate.py extend target/release/succinctly data/compare/inputs symbols.txt > new.txt
 
-`macos` cannot trace (no valgrind, and lldb needs a debugging grant), so it samples instead: each
-run gets a fresh copy of the binary, whose pages are then in no cache, and `mincore()` at exit
-says which 16 KB pages of `__TEXT` it touched. Functions on touched pages whose names look
-platform-specific (NEON, aarch64, Apple) and are missing from the list are added: those after the
-startup marker if only the full rows touched them, before it if a startup run did.
+`macos` cannot trace (no valgrind, and lldb needs a debugging grant) and does not sample either: it
+adds EVERY function of BINARY whose name looks platform-specific (NEON, aarch64, Apple) and that the
+list lacks, at the end of the startup block, whether or not any run calls it (#7826). It used to read
+`mincore()` at exit from a fresh clone of the binary, to keep only the functions on touched pages;
+on macOS that reads every `__TEXT` page as resident in every run (XProtect scans a fresh clone on its
+first exec, and `MINCORE_REFERENCED` on the original reads the same), so it never kept less than
+all of them. The hot functions of the arm64 route that are not NEON kernels come from the Linux
+trace: their names are the same on both targets. It prints what it added on stderr.
 
 The list is demangled names (see link.py); a name that later stops existing is skipped at link time,
 so a stale list degrades gradually: functions new to the startup path land outside the hot block.
-`check BINARY symbols.txt [LIMIT]` (ci.yml's perf-guard job, x86_64) fails when a startup run executes
-more than LIMIT bytes (64 KB) of functions the list misses, or when BINARY was not linked in its order.
+Two checks (ci.yml's perf-guard job, x86_64) catch that:
+
+`check BINARY symbols.txt [LIMIT]` fails when a startup run executes more than LIMIT bytes (64 KB) of
+functions the list misses, or when BINARY was not linked in its order.
+
+`stale TARGET_DIR_OR_LOG [PERCENT]` reads the wrapper's `*.link-order.log` of a release build (the
+newest one under `target/release`) and fails when more than PERCENT of the listed names no longer
+resolve (default 5, see STALE_PERCENT). `check` alone missed #7894: over 222 merges the share
+went from 3.4% to 8.0% and every small run held 1.3 MB more of the binary resident on Linux, while
+the two startup runs `check` traces stayed inside its 64 KB.
 """
 import bisect
 import collections
 import concurrent.futures as cf
-import json
+import glob
 import os
 import re
 import subprocess
@@ -217,75 +228,25 @@ def extend(binary, inputs, listfile):
     return old + large_tail(binary, inputs, dem, {norm(l) for l in old if not l.startswith("#")})
 
 
-MINCORE_C = r"""
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/mman.h>
-#include <mach-o/dyld.h>
-#include <mach-o/loader.h>
-#include <unistd.h>
-__attribute__((destructor)) static void fin(void) {
-  const char *out = getenv("LINK_ORDER_MINCORE"); if (!out) return;
-  const struct mach_header_64 *h = 0; intptr_t slide = 0;
-  for (uint32_t k = 0; k < _dyld_image_count(); k++) {  /* image 0 can be this inserted library */
-    const struct mach_header_64 *c = (const void *)_dyld_get_image_header(k);
-    if (c->filetype == MH_EXECUTE) { h = c; slide = _dyld_get_image_vmaddr_slide(k); break; }
-  }
-  if (!h) return;
-  const struct load_command *lc = (const void *)(h + 1);
-  for (unsigned i = 0; i < h->ncmds; i++, lc = (const void *)((const char *)lc + lc->cmdsize)) {
-    const struct segment_command_64 *s = (const void *)lc;
-    if (lc->cmd != LC_SEGMENT_64 || __builtin_strcmp(s->segname, "__TEXT")) continue;
-    long ps = getpagesize(); size_t np = s->vmsize / ps; char *v = malloc(np);
-    if (mincore((void *)(s->vmaddr + slide), s->vmsize, v)) return;
-    FILE *o = fopen(out, "w"); fprintf(o, "%lx %ld ", (unsigned long)s->vmaddr, ps);
-    for (size_t j = 0; j < np; j++) fputc(v[j] & 1 ? '1' : '0', o);
-    fclose(o);
-  }
-}
-"""
-
 PLATFORM = re.compile(r"neon|aarch64|arm64|apple|darwin|macos", re.I)
 
 
-def macos(binary, inputs, listfile):
-    old = [l.rstrip("\n") for l in open(listfile)]
+def platform_names(demangled, have):
+    """The names in `demangled` that look platform-specific and that `have` (normalized) lacks, sorted."""
+    return sorted({d for d in demangled if PLATFORM.search(d) and norm(d) not in have})
+
+
+def macos(binary, listfile):
+    """`listfile` with every platform-named function of `binary` it lacks added at the end of the
+    startup block. Every one, not the ones a run touches: see the module docstring (#7826)."""
+    with open(listfile) as f:
+        old = [l.rstrip("\n") for l in f]
     have = {norm(l) for l in old if not l.startswith("#")}
-    syms = nm_pairs(binary)
-    with tempfile.TemporaryDirectory() as td:
-        lib = os.path.join(td, "mincore.dylib")
-        src = os.path.join(td, "mincore.c")
-        open(src, "w").write(MINCORE_C)
-        subprocess.run(["cc", "-O2", "-dynamiclib", "-o", lib, src], check=True)
-
-        def touched(run):
-            args, stdin = run
-            copy, rep = os.path.join(td, f"b{os.getpid()}"), os.path.join(td, "pages")
-            # A clone (APFS `cp -c`) shares the blocks but none of the cached pages, so what is
-            # resident at exit is what this run touched. A byte copy would leave every page cached.
-            subprocess.run(["cp", "-c", binary, copy], check=True)
-            env = dict(os.environ, DYLD_INSERT_LIBRARIES=lib, LINK_ORDER_MINCORE=rep)
-            with open(stdin or "/dev/null") as si:
-                subprocess.run([copy, "jq", *args], stdin=si, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, env=env)
-            vm, ps, bits = open(rep).read().split()
-            os.unlink(copy)
-            vm, ps = int(vm, 16), int(ps)
-            return {vm + i * ps for i, b in enumerate(bits) if b == "1"}, ps
-
-        def names(pages, ps):
-            return {s[3] for s in syms if PLATFORM.search(s[3]) and s[3] not in have
-                    and any((p <= s[0] < p + ps) or (s[0] <= p < s[0] + max(s[1], 1)) for p in pages)}
-
-        start = set()
-        for run in STARTUP:
-            start |= names(*touched(run))
-        rest = set()
-        for run in rows(inputs):
-            rest |= names(*touched(run))
-    rest -= start
+    add = platform_names([s[3] for s in nm_pairs(binary)], have)
+    print(f"macos: added {len(add)} platform-named functions: every one {os.path.basename(binary)} defines "
+          f"that the list lacks, called or not. This pass does not sample what runs (#7826).", file=sys.stderr)
     cut = old.index(MARK) if MARK in old else len(old)
-    return old[:cut] + sorted(start) + old[cut:cut + 1] + old[cut + 1:] + sorted(rest)
+    return old[:cut] + add + old[cut:]
 
 
 def check(binary, listfile, limit):
@@ -319,15 +280,73 @@ def check(binary, listfile, limit):
     return ok
 
 
+# The share of listed names that may stop resolving before `stale` fails, in percent. A fresh list is
+# not at 0: on x86_64 Linux the names the macOS pass added never resolve, nor do the few names of
+# functions that only another feature list has. #7894's history is the other end: 3.4% the day the
+# list was last generated, 4.9% fourteen merges later with the first measurable rise in peak RSS (about
+# 0.3 MB a small run on a Ryzen 9 7950X), 6.0% at 0.6 MB, 8.0% at 1.3 MB. So 5% is where the cost
+# starts to show, and leaves room for about thirty renamed or removed functions after a regeneration.
+STALE_PERCENT = 5.0
+LOG_COUNTS = re.compile(r"(\d+) listed, (\d+) found, (\d+) symbols ordered")
+
+
+def stale_share(log_text):
+    """(listed, found, percent of listed names that did not resolve) from a link-order log, or None
+    when the log says the link was plain."""
+    m = LOG_COUNTS.search(log_text)
+    if not m or int(m.group(1)) == 0:
+        return None
+    listed, found = int(m.group(1)), int(m.group(2))
+    return listed, found, 100.0 * (listed - found) / listed
+
+
+def newest_log(path):
+    """`path` if it is a file, else the newest link-order log of the `succinctly` binary under the
+    target profile directory `path` (cargo up to 1.99 links in `deps/`, 1.100 in `build/`)."""
+    if os.path.isfile(path):
+        return path
+    logs = (glob.glob(os.path.join(path, "deps", "succinctly*.link-order.log"))
+            + glob.glob(os.path.join(path, "build", "succinctly", "*", "out", "succinctly*.link-order.log")))
+    return max(logs, key=os.path.getmtime) if logs else None
+
+
+def stale(path, limit):
+    """Fail when more than `limit` percent of the listed names did not resolve in the newest link."""
+    log = newest_log(path)
+    if log is None:
+        print(f"no link-order log under {path}: the linker wrapper did not run for a release binary")
+        return False
+    with open(log) as f:
+        text = f.read().strip()
+    counts = stale_share(text)
+    if counts is None:
+        print(f"{log}: {text}\nthe link was not ordered, so the list could not be checked")
+        return False
+    listed, found, share = counts
+    print(f"link-order list: {listed} listed, {found} found, {listed - found} no longer resolve "
+          f"({share:.1f}%, limit {limit:g}%)")
+    if share > limit:
+        print("scripts/link-order/symbols.txt is stale: functions it names were renamed, split or removed, "
+              "and their replacements sit outside the ordered block, where each keeps a page resident "
+              "(64 KB or a large folio on Linux) in every run that calls it (#7894).\nRegenerate it: "
+              "`generate.py linux` on x86_64 Linux, then `generate.py macos` on Apple silicon "
+              "(docs/guides/release.md).")
+        return False
+    return True
+
+
 def main(argv):
     if len(argv) >= 3 and argv[0] == "linux":
         print("\n".join(linux(argv[1], argv[2])))
     elif len(argv) >= 4 and argv[0] == "extend":
         print("\n".join(extend(argv[1], argv[2], argv[3])))
-    elif len(argv) >= 4 and argv[0] == "macos":
-        print("\n".join(macos(argv[1], argv[2], argv[3])))
+    elif len(argv) >= 3 and argv[0] == "macos":
+        # `macos BINARY LIST`; the inputs directory the sampling pass took in between is ignored
+        print("\n".join(macos(argv[1], argv[-1])))
     elif len(argv) >= 3 and argv[0] == "check":
         sys.exit(0 if check(argv[1], argv[2], int(argv[3]) if len(argv) > 3 else 65536) else 1)
+    elif len(argv) >= 2 and argv[0] == "stale":
+        sys.exit(0 if stale(argv[1], float(argv[2]) if len(argv) > 2 else STALE_PERCENT) else 1)
     else:
         sys.exit(__doc__)
 
