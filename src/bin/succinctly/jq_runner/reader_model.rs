@@ -807,6 +807,11 @@ pub(crate) fn trace(route: &str, values: usize, faults: usize, refused: usize) {
 ///   space, `}`, `]` or `"`: a bare token may be open there.
 ///
 /// Reads the first three bytes of one source and the last byte of each: nothing per byte.
+fn seam_trigger_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SUCCINCTLY_READER_MODEL_SEAM").is_some_and(|v| v == "1"))
+}
+
 pub(crate) fn trigger<'s>(sources: impl Iterator<Item = &'s [u8]>, any_nul: bool) -> bool {
     if any_nul {
         return true;
@@ -827,7 +832,13 @@ pub(crate) fn trigger<'s>(sources: impl Iterator<Item = &'s [u8]>, any_nul: bool
                 // A source that ends on white space or on the closing byte of a string or
                 // container ends between tokens as far as one byte can say (`[1,{"a":1}` then
                 // `]` is certified wrongly: the splitter's own verdict would not be).
-                if !matches!(end, b'\n' | b' ' | b'\t' | b'\r' | b'}' | b']' | b'"') {
+                // Round 3: a seam alone is no trigger (the perf guard's `split*` rows are a
+                // well-formed document cut across files; a seam is an edge only with a NUL, a
+                // broken mark or a fault, and those have their own triggers). Set
+                // `SUCCINCTLY_READER_MODEL_SEAM=1` for round 2's token-byte seam trigger.
+                if seam_trigger_enabled()
+                    && !matches!(end, b'\n' | b' ' | b'\t' | b'\r' | b'}' | b']' | b'"')
+                {
                     return true;
                 }
             }
