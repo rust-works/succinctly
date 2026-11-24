@@ -19874,6 +19874,20 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
         anyhow::bail!("Invalid JSON: empty text");
     }
 
+    // #7881: first the one-pass reader of plain RFC 8259 text, as a `--slurpfile` file is read
+    // (#6110). It builds a value as the route below does and declines anything else (a leniency,
+    // a repeated key, a lone surrogate escape, `nan`, nesting past its own ceiling, an error),
+    // which that route then decides, so every refusal stays its own.
+    if let Some(value) = jq::parse_plain(s) {
+        return Ok(value);
+    }
+    parse_json_value_indexed(s)
+}
+
+/// [`parse_json_value`]'s route for a text the one-pass reader declines (#7881), and the one that
+/// decides every refusal: the validator in jq's accept-set, then the index and the checked
+/// materializer over the same text. `s` is the text without its BOM and surrounding white space.
+fn parse_json_value_indexed(s: &str) -> Result<OwnedValue> {
     // #6637: containers may nest as deep as jq's parse-depth ceiling, not the validator's default
     // of 128 (as `fromjson` reads them, #5688). jq counts an object as two entries of that
     // ceiling, so a text past the old default is also put to jq's own count.
@@ -30008,6 +30022,54 @@ mod tests {
             parse_json_value(r#"{"a":"\udc00"}"#).unwrap().to_json(),
             "{\"a\":\"\u{FFFD}\"}"
         );
+    }
+
+    /// #7881: plain text is read by the one-pass reader, which builds what the indexed route
+    /// builds for the same text; a text the reader declines gets the indexed route's answer, and
+    /// one that is not JSON is refused by it.
+    #[test]
+    fn parse_json_value_reads_plain_text_as_the_indexed_route_does_7881() {
+        for text in [
+            "0",
+            "-0",
+            "1.000",
+            "1e1000",
+            "-1E-400",
+            "100000000000000000000",
+            "0.10",
+            "1.5e300",
+            "true",
+            "null",
+            r#""a\u0000b""#,
+            r#""😀""#,
+            r#""é\n\"""#,
+            "[]",
+            "{}",
+            r#"[1.0,1.00,{"a":[true,false,null,"x"]}]"#,
+            r#"{"b":1,"a":{"c":[1.50,"\n"]}}"#,
+            r#"[{"id":1,"k":"v"},{"id":2,"k":"w"},{"k":"x","id":3.0}]"#,
+            "[ 1 ,\n2 ]",
+        ] {
+            let plain = jq::parse_plain(text).unwrap_or_else(|| panic!("declined {text:?}"));
+            let indexed = parse_json_value_indexed(text).unwrap();
+            assert_eq!(plain, indexed, "{text:?}");
+            assert_eq!(plain.to_json(), indexed.to_json(), "{text:?}");
+            let read = parse_json_value(&format!(" {text}\n")).unwrap();
+            assert_eq!(read.to_json(), indexed.to_json(), "{text:?}");
+        }
+        for (text, json) in [
+            ("007", "7"),
+            (r#"{"a":1,"a":2.0}"#, r#"{"a":2.0}"#),
+            (r#""\udc00""#, "\"\u{FFFD}\""),
+            ("[nan]", "[null]"),
+        ] {
+            assert!(jq::parse_plain(text).is_none(), "{text:?}");
+            assert_eq!(parse_json_value(text).unwrap().to_json(), json, "{text:?}");
+        }
+        for refused in ["[1,2", r#"{"a":1,}"#, "1 2", "nul", r#""\ud800""#, "[1]]"] {
+            assert!(jq::parse_plain(refused).is_none(), "{refused:?}");
+            assert!(parse_json_value(refused).is_err(), "{refused:?}");
+        }
     }
 
     /// #2012 regression guard: a lone *high* surrogate must stay rejected
