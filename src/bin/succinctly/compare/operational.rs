@@ -56,7 +56,8 @@ pub struct BuildTime {
 #[derive(Debug, Clone, Serialize)]
 pub struct Operational {
     pub binaries: Vec<BinaryInfo>,
-    /// Distinct crates in `cargo tree -e normal` for the shipped feature set.
+    /// Distinct crates in `cargo tree -e normal` for the manifest's feature set (not the release
+    /// archives' `cli` alone).
     pub rust_dependencies: Option<usize>,
     pub parallelism: Vec<Parallelism>,
     pub facts: Vec<Fact>,

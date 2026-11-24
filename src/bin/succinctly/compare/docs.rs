@@ -121,15 +121,55 @@ pub fn subject_note(is_harness: bool, features: &str, guide: &str) -> String {
     }
 }
 
-/// [`subject_note`] of a committed run. A run with no `subject_is_harness` measured the harness.
-pub fn subject_note_of(v: &Value, guide: &str) -> String {
+/// A report's "Reproduce" section down to its closing fence: the builds a run needs, then the
+/// command it ran. The harness is built with the features the run measured plus `bench-runner`,
+/// which holds the harness and which the recorded list leaves out: for a valid run those are the
+/// manifest's features, since a run whose build differs from the manifest is marked invalid.
+/// `--features bench-runner` alone, as this section used to say, builds without `simd` and is such
+/// a run. A `--subject` run also builds the subject, with the features it was given.
+pub fn reproduce_section(is_harness: bool, features: &str, command: &str) -> String {
+    let harness: Vec<&str> = features
+        .split(',')
+        .filter(|f| !f.is_empty() && *f != "bench-runner")
+        .chain(["bench-runner"])
+        .collect();
+    let mut s = format!(
+        "\n## Reproduce\n\n```bash\ncargo build --release --features {}\n",
+        harness.join(",")
+    );
+    if !is_harness {
+        s.push_str(&format!(
+            "cargo build --release --features {features} --target-dir target/subject\n"
+        ));
+    }
+    s.push_str(&format!("{command}\n```\n"));
+    s
+}
+
+/// The features a committed run recorded, comma-separated.
+fn features_of(v: &Value) -> String {
     let features: Vec<&str> = v["env"]["succinctly_features"]
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
+    features.join(",")
+}
+
+/// A report's count of Rust dependencies, as a sentence. The count is of the manifest's feature
+/// set (`operational::collect` is given it), which is not the release archives'
+/// [`RELEASE_FEATURES`] alone, so it is not called the shipped one.
+pub fn dependencies_note(count: Option<usize>) -> String {
+    format!(
+        "Rust dependencies of the manifest's feature set (`cargo tree -e normal`): {}.",
+        count.map_or_else(|| "n/a".into(), |n| n.to_string())
+    )
+}
+
+/// [`subject_note`] of a committed run. A run with no `subject_is_harness` measured the harness.
+pub fn subject_note_of(v: &Value, guide: &str) -> String {
     subject_note(
         v["env"]["subject_is_harness"].as_bool() != Some(false),
-        &features.join(","),
+        &features_of(v),
         guide,
     )
 }
@@ -975,6 +1015,56 @@ mod tests {
         assert!(SUBJECT_GUIDE_LINK.ends_with("#which-binary-a-run-measures)"));
     }
 
+    /// [`reproduce_section`] of a committed run, as `report::render` calls it with the run's
+    /// `env` and `command`. A run with no `subject_is_harness` measured the harness.
+    fn reproduce_section_of(v: &Value) -> String {
+        reproduce_section(
+            v["env"]["subject_is_harness"].as_bool() != Some(false),
+            &features_of(v),
+            v["command"].as_str().unwrap_or_default(),
+        )
+    }
+
+    /// The "Reproduce" section builds what the run measured: the features it recorded, which a
+    /// valid run shares with the manifest, plus `bench-runner` for the harness. `bench-runner`
+    /// alone has no `simd`, so the run it gives differs from the manifest and is marked invalid.
+    #[test]
+    fn the_reproduce_section_builds_the_measured_features() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (manifest, _) = super::super::manifest::Manifest::load(root).unwrap();
+        let features = manifest.succinctly.features.as_str();
+        assert!(features.split(',').any(|f| f == "simd"), "{features}");
+        assert_eq!(
+            reproduce_section(true, features, "./target/release/succinctly dev compare jq --full"),
+            format!(
+                "\n## Reproduce\n\n```bash\ncargo build --release --features {features},bench-runner\n\
+                 ./target/release/succinctly dev compare jq --full\n```\n"
+            )
+        );
+        assert_eq!(
+            reproduce_section(false, "cli", "C"),
+            "\n## Reproduce\n\n```bash\ncargo build --release --features cli,bench-runner\n\
+             cargo build --release --features cli --target-dir target/subject\nC\n```\n"
+        );
+        // Never `bench-runner` twice, and never an empty feature before it.
+        assert!(reproduce_section(true, "cli,bench-runner", "C")
+            .contains("--features cli,bench-runner\n"));
+        assert!(reproduce_section(true, "", "C").contains("--features bench-runner\nC\n"));
+        let mut v = perf_run();
+        assert_eq!(
+            reproduce_section_of(&v),
+            reproduce_section(true, "cli,simd", "succinctly dev compare jq --quick")
+        );
+        v["env"]["subject_is_harness"] = json!(false);
+        assert!(reproduce_section_of(&v).contains("--target-dir target/subject\n"));
+
+        assert_eq!(
+            dependencies_note(Some(52)),
+            "Rust dependencies of the manifest's feature set (`cargo tree -e normal`): 52."
+        );
+        assert!(dependencies_note(None).ends_with(": n/a."));
+    }
+
     /// A platform's committed report is written only by its own `--write-docs` run, so
     /// `--render-docs` cannot add a line to it: each must carry the line the report renderer
     /// gives its committed json (`report::render` writes the same call).
@@ -991,6 +1081,28 @@ mod tests {
                 subject_note_of(v, SUBJECT_GUIDE_PATH)
             );
             assert_eq!(report.matches(&line).count(), 1, "jq-{p}.md lacks:{line}");
+            // The build that section names is the one the run measured, not `bench-runner`
+            // alone; and the dependency count is not called the release's.
+            let reproduce = format!("\n{}\nmanifest sha256 `", reproduce_section_of(v));
+            assert_eq!(
+                report.matches(&reproduce).count(),
+                1,
+                "jq-{p}.md lacks:{reproduce}"
+            );
+            assert_eq!(report.matches("## Reproduce").count(), 1, "jq-{p}.md");
+            let count = v["operational"]["rust_dependencies"]
+                .as_u64()
+                .map(|n| n as usize);
+            let dependencies = format!(
+                "\nA ratio near 1.00 means one thread. {}",
+                dependencies_note(count)
+            );
+            assert_eq!(
+                report.matches(&dependencies).count(),
+                1,
+                "jq-{p}.md lacks:{dependencies}"
+            );
+            assert!(!report.contains("shipped feature set"), "jq-{p}.md");
         }
         let index_doc = std::fs::read_to_string(dir.join("jq.md")).unwrap();
         assert!(
