@@ -19942,7 +19942,8 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // `any(cond)`/`all(cond)`/`isvalid(f)` (#2658, below) defer here too rather than from an
         // arm of their own with this same guard and call: each such arm is a slot and a call's
         // arguments in this frame in an unoptimised build, which every level of a recursion pays
-        // several times over (`r(12000; 7)` in `test_literal_dollar_argument_matches_jq_3260`).
+        // several times over (the depth a recursion reaches is gauged by
+        // `recursion_depth_capacity_stays_above_its_floor`, `tests/jq_cli/i3260_depth_capacity.rs`).
         Expr::Builtin(
             Builtin::Skip(..)
             | Builtin::IsEmpty(_)
@@ -20097,7 +20098,8 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // "\(.name)"` copied every user record) to read one field of it. The arm keeps
         // its original shape, one call, and decides inside: this function is on every
         // recursion's path, and a second arm grew its debug frame past ADR-0025's floor
-        // (`test_literal_dollar_argument_matches_jq_3260`).
+        // (the 12,000-level row `test_literal_dollar_argument_matches_jq_3260` then had; the
+        // depth is now gauged by `recursion_depth_capacity_stays_above_its_floor`).
         Expr::StringInterpolation(parts)
             if S::TAG != EvalTag::Yq || interpolation_reads_by_navigation(parts, true) =>
         {
@@ -20323,15 +20325,17 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // consumer that stops after one row stops the walk, where the wildcard
         // below collected the whole product first (`first(combinations(20))`
         // on `[1,2]` built 2^20 rows). It shares this arm rather than taking
-        // one of its own, which grew this frame and took `r(12000; 7)` in
-        // `test_literal_dollar_argument_matches_jq_3260` past the depth limit.
+        // one of its own, which grew this frame and took the `r(12000; 7)` that
+        // `test_literal_dollar_argument_matches_jq_3260` then ran past the depth limit
+        // (`recursion_depth_capacity_stays_above_its_floor` gauges that depth now).
         //
         // #7859: `in(xs)` and `walk(f)` share it too, in a program with an effect somewhere, for an
         // argument with one, which `eval_each` streams (`each_in`, `each_walk`); any other goes on
         // to the wildcard's route. Any other program goes there from this one read. They share
         // the arm, and its one call, for the reason `combinations` does: an arm of their own grew
         // this frame by the call's arguments, seven times a level of that same `r(12000; 7)`,
-        // which the unoptimised arm64 build then refused some hundred levels short.
+        // which the unoptimised arm64 build then refused some hundred levels short (that test
+        // runs the row at 8,000 since, and pins the literal `$` arguments only).
         Expr::Builtin(
             Builtin::PathsFilter(_)
             | Builtin::Combinations
@@ -22161,7 +22165,7 @@ fn each_as_generic<S: EvalSemantics, V: DocumentValue>(
 /// Its own function, reached only from that empty branch, because
 /// [`each_as_generic`] sits in a recursive `def`'s frame once per `$` parameter
 /// and is measured against a native-stack budget with next to nothing to spare
-/// (`test_literal_dollar_argument_matches_jq_3260`): the retry's second fan-out
+/// (`recursion_depth_capacity_stays_above_its_floor`): the retry's second fan-out
 /// and its rewritten `Expr` must not be locals of that frame. A rewritten source
 /// is built from literals and constructors, so it yields owned values and never
 /// defers a bind.
@@ -30578,9 +30582,9 @@ fn is_pure_fusable_slice(slice: &Expr) -> bool {
 /// and then decline; the bounds come from the last stage, a postfix `?` looked through. `None` for
 /// any other shape. Out of line for the reason [`fused_slice_pipe_head`] gives: its result must not
 /// widen the native frames of the evaluator arms that ask (`eval_single`'s `IndexExpr` arm sits on
-/// the recursion path the stack-depth guard is calibrated against, and
-/// `test_literal_dollar_argument_matches_jq_3260` failed on ARM64 when a call here left a temporary
-/// in it).
+/// the recursion path the stack-depth guard is calibrated against, and the 12,000-level row
+/// `test_literal_dollar_argument_matches_jq_3260` then had failed on ARM64 when a call here left a
+/// temporary in it; `recursion_depth_capacity_stays_above_its_floor` gauges that depth now).
 #[inline(never)]
 fn navigated_literal_slice(expr: &Expr) -> Option<(&[Expr], Option<i64>, Option<i64>)> {
     let Expr::Pipe(stages) = expr else {
@@ -31587,9 +31591,10 @@ fn each_paths_filter_dispatch<S: EvalSemantics, V: DocumentValue>(
 
 /// [`each_paths_filter_generic`] collected, out of line so
 /// [`eval_builtin_in`]'s own native frame -- which ADR-0025's recursion floor
-/// is read against -- does not carry this arm's locals (the `r(12000; 7)` row of
-/// `test_literal_dollar_argument_matches_jq_3260` failed under coverage's fatter
-/// frames when they lived in the match).
+/// is read against -- does not carry this arm's locals (the `r(12000; 7)` row
+/// `test_literal_dollar_argument_matches_jq_3260` then had failed under coverage's
+/// fatter frames when they lived in the match; the depth a build reaches is gauged
+/// by `recursion_depth_capacity_stays_above_its_floor` now).
 #[inline(never)]
 fn collect_paths_filter_generic<S: EvalSemantics, V: DocumentValue>(
     filter: &Expr,

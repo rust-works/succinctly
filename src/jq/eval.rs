@@ -9441,8 +9441,9 @@ pub(crate) fn yq_as_source_scope<S: EvalSemantics>() -> Option<yq_read_only_cont
 ///
 /// Out of line on purpose: the `as` evaluators recurse once per `$`-parameter
 /// call, and the rewritten `Expr` and the second run's frame must not sit in
-/// theirs (`test_literal_dollar_argument_matches_jq_3260` pins a 12000-deep
-/// `def r($a; $b)` in a debug build).
+/// theirs: the depth a `def r($a; $b)` recursion reaches in a debug build is
+/// held above a floor by `recursion_depth_capacity_stays_above_its_floor`
+/// (`tests/jq_cli/i3260_depth_capacity.rs`).
 #[inline(never)]
 pub(crate) fn yq_as_source_retry<S: EvalSemantics, T>(
     expr: &Expr,
