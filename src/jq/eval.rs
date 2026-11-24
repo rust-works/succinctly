@@ -122231,17 +122231,61 @@ mod native_stack {
     /// stack may move. `(0, _)` is unregistered.
     pub(crate) type Budget = (usize, usize);
 
+    /// The lowest address a call may be entered from, and the lowest one of its outputs may be
+    /// handed on from.
+    pub(crate) type Floors = (usize, usize);
+
     thread_local! {
         static BUDGET: Cell<Budget> = const { Cell::new((0, 0)) };
+        /// `BUDGET` as the two addresses a `DefCall` arm compares with (`floors_of`), kept
+        /// beside it so that a call reads them instead of working them out (#7893); `(0, 0)`
+        /// when no stack is registered.
+        static FLOORS: Cell<Floors> = const { Cell::new((0, 0)) };
+        /// The address of the innermost live sink that checks a call's outputs against this
+        /// budget (`super::DefOutputWatch`, #7893); `0` is none.
+        static WATCHED_SINK: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn budget() -> Budget {
         BUDGET.with(Cell::get)
     }
 
-    /// Restores the previous budget on drop.
+    pub(crate) fn floors() -> Floors {
+        FLOORS.with(Cell::get)
+    }
+
+    /// The floor a descent stops at, the budget's reach below where it was registered, and the
+    /// bound of an output on its way up, a quarter of the registered stack below that (#7856).
+    /// Plain addresses, since the stack grows downward on every target the crate builds for
+    /// (ADR-0025); both `0`, which no frame lies below, when no stack is registered.
+    fn floors_of((origin, reach): Budget) -> Floors {
+        if origin == 0 {
+            (0, 0)
+        } else {
+            (
+                origin.saturating_sub(reach),
+                origin.saturating_sub(reach + reach / 2),
+            )
+        }
+    }
+
+    fn set_budget(budget: Budget) {
+        BUDGET.with(|b| b.set(budget));
+        FLOORS.with(|f| f.set(floors_of(budget)));
+    }
+
+    pub(crate) fn watched_sink() -> usize {
+        WATCHED_SINK.with(Cell::get)
+    }
+
+    /// Name `sink` the innermost watched sink, returning the one it replaces.
+    pub(crate) fn watch_sink(sink: usize) -> usize {
+        WATCHED_SINK.with(|w| w.replace(sink))
+    }
+
+    /// Restores the previous budget, and the sink that was watched under it, on drop.
     #[must_use]
-    pub(crate) struct Guard(Budget);
+    pub(crate) struct Guard(Budget, usize);
 
     /// Arm a budget of `reach` bytes from `here` for the caller's scope. A
     /// registration nested inside another never loosens it: the outer
@@ -122254,19 +122298,23 @@ mod native_stack {
         } else {
             outer_reach.saturating_sub(origin.abs_diff(here)).min(reach)
         };
-        let tighter = (here, left);
-        BUDGET.with(|b| b.set(tighter));
-        Guard(previous)
+        set_budget((here, left));
+        // A sink watched under the outer budget checks the outer bound, which is the looser
+        // one, so nothing in this scope may take it for its own (#7893).
+        Guard(previous, watch_sink(0))
     }
 
     /// Unregister the budget for the caller's scope (#7676); the guard restores it.
     pub(crate) fn lift() -> Guard {
-        Guard(BUDGET.with(|b| b.replace((0, 0))))
+        let previous = self::budget();
+        set_budget((0, 0));
+        Guard(previous, watch_sink(0))
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            BUDGET.with(|b| b.set(self.0));
+            set_budget(self.0);
+            watch_sink(self.1);
         }
     }
 }
@@ -122277,6 +122325,18 @@ mod native_stack {
 
     pub(crate) fn budget() -> Budget {
         (0, 0)
+    }
+
+    pub(crate) fn floors() -> (usize, usize) {
+        (0, 0)
+    }
+
+    pub(crate) fn watched_sink() -> usize {
+        0
+    }
+
+    pub(crate) fn watch_sink(_sink: usize) -> usize {
+        0
     }
 
     pub(crate) struct Guard;
@@ -122350,36 +122410,12 @@ pub(crate) fn native_stack_exhausted() -> bool {
     origin != 0 && origin.abs_diff(stack_address()) > reach
 }
 
-/// The floors a `DefCall` arm checks (#7856): `None` when the floor a recursion's descent stops at
-/// is spent (ADR-0025, what [`native_stack_exhausted`] asks), and otherwise the lowest stack
-/// address an output of the call may be handed on from ([`output_past`]), `0` on a thread that
-/// registered no stack.
-///
-/// A recursion's outputs climb back up through every level's consumer on top of the descent's
-/// frames, with no `DefCall` or `Shared` evaluated on the way: `{k: f($n - 1), v: (foreach (1, 2)
-/// as $x (0; . + $x))}` runs the object's value for each output of the call, from inside that
-/// call, so a recursion admitted at 9,000 levels spent the second half of the stack on the climb
-/// and aborted. The climb is checked a quarter of the stack further down than the floor, which a
-/// descent never reaches: a recursion that answered with room to spare still does, and the last
-/// quarter covers the bounded work one level's consumer may do (ADR-0025's list). The stack grows
-/// downward on every target the crate builds for (ADR-0025), so the address is a plain bound, read
-/// once per call: an output pays a compare.
-#[inline]
-pub(crate) fn def_call_floors() -> Option<usize> {
-    let (origin, reach) = native_stack::budget();
-    if origin == 0 {
-        return Some(0);
-    }
-    if origin.abs_diff(stack_address()) > reach {
-        return None;
-    }
-    Some(origin.saturating_sub(reach + reach / 2))
-}
-
-/// Whether the caller's frame lies below `limit`, the bound [`def_call_floors`] gave its call
+/// Whether the caller's frame lies below `limit`, the bound [`DefOutputWatch::admits`] gave its call
 /// (#7856): the address of a local, not a call, since it is asked for every output.
 #[inline(always)]
 pub(crate) fn output_past(limit: usize) -> bool {
+    #[cfg(all(test, feature = "std"))]
+    def_output_checks_tests_7893::count();
     let marker = 0u8;
     (core::hint::black_box(core::ptr::addr_of!(marker)) as usize) < limit
 }
@@ -122401,21 +122437,145 @@ pub(crate) fn def_output_refusal(def: &FuncDefData) -> Flow {
     Flow::Escaped(Control::Error(def_call_depth_refusal(def)))
 }
 
-/// `sink`, checking [`output_past`] against `limit` before each output of a call to a def that
-/// may recurse reaches it (#7856); `refused` is set when the check fails, and the caller turns the
-/// stop into [`def_output_refusal`] once the body has returned.
+/// `sink`, checking [`output_past`] against the call's bound before each output of a call to a
+/// def that may recurse reaches it (#7856). A check that fails stops the call and is recorded in
+/// `watch`, and the caller turns the stop into [`def_output_refusal`] once the body has returned
+/// ([`DefOutputWatch::end`]).
 #[inline(always)]
 pub(crate) fn checked_def_output<T>(
-    limit: usize,
-    refused: &mut bool,
+    watch: &DefOutputWatch,
     sink: &mut dyn FnMut(T) -> Demand,
     item: T,
 ) -> Demand {
-    if output_past(limit) {
-        *refused = true;
+    if output_past(watch.limit.get()) {
+        watch.refuse();
         return Demand::Stop;
     }
     sink(item)
+}
+
+/// The address of a sink, which names it while it is alive.
+///
+/// `#[inline]`, like every helper of [`DefOutputWatch`] below, and not `#[inline(always)]`: an
+/// unoptimised build then calls them, and their arguments and locals are in frames of their own.
+/// Inlined there, they added 224 bytes to the frame of each `DefCall` arm, which every level of a
+/// recursion pays for and which the unoptimised build's floor is within a few levels of (ADR-0025).
+#[inline]
+pub(crate) fn sink_address<T: ?Sized>(sink: &T) -> usize {
+    // Not `core::ptr::from_ref`, which is stable only since 1.76 (`clippy.toml`'s `msrv`).
+    core::ptr::addr_of!(*sink).cast::<()>() as usize
+}
+
+/// What a `DefCall` arm keeps for the floors it checks (#7856, #7893), in two words, because every
+/// level of a recursion pays for the arm's frame.
+///
+/// The first is the bound of the call's outputs ([`Self::admits`]). The second is nothing while
+/// the outputs go unwrapped; otherwise the sink that was watched before this call's wrapper took
+/// the name ([`Self::unchecked`]), which [`Self::end`] or a drop gives back, and whether an output
+/// was refused. The name therefore always belongs to a wrapper that is alive, a call that unwinds
+/// included, and a sink that is not a wrapper never has it.
+pub(crate) struct DefOutputWatch {
+    /// The lowest stack address an output of the call may be handed on from ([`output_past`]),
+    /// `0` on a thread that registered no stack.
+    pub(crate) limit: core::cell::Cell<usize>,
+    state: core::cell::Cell<usize>,
+}
+
+impl DefOutputWatch {
+    /// The low bits of `state`: a sink's address is a multiple of its alignment, a pointer's.
+    const WATCHING: usize = 1;
+    const REFUSED: usize = 2;
+
+    /// No bound and no wrapper yet.
+    #[inline]
+    pub(crate) const fn idle() -> Self {
+        Self {
+            limit: core::cell::Cell::new(0),
+            state: core::cell::Cell::new(0),
+        }
+    }
+
+    /// The floors a `DefCall` arm checks (#7856): `false` when the floor a recursion's descent
+    /// stops at is spent (ADR-0025, what [`native_stack_exhausted`] asks), and otherwise the bound
+    /// of the call's outputs is set.
+    ///
+    /// A recursion's outputs climb back up through every level's consumer on top of the descent's
+    /// frames, with no `DefCall` or `Shared` evaluated on the way: `{k: f($n - 1), v: (foreach (1,
+    /// 2) as $x (0; . + $x))}` runs the object's value for each output of the call, from inside
+    /// that call, so a recursion admitted at 9,000 levels spent the second half of the stack on
+    /// the climb and aborted. The climb is checked a quarter of the stack further down than the
+    /// floor, which a descent never reaches: a recursion that answered with room to spare still
+    /// does, and the last quarter covers the bounded work one level's consumer may do (ADR-0025's
+    /// list). The stack grows downward on every target the crate builds for (ADR-0025), so both
+    /// addresses are plain bounds, worked out when the budget is registered and read here
+    /// (`native_stack::floors`, #7893): an output pays a compare.
+    ///
+    /// The frame is the arm's own: this value is a local of it, and its address stands for where
+    /// the stack has got to, with no call to [`stack_address`].
+    #[inline]
+    pub(crate) fn admits(&self) -> bool {
+        let (descent, output) = native_stack::floors();
+        if sink_address(self) < descent {
+            return false;
+        }
+        self.limit.set(output);
+        true
+    }
+
+    /// Whether the outputs of a call to `def` need a check of their own before they reach `sink`,
+    /// and so a wrapper around it (#7856, #7893).
+    ///
+    /// No when the def cannot recurse, as before; and no when `sink` is itself the wrapper of the
+    /// innermost call that is being watched. That call handed its sink on unchanged, through a
+    /// `,`, the last stage of a pipe, a branch of an `if`, to this one, so an output of this call
+    /// reaches that wrapper straight from where it is produced and is checked there, against the
+    /// same bound and from the same depth of stack. Wrapping it again checked every output once
+    /// per level it climbed: `def f($n): if $n > 0 then f($n - 1), $n else $n end; [f(N)]` ran
+    /// N²/2 checks, each a call through one more wrapper, for N outputs (#7893). A consumer that
+    /// does work of its own for each output is a different sink, and the call it holds is wrapped
+    /// as before. (The same def threading its count through `.`, `(. - 1 | f), .`, also crossed
+    /// the owned evaluator's bridge at each level; `owned_call`'s doors for a `,` and for a pipe
+    /// ending in the call are what hand its sink on.)
+    #[inline]
+    pub(crate) fn unchecked<T: ?Sized>(def: &FuncDefData, sink: &T) -> bool {
+        super::tail_call::def_may_recurse(def) && native_stack::watched_sink() != sink_address(sink)
+    }
+
+    /// `wrapper` takes the name of this thread's innermost watched sink.
+    #[inline]
+    pub(crate) fn begin<T: ?Sized>(&self, wrapper: &T) {
+        let sink = sink_address(wrapper);
+        debug_assert_eq!(sink & (Self::WATCHING | Self::REFUSED), 0);
+        self.state
+            .set(native_stack::watch_sink(sink) | Self::WATCHING);
+    }
+
+    /// An output of the call was past the bound, and was not handed on.
+    #[inline]
+    pub(crate) fn refuse(&self) {
+        self.state.set(self.state.get() | Self::REFUSED);
+    }
+
+    /// The call's body has returned: the name goes back to the sink that had it, and the answer
+    /// is whether an output was refused.
+    #[inline]
+    pub(crate) fn end(&self) -> bool {
+        let state = self.state.get();
+        if state == 0 {
+            return false;
+        }
+        self.state.set(0);
+        native_stack::watch_sink(state & !(Self::WATCHING | Self::REFUSED));
+        state & Self::REFUSED != 0
+    }
+}
+
+impl Drop for DefOutputWatch {
+    #[inline]
+    fn drop(&mut self) {
+        // Only a call that unwinds gets here with the name still taken.
+        self.end();
+    }
 }
 
 /// #7856: the outputs of a recursion climb through every level's consumer, and the climb is
@@ -122525,6 +122685,310 @@ mod def_output_floor_tests_7856 {
                 assert!(refused > 1, "{shape}: answers at depth 1");
             }
         }
+    }
+}
+
+/// #7893: an output of a recursion is checked once on its way to a consumer, not once per level
+/// it climbs: the checks are counted, so the pin is the work and not a time.
+#[cfg(all(test, feature = "std"))]
+mod def_output_checks_tests_7893 {
+    use super::*;
+    use crate::jq::eval_generic::GenericResult;
+    use crate::jq::parse;
+    use crate::json::JsonIndex;
+    use std::cell::Cell;
+
+    const STACK: usize = 32 * 1024 * 1024;
+
+    thread_local! {
+        static CHECKS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// One more output checked against the stack ([`output_past`]).
+    pub(super) fn count() {
+        CHECKS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// What `program` answers over `null` on a thread with a registered stack, and how many
+    /// output checks the evaluation ran.
+    fn checks(program: &str, generic: bool) -> (Vec<String>, u64) {
+        let program = program.to_owned();
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(move || {
+                let expr = parse(&program).expect("parses");
+                let json = b"null";
+                let index = JsonIndex::build(json);
+                let root = index.root(json);
+                with_stack_budget(STACK, || {
+                    CHECKS.with(|c| c.set(0));
+                    let outputs = if generic {
+                        match crate::jq::eval_generic::eval(&expr, root.value()) {
+                            GenericResult::Error(e) => panic!("{program}: {}", e.message),
+                            other => other.collect_owned::<JqSemantics>(),
+                        }
+                    } else {
+                        match eval_full::<Vec<u64>, JqSemantics>(&expr, root) {
+                            QueryResult::Error(e) => panic!("{program}: {}", e.message),
+                            other => other.collect_owned_checked::<JqSemantics>(),
+                        }
+                    };
+                    let outputs = outputs
+                        .expect("decodes")
+                        .iter()
+                        .map(OwnedValue::to_json)
+                        .collect();
+                    (outputs, CHECKS.with(Cell::get))
+                })
+            })
+            .expect("spawns")
+            .join()
+            .expect("answers")
+    }
+
+    /// Recursions whose calls hand their sink on unchanged, so every output of every level goes
+    /// straight to the one consumer: the program for a depth, and how many outputs it has.
+    /// Answers as jq 1.7.1 and 1.8.2 give them.
+    fn handed_on(depth: u64) -> [(String, u64); 5] {
+        [
+            // The issue's: the def emits after its recursive call.
+            (
+                format!("def f: if . > 0 then (. - 1 | f), . else . end; [{depth} | f] | length"),
+                depth + 1,
+            ),
+            (
+                format!("def f($n): if $n > 0 then f($n - 1), $n else $n end; [f({depth})] | length"),
+                depth + 1,
+            ),
+            // Through a closure parameter. (Through a second def, `def f: def g: ...; g;`, the
+            // outer body ends in a call and runs as a tail loop, whose sink is its own.)
+            (
+                format!(
+                    "def f(g): if . > 0 then (. - 1 | f(g)), g else g end; [{depth} | f(.)] | length"
+                ),
+                depth + 1,
+            ),
+            // Emitting before the call, which was never slow.
+            (
+                format!("def f: if . > 0 then ., (. - 1 | f) else . end; [{depth} | f] | length"),
+                depth + 1,
+            ),
+            // A fold as the consumer.
+            (
+                format!(
+                    "def f: if . > 0 then (. - 1 | f), . else . end; \
+                     reduce ({depth} | f) as $x (0; . + 1)"
+                ),
+                depth + 1,
+            ),
+        ]
+    }
+
+    #[test]
+    fn an_output_handed_on_unchanged_is_checked_once_not_once_per_level_7893() {
+        const DEPTH: u64 = 100;
+        for (program, outputs) in handed_on(DEPTH) {
+            for generic in [false, true] {
+                let (answer, checks) = checks(&program, generic);
+                assert_eq!(answer, [outputs.to_string()], "{program}");
+                // At most a check for each output (a route that returns its outputs instead of
+                // pushing them checks none: they climb nothing). A call per level checking each
+                // again is DEPTH² / 2 = 5,000 checks.
+                assert!(
+                    checks <= 2 * outputs,
+                    "{program} (generic: {generic}): {checks} checks for {outputs} outputs"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tree_recursion_checks_each_output_once_7893() {
+        // 2^10 - 1 outputs, each from up to nine levels down.
+        let program =
+            "def t: if . > 0 then (. - 1 | t), (. - 1 | t), . else . end; [9 | t] | length";
+        for generic in [false, true] {
+            let (answer, checks) = checks(program, generic);
+            assert_eq!(answer, ["1023"]);
+            assert!(
+                (1022..=2 * 1023).contains(&checks),
+                "generic {generic}: {checks} checks"
+            );
+        }
+    }
+
+    /// A consumer between two levels is a sink of its own, so the call under it is wrapped as
+    /// before (#7856): the one output of the deepest level is checked at every level it climbs.
+    #[test]
+    fn an_output_climbing_through_a_consumer_is_checked_at_every_level_7893() {
+        const DEPTH: u64 = 100;
+        let program =
+            format!("def f($n): if $n <= 0 then 0 else {{k: f($n - 1)}} | .k end; f({DEPTH})");
+        for generic in [false, true] {
+            let (answer, checks) = checks(&program, generic);
+            assert_eq!(answer, ["0"]);
+            assert!(checks >= DEPTH, "generic {generic}: {checks} checks");
+        }
+    }
+
+    /// #7856's protection where a level's call is not wrapped: `g` hands its sink on to the `f` it
+    /// calls, so that `f` is checked by `g`'s wrapper, and the climb through the object of each
+    /// level is refused before it overflows the stack, on both evaluators. The same for a def that
+    /// emits after a call whose outputs climb through a consumer.
+    #[test]
+    fn a_climb_through_calls_that_are_not_wrapped_is_still_refused_7893() {
+        const HEAVY: &str = "foreach (1,2) as $x (.; . + $x) | foreach (1,2) as $y (.; . + $y) \
+                             | foreach (1,2) as $z (.; . + $z) | foreach (1,2) as $w (.; . + $w)";
+        let leaf = format!("(0 | {HEAVY})");
+        let shapes = [
+            (
+                format!(
+                    "def f($n): def g: f($n - 1); if $n <= 0 then {leaf} else {{k: g, v: {leaf}}} \
+                     end; first(f(N)) | length"
+                ),
+                "2",
+            ),
+            (
+                format!(
+                    "def f($n): if $n <= 0 then 0 else (f($n - 1) | {HEAVY}), 0 end; \
+                     first(f(N)) | . > 0"
+                ),
+                "true",
+            ),
+        ];
+        for (shape, want) in shapes {
+            for generic in [false, true] {
+                let owned = shape.clone();
+                let refused = std::thread::Builder::new()
+                    .stack_size(STACK)
+                    .spawn(move || {
+                        let mut depth = 1u32;
+                        loop {
+                            let program = owned.replace('N', &depth.to_string());
+                            let expr = parse(&program).expect("parses");
+                            let json = b"null";
+                            let index = JsonIndex::build(json);
+                            let root = index.root(json);
+                            let answer = with_stack_budget(STACK, || {
+                                let outputs = if generic {
+                                    match crate::jq::eval_generic::eval(&expr, root.value()) {
+                                        GenericResult::Error(e) => return Err(e.message),
+                                        other => other.collect_owned::<JqSemantics>(),
+                                    }
+                                } else {
+                                    match eval_full::<Vec<u64>, JqSemantics>(&expr, root) {
+                                        QueryResult::Error(e) => return Err(e.message),
+                                        other => other.collect_owned_checked::<JqSemantics>(),
+                                    }
+                                };
+                                Ok(outputs
+                                    .expect("decodes")
+                                    .iter()
+                                    .map(OwnedValue::to_json)
+                                    .collect::<Vec<_>>())
+                            });
+                            match answer {
+                                Ok(out) => assert_eq!(out, [want], "{program}"),
+                                Err(message) => {
+                                    assert!(
+                                        message.ends_with("exceeded maximum recursion depth"),
+                                        "{program}: {message}"
+                                    );
+                                    return depth;
+                                }
+                            }
+                            assert!(depth < 1_000_000, "never refused: {owned}");
+                            depth = (depth + 1).max(depth + depth / 33);
+                        }
+                    })
+                    .expect("spawns")
+                    .join()
+                    .expect("refuses instead of overflowing");
+                assert!(refused > 1, "{shape}: answers at depth 1");
+            }
+        }
+    }
+
+    /// The watched sink follows the calls that are live: a nested watch gives the name back when
+    /// it ends, an unwinding one included, and a budget registered inside another starts with
+    /// none, since its bound is the tighter one. A refusal is the watch's answer, once.
+    #[test]
+    fn the_watched_sink_is_restored_and_not_shared_across_budgets_7893() {
+        // Stand-ins for wrappers: only their addresses are read.
+        let slots = [0u64; 5];
+        let at = |i: usize| sink_address(&slots[i]);
+        assert_eq!(native_stack::watched_sink(), 0);
+        let idle = DefOutputWatch::idle();
+        assert!(!idle.end());
+        let outer = DefOutputWatch::idle();
+        outer.begin(&slots[0]);
+        assert_eq!(native_stack::watched_sink(), at(0));
+        {
+            let inner = DefOutputWatch::idle();
+            inner.begin(&slots[1]);
+            assert_eq!(native_stack::watched_sink(), at(1));
+            inner.refuse();
+            assert!(inner.end());
+            assert_eq!(native_stack::watched_sink(), at(0));
+            assert!(!inner.end());
+            let dropped = DefOutputWatch::idle();
+            dropped.begin(&slots[2]);
+            assert_eq!(native_stack::watched_sink(), at(2));
+        }
+        assert_eq!(native_stack::watched_sink(), at(0));
+        let unwound = std::panic::catch_unwind(|| {
+            let inner = DefOutputWatch::idle();
+            inner.begin(&slots[3]);
+            panic!("unwinds past a live watch");
+        });
+        assert!(unwound.is_err());
+        assert_eq!(native_stack::watched_sink(), at(0));
+        with_stack_budget(1 << 20, || {
+            assert_eq!(native_stack::watched_sink(), 0);
+            let nested = DefOutputWatch::idle();
+            nested.begin(&slots[4]);
+        });
+        assert_eq!(native_stack::watched_sink(), at(0));
+        assert!(!outer.end());
+        assert_eq!(native_stack::watched_sink(), 0);
+    }
+
+    /// The two addresses a call compares with are worked out when the budget is registered: its
+    /// reach below where it was registered, and three quarters of the registered stack below
+    /// it; none without a budget, and the outer ones again when a nested budget ends. The floor
+    /// of a descent is where [`native_stack_exhausted`] puts it.
+    #[test]
+    fn the_floors_follow_the_registered_budget_7893() {
+        /// The bound a call entered here is given, or `None` where it is refused.
+        fn bound() -> Option<usize> {
+            let watch = DefOutputWatch::idle();
+            watch.admits().then(|| watch.limit.get())
+        }
+        assert_eq!(native_stack::floors(), (0, 0));
+        assert_eq!(bound(), Some(0));
+        with_stack_budget(1 << 24, || {
+            let (origin, reach) = native_stack::budget();
+            let outer = native_stack::floors();
+            assert_eq!(outer, (origin - reach, origin - (reach + reach / 2)));
+            assert_eq!(bound(), Some(outer.1));
+            assert!(!native_stack_exhausted());
+            with_stack_budget(1 << 16, || {
+                let (origin, reach) = native_stack::budget();
+                let nested = native_stack::floors();
+                assert_eq!(nested, (origin - reach, origin - (reach + reach / 2)));
+                assert!(nested.0 > outer.0 && nested.1 > outer.1);
+            });
+            assert_eq!(native_stack::floors(), outer);
+            with_native_stack_floor_lifted(|| assert_eq!(native_stack::floors(), (0, 0)));
+            assert_eq!(native_stack::floors(), outer);
+            // A budget with no room left: the descent's floor is the frame it was registered
+            // from, and every call below it is refused, as `native_stack_exhausted` says.
+            with_stack_budget(0, || {
+                assert!(native_stack_exhausted());
+                assert_eq!(bound(), None);
+            });
+        });
+        assert_eq!(native_stack::floors(), (0, 0));
     }
 }
 
@@ -123649,7 +124113,7 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
 ) -> Flow {
     // #7856: an output of a call that may recurse climbs back through every level's consumer, so
-    // it checks the stack on its way out (`def_call_floors`). The wrapper's room is paid for in
+    // it checks the stack on its way out (`DefOutputWatch::admits`). The wrapper's room is paid for in
     // this frame, which every level of a recursion pays: the arm's error paths are out of line
     // (`def_call_failed`, `def_output_refusal`), and it checks the floor itself so that it holds
     // the call's guard, not a `Result` of one.
@@ -123657,13 +124121,16 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         Ok(body) => body,
         Err(e) => return def_call_failed(e),
     };
-    let Some(limit) = def_call_floors() else {
+    let watch = DefOutputWatch::idle();
+    if !watch.admits() {
         return def_output_refusal(def);
-    };
-    let mut refused = false;
+    }
+    // #7893: unless the sink is the wrapper of the call that handed it on unchanged, which checks
+    // this call's outputs too (`DefOutputWatch::unchecked`).
     let mut checked;
-    let sink: &mut dyn FnMut(Item<'a, W>) -> Demand = if super::tail_call::def_may_recurse(def) {
-        checked = |item| checked_def_output(limit, &mut refused, sink, item);
+    let sink: &mut dyn FnMut(Item<'a, W>) -> Demand = if DefOutputWatch::unchecked(def, sink) {
+        checked = |item| checked_def_output(&watch, sink, item);
+        watch.begin(&checked);
         &mut checked
     } else {
         sink
@@ -123682,7 +124149,7 @@ fn each_def_call<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         let _guard = def_call_guard(frames, bound.is_hot());
         eval_each::<W, S>(&body, value, optional, sink)
     };
-    if refused {
+    if watch.end() {
         return def_output_refusal(def);
     }
     flow
