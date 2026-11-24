@@ -684,52 +684,16 @@ DEFAULT_THRESHOLD = 5.0
 # entry was removed once the row read +0.0% / +0.0% on x86_64 / ARM64-Linux
 # against a merge-base that already included it (PR #4878's perf-guard logs).
 #
-# `users_yq_raw_test` (#5531) carries an override of the same one-off kind: the regex
-# builtins keep a pattern's compiled form instead of compiling it again for every input
-# line, and this row is a `test` over every line of the document (-59.4% ARM64-Linux /
-# -57.7% x86_64 against the PR's own merge-base, outputs byte-identical). Remove it once
-# `main` carries the change and the row reads ~0% against a merge-base that includes it.
-#
-# `users_yq_raw_slice` (#5675) carries an override of the same one-off kind: `write_json_body_jq`
-# copies a string's escape-free text whole instead of writing it a `char` at a time, and this row
-# writes the three lines of every `-R` document it slices (-5.0% x86_64 / -6.0% ARM64-Linux against
-# the PR's own merge-base, outputs byte-identical). Remove it once `main` carries the change and the
-# row reads ~0% against a merge-base that includes it.
-#
-# `arrays_map_iterate` (#6069) carries an override of the same one-off kind, but for a codegen
-# ripple rather than a change to the row's own work: `map(length) | .[]` runs no regex, and #6069
-# only adds a pattern rewrite to the regex builtins (`src/jq/onig_capture_loop.rs` and the
-# `RegexEngine::Rewritten` arms in `src/jq/eval.rs`). The row read -5.8% x86_64 / -0.0%
-# ARM64-Linux against the PR's own merge-base, so it is x86_64 instruction selection around the
-# changed code, not work the row stopped doing. Remove it once `main` carries #6069 and the row
-# reads ~0% against a merge-base that includes it.
-#
-# `users_del_select` / `users_del_bound_select` / `users_assign_scores` / `users_update_select`
-# (#6125) carry overrides of the same one-off kind: materializing a container of plain JSON reads
-# its own text in one pass instead of walking the cursor, and these write shapes materialize the
-# document they write into (-18.4% / -17.2% / -15.9% / -17.3% x86_64, -22.6% / -22.2% / -20.2% /
-# -21.7% ARM64-Linux against the PR's own merge-base, outputs byte-identical). Remove them once
-# `main` carries the change and the rows read ~0% against a merge-base that includes it.
-#
-# `users_yq_raw_slice` is raised again (10.0 to 90.0) for #6258: `.[0:3]` over each `-R` line is a
-# literal-bound slice of an owned string, which is now cut in place instead of written out as JSON,
-# indexed and decoded (-84.0% x86_64 / -82.4% ARM64-Linux against the PR's own merge-base, outputs
-# byte-identical). Lower it to 10.0 once `main` carries the change and the row reads ~0% against a
-# merge-base that includes it.
-#
-# `users_yq_del_select` (#6880) carries an override of the same one-off kind: the write's snapshot
-# of the document holds one empty tree for each subtree that says nothing instead of a node per node
-# of it, and the result's tree is not built over it, so this yq-mode write row does less work (-10.9%
-# x86_64 / -11.6% ARM64-Linux against the PR's own merge-base, outputs byte-identical). Remove it once
-# `main` carries the change and the row reads ~0% against a merge-base that includes it.
-#
-# `users_compact_latefail` (#7366) carries an override of the same one-off kind: its duplicated
-# last member is a repeat in an object below the document, which the canonical scan now records
-# and scans past, so the document is printed from its text around that object instead of being
-# re-rendered whole after the scan (-80.5% x86_64 / -76.7% ARM64-Linux against the PR's own
-# merge-base; outputs identical to jq 1.7.1's). The row then measures that route, not the full
-# scan and re-render its comment above names. Remove the override once `main` carries the change
-# and the row reads ~0% against a merge-base that includes it.
+# Nine rows carried overrides of the same one-off kind long after `main` had the changes they were
+# for (#7913): `users_yq_raw_test` 65.0 (#5531, the regex builtins keep a pattern's compiled form),
+# `users_yq_raw_slice` 90.0 (#5675's whole-run string writer, then #6258's in-place literal slice),
+# `arrays_map_iterate` 8.0 (#6069, an x86_64 codegen ripple), `users_del_select` /
+# `users_del_bound_select` / `users_assign_scores` / `users_update_select` 30.0 each (#6125, a plain
+# container read in one pass), `users_yq_del_select` 15.0 (#6880, the write's collapsed
+# presentation tree) and `users_compact_latefail` 85.0 (#7366, the text print around a nested
+# repeat). The entries were removed once every one of them read within 0.0% on x86_64 and
+# ARM64-Linux against a merge-base that already included its change (the perf-guard logs of PRs
+# #7911 and #7912).
 #
 # `seq_name_bad_last` (#6619) carries a TIGHTER threshold than the default (3.0 against 5.0), the one
 # override here that is not a loosening. #6594 (#6500) converts each record as the queue is read
@@ -763,16 +727,30 @@ QUERY_THRESHOLDS = {
     "doc_select_and_or": 2.0,
     "doc_and_def": 2.0,
     "wide_keys_unsorted": 10.0,
-    "users_yq_raw_test": 65.0,
-    "users_yq_raw_slice": 90.0,
-    "arrays_map_iterate": 8.0,
-    "users_del_select": 30.0,
-    "users_del_bound_select": 30.0,
-    "users_assign_scores": 30.0,
-    "users_update_select": 30.0,
-    "users_yq_del_select": 15.0,
-    "users_compact_latefail": 85.0,
 }
+
+# #7913: nine one-off entries above stayed for up to four weeks after `main` had their changes,
+# because nothing but a comment said they were one-off. Every entry above `DEFAULT_THRESHOLD` is
+# now named in exactly one of these: `ONE_OFF_UNTIL`, with the number of the pull request whose
+# change it covers, or `PERMANENT_LOOSE`. `scripts/test_perf_guard.py` fails once `main` is
+# `ONE_OFF_GRACE_MERGES` merges past that pull request's merge, which leaves the pull request's
+# own runs, the merge queue behind it and the follow-up that removes the entry room to pass.
+ONE_OFF_UNTIL = {}
+PERMANENT_LOOSE = frozenset({"wide_keys_unsorted"})
+ONE_OFF_GRACE_MERGES = 50
+
+
+def stale_one_offs(subjects, one_offs=None, grace=ONE_OFF_GRACE_MERGES):
+    """The rows of `one_offs` (row -> pull request number) whose pull request was merged `grace`
+    or more first-parent commits before HEAD. `subjects` is `git log --first-parent --format=%s`,
+    HEAD first; a pull request it does not hold (not merged yet, or a shallow clone) is not stale."""
+    one_offs = ONE_OFF_UNTIL if one_offs is None else one_offs
+    merged = {}
+    for age, subject in enumerate(subjects):
+        words = subject.split()
+        if words[:3] == ["Merge", "pull", "request"] and len(words) > 3:
+            merged.setdefault(words[3], age)
+    return sorted(row for row, pr in one_offs.items() if merged.get(f"#{pr}", -1) >= grace)
 
 # argparse wants a plain string for `epilog`; keeping it as a real constant
 # (not a slice of `__doc__`) means reflowing the module docstring above can
@@ -1403,8 +1381,9 @@ def failure_advice(baseline_binary: bool) -> str:
             "cannot help here and is rejected outright in this mode. If this is real and "
             "understood (new correctness work that genuinely costs more, or an "
             "optimization that genuinely costs less), add a QUERY_THRESHOLDS override "
-            "sized from this run's own measured drift, with a note to remove it once "
-            "main carries the change (see that dict's own comment for the procedure). "
+            "sized from this run's own measured drift, and name the row in ONE_OFF_UNTIL with "
+            "this pull request's number so it is removed once main carries the change (see "
+            "that dict's own comment for the procedure). "
             "If it's unexpected, that's exactly what this guard exists to catch -- see "
             "docs/guides/benchmarking.md for how to investigate."
         )

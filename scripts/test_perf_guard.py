@@ -16,6 +16,7 @@ import io
 import json
 import os
 import pathlib
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -602,6 +603,32 @@ class MeasuredPathTests(unittest.TestCase):
         self.assertEqual(name, "succinctly")
         self.assertTrue(is_link)
         self.assertEqual(target, os.path.abspath("some/relative/bin"))
+
+
+class OneOffOverrideTests(unittest.TestCase):
+    """#7913: a one-off override must not outlive the change it was added for."""
+
+    def test_every_loose_override_is_named_one_off_or_permanent(self):
+        loose = {row for row, t in perf_guard.QUERY_THRESHOLDS.items()
+                 if t > perf_guard.DEFAULT_THRESHOLD}
+        self.assertEqual(loose, set(perf_guard.ONE_OFF_UNTIL) | perf_guard.PERMANENT_LOOSE)
+        self.assertFalse(set(perf_guard.ONE_OFF_UNTIL) & perf_guard.PERMANENT_LOOSE)
+
+    def test_a_one_off_is_stale_only_past_the_grace(self):
+        subjects = ["Merge pull request #9 from o/b", "fix(jq): x (#7)", "Merge pull request #7 from o/a"]
+        for grace, stale in ((2, ["row"]), (3, [])):
+            self.assertEqual(perf_guard.stale_one_offs(subjects, {"row": 7, "new": 8}, grace), stale)
+
+    def test_no_one_off_override_outlived_its_pull_request(self):
+        try:
+            log = subprocess.run(
+                ["git", "-C", str(_SCRIPT_PATH.parent), "log", "--first-parent", "--format=%s", "HEAD"],
+                capture_output=True, text=True, check=True).stdout
+        except (OSError, subprocess.CalledProcessError):
+            self.skipTest("no git history here (an archive extract)")
+        self.assertEqual(
+            perf_guard.stale_one_offs(log.splitlines()), [],
+            "main carries these rows' changes: remove their QUERY_THRESHOLDS and ONE_OFF_UNTIL entries")
 
 
 if __name__ == "__main__":
