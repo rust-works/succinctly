@@ -109,6 +109,11 @@ HEAVY_TESTS=(
   per_issue::i5526::test_built_value_past_the_native_stack_floor_on_document_input_5526 # 17
   # #7856: about thirty runs, each climbing to three quarters of the debug thread's native stack.
   per_issue::i7856::a_recursion_climbing_through_an_object_refuses_instead_of_aborting_7856
+  # The depth-capacity gauge: about sixty runs, each to the floor of the debug thread's native stack or
+  # to the frame count. Listed for its build as much as its time (#7373, above): its floors are the
+  # unoptimised build's, which every `deep-recursion` leg is, and an `opt-level=1` build clears them
+  # by so much that a frame could grow there unseen.
+  per_issue::i3260_depth_capacity::recursion_depth_capacity_stays_above_its_floor
 )
 
 # What the `deep-recursion` leg runs, and every other leg skips.
