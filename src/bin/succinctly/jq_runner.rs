@@ -8213,7 +8213,7 @@ impl ModelRead {
 /// and the line, `usize::MAX` for a position with no file.
 fn model_place(source: u32, line: u64) -> (u32, usize) {
     if source == reader_model::NO_SOURCE {
-        (0, usize::MAX)
+        (NO_SOURCE, usize::MAX)
     } else {
         (source, usize::try_from(line).unwrap_or(usize::MAX - 1))
     }
@@ -10327,9 +10327,11 @@ fn read_inputs(
         // the array, the one that ended the stream included. Each names its file by the table
         // `locations` holds, so the array's location is one entry in that table.
         if resume_slurp_done {
+            // PROTOTYPE (reader model): an array returned after jq closed its last file has no
+            // file to name (`input_filename` is `null`), not the first one.
             let (src, line) = locations
                 .slurp_eof(slurp_eof_line)
-                .unwrap_or((0, UNKNOWN_LINE));
+                .unwrap_or((if use_model { NO_SOURCE } else { 0 }, UNKNOWN_LINE));
             let mut slurped_locations = InputLocations::new(locations.files().to_vec());
             slurped_locations.unopened_tail = locations.unopened_tail;
             // #6480: the faults go ahead of the array, the one at the end of the text included.
