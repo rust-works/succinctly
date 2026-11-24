@@ -123431,14 +123431,15 @@ pub(crate) const PROBED_ARG_OUTPUTS: usize = 32;
 /// route its reads take.
 #[inline(never)]
 fn classify_eager_arg(arg: &SharedArg, expr: &Expr) -> bool {
-    let mut walk = PureWalk::new(true);
+    let mut walk = PureWalk::counting();
     if single_valued_pure(expr, None, &mut walk).is_none() {
         return false;
     }
-    arg.set_eager_width(u8::try_from(walk.width).unwrap_or(u8::MAX));
-    let eager = walk.reads_eagerly();
+    let count = &walk.count;
+    arg.set_eager_width(u8::try_from(count.width).unwrap_or(u8::MAX));
+    let eager = count.reads_eagerly();
     if !eager {
-        arg.set_pure_route(walk.pure_route());
+        arg.set_pure_route(count.pure_route());
     }
     eager
 }
@@ -123463,11 +123464,94 @@ thread_local! {
 /// where a nested `Shared` counts by its own remembered answer and a `,` of
 /// constant-cost alternatives is admitted -- or an operand for [`settles_before_consumer`], which
 /// must be single-valued and walks into every `Shared`.
-pub(crate) struct PureWalk {
+///
+/// What only an argument's classification needs, the count of its outputs
+/// (#7870), is `count`: nothing for the settle analysis ([`NoCount`]), which
+/// runs at every evaluation of an operator over calls and whose walk is the
+/// one it was before the count existed, and [`EagerCount`] for [`is_eager_arg`],
+/// which runs once for each argument.
+pub(crate) struct PureWalk<C: ArgCount = NoCount> {
     budget: u32,
     for_eager_arg: bool,
-    /// For [`is_eager_arg`], a bound on the output count of what has been
-    /// walked: the product of every `,` and every argument read (#7870).
+    count: C,
+}
+
+impl PureWalk<NoCount> {
+    pub(crate) const fn new(for_eager_arg: bool) -> Self {
+        Self {
+            budget: SETTLE_ANALYSIS_BUDGET,
+            for_eager_arg,
+            count: NoCount,
+        }
+    }
+}
+
+impl PureWalk<EagerCount> {
+    /// The walk that classifies an argument for [`is_eager_arg`] and bounds
+    /// its output count (#7870).
+    const fn counting() -> Self {
+        Self {
+            budget: SETTLE_ANALYSIS_BUDGET,
+            for_eager_arg: true,
+            count: EagerCount {
+                width: 1,
+                max_nested: 0,
+                reads: 0,
+                all_nested_eager: true,
+                param_width: 1,
+                param_reads: 0,
+                recursive: false,
+            },
+        }
+    }
+}
+
+/// What [`single_valued_pure`] keeps of the outputs of what it walks (#7870).
+/// The defaults keep nothing and are the walk as it was: [`NoCount`] takes them
+/// all, so the settle analysis pays for no count. [`EagerCount`] overrides them.
+pub(crate) trait ArgCount: Sized {
+    /// A `,` of `alternatives` constant-cost alternatives was admitted.
+    #[inline(always)]
+    fn comma(&mut self, _alternatives: usize) {}
+
+    /// The argument `inner` is read inside the argument being walked: `None`
+    /// when that rules the walked argument out, by `inner`'s remembered answer.
+    #[inline(always)]
+    fn argument(&mut self, inner: &SharedArg) -> Option<bool> {
+        is_eager_arg(inner).then_some(false)
+    }
+
+    /// `def`'s parameter `name` is read in its body.
+    #[inline(always)]
+    fn parameter(&mut self, _def: &FuncDefData, _name: &str) {}
+
+    /// A definition that calls itself was walked.
+    #[inline(always)]
+    fn recursion(&mut self) {}
+
+    /// Walk a call to `def` with `args`: its arguments, then its body.
+    #[inline(always)]
+    fn def_call(
+        walk: &mut PureWalk<Self>,
+        def: &FuncDefData,
+        args: &[Expr],
+        within: Option<&FuncDefData>,
+    ) -> Option<bool> {
+        all_single_valued_pure(args, within, walk)?;
+        single_valued_pure(&def.body, Some(def), walk)?;
+        Some(true)
+    }
+}
+
+/// The settle analysis's [`ArgCount`]: none.
+pub(crate) struct NoCount;
+
+impl ArgCount for NoCount {}
+
+/// [`is_eager_arg`]'s [`ArgCount`]: a bound on the output count of the argument
+/// being walked, and what its route is decided from (#7870).
+pub(crate) struct EagerCount {
+    /// The product of every `,` and every argument read.
     width: u32,
     /// The widest argument read, by its own bound.
     max_nested: u32,
@@ -123484,54 +123568,10 @@ pub(crate) struct PureWalk {
     recursive: bool,
 }
 
-impl PureWalk {
-    pub(crate) const fn new(for_eager_arg: bool) -> Self {
-        Self {
-            budget: SETTLE_ANALYSIS_BUDGET,
-            for_eager_arg,
-            width: 1,
-            max_nested: 0,
-            reads: 0,
-            all_nested_eager: true,
-            param_width: 1,
-            param_reads: 0,
-            recursive: false,
-        }
-    }
-
-    /// Multiply the output-count bound by `by` (#7870).
+impl EagerCount {
+    /// Multiply the output-count bound by `by`.
     fn widen(&mut self, by: u32) {
         self.width = self.width.saturating_mul(by);
-    }
-
-    /// Count a read of the argument `inner` inside the argument being walked
-    /// (#7870): `None` when it is not pure, by its own remembered answer.
-    #[inline(never)]
-    fn read_argument(&mut self, inner: &SharedArg) -> Option<bool> {
-        let eager = is_eager_arg(inner);
-        if !eager && inner.pure_route().is_none() {
-            return None;
-        }
-        let width = u32::from(inner.eager_width());
-        self.widen(width);
-        self.max_nested = self.max_nested.max(width);
-        self.reads = self.reads.saturating_add(1);
-        self.all_nested_eager &= eager;
-        Some(false)
-    }
-
-    /// Count a read of `def`'s bare parameter `name` in its body, as a read of
-    /// the arguments of the call being walked (#7870). A `$` parameter's bare
-    /// name reads the one value bound for this run.
-    fn read_parameter(&mut self, def: &FuncDefData, name: &str) {
-        if def
-            .params
-            .iter()
-            .any(|p| !p.is_dollar() && p.name() == name)
-        {
-            self.widen(self.param_width);
-            self.reads = self.reads.saturating_add(self.param_reads);
-        }
     }
 
     /// Whether the walked argument may be read eagerly (#7870); see
@@ -123560,14 +123600,81 @@ impl PureWalk {
     }
 }
 
+impl ArgCount for EagerCount {
+    fn comma(&mut self, alternatives: usize) {
+        self.widen(u32::try_from(alternatives).unwrap_or(u32::MAX));
+    }
+
+    /// Count a read of the argument `inner`: `None` when it is not pure.
+    #[inline(never)]
+    fn argument(&mut self, inner: &SharedArg) -> Option<bool> {
+        let eager = is_eager_arg(inner);
+        if !eager && inner.pure_route().is_none() {
+            return None;
+        }
+        let width = u32::from(inner.eager_width());
+        self.widen(width);
+        self.max_nested = self.max_nested.max(width);
+        self.reads = self.reads.saturating_add(1);
+        self.all_nested_eager &= eager;
+        Some(false)
+    }
+
+    /// Count a read of `def`'s bare parameter `name` as a read of the arguments
+    /// of the call being walked. A `$` parameter's bare name reads the one
+    /// value bound for this run.
+    fn parameter(&mut self, def: &FuncDefData, name: &str) {
+        if def
+            .params
+            .iter()
+            .any(|p| !p.is_dollar() && p.name() == name)
+        {
+            self.widen(self.param_width);
+            self.reads = self.reads.saturating_add(self.param_reads);
+        }
+    }
+
+    fn recursion(&mut self) {
+        self.recursive = true;
+    }
+
+    /// The arguments yield their outputs where the body reads them, once for
+    /// each read: their count is taken aside for the walk of the body, which
+    /// counts it again at each bare parameter it names ([`Self::parameter`]). A
+    /// `$` parameter runs the body once for each output instead.
+    #[inline(never)]
+    fn def_call(
+        walk: &mut PureWalk<Self>,
+        def: &FuncDefData,
+        args: &[Expr],
+        within: Option<&FuncDefData>,
+    ) -> Option<bool> {
+        let c = &mut walk.count;
+        let outer = (c.width, c.reads, c.param_width, c.param_reads);
+        (c.width, c.reads) = (1, 0);
+        all_single_valued_pure(args, within, walk)?;
+        let c = &mut walk.count;
+        (c.param_width, c.param_reads) = (c.width, c.reads);
+        (c.width, c.reads) = (outer.0, outer.1);
+        if def.params.iter().any(Param::is_dollar) {
+            c.widen(c.param_width);
+            c.reads = c.reads.saturating_add(c.param_reads);
+        }
+        single_valued_pure(&def.body, Some(def), walk)?;
+        let c = &mut walk.count;
+        (c.param_width, c.param_reads) = (outer.2, outer.3);
+        Some(true)
+    }
+}
+
 /// [`settles_before_consumer`]'s and [`is_eager_arg`]'s analysis,
 /// within the raw body of `within` when given: `None` if `expr` is not
 /// recognised as single-valued and effect-free or the budget runs out,
 /// otherwise whether it calls a `def`.
-pub(crate) fn single_valued_pure(
+pub(crate) fn single_valued_pure<C: ArgCount>(
     expr: &Expr,
     within: Option<&FuncDefData>,
-    walk: &mut PureWalk,
+    walk: &mut PureWalk<C>,
 ) -> Option<bool> {
     walk.budget = walk.budget.checked_sub(1)?;
     #[cfg(test)]
@@ -123633,67 +123740,31 @@ pub(crate) fn single_valued_pure(
         Expr::As { expr, body, .. } => Some(sv(expr)? | sv(body)?),
         // An argument captured in the caller's scope: the definition being
         // analysed, if any, has no bearing on what it names.
-        Expr::Shared(inner) if walk.for_eager_arg => walk.read_argument(inner),
+        Expr::Shared(inner) if walk.for_eager_arg => walk.count.argument(inner),
         // Every alternative is evaluated when the argument is read, including
         // ones a `first`/`limit` consumer never asks for, so `,` is eager only
         // over alternatives that cost nothing to produce: `g(1, (27 | fib))`
         // must not run `fib` for a `first(n)` (#3287 review).
         Expr::Comma(items) if walk.for_eager_arg && items.iter().all(is_constant_cost) => {
-            walk.widen(u32::try_from(items.len()).unwrap_or(u32::MAX));
+            walk.count.comma(items.len());
             Some(false)
         }
         Expr::Shared(inner) => single_valued_pure(inner, None, walk),
-        Expr::DefCall { def, args, .. } if walk.for_eager_arg => {
-            eager_def_call_pure(def, args, within, walk)
-        }
-        Expr::DefCall { def, args, .. } => {
-            all_single_valued_pure(args, within, walk)?;
-            single_valued_pure(&def.body, Some(def), walk)?;
-            Some(true)
-        }
+        Expr::DefCall { def, args, .. } => C::def_call(walk, def, args, within),
         Expr::FuncCall { name, args, .. } => match within {
             Some(def) if args.is_empty() && def.params.iter().any(|p| p.name() == name) => {
-                if walk.for_eager_arg {
-                    walk.read_parameter(def, name);
-                }
+                walk.count.parameter(def, name);
                 Some(false)
             }
             Some(def) if *name == def.name && args.len() == def.params.len() => {
                 all_single_valued_pure(args, within, walk)?;
-                walk.recursive = true;
+                walk.count.recursion();
                 Some(true)
             }
             _ => None,
         },
         _ => None,
     }
-}
-
-/// [`single_valued_pure`]'s call arm for [`is_eager_arg`], which also bounds the
-/// call's output count (#7870). The arguments yield their outputs where the body
-/// reads them, once for each read: their count is taken aside for the walk of
-/// the body, which counts it again at each bare parameter it names
-/// ([`PureWalk::read_parameter`]). A `$` parameter runs the body once for each
-/// output instead.
-#[inline(never)]
-fn eager_def_call_pure(
-    def: &FuncDefData,
-    args: &[Expr],
-    within: Option<&FuncDefData>,
-    walk: &mut PureWalk,
-) -> Option<bool> {
-    let outer = (walk.width, walk.reads, walk.param_width, walk.param_reads);
-    (walk.width, walk.reads) = (1, 0);
-    all_single_valued_pure(args, within, walk)?;
-    (walk.param_width, walk.param_reads) = (walk.width, walk.reads);
-    (walk.width, walk.reads) = (outer.0, outer.1);
-    if def.params.iter().any(Param::is_dollar) {
-        walk.widen(walk.param_width);
-        walk.reads = walk.reads.saturating_add(walk.param_reads);
-    }
-    single_valued_pure(&def.body, Some(def), walk)?;
-    (walk.param_width, walk.param_reads) = (outer.2, outer.3);
-    Some(true)
 }
 
 /// Whether `expr` produces its one output in constant time, with no effect:
@@ -123710,10 +123781,10 @@ fn is_constant_cost(expr: &Expr) -> bool {
 
 /// [`single_valued_pure`] over every expression of `exprs`: `None` if any is
 /// not recognised, otherwise whether any calls a `def`.
-fn all_single_valued_pure(
+fn all_single_valued_pure<C: ArgCount>(
     exprs: &[Expr],
     within: Option<&FuncDefData>,
-    walk: &mut PureWalk,
+    walk: &mut PureWalk<C>,
 ) -> Option<bool> {
     let mut calls = false;
     for e in exprs {
