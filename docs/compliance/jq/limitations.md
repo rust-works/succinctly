@@ -417,6 +417,14 @@ That fault is met in the next file's first read, so it drops the rest of that re
 A column jq 1.7.1 reports later on such a line does not count the bytes its chunk hid, and `succinctly jq` counts them, as jq 1.8.2 does.
 Pinned by `tests/jq_cli/i7921.rs`, which holds the residual rows too.
 
+**A number with a NUL in a later file, read by `input` past a fault, is an error where both jq releases read it, when the files go to the windowed route ([#7904](https://github.com/rust-works/succinctly/issues/7904)).**
+Several files of 4 MiB or more between them are read a window at a time, and when the first of them is a large one that ends in a fault, a program that reads on past the fault (`[limit(3; repeat(try input catch .) | select(. != 1))]` under `-n`) takes the files after it through a reader that does not read a NUL glued to a number as #7437 above reads it.
+With a first file of 3,145,728 lines of `1` and then `l 1` and a newline, and a second file of `2`, a NUL, `x` and a newline, jq 1.7.1 and 1.8.2 give the fault and `2`, and `succinctly jq` gives the fault and `Invalid JSON text`.
+The family is wider than the issue's case: the number may sit in an array or an object (`[2`, a NUL, `x]` is `Invalid JSON text: expected ',' or ']', found '\0'` here and `[2]` in jq), on a later line of the file (`5` and then the same line give `5` and `Invalid JSON text` here, `5` and `2` in jq), or in a third file, after a second file small or large, and a value after it in the same read is lost with it (`2`, a NUL, `x`, a space and `7` is `2` and `7` in jq and the error alone here).
+No value is wrong: the error stands where jq has values, and with a small first file (followed by a large one or not), or the same bytes in one file, `succinctly jq` reads the number as jq does.
+In a 320,000-row differential of the input reader, 86 rows fall in this family, 65 of them on inputs where the two jq releases agree.
+It is left to a single model of jq's input reader that every route would consult, which is proposed and not decided; no test pins it.
+
 ## A `-f` program file with a NUL byte is refused, as jq 1.8.2 refuses it; jq 1.7.1 ends the program at the NUL (#7434)
 
 jq 1.7.1 hands a `-f` program file to its compiler as a C string, so the program ends at the first NUL byte and the rest of the file is dropped without a word: `.a\0| .b` runs `.a`, and `# c\0` followed by a newline and `.a` is a comment alone, which fails with `Top-level program not given`.
@@ -8634,6 +8642,7 @@ A refusal the `regex` crate's parser makes is given Oniguruma's message from the
 A repeat count past Oniguruma's 100000 (`x{100001}`, `x{1000,100001}`, `x{99999999}`) is `too big number for repeat range`, which the crate either compiled (and matched) or refused for its size; `x{,100001}` is answered, as in jq.
 Oniguruma reads the number after a `{` as it lexes, before it knows whether the brace is a repeat, so the count is refused wherever the brace stands (#6433): inside a look-around or an atomic group (`(?=a{100001})`), in a brace that never closes or holds more than digits (`x{100001`, `x{100001a}`, `x{1,100001 }`), and with nothing before it (`{100001}`).
 A brace in a class, a quoted run `\Q…\E`, a comment or a braced escape (`\x{100001}`) is no interval, nor is one whose number does not follow it at once (`{,100001}`, `{ 100001}`), and jq answers those.
+A brace in a group's, a reference's or a call's name is no interval to jq either, and is still read as one here (the second family of the next section).
 An error before the brace comes first, as Oniguruma reads in order (`{2,}{4294967296` is `target of repeat operator is not specified`), except one Oniguruma meets only at the end of the pattern or after reading it (an unclosed group, an undefined call), which the count comes before.
 A call `\g<n>` to a group the pattern does not have is `undefined group <n> reference` (`\g<+1>` too), and `\g<0>` or one that reaches before the first group (`\g<-1>`) is `never ending recursion`.
 Past a construct the crate cannot read but jq accepts (`(?'name'…)`, a reference to a group the pattern has, a second group of the same name), the pattern is read on for a later error (`(?<x>a)\k<x>(` is `end pattern with unmatched parenthesis`).
@@ -8646,7 +8655,8 @@ A refusal of a construct jq accepts (a call `\g<a>` to a group the pattern has, 
 Since the wider regex fuzz of [#7689](https://github.com/rust-works/succinctly/issues/7689) these are worded as in jq too: a reference or call with no name (`\k<`, `\k<>`, `\g<>`, `\k''`, `(?'`) is `group name is empty`; a sign after `(?` that opens no group (`(?}`, `(??`, `(?|`, `(?[`, `(? `) is `undefined group option`; a callout by name (`(*`) is `invalid callout pattern` when nothing follows, `invalid callout name` for a name that does not start with a letter or `_` or does not end in `)`, `[` or `{`, `end pattern in group` when it runs to the end, and `undefined callout name` for one jq does not have (jq's own, `(*FAIL)`, `(*MAX{2})` and the rest, are answered or refused as before); and an empty property name (`\p{}`) is `invalid character property name {}` where it stands.
 Errors now come in Oniguruma's order in three more places: a `)` that closes no group is refused where it stands (`)\` is `unmatched close parenthesis`, not `end pattern at escape`), a backreference to a group the pattern does not have is refused only after the rest of the pattern is read (`\2)` is `unmatched close parenthesis`, `\2\` is `end pattern at escape`), and the possessive scan's own refusal (`possessive quantifier is not supported`) never hides an error jq makes (`*+a` is `target of repeat operator is not specified`).
 Pinned by `tests/jq_cli/i7689_errors.rs`.
-Since [#7852](https://github.com/rust-works/succinctly/issues/7852) and [#7858](https://github.com/rust-works/succinctly/issues/7858) the order follows one rule, the order of Oniguruma's compile (`parse_and_tune`, `regcomp.c`): it parses the whole pattern, refusing each parse error where it stands, then refuses a backreference or a conditional to a group number the pattern does not have (`check_backrefs`), then a call to a group it does not have (`tune_call`), then a call that never ends, then a look-behind's body (`tune_tree`).
+Since [#7852](https://github.com/rust-works/succinctly/issues/7852) and [#7858](https://github.com/rust-works/succinctly/issues/7858) the order is meant to follow one rule, the order of Oniguruma's compile (`parse_and_tune`, `regcomp.c`): it parses the whole pattern, refusing each parse error where it stands, then refuses a backreference or a conditional to a group number the pattern does not have (`check_backrefs`), then a call to a group it does not have (`tune_call`), then a call that never ends, then a look-behind's body (`tune_tree`).
+It is the rule the scans that find these errors aim at, not one they keep for every pattern: each of them reads the pattern text with a scanner of its own, so where one reads a construct otherwise than Oniguruma two errors still come in another order or in other words (`\p{Foo}a{2,1}` and `\p{Foo}\k<m>` are `invalid character property name {Foo}` in jq 1.7.1 and 1.8.2, and `upper is smaller than lower in repeat range` and `undefined name <m> reference` here), the first family of the next section.
 A refusal of a later pass therefore waits for every error of the passes before it, wherever that stands: `(?:\1` is `end pattern with unmatched parenthesis`, `(?=\1){2}` and `(?=a)*[` are `target of repeat operator is invalid`, `\k<n>(?<n>a)` is `undefined name <n> reference` (a name is looked up among the groups opened before the reference), and `\g<-1>\g<n>` is `undefined name <n> reference`.
 A refusal of a later pass is checked by reading the pattern again with the constructs that pass refuses written as ones that parse the same way (a missing group's `\1` as an empty group, a look-behind as a look-ahead), so only a refused pattern pays for it.
 A reference after or inside a look-around, an atomic group, an absent operator, a conditional or a comment (`(?=a)\k<n>`, `(?>a)\k<n>`, `(?#c)\g<1>`) is read past them, so it is jq's `undefined name <n> reference` or `undefined group <1> reference`, not the `regex` crate's words.
@@ -8672,6 +8682,33 @@ Still out of order: `never ending recursion` is reported for a `\g<0>` wherever 
 Pinned by `tests/jq_cli/i7852.rs`, `tests/jq_cli/i7858.rs` and `tests/jq_cli/i7888.rs`.
 The rows are pinned against jq 1.7.1 in `tests/jq_cli/i6423.rs` and `tests/jq_cli/i6433.rs`.
 `succinctly yq` is not affected: its patterns are Go's, refused in Go's words (``error parsing regexp: missing closing ]: `[` ``).
+
+### Generated patterns the text passes still read otherwise than Oniguruma: five families left to the regex front-end proposal (#7864, #7877, #7878, #7887)
+
+Before the engines see a jq-mode pattern, a chain of passes reads and rewrites its text, each with a scanner of its own, and they do not always agree with Oniguruma (or with each other) on where a class, an escape, a comment, a name or an interval ends, or on which of two errors comes first.
+A differential corpus built for a proposal to replace that front end (330,133 generated patterns in 459,678 rows of `test`, `match`, `capture`, `scan`, `sub`, `gsub`, `splits` and `split`, some under `x`, `i` and `g`) found 49,641 rows where `succinctly jq` differed from both jq 1.7.1 and 1.8.2.
+Most of them are in classes recorded in the sections above: refusals in the engines' words (#6423), look-behind bodies the reader does not follow (#5502), class errors (#6229) and calls to a group the pattern has (#7864).
+The corpus is adversarial by construction: on its generator of ordinary patterns 652 of 27,610 rows differ.
+The five families below had no entry.
+They are left to that proposal, which is not decided, and no test pins them; every example was captured from jq 1.7.1, jq 1.8.2 and `succinctly jq`, and the two jq releases agree on each.
+
+- **Both refuse, in different words (about 11,700 rows).** A scan reads a construct otherwise than Oniguruma, or reports a later error before an earlier one.
+  `\p{Foo}a{2,1}` and `\p{Foo}\k<m>` are `invalid character property name {Foo}` in jq, and `upper is smaller than lower in repeat range` and `undefined name <m> reference` here.
+  `\xC3\xAz` is `invalid code point value` in jq and `too short multibyte code string` here.
+  `(a)(?(+1)a)` is `invalid backref number/name` in jq and `target of repeat operator is not specified` here.
+  Only the message differs: neither tool gives a value.
+- **A different refusal where the repeat-count limit is involved (about 2,988 rows).** The count check reads the digits after a `{` inside a name as an interval.
+  `\k<a{100001}>`, `\g<a{100001}>` and `(?<a{100001}` are `too big number for repeat range` here, and `invalid char in group name <a{100001}>`, `undefined name <a{100001}> reference` and `invalid group name <a{100001>` in jq.
+  In a group's own name it refuses a pattern jq answers: `"a" | test("(?<n{1000000}>a)")` is `true` in jq.
+  The other way round, it misses a count jq reads in a class that holds `[:` and a later `:]`: `"a" | test("[a[:b]{100001}c:]]")` is `too big number for repeat range` in jq and `false` here, an answer where jq has none.
+- **An answer where jq refuses for another reason (about 623 rows, 509 of them `invalid backref number/name` in jq).** These are values jq never gives, so a program that catches the error gets a match result instead.
+  `"a" | test("(?(-1)a)")` is `true` here and `"a" | test("(a)(?(-2)a)")` is `false`, where both jq releases refuse them with `invalid backref number/name`.
+- **Refused here in Oniguruma's words, where jq answers (about 2,439 rows, 1,617 of them under `x`).** A scan misreads the text and makes a refusal jq does not.
+  On `"a"`, `test("^\\c\\A*$")` is `target of repeat operator is invalid` here, `test("(?+1)(a)")` is `undefined group option` and `test("(a)(?(<-1>)a)")` is `undefined name <-1> reference`, and on `"xy"` `test("^(?<a[>x)((?i)y)\\2$")` is `invalid backref number/name`; each is `false` in jq.
+  #7877 and #7878 (above) are two shapes of this family under `x`.
+- **A different answer under `x` (about 1,620 rows).** These are wrong answers, not refusals; the first item of #7887 (a group in a look-behind that keeps its text, recorded under #5502) is one shape.
+  Another: under `x` jq reads a no-break space (U+00A0) as itself, where the scans here skip it as a blank (`"a " | test("^a +$"; "x")` is `true` in jq and `false` here).
+  So `a*`, a no-break space and `+` is the possessive `a*+` here, and so it is with U+3000, U+0085, U+2003 or a vertical tab in its place: `"aa" | test("a* +"; "x")` is `true` here and `false` in jq, and `"aa" | [match("a* +"; "gx") | .string]` is `["aa",""]` here and `[]` in jq (found by the pre-release differential, #7926).
 
 ### A pattern nests groups at most 511 deep, as in jq 1.8.2 (#7528)
 
@@ -9942,6 +9979,7 @@ parameter is re-evaluated at each use, so reading one at depth `d` costs `O(d)`.
 `$`-style parameter is bound to a value once per call (#3149), so recursion through one is
 linear. Measured interleaved on one machine,
 `sum_to(8000)` is 10.8 s here against jq's 4.3 s: same complexity, ~2.5x constant.
+A recursion through a bare parameter that the depth limit above refuses pays that quadratic cost for every level it runs first, so `def f(n): if n==0 then 0 else 1+f(n-1) end; f(10000)` takes longer to be refused here (`exceeded maximum recursion depth`, exit 5) than jq 1.7.1 and 1.8.2 take to print `10000`.
 A recursion that makes many cheap calls is slower than jq by a constant for a second reason: this evaluator binds by substitution, so every call of a recursive `def` copies its body (its call nodes are new at each level, so nothing is cached), up to three times for a `$` parameter with a computed argument ([#7699](https://github.com/rust-works/succinctly/issues/7699)).
 Since #7699 the copy that substituted the bare names is skipped when the body reads none of them and no argument is a literal, which leaves `def f($n): ... f($n - 1) | f($n - 1) ...; 0 | f(16)` 4.1-5.1x slower than jq 1.7.1 on an Apple M4 Pro and an AMD Ryzen 9 7950X (from 5.5-6.4x), with the same output.
 
@@ -11380,6 +11418,9 @@ line longer than jq's 4095-byte read that holds invalid UTF-8, the read boundary
 the text after each invalid byte became a three-byte U+FFFD, where jq counts the bytes it read,
 so a value within a few bytes of the boundary can be placed one line off. Invalid bytes are
 substituted before the line model sees the text, and a genuine U+FFFD looks the same.
+A program that reads on past a caught fault meets the moved resumption point as a fault jq does not raise ([#7921](https://github.com/rust-works/succinctly/issues/7921)): with `0`, a newline, 4,092 spaces, `}`, the byte `0x80`, a quote, a newline, `5` and a newline, `[limit(6; repeat(try input catch .))]` under `-n` is `0`, the `}` fault and `5` in jq 1.7.1 and 1.8.2, and here a second fault, `Invalid numeric literal at line 2, column 4095`, comes before the `5`; with 4,091 spaces it is `Unfinished string at EOF at line 4, column 0` in place of the `5`.
+Neither gives a value jq does not: a fault stands where jq reads on.
+Counting the reads in the bytes jq read there is left to the proposed single model of jq's input reader (not decided).
 The column a parse error names is counted over the bytes jq read, an invalid byte one column, since [#5964](https://github.com/rust-works/succinctly/issues/5964) (`\xff }` is column 2).
 A run jq collapses or drops inside a string (`"\xe1A" }`, where the `A` goes with the lead byte) is counted over the bytes it covered since [#5975](https://github.com/rust-works/succinctly/issues/5975): the substitution reports an edit for each replacement ([`substitute_invalid_utf8_jq_document_mapped`](../../../src/jq/utf8_document.rs)), so an offset in the text maps to the original through them.
 The fault the main loop meets, and `-s` and `--stream`, count it over the bytes read.
@@ -13927,6 +13968,15 @@ Negating it keeps it a literal, as #7453 negates every literal after jqlang/jq#3
 Its `length` keeps it a literal too, as #7534 keeps every literal's after jqlang/jq#3275, so `-Infinity | length > 1e1000` is `true` and `length == 1e1000` is `false`, jq 1.8.2's answers, where jq 1.7.1, whose `length` is `fabs` of the double, says `false` and `true`.
 Under `--preserve-input` (a succinctly extension that echoes a number's source spelling) it now prints as `Infinity` inside a constructed value too (`[., 1]`), as it already did at the top level.
 yq mode keeps the bare double.
+
+### A literal past decNumber's smallest exponent prints as jq rounds it, and compares as written
+
+jq keeps a number literal as a decNumber, and one written with an exponent of -1147483647 or below comes out rounded: `1e-1147483647` and `1e-1999999999` print as the zero `0E-1147483646`, and `12e-1147483647` as `1E-1147483646`, in jq 1.7.1, jq 1.8.2 and `succinctly jq` alike.
+jq compares the rounded value, and `succinctly jq` compares the literal as written, so these are wrong answers here: `1e-1999999999 == 0` and `12e-1147483647 == 1e-1147483646` are `true` in both jq releases and `false` here, `1e-1999999999 > 0` is `false` in jq and `true` here, `[1e-1999999999, 0] | unique` is `[0E-1147483646]` in jq and `[0,0E-1147483646]` here, and `[1e-1999999999] | min == 0` is `true` in jq and `false` here.
+A number read from the input or from `--argjson` is read the same way (`echo '[1e-1999999999, 0]' | jq '.[0] == .[1]'` is `true` in jq and `false` here).
+Negating one keeps the sign of its digits, where #7453 negates a literal zero to a positive zero as jq 1.8.2 does: `-1e-1999999999`, `1e-1999999999 | -.` and `-$a` for `--argjson a 1e-1999999999` print `-0E-1147483646` here, `0E-1147483646` in jq 1.8.2 and `-0` in jq 1.7.1 (whose `-` computes a double), while one written as a zero (`-0e-999999999999999999999999999999`) is `0E-1147483646` here as in jq 1.8.2.
+Arithmetic is not affected, since a computed number is a double: `1e-1999999999 * 1` is `0` in all three.
+This is not a permitted divergence, only one not yet fixed (found by the pre-release differential, #7924, no test).
 
 ### Two equally long slices of one array are `==` in jq, and are compared by content here (#7459)
 

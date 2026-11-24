@@ -1297,6 +1297,17 @@ position on this curve, not the change's cost. In the #3100 data that curve span
 enough to flip the sign of any change under 15% that moves the index builder: an
 `Ir`-neutral change that moves the builder forward 16 bytes reads +10% slower.
 
+**On aarch64-apple-darwin the pad has to go inside the ordered block (#7826).** The release binary's
+hot functions are linked first, in the order of `scripts/link-order/symbols.txt` (#7260), and ld64
+keeps each function's offset mod 64 from the LTO object. A changed link order therefore moves a hot
+function only by whole multiples of 64 bytes there, and a padding function called from `main` did not
+move the ordered code at all for 16 or 32 bytes on an Apple M4 Pro (LTO emitted the pad after it);
+a 48-byte pad moved everything by 64. To get 16/32/48-byte shifts on that target, name the pad
+function in the list ahead of the hot ones. The same list is why a regenerated `symbols.txt` is a
+placement change in its own right: time it interleaved against the old list with an A/A' control
+before committing it (#7894), and regenerate it last before a release
+([release.md](release.md#regenerate-the-link-order-list-the-last-code-change-before-the-tag)).
+
 **Placement is not the only thing a startup change moves (#7332).** `.numbers | sort | .[0]` on a
 10 MB `numbers` document read +6.5% on a 7950X from a change that only reshaped start-up, with the
 per-function `Ir` flat, and the padding holdout above did not reproduce it: bases padded by 16 bytes

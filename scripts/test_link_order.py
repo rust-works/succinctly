@@ -2,7 +2,8 @@
 """Self-tests for scripts/link-order/link.py, the release binary's function-order linker wrapper (#7260).
 
 No linker, no build: the decisions `link.py` makes from rustc's arguments, the name normalization
-that lets one list serve GNU and LLVM demanglers, and the resolution against an object's symbols.
+that lets one list serve GNU and LLVM demanglers, the resolution against an object's symbols, and
+`generate.py`'s staleness check of the wrapper's log and its macOS pass (#7894, #7826).
 """
 import os
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "link-order"))
+import generate  # noqa: E402
 import link  # noqa: E402
 
 
@@ -144,6 +146,120 @@ class Resolve(unittest.TestCase):
             for p in (o, rlib):
                 open(p, "w").close()
             self.assertEqual(link.objects(["-o", "out", o, rlib, os.path.join(d, "absent.o")]), [o])
+
+
+def write(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+
+
+class Stale(unittest.TestCase):
+    """`generate.py stale`: a list too many of whose names no longer resolve fails the build (#7894)."""
+
+    FRESH = "1454 listed, 1405 found, 1458 symbols ordered (rustc links with lld)\n"
+    DRIFTED = "1455 listed, 1339 found, 1446 symbols ordered (rustc links with lld)\n"
+
+    def run_stale(self, path, limit=generate.STALE_PERCENT):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = generate.stale(path, limit)
+        return ok, out.getvalue()
+
+    def test_share_is_read_from_the_wrappers_log_line(self):
+        listed, found, share = generate.stale_share(self.FRESH)
+        self.assertEqual((listed, found), (1454, 1405))
+        self.assertAlmostEqual(share, 3.37, places=2)
+        self.assertIsNone(generate.stale_share("plain link: no lld: GNU ld has no --symbol-ordering-file\n"))
+        self.assertIsNone(generate.stale_share("0 listed, 0 found, 5 symbols ordered (ld64)\n"))
+
+    def test_the_log_format_is_the_one_link_py_writes(self):
+        # link.py's summary line and this parser must not drift apart: read link.py's own format string.
+        with open(os.path.join(os.path.dirname(link.__file__), "link.py")) as f:
+            src = f.read()
+        self.assertIn('listed, {len(names) - missing} found, {len(order)} symbols "', src)
+        self.assertIsNotNone(generate.stale_share("7 listed, 6 found, 11 symbols ordered (ld64)"))
+
+    def test_the_list_as_generated_passes_and_the_list_of_7894_fails(self):
+        # 3.4% unresolved on the day the list was generated, 8.0% after 222 merges (#7894).
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "succinctly-01.link-order.log")
+            write(log, self.FRESH)
+            ok, out = self.run_stale(log)
+            self.assertTrue(ok, out)
+            self.assertIn("1454 listed, 1405 found, 49 no longer resolve (3.4%", out)
+            write(log, self.DRIFTED)
+            ok, out = self.run_stale(log)
+            self.assertFalse(ok, out)
+            self.assertIn("116 no longer resolve (8.0%", out)
+            self.assertIn("generate.py linux", out)
+            self.assertTrue(self.run_stale(log, 10)[0])
+
+    def test_a_plain_link_or_no_log_fails_instead_of_passing_unchecked(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok, out = self.run_stale(d)
+            self.assertFalse(ok)
+            self.assertIn("no link-order log", out)
+            log = os.path.join(d, "x.link-order.log")
+            write(log, "plain link: rustc chose another linker: -fuse-ld=mold\n")
+            ok, out = self.run_stale(log)
+            self.assertFalse(ok)
+            self.assertIn("not ordered", out)
+
+    def test_the_newest_log_of_either_cargo_layout_is_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            deps = os.path.join(d, "deps")
+            out_dir = os.path.join(d, "build", "succinctly", "745a72d7e8e86ffb", "out")
+            os.makedirs(deps)
+            os.makedirs(out_dir)
+            old, new = os.path.join(deps, "succinctly-01.link-order.log"), os.path.join(out_dir, "succinctly.link-order.log")
+            write(old, self.DRIFTED)
+            write(new, self.FRESH)
+            os.utime(old, (1, 1))
+            self.assertEqual(generate.newest_log(d), new)
+            os.utime(old, None)
+            os.utime(new, (1, 1))
+            self.assertEqual(generate.newest_log(d), old)
+            # another binary's log (a test executable is never ordered, but be exact about the name)
+            write(os.path.join(deps, "jq_cli_tests-02.link-order.log"), self.FRESH)
+            os.utime(new, None)
+            os.utime(old, (1, 1))
+            self.assertEqual(generate.newest_log(d), new)
+
+
+class MacosPass(unittest.TestCase):
+    """`generate.py macos` adds every platform-named function the list lacks: it is not a sample (#7826)."""
+
+    def test_every_platform_named_function_the_list_lacks_is_added(self):
+        demangled = ["succinctly::json::simd::neon::process_chunk_standard", "core::fmt::write",
+                     "<&core::core_arch::arm_shared::neon::uint8x16_t as core::fmt::Debug>::fmt",
+                     "std::sys::thread_local::guard::apple::enable::run_dtors",
+                     "memchr::arch::aarch64::neon::memchr::memchr_raw", "succinctly::json::simd::avx2::f"]
+        have = {link.norm("memchr::arch::aarch64::neon::memchr::memchr_raw"), "core::fmt::write"}
+        self.assertEqual(generate.platform_names(demangled, have), [
+            "<&core::core_arch::arm_shared::neon::uint8x16_t as core::fmt::Debug>::fmt",
+            "std::sys::thread_local::guard::apple::enable::run_dtors",
+            "succinctly::json::simd::neon::process_chunk_standard"])
+
+    def test_additions_close_the_startup_block_and_the_rest_keeps_its_order(self):
+        syms = [(0, 4, "_a", "b::neon::k"), (4, 4, "_b", "a::plain"), (8, 4, "_c", "a::aarch64::z"), (12, 4, "_d", "x::listed_neon")]
+        real = generate.nm_pairs
+        generate.nm_pairs = lambda binary: syms
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+                f.write("# header\nmain\n" + generate.MARK + "\nx::listed_neon\nhot::f\n")
+            import contextlib
+            import io
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                out = generate.macos("target/release/succinctly", f.name)
+        finally:
+            generate.nm_pairs = real
+            os.unlink(f.name)
+        self.assertEqual(out, ["# header", "main", "a::aarch64::z", "b::neon::k", generate.MARK, "x::listed_neon", "hot::f"])
+        self.assertIn("added 2 platform-named functions", err.getvalue())
+        self.assertIn("does not sample", err.getvalue())
 
 
 if __name__ == "__main__":
