@@ -71,6 +71,7 @@ A row whose slowest tool runs over 15 ms is topped up to 21 repetitions (within 
 ratios are of each tool's fastest run, marked † in the report, because run-to-run noise moves the median of a figure that
 long (#5581). A row with a CV above 5% is marked, and its ratio is not a finding on its own.
 Dimension F runs the resource-limit probes under a 10 s deadline and classes each outcome (ok, error, crash, timeout).
+A ledger entry of a robustness row can state the class it accepts for each tool (`subject_class`, `reference_class`, per OS where the platforms differ): a listed row whose tool ends in another class fails the run like an unlisted divergence, so a row that moves from an exit status to a signal under an unchanged entry is reported (#7891; `divergences/README.md`).
 Its `memory` probes cap the address space with `ulimit -v` (graceful error versus abort; early-exit `first`/`limit`/`isempty` on a generated array); macOS refuses `ulimit -v`, so there they run uncapped as a no-op and only Linux CI exercises the limit.
 A run lowers its own `RLIMIT_CORE` to 1 byte, soft and hard, before it starts anything, and every child inherits it: a probe that ends a tool on a signal (jq 1.7.1 on `strftime/1`, the `memory` rows) leaves no core dump, even where `core_pattern` pipes to a handler, which ignores a limit of 0 (#7891).
 The class, exit status and output of such a row are unchanged; macOS still writes its own crash report.

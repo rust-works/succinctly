@@ -9,10 +9,16 @@
 //! as `changelog.d/` did for `CHANGELOG.md` (#3920). The run fails on a difference that is not
 //! listed and on a listed one that no longer differs, so the ledger cannot drift from the
 //! behaviour in either direction (`jq_error_message_tests.rs` does the same for error wording).
+//!
+//! An id says that a row differs, not how it ends. A robustness entry can therefore also state
+//! the outcome class it accepts for each tool (`subject_class`, `reference_class`, #7891): a row
+//! that moves between an exit status and death by a signal, or starts to run into the deadline,
+//! keeps its id and would otherwise pass unreported.
 
+use super::robust::Class;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 pub const CATEGORIES: &[&str] = &[
@@ -43,6 +49,112 @@ pub struct Entry {
     /// called stale where it does not.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub volatile: bool,
+    /// The outcome classes this entry accepts for succinctly on a robustness row; `None`
+    /// leaves the class unchecked, as before the field existed (#7891).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_class: Option<Classes>,
+    /// The same for the reference jq, where the row's meaning depends on how jq ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_class: Option<Classes>,
+}
+
+/// The outcome classes an entry accepts for one tool.
+///
+/// In the entry file it is one class (`"error"`), a list where the outcome legitimately
+/// depends on the build or the host (`["error", "crash"]`), or a table of either per
+/// `std::env::consts::OS` where the platforms differ (`{ linux = "timeout", macos = "error" }`).
+/// An OS the table does not name is not checked: that is how a platform nobody has observed is
+/// left out.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum Classes {
+    Everywhere(Vec<Class>),
+    PerOs(BTreeMap<String, Vec<Class>>),
+}
+
+impl Classes {
+    /// The classes accepted on `os`, or `None` when the entry says nothing for it.
+    pub fn on(&self, os: &str) -> Option<&[Class]> {
+        match self {
+            Self::Everywhere(c) => Some(c),
+            Self::PerOs(m) => m.get(os).map(Vec::as_slice),
+        }
+    }
+}
+
+/// The values of `std::env::consts::OS` a per-OS class table may name: a misspelt key would
+/// otherwise be an expectation that is never checked.
+const OSES: &[&str] = &[
+    "android",
+    "dragonfly",
+    "freebsd",
+    "illumos",
+    "ios",
+    "linux",
+    "macos",
+    "netbsd",
+    "openbsd",
+    "solaris",
+    "windows",
+];
+
+/// One class or a non-empty list of distinct classes, as `what` (for the error) wrote it.
+fn class_list(what: &str, value: &toml::Value) -> Result<Vec<Class>> {
+    let one = |v: &toml::Value| -> Result<Class> {
+        let name = v
+            .as_str()
+            .with_context(|| format!("{what}: a class is a string, not `{v}`"))?;
+        Class::from_name(name).with_context(|| {
+            format!(
+                "{what}: unknown class `{name}` (one of {})",
+                Class::ALL.map(|c| format!("`{}`", c.name())).join(", ")
+            )
+        })
+    };
+    let list = match value {
+        toml::Value::Array(items) => items.iter().map(one).collect::<Result<Vec<_>>>()?,
+        v => vec![one(v)?],
+    };
+    if list.is_empty() {
+        anyhow::bail!("{what}: an empty list accepts no outcome; leave the field out instead");
+    }
+    if let Some(c) = list
+        .iter()
+        .find(|c| list.iter().filter(|x| x == c).count() > 1)
+    {
+        anyhow::bail!("{what}: `{}` is listed twice", c.name());
+    }
+    Ok(list)
+}
+
+/// The `field` of entry `id`, whose `platform` is the OS it is restricted to, if any.
+fn parse_classes(
+    id: &str,
+    field: &str,
+    platform: Option<&str>,
+    value: &toml::Value,
+) -> Result<Classes> {
+    let what = format!("divergence `{id}`, `{field}`");
+    let toml::Value::Table(table) = value else {
+        return Ok(Classes::Everywhere(class_list(&what, value)?));
+    };
+    if table.is_empty() {
+        anyhow::bail!("{what}: an empty table checks nothing; leave the field out instead");
+    }
+    let mut per_os = BTreeMap::new();
+    for (os, v) in table {
+        if !OSES.contains(&os.as_str()) {
+            anyhow::bail!("{what}: `{os}` is not a `std::env::consts::OS` this loader knows");
+        }
+        if platform.is_some_and(|p| p != os) {
+            anyhow::bail!(
+                "{what}: names `{os}`, but the entry is for `platform = \"{}\"` only",
+                platform.unwrap_or_default()
+            );
+        }
+        per_os.insert(os.clone(), class_list(&format!("{what}, `{os}`"), v)?);
+    }
+    Ok(Classes::PerOs(per_os))
 }
 
 /// The fields of an entry file: every field of [`Entry`] but the id, which is the path.
@@ -55,6 +167,8 @@ struct Body {
     platform: Option<String>,
     #[serde(default)]
     volatile: bool,
+    subject_class: Option<toml::Value>,
+    reference_class: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -63,11 +177,48 @@ pub struct Outcome {
     pub unlisted: Vec<String>,
     /// Listed, no longer observed.
     pub stale: Vec<String>,
+    /// Listed and observed, but a tool ended in a class its entry does not accept (#7891).
+    /// Left out of `results.json` when empty, so a run without one is written as before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub class: Vec<ClassMismatch>,
 }
 
 impl Outcome {
     pub fn is_clean(&self) -> bool {
-        self.unlisted.is_empty() && self.stale.is_empty()
+        self.unlisted.is_empty() && self.stale.is_empty() && self.class.is_empty()
+    }
+}
+
+/// A listed row on which a tool ended in a class its entry does not accept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClassMismatch {
+    pub id: String,
+    /// `subject` or `reference`: which of the entry's two fields it is.
+    pub tool: &'static str,
+    pub expected: Vec<Class>,
+    pub observed: Class,
+}
+
+impl ClassMismatch {
+    /// `subject class `crash`, expected `error``: the part after the id.
+    pub fn what(&self) -> String {
+        let expected: Vec<String> = self
+            .expected
+            .iter()
+            .map(|c| format!("`{}`", c.name()))
+            .collect();
+        format!(
+            "{} class `{}`, expected {}",
+            self.tool,
+            self.observed.name(),
+            expected.join(" or ")
+        )
+    }
+}
+
+impl std::fmt::Display for ClassMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.id, self.what())
     }
 }
 
@@ -113,6 +264,9 @@ pub fn id_of(suite: &str, file_name: &str) -> Result<String> {
     Ok(format!("{suite}:{probe}"))
 }
 
+/// The suite whose rows have an outcome class (`robust.rs`), and so whose entries may state one.
+const CLASSED_SUITE: &str = "robust";
+
 /// One entry from the text of `<suite>/<file_name>`.
 pub fn parse_entry(suite: &str, file_name: &str, text: &str) -> Result<Entry> {
     let id = id_of(suite, file_name)?;
@@ -121,7 +275,20 @@ pub fn parse_entry(suite: &str, file_name: &str, text: &str) -> Result<Entry> {
     if !CATEGORIES.contains(&body.category.as_str()) {
         anyhow::bail!("divergence `{id}` has unknown category `{}`", body.category);
     }
+    let classes = |field: &str, value: Option<&toml::Value>| -> Result<Option<Classes>> {
+        let Some(value) = value else { return Ok(None) };
+        // Only the robustness dimension classes an outcome: elsewhere nothing would read the
+        // field, and an expectation nothing checks is worse than none.
+        if suite != CLASSED_SUITE {
+            anyhow::bail!(
+                "divergence `{id}` has `{field}`, which only a `{CLASSED_SUITE}` entry can state"
+            );
+        }
+        parse_classes(&id, field, body.platform.as_deref(), value).map(Some)
+    };
     Ok(Entry {
+        subject_class: classes("subject_class", body.subject_class.as_ref())?,
+        reference_class: classes("reference_class", body.reference_class.as_ref())?,
         id,
         category: body.category,
         reason: body.reason,
@@ -267,7 +434,50 @@ pub fn check<S: AsRef<str>>(
             .filter(|id| !observed.contains(**id) && !volatile.contains(**id))
             .map(|s| (*s).to_string())
             .collect(),
+        class: vec![],
     }
+}
+
+/// The observed rows whose class an entry does not accept (#7891).
+///
+/// `rows` are the rows the run observed as diverging, each as its ledger id with the
+/// reference's and the subject's class. Only those are judged: a listed row that no longer
+/// diverges is stale (or volatile and absent), and an unlisted one is already reported. An
+/// entry without the field, one for another OS, and a per-OS table that does not name this OS
+/// each leave the class unchecked.
+pub fn check_classes(entries: &[Entry], rows: &[(String, Class, Class)]) -> Vec<ClassMismatch> {
+    check_classes_on(entries, rows, std::env::consts::OS)
+}
+
+fn check_classes_on(
+    entries: &[Entry],
+    rows: &[(String, Class, Class)],
+    os: &str,
+) -> Vec<ClassMismatch> {
+    let mut out = vec![];
+    for (id, reference, subject) in rows {
+        let Some(e) = entries
+            .iter()
+            .find(|e| e.id == *id && e.platform.as_deref().map_or(true, |p| p == os))
+        else {
+            continue;
+        };
+        for (tool, spec, observed) in [
+            ("reference", &e.reference_class, *reference),
+            ("subject", &e.subject_class, *subject),
+        ] {
+            match spec.as_ref().and_then(|s| s.on(os)) {
+                Some(accepted) if !accepted.contains(&observed) => out.push(ClassMismatch {
+                    id: id.clone(),
+                    tool,
+                    expected: accepted.to_vec(),
+                    observed,
+                }),
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -282,6 +492,8 @@ mod tests {
             issue: None,
             platform: None,
             volatile: false,
+            subject_class: None,
+            reference_class: None,
         }
     }
 
@@ -381,6 +593,257 @@ mod tests {
         assert!(parse_entry("cli", "a.toml", "category='to-triage'\n").is_err());
         assert!(parse_entry("cli", "a.toml", &ok.replace("to-triage", "whatever")).is_err());
         assert!(parse_entry("cli", "a.toml", &format!("{ok}extra='x'\n")).is_err());
+    }
+
+    const ROBUST: &str = "category='by-design'\nreason='y'\n";
+
+    fn robust(extra: &str) -> Result<Entry> {
+        parse_entry("robust", "p.toml", &format!("{ROBUST}{extra}"))
+    }
+
+    /// One class, a list, or a table per OS; absent means unchecked.
+    #[test]
+    fn an_entry_states_the_classes_it_accepts_in_three_shapes() {
+        let none = robust("").unwrap();
+        assert_eq!((none.subject_class, none.reference_class), (None, None));
+        let e =
+            robust("subject_class = 'error'\nreference_class = ['crash', 'timeout']\n").unwrap();
+        assert_eq!(
+            e.subject_class,
+            Some(Classes::Everywhere(vec![Class::Error]))
+        );
+        assert_eq!(
+            e.reference_class,
+            Some(Classes::Everywhere(vec![Class::Crash, Class::Timeout]))
+        );
+        let e = robust("subject_class = { linux = 'timeout', macos = ['error', 'ok'] }\n").unwrap();
+        let spec = e.subject_class.unwrap();
+        assert_eq!(spec.on("linux"), Some(&[Class::Timeout][..]));
+        assert_eq!(spec.on("macos"), Some(&[Class::Error, Class::Ok][..]));
+        // An OS the table does not name is not checked.
+        assert_eq!(spec.on("freebsd"), None);
+        // An entry restricted to one OS may name that OS in the table.
+        let e = robust("platform = 'linux'\nsubject_class = { linux = 'crash' }\n").unwrap();
+        assert_eq!(
+            e.subject_class.unwrap().on("linux"),
+            Some(&[Class::Crash][..])
+        );
+    }
+
+    #[test]
+    fn a_class_field_the_loader_cannot_check_is_a_load_error() {
+        for (extra, needle) in [
+            ("subject_class = 'crashed'\n", "unknown class `crashed`"),
+            ("subject_class = 'Crash'\n", "unknown class `Crash`"),
+            (
+                "reference_class = ['crash', 'abort']\n",
+                "unknown class `abort`",
+            ),
+            (
+                "subject_class = { linux = 'signal' }\n",
+                "unknown class `signal`",
+            ),
+            ("subject_class = 1\n", "a class is a string"),
+            ("subject_class = ['error', 2]\n", "a class is a string"),
+            ("subject_class = []\n", "an empty list"),
+            ("subject_class = {}\n", "an empty table"),
+            ("subject_class = { linux = [] }\n", "an empty list"),
+            ("subject_class = ['error', 'error']\n", "listed twice"),
+            ("subject_class = { macosx = 'error' }\n", "`macosx` is not"),
+            (
+                "platform = 'linux'\nsubject_class = { macos = 'error' }\n",
+                "names `macos`",
+            ),
+            ("subject_classes = 'error'\n", "unknown field"),
+        ] {
+            let err = format!("{:#}", robust(extra).unwrap_err());
+            assert!(err.contains(needle), "{extra}: {err}");
+        }
+        // The message names the entry and the field.
+        let err = format!("{:#}", robust("reference_class = 'x'\n").unwrap_err());
+        assert!(
+            err.contains("`robust:p`") && err.contains("`reference_class`"),
+            "{err}"
+        );
+        // Only a robustness row has a class.
+        let err = parse_entry(
+            "cli",
+            "p.toml",
+            &format!("{ROBUST}subject_class = 'error'\n"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only a `robust` entry"), "{err}");
+    }
+
+    fn classed(id: &str, subject: Option<Classes>, reference: Option<Classes>) -> Entry {
+        Entry {
+            subject_class: subject,
+            reference_class: reference,
+            ..entry(id)
+        }
+    }
+
+    /// No mismatch.
+    const NONE: [ClassMismatch; 0] = [];
+
+    fn row(id: &str, reference: Class, subject: Class) -> (String, Class, Class) {
+        (id.into(), reference, subject)
+    }
+
+    /// The case of #7891: the row still differs, so its id is neither unlisted nor stale, and
+    /// only the class says that succinctly now dies on a signal.
+    #[test]
+    fn a_row_that_changes_class_under_an_unchanged_id_is_reported() {
+        let e = [classed(
+            "robust:m",
+            Some(Classes::Everywhere(vec![Class::Error])),
+            Some(Classes::Everywhere(vec![Class::Ok])),
+        )];
+        let ids = set(&["robust:m"]);
+        assert!(check(&e, &ids, &["robust"]).is_clean());
+        assert_eq!(
+            check_classes(&e, &[row("robust:m", Class::Ok, Class::Error)]),
+            NONE
+        );
+        let moved = check_classes(&e, &[row("robust:m", Class::Ok, Class::Crash)]);
+        assert_eq!(
+            moved,
+            [ClassMismatch {
+                id: "robust:m".into(),
+                tool: "subject",
+                expected: vec![Class::Error],
+                observed: Class::Crash,
+            }]
+        );
+        assert_eq!(
+            moved[0].to_string(),
+            "robust:m: subject class `crash`, expected `error`"
+        );
+        // A mismatch fails the run like an unlisted divergence.
+        let mut o = check(&e, &ids, &["robust"]);
+        o.class = moved;
+        assert!(!o.is_clean());
+        // The reference is judged by its own field, and both can be wrong at once.
+        let both = check_classes(&e, &[row("robust:m", Class::Timeout, Class::Ok)]);
+        let said: Vec<String> = both.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            said,
+            [
+                "robust:m: reference class `timeout`, expected `ok`",
+                "robust:m: subject class `ok`, expected `error`"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_list_accepts_each_of_its_classes_and_names_them_all_on_a_mismatch() {
+        let e = [classed(
+            "robust:m",
+            Some(Classes::Everywhere(vec![Class::Error, Class::Crash])),
+            None,
+        )];
+        for ok in [Class::Error, Class::Crash] {
+            assert_eq!(check_classes(&e, &[row("robust:m", Class::Ok, ok)]), NONE);
+        }
+        let m = check_classes(&e, &[row("robust:m", Class::Ok, Class::Timeout)]);
+        assert_eq!(
+            m[0].to_string(),
+            "robust:m: subject class `timeout`, expected `error` or `crash`"
+        );
+    }
+
+    /// Without the field an entry behaves as it did before the field existed, whatever the
+    /// classes are; so does a row with no entry, which `check` reports as unlisted.
+    #[test]
+    fn an_entry_without_the_field_accepts_every_class() {
+        let e = [entry("robust:m")];
+        for r in Class::ALL {
+            for s in Class::ALL {
+                assert_eq!(check_classes(&e, &[row("robust:m", r, s)]), NONE);
+                assert_eq!(check_classes(&e, &[row("robust:other", r, s)]), NONE);
+            }
+        }
+    }
+
+    #[test]
+    fn a_class_is_checked_on_the_os_it_is_stated_for() {
+        let per_os = |pairs: &[(&str, Class)]| {
+            Classes::PerOs(
+                pairs
+                    .iter()
+                    .map(|(os, c)| ((*os).to_string(), vec![*c]))
+                    .collect(),
+            )
+        };
+        let e = [classed(
+            "robust:m",
+            Some(per_os(&[
+                ("linux", Class::Timeout),
+                ("macos", Class::Error),
+            ])),
+            None,
+        )];
+        let rows = [row("robust:m", Class::Ok, Class::Timeout)];
+        assert_eq!(check_classes_on(&e, &rows, "linux"), NONE);
+        assert_eq!(
+            check_classes_on(&e, &rows, "macos")[0].what(),
+            "subject class `timeout`, expected `error`"
+        );
+        // Not named: not checked.
+        assert_eq!(check_classes_on(&e, &rows, "freebsd"), NONE);
+        // An entry for another OS is not this host's entry at all.
+        let mut linux_only = classed(
+            "robust:m",
+            Some(Classes::Everywhere(vec![Class::Error])),
+            None,
+        );
+        linux_only.platform = Some("linux".into());
+        assert_eq!(
+            check_classes_on(&[linux_only.clone()], &rows, "macos"),
+            NONE
+        );
+        assert_eq!(check_classes_on(&[linux_only], &rows, "linux").len(), 1);
+    }
+
+    /// A recorded run keeps the expectation beside the entry, in the shape the file has it.
+    #[test]
+    fn an_entry_is_recorded_with_its_classes_only_when_it_states_them() {
+        let plain = serde_json::to_value(entry("robust:m")).unwrap();
+        assert!(plain.get("subject_class").is_none() && plain.get("reference_class").is_none());
+        let e = robust("subject_class = ['error', 'crash']\nreference_class = { linux = 'ok' }\n")
+            .unwrap();
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["subject_class"], serde_json::json!(["error", "crash"]));
+        assert_eq!(v["reference_class"], serde_json::json!({"linux": ["ok"]}));
+        let back: Entry = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            (back.subject_class, back.reference_class),
+            (e.subject_class, e.reference_class)
+        );
+        // An empty mismatch list leaves `results.json` as it was.
+        let o = serde_json::to_value(Outcome::default()).unwrap();
+        assert!(o.get("class").is_none(), "{o}");
+    }
+
+    /// Every class a checked-in entry states is for a probe that exists.
+    #[test]
+    fn the_checked_in_class_expectations_name_real_robustness_probes() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("comparison/jq/divergences");
+        let probes = super::super::robust::parse_probes(include_str!(
+            "../../../../comparison/jq/probes/robust.tsv"
+        ))
+        .unwrap();
+        let classed: Vec<Entry> = load(&dir)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.subject_class.is_some() || e.reference_class.is_some())
+            .collect();
+        assert!(!classed.is_empty());
+        for e in classed {
+            let probe = e.id.strip_prefix("robust:").unwrap();
+            assert!(probes.iter().any(|p| p.id == probe), "{}", e.id);
+        }
     }
 
     fn write(root: &Path, rel: &str, text: &str) {

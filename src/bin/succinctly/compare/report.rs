@@ -216,9 +216,14 @@ pub fn render(results: &Results) -> String {
             "| Known divergences (ledger) | {} |",
             r.known_divergences.len()
         );
+        // The class count is printed only when there is one, so a clean report reads as before.
+        let class = match r.ledger.class.len() {
+            0 => String::new(),
+            n => format!(", {n} with another outcome class"),
+        };
         let _ = writeln!(
             s,
-            "| Ledger drift | {} unlisted, {} stale |",
+            "| Ledger drift | {} unlisted, {} stale{class} |",
             r.ledger.unlisted.len(),
             r.ledger.stale.len()
         );
@@ -1235,22 +1240,37 @@ fn robust_section(s: &mut String, r: &Results) {
         let ok = r.robust.iter().filter(|x| x.area == a && x.matches).count();
         let _ = writeln!(s, "| {a} | {all} | {ok} |");
     }
+    robust_rows(s, &r.robust, &r.known_divergences, &r.ledger.class);
+}
+
+/// The rows the ledger must list, each with its entry; a class the entry does not accept
+/// (#7891) is said in front of the entry's own text.
+fn robust_rows(
+    s: &mut String,
+    rows: &[robust::Row],
+    known: &[ledger::Entry],
+    class: &[ledger::ClassMismatch],
+) {
     let _ = writeln!(s, "\n| Probe | jq | succinctly | Ledger |");
     let _ = writeln!(s, "|-------|----|-------------|--------|");
     let cls = |c: robust::Class, exit: Option<i32>, ms: f64| {
         let e = exit.map_or_else(|| "signal".into(), |e| e.to_string());
         format!("{c:?} {e} ({ms:.0} ms)").to_lowercase()
     };
-    for x in r.robust.iter().filter(|x| {
-        !x.matches || matches!(x.subject, robust::Class::Crash | robust::Class::Timeout)
-    }) {
+    for x in rows.iter().filter(|x| x.is_ledgered()) {
+        let id = format!("robust:{}", x.id);
+        let moved: String = class
+            .iter()
+            .filter(|m| m.id == id)
+            .map(|m| format!("**{}**; ", m.what()))
+            .collect();
         let _ = writeln!(
             s,
-            "| `{}` | {} | {} | {} |",
+            "| `{}` | {} | {} | {moved}{} |",
             x.id,
             cls(x.reference, x.reference_exit, x.reference_ms),
             cls(x.subject, x.subject_exit, x.subject_ms),
-            note_for(r, &format!("robust:{}", x.id))
+            ledger_note(known, &id)
         );
     }
 }
@@ -1414,6 +1434,8 @@ mod tests {
             issue: None,
             platform: None,
             volatile: false,
+            subject_class: None,
+            reference_class: None,
         }];
         let mut listed = String::new();
         fuzz_section(
@@ -1464,6 +1486,8 @@ mod tests {
             issue: None,
             platform: None,
             volatile: false,
+            subject_class: None,
+            reference_class: None,
         }];
         let mut listed = String::new();
         sweep_section(
@@ -1838,6 +1862,41 @@ mod syntax_tests {
         }
     }
 
+    /// A listed row whose class moved keeps its entry's text and says the mismatch before it.
+    #[test]
+    fn a_robustness_row_with_another_class_says_so_before_its_entry() {
+        let row = robust::Row {
+            id: "mem".into(),
+            area: "memory".into(),
+            matches: false,
+            reference: robust::Class::Ok,
+            subject: robust::Class::Crash,
+            reference_exit: Some(0),
+            subject_exit: None,
+            reference_ms: 1.0,
+            subject_ms: 2.0,
+        };
+        let known = [entry("robust:mem")];
+        let mut plain = String::new();
+        robust_rows(&mut plain, std::slice::from_ref(&row), &known, &[]);
+        assert!(
+            plain.contains("| `mem` | ok 0 (1 ms) | crash signal (2 ms) | to-triage: the parser"),
+            "{plain}"
+        );
+        let moved = [ledger::ClassMismatch {
+            id: "robust:mem".into(),
+            tool: "subject",
+            expected: vec![robust::Class::Error],
+            observed: robust::Class::Crash,
+        }];
+        let mut said = String::new();
+        robust_rows(&mut said, &[row], &known, &moved);
+        assert!(
+            said.contains("| **subject class `crash`, expected `error`**; to-triage: the parser"),
+            "{said}"
+        );
+    }
+
     fn entry(id: &str) -> ledger::Entry {
         ledger::Entry {
             id: id.into(),
@@ -1846,6 +1905,8 @@ mod syntax_tests {
             issue: None,
             platform: None,
             volatile: false,
+            subject_class: None,
+            reference_class: None,
         }
     }
 

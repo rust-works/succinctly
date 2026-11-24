@@ -64,19 +64,17 @@ fn set() -> std::io::Result<()> {
     }
 }
 
+/// What the harness's tests share to end a child on a signal without leaving a dump: the limit
+/// is set by [`apply`], the one mechanism a run uses, in a copy of the test binary, never in the
+/// test binary itself, where it could not be raised again and would hide from the test below
+/// whether `apply` set it.
 #[cfg(all(test, unix))]
-mod tests {
-    use super::super::exec::exec_env;
+pub(crate) mod testing {
     use super::super::harness::Tool;
-    use super::super::robust::{classify, Class};
-    use std::path::Path;
-    use std::process::Command;
-
-    const ROLE: &str = "COMPARE_CORE_LIMIT_ROLE";
 
     /// This process's `RLIMIT_CORE`, soft and hard, in bytes.
     #[allow(unsafe_code)] // one `getrlimit(2)` call, writing only into a local
-    fn core_limit() -> (libc::rlim_t, libc::rlim_t) {
+    pub(crate) fn core_limit() -> (libc::rlim_t, libc::rlim_t) {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -86,13 +84,12 @@ mod tests {
         (limit.rlim_cur, limit.rlim_max)
     }
 
-    /// This test binary, re-run for this one test. The test's path is taken from the module's, so
-    /// it follows the module if that moves: an `--exact` name that matches nothing runs no test
-    /// and exits 0.
-    fn this_test() -> Tool {
-        let module = module_path!();
+    /// This test binary, re-run for the one test `test` of the module `module_path!()` names. The
+    /// test's path is taken from the module's, so it follows the module if that moves: an
+    /// `--exact` name that matches nothing runs no test and exits 0.
+    pub(crate) fn rerun(module: &str, test: &str) -> Tool {
         let name = format!(
-            "{}::a_harness_child_that_aborts_ran_under_a_core_limit_of_one_byte",
+            "{}::{test}",
             module.split_once("::").map_or(module, |(_, rest)| rest)
         );
         Tool {
@@ -107,6 +104,41 @@ mod tests {
         }
     }
 
+    /// End this process on a signal, as a tool that crashes does, leaving no dump: `abort` under
+    /// the 1-byte limit of [`apply`](super::apply). Where that limit is refused (a hard limit
+    /// that is already 0, which a piped `core_pattern` handler ignores) it is `SIGKILL`
+    /// instead, which is never dumped and is as much a death by signal to the caller.
+    pub(crate) fn die_on_a_signal_without_a_dump() -> ! {
+        super::apply();
+        if core_limit() == (super::CORE_LIMIT, super::CORE_LIMIT) {
+            std::process::abort();
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &std::process::id().to_string()])
+            .status();
+        // Not reached unless `kill` could not be run: fail the caller instead of dumping.
+        std::process::exit(101)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::super::exec::exec_env;
+    use super::super::harness::Tool;
+    use super::super::robust::{classify, Class};
+    use super::testing::core_limit;
+    use std::path::Path;
+    use std::process::Command;
+
+    const ROLE: &str = "COMPARE_CORE_LIMIT_ROLE";
+
+    fn this_test() -> Tool {
+        super::testing::rerun(
+            module_path!(),
+            "a_harness_child_that_aborts_ran_under_a_core_limit_of_one_byte",
+        )
+    }
+
     /// A child the harness's own spawn helper starts after [`apply`](super::apply) runs under a
     /// limit of exactly 1 byte, soft and hard, and a child that then aborts is still read as a
     /// crash with its signal and its output: the limit changes no class.
@@ -114,24 +146,39 @@ mod tests {
     /// Three processes, because the limit cannot be raised again and so must not be set in the
     /// test binary the other tests run in: this one starts a `harness` copy of itself, which calls
     /// `apply` and runs a `tool` copy through `exec_env`; the `tool` prints its limit and aborts.
+    ///
+    /// Where the hard limit is already below 1 byte (a shell after `ulimit -c 0`) it cannot be
+    /// raised to 1: `apply` prints its note and the limit stays what it was, which the child must
+    /// then inherit unchanged. A file `core_pattern` writes no dump under it either, but a piped
+    /// handler ignores a limit of 0, so the `tool` does not abort there: the test would otherwise
+    /// leave the dump this module exists to prevent.
     #[test]
     fn a_harness_child_that_aborts_ran_under_a_core_limit_of_one_byte() {
         match std::env::var(ROLE).ok().as_deref() {
             Some("tool") => {
                 let (soft, hard) = core_limit();
                 println!("core-limit soft={soft} hard={hard}");
-                std::process::abort();
+                if (soft, hard) == (1, 1) {
+                    std::process::abort();
+                }
             }
             Some("harness") => {
+                let before = core_limit();
                 super::apply();
-                assert_eq!(core_limit(), (1, 1));
+                let expected = if before.1 >= 1 { (1, 1) } else { before };
+                assert_eq!(core_limit(), expected);
                 let env = [(ROLE.to_string(), "tool".to_string())];
                 let e = exec_env(&this_test(), &[], "", Path::new("."), &env).unwrap();
                 // libtest prints `test <name> ... ` in front of it, on the same line.
                 let out = String::from_utf8_lossy(&e.stdout);
-                assert!(out.contains("core-limit soft=1 hard=1\n"), "{out}");
-                assert_eq!((e.exit, e.signal), (None, Some(libc::SIGABRT)));
-                assert_eq!(classify(&e), Class::Crash);
+                let line = format!("core-limit soft={} hard={}\n", expected.0, expected.1);
+                assert!(out.contains(&line), "{out}");
+                if expected == (1, 1) {
+                    assert_eq!((e.exit, e.signal), (None, Some(libc::SIGABRT)));
+                    assert_eq!(classify(&e), Class::Crash);
+                } else {
+                    assert_eq!((e.exit, e.signal), (Some(0), None));
+                }
                 println!("harness-saw-the-limit");
             }
             _ => {

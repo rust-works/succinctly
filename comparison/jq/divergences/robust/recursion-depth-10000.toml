@@ -1,2 +1,3 @@
 category = "by-design"
-reason = "A user-defined function recursing 10000 deep: jq answers (about 3 s); succinctly's stack guard refuses with `exceeded maximum recursion depth` (ADR-0025)."
+reason = "A user-defined function recursing 10000 deep: jq answers (about 3 s); succinctly's stack guard refuses with `exceeded maximum recursion depth` (ADR-0025). The refusal is not immediate, so whether it arrives inside the 10 s deadline depends on the host's speed, and a run records either class for succinctly: `error` (exit 5) where it does, as on an Apple M4 Pro, and `timeout` where it does not, as on an AMD Ryzen 9 7950X under Linux (#7891)."
+subject_class = ["error", "timeout"]
