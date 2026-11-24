@@ -25705,13 +25705,18 @@ mod tests {
     fn the_lone_file_gate_test_ignores_an_open_stdin_pipe_7746() {
         use std::process::{Command, Stdio};
         use std::time::{Duration, Instant};
+        // The other test's path is taken from this module's (libtest's names leave the crate out),
+        // and the child has to say that it ran one test: a name that matches nothing runs no test
+        // and exits 0, which would pass here without reading anything (#7896).
+        let module = module_path!();
+        let name = format!(
+            "{}::windowed_plain_file_takes_only_regular_files_big_enough_6920_7024",
+            module.split_once("::").map_or(module, |(_, rest)| rest)
+        );
         let mut child = Command::new(std::env::current_exe().expect("this test binary"))
-            .args([
-                "windowed_plain_file_takes_only_regular_files_big_enough_6920_7024",
-                "--test-threads=1",
-            ])
+            .args(["--exact", &name, "--test-threads=1"])
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("the test binary runs");
@@ -25730,7 +25735,15 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         };
         let status = status.expect("the child read standard input and never returned");
-        assert!(status.success(), "{status}");
+        // A few lines, so the child was never held up writing them to a pipe nobody was reading.
+        let mut text = String::new();
+        let mut stdout = child.stdout.take().expect("the child's standard output");
+        std::io::Read::read_to_string(&mut stdout, &mut text).expect("the child's report");
+        assert!(status.success(), "{status}\n{text}");
+        assert!(
+            text.contains("running 1 test\n") && text.contains("test result: ok. 1 passed;"),
+            "the child did not run exactly one test under the name {name}:\n{text}"
+        );
     }
 
     /// #7262: a lone `--seq` file the whole-file route could not hold is that route's, which reports it before
