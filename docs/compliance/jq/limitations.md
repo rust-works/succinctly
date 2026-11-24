@@ -501,6 +501,8 @@ In the same way the fault event that follows the array under `--stream-errors -s
 A directory or a file that did not open in the middle of the list kept the 1.7.1 model of the slurp loop until #7807, and reads as 1.8.2 reads it since: `jq -c -s --stream . dir one.json` over `[1]` is `[[[0],1],[[0]]]`, where 1.7.1 lost the `[[0]]`.
 `succinctly yq` is not changed.
 Pinned by `tests/jq_cli/i7523.rs` and `tests/jq_cli/i7807.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`).
+`scripts/jq-stream-errors-oracle-sweep.py`, which compares with the pinned 1.7.1, does not compare a `-s` row that jq 1.7.1 itself runs the program more than once for (`oracle_reruns_slurped_program`, #7890): that second run is the event or fault 1.8.2 keeps in the array.
+It prints how many rows that was and exits 2 when it is more than 0.75% of the run.
 
 ## After the last input has been read to its end, the position is jq 1.7.1's, not jq 1.8.2's (#7607)
 
@@ -8397,15 +8399,27 @@ Three differences remain.
   Over five draws of 2,000 generated look-behinds (10,000 in all) against jq 1.7.1, 1,717 differ from jq without this rule and 86 with it, and none that agreed without it differs now.
   What it does not follow keeps the older shape rules of #6201: an alternation whose branches are of fixed, differing widths is refused here as in jq (`(?<=a|bc)`, `(?<!a(?:b|cd))`, `(?<=(?:a|bc){2})`), wherever it sits in a body this does not read.
   The bodies it does not read are those with a case-insensitive flag, a backreference, a nested lookaround, an atomic group or a comment, `\K`, `\G`, `\Z` or `\R`, a character that is not ASCII, a flag group, a quantified group that Oniguruma merges with another quantifier in a way the table of `onig_reduce_nested_quantifier` does not settle, a repeated class whose possessive reading depends on what the class holds (`(?<=\w*\d)`), and two groups of one name.
-  Left accepted here though jq refuses them: `(?<=\R|a)` (`\R` is one or two characters) and a branch with an anchor beside a character (`(?<=a|b\z)`).
+  Left accepted here though jq refuses them: `(?<=\R|a)` (`\R` is one or two characters) and a `$` (`(?<=a$)`, `(?<=a|b$)`).
   Under the `x` flag or an inline `(?x)` the same rules read the pattern without the blanks and `#` comments the mode ignores, following the mode group by group (`(?x)`, `(?x:...)`, `(?-x)`), since [#7865](https://github.com/rust-works/succinctly/issues/7865): `(?x)(?<=a|bc)`, `(?-x)(?<=a|bc)` and `(?<= a | bc )` under `x` are refused as `(?<=a|bc)` is, and `(?<=a b|bc)` under `x` is accepted.
   Before, a pattern under `x` or with an inline flag group naming `x` skipped them and was answered.
   A brace that opens no interval for the blank it holds is the literal characters the mode leaves (`a{ 0}` is the four characters `a{0}`), and an option group that names only `x` is read as the option group it is, so its body is one of those the reader does not follow (`(?<=(?x:a)+)` is refused by jq and answered here, as `(?<=(?m:a)+)` is).
   An item repeated no times has no length and is nothing to differ over, in or out of the mode: `(?<=(?i:a)b|c{0})` and `(?<=(?:a|bc){0})` under `i` are accepted, as in jq, where the shape rules refused them.
   Over four draws of 550 generated look-behinds, each written ten ways (plain, under `x`, with blanks and comments, behind `(?x)`, inside `(?x:...)`, after `(?-x)`, under `ix`; 22,000 rows) against jq 1.7.1 and 1.8.2, which agree on every row, 5,424 of the 17,600 rows in the extended mode differed from jq before and 2,647 do now, and no row that agreed differs.
-  Those that still differ hold a body from the list above that the reader does not follow, or a brace with a blank outside the mode (`(?<=[^a]\w{1, 2})` is the literal text in jq and read as an interval here), or are refused in other words (`(?<=b*x*?|$cb{2,})` is `invalid pattern in look-behind` in jq and `undefined error code` here, with or without `x`).
+  Those that still differ hold a body from the list above that the reader does not follow, or are refused in other words (`(?<=b*x*?|$cb{2,})` is `invalid pattern in look-behind` in jq and `undefined error code` here, with or without `x`).
+  Since [#7887](https://github.com/rust-works/succinctly/issues/7887) the reader takes a class and a brace as jq does, in the mode or out of it.
+  A `[` inside a class is a member, since jq's classes do not nest: `[[ab]]` is the class `[[ab]` and a `]`, so `(?<=[[ab]]|ab)` is accepted and `(?<=[[ab]]|a)` refused, where it was the other way round.
+  A brace that opens no interval is the characters it is: `(?<=a{0 })` is a look-behind of five characters, where it was taken for one that matches nothing and answered `true`, and `(?<=a{0 }|bc)` is refused.
+  An option run in a branch that is sure to match nothing makes the body no look-behind, as a branch written empty does: `(?<=(?i)a{0}|(a))` and `(?<=x|(?i)|bc)` are accepted, which the shape rules refused.
+  Where such a body also holds `$`, `\z`, `\Z`, `\K`, `\G`, a look-ahead, an atomic group or a comment, or a group that captures in a pattern with a reference or a call, the older rule stands (`(?<=(a)|(?i))\1` is refused, as in jq).
+  A look-behind inside another is judged on its own, and one that such a branch makes no look-behind is nothing for the outer one to differ over (`(?<=(?<=(?-i)|ab))` and `(?<=(?<=a)b|(?i))` are accepted).
+  A `\z` or a `\Z` is allowed in no look-behind, and is refused where the shape rules read the body (`(?<=a\z)`, `(?<!\Z)`, `(?<=(a|b\z))`); `(?<=\z|)`, whose body is written as its empty node first, is still answered.
+  Where the whole pattern is matched without regard to case (the `i` flag or a leading `(?i)`, and no option run that turns `i` off), a class that is not negated and holds a character whose folding is longer than itself (`ß` folds to `ss`) has no one length, and the look-behind it stands in is refused as in jq: `"a" | test("(?<=[[:alpha:]])"; "i")`.
+  The sets looked for are the POSIX brackets `alpha`, `alnum`, `lower`, `upper`, `graph`, `print` and `word`, the negated ones of `lower`, `upper`, `punct`, `digit`, `space`, `xdigit`, `cntrl`, `blank` and `ascii`, and `\D`, `\w` and `\S`; a character written out (`[ß]`), a `\p{..}` property, and a pattern that folds case in a part of it only (`(?<=(?i:[[:alpha:]]))`) are still answered.
+  A look-behind that can match nothing and is repeated (`(?<=a|)+`) is `target of repeat operator is invalid`, as in jq; it was written as its empty node before the repeat was seen, and answered.
+  Still answered differently under `x`: a group in a look-behind that can match nothing keeps its text, because the empty-node rewrite is not made in the extended mode (`"ab" | capture("(?<=(?<n>a)|a{0})b"; "x")` is `{"n":"a"}` here and `{"n":null}` in jq, the first item of #7887).
+  Over 420,000 generated patterns against jq 1.7.1 and 1.8.2, 2,624 rows that differed from jq now match and no row that matched differs.
   The part about a lookahead inside a look-behind (`(?<=(?=a)a)`) is #6197.
-  Pinned by `test_lookbehind_oniguruma_refuses_is_refused_5502`, `tests/jq_cli/i6519.rs` and `tests/jq_cli/i7865.rs`.
+  Pinned by `test_lookbehind_oniguruma_refuses_is_refused_5502`, `tests/jq_cli/i6519.rs`, `tests/jq_cli/i7865.rs` and `tests/jq_cli/i7887.rs`.
 - **A `\K` that ends a look-behind match ends the global search here; jq's never ends.**
   `"cab" | [match("(?<=a\\Kb)";"g")]` never answers in jq 1.7.1: the match is `[2,3)`, jq resumes at its end (3), and the look-behind finds the same match from there, so the search pushes it for ever and grows without bound.
   Matching that would take the host process down, so a match that begins before the offset the search resumed from and ends at it is skipped, and the search moves on one character: the answer is `["b"]` ([#6169](https://github.com/rust-works/succinctly/issues/6169)).
@@ -8585,7 +8599,19 @@ A refusal of a later pass is checked by reading the pattern again with the const
 A reference after or inside a look-around, an atomic group, an absent operator, a conditional or a comment (`(?=a)\k<n>`, `(?>a)\k<n>`, `(?#c)\g<1>`) is read past them, so it is jq's `undefined name <n> reference` or `undefined group <1> reference`, not the `regex` crate's words.
 The repeat checks see past the blanks an inline `(?x)` turns on (`(?x)(?i)+` is `target of repeat operator is not specified`), as they did under the `x` flag only.
 Still the crate's words: a pattern with a call to a group it has (`\g<1>`), which succinctly does not compile, also where jq refuses it for another reason (`(?<n>a)(?<=a|bc)\g<1>` is `invalid pattern in look-behind` in jq).
-Pinned by `tests/jq_cli/i7852.rs` and `tests/jq_cli/i7858.rs`.
+Since [#7888](https://github.com/rust-works/succinctly/issues/7888) an interval whose upper bound is below its lower one is refused where it stands, as Oniguruma refuses it when it reads the token: `a{2,1}\k<m>`, `\A{2,1}`, `{2,1}` and `(?i){2,1}` are `upper is smaller than lower in repeat range`, where the first reported the reference after it and the others the repeat's target.
+A call by a name that starts with a digit and is no number (`\g<1 >`, `\g<2x>`) names no group, which jq says once the whole pattern is read: it is `undefined name <1 > reference`, after a missing group's backreference (`\1\g<1 >` is `invalid backref number/name`), and was `invalid group name <1 >` at once.
+A conditional whose condition starts with `?` (`(?(?i)a)`) is `target of repeat operator is not specified`.
+A count past the limit (`{100001}`) yields to an error before it only when that one is the parse's: `\k<m>a{100001}` is `undefined name <m> reference`, and `\1a{100001}` and `\g<n>a{100001}` are `too big number for repeat range`.
+The scans that put these errors in order read a class as jq does, without nesting (`[[]` is a whole class), a control escape with the character it names (`\c$` is no anchor and `\c(` opens no group, so `(?x)\c$+` and `(?i)\c$+` are answered, which were `target of repeat operator is invalid`), and, under `x`, a group's or a reference's name as it is written (`(?< n>a)` is `invalid char in group name < n>`) and the character after `(?` as the option it is.
+The name of a call runs to its `>` or `'`, pattern syntax and all (`\g<n\k<n>\g<n>` is `undefined name <n\k<n> reference` and `\g<a{2,1}>` `undefined name <a{2,1}> reference`), or to a `)` before then (`\g<n)>)` is `invalid group name <n>`), and a property whose braces never close or hold a `)` or a `{` first is `end pattern with unmatched parenthesis` where it stands (`\p{a)b`, `\p{a{2,1}`), as in jq; both were read on into.
+A reference whose name holds a character no name may (`\k< n>`, `\k<a.b>`, `\k<(>`) is `invalid char in group name < n>` where it stands; it was `undefined name < n> reference`, or left to a later reading.
+A negated property (`\p{^N}`) in a pattern with a call is read on the way to the call's refusal (`\g<n>\p{^N}` is `undefined name <n> reference`, and was `invalid character property name {N}`).
+A backreference at a recursion level (`\k<1+0>`, `\k<n-1>`) is read: in a pattern with no call it is the plain reference at level 0 and matches nothing at any other level, and one to a group the pattern does not have is `invalid backref number/name`, after the errors of the parse; it was `invalid group name <1>` wherever it stood.
+With a call in the pattern (`(a)\g<1>\k<1+0>`) the level counts, and the pattern keeps the crate's words.
+Over 420,000 generated patterns against jq 1.7.1 and 1.8.2, 44,416 rows that differed from jq now match and no row that matched differs.
+Still out of order: `never ending recursion` is reported for a `\g<0>` wherever it stands, where jq allows one that an alternative avoids and reports a later pass's error (`(?<!a|c\g<0>)` is `invalid pattern in look-behind` in jq); and the wording of a few names (`\k<1+>`, which jq words with a second `>`; `\k<a-b>` and `\k<a)>`, `invalid group name` in jq).
+Pinned by `tests/jq_cli/i7852.rs`, `tests/jq_cli/i7858.rs` and `tests/jq_cli/i7888.rs`.
 The rows are pinned against jq 1.7.1 in `tests/jq_cli/i6423.rs` and `tests/jq_cli/i6433.rs`.
 `succinctly yq` is not affected: its patterns are Go's, refused in Go's words (``error parsing regexp: missing closing ]: `[` ``).
 
@@ -13708,6 +13734,7 @@ jq: parse error: Invalid numeric literal at line 1, column 6
 ```
 `succinctly yq` is unchanged: its JSON input goes through the YAML parser, which never read these spellings as numbers.
 The ledger entry `cli:shtest-cve-2023-50268-nan-payload` records the one `succinctly dev compare jq` probe that reads a payload (`Nan4000`), as `newer-than-primary`.
+`scripts/jq-stream-errors-oracle-sweep.py` writes no payload: its generator joins tokens, and a `nan` directly before a digit is given a space (`separate_nan_payload`, #7890), so the rows still run and still compare with jq 1.7.1.
 
 **A parsed NaN compared with itself — closed by
 [#3309](https://github.com/rust-works/succinctly/issues/3309); a container compared with

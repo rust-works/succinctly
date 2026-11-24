@@ -613,10 +613,22 @@ pub(crate) fn tune(pattern: &str, ignore_case: bool) -> Vec<Tuned> {
     let Some(shadow) = oniguruma_shadow(pattern) else {
         return Vec::new();
     };
-    tune_shadow(pattern, &shadow)
+    tune_shadow(pattern, &shadow, true)
 }
 
-fn tune_shadow(pattern: &str, shadow: &OnigurumaShadow) -> Vec<Tuned> {
+/// [`tune`] for a pattern matched without regard to case, sized as if case counted (#7887): what
+/// the look-behinds are before folding widens anything. A body that is empty then is empty still.
+pub(crate) fn tune_unfolded(pattern: &str) -> Vec<Tuned> {
+    if !pattern.contains("(?<") {
+        return Vec::new();
+    }
+    let Some(shadow) = oniguruma_shadow(pattern) else {
+        return Vec::new();
+    };
+    tune_shadow(pattern, &shadow, false)
+}
+
+fn tune_shadow(pattern: &str, shadow: &OnigurumaShadow, case_counts: bool) -> Vec<Tuned> {
     // The offsets are read in both texts; the shadow keeps the pattern's length by construction.
     if shadow.text.len() != pattern.len() {
         return Vec::new();
@@ -635,7 +647,7 @@ fn tune_shadow(pattern: &str, shadow: &OnigurumaShadow) -> Vec<Tuned> {
         .copied()
         .filter(|&at| is_behind(at))
         .collect();
-    if folds_case(&tree, &behind) {
+    if case_counts && folds_case(&tree, &behind) {
         return Vec::new();
     }
     let mut groups = Vec::new();
@@ -690,6 +702,14 @@ pub(crate) fn rewrite_empty(pattern: &str, ignore_case: bool) -> Option<String> 
     let found: Vec<Tuned> = tune(pattern, ignore_case)
         .into_iter()
         .filter(|tuned| tuned.verdict == Verdict::Empty)
+        // A repeat operator after it repeats a look-behind, which the caller's scan refuses as
+        // jq does (`(?<!a|)+`): written as an empty node it would be a repeat jq never sees.
+        .filter(|tuned| {
+            !matches!(
+                pattern.as_bytes().get(tuned.close + 1),
+                Some(b'*' | b'+' | b'?' | b'{')
+            )
+        })
         .collect();
     if found.is_empty() {
         return None;
@@ -853,6 +873,11 @@ mod tests {
             rewrite_empty("(?<=a|bc)b", false),
             None,
             "a body of several lengths"
+        );
+        assert_eq!(
+            rewrite_empty("(?<=a|)+b", false),
+            None,
+            "a repeated look-behind is left for the scan to refuse"
         );
     }
 

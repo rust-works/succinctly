@@ -143,7 +143,7 @@ sha2 = { version = "0.11.1", optional = true }
 # RUSTSEC-2026-0543, #7345). Everywhere, with `std` only; the non-Windows table below adds the
 # system time zone, so on Windows a "local" stamp reads as UTC (jiff falls back to UTC with no
 # `tz-system`). The same crate `local-zone` uses, so no new crate in the tree.
-jiff = { version = "0.2", default-features = false, features = ["std"], optional = true }
+jiff = { version = "1.0", default-features = false, features = ["std"], optional = true }
 
 # `libc` for the CLI's two `signal` calls: `SIGPIPE` back to its default (#5547), as Rust starts a
 # process with it ignored and jq and yq die of it, so `tool | head -n1` is quiet and exits 141,
@@ -160,7 +160,7 @@ libc = { version = "0.2", optional = true }
 # zoneinfo directory for `tzdb-zoneinfo` to read: the released Windows binary keeps
 # the POSIX-offset-string model exactly (#3054).
 [target.'cfg(not(windows))'.dependencies]
-jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"], optional = true }
+jiff = { version = "1.0", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"], optional = true }
 
 [dev-dependencies]
 criterion = "0.8"
