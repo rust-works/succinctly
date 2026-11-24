@@ -8708,7 +8708,7 @@ They are left to that proposal, which is not decided, and no test pins them; eve
   #7877 and #7878 (above) are two shapes of this family under `x`.
 - **A different answer under `x` (about 1,620 rows).** These are wrong answers, not refusals; the first item of #7887 (a group in a look-behind that keeps its text, recorded under #5502) is one shape.
   Another: under `x` jq reads a no-break space (U+00A0) as itself, where the scans here skip it as a blank (`"a " | test("^a +$"; "x")` is `true` in jq and `false` here).
-  So `a*`, a no-break space and `+` is the possessive `a*+` here, and so it is with U+3000, U+0085, U+2003 or a vertical tab in its place: `"aa" | test("a* +"; "x")` is `true` here and `false` in jq, and `"aa" | [match("a* +"; "gx") | .string]` is `["aa",""]` here and `[]` in jq (found by the pre-release differential, no issue yet).
+  So `a*`, a no-break space and `+` is the possessive `a*+` here, and so it is with U+3000, U+0085, U+2003 or a vertical tab in its place: `"aa" | test("a* +"; "x")` is `true` here and `false` in jq, and `"aa" | [match("a* +"; "gx") | .string]` is `["aa",""]` here and `[]` in jq (found by the pre-release differential, #7926).
 
 ### A pattern nests groups at most 511 deep, as in jq 1.8.2 (#7528)
 
@@ -13976,7 +13976,7 @@ jq compares the rounded value, and `succinctly jq` compares the literal as writt
 A number read from the input or from `--argjson` is read the same way (`echo '[1e-1999999999, 0]' | jq '.[0] == .[1]'` is `true` in jq and `false` here).
 Negating one keeps the sign of its digits, where #7453 negates a literal zero to a positive zero as jq 1.8.2 does: `-1e-1999999999`, `1e-1999999999 | -.` and `-$a` for `--argjson a 1e-1999999999` print `-0E-1147483646` here, `0E-1147483646` in jq 1.8.2 and `-0` in jq 1.7.1 (whose `-` computes a double), while one written as a zero (`-0e-999999999999999999999999999999`) is `0E-1147483646` here as in jq 1.8.2.
 Arithmetic is not affected, since a computed number is a double: `1e-1999999999 * 1` is `0` in all three.
-This is not a permitted divergence, only one not yet fixed (found by the pre-release differential, no issue yet, no test).
+This is not a permitted divergence, only one not yet fixed (found by the pre-release differential, #7924, no test).
 
 ### Two equally long slices of one array are `==` in jq, and are compared by content here (#7459)
 
