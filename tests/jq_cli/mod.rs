@@ -17,9 +17,10 @@
 //!   open PR). Extend an existing test in place when it already covers the same behaviour.
 //! - A test that belongs with a topical group already in `jq_cli_tests.rs` (a `mod ... {}`
 //!   block) may still go there, next to its siblings, but never at the end of the file.
-//! - `scripts/deep-recursion-tests.sh` matches its tests by bare name with `--exact`, so a
-//!   test it lists must stay at the root of `jq_cli_tests.rs`: inside this module its name
-//!   would be `per_issue::iN::name` and neither the skip nor the run would find it.
+//! - `scripts/deep-recursion-tests.sh` matches its tests by full name with `--exact`, so a
+//!   test of this directory is listed there as `per_issue::iN::name` (as `i5782`'s and the
+//!   depth gauge of `i3260_depth_capacity` are): under its bare name neither the skip nor the
+//!   run would find it.
 //! - `cargo fmt` cannot follow a macro-generated `mod`, so it does not reach these files:
 //!   `scripts/fmt-per-issue.sh` checks them (CI's `Format` job and `scripts/pre-push.sh` run it).
 //! - Any other `*.rs` file dropped in this directory becomes a module (and a compiled one), so
