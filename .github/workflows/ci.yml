@@ -1203,10 +1203,13 @@ jobs:
         if: needs.gate.outputs.code == 'true'
 
       - name: Install Rust
+        id: toolchain
         if: needs.gate.outputs.code == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          # For the Windows type check, the last step of this job.
+          targets: x86_64-pc-windows-msvc
 
       - name: Run Clippy
         if: needs.gate.outputs.code == 'true'
@@ -1234,6 +1237,29 @@ jobs:
         run: |
           source scripts/lib/clippy-variants.sh
           cargo clippy --all-targets --features "$CLIPPY_CORE_FEATURES" -- -D warnings
+
+      # `release.yml` is the only workflow that builds `x86_64-pc-windows-msvc`, so a change that
+      # stops the Windows build from compiling passed every PR and merge-group check and failed when
+      # a release was cut (#7388: #7279 called a `#[cfg(unix)]` function from code every platform
+      # compiles, found by hand three days later). This type-checks what the release's `windows` leg
+      # builds (`--features cli`, the library and the binary, with that leg's `rustflags`) for that
+      # target on this Linux runner: `cargo check` does not link, so it needs no Windows runner and
+      # no MSVC toolchain. It does not see a link-time or run-time failure; only the release build
+      # does. Warnings are denied, as in the steps above, so an item only the unix builds use is
+      # given its `cfg` instead of piling up as a Windows warning nobody reads.
+      # scripts/test_pre_push.py holds the command to release.yml's.
+      #
+      # It is a step of this job, not a job of its own, because `Clippy` is a required check and the
+      # list of required checks is a repository setting: as a step it blocks a merge and ejects from
+      # the merge queue (this job runs in every merge group, where the gate's `code` is always
+      # `true`), and the job reports success on a docs-only PR as before. It runs whether or not the
+      # Clippy steps passed, so each reports on its own. `RUSTFLAGS` is this step's own: it must not
+      # reach the Clippy steps, and scripts/test_deep_recursion_tests.py allows it nowhere else.
+      - name: Type-check what the release builds for Windows
+        if: ${{ !cancelled() && needs.gate.outputs.code == 'true' && steps.toolchain.outcome == 'success' }}
+        env:
+          RUSTFLAGS: -C target-feature=+popcnt -D warnings
+        run: cargo check --locked --target x86_64-pc-windows-msvc --features cli --lib --bins
 
   fmt:
     name: Format
@@ -1399,34 +1425,6 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
         run: cargo check --locked --features cli,simd,regex,serde
-
-  # `release.yml` is the only workflow that builds `x86_64-pc-windows-msvc`, so a change that stops
-  # the Windows build from compiling passed every PR and merge-group check and failed when a release
-  # was cut (#7388: #7279 called a `#[cfg(unix)]` function from code every platform compiles, found
-  # by hand three days later). This type-checks what the release's `windows` leg builds (`--features
-  # cli`, the library and the binary, with that leg's `rustflags`) for that target on a Linux runner:
-  # `cargo check` does not link, so it needs no Windows runner and no MSVC toolchain. It does not
-  # see a link-time or run-time failure; only the release build does. Warnings are denied, as in
-  # Clippy, so an item only the unix builds use is given its `cfg` instead of piling up as a Windows
-  # warning nobody reads. scripts/test_pre_push.py holds the command to release.yml's. Not a
-  # required check; it skips wholesale like MSRV.
-  windows-check:
-    name: Windows type check
-    needs: gate
-    if: needs.gate.outputs.retest != 'false' && needs.gate.outputs.code == 'true'
-    runs-on: ubuntu-26.04
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Type-check what the release builds for Windows
-        env:
-          RUSTFLAGS: -C target-feature=+popcnt -D warnings
-        run: cargo check --locked --target x86_64-pc-windows-msvc --features cli --lib --bins
 
   # Pull-request coverage: the sticky patch-coverage comment, diffed against the
   # baseline that coverage-baseline.yml published for the PR's merge-base. Only

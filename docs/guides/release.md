@@ -198,10 +198,12 @@ without it, prints a message naming the requirement and `cargo install succinctl
 build) instead of dying on `Illegal instruction`. State the CPU floor in the release notes of the first release
 that ships this. `cargo install` and the library keep the baseline target.
 
-The Windows build is the only one no CI test job compiles, so CI's `Windows type check` job
+The Windows build is the only one no CI test job compiles, so the last step of CI's `Clippy` job
 (`.github/workflows/ci.yml`, #7388) runs `cargo check --locked --target x86_64-pc-windows-msvc --features cli --lib
 --bins` on a Linux runner with the same `RUSTFLAGS` and warnings denied, and the pre-push `windows-check` gate
-(`--full`) runs it where `rustup target add x86_64-pc-windows-msvc` has been run. It type-checks without linking,
+(`--full`) runs it where `rustup target add x86_64-pc-windows-msvc` has been run. `Clippy` is a required check
+and runs in every merge group, so a change that stops the Windows build from compiling cannot merge.
+It type-checks without linking,
 so a link-time or run-time failure on Windows still shows only in the release build.
 
 The Linux archives are built on `ubuntu-24.04` and `ubuntu-24.04-arm`, although the x86_64 CI jobs run on
