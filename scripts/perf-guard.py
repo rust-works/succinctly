@@ -735,7 +735,7 @@ QUERY_THRESHOLDS = {
 # change it covers, or `PERMANENT_LOOSE`. `scripts/test_perf_guard.py` fails once `main` is
 # `ONE_OFF_GRACE_MERGES` merges past that pull request's merge, which leaves the pull request's
 # own runs, the merge queue behind it and the follow-up that removes the entry room to pass.
-ONE_OFF_UNTIL = {"argjson_objects": 7907}
+ONE_OFF_UNTIL = {}
 PERMANENT_LOOSE = frozenset({"wide_keys_unsorted"})
 ONE_OFF_GRACE_MERGES = 50
 
