@@ -180,8 +180,9 @@ percent or two. macOS has no budget, since macOS runners are not spent on the pe
 
 The macOS ARM64 archive is built for macOS 12.0 or newer, not for rustc's default of 11.0 on arm64 (#7321). The
 setting is `MACOSX_DEPLOYMENT_TARGET` in `.cargo/config.toml`'s `[env]`, so the archive, a local `cargo build
---release` and the binary `succinctly dev compare jq` times are built the same way, and `release.yml` needs no
-setting of its own. A 12.0 target gets chained fixups, which remove 22,214 rebases into 103 `__DATA_CONST` pages
+--release` and the binary `succinctly dev compare jq` times get the same deployment target (their cargo features
+differ: [Which binary a run measures](reproducing-the-jq-comparison.md#which-binary-a-run-measures)), and `release.yml`
+needs no setting of its own. A 12.0 target gets chained fixups, which remove 22,214 rebases into 103 `__DATA_CONST` pages
 from every start (about 0.07 ms of `jq -n 1` on an Apple M4 Pro); the cost is that the archive does not run on
 macOS 11. `tests/jq_cli/i7321.rs` reads `minos` and the fixup load command of the built binary.
 State the macOS floor in the release notes of the first release that ships this. `cargo install` builds for the

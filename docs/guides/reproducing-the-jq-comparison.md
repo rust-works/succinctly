@@ -37,6 +37,58 @@ the rest are on you.
 | Enough disk: about 15 GB for the build, both jq builds and the 3.2 GB of `--huge` inputs | no       |
 | Every platform at the same commit                                             | no                     |
 
+## Which binary a run measures
+
+By default the subject of a run is the harness's own executable: a release build with the manifest's features,
+`cli,simd,regex,serde`, plus `bench-runner`, which holds the harness. `env.json` then says `"subject_is_harness": true`,
+and its `succinctly_features` list leaves `bench-runner` out. All three committed runs measured that build. The release
+archives are built by `.github/workflows/release.yml` with `--features cli` alone, and no committed figure is of that
+build ([#7385](https://github.com/rust-works/succinctly/issues/7385)). The index, each report and each generated block
+name the measured binary.
+
+`cli` already turns on `regex` and `serde`, so the measured build and the release build differ in two features:
+
+- **`simd`** gates explicit popcount and balanced-parentheses intrinsics (`src/bits/popcount.rs`, `src/trees/bp.rs`)
+  and nothing else; the release build calls `count_ones()` there. Nothing is known to differ, because no row has been
+  measured on both builds.
+- **`bench-runner`** adds the harness and the benchmark runners, with `ctrlc`, `serde_yaml`, `toml`, `sha2` and what
+  they depend on (24 more crates in an arm64 macOS build).
+
+What differs between the harness build and the `cli` build, as far as it has been measured:
+
+- **Size.** An arm64 macOS build of `cd718f9a6` is 16.3 MB stripped (19.0 MB as built) with `cli`, and 17.6 MB
+  (20.6 MB) with `cli,simd,regex,serde,bench-runner`. Section H of a report sizes the measured binary, so the harness
+  build unless `--subject` was given.
+- **Linked libraries on macOS.** The same `cli` build links `libSystem` and `libiconv`; the harness build links
+  `libobjc` and `Foundation.framework` as well, which come in through `ctrlc` (the committed macOS report lists them in
+  section H). The Linux builds were not compared.
+- **Start-up memory.** A harness process on macOS loads those two libraries, so every small-input memory row of the
+  macOS report carries whatever they cost. The two builds have not been measured at one commit on macOS. On an AMD
+  Ryzen 9 7950X at `e43c3f9c4`, the harness build's peak RSS was a median 0.13 MB above that of a build with
+  `cli,simd,regex,serde` (so `bench-runner` alone) on the rows under 60 MB.
+- **Speed.** Not measured.
+
+To measure another build, build it apart from the harness and pass it as the subject with the features it was built
+with (a binary does not record them):
+
+```bash
+cargo build --release --locked --features cli,simd,regex,serde,bench-runner   # the harness
+cargo build --release --locked --features cli --target-dir target/subject     # what release.yml builds
+./target/release/succinctly dev compare jq --full --huge \
+  --subject target/subject/release/succinctly --subject-features cli
+```
+
+The reports then name a separate build and its features. Two limits:
+
+- A subject whose features are not the manifest's is marked **INVALID** ("build ... differs from the manifest's"), and
+  `--write-docs` refuses it. So a run of the `cli` build can be read from `data/compare/<run_id>/`, and cannot be
+  committed until [comparison/jq/manifest.toml](../../comparison/jq/manifest.toml) names `cli`, which is the open
+  question of #7385.
+- `--subject-features cli,simd,regex,serde` (the manifest's features without `bench-runner`) is a valid run. The
+  memory figures recorded for [#7412](https://github.com/rust-works/succinctly/issues/7412) in
+  [docs/benchmarks/jq.md](../benchmarks/jq.md#memory) were measured that way, so they are of neither the harness build
+  nor the release build.
+
 ## On a machine you control
 
 ```bash
@@ -52,7 +104,8 @@ cargo build --release --locked --features cli,simd,regex,serde,bench-runner
 ```
 
 The feature list is `[succinctly] features` in [comparison/jq/manifest.toml](../../comparison/jq/manifest.toml) plus
-`bench-runner`, which the harness needs. `--full` takes about three hours on a Graviton4 and `--huge` adds about an hour;
+`bench-runner`, which the harness needs. That binary is also the one measured
+([Which binary a run measures](#which-binary-a-run-measures)). `--full` takes about three hours on a Graviton4 and `--huge` adds about an hour;
 both are single-threaded measurements, so core count barely changes that. The run writes `data/compare/<run_id>/`
 (`env.json`, `results.json`, `report.md`) and, with `--write-docs`, rewrites `docs/compare/jq-<os>-<arch>.{md,json}`
 plus the index and the blocks other pages quote.
