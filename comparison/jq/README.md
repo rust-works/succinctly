@@ -72,6 +72,8 @@ ratios are of each tool's fastest run, marked † in the report, because run-to-
 long (#5581). A row with a CV above 5% is marked, and its ratio is not a finding on its own.
 Dimension F runs the resource-limit probes under a 10 s deadline and classes each outcome (ok, error, crash, timeout).
 Its `memory` probes cap the address space with `ulimit -v` (graceful error versus abort; early-exit `first`/`limit`/`isempty` on a generated array); macOS refuses `ulimit -v`, so there they run uncapped as a no-op and only Linux CI exercises the limit.
+A run lowers its own `RLIMIT_CORE` to 1 byte, soft and hard, before it starts anything, and every child inherits it: a probe that ends a tool on a signal (jq 1.7.1 on `strftime/1`, the `memory` rows) leaves no core dump, even where `core_pattern` pipes to a handler, which ignores a limit of 0 (#7891).
+The class, exit status and output of such a row are unchanged; macOS still writes its own crash report.
 
 Dimension H reports binary size, dynamic libraries, the Rust dependency count, whether either tool uses more than one
 core, and licence / `no_std` / CI-runner facts read from the repository. `--build-time` also times a cold build of each pinned jq (`configure` + `make` + `make install`, the tarball download not on the clock) and of succinctly (`cargo build --release --locked` into a scratch target directory after an untimed `cargo fetch`), and the rebuild of succinctly after touching `src/lib.rs`: one run each in `target/compare/build-time/`, which is removed afterwards. It takes minutes, and a figure that long moves with the disk cache and load, so the report gives a magnitude, not a ratio.
