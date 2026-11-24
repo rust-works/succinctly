@@ -2700,7 +2700,14 @@ fn parse_jq(argv: Vec<std::ffi::OsString>, about: Option<&'static str>) -> JqCom
     let mut cmd = JqCommand::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     cmd.named_order = jq_runner::named_flag_order_of(&matches);
     cmd.set_positional_words(walked.positional);
-    checked_json.set_words(argv);
+    // Only a run that kept a value keeps argv with it (#7907): on every other run argv is freed
+    // where it always was, at the end of this function, so the heap the run starts from is the
+    // one it started from before any value was kept. Moving that free past the start of the run
+    // changed which of the allocator's paths every later allocation took, and with it the
+    // instruction count of runs that pass no `--argjson` at all.
+    if checked_json.kept_any() {
+        checked_json.set_words(argv);
+    }
     cmd.checked_json = checked_json;
     cmd
 }

@@ -7477,6 +7477,11 @@ impl CheckedJson {
         Self::check(&mut self.jsonargs, word, index)
     }
 
+    /// Whether any check kept a value: only then is argv worth keeping ([`Self::set_words`]).
+    pub(crate) fn kept_any(&self) -> bool {
+        !(self.argjson.is_empty() && self.jsonargs.is_empty())
+    }
+
     /// Take `argv`, the words the checks were made on, so that a kept value can be matched to
     /// the text that asks for it.
     pub(crate) fn set_words(&mut self, argv: Vec<std::ffi::OsString>) {
@@ -28493,6 +28498,25 @@ mod tests {
             assert_eq!((walked, total), (1, 1));
             assert_eq!(context.named["a"].to_json(), "\"x\"");
             assert_eq!(context.named["b"].to_json(), "2.0");
+        }
+
+        /// argv is kept only beside a kept value (#7907): a run with none frees it where it always
+        /// did, so its heap, and the allocator's work for the rest of the run, are what they were.
+        #[test]
+        fn argv_is_kept_only_beside_a_kept_value() {
+            let parse = |words: &[&str]| {
+                let argv = words.iter().map(std::ffi::OsString::from).collect();
+                crate::cli::parse_jq(argv, None).checked_json
+            };
+            let none = parse(&["jq", "-n", "--arg", "a", "1", "."]);
+            assert!(!none.kept_any() && none.words.is_empty());
+            // A skipped `--argjson` keeps nothing either.
+            let skipped = parse(&["jq", "-n", "--arg", "a", "1", "--argjson", "a", "2", "."]);
+            assert!(!skipped.kept_any() && skipped.words.is_empty());
+            let named = parse(&["jq", "-n", "--argjson", "a", "1", "."]);
+            assert!(named.kept_any() && named.words.len() == 6);
+            let word = parse(&["jq", "-n", ".", "--jsonargs", "1"]);
+            assert!(word.kept_any() && word.words.len() == 5);
         }
 
         /// A `JqCommand` the walk did not read parses each text when it binds it, as before.
