@@ -258,7 +258,7 @@ GATES = (
         (
             f"if rustup target list --installed 2>/dev/null | grep -qx {WINDOWS_TARGET}; then {WINDOWS_CHECK}; "
             f'else echo "    not run: the {WINDOWS_TARGET} rustup target is not installed '
-            f"(rustup target add {WINDOWS_TARGET}); CI's Windows type check job runs it\"; fi",
+            f"(rustup target add {WINDOWS_TARGET}); CI's Clippy job runs it\"; fi",
         ),
         (rf"^{re.escape(WINDOWS_CHECK)}$",),
         paths=RUST_PATHS,
