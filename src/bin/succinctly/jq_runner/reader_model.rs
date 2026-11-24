@@ -803,7 +803,8 @@ pub(crate) fn trace(route: &str, values: usize, faults: usize, refused: usize) {
 ///
 /// - `any_nul`: some source holds a NUL byte (a fact each route's own NUL search already has);
 /// - the first source with a byte starts with `EF` but not with the whole mark `EF BB BF`;
-/// - of two or more sources with bytes, one before the last does not end in a newline.
+/// - of two or more sources with bytes, one before the last ends in a byte other than white
+///   space, `}`, `]` or `"`: a bare token may be open there.
 ///
 /// Reads the first three bytes of one source and the last byte of each: nothing per byte.
 pub(crate) fn trigger<'s>(sources: impl Iterator<Item = &'s [u8]>, any_nul: bool) -> bool {
@@ -823,7 +824,10 @@ pub(crate) fn trigger<'s>(sources: impl Iterator<Item = &'s [u8]>, any_nul: bool
                 }
             }
             Some(end) => {
-                if end != b'\n' {
+                // A source that ends on white space or on the closing byte of a string or
+                // container ends between tokens as far as one byte can say (`[1,{"a":1}` then
+                // `]` is certified wrongly: the splitter's own verdict would not be).
+                if !matches!(end, b'\n' | b' ' | b'\t' | b'\r' | b'}' | b']' | b'"') {
                     return true;
                 }
             }

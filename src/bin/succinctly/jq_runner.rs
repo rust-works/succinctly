@@ -8138,8 +8138,12 @@ struct ModelRead {
 impl ModelRead {
     fn of(raws: &[(Option<usize>, Vec<u8>)], slurp: bool) -> Self {
         let sources: Vec<&[u8]> = raws.iter().map(|(_, raw)| raw.as_slice()).collect();
+        Self::of_sources(&sources, slurp)
+    }
+
+    fn of_sources(sources: &[&[u8]], slurp: bool) -> Self {
         let mut reader = reader_model::Reader::new(
-            &sources,
+            sources,
             reader_model::ReaderProfile::succinctly(),
             slurp,
         );
@@ -8207,6 +8211,94 @@ impl ModelRead {
         (self.end.source != reader_model::NO_SOURCE)
             .then(|| usize::try_from(self.end.line).unwrap_or(usize::MAX - 1))
     }
+}
+
+/// PROTOTYPE (reader model): the result of [`read_inputs`] from the model's items: each value
+/// through [`parse_json_value`] with its place, each fault where the route this replaces puts
+/// one (`resumed_errors` for a program that reads on, `trailing_error` for the main loop's
+/// first). Returns the error a slurp ends in, which stays all-or-nothing.
+#[allow(clippy::too_many_arguments)]
+fn build_from_model(
+    read: ModelRead,
+    args: &JqCommand,
+    track_eof: bool,
+    route: &str,
+    values: &mut Vec<OwnedValue>,
+    locations: &mut InputLocations,
+    resumed_errors: &mut Vec<(usize, TrailingParseError)>,
+    trailing_error: &mut Option<TrailingParseError>,
+    resume_slurp_done: &mut bool,
+) -> Option<anyhow::Error> {
+    BROKEN_MARK_STREAM.with(|flag| flag.set(read.malformed_bom));
+    // #6019: `-n -s` with a program that reads `input`, over a stream with a fault.
+    let resume_slurp = args.slurp && args.null_input && track_eof && read.faults() > 0;
+    *resume_slurp_done = resume_slurp;
+    let resumes = track_eof && (!args.slurp || resume_slurp);
+    let (mut model_values, mut model_faults, mut refused) = (0usize, 0usize, 0usize);
+    for item in read.items {
+        match item {
+            reader_model::Item::Value { text, source, line } => {
+                model_values += 1;
+                let value = parse_json_value(&text).unwrap_or_else(|_| {
+                    // A text jq's parser accepted and the crate's value reader refuses: a gap
+                    // of the prototype, counted in the trace.
+                    refused += 1;
+                    OwnedValue::Null
+                });
+                values.push(value);
+                if !args.slurp {
+                    let (src, line) = model_place(source, line);
+                    locations.push(src as usize, line);
+                }
+            }
+            reader_model::Item::Fault {
+                message,
+                source,
+                line,
+            } => {
+                model_faults += 1;
+                let (src, line) = model_place(source, line);
+                let line = if line == usize::MAX {
+                    UNKNOWN_LINE
+                } else {
+                    line as u64
+                };
+                let error = EvalError::new(message);
+                if resumes {
+                    resumed_errors.push((
+                        values.len(),
+                        TrailingParseError {
+                            error,
+                            source: src,
+                            line,
+                            seq_warning: false,
+                            as_parse_error: false,
+                        },
+                    ));
+                } else if args.slurp {
+                    // `--slurp` stays all-or-nothing, as on the route this replaces.
+                    reader_model::trace(route, model_values, model_faults, refused);
+                    return Some(
+                        MalformedJsonError::new(error)
+                            .at_stream_fault(src as usize, line as usize)
+                            .into(),
+                    );
+                } else {
+                    // jq's main loop stops at the first parse error (#2961).
+                    *trailing_error = Some(TrailingParseError {
+                        error,
+                        source: src,
+                        line,
+                        seq_warning: false,
+                        as_parse_error: true,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    reader_model::trace(route, model_values, model_faults, refused);
+    None
 }
 
 /// PROTOTYPE (reader model): a model position as [`InputLocations::push`] takes it: the source,
@@ -8819,6 +8911,8 @@ fn read_inputs(
             nuls.iter().any(|scan| scan.nul),
         )
     });
+    // Whether the result is the model's: from the start, or after the fast loop met a fault.
+    let mut model_built = use_model;
     // The model's read of the sources as they were read, before anything rewrites them.
     let mut model_read: Option<ModelRead> =
         use_model.then(|| ModelRead::of(&raw_bytes, args.slurp));
@@ -9681,7 +9775,7 @@ fn read_inputs(
     } else {
         raw_inputs.last().map(|(_, raw)| raw.as_bytes())
     };
-    let slurp_eof_line: Option<usize> = if let Some(read) = &model_read {
+    let mut slurp_eof_line: Option<usize> = if let Some(read) = &model_read {
         // PROTOTYPE (reader model): the reader's line when the slurp's last call returned.
         read.slurp_eof_line()
     } else if args.slurp {
@@ -9834,75 +9928,19 @@ fn read_inputs(
         LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
         LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
         LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
-        if read.malformed_bom {
-            BROKEN_MARK_STREAM.with(|flag| flag.set(true));
+        if let Some(failure) = build_from_model(
+            read,
+            args,
+            track_eof,
+            "read_inputs",
+            &mut values,
+            &mut locations,
+            &mut resumed_errors,
+            &mut trailing_error,
+            &mut resume_slurp_done,
+        ) {
+            return Ok(Err(failure));
         }
-        // #6019: `-n -s` with a program that reads `input`, over a stream with a fault.
-        let resume_slurp = args.slurp && args.null_input && track_eof && read.faults() > 0;
-        resume_slurp_done = resume_slurp;
-        let resumes = track_eof && (!args.slurp || resume_slurp);
-        let (mut model_values, mut model_faults, mut refused) = (0usize, 0usize, 0usize);
-        for item in read.items {
-            match item {
-                reader_model::Item::Value { text, source, line } => {
-                    model_values += 1;
-                    let value = parse_json_value(&text).unwrap_or_else(|_| {
-                        // A text jq's parser accepted and the crate's value reader refuses: a gap
-                        // of the prototype, counted in the trace.
-                        refused += 1;
-                        OwnedValue::Null
-                    });
-                    values.push(value);
-                    if !args.slurp {
-                        let (src, line) = model_place(source, line);
-                        locations.push(src as usize, line);
-                    }
-                }
-                reader_model::Item::Fault {
-                    message,
-                    source,
-                    line,
-                } => {
-                    model_faults += 1;
-                    let (src, line) = model_place(source, line);
-                    let line = if line == usize::MAX {
-                        UNKNOWN_LINE
-                    } else {
-                        line as u64
-                    };
-                    let error = EvalError::new(message);
-                    if resumes {
-                        resumed_errors.push((
-                            values.len(),
-                            TrailingParseError {
-                                error,
-                                source: src,
-                                line,
-                                seq_warning: false,
-                                as_parse_error: false,
-                            },
-                        ));
-                    } else if args.slurp {
-                        // `--slurp` stays all-or-nothing, as on the route this replaces.
-                        reader_model::trace("read_inputs", model_values, model_faults, refused);
-                        return Ok(Err(MalformedJsonError::new(error)
-                            .at_stream_fault(src as usize, line as usize)
-                            .into()));
-                    } else {
-                        // jq's main loop stops at the first parse error (#2961).
-                        trailing_error = Some(TrailingParseError {
-                            error,
-                            source: src,
-                            line,
-                            seq_warning: false,
-                            as_parse_error: true,
-                        });
-                        break;
-                    }
-                }
-            }
-        }
-        reader_model::trace("read_inputs", model_values, model_faults, refused);
     } else {
         // Where the next file starts in jq's input, which reads every file as one stream; only
         // the depth limit's message reads it (#5497). The files are consumed as they are read,
@@ -9913,6 +9951,11 @@ fn read_inputs(
             join_dsv_records_across_files(&mut raw_inputs, dsv_config(delimiter).quote_char);
         }
         let last = raw_inputs.len().saturating_sub(1);
+        // PROTOTYPE (reader model): what the loop below leaves for the model when it meets a
+        // fault: the bytes of a lone source (copied only then), and the error a slurp would
+        // have returned.
+        let mut fault_text: Option<Vec<u8>> = None;
+        let mut slurp_failure: Option<anyhow::Error> = None;
         LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
         LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
         LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
@@ -10181,6 +10224,12 @@ fn read_inputs(
                         &ends,
                         values.len() - documents_before,
                     );
+                    if model_scope && last == 0 && !resumed_errors.is_empty() {
+                        fault_text = Some(lossy.map_or_else(
+                            || raw.as_bytes().to_vec(),
+                            |lossy| lossy.original.clone(),
+                        ));
+                    }
                     continue;
                 }
                 // Parse as JSON stream: the clean prefix, and the parse error
@@ -10198,13 +10247,24 @@ fn read_inputs(
                     if let Some(error) = &parse_error {
                         let malformed = MalformedJsonError::new(error.clone());
                         // #5555: the read that met the fault, as the resuming route places it.
-                        return Ok(Err(
+                        let failure: anyhow::Error =
                             match slurp_fault_at(&raw, seam, parsed.len(), args.stream) {
                                 Some(line) => malformed.at_stream_fault(src, line),
                                 None => malformed, // patchcov: coverage tolerate-line reason="unreachable: the prefix parse stopped at value `parsed`, which the splitter either delimits or stopped at, so a read is found; kept so a disagreement falls back to line 0 (#5555)"
                             }
-                            .into(),
-                        ));
+                            .into();
+                        // PROTOTYPE (reader model): the model reads a faulted text again below.
+                        if !model_scope {
+                            return Ok(Err(failure));
+                        }
+                        if last == 0 {
+                            fault_text = Some(lossy.map_or_else(
+                                || raw.as_bytes().to_vec(),
+                                |lossy| lossy.original.clone(),
+                            ));
+                        }
+                        slurp_failure = Some(failure);
+                        break;
                     }
                 }
                 // Skipped under `--slurp` (#1541) -- see the DSV branch above.
@@ -10271,6 +10331,12 @@ fn read_inputs(
                         seq_warning: false,
                         as_parse_error: false,
                     });
+                    if model_scope && last == 0 {
+                        fault_text = Some(lossy.map_or_else(
+                            || raw.as_bytes().to_vec(),
+                            |lossy| lossy.original.clone(),
+                        ));
+                    }
                     break;
                 }
             }
@@ -10283,6 +10349,64 @@ fn read_inputs(
             // `debug_assert_eq!(inputs.len(), locations.per_value().len())`.
             if !args.slurp && !lazy_inputs {
                 debug_assert_eq!(locations.len(), values.len(), "one location per value");
+            }
+        }
+        // PROTOTYPE (reader model): a fault is an edge too. The loop above met one, so its
+        // result is dropped and the model reads the sources as they were read: a lone source
+        // from the copy made at the fault (behind the BOM the strip took), several regular
+        // files from a second read of them. Anything else keeps the loop's result.
+        let faulted =
+            slurp_failure.is_some() || trailing_error.is_some() || !resumed_errors.is_empty();
+        let pristine: Option<Vec<Vec<u8>>> = if !(model_scope && faulted) {
+            None
+        } else if last == 0 {
+            fault_text.take().map(|text| {
+                let cut = bom_cuts.first().copied().unwrap_or(0).min(3);
+                let mut bytes = b"\xEF\xBB\xBF"[..cut].to_vec();
+                bytes.extend_from_slice(&text);
+                vec![bytes]
+            })
+        } else if !files.is_empty()
+            && files
+                .iter()
+                .all(|path| std::fs::metadata(path).is_ok_and(|meta| meta.is_file()))
+        {
+            let (_, raws, failures) = read_input_files(&files, false, false);
+            (failures.is_empty() && raws.len() == last + 1).then_some(raws)
+        } else {
+            None
+        };
+        match pristine {
+            Some(sources) => {
+                let slices: Vec<&[u8]> = sources.iter().map(Vec::as_slice).collect();
+                let read = ModelRead::of_sources(&slices, args.slurp);
+                values.clear();
+                resumed_errors.clear();
+                trailing_error = None;
+                LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
+                let mut fresh = InputLocations::new(locations.files().to_vec());
+                fresh.eof_tail = records_eof.then_some(read.eof_tail());
+                locations = fresh;
+                slurp_eof_line = read.slurp_eof_line();
+                model_built = true;
+                if let Some(failure) = build_from_model(
+                    read,
+                    args,
+                    track_eof,
+                    "read_inputs-after-fault",
+                    &mut values,
+                    &mut locations,
+                    &mut resumed_errors,
+                    &mut trailing_error,
+                    &mut resume_slurp_done,
+                ) {
+                    return Ok(Err(failure));
+                }
+            }
+            None => {
+                if let Some(failure) = slurp_failure {
+                    return Ok(Err(failure));
+                }
             }
         }
     }
@@ -10331,7 +10455,7 @@ fn read_inputs(
             // file to name (`input_filename` is `null`), not the first one.
             let (src, line) = locations
                 .slurp_eof(slurp_eof_line)
-                .unwrap_or((if use_model { NO_SOURCE } else { 0 }, UNKNOWN_LINE));
+                .unwrap_or((if model_built { NO_SOURCE } else { 0 }, UNKNOWN_LINE));
             let mut slurped_locations = InputLocations::new(locations.files().to_vec());
             slurped_locations.unopened_tail = locations.unopened_tail;
             // #6480: the faults go ahead of the array, the one at the end of the text included.
@@ -16710,6 +16834,18 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
         }
         // The front validated and searched for a NUL in one read of it (#7437).
         let scan = succinctly::jq::scan_utf8_and_nul(&bytes[bom..]);
+        // PROTOTYPE (reader model): a regular file whose front holds a NUL or a mark that breaks
+        // off is read whole, before anything rewrites it, for the route that reads it through
+        // the model.
+        if !streamed
+            && (scan.nul || BROKEN_MARK_STREAM.with(std::cell::Cell::get))
+            && reader_model::enabled()
+        {
+            return Ok(match reader.read_to_end(&mut bytes) {
+                Ok(_) => LoneStart::Read(bytes),
+                Err(_) => LoneStart::Declined,
+            });
+        }
         // #7748: the number tokens' NUL tails of the front, as the route that reads the source whole
         // rewrites them ([`blank_nul_number_tails_in`]) and as each window after it is
         // ([`blank_lazy_window_nul_tails`]), before the scan reads it: the text handed to the lazy

@@ -240,7 +240,11 @@ fn reader_model_trigger_reads_the_edges_only() {
     assert!(t(&[b"\xEF"], false));
     assert!(t(&[b"", b"\xEF\xBB", b"\xBF1\n"], false));
     assert!(t(&[b"\xEF1\n"], false));
-    // A source before the last that does not end in a newline.
+    // A source before the last that ends in a byte a bare token or an open container ends in.
     assert!(t(&[b"1", b"2\n"], false));
     assert!(t(&[b"1\n", b"[", b"", b"]\n"], false));
+    assert!(t(&[b"[1,", b"2]"], false));
+    assert!(t(&[b"tr", b"ue"], false));
+    // One that ends where a string or container closes, or on white space, does not.
+    assert!(!t(&[b"{\"a\":1}", b"[2]", b"\"x\"", b"3 ", b"4"], false));
 }
