@@ -114,24 +114,39 @@ mod tests {
     /// Three processes, because the limit cannot be raised again and so must not be set in the
     /// test binary the other tests run in: this one starts a `harness` copy of itself, which calls
     /// `apply` and runs a `tool` copy through `exec_env`; the `tool` prints its limit and aborts.
+    ///
+    /// Where the hard limit is already below 1 byte (a shell after `ulimit -c 0`) it cannot be
+    /// raised to 1: `apply` prints its note and the limit stays what it was, which the child must
+    /// then inherit unchanged. A file `core_pattern` writes no dump under it either, but a piped
+    /// handler ignores a limit of 0, so the `tool` does not abort there: the test would otherwise
+    /// leave the dump this module exists to prevent.
     #[test]
     fn a_harness_child_that_aborts_ran_under_a_core_limit_of_one_byte() {
         match std::env::var(ROLE).ok().as_deref() {
             Some("tool") => {
                 let (soft, hard) = core_limit();
                 println!("core-limit soft={soft} hard={hard}");
-                std::process::abort();
+                if (soft, hard) == (1, 1) {
+                    std::process::abort();
+                }
             }
             Some("harness") => {
+                let before = core_limit();
                 super::apply();
-                assert_eq!(core_limit(), (1, 1));
+                let expected = if before.1 >= 1 { (1, 1) } else { before };
+                assert_eq!(core_limit(), expected);
                 let env = [(ROLE.to_string(), "tool".to_string())];
                 let e = exec_env(&this_test(), &[], "", Path::new("."), &env).unwrap();
                 // libtest prints `test <name> ... ` in front of it, on the same line.
                 let out = String::from_utf8_lossy(&e.stdout);
-                assert!(out.contains("core-limit soft=1 hard=1\n"), "{out}");
-                assert_eq!((e.exit, e.signal), (None, Some(libc::SIGABRT)));
-                assert_eq!(classify(&e), Class::Crash);
+                let line = format!("core-limit soft={} hard={}\n", expected.0, expected.1);
+                assert!(out.contains(&line), "{out}");
+                if expected == (1, 1) {
+                    assert_eq!((e.exit, e.signal), (None, Some(libc::SIGABRT)));
+                    assert_eq!(classify(&e), Class::Crash);
+                } else {
+                    assert_eq!((e.exit, e.signal), (Some(0), None));
+                }
                 println!("harness-saw-the-limit");
             }
             _ => {

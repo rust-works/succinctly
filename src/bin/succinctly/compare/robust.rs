@@ -10,7 +10,7 @@
 use super::exec::{exec_within, Exec};
 use super::harness::Tool;
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
@@ -84,13 +84,33 @@ pub fn parse_probes(text: &str) -> Result<Vec<Probe>> {
     Ok(out)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Class {
     Ok,
     Error,
     Crash,
     Timeout,
+}
+
+impl Class {
+    pub const ALL: [Self; 4] = [Self::Ok, Self::Error, Self::Crash, Self::Timeout];
+
+    /// The name the report, `results.json` and a ledger entry's `subject_class` /
+    /// `reference_class` use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Crash => "crash",
+            Self::Timeout => "timeout",
+        }
+    }
+
+    /// The class called `name`, or `None`: a ledger entry naming an unknown class is refused.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.name() == name)
+    }
 }
 
 pub fn classify(e: &Exec) -> Class {
@@ -116,6 +136,14 @@ pub struct Row {
     pub subject_exit: Option<i32>,
     pub reference_ms: f64,
     pub subject_ms: f64,
+}
+
+impl Row {
+    /// Whether the ledger must list this row: it differs from the reference, or succinctly
+    /// crashed or hung, which is listed even when jq does the same.
+    pub fn is_ledgered(&self) -> bool {
+        !self.matches || matches!(self.subject, Class::Crash | Class::Timeout)
+    }
 }
 
 fn wrapped(tool: &Tool, wrap: Option<&str>) -> Tool {
@@ -232,6 +260,16 @@ mod tests {
         assert_eq!(classify(&e(None, "", true)), Class::Timeout);
     }
 
+    /// A ledger entry names a class by the word `results.json` records for it.
+    #[test]
+    fn a_class_is_named_as_it_is_serialized() {
+        for c in Class::ALL {
+            assert_eq!(serde_json::to_value(c).unwrap(), c.name());
+            assert_eq!(Class::from_name(c.name()), Some(c));
+        }
+        assert!(Class::from_name("Crash").is_none() && Class::from_name("signal").is_none());
+    }
+
     #[test]
     fn the_checked_in_probes_parse() {
         let text = include_str!("../../../../comparison/jq/probes/robust.tsv");
@@ -259,7 +297,15 @@ mod tests {
             (rows[0].reference, rows[0].subject),
             (Class::Ok, Class::Crash)
         );
-        assert!(run(&ok, &ok, &probes, None, Path::new(".")).unwrap()[0].matches);
+        assert!(rows[0].is_ledgered());
+        let same = run(&ok, &ok, &probes, None, Path::new(".")).unwrap();
+        assert!(same[0].matches && !same[0].is_ledgered());
+        // A crash both tools share matches and is still listed. (`KILL`, which is a death by
+        // signal like any other to the classifier and is never dumped.)
+        let killed = sh("kill -KILL $$");
+        let both = run(&killed, &killed, &probes, None, Path::new(".")).unwrap();
+        assert!(both[0].matches && both[0].is_ledgered());
+        assert_eq!(both[0].subject, Class::Crash);
     }
 
     #[test]

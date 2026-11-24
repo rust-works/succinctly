@@ -804,10 +804,7 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
             only("robust").as_ref(),
             &fixtures,
         )?;
-        // A crash or hang of succinctly is listed even when jq does the same.
-        for r in robust_rows.iter().filter(|r| {
-            !r.matches || matches!(r.subject, robust::Class::Crash | robust::Class::Timeout)
-        }) {
+        for r in robust_rows.iter().filter(|r| r.is_ledgered()) {
             observed.insert(format!("robust:{}", r.id));
         }
         dimensions.push(DimensionStatus {
@@ -1000,7 +997,15 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
              robustness and sweeps"
         );
     }
-    let ledger_outcome = ledger::check(&known, &observed, &run_suites);
+    let mut ledger_outcome = ledger::check(&known, &observed, &run_suites);
+    // A listed row keeps its id when a tool starts to end differently (an exit status becoming a
+    // signal, #7891), so the classes an entry states are checked beside the ids.
+    let classed: Vec<(String, robust::Class, robust::Class)> = robust_rows
+        .iter()
+        .filter(|r| r.is_ledgered())
+        .map(|r| (format!("robust:{}", r.id), r.reference, r.subject))
+        .collect();
+    ledger_outcome.class = ledger::check_classes(&known, &classed);
     if args.ledger_only {
         let skipped = ledger::unchecked(&known, &run_suites);
         println!(
@@ -1122,6 +1127,15 @@ pub fn run(args: CompareJqArgs) -> Result<i32> {
         if !ids.is_empty() {
             eprintln!("{what}: {}", ids.join(", "));
         }
+    }
+    if !results.ledger.class.is_empty() {
+        let said: Vec<String> = results
+            .ledger
+            .class
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        eprintln!("listed with another outcome class: {}", said.join("; "));
     }
     Ok(i32::from(
         !differing.is_empty() || !results.ledger.is_clean() || !verify_failures.is_empty(),

@@ -29,6 +29,10 @@ use std::process::Command;
 ///
 /// Apply it to the command that runs the process to be killed (when that is a `sh -c` wrapper that
 /// `exec`s the process, to the `sh`: the limit is inherited across both).
+///
+/// Where the hard limit is already 0 the limit cannot be set and is left as it is: a file
+/// `core_pattern` writes nothing under it either, but a piped handler still receives the dump, so
+/// run the suite on such a host from a shell that has not lowered the limit.
 pub fn without_core_dump(command: &mut Command) -> &mut Command {
     // SAFETY: the closure runs in the forked child before `exec` and makes one `setrlimit` call, which
     // is async-signal-safe; it allocates nothing and takes no lock.
@@ -39,9 +43,20 @@ pub fn without_core_dump(command: &mut Command) -> &mut Command {
                 rlim_max: 1,
             };
             if libc::setrlimit(libc::RLIMIT_CORE, &one) == 0 {
+                return Ok(());
+            }
+            let refused = io::Error::last_os_error();
+            // A hard limit that is already below 1 byte (a shell after `ulimit -c 0`) cannot be
+            // raised to it. The child then runs under the limit it has, as it did before this
+            // helper existed, instead of not being started at all (#7891).
+            let mut now = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_CORE, &mut now) == 0 && now.rlim_max < 1 {
                 Ok(())
             } else {
-                Err(io::Error::last_os_error())
+                Err(refused)
             }
         })
     }
@@ -53,6 +68,7 @@ mod tests {
 
     /// The limit the helper sets reaches the child, soft and hard. `ulimit -c` of a POSIX `sh` counts
     /// blocks, so one byte reads as 0 there: a limit of 0 blocks that is not the unset "unlimited".
+    /// A hard limit that was already 0 reads the same, and the child still starts.
     #[test]
     fn the_child_runs_under_a_core_limit_of_one_byte() {
         let mut command = Command::new("sh");
