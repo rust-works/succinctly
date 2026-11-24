@@ -190,6 +190,13 @@ class PlanTests(unittest.TestCase):
         self.assertIsNone(p["ledger-only"])
         self.assertIsNotNone(p["fmt"])
 
+    def test_a_manifest_change_checks_the_nested_lockfiles_7467(self):
+        # fuzz/ and bench-compare/ depend on the main crate by path: its manifest can stale their locks.
+        for path in ("Cargo.toml", "fuzz/Cargo.toml", "fuzz/Cargo.lock", "bench-compare/Cargo.lock"):
+            self.assertIsNone(self.plan([path])["nested-locks"], path)
+        self.assertIsNotNone(self.plan(["src/jq/eval.rs"])["nested-locks"])
+        self.assertIsNotNone(self.plan(["Cargo.lock"])["nested-locks"])
+
     def test_a_generated_doc_block_runs_the_bench_runner_bin_tests(self):
         # A hand edit to a block the compare tests hold to docs/compare/ fails before the push.
         self.assertIsNone(self.plan(["docs/benchmarks/jq.md"])["bench-runner-bin"])
