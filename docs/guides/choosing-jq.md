@@ -133,8 +133,11 @@ to 7.1x on the M4 Pro, at 100 MB), so jq is the better choice only where 10 to 1
 <!-- claim: stream-abandon -->
 
 One stream shape is slower: taking the first `input` and abandoning the rest (`ndjson_inputs_first` is 0.91x on the
-7950X and 0.64x on the M4 Pro at 100 MB, and 0.94x and 0.61x at 1 GB). `--seq` output, which the reports of 2026-11-12
-showed slower too, is now faster (`users_seq_output` is 2.4x and 3.9x at 10 MB).
+7950X and 0.64x on the M4 Pro at 100 MB, and 0.94x and 0.61x at 1 GB). Discarding a `--seq` input that holds no RS
+byte, which the reports of 2026-11-12 showed slower too, is now faster (`users_seq_output` is 2.4x and 3.9x at 10 MB).
+That row writes no record, whatever its name says: `--seq` skips everything before the first RS, in both tools
+([#7275](https://github.com/rust-works/succinctly/issues/7275)). `users_seq_records` is the same program over the
+document behind an RS, and no committed report has measured it yet.
 
 ### The program needs a jq 1.8 feature
 

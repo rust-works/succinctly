@@ -1239,6 +1239,39 @@ mod tests {
         }
     }
 
+    /// #7275: `users_seq_output` keeps the plain `users` shape the committed runs measured it on
+    /// (no RS byte, so `--seq` reads no record and neither tool writes one), and
+    /// `users_seq_records` is the same program over the RS-framed twin, the row that writes its
+    /// records. Pointing the first at the framed shape would make it another measurement under an
+    /// id the committed reports already quote.
+    #[test]
+    fn the_seq_rows_over_the_users_document_differ_only_in_the_rs_frame() {
+        let qs = parse_queries(include_str!("../../../../comparison/jq/queries/perf.tsv")).unwrap();
+        let row = |id: &str| qs.iter().find(|q| q.id == id).expect(id);
+        let (discard, records) = (row("users_seq_output"), row("users_seq_records"));
+        assert_eq!(discard.shapes, ["users"]);
+        assert_eq!(records.shapes, ["users-seq"]);
+        assert_eq!(
+            (&discard.flags, &discard.filter, &discard.max_tier),
+            (&records.flags, &records.filter, &records.max_tier)
+        );
+        assert!(records.flags.iter().any(|f| f == "--seq"));
+        let (m, _) = super::super::manifest::Manifest::parse(include_str!(
+            "../../../../comparison/jq/manifest.toml"
+        ))
+        .unwrap();
+        for framed in m.inputs.iter().filter(|i| i.shape == "users-seq") {
+            assert_eq!(framed.pattern, "users-seq");
+            let plain = m
+                .inputs
+                .iter()
+                .find(|i| i.shape == "users" && i.tier == framed.tier)
+                .expect("a plain twin at the same tier");
+            assert_eq!((&plain.size, plain.seed), (&framed.size, framed.seed));
+            assert_ne!(plain.sha256, framed.sha256);
+        }
+    }
+
     #[test]
     fn checked_in_queries_parse_and_name_known_shapes() {
         let text = include_str!("../../../../comparison/jq/queries/perf.tsv");

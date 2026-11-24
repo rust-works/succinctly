@@ -604,6 +604,9 @@ enum PatternArg {
     JsonSeqBadFirst,
     /// Like `json-seq`, with one truncated record after the last (#6619)
     JsonSeqBadLast,
+    /// The `users` document as one RFC 7464 record: an RS byte, the document, a line feed
+    /// (one large record for `jq --seq`, which discards a document with no RS, #7275)
+    UsersSeq,
 }
 
 /// Generate a suite of JSON files with various sizes and patterns for benchmarking
@@ -1914,6 +1917,7 @@ impl From<PatternArg> for generators::Pattern {
             PatternArg::JsonSeq => Self::JsonSeq,
             PatternArg::JsonSeqBadFirst => Self::JsonSeqBadFirst,
             PatternArg::JsonSeqBadLast => Self::JsonSeqBadLast,
+            PatternArg::UsersSeq => Self::UsersSeq,
         }
     }
 }
@@ -2844,7 +2848,7 @@ fn run_main() -> Result<()> {
             JsonSubcommand::Generate(args) => {
                 let pattern: generators::Pattern = args.pattern.into();
                 if pattern.is_line_delimited() && args.pretty {
-                    anyhow::bail!("--pretty needs a single document; the ndjson and json-seq patterns (json-seq-bad-first, json-seq-bad-last) have one record per line");
+                    anyhow::bail!("--pretty needs a single document; the ndjson and json-seq patterns (json-seq-bad-first, json-seq-bad-last) have one record per line, and users-seq is one framed record");
                 }
                 let json = generate_json(
                     args.size,
@@ -4256,6 +4260,24 @@ mod tests {
             generators::Pattern::from(PatternArg::JsonSeq),
             generators::Pattern::JsonSeq
         ));
+    }
+
+    /// #7275: `users-seq` is verified as a framed line: the document behind its RS parses, and
+    /// the bare `users` document is refused for it.
+    #[test]
+    fn test_users_seq_pattern_maps_and_is_verified_as_one_framed_record() {
+        use generators::Pattern;
+        assert!(matches!(
+            Pattern::from(PatternArg::UsersSeq),
+            Pattern::UsersSeq
+        ));
+        let framed = generate_json(600, Pattern::UsersSeq, Some(1), 5, 0.1);
+        assert!(validate_generated_json(&framed, false, Pattern::UsersSeq)
+            .unwrap()
+            .is_none());
+        let bare = generate_json(600, Pattern::Users, Some(1), 5, 0.1);
+        let err = validate_generated_json(&bare, false, Pattern::UsersSeq).unwrap_err();
+        assert!(format!("{err:#}").contains("line 1: no RS byte"), "{err:#}");
     }
 
     /// #6619: the faulty `json-seq` patterns have one line that is not JSON, at the end the

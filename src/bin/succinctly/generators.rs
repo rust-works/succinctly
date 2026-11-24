@@ -22,23 +22,28 @@ pub enum Pattern {
     JsonSeq,
     JsonSeqBadFirst,
     JsonSeqBadLast,
+    UsersSeq,
 }
 
 impl Pattern {
-    /// One document per line (`ndjson`, `json-seq`), not a single document: `--verify` checks
-    /// each line, and there is nothing to pretty-print.
+    /// One document per line (`ndjson`, `json-seq`, and the one line of `users-seq`), not a bare
+    /// document: `--verify` checks each line, and there is nothing to pretty-print.
     pub fn is_line_delimited(self) -> bool {
         matches!(
             self,
-            Self::Ndjson | Self::JsonSeq | Self::JsonSeqBadFirst | Self::JsonSeqBadLast
+            Self::Ndjson
+                | Self::JsonSeq
+                | Self::JsonSeqBadFirst
+                | Self::JsonSeqBadLast
+                | Self::UsersSeq
         )
     }
 
-    /// Each record is introduced by an RS byte (RFC 7464): the `json-seq` family.
+    /// Each record is introduced by an RS byte (RFC 7464): the `json-seq` family and `users-seq`.
     pub fn is_framed(self) -> bool {
         matches!(
             self,
-            Self::JsonSeq | Self::JsonSeqBadFirst | Self::JsonSeqBadLast
+            Self::JsonSeq | Self::JsonSeqBadFirst | Self::JsonSeqBadLast | Self::UsersSeq
         )
     }
 
@@ -88,6 +93,7 @@ pub fn generate_json(
         Pattern::JsonSeq => generate_ndjson_json(target_size, seed, true),
         Pattern::JsonSeqBadFirst => generate_json_seq_with_fault(target_size, seed, true),
         Pattern::JsonSeqBadLast => generate_json_seq_with_fault(target_size, seed, false),
+        Pattern::UsersSeq => generate_users_seq_json(target_size, seed),
     }
 }
 
@@ -571,6 +577,16 @@ pub fn generate_json_seq_with_fault(target_size: usize, seed: Option<u64>, first
     } else {
         format!("{records}{JSON_SEQ_FAULT}")
     }
+}
+
+/// The [`generate_users_json`] document as one RFC 7464 record: an RS byte, the document, a line
+/// feed (#7275). The `users` document itself holds no RS, and jq 1.7.1's `--seq` reader discards
+/// everything before the first RS, so `--seq` over it writes nothing; the `json-seq` records are
+/// small ones. This is the one shape where `--seq` reads a single large record and a filter can
+/// write many results out of it. The document is the `users` pattern's own, byte for byte, so
+/// the file is two bytes longer.
+pub fn generate_users_seq_json(target_size: usize, seed: Option<u64>) -> String {
+    format!("\u{1e}{}\n", generate_users_json(target_size, seed))
 }
 
 /// Generate a wide flat object: many distinct top-level scalar keys, no
@@ -1135,6 +1151,20 @@ mod tests {
         assert_eq!(Pattern::JsonSeq.fault_line(10), None);
         assert_eq!(Pattern::Ndjson.fault_line(10), None);
         assert!(Pattern::JsonSeqBadLast.is_framed() && !Pattern::Ndjson.is_framed());
+    }
+
+    /// #7275: `users-seq` is the `users` document behind one RS and before one LF, and nothing
+    /// else, so it is one framed line.
+    #[test]
+    fn test_users_seq_is_the_users_document_as_one_rs_framed_record() {
+        let users = generate_json(4096, Pattern::Users, Some(42), 5, 0.1);
+        let framed = generate_json(4096, Pattern::UsersSeq, Some(42), 5, 0.1);
+        assert_eq!(framed, format!("\u{1e}{users}\n"));
+        assert!(!users.contains('\u{1e}') && !users.contains('\n'));
+        assert_eq!(framed.lines().count(), 1);
+        assert!(Pattern::UsersSeq.is_framed() && Pattern::UsersSeq.is_line_delimited());
+        assert!(!Pattern::UsersSeq.has_fault());
+        assert_eq!(Pattern::UsersSeq.fault_line(1), None);
     }
 
     #[test]

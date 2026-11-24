@@ -680,6 +680,30 @@ size = "100mb"
 seed = 1
 sha256 = "156154efacf44c46f011af8b37ee0a07d2951be78e055b0e4e48ffa373c7fb05"
 
+# The `users` document as one RFC 7464 record (#7275): an RS byte, the document, a line feed. `--seq` over the
+# plain `users` shape reads no record at all (jq 1.7.1 discards what precedes the first RS), and the `jsonseq`
+# records are small, so this is the one shape where a `--seq` filter writes many results out of one record.
+# Each file is its `users` twin plus two bytes; `.users[]|.id` writes 6,990 records from the 1 MB file and 69,905 from
+# the 10 MB one.
+
+[[input]]
+id = "users-seq-1mb"
+shape = "users-seq"
+tier = "1mb"
+pattern = "users-seq"
+size = "1mb"
+seed = 1
+sha256 = "8b8407a09a58c2a165df765061ea9b9fddc928d27bc468cdb51e8761e091155f"
+
+[[input]]
+id = "users-seq-10mb"
+shape = "users-seq"
+tier = "10mb"
+pattern = "users-seq"
+size = "10mb"
+seed = 1
+sha256 = "bc7448b8e3d98cb78c8ba25f0ecc304080161a3192c586cabd95469a56dc619b"
+
 # Dimensions D/E on real files (#5552): JSON files from the benchmark corpus, copied from the vendored seed or from
 # `scripts/sync-bench-corpus.sh`'s fetch, each pinned by the sha256 the corpus manifest records. A fetched file that is
 # not on the machine drops its rows with a note. They are 0.5 KB to 0.8 MB, so most rows are startup-bound.
