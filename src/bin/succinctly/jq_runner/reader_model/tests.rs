@@ -199,14 +199,15 @@ fn reader_model_slurp_equals_jq_182() {
     );
 }
 
-/// `succinctly()` is jq 1.7.1 but for the NUL cut of a newline-less read (#5654), so it equals
-/// 1.7.1 on every case with no NUL.
+/// `succinctly()` is jq 1.7.1 but for the NUL cut of a newline-less read (#5654) and a NaN's
+/// payload (#7522), so it equals 1.7.1 on every case with no NUL (none holds such a NaN).
 #[test]
 fn reader_model_succinctly_profile_is_171_without_the_nul_cut() {
     let profile = ReaderProfile::succinctly();
     assert_eq!(
         ReaderProfile {
             nul_cut: true,
+            nan_payload: true,
             ..profile
         },
         ReaderProfile::jq171()

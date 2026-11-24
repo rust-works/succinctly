@@ -48,6 +48,9 @@ pub(crate) struct ReaderProfile {
     /// jq 1.8.2's `check_literal` case `'\''`: `Invalid string literal; expected ", but got '`.
     /// 1.7.1 reads the token as a number (`Invalid numeric literal`).
     pub single_quote_message: bool,
+    /// jq 1.7.1's `jv_number_with_literal` takes whatever decNumber reads, a NaN with a payload
+    /// included (`NaN5`); 1.8.2 refuses a NaN with a payload (`Invalid numeric literal`).
+    pub nan_payload: bool,
 }
 
 impl ReaderProfile {
@@ -61,6 +64,7 @@ impl ReaderProfile {
     /// - `position_after_end_171: true`: jq 1.7.1.
     /// - `slurp_reads_remaining: true`: jq 1.7.1.
     /// - `single_quote_message: false`: jq 1.7.1.
+    /// - `nan_payload: false`: jq 1.8.2, as the crate's one number grammar decides it (#7522).
     pub(crate) const fn succinctly() -> Self {
         Self {
             read_len: 4095,
@@ -70,6 +74,7 @@ impl ReaderProfile {
             position_after_end_171: true,
             slurp_reads_remaining: true,
             single_quote_message: false,
+            nan_payload: false,
         }
     }
 
@@ -78,6 +83,7 @@ impl ReaderProfile {
     const fn jq171() -> Self {
         Self {
             nul_cut: true,
+            nan_payload: true,
             ..Self::succinctly()
         }
     }
@@ -93,6 +99,7 @@ impl ReaderProfile {
             position_after_end_171: false,
             slurp_reads_remaining: false,
             single_quote_message: true,
+            nan_payload: false,
         }
     }
 }
@@ -181,6 +188,7 @@ struct Parser<'a> {
     st: St,
     max_depth: usize,
     single_quote_message: bool,
+    nan_payload: bool,
 }
 
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
@@ -206,6 +214,7 @@ impl<'a> Parser<'a> {
             st: St::Normal,
             max_depth: profile.max_depth,
             single_quote_message: profile.single_quote_message,
+            nan_payload: profile.nan_payload,
         }
     }
 
@@ -425,7 +434,9 @@ impl<'a> Parser<'a> {
                 .unwrap_or_default();
             // `jv_number_with_literal`: decNumber's grammar. The crate's one definition of it
             // refuses a NaN payload as jq 1.8 does; 1.7.1 accepts `nan5`.
-            if !crate::cli::jq_seq_reader::number_is_valid(c_string) {
+            if !crate::cli::jq_seq_reader::number_is_valid(c_string)
+                && !(self.nan_payload && is_nan_with_payload(c_string))
+            {
                 return Err("Invalid numeric literal");
             }
             let len = c_string.len();
@@ -565,6 +576,21 @@ impl<'a> Parser<'a> {
             None => Next::None,
         }
     }
+}
+
+/// decNumber's NaN with a payload: an optional sign, `NaN` or `sNaN` in any case, then digits.
+fn is_nan_with_payload(token: &[u8]) -> bool {
+    let body = match token.first() {
+        Some(b'+' | b'-') => &token[1..],
+        _ => token,
+    };
+    let body = match body.first() {
+        Some(b's' | b'S') => &body[1..],
+        _ => body,
+    };
+    body.len() > 3
+        && body[..3].eq_ignore_ascii_case(b"nan")
+        && body[3..].iter().all(u8::is_ascii_digit)
 }
 
 /// `unhex4`.
