@@ -39,6 +39,7 @@ use crate::cli::output::{
 };
 
 mod eof_location;
+mod reader_model;
 mod window;
 
 /// One word taken by `--args` (a string) or `--jsonargs` (JSON text), kept
@@ -6071,7 +6072,10 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // stream to the materializing path below, which the run goes on to once they are out.
     let mut seq_tail_handed_on = false;
     let lazy_path_taken = can_use_lazy_path && !args.null_input;
-    if lazy_path_taken {
+    // PROTOTYPE (reader model): the sources may hold an edge jq's reader decides, so the run takes
+    // the route below that reads them through the model (not re-indented: a scratch branch).
+    let mut reader_model_declined = false;
+    if lazy_path_taken { 'lazy_route: {
         // Lazy path: read files as raw bytes and process directly
         // This preserves original number formatting like "4e4"
         // #6920: regular files are read a window at a time (#7024: several, as the one stream jq reads),
@@ -6172,6 +6176,31 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // #7437: each source validated and searched for a NUL in the one read of it, which the
         // substitution below takes the verdict of.
         let scans = reads_plain_json(&args).then(|| scan_sources(&raw_inputs));
+        // PROTOTYPE (reader model): the trigger, from the scan just made and the ends of the
+        // sources. The bytes go to the route below as a route that read them for nothing hands
+        // them on (`seq_plain_json_inputs`).
+        if let Some(scans) = &scans {
+            if windowed.is_none()
+                && failures.is_empty()
+                && reader_model::trigger(
+                    raw_inputs.iter().map(Vec::as_slice),
+                    scans.iter().any(|scan| scan.nul),
+                )
+                && reader_model::enabled()
+            {
+                reader_model::trace("default-route-declined", 0, 0, 0);
+                if files.is_empty() {
+                    STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = raw_inputs.pop());
+                } else {
+                    let named = get_input_files(&args);
+                    NAMED_PUSHBACK.with(|slot| {
+                        *slot.borrow_mut() = Some((named, (files, raw_inputs, failures)));
+                    });
+                }
+                reader_model_declined = true;
+                break 'lazy_route;
+            }
+        }
         if let Some(scans) = &scans {
             blank_nul_number_tails_in(raw_inputs.iter_mut(), Some(scans), false, false);
         }
@@ -6919,8 +6948,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             std::mem::forget(held_index);
             std::mem::forget(held_document);
         }
-    }
-    if !lazy_path_taken || seq_tail_handed_on {
+    } }
+    if !lazy_path_taken || seq_tail_handed_on || reader_model_declined {
         // The materializing path: reads every document up front into a
         // `Vec<OwnedValue>`, which is what the input-builtin queue below needs
         // to seed from and what `-R`/`--seq`/DSV input need in order to
@@ -8093,6 +8122,103 @@ fn last_value_reaches_end_past_faults(
         && (args.raw_input || past_faults || first_stream_fault(raws).is_none())
 }
 
+/// PROTOTYPE (reader model): what [`reader_model::Reader`] read of a run's sources, read whole.
+struct ModelRead {
+    /// Every value and fault, in the order jq's reader hands them out. Under a slurp the values
+    /// are the array's members and carry no position of their own.
+    items: Vec<reader_model::Item>,
+    /// Where the reader stands after the read that found the end of the input (after the call
+    /// that returned the array, under a slurp).
+    end: reader_model::Position,
+    /// The parser is in its `Malformed BOM` state: the last item is that fault, and every read
+    /// after it is that fault again.
+    malformed_bom: bool,
+}
+
+impl ModelRead {
+    fn of(raws: &[(Option<usize>, Vec<u8>)], slurp: bool) -> Self {
+        let sources: Vec<&[u8]> = raws.iter().map(|(_, raw)| raw.as_slice()).collect();
+        let mut reader = reader_model::Reader::new(
+            &sources,
+            reader_model::ReaderProfile::succinctly(),
+            slurp,
+        );
+        let mut items = Vec::new();
+        if slurp {
+            // Each call returns a fault, or at last the array: the faults come first here, and
+            // the members after them.
+            loop {
+                let step = reader.next_input();
+                let at = reader.position();
+                match step {
+                    reader_model::Step::Fault(message) => {
+                        items.push(reader_model::Item::Fault {
+                            message,
+                            source: at.source,
+                            line: at.line,
+                        });
+                        if reader.malformed_bom() {
+                            break;
+                        }
+                    }
+                    reader_model::Step::Slurped(members) => {
+                        items.extend(members.into_iter().map(|text| reader_model::Item::Value {
+                            text,
+                            source: at.source,
+                            line: at.line,
+                        }));
+                        break;
+                    }
+                    reader_model::Step::Value(_) | reader_model::Step::End => break,
+                }
+            }
+        } else {
+            while let Some(item) = reader.next_item() {
+                items.push(item);
+                if reader.malformed_bom() {
+                    break;
+                }
+            }
+        }
+        Self {
+            items,
+            end: reader.position(),
+            malformed_bom: reader.malformed_bom(),
+        }
+    }
+
+    fn faults(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| matches!(item, reader_model::Item::Fault { .. }))
+            .count()
+    }
+
+    /// The end of the input for an `input` that runs past it (#4303).
+    fn eof_tail(&self) -> EofTail {
+        EofTail {
+            newlines: self.end.line,
+            unknown: self.end.source == reader_model::NO_SOURCE,
+        }
+    }
+
+    /// The line a slurp's one value is read at, or `None` for `<unknown>`.
+    fn slurp_eof_line(&self) -> Option<usize> {
+        (self.end.source != reader_model::NO_SOURCE)
+            .then(|| usize::try_from(self.end.line).unwrap_or(usize::MAX - 1))
+    }
+}
+
+/// PROTOTYPE (reader model): a model position as [`InputLocations::push`] takes it: the source,
+/// and the line, `usize::MAX` for a position with no file.
+fn model_place(source: u32, line: u64) -> (u32, usize) {
+    if source == reader_model::NO_SOURCE {
+        (0, usize::MAX)
+    } else {
+        (source, usize::try_from(line).unwrap_or(usize::MAX - 1))
+    }
+}
+
 /// [`get_inputs`], up to the source for a last file that did not open.
 fn read_inputs(
     args: &JqCommand,
@@ -8667,8 +8793,45 @@ fn read_inputs(
     // the events, and the first fault is the error jq raises.
     let stream_by_reader =
         json_input_mode && args.stream && !args.stream_errors && (track_eof || args.slurp);
+    // PROTOTYPE (reader model): the plain JSON reader over sources read whole, with every file
+    // open. The NUL search is the one `blank_nul_number_tails_in` makes of each source: its
+    // verdicts are handed to it below, so a source with no NUL is still searched once.
+    let model_scope = json_input_mode
+        && reads_plain_json(args)
+        && !args.stream
+        && !args.stream_errors
+        && !any_open_failure
+        && !unopened_tail
+        && handed.is_none()
+        && reader_model::enabled();
+    let model_nuls: Option<Vec<succinctly::jq::TextScan>> = model_scope.then(|| {
+        raw_bytes
+            .iter()
+            .map(|(_, raw)| succinctly::jq::TextScan {
+                utf8: false,
+                nul: succinctly::jq::find_nul(raw).is_some(),
+            })
+            .collect()
+    });
+    let use_model = model_nuls.as_ref().is_some_and(|nuls| {
+        reader_model::trigger(
+            raw_bytes.iter().map(|(_, raw)| raw.as_slice()),
+            nuls.iter().any(|scan| scan.nul),
+        )
+    });
+    // The model's read of the sources as they were read, before anything rewrites them.
+    let mut model_read: Option<ModelRead> =
+        use_model.then(|| ModelRead::of(&raw_bytes, args.slurp));
+    if use_model {
+        // The model has read them; nothing below reads these bytes.
+        for (_, raw) in &mut raw_bytes {
+            raw.clear();
+        }
+    }
     // `--seq` keeps the mark: its reader removes it as jq's does, and reacts to one that breaks off.
-    let bom_cuts = if json_input_mode {
+    let bom_cuts = if use_model {
+        Vec::new()
+    } else if json_input_mode {
         // #7897: not for the bytes jq's streaming parser reads here (`--stream-errors`, and
         // `--stream` by the reader): it ends a number token at a NUL itself, a refill at a time
         // (`jq_stream_errors::Parser::check_literal`), and the rewrite moves digits between the
@@ -8676,7 +8839,7 @@ fn read_inputs(
         if reads_plain_json(args) && !args.stream_errors && !stream_by_reader {
             blank_nul_number_tails_in(
                 raw_bytes.iter_mut().map(|(_, raw)| raw),
-                None,
+                model_nuls.as_deref(),
                 track_eof,
                 args.stream,
             );
@@ -8692,6 +8855,7 @@ fn read_inputs(
         && reads_plain_json(args)
         && !args.stream
         && !args.stream_errors
+        && !use_model
         && bom_cuts.iter().all(|&cut| cut == 0)
     {
         let mut mark = crate::cli::front_matter::StreamBomMatch::default();
@@ -8710,12 +8874,16 @@ fn read_inputs(
     // rest to the eager reader, so a program that stops early does not scan every file but the last
     // whole: the files before the one a scan reaches are clean, with nothing open for the next.
     let several_lazy = lazy_read_flags(args, track_eof)
+        && !use_model
         && raw_bytes.len() > 1
         && raw_bytes
             .iter()
             .all(|(_, raw)| std::str::from_utf8(raw).is_ok());
     let mut seams = if several_lazy {
         vec![Seam::NONE; raw_bytes.len()]
+    } else if use_model {
+        // PROTOTYPE (reader model): the parser carries an open token over a seam itself.
+        Vec::new()
     } else if json_input_mode && !args.validate && !args.stream_errors && !stream_by_reader {
         stitch_json_file_seams(
             raw_bytes.iter_mut().map(|(_, raw)| raw),
@@ -9384,12 +9552,19 @@ fn read_inputs(
     // that is not UTF-8.
     // #5857: several files take it as `several_lazy` admits them, so the bytes as read are the text
     // the route holds.
-    let lazy_candidate =
-        records_eof && json_input_mode && !args.stream && (raw_bytes.len() == 1 || several_lazy);
-    let mut eof_tail = (records_eof && !lazy_candidate).then(|| {
-        let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
-        EofTail::of(&sources, args.raw_input, &seams, args.stream)
-    });
+    let lazy_candidate = records_eof
+        && json_input_mode
+        && !args.stream
+        && !use_model
+        && (raw_bytes.len() == 1 || several_lazy);
+    let mut eof_tail = match &model_read {
+        // PROTOTYPE (reader model): where the reader stands after the read that found the end.
+        Some(read) => records_eof.then_some(read.eof_tail()),
+        None => (records_eof && !lazy_candidate).then(|| {
+            let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
+            EofTail::of(&sources, args.raw_input, &seams, args.stream)
+        }),
+    };
 
     // All reads happen first, then decoding: a later file's read error still
     // outranks an earlier file's content error, as it did before.
@@ -9506,7 +9681,10 @@ fn read_inputs(
     } else {
         raw_inputs.last().map(|(_, raw)| raw.as_bytes())
     };
-    let slurp_eof_line: Option<usize> = if args.slurp {
+    let slurp_eof_line: Option<usize> = if let Some(read) = &model_read {
+        // PROTOTYPE (reader model): the reader's line when the slurp's last call returned.
+        read.slurp_eof_line()
+    } else if args.slurp {
         last_source.and_then(|raw| {
             // #1550: the drop check reads across every file as one stream,
             // not just `raw_inputs.last()` alone -- a truncated record's
@@ -9651,6 +9829,80 @@ fn read_inputs(
             values = build_raw_input_values(&raw_inputs, &mut locations);
             debug_assert_eq!(locations.len(), values.len(), "one location per value");
         }
+    } else if let Some(read) = model_read.take() {
+        // PROTOTYPE (reader model): the values and faults are the model's, in its order.
+        LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
+        LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
+        LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
+        if read.malformed_bom {
+            BROKEN_MARK_STREAM.with(|flag| flag.set(true));
+        }
+        // #6019: `-n -s` with a program that reads `input`, over a stream with a fault.
+        let resume_slurp = args.slurp && args.null_input && track_eof && read.faults() > 0;
+        resume_slurp_done = resume_slurp;
+        let resumes = track_eof && (!args.slurp || resume_slurp);
+        let (mut model_values, mut model_faults, mut refused) = (0usize, 0usize, 0usize);
+        for item in read.items {
+            match item {
+                reader_model::Item::Value { text, source, line } => {
+                    model_values += 1;
+                    let value = parse_json_value(&text).unwrap_or_else(|_| {
+                        // A text jq's parser accepted and the crate's value reader refuses: a gap
+                        // of the prototype, counted in the trace.
+                        refused += 1;
+                        OwnedValue::Null
+                    });
+                    values.push(value);
+                    if !args.slurp {
+                        let (src, line) = model_place(source, line);
+                        locations.push(src as usize, line);
+                    }
+                }
+                reader_model::Item::Fault {
+                    message,
+                    source,
+                    line,
+                } => {
+                    model_faults += 1;
+                    let (src, line) = model_place(source, line);
+                    let line = if line == usize::MAX {
+                        UNKNOWN_LINE
+                    } else {
+                        line as u64
+                    };
+                    let error = EvalError::new(message);
+                    if resumes {
+                        resumed_errors.push((
+                            values.len(),
+                            TrailingParseError {
+                                error,
+                                source: src,
+                                line,
+                                seq_warning: false,
+                                as_parse_error: false,
+                            },
+                        ));
+                    } else if args.slurp {
+                        // `--slurp` stays all-or-nothing, as on the route this replaces.
+                        reader_model::trace("read_inputs", model_values, model_faults, refused);
+                        return Ok(Err(MalformedJsonError::new(error)
+                            .at_stream_fault(src as usize, line as usize)
+                            .into()));
+                    } else {
+                        // jq's main loop stops at the first parse error (#2961).
+                        trailing_error = Some(TrailingParseError {
+                            error,
+                            source: src,
+                            line,
+                            seq_warning: false,
+                            as_parse_error: true,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+        reader_model::trace("read_inputs", model_values, model_faults, refused);
     } else {
         // Where the next file starts in jq's input, which reads every file as one stream; only
         // the depth limit's message reads it (#5497). The files are consumed as they are read,
