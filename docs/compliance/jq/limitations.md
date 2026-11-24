@@ -413,6 +413,7 @@ Before #7921 the token was left malformed, so the number was lost, and the fault
 With one space fewer the chunk hides the quote too (jq 1.7.1: the fault, `1`, `8`, `9`; jq 1.8.2: the fault, `1`, the unfinished string); with one more the token goes on with a byte of the next chunk (jq 1.7.1: the fault and `Invalid numeric literal at line 1, column 4096`; jq 1.8.2 as before); `succinctly jq` gives the fault, the unfinished string, `8` and `9` for both.
 Matching jq 1.7.1 there is discarding input after a NUL, which this section declines, and matching jq 1.8.2 is adopting its 4,091-byte chunk on every route.
 A number with a NUL that ends a file with no newline, followed by another file, is still an error where both releases read the number ([#7922](https://github.com/rust-works/succinctly/issues/7922)).
+That fault is met in the next file's first read, so it drops the rest of that read: when an earlier number on the same long line is one of the two shapes above (`1`, a NUL, `a`, a space, `2`, a NUL, `b` at the end of one file after 4,092 spaces, and a space, `3` and a newline in the next), `succinctly jq` now reads `1` and loses the `3` to the fault, where before #7921 it lost the `1` and read the `3`; both jq releases read `1`, `2` and `3`, and so will `succinctly jq` once #7922 reads the `2`.
 A column jq 1.7.1 reports later on such a line does not count the bytes its chunk hid, and `succinctly jq` counts them, as jq 1.8.2 does.
 Pinned by `tests/jq_cli/i7921.rs`, which holds the residual rows too.
 
