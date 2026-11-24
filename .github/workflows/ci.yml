@@ -1135,11 +1135,17 @@ jobs:
       # Linux, 64 KB or a whole large folio per scattered function). Fails when more than 64 KB of
       # them is missing: rerun `scripts/link-order/generate.py linux` and commit the list. The
       # wrapper's trace and log come first: how many names it ordered, or why it linked plain.
+      #
+      # #7894: `stale` reads that log and fails when more than 5% of the listed names no longer
+      # resolve (`STALE_PERCENT` in generate.py says why 5). The startup check alone let the list
+      # drift for 222 merges: the functions that went missing were on the paths of ordinary rows,
+      # not of the two startup runs it traces, and each kept a page of text resident per run.
       - name: Link order covers the startup path
         if: matrix.name == 'x86_64'
         run: |
           cat "$RUNNER_TEMP/link-order-trace.txt" || echo "the linker wrapper ran for no link"
           ls -t target/release/deps/succinctly*.link-order.log target/release/build/succinctly/*/out/succinctly*.link-order.log 2>/dev/null | head -1 | xargs -r cat
+          python3 scripts/link-order/generate.py stale target/release
           python3 scripts/link-order/generate.py check target/release/succinctly scripts/link-order/symbols.txt 65536
 
       # #5704: what the lookup step above finds. Named by arch, SHA and a hash of
