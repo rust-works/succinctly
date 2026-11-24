@@ -4,6 +4,8 @@
 
 Generated comparison of `jq` 1.7.1 (primary) and 1.8.2 (secondary) with `succinctly jq`: features, correctness, performance, memory, robustness and operational properties. Reproduce with `succinctly dev compare jq`; see [comparison/jq/README.md](../../comparison/jq/README.md). Each platform has its own report; memory-bound effects do not port across architectures, so no figure is extrapolated between them.
 
+**Measured binary** (every platform): the harness itself, built with `cli,simd,regex,serde` plus `bench-runner`. The release archives are built with `cli` alone, and no figure here is of that build; `--subject` measures another build ([reproducing-the-jq-comparison.md](../guides/reproducing-the-jq-comparison.md#which-binary-a-run-measures)).
+
 | Platform | CPU | Commit | Builtins agreeing | CLI probes | Upstream jq tests | Geomean speedup |
 |----------|-----|--------|-------------------|------------|-------------------|-----------------|
 | [linux-aarch64](jq-linux-aarch64.md) | ARM Neoverse-V2 | `73f049b2c` | 98.1% | 469/482 | 738/738 | 2.71x |

@@ -34,13 +34,16 @@ pub fn render(results: &Results) -> String {
     if r.command.contains("--control") {
         let _ = writeln!(s, "> **CONTROL RUN:** the subject is jq itself, so every ratio shows the harness's noise floor, not a comparison.\n");
     }
-    if !e.subject_is_harness {
-        let _ = writeln!(
-            s,
-            "> Timed binary: a separate build (`{}`), not the harness (#5570).\n",
-            e.succinctly_features.join(",")
-        );
-    }
+    // Always said, since the harness's own build is not the release archive's either (#7385).
+    let _ = writeln!(
+        s,
+        "> Measured binary: {}.\n",
+        super::docs::subject_note(
+            e.subject_is_harness,
+            &e.succinctly_features.join(","),
+            super::docs::SUBJECT_GUIDE_PATH
+        )
+    );
     if !e.invalid_reasons.is_empty() {
         let _ = writeln!(s, "> **INVALID RUN — do not quote the timings:**");
         for why in &e.invalid_reasons {

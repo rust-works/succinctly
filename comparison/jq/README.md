@@ -86,12 +86,17 @@ core, and licence / `no_std` / CI-runner facts read from the repository. `--buil
 ```
 
 The harness needs `bench-runner`, which the shipped CLI does not carry (`bench-runner` pulls in `ctrlc`, which links Foundation on macOS, #5551).
-To time the shipped build instead, build it separately and pass it in; the report records that the timed binary is not the harness:
+By default the harness measures itself, so the committed reports are of a `cli,simd,regex,serde` build plus `bench-runner`, where the release archives are built with `cli` alone (#7385).
+To measure a build without the harness instead, build it separately and pass it in; the report records that the timed binary is not the harness:
 
 ```bash
 cargo build --release --features cli,simd,regex,serde --target-dir target/subject
 ./target/release/succinctly dev compare jq --quick --subject target/subject/release/succinctly --subject-features cli,simd,regex,serde
 ```
+
+That subject has the manifest's features, so the run is valid; it is still not the release build.
+`--features cli` with `--subject-features cli` measures what `release.yml` builds, and the run is then marked **INVALID** for differing from `manifest.toml`, so `--write-docs` refuses it.
+[Which binary a run measures](../../docs/guides/reproducing-the-jq-comparison.md#which-binary-a-run-measures) lists what is known to differ between the builds.
 
 `--write-docs` writes `docs/compare/jq-<platform>.{md,json}` and the index `docs/compare/jq.md`, and regenerates the `<!-- compare:jq-<platform> -->` block of `docs/benchmarks/jq.md` from that json.
 A platform's first run needs the two markers added at the top of its section there.

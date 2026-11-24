@@ -4,6 +4,8 @@
 
 Apple M4 Pro · macOS 26.5.1 · 12 cores · `73f049b2c`
 
+> Measured binary: the harness itself, built with `cli,simd,regex,serde` plus `bench-runner`. The release archives are built with `cli` alone, and no figure here is of that build; `--subject` measures another build (`docs/guides/reproducing-the-jq-comparison.md`).
+
 ## Summary
 
 | Metric                      | Value |
