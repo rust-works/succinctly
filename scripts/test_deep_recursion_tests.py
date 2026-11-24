@@ -310,12 +310,18 @@ class CiWiringTests(unittest.TestCase):
         )
         self.assertEqual(code.count("CARGO_PROFILE_"), 4 * sum(optimised_jobs.values()))
         self.assertEqual(code.count("CARGO_INCREMENTAL"), 2 * sum(optimised_jobs.values()))
-        # #7388: the one `RUSTFLAGS` is a step's own, in the job that type-checks the Windows build
-        # (no test runs there), so it reaches no test leg.
-        windows = re.search(r"^  windows-check:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", code, re.M | re.S)
-        self.assertEqual(windows.group(1).count("RUSTFLAGS:"), 1)
-        self.assertRegex(windows.group(1), r"\n        env:\n          RUSTFLAGS: .*\n        run: cargo check ")
-        code = code.replace(windows.group(0), "")
+        # #7388: the one `RUSTFLAGS` is a step's own, on the step of the `clippy` job that
+        # type-checks the Windows build (no test runs in that job), so it reaches no test leg and
+        # no other step. Only that step's `env` is set aside: the rest of the job is still held to
+        # the rule below.
+        clippy = re.search(r"^  clippy:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", code, re.M | re.S)
+        own = re.findall(
+            r"\n        env:\n          RUSTFLAGS: .*(?=\n        run: cargo check --locked --target \S+ )",
+            clippy.group(1),
+        )
+        self.assertEqual(len(own), 1)
+        self.assertEqual(code.count("RUSTFLAGS:"), 1)
+        code = code.replace(own[0], "")
         self.assertNotRegex(code, r"opt-level|RUSTFLAGS:")
         manifest = (CI_YML.parents[2] / "Cargo.toml").read_text()
         self.assertNotRegex(manifest, r"(?m)^\[profile\.(dev|test)\b")

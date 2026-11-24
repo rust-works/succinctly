@@ -559,8 +559,9 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests
 ```
 
-No CI test job builds for Windows, which only the release does, so CI's `Windows type check` job and the
-`windows-check` pre-push gate (`--full`) type-check the release's Windows build from any host (#7388). An item
+No CI test job builds for Windows, which only the release does, so the last step of CI's `Clippy` job and the
+`windows-check` pre-push gate (`--full`) type-check the release's Windows build from any host (#7388). The step is
+in `Clippy` because that job is a required check, so a Windows break blocks a merge and ejects from the merge queue. An item
 that only unix code uses needs `#[cfg(unix)]` (`#[cfg(any(unix, test))]` when a unit test calls it), or this fails
 on the unused-item warning:
 

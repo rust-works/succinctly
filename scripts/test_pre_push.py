@@ -157,9 +157,20 @@ class GateTableTests(unittest.TestCase):
         self.assertIn(f"rustflags: {pre_push.WINDOWS_RUSTFLAGS}\n", leg)
         self.assertIn("run: cargo build --verbose --release --features cli --target ${{ matrix.target }}\n", release)
         self.assertIn(" --features cli --lib --bins", pre_push.WINDOWS_CHECK)
-        # CI's job and the gate run one command under one RUSTFLAGS, warnings denied.
+        # CI's step and the gate run one command under one RUSTFLAGS, warnings denied. The step is
+        # in the `Clippy` job, a required check, so a Windows break blocks a merge and ejects from
+        # the merge queue without a repository setting: that job has no `if` on the event, its code
+        # steps run when the gate says `code`, and no second copy runs as a job of its own.
         with open(os.path.join(ROOT, ".github/workflows/ci.yml"), encoding="utf-8") as f:
-            ci = f.read()
+            workflow = f.read()
+        ci = re.search(r"^  clippy:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", workflow, re.M | re.S).group(1)
+        self.assertEqual(workflow.count(pre_push.WINDOWS_CHECK), 1)
+        self.assertNotIn("windows-check:", workflow)
+        self.assertTrue(ci.startswith("    name: Clippy\n"))
+        self.assertIn("\n    if: needs.gate.outputs.retest != 'false'\n", ci)
+        step = next(s for s in re.split(r"^      - ", ci, flags=re.M) if pre_push.WINDOWS_CHECK in s)
+        self.assertRegex(step, r"\n        if: .*needs\.gate\.outputs\.code == 'true'")
+        self.assertNotIn("github.event_name", step)
         gate = next(g for g in pre_push.GATES if g.name == "windows-check")
         flags = gate.env["RUSTFLAGS"]
         self.assertEqual(flags, f"{pre_push.WINDOWS_RUSTFLAGS} -D warnings")
