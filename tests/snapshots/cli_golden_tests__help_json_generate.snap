@@ -35,6 +35,7 @@ Options:
           - json-seq:           Like `ndjson`, with each record introduced by an RS byte (RFC 7464 JSON text sequences, the input of `jq --seq`)
           - json-seq-bad-first: Like `json-seq`, with one truncated record before the first (a `--seq` stream with a diagnostic, the shape no clean stream exercises, #6619)
           - json-seq-bad-last:  Like `json-seq`, with one truncated record after the last (#6619)
+          - users-seq:          The `users` document as one RFC 7464 record: an RS byte, the document, a line feed (one large record for `jq --seq`, which discards a document with no RS, #7275)
           
           [default: comprehensive]
 

@@ -226,7 +226,8 @@ const CLAIMS: &[Claim] = &[
                 "ndjson-100mb",
             ) < 24.0
     }),
-    // One stream shape where jq is the faster tool, and `--seq` output, which no longer is.
+    // One stream shape where jq is the faster tool, and discarding a `--seq` input with no RS byte
+    // (what `users_seq_output` times, #7275), which no longer is.
     ("stream-abandon", |r| {
         speedup(r, "ndjson_inputs_first", "ndjson-100mb") < 1.0
             && speedup(r, "users_seq_output", "users-10mb") > 1.5

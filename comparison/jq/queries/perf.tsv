@@ -56,7 +56,9 @@ users_three_files	-c @files=3	.users|length	users	10mb
 seq_identity	--seq -c	.	jsonseq	100mb
 seq_field	--seq -r	.name	jsonseq	100mb
 seq_slurp	--seq -s -c	map(.score)|add	jsonseq	10mb
+# `users_seq_output` writes no output (#7275): the `users` document holds no RS byte, and jq 1.7.1's `--seq` reader discards everything before the first RS, so both tools print one `ignoring parse error` diagnostic and nothing else. It times discarding such a stream and keeps the id the committed runs measured it under. `users_seq_records` runs the same program over the same document behind an RS (`users-seq`), so it writes one RFC 7464 record per user.
 users_seq_output	--seq -c	.users[]|.id	users	10mb
+users_seq_records	--seq -c	.users[]|.id	users-seq	10mb
 seq_field_bad_first	--seq -r	.name	jsonseq-bad-first	100mb
 seq_field_bad_last	--seq -r	.name	jsonseq-bad-last	100mb
 users_slurpfile	-n --slurpfile d @INPUT@	$d[0].users|length	users	10mb
