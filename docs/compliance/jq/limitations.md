@@ -8039,6 +8039,7 @@ The output, standard error included, and the exit status of every row are the ba
 
 Two costs that [#7483](https://github.com/rust-works/succinctly/issues/7483) and [#7789](https://github.com/rust-works/succinctly/issues/7789) cut are not yet down to jq's.
 The answers are jq's in both; only the time or the memory differs.
+The subsections after those two record open performance issues the same way: the answer is jq's wherever the run finishes, and what differs is a cost.
 
 ### A recursion that binds a member of its state between two calls (#7483)
 
@@ -8063,6 +8064,38 @@ Measured for PR [#7838](https://github.com/rust-works/succinctly/pull/7838) (rel
 Over 300 chains of 120 nested objects `del(.. | .n?) | tojson | length` peaks at 0.60x jq 1.7.1's on the AMD Ryzen 9 7950X and 0.67x on the Apple M4 Pro, and `delpaths([path(.. | .n?)]) | tojson | length` at 2.29x and 1.66x.
 What is left is the size of a path: each distinct path node such a delete names is a `PathPrefix` of 112 bytes on a 64-bit target (its component is a 96-byte `Expr`), held with a node of the delete trie and its edges for as long as the document, and shrinking it needs a compact path-component type through the path resolver.
 The answers are pinned by `tests/jq_cli/i7789.rs`, and the sharing by the unit tests in `del_path_memory_tests_7789` (`src/jq/eval.rs`).
+
+### A closure argument that adds to a generator at each level is built whole before `first` reads it (#7870)
+
+`def f(g; $n): if $n <= 0 then g else f(g + (1,3); $n - 1) end; first(f((1,3); 16))` prints `17` here and in jq 1.7.1 and 1.8.2.
+jq pulls one output of `g` at a time, so `first` stops the chain after its first value and `first(f((1,3); 500))` prints `501` at once in both releases.
+`succinctly jq` builds all `2^n` outputs of the argument chain before `first` gets its value, so its time and its memory are exponential in `n`.
+A depth jq answers at once therefore does not finish here: `first(f((1,3); 500))` grows until an allocation fails and the process aborts (`memory allocation of 1073741824 bytes failed`, under a 2 GiB address-space cap on x86_64 Linux).
+The pipe spelling, `f(g | . + (1,3); $n - 1)`, grows the same way.
+An object or a string interpolation around `g` (`f({k: g, v: (1,3)}; $n - 1)`, `f("\(g)\((1,3))"; $n - 1)`) does not grow that way: both answer at 500 levels as jq does, and deeper the recursion is refused at the native-stack floor, as the section on recursive `def`s says.
+Open as [#7870](https://github.com/rust-works/succinctly/issues/7870); no test pins the cost.
+
+### A memo array a recursion writes to and threads through `as` bindings (#7803)
+
+A memoised Hofstadter Q sequence that carries its memo array from call to call through `as` bindings gives jq's answers and takes time that grows faster than linearly in N, about the shape of a quadratic, where jq 1.7.1 and 1.8.2 grow about linearly:
+`def Q: def Q(n): n as $n | (if . == null then [1, 1, 1] else . end) as $q | if $q[$n] != null then $q else $q | Q($n - 1) as $q1 | $q1 | Q($n - 2) as $q2 | $q2 | Q($n - $q2[$n - 1]) as $q3 | $q3 | Q($n - $q3[$n - 2]) as $q4 | ($q4[$n - $q4[$n - 1]] + $q4[$n - $q4[$n - 2]]) as $ans | $q4 | setpath([$n]; $ans) end; . as $n | null | Q($n) | .[$n]; 800 | Q` prints `452` in all three, and `1500` for 3200.
+The cost of a call depends on the length of the array it carries, and it needs a write to that array: [#7803](https://github.com/rust-works/succinctly/issues/7803) found that passing an array through 2,000 calls unchanged costs the same at any length.
+This is a different cost from the constant per call of #7699 (the section on recursive `def`s).
+Past about 4,200 levels the same program is refused at the native-stack floor (`Q/1 exceeded maximum recursion depth` for 5000, where jq prints `2423`), which that section records.
+Open as #7803; no test pins the cost.
+
+### An `--argjson` value costs more to read than the same JSON through `--slurpfile` (#7881)
+
+This one is not a difference from jq, which was not measured; it is recorded as [#7881](https://github.com/rust-works/succinctly/issues/7881) states it.
+Reading an `--argjson` value costs about 800 instructions per byte of its text, about twenty times what `--slurpfile` pays for the same kind of JSON, whether or not the program uses the variable (cachegrind instruction counts on an AMD Ryzen 9 7950X, `main` at b063f49e8).
+The cost is linear in the value, so it is a constant factor, and the operating system's limit on one argument bounds it (128 KiB on Linux).
+It was not compared with an older build, and `--jsonargs` was not measured.
+
+### `map_values` over a wide object is slower on an Apple M4 Pro since the CLI is compiled into the library (#7392)
+
+This one is a difference from an earlier build of `succinctly jq`, not from jq, which is slower on the row in every committed report ([docs/compare/](../../compare/jq.md)).
+`map_values(.+1)|length` over the `wide` fixture (`wide_map_values` in `comparison/jq/queries/perf.tsv`) is several percent slower at 1 MB and at 10 MB on an Apple M4 Pro than before #7384, which compiles the CLI as a module of the library, and unchanged on an AMD Ryzen 9 7950X, as [#7392](https://github.com/rust-works/succinctly/issues/7392) measured it with `succinctly dev compare jq --full`.
+The cause is in how the same source is compiled, shows on that chip only, and is not diagnosed.
 
 ## Nesting depth (#5497)
 
@@ -8417,6 +8450,7 @@ Three differences remain.
   The sets looked for are the POSIX brackets `alpha`, `alnum`, `lower`, `upper`, `graph`, `print` and `word`, the negated ones of `lower`, `upper`, `punct`, `digit`, `space`, `xdigit`, `cntrl`, `blank` and `ascii`, and `\D`, `\w` and `\S`; a character written out (`[ß]`), a `\p{..}` property, and a pattern that folds case in a part of it only (`(?<=(?i:[[:alpha:]]))`) are still answered.
   A look-behind that can match nothing and is repeated (`(?<=a|)+`) is `target of repeat operator is invalid`, as in jq; it was written as its empty node before the repeat was seen, and answered.
   Still answered differently under `x`: a group in a look-behind that can match nothing keeps its text, because the empty-node rewrite is not made in the extended mode (`"ab" | capture("(?<=(?<n>a)|a{0})b"; "x")` is `{"n":"a"}` here and `{"n":null}` in jq, the first item of #7887).
+  Where the match is empty the kept group can give an answer that is neither release's: `"a1b22" | [scan("(?<=(a)|a{0})"; "x")]` is `[[null],[""],[null],[null],[null],[null]]` here, six `[""]` in jq 1.7.1 and six `[null]` in jq 1.8.2 (the capture that takes no part in an empty match, #7520); #7887 stays open for it.
   Over 420,000 generated patterns against jq 1.7.1 and 1.8.2, 2,624 rows that differed from jq now match and no row that matched differs.
   The part about a lookahead inside a look-behind (`(?<=(?=a)a)`) is #6197.
   Pinned by `test_lookbehind_oniguruma_refuses_is_refused_5502`, `tests/jq_cli/i6519.rs`, `tests/jq_cli/i7865.rs` and `tests/jq_cli/i7887.rs`.
@@ -8599,6 +8633,10 @@ A refusal of a later pass is checked by reading the pattern again with the const
 A reference after or inside a look-around, an atomic group, an absent operator, a conditional or a comment (`(?=a)\k<n>`, `(?>a)\k<n>`, `(?#c)\g<1>`) is read past them, so it is jq's `undefined name <n> reference` or `undefined group <1> reference`, not the `regex` crate's words.
 The repeat checks see past the blanks an inline `(?x)` turns on (`(?x)(?i)+` is `target of repeat operator is not specified`), as they did under the `x` flag only.
 Still the crate's words: a pattern with a call to a group it has (`\g<1>`), which succinctly does not compile, also where jq refuses it for another reason (`(?<n>a)(?<=a|bc)\g<1>` is `invalid pattern in look-behind` in jq).
+jq 1.7.1 and 1.8.2 answer such a pattern, the call being a copy of the group's pattern: `"aa" | test("(a)\\g<1>")` and `"aa" | test("(?<n>a)\\g<n>")` are `true` and `"aa" | [match("(a)\\g<1>"; "g") | .string]` is `["aa"]` in jq, and each is `Regex failure: regex parse error: ... unrecognized escape sequence` here, the largest class the #7852 fuzz left ([#7864](https://github.com/rust-works/succinctly/issues/7864), open).
+Under the `x` flag or an inline `(?x)`, a brace with a `#` comment inside is still read as an interval by the repeat checks: `"a" | test("(?=a){1#k\n,2}"; "x")` is `false` in jq 1.7.1 and 1.8.2, where the comment leaves a literal `{`, and `target of repeat operator is invalid` here, as `(?=a){1,2}` is in all three ([#7877](https://github.com/rust-works/succinctly/issues/7877), open).
+Under the same mode a blank between `(` and `?` still opens a group here: `"a" | test("( ?:a)"; "x")`, `test("(?x)( ?=a)")` and `test("( ?<=a)"; "x")` are `true`, and `test("( ?a)"; "x")` is the `regex` crate's `unrecognized flag`, where jq 1.7.1 and 1.8.2 read a plain group and a `?` with nothing before it, `target of repeat operator is not specified` for all four ([#7878](https://github.com/rust-works/succinctly/issues/7878), open).
+A callout whose name is followed by a tag that is no tag (`(*ab[a-c]+)`) is `invalid callout tag name` in jq 1.7.1 and 1.8.2 and `undefined callout name` here; both refuse it with exit status 5 (found by the pre-release differential, no issue).
 Since [#7888](https://github.com/rust-works/succinctly/issues/7888) an interval whose upper bound is below its lower one is refused where it stands, as Oniguruma refuses it when it reads the token: `a{2,1}\k<m>`, `\A{2,1}`, `{2,1}` and `(?i){2,1}` are `upper is smaller than lower in repeat range`, where the first reported the reference after it and the others the repeat's target.
 A call by a name that starts with a digit and is no number (`\g<1 >`, `\g<2x>`) names no group, which jq says once the whole pattern is read: it is `undefined name <1 > reference`, after a missing group's backreference (`\1\g<1 >` is `invalid backref number/name`), and was `invalid group name <1 >` at once.
 A conditional whose condition starts with `?` (`(?(?i)a)`) is `target of repeat operator is not specified`.
@@ -8609,6 +8647,7 @@ A reference whose name holds a character no name may (`\k< n>`, `\k<a.b>`, `\k<(
 A negated property (`\p{^N}`) in a pattern with a call is read on the way to the call's refusal (`\g<n>\p{^N}` is `undefined name <n> reference`, and was `invalid character property name {N}`).
 A backreference at a recursion level (`\k<1+0>`, `\k<n-1>`) is read: in a pattern with no call it is the plain reference at level 0 and matches nothing at any other level, and one to a group the pattern does not have is `invalid backref number/name`, after the errors of the parse; it was `invalid group name <1>` wherever it stood.
 With a call in the pattern (`(a)\g<1>\k<1+0>`) the level counts, and the pattern keeps the crate's words.
+jq 1.7.1 and 1.8.2 answer it (`"aa" | test("(a)\\g<1>\\k<1+0>")` is `false`), as they answer every call to a group the pattern has (#7864).
 Over 420,000 generated patterns against jq 1.7.1 and 1.8.2, 44,416 rows that differed from jq now match and no row that matched differs.
 Still out of order: `never ending recursion` is reported for a `\g<0>` wherever it stands, where jq allows one that an alternative avoids and reports a later pass's error (`(?<!a|c\g<0>)` is `invalid pattern in look-behind` in jq); and the wording of a few names (`\k<1+>`, which jq words with a second `>`; `\k<a-b>` and `\k<a)>`, `invalid group name` in jq).
 Pinned by `tests/jq_cli/i7852.rs`, `tests/jq_cli/i7858.rs` and `tests/jq_cli/i7888.rs`.
@@ -9909,6 +9948,12 @@ So a recursion that reaches the floor refuses with `exceeded maximum recursion d
 That is a resource limit of this implementation, not a rule of the language, as under `ulimit -v` above.
 Real yq (Go) aborts at the same limit (`runtime/cgo: pthread_create failed`), and `succinctly yq` runs on the main thread too.
 
+A recursion that never ends does not always end the run the same way.
+`def s(n;x;y): if n == 0 then x+y elif y == 0 then x else s(label $q | 1; s(n;x;y-1); s(n;x;y-1) + y) end; s(1;1;1)`, a Sudan function whose `n` never falls, yields nothing in either tool.
+jq 1.7.1 and 1.8.2 grow until memory runs out (jq 1.7.1 aborts with `jq: error: cannot allocate memory` under a 2 GiB address-space cap on x86_64 Linux), where `succinctly jq` runs on, holding no more memory as it goes, until it is interrupted.
+There is no output to differ over, only the way the run ends.
+Without its `label $q |` the same program runs on without growing in jq 1.7.1 too, so jq's growth comes with the label; the cause was not traced further (found by the pre-release differential, no issue, and no test, since the program does not end).
+
 ## An input read whole with no room for it (#7576)
 
 An input `succinctly jq` reads whole that there is no room for ends the run as jq's failed allocation does: `jq: error: cannot allocate memory` and `abort()`, exit 134 to a shell, with nothing on stdout.
@@ -10934,6 +10979,11 @@ Where those meet, the answer can be neither release's.
 With `f1.seq` holding `\x1e1\n` and `f2.seq` holding `\x1e2 `, `jq --seq -n -c '[input,input,input]' f1.seq f2.seq` raises `break` at `f2.seq:0` in both releases, 1.7.1 because it ended the stream at the RS that opens `f2.seq` and 1.8.2 because it keeps the name past the end; `succinctly jq` reads the `2` and then loses the position by 1.7.1's rule (`(at <unknown>)`).
 And a `--seq --stream` file of exactly 4,095 bytes whose last byte closes a container, then a file that fails, then a record: both releases stop after the first file's events (1.7.1 at the third file's RS, 1.8.2 because its 4,091-byte reads hand the closer out with the failed file's read), where `succinctly jq` reads the third file's first event too (`tests/jq_cli/i6760.rs`).
 Both would go if #7607 and the read size were followed as well.
+A message can be neither release's too, where the adopted warning meets a wording that is not adopted.
+With a last record cut short after a newline, `printf '\x1e[1]\n\x1e[2' | jq --seq -c '.a'` prints `jq: error (at <stdin>:1): Cannot index array with string "a"` and nothing more in jq 1.7.1, and `jq: error (at <stdin>:1): Cannot index array with string ("a")` and then `jq: ignoring parse error: Unfinished JSON term at EOF at line 2, column 3` in jq 1.8.2.
+`succinctly jq` prints jq 1.7.1's wording of the type error, which it keeps ([#7450's section](#cannot-index-type-with-string-key-stops-the-key-at-a-nul-byte-as-jq-171-does-jq-182-words-the-message-differently-7450)), and then jq 1.8.2's warning; the exit status is 5 in all three, and `--seq --stream` over the same bytes differs the same way.
+The differential run for #7889 counted about 320 such rows in 122,400, most of them under `--stream`: each is a type error the two releases word differently, raised before a truncated last record that only jq 1.8.2 reports.
+Pinned by `tests/jq_cli/i7718_truncated_record_wording.rs`, at `succinctly jq`'s answer with both releases' in its comments.
 The compare harness compares against the pinned 1.7.1: `scripts/jq-seq-oracle-sweep.py` skips the streams 1.7.1 reads in a last buffer that holds data (`reads_past_last_buffer`, counted under `artifact-shapes-skipped`; `--expect-artifacts` includes them).
 `scripts/jq-seq-door-sweep.py` skips the same streams by the same test, and counts them; no probe or differential case of `comparison/jq/` reads past such a buffer, so the ledger has no entry for it.
 Pinned by `tests/jq_cli/i7718.rs`, whose rows were captured from jq 1.8.2 (`/opt/homebrew/bin/jq`), with jq 1.7.1's answers in its comments, and whose route rows hold the pipe, standard input, a file, the file read whole and two files to one answer, below and above the windowed routes' size.
@@ -12212,6 +12262,10 @@ and the `jq-linux-arm64` release binaries):
 - **A POSIX string with an explicit rule** applies it to every year; jq on macOS showed standard
   time in 1906, on 1970-01-01 and in year 33658 for `NZST-12NZDT,M9.5.0,M4.1.0/3` and
   `EST5EDT,M3.2.0,M11.1.0`.
+  The macOS jq, 1.7.1 and 1.8.2 alike, showed standard time for every instant before 1970 that was tried under such a rule: `TZ='NZST-12NZDT,M9.5.0,M4.1.0/3'`, `-2174684460 | localtime` (February 1901, daylight time by the rule) is `[1901,1,2,12,59,0,6,32]` there and `[1901,1,2,13,59,0,6,32]` here, and `TZ='CET-1CEST,M3.5.0,M10.5.0/3'`, `-300000000 | localtime` (June 1960) is `[1960,5,29,19,40,0,3,180]` there and `[1960,5,29,20,40,0,3,180]` here.
+  That is the Apple C library's reading: jq 1.7.1 on Linux (glibc 2.43) answers the 1901 row as `succinctly jq` does.
+  glibc has a reading of its own before 1970: under the same `NZST` rule, `-1000000000 | localtime` (25 April 1938, standard time by the rule) is `[1938,3,25,11,13,20,1,114]` in jq 1.7.1 on Linux, and `[1938,3,25,10,13,20,1,114]` here and in both macOS releases.
+  From 1970 on, the rows tried agree in all of them (to 2001 on Linux and to 2097 on macOS); jq 1.8.2 was not captured on Linux.
 - **Instants past year 9999** are folded back by whole 400-year cycles (146097 days, a whole
   number of weeks, so the weekday and the daylight-time rule recur) and answered by the zone at
   that position, as libc does for an IANA zone: `TZ=America/New_York`, `1e12` (33658-09-26) is
@@ -12219,6 +12273,11 @@ and the `jq-linux-arm64` release binaries):
   -9999 the zone's earliest offset applies, as in libc. jq reaches year 2³¹ and wraps the year
   there (`67768036191676799` under `TZ=America/New_York` prints a negative year); this raises
   `error converting number of seconds since epoch to datetime`.
+  `gmtime` has the same bounds, with no zone involved: jq's `tm2jv` (`src/builtin.c`) adds 1900 to the C `int` year of the `struct tm`, so `67768036160140800 | gmtime` (1 January 2147485547, the number `[1e20,0,1,0,0,0,0,0] | mktime` gives, #7532) is `[-2147481749,0,1,0,0,0,3,0]` in jq 1.7.1 on macOS and on Linux (glibc 2.43) and in the macOS jq 1.8.2, and the error here.
+  The last year that prints as itself is 2147483647 (`67767976233532000 | gmtime` is `[2147483647,11,31,23,46,40,2,364]` here and in both macOS releases), and `67767976233532800 | gmtime`, a second into the next year, is `[-2147483648,0,1,0,0,0,3,0]` in jq and the error here.
+  `todate` and `strftime` of such a number raise the same error here, where jq formats a year that depends on the release and the platform (`67768036160140800 | todate` is `"2147485547-01-01T00:00:00Z"` in jq 1.7.1 on macOS, `"-2147481749-01-01T00:00:00Z"` in jq 1.7.1 on Linux and `"-2147481748-01-01T00:00:00Z"` in the macOS jq 1.8.2).
+  At the other end `succinctly jq` answers the years jq refuses because the year less 1900 leaves C's `int`: `-67768040609750000 | gmtime` is `[-2147481749,11,31,21,26,40,3,364]` here and `error converting number of seconds since epoch to datetime` in jq 1.7.1 on both platforms and in the macOS jq 1.8.2, and `-67768040609740800 | gmtime` (`[-2147481748,0,1,0,0,0,4,0]`, the first second of the earliest year jq holds) is the same in all of them.
+  Both ends are kept: a wrapped year is a date the number does not name, and the years below jq's bound are answered by the calendar (found by the pre-release differential, no issue; pinned by `tests/jq_cli/i7723_gmtime_year_bounds.rs`).
 - **A broken-down array** passed to `strflocaltime` is labelled by the zone at that wall-clock
   time, normalised as `mktime` does; a time the zone skipped takes the later offset and a repeated
   one the earlier.
@@ -15918,6 +15977,11 @@ Its `todate` formats the fields as given, as the macOS jq does (`[1970,0,1,21474
 `[1969,11,31,23,59,58,0,0] | mktime` and `[253402300800,100] | mktime` are `mktime not supported on this platform` and `mktime requires parsed datetime inputs` there, as in the macOS jq 1.7.1.
 For the saturated year it answers `67767976265155200` for `[2147485547,12,1,0,0,0,0,0] | mktime` and for both the `:59` and the `:60` reading of `[2147485547,11,31,23,59,60,0,0] | mktime` (the macOS jq 1.7.1 answers `67767976233532800` for all three), which is jq 1.7.1's own reading of those years (#7532) and says nothing about the 1.8.2 rows.
 jq 1.8.2 on Linux was not captured, so what it answers for the saturated-year rows, the `:60` reading among them, remains uncaptured.
+`strflocaltime` with a seconds field at the C `int` limits shows the same separate addition in a local zone: `TZ=America/Sao_Paulo`, `[2015,0,1,0,0,-2147483649,0,0] | strflocaltime("%F %T %Z %s")` is `"1946-12-13 19:45:52 -03 -727406048"` in the macOS jq 1.8.2 and `"1946-12-13 20:45:52 -03 -727402448"` here.
+The macOS `mktime` settles the offset for the reading without its seconds (midnight on 1 January 2015, daylight time, two hours behind UTC) and then adds them, where `succinctly jq` normalises the fields first and asks the zone at the reading they make (20:45:52 on 13 December 1946, three hours behind UTC), the wall-clock rule of #7606.
+So the two are apart by what the zone's offset changed between the two dates: an hour under `America/Sao_Paulo` and `Australia/Sydney`, more than a day under `Pacific/Apia` (`"1946-12-12 19:15:52 -1130 -727463648"` against `"1946-12-13 20:45:52 -1130 -727371848"`), and nothing under `Europe/Paris` or `UTC`.
+jq 1.7.1 formats the fields as given, on macOS and on Linux (`"2015-01-01 00:00:-2147483648 -03 -727402448"` under `America/Sao_Paulo`, with `succinctly jq`'s epoch seconds).
+jq 1.8.2 was not captured on Linux, so that this difference is the Apple C library's alone is read from the mechanism above and not shown; no test pins these rows.
 Pinned by `tests/jq_cli/i7722.rs` and `tests/jq_cli/i7723.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`) and jq 1.8.2 (`/opt/homebrew/bin/jq`) on macOS; the Linux answers above were captured from jq 1.7.1 on Linux (glibc 2.35).
 
 ## No program with a terminal on both standard input and output is jq's usage error (#7462)

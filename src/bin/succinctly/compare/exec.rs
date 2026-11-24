@@ -269,13 +269,18 @@ mod tests {
         // Re-run this test binary with the variables exported, since a test cannot set its own
         // environment without racing the others.
         if std::env::var_os("COMPARE_EXEC_LEAK_CHILD").is_none() {
+            // The test's path is taken from the module's, so it follows the module if that moves
+            // (libtest's names leave the crate out). An `--exact` name that matches nothing runs
+            // no test and exits 0, as this one did after #7384 moved the module (#7896), so the
+            // child also has to say that it ran one test.
+            let module = module_path!();
+            let name = format!(
+                "{}::a_hosts_locale_variables_do_not_reach_the_tool",
+                module.split_once("::").map_or(module, |(_, rest)| rest)
+            );
             let me = std::env::current_exe().unwrap();
             let out = std::process::Command::new(me)
-                .args([
-                    "--exact",
-                    "compare::exec::tests::a_hosts_locale_variables_do_not_reach_the_tool",
-                ])
-                .args(["--nocapture", "--test-threads=1"])
+                .args(["--exact", &name, "--nocapture", "--test-threads=1"])
                 .env("COMPARE_EXEC_LEAK_CHILD", "1")
                 .env("LANG", "de_DE.UTF-8")
                 .env("LC_TIME", "de_DE.UTF-8")
@@ -283,10 +288,15 @@ mod tests {
                 .env("LANGUAGE", "de")
                 .output()
                 .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
             assert!(
                 out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stdout)
+                "{text}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                text.contains("running 1 test\n") && text.contains("test result: ok. 1 passed;"),
+                "the child did not run exactly one test under the name {name}:\n{text}"
             );
             return;
         }
