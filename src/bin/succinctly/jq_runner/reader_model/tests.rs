@@ -112,23 +112,23 @@ struct Case {
 include!("cases.rs");
 
 #[derive(Clone, Copy)]
-enum Run {
+enum Program {
     Inputs,
     Main,
     Slurp,
 }
 
-fn render(case: &Case, profile: ReaderProfile, run: Run) -> String {
+fn render(case: &Case, profile: ReaderProfile, run: Program) -> String {
     let files = build(case.files);
     let files: Vec<&[u8]> = files.iter().map(Vec::as_slice).collect();
     match run {
-        Run::Inputs => render_inputs(&files, profile, false, 12),
-        Run::Main => render_main(&files, profile),
-        Run::Slurp => render_inputs(&files, profile, true, 4),
+        Program::Inputs => render_inputs(&files, profile, false, 12),
+        Program::Main => render_main(&files, profile),
+        Program::Slurp => render_inputs(&files, profile, true, 4),
     }
 }
 
-fn check(select: impl Fn(&Case) -> Option<&'static str>, profile: ReaderProfile, run: Run) {
+fn check(select: impl Fn(&Case) -> Option<&'static str>, profile: ReaderProfile, run: Program) {
     let mut failed = Vec::new();
     let mut checked = 0;
     for case in CASES {
@@ -159,17 +159,17 @@ fn reader_model_has_at_least_forty_cases() {
 
 #[test]
 fn reader_model_inputs_equal_jq_171() {
-    check(|case| Some(case.inputs_171), ReaderProfile::jq171(), Run::Inputs);
+    check(|case| Some(case.inputs_171), ReaderProfile::jq171(), Program::Inputs);
 }
 
 #[test]
 fn reader_model_main_loop_equals_jq_171() {
-    check(|case| Some(case.main_171), ReaderProfile::jq171(), Run::Main);
+    check(|case| Some(case.main_171), ReaderProfile::jq171(), Program::Main);
 }
 
 #[test]
 fn reader_model_slurp_equals_jq_171() {
-    check(|case| Some(case.slurp_171), ReaderProfile::jq171(), Run::Slurp);
+    check(|case| Some(case.slurp_171), ReaderProfile::jq171(), Program::Slurp);
 }
 
 #[test]
@@ -177,7 +177,7 @@ fn reader_model_inputs_equal_jq_182() {
     check(
         |case| (!case.skip_182).then_some(case.inputs_182),
         ReaderProfile::jq182(),
-        Run::Inputs,
+        Program::Inputs,
     );
 }
 
@@ -186,7 +186,7 @@ fn reader_model_main_loop_equals_jq_182() {
     check(
         |case| (!case.skip_182).then_some(case.main_182),
         ReaderProfile::jq182(),
-        Run::Main,
+        Program::Main,
     );
 }
 
@@ -195,7 +195,7 @@ fn reader_model_slurp_equals_jq_182() {
     check(
         |case| (!case.skip_182).then_some(case.slurp_182),
         ReaderProfile::jq182(),
-        Run::Slurp,
+        Program::Slurp,
     );
 }
 
@@ -217,8 +217,8 @@ fn reader_model_succinctly_profile_is_171_without_the_nul_cut() {
             continue;
         }
         checked += 1;
-        assert_eq!(render(case, profile, Run::Inputs), case.inputs_171, "{}", case.name);
-        assert_eq!(render(case, profile, Run::Slurp), case.slurp_171, "{}", case.name);
+        assert_eq!(render(case, profile, Program::Inputs), case.inputs_171, "{}", case.name);
+        assert_eq!(render(case, profile, Program::Slurp), case.slurp_171, "{}", case.name);
     }
     assert!(checked >= 30, "{checked} cases without a NUL");
 }
