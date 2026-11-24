@@ -71,6 +71,7 @@ A row whose slowest tool runs over 15 ms is topped up to 21 repetitions (within 
 ratios are of each tool's fastest run, marked † in the report, because run-to-run noise moves the median of a figure that
 long (#5581). A row with a CV above 5% is marked, and its ratio is not a finding on its own.
 Dimension F runs the resource-limit probes under a 10 s deadline and classes each outcome (ok, error, crash, timeout).
+A ledger entry of a robustness row can state the class it accepts for each tool (`subject_class`, `reference_class`, per OS where the platforms differ): a listed row whose tool ends in another class fails the run like an unlisted divergence, so a row that moves from an exit status to a signal under an unchanged entry is reported (#7891; `divergences/README.md`).
 Its `memory` probes cap the address space with `ulimit -v` (graceful error versus abort; early-exit `first`/`limit`/`isempty` on a generated array); macOS refuses `ulimit -v`, so there they run uncapped as a no-op and only Linux CI exercises the limit.
 A run lowers its own `RLIMIT_CORE` to 1 byte, soft and hard, before it starts anything, and every child inherits it: a probe that ends a tool on a signal (jq 1.7.1 on `strftime/1`, the `memory` rows) leaves no core dump, even where `core_pattern` pipes to a handler, which ignores a limit of 0 (#7891).
 The class, exit status and output of such a row are unchanged; macOS still writes its own crash report.
@@ -86,12 +87,17 @@ core, and licence / `no_std` / CI-runner facts read from the repository. `--buil
 ```
 
 The harness needs `bench-runner`, which the shipped CLI does not carry (`bench-runner` pulls in `ctrlc`, which links Foundation on macOS, #5551).
-To time the shipped build instead, build it separately and pass it in; the report records that the timed binary is not the harness:
+By default the harness measures itself, so the committed reports are of a `cli,simd,regex,serde` build plus `bench-runner`, where the release archives are built with `cli` alone (#7385).
+To measure a build without the harness instead, build it separately and pass it in; the report records that the timed binary is not the harness:
 
 ```bash
 cargo build --release --features cli,simd,regex,serde --target-dir target/subject
 ./target/release/succinctly dev compare jq --quick --subject target/subject/release/succinctly --subject-features cli,simd,regex,serde
 ```
+
+That subject has the manifest's features, so the run is valid; it is still not the release build.
+`--features cli` with `--subject-features cli` measures what `release.yml` builds, and the run is then marked **INVALID** for differing from `manifest.toml`, so `--write-docs` refuses it.
+[Which binary a run measures](../../docs/guides/reproducing-the-jq-comparison.md#which-binary-a-run-measures) lists what is known to differ between the builds.
 
 `--write-docs` writes `docs/compare/jq-<platform>.{md,json}` and the index `docs/compare/jq.md`, and regenerates the `<!-- compare:jq-<platform> -->` block of `docs/benchmarks/jq.md` from that json.
 A platform's first run needs the two markers added at the top of its section there.

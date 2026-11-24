@@ -208,6 +208,9 @@ pub(super) fn min_windowed_seq_file_bytes() -> u64 {
 /// windows share their buffers with the thread that certifies them and the probe is freed a block at a
 /// time, a windowed pipe holds about two windows, which a pipe that is read whole holds once it is a
 /// little over one: four windows held a probe of 4 MiB for a run whose windows hold 2.
+///
+/// Only the unix pipe routes read a pipe a window at a time, so no other build compiles it (#7388).
+#[cfg(any(unix, test))]
 #[inline]
 pub(super) fn min_windowed_pipe_bytes() -> u64 {
     2 * window_bytes() as u64

@@ -1,3 +1,5 @@
 platform = "linux"
 category = "reference-crash"
 reason = "`\"a\" * 1e9` under `ulimit -v` 512 MiB: jq 1.7.1 aborts; succinctly exits 5 with a graceful error."
+reference_class = "crash"
+subject_class = "error"

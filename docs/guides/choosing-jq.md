@@ -16,6 +16,11 @@ RSS over jq's. Both come from interleaved, output-gated runs: a row is timed onl
 bytes. The figures quoted are medians on the 7950X and the M4 Pro, and memory-bound effects do not port between
 architectures, so each claim below is checked on all three machines.
 
+The reports measured the comparison harness's own build (`cli,simd,regex,serde` plus `bench-runner`), not the binary of
+a release archive, which is built with `cli` alone. No timing or memory row was measured on the release build, so read
+each of those figures as the harness build's; [Which binary a run measures](reproducing-the-jq-comparison.md#which-binary-a-run-measures)
+says what is known to differ and how to measure another build.
+
 Each claim carries an HTML comment marker naming it (`claim:` and an id). [`tests/jq_guidance_claims.rs`](../../tests/jq_guidance_claims.rs)
 reads the committed reports, checks each claim against its stated threshold, and fails when a report is
 regenerated and a claim stops holding: change the claim, or the advice, in the same change.

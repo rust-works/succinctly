@@ -32,9 +32,46 @@ The file holds the other fields, with no `[[divergence]]` header and no `id`:
 | `issue`    | optional tracking issue. A branch that references a `to-triage` entry's issue deletes the entry in the same change (`scripts/ledger_refs.py`, #5585); one that only mentions it says `[ledger keeps #N]` on its own line in a commit message |
 | `platform` | optional `std::env::consts::OS` the entry was observed on; other OSes neither expect nor call it stale |
 | `volatile` | optional `true`: whether the difference shows depends on the host, on its speed (a probe the reference finishes inside the 10 s deadline on a fast machine only), on its address-space footprint (a probe just under a `ulimit -v` cap) or on which locales it has installed (`locale-strptime-ampm-de-de`: a host with `de_DE` matches, one without falls back to `C` and differs); expected where it shows, not stale where it does not |
+| `subject_class` | optional, `robust` entries only: the outcome class the entry accepts for succinctly, see below |
+| `reference_class` | optional, `robust` entries only: the same for the reference jq                             |
 
 Write each field as a basic `"..."` string (or `true`), one per line: `scripts/ledger_refs.py` reads
-`category` and `issue` by pattern, not with a TOML parser.
+`category` and `issue` by pattern, not with a TOML parser. The two class fields may also be a list
+or an inline table, still on one line.
+
+## Outcome classes of a robustness entry
+
+An id says that a row differs, not how each tool ends, so a row can change under an unchanged
+entry: `mem-limit-64m-string` went from an exit status to death by a signal between two runs and
+nothing reported it (#7891). A `robust` entry can therefore state the class it accepts for each
+tool, in the words the robustness dimension uses (`ok`, `error` for a non-zero exit, `crash` for
+a signal or a panic, `timeout` for the 10 s deadline):
+
+```toml
+subject_class = "error"                                # one class
+subject_class = ["error", "crash"]                     # either: it depends on the build or the host
+subject_class = { linux = "timeout", macos = "error" } # per `std::env::consts::OS`
+reference_class = "crash"
+```
+
+- The fields are optional and independent. Without one, that tool's class is not checked, as
+  before the fields existed.
+- A row is judged when the run observes it as diverging. A tool that ends in a class the entry
+  does not accept fails the run like an unlisted divergence, naming the row, the class observed
+  and the classes accepted, and the report says so in the row's ledger column:
+
+  ```text
+  listed with another outcome class: robust:mem-limit-64m-string: subject class `crash`, expected `error`
+  ```
+- A list is for an outcome that legitimately varies, and the `reason` says why. A table states a
+  class per OS where the platforms differ; an OS it does not name is not checked there, which is
+  how a platform nobody has observed is left out. Each value of a table is a class or a list.
+- The loader refuses a name that is not a class, an empty list or table, a class listed twice, a
+  key that is not an OS, an OS other than the entry's own `platform`, and either field on an
+  entry outside `robust`.
+- State `reference_class` when the entry's meaning depends on how jq ends (`reference-crash`,
+  `reference-slow`, or jq answering where succinctly does not).
+- A `volatile` entry is judged only on a run where its difference shows.
 
 Adding an entry adds a file and deleting one deletes its file, so two PRs that touch different
 entries never touch the same lines. Two PRs that ledger the same probe produce the same path and

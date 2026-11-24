@@ -5403,7 +5403,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // --rawfile is jq's own usage error (exit 2, a single `jq: ...` line),
     // not the generic `anyhow`-reported exit 1 every other `Other` failure
     // here still takes (#3051).
-    let context = match build_context(&args) {
+    let context = match build_context(&mut args) {
         Ok(context) => context,
         Err(BuildContextError::Usage(message)) => {
             report_usage_error_bytes(&message);
@@ -7443,10 +7443,87 @@ fn invalid_json_text_passed_to(flag: &str) -> String {
     )
 }
 
-/// Whether `text` is one JSON text as `--argjson` and `--jsonargs` read it: the check jq's option
-/// loop makes where it reads the word (#7712).
-pub(crate) fn is_json_text(text: &str) -> bool {
-    parse_json_value(text).is_ok()
+/// The values of the `--argjson` texts and `--jsonargs` words jq's option loop has checked where
+/// it read them (#7712), kept for the run to bind (#7881).
+///
+/// Whether a word is JSON as `--argjson` reads it is only known by parsing it
+/// ([`parse_json_value`]), and the run needs that same value to bind, so the check keeps it and
+/// [`build_context`] takes it instead of parsing the text a second time. Both read the words in
+/// argv order, so the next value wanted is the oldest one kept.
+///
+/// A value is kept under the place of its word in argv, not under a copy of its text, and is
+/// handed over only for a text whose bytes are that word's: a request for any other text gets
+/// nothing and the caller parses it, so what is kept can only save a parse, never change what a
+/// text binds. A word that is not UTF-8 is checked through the text jq makes of it and keeps
+/// nothing.
+#[derive(Debug, Default)]
+pub(crate) struct CheckedJson {
+    /// argv, which the kept values index.
+    words: Vec<std::ffi::OsString>,
+    argjson: std::collections::VecDeque<(usize, OwnedValue)>,
+    jsonargs: std::collections::VecDeque<(usize, OwnedValue)>,
+}
+
+impl CheckedJson {
+    /// Whether `word`, at `index` in argv, is one JSON text as `--argjson` reads it; its value is
+    /// kept when it is.
+    pub(crate) fn check_argjson(&mut self, word: &std::ffi::OsStr, index: usize) -> bool {
+        Self::check(&mut self.argjson, word, index)
+    }
+
+    /// Whether `word`, at `index` in argv, is one JSON text as a `--jsonargs` word is read; its
+    /// value is kept when it is.
+    pub(crate) fn check_jsonargs_word(&mut self, word: &std::ffi::OsStr, index: usize) -> bool {
+        Self::check(&mut self.jsonargs, word, index)
+    }
+
+    /// Whether any check kept a value: only then is argv worth keeping ([`Self::set_words`]).
+    pub(crate) fn kept_any(&self) -> bool {
+        !(self.argjson.is_empty() && self.jsonargs.is_empty())
+    }
+
+    /// Take `argv`, the words the checks were made on, so that a kept value can be matched to
+    /// the text that asks for it.
+    pub(crate) fn set_words(&mut self, argv: Vec<std::ffi::OsString>) {
+        self.words = argv;
+    }
+
+    fn check(
+        kept: &mut std::collections::VecDeque<(usize, OwnedValue)>,
+        word: &std::ffi::OsStr,
+        index: usize,
+    ) -> bool {
+        match word.to_str() {
+            Some(text) => match parse_json_value(text) {
+                Ok(value) => {
+                    kept.push_back((index, value));
+                    true
+                }
+                Err(_) => false,
+            },
+            None => parse_json_value(&crate::cli::jq_word_text(word)).is_ok(),
+        }
+    }
+
+    /// The value of `text`: the oldest one kept when it was parsed from a word of exactly these
+    /// bytes, otherwise a parse of it.
+    fn value_of(
+        kept: &mut std::collections::VecDeque<(usize, OwnedValue)>,
+        words: &[std::ffi::OsString],
+        text: &str,
+    ) -> Result<OwnedValue> {
+        let checked = kept.front().is_some_and(|(index, _)| {
+            words
+                .get(*index)
+                .is_some_and(|word| *crate::cli::os_word_bytes(word) == *text.as_bytes())
+        });
+        if checked {
+            if let Some((_, value)) = kept.pop_front() {
+                return Ok(value);
+            }
+        }
+        parse_json_value(text)
+    }
 }
 
 /// [`invalid_json_text_passed_to`] on standard error, and jq's exit status for it (2), where jq's
@@ -7459,7 +7536,7 @@ pub(crate) fn exit_invalid_json_text(flag: &str) -> ! {
 /// The error `run_jq` would report binding `args`' named and positional arguments, reported, and
 /// the status to exit with (#7712); `None` when they all bind. `parse_jq` asks it of the options
 /// before the word jq's option loop stops at, which jq reads first.
-pub(crate) fn report_named_argument_error(args: &JqCommand) -> Option<i32> {
+pub(crate) fn report_named_argument_error(args: &mut JqCommand) -> Option<i32> {
     match build_context(args) {
         Ok(context) => {
             // As `run_jq` keeps its context: a `--slurpfile` value is not worth freeing at exit (#5673).
@@ -7479,7 +7556,12 @@ pub(crate) fn report_named_argument_error(args: &JqCommand) -> Option<i32> {
 }
 
 /// Build the evaluation context from command-line arguments.
-fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
+///
+/// An `--argjson` text or `--jsonargs` word the option walk already parsed binds the value kept
+/// in `args.checked_json`, which this takes (#7881).
+fn build_context(args: &mut JqCommand) -> Result<EvalContext, BuildContextError> {
+    let mut checked = std::mem::take(&mut args.checked_json);
+    let args = &*args;
     let mut context = EvalContext::default();
 
     // The four flags apply in the order given, and a name keeps its first value (#5154). `named_order` comes from argv; when
@@ -7531,9 +7613,13 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                     .filter(|pair| !context.named.contains_key(&pair[0]))
                 {
                     // jq's own wording doesn't name the flag's variable (`x`) at all.
-                    let json_value = parse_json_value(value).map_err(|_| {
-                        BuildContextError::Usage(invalid_json_text_passed_to("argjson").into())
-                    })?;
+                    let json_value =
+                        CheckedJson::value_of(&mut checked.argjson, &checked.words, value)
+                            .map_err(|_| {
+                                BuildContextError::Usage(
+                                    invalid_json_text_passed_to("argjson").into(),
+                                )
+                            })?;
                     context.named.insert(name.clone(), json_value);
                 }
             }
@@ -7591,9 +7677,10 @@ fn build_context(args: &JqCommand) -> Result<EvalContext, BuildContextError> {
                 .push(OwnedValue::String(text.clone().into())),
             PositionalWord::Json(text) => {
                 // jq's own wording doesn't name the offending value or position.
-                let json_value = parse_json_value(text).map_err(|_| {
-                    BuildContextError::Usage(invalid_json_text_passed_to("jsonargs").into())
-                })?;
+                let json_value = CheckedJson::value_of(&mut checked.jsonargs, &checked.words, text)
+                    .map_err(|_| {
+                        BuildContextError::Usage(invalid_json_text_passed_to("jsonargs").into())
+                    })?;
                 context.positional.push(json_value);
             }
         }
@@ -16097,8 +16184,11 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     let dash = files.first().is_some_and(|path| is_stdin_dash(path));
     // Whether the source is a terminal (#7742), asked only of a source read as a stream.
     let mut terminal = false;
-    // Its descriptor (#7812).
+    // Its descriptor (#7812), which only a unix build assigns below (#7388).
+    #[cfg(unix)]
     let mut terminal_fd: i32 = 0;
+    #[cfg(not(unix))]
+    let terminal_fd: i32 = 0;
     let (mut reader, len): (Box<dyn std::io::Read>, Option<usize>) = match files.first() {
         // #7478: `-` is standard input, read below as an unnamed one is (named `<stdin>`), unless a
         // route before has read it whole already.
@@ -19825,6 +19915,8 @@ fn find_literal_end(bytes: &[u8], pos: usize) -> Option<usize> {
 /// the rejection was a divergence only `--argjson`/`--jsonargs` still
 /// carried.
 fn parse_json_value(s: &str) -> Result<OwnedValue> {
+    #[cfg(test)]
+    ARG_JSON_PARSES.with(|n| n.set(n.get() + 1));
     // #5291: jq's parser skips a leading BOM here too, but a BOM-only text is still not JSON.
     let s = match s.strip_prefix('\u{feff}') {
         Some(rest) if !trim_json_whitespace(rest).is_empty() => rest,
@@ -19836,6 +19928,20 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
         anyhow::bail!("Invalid JSON: empty text");
     }
 
+    // #7881: first the one-pass reader of plain RFC 8259 text, as a `--slurpfile` file is read
+    // (#6110). It builds a value as the route below does and declines anything else (a leniency,
+    // a repeated key, a lone surrogate escape, `nan`, nesting past its own ceiling, an error),
+    // which that route then decides, so every refusal stays its own.
+    if let Some(value) = jq::parse_plain(s) {
+        return Ok(value);
+    }
+    parse_json_value_indexed(s)
+}
+
+/// [`parse_json_value`]'s route for a text the one-pass reader declines (#7881), and the one that
+/// decides every refusal: the validator in jq's accept-set, then the index and the checked
+/// materializer over the same text. `s` is the text without its BOM and surrounding white space.
+fn parse_json_value_indexed(s: &str) -> Result<OwnedValue> {
     // #6637: containers may nest as deep as jq's parse-depth ceiling, not the validator's default
     // of 128 (as `fromjson` reads them, #5688). jq counts an object as two entries of that
     // ceiling, so a text past the old default is also put to jq's own count.
@@ -19855,6 +19961,13 @@ fn parse_json_value(s: &str) -> Result<OwnedValue> {
     // own rather than an incidental by-product of whatever validated it.
     json_bytes_to_owned_value_checked(s.as_bytes())
         .map_err(|e| anyhow::anyhow!("Invalid JSON: {s}: {e}"))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// How many texts [`parse_json_value`] has parsed on this thread, for the tests that pin one
+    /// parse of each `--argjson` text and `--jsonargs` word (#7881).
+    static ARG_JSON_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The four bytes jq's lexer skips between tokens. Not `char::is_whitespace`, which also takes a
@@ -28315,6 +28428,160 @@ mod tests {
         );
     }
 
+    /// #7881: an `--argjson` text and a `--jsonargs` word are parsed once: the option walk parses
+    /// each to check it where jq's option loop does (#7712) and the run binds the value it built.
+    mod argjson_parsed_once_7881 {
+        use super::*;
+
+        fn parses() -> usize {
+            ARG_JSON_PARSES.with(std::cell::Cell::get)
+        }
+
+        /// `words` read as `succinctly jq` reads its argv, then bound: the parses the walk made, the
+        /// parses in all, and the context.
+        fn bind(words: &[&str]) -> (usize, usize, EvalContext) {
+            ARG_JSON_PARSES.with(|n| n.set(0));
+            let argv = words.iter().map(std::ffi::OsString::from).collect();
+            let mut cmd = crate::cli::parse_jq(argv, None);
+            let walked = parses();
+            cmd.resolve_positional_args();
+            let context = build_context(&mut cmd)
+                .unwrap_or_else(|_| panic!("build_context refused {words:?}"));
+            (walked, parses(), context)
+        }
+
+        #[test]
+        fn each_text_is_parsed_once_and_binds_the_value_the_walk_built() {
+            let (walked, total, context) = bind(&[
+                "jq",
+                "-n",
+                "--argjson",
+                "a",
+                "[1.50,2]",
+                "--jsonargs",
+                "$a",
+                "1.000",
+                "--argjson",
+                "b",
+                r#"{"k":1e1000}"#,
+                "--args",
+                "3",
+                "--jsonargs",
+                "[1.50,2]",
+            ]);
+            assert_eq!((walked, total), (4, 4));
+            assert_eq!(context.named["a"].to_json(), "[1.50,2]");
+            assert_eq!(context.named["b"].to_json(), r#"{"k":1E+1000}"#);
+            let positional: Vec<String> =
+                context.positional.iter().map(OwnedValue::to_json).collect();
+            assert_eq!(positional, ["1.000", "\"3\"", "[1.50,2]"]);
+        }
+
+        /// A name an earlier flag bound is skipped unread by both, so nothing is kept for it and
+        /// the texts after it still meet their own values.
+        #[test]
+        fn a_skipped_text_is_parsed_by_neither() {
+            let (walked, total, context) = bind(&[
+                "jq",
+                "-n",
+                "--arg",
+                "a",
+                "x",
+                "--argjson",
+                "a",
+                "{bad",
+                "--argjson",
+                "a",
+                "1",
+                "--argjson",
+                "b",
+                "2.0",
+                ".",
+            ]);
+            assert_eq!((walked, total), (1, 1));
+            assert_eq!(context.named["a"].to_json(), "\"x\"");
+            assert_eq!(context.named["b"].to_json(), "2.0");
+        }
+
+        /// argv is kept only beside a kept value (#7907): a run with none frees it where it always
+        /// did, so its heap, and the allocator's work for the rest of the run, are what they were.
+        #[test]
+        fn argv_is_kept_only_beside_a_kept_value() {
+            let parse = |words: &[&str]| {
+                let argv = words.iter().map(std::ffi::OsString::from).collect();
+                crate::cli::parse_jq(argv, None).checked_json
+            };
+            let none = parse(&["jq", "-n", "--arg", "a", "1", "."]);
+            assert!(!none.kept_any() && none.words.is_empty());
+            // A skipped `--argjson` keeps nothing either.
+            let skipped = parse(&["jq", "-n", "--arg", "a", "1", "--argjson", "a", "2", "."]);
+            assert!(!skipped.kept_any() && skipped.words.is_empty());
+            let named = parse(&["jq", "-n", "--argjson", "a", "1", "."]);
+            assert!(named.kept_any() && named.words.len() == 6);
+            let word = parse(&["jq", "-n", ".", "--jsonargs", "1"]);
+            assert!(word.kept_any() && word.words.len() == 5);
+        }
+
+        /// A `JqCommand` the walk did not read parses each text when it binds it, as before.
+        #[test]
+        fn a_command_the_walk_did_not_read_parses_when_it_binds() {
+            use clap::Parser;
+            ARG_JSON_PARSES.with(|n| n.set(0));
+            let mut cmd =
+                JqCommand::try_parse_from(["jq", "-n", "--argjson", "a", "1.0", "."]).unwrap();
+            let context = build_context(&mut cmd).unwrap_or_else(|_| panic!("refused"));
+            assert_eq!(parses(), 1);
+            assert_eq!(context.named["a"].to_json(), "1.0");
+        }
+
+        /// A kept value is handed over only for a text of its own word's bytes, and only once.
+        #[test]
+        fn a_kept_value_answers_only_its_own_text() {
+            let words: Vec<std::ffi::OsString> =
+                ["jq", "1.0", "{", "[nan]"].map(Into::into).to_vec();
+            let mut checked = CheckedJson::default();
+            assert!(checked.check_argjson(&words[1], 1));
+            assert!(!checked.check_argjson(&words[2], 2));
+            assert!(checked.check_jsonargs_word(&words[3], 3));
+            ARG_JSON_PARSES.with(|n| n.set(0));
+            // Without the words nothing kept can be matched: every text is parsed.
+            let unmatched = CheckedJson::value_of(&mut checked.argjson, &[], "1.0").unwrap();
+            assert_eq!((unmatched.to_json(), parses()), ("1.0".to_string(), 1));
+            checked.set_words(words);
+            let CheckedJson {
+                words,
+                argjson,
+                jsonargs,
+            } = &mut checked;
+            // Another text: parsed, and the kept value stays for its own.
+            let other = CheckedJson::value_of(argjson, words, "2").unwrap();
+            assert_eq!((other.to_json(), parses()), ("2".to_string(), 2));
+            let kept = CheckedJson::value_of(argjson, words, "1.0").unwrap();
+            assert_eq!((kept.to_json(), parses()), ("1.0".to_string(), 2));
+            // Taken: the same text again is a parse of its own.
+            let again = CheckedJson::value_of(argjson, words, "1.0").unwrap();
+            assert_eq!((again.to_json(), parses()), ("1.0".to_string(), 3));
+            // The two flags keep their values apart, and a text that is not JSON is still refused.
+            assert!(CheckedJson::value_of(argjson, words, "{").is_err());
+            let word = CheckedJson::value_of(jsonargs, words, "[nan]").unwrap();
+            assert_eq!((word.to_json(), parses()), ("[null]".to_string(), 4));
+        }
+
+        /// A word that is not UTF-8 is checked through the text jq makes of it, and binds the
+        /// same value by a parse of that text.
+        #[cfg(unix)]
+        #[test]
+        fn a_word_that_is_not_utf8_is_checked_and_then_parsed() {
+            use std::os::unix::ffi::OsStringExt;
+            let word = std::ffi::OsString::from_vec(b"\"a\xffb\"".to_vec());
+            let mut checked = CheckedJson::default();
+            assert!(checked.check_argjson(&word, 1));
+            assert!(checked.argjson.is_empty());
+            let bare = std::ffi::OsString::from_vec(b"\xff".to_vec());
+            assert!(!checked.check_argjson(&bare, 1));
+        }
+    }
+
     /// #5154: the named-variable flags apply in argv order and a name keeps its first value.
     mod named_flag_order_5154 {
         use super::*;
@@ -28329,7 +28596,7 @@ mod tests {
             if with_order {
                 cmd.named_order = named_flag_order(&argv(words));
             }
-            build_context(&cmd).unwrap_or_else(|_| panic!("build_context refused {words:?}"))
+            build_context(&mut cmd).unwrap_or_else(|_| panic!("build_context refused {words:?}"))
         }
 
         fn names(context: &EvalContext) -> Vec<&str> {
@@ -29841,6 +30108,54 @@ mod tests {
             parse_json_value(r#"{"a":"\udc00"}"#).unwrap().to_json(),
             "{\"a\":\"\u{FFFD}\"}"
         );
+    }
+
+    /// #7881: plain text is read by the one-pass reader, which builds what the indexed route
+    /// builds for the same text; a text the reader declines gets the indexed route's answer, and
+    /// one that is not JSON is refused by it.
+    #[test]
+    fn parse_json_value_reads_plain_text_as_the_indexed_route_does_7881() {
+        for text in [
+            "0",
+            "-0",
+            "1.000",
+            "1e1000",
+            "-1E-400",
+            "100000000000000000000",
+            "0.10",
+            "1.5e300",
+            "true",
+            "null",
+            r#""a\u0000b""#,
+            r#""😀""#,
+            r#""é\n\"""#,
+            "[]",
+            "{}",
+            r#"[1.0,1.00,{"a":[true,false,null,"x"]}]"#,
+            r#"{"b":1,"a":{"c":[1.50,"\n"]}}"#,
+            r#"[{"id":1,"k":"v"},{"id":2,"k":"w"},{"k":"x","id":3.0}]"#,
+            "[ 1 ,\n2 ]",
+        ] {
+            let plain = jq::parse_plain(text).unwrap_or_else(|| panic!("declined {text:?}"));
+            let indexed = parse_json_value_indexed(text).unwrap();
+            assert_eq!(plain, indexed, "{text:?}");
+            assert_eq!(plain.to_json(), indexed.to_json(), "{text:?}");
+            let read = parse_json_value(&format!(" {text}\n")).unwrap();
+            assert_eq!(read.to_json(), indexed.to_json(), "{text:?}");
+        }
+        for (text, json) in [
+            ("007", "7"),
+            (r#"{"a":1,"a":2.0}"#, r#"{"a":2.0}"#),
+            (r#""\udc00""#, "\"\u{FFFD}\""),
+            ("[nan]", "[null]"),
+        ] {
+            assert!(jq::parse_plain(text).is_none(), "{text:?}");
+            assert_eq!(parse_json_value(text).unwrap().to_json(), json, "{text:?}");
+        }
+        for refused in ["[1,2", r#"{"a":1,}"#, "1 2", "nul", r#""\ud800""#, "[1]]"] {
+            assert!(jq::parse_plain(refused).is_none(), "{refused:?}");
+            assert!(parse_json_value(refused).is_err(), "{refused:?}");
+        }
     }
 
     /// #2012 regression guard: a lone *high* surrogate must stay rejected
