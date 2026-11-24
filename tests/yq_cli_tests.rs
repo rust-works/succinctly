@@ -74249,3 +74249,74 @@ fn test_yq_number_literal_length_is_its_spelling_3604() -> Result<()> {
     }
     Ok(())
 }
+
+/// #7615: yq reads a hexadecimal integer literal (`0x`/`0X` plus hex digits) in filter
+/// source: `0x10` is 16, the spelled-scalar treatment every literal that keeps its text
+/// gets (`tostring`, `==`, `unique`, and a YAML write all keep `0x10`), `!!int` under
+/// `tag`, and a digit run past i64 is a parse error. All expectations were captured
+/// from pinned yq v4.53.3 on the same arguments. jq mode has no hex literal, and `0x`,
+/// `0xg`, `0x1.8` and `-0x10` stay errors in both tools.
+mod hex_literal_7615 {
+    use super::{run_jq_stdin, run_yq_stdin, run_yq_stdin_with_stderr};
+    use anyhow::Result;
+
+    fn yq_json(filter: &str) -> Result<String> {
+        let (out, code) = run_yq_stdin(filter, "", &["-n", "-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{out}");
+        Ok(out)
+    }
+
+    fn yq_fails(filter: &str) -> Result<()> {
+        let (_, _, code) = run_yq_stdin_with_stderr(filter, "", &["-n", "-o=json", "-I0"])?;
+        assert_ne!(code, 0, "`{filter}` should fail");
+        Ok(())
+    }
+
+    #[test]
+    fn a_hex_integer_literal_evaluates_to_its_value_7615() -> Result<()> {
+        assert_eq!(yq_json("0x10")?, "16\n");
+        assert_eq!(yq_json("0X10")?, "16\n");
+        assert_eq!(yq_json("[0x1f] | .[0]")?, "31\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_hex_integer_literal_keeps_its_spelling_7615() -> Result<()> {
+        assert_eq!(yq_json("0x10 | tostring")?, "\"0x10\"\n");
+        assert_eq!(yq_json("0x10 | tag")?, "\"!!int\"\n");
+        let (out, code) = run_yq_stdin(".a = 0x10", "a: 16\n", &[])?;
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(out, "a: 0x10\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_hex_integer_literal_compares_by_spelling_7615() -> Result<()> {
+        let (out, code) = run_yq_stdin(".a == 0x10", "a: 16\n", &["-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(out, "false\n");
+        assert_eq!(yq_json("[0x1f, 31] | unique")?, "[31,31]\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_hex_integer_literal_out_of_range_is_an_error_7615() -> Result<()> {
+        yq_fails("0xFFFFFFFFFFFFFFFF")?;
+        Ok(())
+    }
+
+    #[test]
+    fn non_hex_literal_spellings_still_fail_7615() -> Result<()> {
+        yq_fails("0x")?;
+        yq_fails("0xg")?;
+        yq_fails("-0x10")?;
+        Ok(())
+    }
+
+    #[test]
+    fn jq_mode_still_rejects_a_hex_literal_7615() -> Result<()> {
+        let (_, code) = run_jq_stdin("0x10", "", &["-n"])?;
+        assert_ne!(code, 0, "jq has no hex literal");
+        Ok(())
+    }
+}

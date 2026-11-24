@@ -4314,6 +4314,17 @@ impl<'a> Parser<'a> {
             self.next();
         }
 
+        // yq's lexer reads `0x`/`0X` and hex digits as an integer literal in
+        // filter source (#7615): `0x10` is 16, keeps its spelling like every
+        // spelled scalar, and a digit run past i64 is the literal's own parse
+        // error. jq has no hex literal, and `-0x10` is an error in yq too, so
+        // the branch requires yq mode at the literal's own start.
+        if self.mode == ParserMode::Yq && self.pos == start {
+            if let Some(lit) = self.parse_yq_hex_literal(start)? {
+                return Ok(lit);
+            }
+        }
+
         let leading_dot = self.pos == start && self.peek() == Some('.');
         if !leading_dot {
             // Must have at least one digit
@@ -4428,6 +4439,37 @@ impl<'a> Parser<'a> {
                 NumberRepr::Float(f) => Literal::float(f),
             })
         }
+    }
+
+    /// Scan a yq-mode `0x`/`0X` hexadecimal integer literal at `self.pos`
+    /// (#7615). Returns `None` when the text there is not `0x`/`0X` plus at
+    /// least one hex digit, so `0x` and `0xg` keep their existing error path.
+    /// The value is i64-ranged like every yq integer: a longer digit run is
+    /// the literal's own parse error, matching yq's `strconv.ParseInt`
+    /// "value out of range". The spelled text is kept like every literal
+    /// that carries its source spelling.
+    fn parse_yq_hex_literal(&mut self, start: usize) -> Result<Option<Literal>, ParseError> {
+        let rest = &self.input[self.pos..];
+        if !rest.starts_with("0x") && !rest.starts_with("0X") {
+            return Ok(None);
+        }
+        let digits = rest[2..]
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .count();
+        if digits == 0 {
+            return Ok(None);
+        }
+        for _ in 0..2 + digits {
+            self.next();
+        }
+        let spelled = &self.input[start..self.pos];
+        let value = i64::from_str_radix(&spelled[2..], 16)
+            .map_err(|_| ParseError::new("invalid number", start))?;
+        Ok(Some(Literal::NumberLiteral(
+            NumberRepr::Int(value),
+            spelled.to_string(),
+        )))
     }
 
     /// Parse a string literal or string interpolation.

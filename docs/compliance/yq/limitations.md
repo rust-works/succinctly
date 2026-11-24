@@ -6212,7 +6212,7 @@ untouched. The key is `tostring`'s text, so `==` and `unique` agree about a numb
   gives `.anch | unique | length` of `3` in yq and `1` here (`group_by(.) | length` is `2` there and
   `1` here). Aliases are resolved before the key is built, so the identity is gone.
 - **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
-  the text a `True` keys on is its resolved text here, as is a `01` or `0x1f` written as a filter literal (`[01, 1] | unique` is `[1]` here and `[1,1]` in yq).
+  the text a `True` keys on is its resolved text here, as is a `01` written as a filter literal (`[01, 1] | unique` is `[1]` here and `[1,1]` in yq).
   A document `[01, 1, 0x1f, 31, True, true] | unique` has 5 elements here and 6 in yq: its integers key on their text since the integer slice of #2802, the `True` does not.
   The same residual `==` has.
 - **Cost.** yq mode builds one `String` key per element and probes a hashed `IndexSet`/`IndexMap`
