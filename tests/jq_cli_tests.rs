@@ -32815,6 +32815,14 @@ fn test_eager_link_stays_lazy_over_an_effect_3287() -> Result<()> {
 /// (`as`, `reduce`, `foreach`, `?//`, a nested `$` parameter) shadowing
 /// `$name`, duplicate `$` names, a bare parameter of the same name, and a
 /// literal beside a generator argument.
+///
+/// The last row is the recursion #3260's PR showed: binding the literal costs no frame, so the
+/// call recursed past the 6,666 levels the frame count allowed it before. It ran at depth
+/// 12,000 until the unoptimised arm64 builds were found to answer it to about 12,075 only, which
+/// made this test the place where any growth of a recursive evaluator frame failed, on one CI
+/// leg. The row now runs at 8,000, two thirds of what the tightest build answers, and is about
+/// the binding; `per_issue::i3260_depth_capacity` measures the depth a build reaches and holds
+/// it above a floor (ADR-0025).
 #[test]
 fn test_literal_dollar_argument_matches_jq_3260() -> Result<()> {
     for (filter, expected) in [
@@ -32839,7 +32847,7 @@ fn test_literal_dollar_argument_matches_jq_3260() -> Result<()> {
         ("def f($a; $b): [$a, $b]; [f(1; 2,3)]", "[[1,2],[1,3]]"),
         ("def f($x): {($x): $x}; f(\"k\")", r#"{"k":"k"}"#),
         (
-            "def r($p1; $p2): if $p1 == 0 then $p2 else r($p1 - 1; $p2) end; r(12000; 7)",
+            "def r($p1; $p2): if $p1 == 0 then $p2 else r($p1 - 1; $p2) end; r(8000; 7)",
             "7",
         ),
     ] {
