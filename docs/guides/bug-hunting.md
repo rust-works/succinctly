@@ -7,7 +7,7 @@ with its reference implementation, and with itself, on generated input, then tur
 issue, a fix and a pinning test. It is not the regression suite: the suite and `succinctly dev compare jq` re-check what
 is already known, and a hunt looks for what nobody has written a test for yet.
 
-This guide describes the method of the hunt run before a release from 2026-11-21 to 2026-11-23, in two rounds. As of
+This guide describes the method of the hunt run before a release from 2026-11-21 to 2026-11-25, in three rounds. As of
 2026-11-23 00:45 UTC, with fixes still being written, timed and merged, its filing log lists 198 issues (#7425 to
 #7815): 133 from the first round and 65 from the second, where the 40 findings of the second round's five hunters
 became 38 issues and fixers, timing agents and verifiers filed the rest as follow-ups. Of the 198, 168 were closed:
@@ -15,6 +15,9 @@ became 38 issues and fixers, timing agents and verifiers filed the rest as follo
 other changes. Of the 30 still open, 23 had a fix on a branch or in an open pull request (several of them held for
 timing) and 7 had none: design work, or a fix in progress. Another 19 issues opened in the same period are not in the
 log: fixers filed some directly (#7575, #7576, #7775), and others concern CI, tooling or yq (#7615 to #7618). The
+third round, from 2026-11-23 to 2026-11-25, started no new hunters: it ran the verification work as a hunt
+(differentials of the build from before the hunt against `main`, the AVX2 machine, a full `dev compare`, corpora built
+for three design studies) and filed 47 more issues (#7826 to #7935); see [The third round](#the-third-round). The
 guide is written for whoever runs the next hunt, alone or as a coordinator of several agents. Read it once top to
 bottom; the later sections are reference.
 
@@ -23,6 +26,7 @@ bottom; the later sections are reference.
 - [The known-set check](#the-known-set-check)
 - [Strategies](#strategies)
 - [Coverage map](#coverage-map)
+- [The third round](#the-third-round)
 - [Territories and the hunter's report](#territories-and-the-hunters-report)
 - [Harness rules](#harness-rules)
 - [From finding to merged fix](#from-finding-to-merged-fix)
@@ -41,7 +45,9 @@ clean.
 Run another after a large batch of fixes has merged. More than 100 PRs merged during the first round, many of them in
 the same input routes, and fixes interact: #7570 was a new bug in the fix for #7455, #7720 came from #7602 and #7795
 from #7744, each found by a later hunter or fixer, not by the fix's own tests (see
-[Regressions from the hunt's own fixes](#regressions-from-the-hunts-own-fixes)).
+[Regressions from the hunt's own fixes](#regressions-from-the-hunts-own-fixes)). In the third round at least 16 of
+the 47 issues filed were regressions of the hunt's own fixes, and the
+[regression differentials](#regression-differentials) found 12 of them.
 
 Do not hunt in the last hours before a release. A finding then has no time to be fixed and verified; see
 [Stopping rules](#stopping-rules).
@@ -89,6 +95,22 @@ A finding is any one of:
 Decide from upstream evidence, never from which answer looks better: jq's `NEWS.md` at tag `jq-1.8.2`, the source at
 both tags, and the commit or PR that changed the behaviour (`gh api repos/jqlang/jq/...`). The 1.8.2 test files are
 vendored in `comparison/jq/vendor/jq-1.8.2/`.
+
+For an edge of jq's input reader (a NUL, a byte-order mark, a fault near a 4,095-byte read, a file boundary), read
+jq's own source, `src/util.c` and `src/jv_parse.c`, at each tag. No test file and no NEWS entry states the rules: jq
+reads with `fgets` into a 4,096-byte buffer, keeps one parser for the whole run and drops the rest of a read on a
+fault, and the answers fall out of that. The third round's fix for #7921 came from reading them. Two cautions from that
+work:
+
+- **Check which tag a source file comes from before reasoning from it.** Copies of the reader taken as jq 1.8.2's were
+  1.8.0's and 1.8.1's, which read input differently; fetch the file at the tag (`gh api
+  'repos/jqlang/jq/contents/src/util.c?ref=jq-1.8.2'`).
+- **Read each 1.8 change's intent from jq's own commits, change by change, before adopting it.** Of the ways 1.8.2's
+  reader differs from 1.7.1's, the end of the cut at a NUL is a security fix (commit 6374ae0, "Fix NUL truncation in
+  the JSON parser", CVE-2026-33948), while the 4,091-byte read is a side effect, on JSON input, of a fix for `-R -s`
+  splitting multibyte characters (jqlang/jq#3421), and the closing empty read is the deliberate mechanism of a
+  `--slurp --stream` fix (jqlang/jq#3279). Only the first is a fix of the behaviour it changes; for the other two,
+  what they do to other routes is a separate decision.
 
 `succinctly yq` follows yq v4.53.3 the same way; see [For a yq hunt](#for-a-yq-hunt).
 
@@ -153,6 +175,7 @@ count, so the next hunt does not repeat it.
 | Call-heavy programs              | recursion grids by leaf and combiner; chains and DAGs of defs and modules | against jq, time included                     | #7786         | #7713, #7786, #7787                                                                                 |
 | Complexity probes                | one program at three or more sizes; one quantity varied, the others held  | growth against jq's growth                    | #7563         | 12 quadratic-or-worse issues in the first round; causes found for #7451, #7483, #7697, #7699, #7721 |
 | Verification passes              | every filed reproduction, at full size and on both platforms              | against the target reference                  | #7448         | 0 regressions; 3 incomplete fixes completed by follow-up PRs                                        |
+| Regression differentials         | the earlier generators, plus new ones weighted to what the fixes changed  | the pre-hunt build against `main`, then jq    | #7887         | 5 clusters in 2.73M cases (#7842 to #7845); 5 more and a slow-down in 1.94M (#7887 to #7889, #7893) |
 
 ### Grammar and mutation fuzzing
 
@@ -319,6 +342,23 @@ the native stack (#7475; the threshold lies between 45,000 and 60,000). A fixer 
 builders disagree on one malformed token (#7539), which no CLI run had shown: when a library-level differential is
 cheap, run it too.
 
+They did not disagree in the third round either. The AVX2 machine ran 580,218 cases at `77bff4b58` and 185,620 more
+at `e43c3f9c4`, from a generator weighted toward the merged fixes (files cut inside escapes and multibyte
+characters, byte-order marks, `--seq`, `-R`), on `cli`, `cli,simd` and `cli,portable-popcount`, and on `cli,simd`
+with `sse2` forced: 1,488,692 and 734,975 variant runs with no mismatch between them, and the test suites green on
+that CPU each time. Its findings were #7866, which is not CPU-specific, and two more shapes of #7888's error order.
+
+A third run on the same machine, at `a9da4e814` (the code of the release candidate), added a mode that puts faults at
+jq's 4,095-byte read boundaries (#7921, #7897) and ran `cli,simd` with `sse2` forced as a fourth build. The four
+builds never disagreed: 602,250 cases and 1,742,616 variant runs with no mismatch, and on that CPU 6,341 library tests,
+5,206 `jq_cli_tests`, 3,698 `yq_cli_tests` and all 27 deep-recursion tests passed. Against `e43c3f9c4`, 24 rows
+changed. The 22 in the read-boundary mode are all improvements. Of the 2 regex rows, one is #7878's open shape, wrong
+before and wrong in other words now. The other is an error-order regression under the `x` flag: an option group with a
+blank before its `)` is reported as a later repeat error (`(?i ) ?`, `(?ix )(?<= ?)`, `(?i )(?= ?)` are `target of
+repeat operator is not specified`, where jq says `undefined group option`). `(?i ) ?` and `(?i )(?= ?)` already
+answered so at `e43c3f9c4`, and `(?ix )(?<= ?)` is new since; it is recorded as a comment on #7929. Like #7866, it is
+not CPU-specific.
+
 A **debug-versus-release differential** finds what only an internal assertion sees. Run every generated case on both
 builds and keep the cases where only the debug build differs. In about 135,000 generated programs the 562 debug-only
 differences had one cause: negating the input 2^63 left a number whose stored form disagreed with its own text, which
@@ -479,10 +519,76 @@ The hunt ran four passes: on the combined tree of unmerged fixes (107 issues, 0 
 regressions), and on the x86_64 Linux box at `47c652241` for the rows that need Linux or 4 GiB inputs. The second pass
 found three fixes incomplete on shapes their tests did not cover (a nested one-member object, #7448; `/dev/fd/7`,
 #7446; `/dev/stdin`, #7568), and each got a follow-up PR on the closed issue: two fixes and one recorded divergence.
+A fifth pass, at `77bff4b58` in the third round, covered 83 issues (64 FIXED, 12 RECORDED, 7 still differing, all
+of them open, partial or a duplicate) and re-checked 30 from earlier passes, with no row regressed. Its own
+differentials around the newest fixes found three more: a recursion over a parenthesised `foreach` leaf under string
+interpolation refused at depth 12 since #7828 (#7846), a write to a closed stderr pipe on macOS that sometimes exits
+normally, dating from #5547 (#7847), and what was left of #7483 and #7789 (#7848). No separate pass ran at the
+release candidate, `6362c4bc4`: the last [regression differential](#regression-differentials) ran at `a9da4e814`,
+whose code the candidate shares (it changes no source file, only the link-order list, its tooling and docs), and
+stands in for one.
 
 Verify on the other platform too. Two fixes verified on macOS (the descriptor-offset tests of #7686 and #7687) carry
 separate Linux expectations; the fourth pass ran those expectations against jq 1.7.1 on Linux, 48 runs, and all
 agreed.
+
+### Regression differentials
+
+A verification pass re-runs what was filed; a **regression differential** looks for what the fixes broke. Build
+`succinctly` at the commit the hunt started from (here `73f049b2c`, the commit of the last committed `dev compare`
+runs) and at current `main`, run both on every generated case, and run jq 1.7.1 only where the two differ. Classify
+each differing case on stdout, stderr and exit status:
+
+- **REG:** the old build matched jq on stdout and exit status and the new one does not; **REGERR:** the same on
+  stderr alone. These are the leads.
+- **FIX:** the new build matches jq on all three and the old one did not.
+- **NEWCRASH:** the new build panicked, was signalled, timed out or was killed for memory where the old one was not.
+- **OTHER:** neither build matches jq. Not a regression by this definition; scan it for new crashes and leave it.
+
+It finds what a fix's own tests cannot. A fix's test pins the shapes its author had in mind, over a matrix built for
+that issue; a regression differential runs every shape the generators make against the build before any fix, so a
+fix that changes a neighbouring shape shows up as old-agreed and new-differs whether or not anyone wrote a test for
+that shape, and jq decides which side is right, so no expectation has to be written. It is also cheap: two
+`succinctly` runs per case, and jq only on the few percent that differ. Expect most REG rows to be deliberate
+changes, above all adoptions of jq 1.8.2 (`[last(empty)]` is `[]` now, so every row that reaches it differs), so
+classify each family against [limitations.md](../compliance/jq/limitations.md) by one example before reading rows, and
+re-run each real lead by hand on both builds and both jq releases.
+
+Weight the generators toward what changed. List the merged fixes by area, add generators for those areas, and keep
+the earlier hunters' generators unchanged beside them as the control.
+
+The third round ran three, each finding five clusters:
+
+- **x86_64 Linux** (an AVX2-only Intel i7-6700), about 2.73 million cases against `main` up to `77bff4b58`. Four
+  live regressions, each traced to a merged fix: a stream's BOM read as text after a file that does not open
+  (#7842, from #7646), `path(inside(.b |= 1))` reporting the wrong path error (#7843, from #7543), a regex error
+  reported in the wrong order (#7844, from #7745) and a native builtin with `inputs` as its argument draining the
+  stream before it raises (#7845, from #7543). The fifth, a cut document read in quadratic time, was already fixed
+  (#7792).
+- **macOS arm64** (an Apple M5), 1,943,904 cases at `e43c3f9c4`, the commit first meant as the release candidate,
+  weighted toward regex, named arguments, label and `break`, builtin arguments that read `input`, deep recursion,
+  byte-order marks, truncated UTF-8 under `-R`, closed pipes and dates. Five clusters: three regex regressions under
+  the `x` flag from #7865 (#7887; one of its rows only looked new, and its cause predates the hunt), regex error
+  order from #7852 (#7888), and a `--seq` position from #7775 (#7889). A flag for a recursive generator whose time
+  grew with the square of its depth, with the same output, became #7893: quadratic since #7702, and since #7856
+  for the same recursion over a `$n` parameter. No crash, abort or hang was the new build's alone.
+- **macOS arm64 again** (an Apple M5 laptop), 1,806,339 cases in 31 steps, `73f049b2c` against `a9da4e814`, the code
+  of the release candidate, with a build of `e43c3f9c4` to tell what changed since the second run from what was
+  already there. New generators covered 4,095-byte reads, closure arguments that grow at each level, `--argjson` texts,
+  the regex shapes of #7887 and #7888, and `--seq` with `halt`. It counted FIX 231,370, REG 27,141, REGERR 5,378,
+  NEWCRASH 4 and OTHER 23,318, and 1,501 rows that differ only by a recorded normalisation (#7453, #7605, #7534).
+  Five clusters, all filed: a doubly recursive def with a `try` in a closure argument that takes about 16 s where jq
+  answers at once, bisected to PR #7828 for #7787 (#7928); regex error order and answers changed by the fixes for
+  #7887 and #7888 (#7929); regex rows that expose older gaps (#7930); a wrong position and a fault reported twice at a
+  BOM-led 4,095-byte read boundary (#7931); and exit 0 with `[]` where jq exits 5, after a BOM, a fault and a number
+  ending in a NUL at the read boundaries, very likely from #7923 (#7934). #7928 and #7931 were already in
+  `e43c3f9c4`; #7929 and #7934 are newer. Both builds passed 2 GiB on a recursive collect-and-reyield that jq answers
+  in 2.6 MB, a lead outside the regression scope, filed as #7935.
+
+The regex compiler is where fixes broke fixes fastest: in one day #7865 led to #7887, and #7852 with #7858 led to
+#7888, each fix's own sweep clean, and the fixes for #7887 and #7888 led in turn to #7929. A rule decided by several
+hand-written passes over the same text fails this way (see the regex proposal in
+[Three design proposals](#three-design-proposals)).
 
 ## Coverage map
 
@@ -560,6 +666,29 @@ later `main`). Their findings by territory:
 | Large documents                                                                    | about 6,000 runs (50 programs, 5 shapes, 2 KB to 93 MB, 7 flag sets)                                    | zero; a 55-program memory sweep found #7789                                                 |
 | Regex tail, dedicated fuzz                                                         | 34,308 quantifier rows; 19,500 wide rows                                                                | #7689 closed; #7804, #7805; 629 and about 1,243 rows still differ, recorded or engine-level |
 
+### Third round (2026-11-23 to 2026-11-25)
+
+No hunters: verification differentials, timing passes and three design studies' corpora, on `main` as the second
+round's fixes merged (`77bff4b58`, then `e43c3f9c4`, then `a9da4e814`), and at the release candidate, `6362c4bc4`.
+
+| Area                                                                        | Approximate cases                                  | Outcome                                                                      |
+|-----------------------------------------------------------------------------|----------------------------------------------------|------------------------------------------------------------------------------|
+| Regression differential, x86_64 Linux (AVX2), pre-hunt build against `main` | about 2.73 million                                 | #7842 to #7845; a fifth cluster already fixed (#7792)                        |
+| Regression differential, macOS arm64 (Apple M5), at `e43c3f9c4`             | 1,943,904                                          | #7887, #7888, #7889, #7893                                                   |
+| Regression differential, macOS arm64 (Apple M5), at `a9da4e814`             | 1,806,339                                          | #7928 to #7931, #7934; #7935 outside its scope                               |
+| Verification pass 5 at `77bff4b58`                                          | 83 issues, 30 re-checked                           | 0 rows regressed; #7846, #7847, #7848                                        |
+| AVX2-only x86_64: builds, SIMD levels and test suites                       | 580,218 and 185,620 cases                          | zero build differences; #7866                                                |
+| AVX2-only x86_64 at `a9da4e814`: four builds and test suites                | 602,250 cases, 1,742,616 variant runs              | zero build differences; one regex error order (#7929)                        |
+| Placement, Apple M4 Pro, interleaved against `73f049b2c`                    | 1 MB pass-through and startup rows                 | no regression; the link-order lead refuted; #7826 (tooling)                  |
+| Placement, AMD Ryzen 9 7950X, interleaved against `73f049b2c`               | 1 MB pass-through and startup rows, 173 more cells | #7880 (a per-byte scan from #7719); #7881 found measuring it                 |
+| `dev compare jq --full --huge` on both chips at `e43c3f9c4`                 | 251 timed rows, 32 sweeps, the probes              | every timed row gated `match`; exit 1 on a stale sweep (#7890); #7891        |
+| `dev compare jq --full --huge` on both chips at `6362c4bc4`                 | 253 timed rows, 32 sweeps, the probes              | every timed row gated `match`; exit 0; #7933 (placement)                     |
+| Peak memory against the #7412 paragraph, AMD Ryzen 9 7950X                  | 231 rows, with an A/A' control                     | #7894                                                                        |
+| Peak memory with the link-order list regenerated (#7927), both chips        | 231 rows, with an A/A' control                     | rows above jq 92 to 86 (7950X) and 79 to 76 (M4 Pro); #7826, #7894 closed    |
+| Input reader (design study), against jq 1.7.1 and 1.8.2                     | 320,000                                            | #7921, and #7922 from its fix; #7904's family is wider than the issue        |
+| Regex patterns (design study)                                               | 330,133 patterns, 459,678 rows                     | 49,641 rows differ from both releases; #7864, #7877, #7878, #7887 still open |
+| The fixes' own differentials (old, `main` and fix against jq)               | about 1.6 million over 9 changes                   | 0 rows regressed against `main`; #7897 and #7904 found along the way         |
+
 ### Never covered
 
 - **`succinctly yq`.** No hunt of this kind has run on yq mode; four yq issues were filed only in passing (#7615 to
@@ -579,6 +708,135 @@ later `main`). Their findings by territory:
   [limitations.md](../compliance/jq/limitations.md); #7803 is another).
 - **The library API** apart from the CLI, except the builder differential behind #7539.
 - **Compile-error locations in the middle of a program:** 33 bison-versus-parser differences were left unchased.
+
+## The third round
+
+The third round began at the second round's snapshot (2026-11-23 00:45 UTC), with that round's hunters finished and
+30 of its issues still open. It started no hunters, and the owner extended the time box by a day during it. Each
+verification step was run as a hunt aimed at what the batch of fixes had changed: regression differentials against
+the build from before the hunt, a fifth verification pass, the AVX2 machine, timing and placement passes on both
+benchmark machines, a full `dev compare` on both, a memory check against the documented bound, and the corpora of
+three design studies. Small items the owner picked from the backlog ran beside it (#7275, #7385, #7388, #7467).
+
+### What it found and fixed
+
+- **Filed:** 47 issues, #7826 to #7935, all in the filing log. At least 16 were regressions of the hunt's own fixes:
+  #7842 to #7846, #7880, #7881, #7887 to #7889, #7893, #7897, #7928, #7929, #7931 and #7934. #7933 is a slowdown
+  since `e43c3f9c4` at equal instruction counts (code placement), one row family on each chip.
+- **Closed, as of 2026-11-24 19:45 UTC:** 30, all by merged changes: 28 by a change to code, tests or tooling (#7826
+  and #7894 by #7927), and #7848 and #7866 by a recorded divergence with a pinning test. 17 are open.
+- **Merged:** 72 pull requests between the snapshot and `6362c4bc4`: 26 landed the second round's work still in flight
+  (fixes, docs and the new perf-guard rows of #7841), and 46 were opened in the third round, two of them dependency
+  updates (#7884; #7900, `jiff` 1.0, whose migration was checked by a 682,074-case differential with no difference).
+  The last two recorded the deferred divergences (#7925) and regenerated the link-order list (#7927).
+- **Open, 17:**
+  - **Regressions present in the candidate:** #7928, #7929, #7931 and #7934 since the hunt began, and #7933, the
+    placement slowdowns against `e43c3f9c4`.
+  - **Older, found in this round:** #7924 (a literal past decNumber's smallest exponent compared as written), #7926
+    (Unicode blanks skipped under the regex `x` flag), #7930 (a `\cX` or a backreference before a look-behind turns
+    off its refusal) and #7935 (a recursive collect-and-reyield whose memory grows exponentially).
+  - **Deferred to the design proposals:** the regex tail, #7864, #7877, #7878 and #7887 (its remaining item predates
+    the hunt); #7870, whose point fix (#7915) made the issue's chain linear where it doubled with each level, with the
+    per-call constant and two yq-mode shapes left; and the input reader's #7904, #7921 (its filed shapes fixed by
+    #7923, a residual recorded) and #7922.
+
+#7925 recorded the deferred jq divergences in [limitations.md](../compliance/jq/limitations.md). #7904's family is
+there as an error where both jq releases read the number, wider than the issue's case, left to the proposed single
+model of jq's input reader. The regex design study's corpus is there as five families of generated patterns that the
+text passes read otherwise than Oniguruma (refused in other words, about 11,700 rows; a different refusal around the
+repeat-count limit, about 2,988; an answer where jq refuses, about 623; refused where jq answers, about 2,439; a
+different answer under `x`, about 1,620), left to the regex front-end proposal. No test pins either. The same change
+recorded #7924 and #7926, also with no test. #7928 to #7931, #7934 and #7935 are not yet recorded there; whether to
+record them before the release is the owner's decision.
+
+### Three design proposals
+
+Three areas kept producing findings that one fix per issue cannot close, as [Stopping rules](#stopping-rules)
+describes. The owner commissioned a design study of each; each wrote an ADR-shaped proposal with a prototype on an
+unpushed branch. They are proposals, not decisions:
+
+- **`def` calls** (#7870, #7699, #7803, #7787): run them on a call machine with environments and a heap fork stack,
+  as jq does, instead of substituting the body per call on the native stack (it would amend
+  [ADR-0020](../adrs/adr-0020.md) and [ADR-0025](../adrs/adr-0025.md)).
+- **Regex** (#7864, #7877, #7878, #7887): compile and match jq-mode patterns with Oniguruma itself, at the commit jq
+  1.7.1 pins, and read the pattern text once (it would supersede [ADR-0019](../adrs/adr-0019.md), a decision the
+  owner makes).
+- **Input reader** (#7904, #7921, #7922): read jq-mode input through one model of jq's reader, entered at sync points,
+  with the semi-index running between them (the first ADR for the input layer).
+
+### Verification and its results
+
+- **Regression differentials:** three runs, five clusters each, 13 of the round's issues; see
+  [Regression differentials](#regression-differentials).
+- **AVX2 machine:** no build or SIMD-level difference in 3,966,283 variant runs over three runs; see
+  [Build differentials](#build-differentials).
+- **`dev compare jq --full --huge` before and after,** at `e43c3f9c4` on the AMD Ryzen 9 7950X and the Apple M4 Pro,
+  against each machine's committed run at `73f049b2c`. Every one of the 251 timed rows gated `match` on both chips.
+  No row flipped from succinctly-faster to jq-faster on either chip, and no row was slower than the committed run
+  beyond its noise: the three M4 Pro rows that read slower by median were faster by min-of-reps under an interleaved
+  A/A'/B hold, and retire 3.5 to 10.7% fewer instructions (cachegrind, on the 7950X). No row's peak memory rose by
+  more than 10% against the committed run, and most rows fell by more. Both runs exited 1 for one reason, a sweep
+  that had not learned an adopted jq 1.8.2 behaviour (#7890). The two runs also wrote 9 crash dumps from untimed
+  probes on the Linux box (#7891), and they measure the comparison harness's build, not the shipped one
+  ([docs/compare/jq.md](../compare/jq.md), #7385).
+- **Placement passes** on both chips, interleaved against `73f049b2c` with A/A' controls: no 1 MB or startup row is
+  slower, and the one regression in 173 more cells was real work, not placement: a per-byte scan of every string
+  literal for `__jq` since #7719, which took `users_rawfile` from 8.84 to 91.41 million instructions at 10 MB on the
+  7950X (#7880). Measuring its fix found `--argjson` parsed twice since #7743 (#7881).
+- **Memory against the documented #7412 bound:** no longer true at `a9da4e814`, from a stale link-order list (#7894),
+  and restored at the candidate. #7927 regenerated the list from `a9da4e814` (on Linux, then on macOS for the
+  platform-named functions), closed #7894 and #7826, and made CI fail when more than 5% of the listed names no longer
+  resolve. On the 231 rows of the #7412 run, with A/A' controls, the rows above jq 1.7.1 went from 92 to 86 on the
+  AMD Ryzen 9 7950X and from 79 to 76 on the Apple M4 Pro, the counts of the #7412 run, and no row moved above jq.
+  The geomean of the memory ratio went from 0.720 to 0.626 and from 0.578 to 0.553 (0.616 and 0.547 in the #7412
+  run), and `startup` on the 7950X from 5.10 to 3.63 MB. Instruction counts did not change. #7927 also refreshed the
+  paragraph in [docs/benchmarks/jq.md](../benchmarks/jq.md) with these figures.
+- **Input-reader corpus:** 320,000 cases built from a seed, each compared with jq 1.7.1 and 1.8.2 on all three
+  channels: 310,249 equal jq 1.7.1, 7,686 follow jq 1.8.2 (recorded adoptions), and 2,065 match neither. Read by
+  hand, the wrong values among those reduce to two recorded mixtures of the releases, #7866, lazy validation, and
+  #7921, which predates the hunt; 1,305 of the 2,065 are inputs on which the two jq releases disagree with each
+  other.
+- **Final re-verification at the release candidate,** `6362c4bc4`, `main` after #7927. It changes no source file
+  of `a9da4e814`, only the link-order list, its tooling, CI and docs, so the differentials run there cover its code:
+  - **Regression differential:** 1,806,339 cases on an Apple M5 laptop, five clusters, all filed (#7928 to #7931,
+    #7934); see [Regression differentials](#regression-differentials).
+  - **AVX2 differential:** four builds on an AVX2-only Intel i7-6700 that never disagreed in 602,250 cases and
+    1,742,616 variant runs, every test gate green, and one regex error-order regression, recorded on #7929; see
+    [Build differentials](#build-differentials).
+  - **`dev compare jq --full --huge` on both chips,** at `6362c4bc4` itself. Both runs exited 0, the ledger had 0
+    unlisted and 0 stale entries, and all 223 file rows, 24 stdin rows and 6 huge rows gated `match`. The all-rows
+    geomean speed-up over jq 1.7.1 is 3.20x on the AMD Ryzen 9 7950X (2.74x in the committed run, 3.19x at
+    `e43c3f9c4`), with jq faster on 0 of 221 rows, and 2.85x on the Apple M4 Pro (2.56x and 2.86x), with jq faster on
+    26 of 221, unchanged from `e43c3f9c4`. No row flipped to jq-faster. Peak RSS geomean fell 44.2% on the 7950X and
+    18.7% on the M4 Pro against the committed run, no row's peak RSS rose by more than 10% and 1 MiB, and the Linux
+    box wrote no crash dumps (#7891's 1-byte core limit works). Against the committed run, the only rows more than 5%
+    slower by median are two known ones on the M4 Pro: `strings_length` at 100 MB (+6.7%, -0.6% by min, a bimodal
+    row) and `wide_map_values` at 1 MB (+5.3%, the accepted #7392 and #7416 trade of time for memory).
+  - **Placement against `e43c3f9c4`:** two row families are slower under an interleaved A/A'/B with the same
+    instruction counts: `ndjson_slurp` and `seq_slurp` by 3 to 6% on the M4 Pro, and `strings_upcase` by 9.7 to 11.6%
+    on the 7950X, still 43 to 53 times faster than jq and faster than in the committed run at 1 MB (7.41 against
+    8.33 ms). Both are filed as #7933 and not bisected; the suspect is #7927's list.
+  - **The committed runs in `docs/compare/`** were not refreshed; that is left to release preparation.
+  - **Verification pass:** not run as a separate step; the regression differential at `a9da4e814` covers the
+    candidate's code (see [Verification passes](#verification-passes)).
+
+### Lessons
+
+Each is folded into the section it belongs to:
+
+- Perf-guard counts move from start-up heap state and from link layout alone (#7907, #7915, #7923): see
+  [What the CI perf guard does not see](#what-the-ci-perf-guard-does-not-see).
+- A regression differential against the build from before the hunt catches what fixes break (#7887, #7888): see
+  [Regression differentials](#regression-differentials) and
+  [Regressions from the hunt's own fixes](#regressions-from-the-hunts-own-fixes).
+- Sweep expectations and one-off perf-guard thresholds go stale (#7890, #7913): see [Gates](#gates) and
+  [What the CI perf guard does not see](#what-the-ci-perf-guard-does-not-see).
+- A stale link-order list costs memory silently (#7894): see
+  [What went wrong when a step was skipped](#what-went-wrong-when-a-step-was-skipped).
+- Core-dump limits for children on shared machines (#7869, #7891), and stopping only processes by recorded PID: see
+  [Harness rules](#harness-rules) and [Sharing machines](#sharing-machines).
+- Read jq's own source for reader edges, check which tag a file comes from, and read a 1.8 change's intent from jq's
+  commits (CVE-2026-33948): see [The reference](#the-reference).
 
 ## Territories and the hunter's report
 
@@ -646,6 +904,17 @@ Each rule comes from an incident in this hunt.
 - **Never wrap a test harness in `RLIMIT_AS`.** Thread-stack reservations count against the address-space limit, so
   the test harness's thread spawns fail with `EAGAIN` and it aborts. Keep the limit for fuzz drivers, their children
   and single peak-RSS probes; for a test run, watch available memory and the kernel log for OOM kills.
+- **Give every child that may abort a core limit of exactly 1 byte, set with `setrlimit`.** On a Linux host whose
+  `core_pattern` is a pipe (WSL2's crash capture, systemd-coredump, apport), an aborting child writes a dump of up to
+  hundreds of MB whatever a limit of 0 says: the kernel skips a piped handler only for a limit of 1. A deliberate-abort
+  test aborted the CLI about 21 times per run and each left a dump (#7869), and one pre-release `dev compare --full`
+  wrote 9 dumps, 800 MB, from untimed probes on which jq 1.7.1 or succinctly is expected to abort (#7891). Since then
+  the comparison sets that limit for itself and every child it starts (`src/bin/succinctly/compare/core_limit.rs`), as
+  `tests/common/no_core_dump.rs` does for test children. Set it with `setrlimit(RLIMIT_CORE, (1, 1))` (in Python,
+  `resource.setrlimit` in a `preexec_fn`, or a wrapper that sets it and execs, for `cargo test` too), never with the
+  shell's `ulimit -c`: `ulimit -c 1` sets 1,024 bytes, which does not stop the dump, and `ulimit -c 0` sets the hard
+  limit to 0 as well, after which no child can raise it to 1 and the repository's own core-limit tests fail. On macOS
+  the limit stops the core file but not the crash reporter.
 - **Never put real random input in a test.** A test reading `/dev/urandom` failed now and then in the merge queue and
   looked like a flake; it was a real unbounded read (#7812) that only some random prefixes reach (2 of 200 local runs).
   Feed a test fixed bytes (#7813 types fixed lines into a pseudo-terminal) and hunt the random shape separately.
@@ -747,6 +1016,13 @@ The fuzz dimension uses the manifest's seeds (1 to 3 in CI). An entry that only 
 CI, so ledger only what CI's seeds find. The `--full` comparison runs more oracle sweeps than CI does, and an adoption
 that leaves one of them without an entry makes the release's `--full` run exit 1 (#7815).
 
+It happened again in the third round. #7807 adopted jq 1.8.2 for a `-s` fault at the end of the text, and the
+`stream-errors` sweep, which judges against jq 1.7.1, met that shape on 3 of its 2,600 runs; nothing showed it until
+the pre-release `--full` run exited 1 on both chips (#7890). The bisect found the deliberate adoption, not a bug; the
+fix taught the sweep the adopted shapes rather than ledgering the whole sweep, and its run over seeds 1 to 20 found
+one real bug on seed 17 (#7897). When a change adopts jq 1.8.2 behaviour, search every sweep under `scripts/` that
+judges against jq 1.7.1 for the shape, not only the ledger, and run the sweeps' extra seeds once.
+
 ### The performance hold
 
 A fix that touches code ordinary queries run (a hot path) is held until it has been timed. The fixer marks the hand-off
@@ -812,7 +1088,7 @@ shapes the guard has no row for.
 ### What the CI perf guard does not see
 
 The guard counts instructions over a fixed list of rows on every PR and fails on drift past each row's threshold. The
-second round's timing passes found three ways it misleads:
+second round's timing passes found three ways it misleads, and the third round two more:
 
 - **Shapes with no row.** Many small records with one evaluation each (#7719, #7786); one document across several files
   (#7750); escape-heavy text (#7758); per-element `and`/`or` and object construction with a def (#7787); fold steps
@@ -821,10 +1097,29 @@ second round's timing passes found three ways it misleads:
   identical builds, and the guard takes 14% longer.
 - **Loose per-row overrides.** A `QUERY_THRESHOLDS` entry of 30%, kept from an older change, let a +5.9% row of #7789
   (`del(.users[] | select(.score < 100))`) pass. Remove an override once `main` carries the change it was for (#7695),
-  and read the drift column, not only the verdict.
+  and read the drift column, not only the verdict. A comment saying so was not enough: in the third round nine more
+  overrides, of 8% to 90%, had outlived their changes by up to four weeks (#7913). Every override above the default
+  is now named with the pull request it covers (`ONE_OFF_UNTIL` in `scripts/perf-guard.py`), and the script's
+  self-tests fail once `main` is 50 merges past that pull request.
 - **It fails on improvements too.** A row more than 5% faster fails like one that is slower (#7672 failed on -7.2%), so
   a fix that speeds up a guarded row needs an override until `main` has it, and new rows merge after the fixes that
   move them: #7798 was held to merge last, or every fix still in flight would have tripped it.
+- **It moves when the counted code does not: start-up heap state.** #7907, the fix for #7881, moved per-record rows
+  by up to 1.5% on CI, and no function of the crate changed its count on them. The branch kept argv until later in
+  start-up instead of freeing it where it always had been, which changed the heap every run starts from and so which
+  of glibc's allocator paths each later allocation takes: the whole difference was in `_int_malloc`, `unlink_chunk`,
+  `_int_free`, `memcpy` and `memcmp`. Keeping argv only when a value was kept put every row back within a start-up
+  constant.
+- **It moves with link layout.** A yq row read +0.073% on #7923's branch, all of it in `__memcmp_avx2_movbe`: the
+  same calls, each costing more, from operand alignment in a binary 3,912 bytes larger, for a change that touches no
+  yq code. A term of the same kind on #7915 showed on one machine's guard run and not on CI's. Another row of #7923 read
+  +0.108% from allocator state, and -0.26% when the same two binaries were started from a path one character
+  shorter: its sign follows the length of the binary's path.
+
+So attribute a moved row by function before believing it: `cg_annotate` of base and branch, with a second build of
+the base as the A/A control, as in [The performance hold](#the-performance-hold). A difference that sits entirely in
+the allocator or in `memcmp`, with every function of the crate flat, is state or layout, not work the change added;
+say so in the PR, and let CI's run of the same rows confirm it.
 
 ### Landing
 
@@ -852,7 +1147,7 @@ second round's timing passes found three ways it misleads:
 ### Regressions from the hunt's own fixes
 
 Fixes written quickly in the same code break each other, and their own tests do not show it. In the second round they
-were found four ways:
+were found four ways, and in the third round mostly a fifth:
 
 - **By a later hunter or fixer in the same area.** #7720 (a `?//` inside `map` in an object value refused at compile
   time) came from #7602's parser change and was found by the next round's builtin-family fuzzer. #7795 (a def whose body
@@ -870,10 +1165,20 @@ were found four ways:
   2.81x, and no row flipped to jq-faster) and found three things no branch's timing could. `--rawfile` had held two
   copies of the file since #7436 (+34% time and +86% peak RSS at 100 MB on the Apple M4 Pro, #7814). 1 MB pass-through
   rows were 5 to 9% slower on the M4 Pro while x86_64 instruction counts on the same rows had fallen, which pointed at
-  the link order: its symbol list had been generated on x86_64 and lacks the NEON kernels. And the comparison itself
+  the link order: its symbol list had been generated on x86_64 and lacks the NEON kernels. A placement pass in the
+  third round refuted that lead: relinked without the order file the build was not faster, and under interleaved
+  A/A' control `main` was faster than the committed build on those rows, so the midway reading was load on the
+  machine, not code. Confirm a cross-run difference under interleaving before bisecting it. And the comparison itself
   exited 1, because six oracle sweeps still judged against jq 1.7.1 after deliberate adoptions of 1.8.2 behaviour
   (#7518, #7525) and had no ledger entries (#7815).
 - **By a verification pass,** as in the first round: a row FIXED in one pass that differs in the next.
+- **By a regression differential against the build from before the hunt** (the third round): three runs gave 13 of
+  its issues, 12 of them regressions of merged fixes, among them two regex misreadings from one fix (#7887 from
+  #7865) and an error order from another (#7888 from #7852), with each fix's own sweep clean; see
+  [Regression differentials](#regression-differentials). The fixes of those regressions were checked the same way,
+  three builds against jq: the regex repair's 420,000-case differential moved 47,040 rows to jq's answers and
+  regressed none against `main`. The third regression differential still found #7929 in the fixes for #7887 and
+  #7888.
 
 ### Verification after merge
 
@@ -895,6 +1200,14 @@ their tests.
 - **A fixer's own timing taken for a timing pass.** #7775's fixer measured instruction counts of the rows it changed;
   the coordinator's review found that the new early-exit reader held a whole pipe in memory and opened every named file
   up front. Review what a fix does to memory and to files it does not read, not only to the rows it targets.
+- **A generated list left to go stale.** `scripts/link-order/symbols.txt` orders the binary's hot functions at link
+  time, and was edited twice in the 222 merges between the #7412 memory run and the third round, while the code moved
+  under it: 1,339 of its 1,455 names still resolved. Nothing failed, not the tests, not the perf guard (it counts
+  instructions, not pages), not `generate.py check`. Peak RSS on rows under 60 MB rose by a median 1.29 MB on the AMD
+  Ryzen 9 7950X, in file-backed pages of the binary, gradually over the merges and not in any one PR, and the
+  documented #7412 bound stopped being true (#7894). Rebuilding with only the list regenerated recovered nearly all
+  of it. Check how many listed names still resolve (the link log prints it) before a release, and regenerate the
+  list after a large batch of merges. Since #7927, CI fails when more than 5% of them no longer resolve.
 
 ## Coordinating several agents
 
@@ -932,7 +1245,8 @@ line self-contained:
 - **Hand-off list ("ready"):** branch, worktree, issues, full head sha, priority, note. The note carries gates run, what
   is unverified, merge-order dependencies, `Closes #N` or `Refs #N`, and a hold marker (`HOLD-PERF`, `HOLD-GATES`,
   `HOLD-LEDGER`) only when a hold is meant: a marker word inside an ordinary note held one branch back by mistake, so
-  a branch with no hold says "no perf hold".
+  a branch with no hold says "no perf hold". A hold lifted on evidence is lifted on every line that carries it: in the
+  third round a superseded line still marked `HOLD-PERF` kept the merge agent from opening #7870's released branch.
 - **Merge-agent lists:** PRs waiting on CI (PR, issue, head sha, note); released branches (branch, PR, sha, time);
   parked PRs (PR, sha, reason); and a status table (PR, issue, state, last action, time).
 - **Verification tables:** issue, state, class, target reference, note; one per pass.
@@ -971,6 +1285,9 @@ agent's check refuses an action (a cleanup `rm` on a remote machine, a `gh issue
 on that agent's behalf: not the coordinator and not the machine coordinator. Doing so launders the refusal. The
 refused action goes to the owner, saying what it would do and why; a refused issue goes into a draft in the agent's
 worktree for the coordinator to file. Leftovers on a machine wait for the owner, on the list of pending decisions.
+In the third round four refused issue drafts waited in worktrees until the owner allowed the coordinator to file
+them, and a fixer's edit to a sweep's expectations, refused as weakening a check, went to the owner as three options
+before the sweep was changed (#7890).
 
 ### Hand-over when an agent's context runs out
 
@@ -982,6 +1299,12 @@ pass; the gate recipe used before; and what not to change. The fixer of #7786 an
 context ran out before either rework began, and two fresh fixers took the reworks on from it. The #7750 branch was
 finished (lint fixes, Linux gates, a 68,320-list re-sweep) by an agent that had not written it. Merge agents keep a
 status table and a notes file, and each successor starts from them.
+
+A context limit ends one agent; a usage limit ends every agent on the same model at once. In the third round a usage
+limit ended a fixer, the merge agent and the agent preparing the link-order regeneration within minutes of each
+other, with one fix's last sweep and pull request still to do. Agents cannot change model mid-run, so continuations
+on another model started from the three agents' state files and took the work on. Keep every long-running agent's
+state file current, not only when its context runs low.
 
 ### Sharing machines
 
@@ -1010,11 +1333,19 @@ status table and a notes file, and each successor starts from them.
   benchmark machines), and assign from it when an agent leaves one.
 - **Resumable jobs.** The network dropped several times and every remote box went offline once for hours. Run each long
   job in a detached terminal, as a script that skips finished steps and logs to files on the machine; never as one long
-  foreground call. When a machine is unreachable, probe it at most every 10 minutes and work locally meanwhile.
+  foreground call. When a machine is unreachable, probe it at most every 10 minutes and work locally meanwhile. In
+  the third round every remote machine went offline at once for about an hour, two of them rebooting; one step that was
+  running there was lost, a sweep moved to the coordinating laptop at two jobs, and the work that needed the
+  machines waited for them.
 - **Liveness:** every live job touches a heartbeat file each minute and appends `started`/`finished` lines to a status
   file, so the machine owner can tell finished from crashed. A runner refuses to start a second copy of itself.
 - **Cleanup:** delete sources, targets and inputs, keep small logs, append the agent's tag to a done file, and tell the
   machine owner. Never kill a process you did not start, and never `pkill` by pattern.
+- **Stop your own jobs by recorded PID, not by pattern.** Record the PID or process group of every job you start (a
+  `.pid` file) and stop it with `kill` on that PID or `killpg` on that group. `pkill -f`, `killall` and `pgrep | xargs
+  kill` match on a command line, and on a shared machine another session's process can carry the same words: in the
+  third round an agent stopped its own steps with `pkill -f`, which happened to harm nothing, and the rule became one
+  of the machine rules.
 
 ### Stopping rules
 
@@ -1038,7 +1369,9 @@ status table and a notes file, and each successor starts from them.
   filter never reads (the semi-index validates lazily, so faults beside what a filter reads keep surfacing, and #7556
   and a file-cut case of the route hunter were recorded rather than fixed); and the two evaluators
   (`src/jq/eval.rs` and `src/jq/eval_generic.rs`), each of which needs every fix (#7788 is #7786's shape in yq mode).
-  Each needs an owner decision and more time than the tail of a hunt.
+  Each needs an owner decision and more time than the tail of a hunt. In the third round the owner commissioned a
+  design study for three such areas (the def-call model, the regex front end and the input reader), each delivered as
+  a proposal with a prototype and nothing merged; see [Three design proposals](#three-design-proposals).
 - **Leave design questions to the owner.** A performance trade-off (#7554's O(n) `first`), an ownership-model change
   (#7483) or a cap that jq added for its own safety is a decision, not a fix.
 
@@ -1065,7 +1398,12 @@ status table and a notes file, and each successor starts from them.
    perf-guard rows after the fixes that move them.
 10. Verify every filed reproduction on `main` (on Linux at size, and each platform-sensitive fix on the other
     platform) after the fixes land, and compare with the last pass.
-11. Update this page's coverage map with the new areas, volumes and outcomes, and the index.
+11. Run a regression differential of the build from before the hunt against `main`, weighted toward what the fixes
+    changed, after each large batch of merges and again at the release candidate, on more than one platform.
+12. Before the release: check how many link-order names still resolve and regenerate the list if they have drifted;
+    drop perf-guard overrides `main` no longer needs; make sure every sweep that judges against jq 1.7.1 knows each
+    adopted jq 1.8.2 behaviour; run `dev compare jq --full --huge` on both benchmark machines and read its exit status.
+13. Update this page's coverage map with the new areas, volumes and outcomes, and the index.
 
 ### For a yq hunt
 
