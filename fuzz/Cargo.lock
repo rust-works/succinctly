@@ -206,6 +206,7 @@ name = "succinctly"
 version = "0.8.0"
 dependencies = [
  "bytemuck",
+ "hashbrown",
  "indexmap",
  "libm",
 ]
