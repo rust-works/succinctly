@@ -320,6 +320,7 @@ pub fn blank_nul_number_tails(
                     .iter()
                     .position(|&b| b == b'\n')
                     .is_some_and(|at| nul + at < read_end)
+                    || hidden_tail_reads_alike(text, token_end, read_end, chunk, line_start, nul)
             });
             // The first NUL of the token decides it: one later in it is part of the same tail.
             let number = |token: &[u8]| !token.is_empty() && literal(token).is_ok();
@@ -348,6 +349,48 @@ pub fn blank_nul_number_tails(
             Some(found) => nul = search + found,
             None => return changed,
         }
+    }
+}
+
+/// Whether both jq releases read the number before the NUL at `nul`, the first NUL of a read with
+/// no line break, as the token ending at `token_end`, for [`blank_nul_number_tails`] (#7921).
+///
+/// jq 1.7.1 hands its parser such a read only up to the NUL: the token is what came before the NUL,
+/// still open, and the bytes from the NUL to the read's end (`read_end`) are never seen. jq 1.8.2
+/// reads the whole token and its number parser stops at the NUL. The two agree, and nothing but the
+/// token's own tail and white space is lost, in two shapes:
+///
+/// - the read hides the rest of the token and then only white space, and the next read starts with
+///   a byte that ends a token (the token's own end when the read ends there);
+/// - the token goes on into the next read with another NUL, in a read that holds a line break, which
+///   jq 1.7.1 hands over whole: the token it reads is the same C string.
+///
+/// Anywhere else the releases differ (a read that hides a bracket or a comma, a token that goes on
+/// with a digit of the next read) and nothing is rewritten. A read that reaches the end of `text`
+/// is left alone too: `text` may be a window of its source. `read_end - chunk` is where the read
+/// starts, the line's start in its first read.
+fn hidden_tail_reads_alike(
+    text: &[u8],
+    token_end: usize,
+    read_end: usize,
+    chunk: usize,
+    line_start: usize,
+    nul: usize,
+) -> bool {
+    let Some(&next) = text.get(read_end) else {
+        return false;
+    };
+    if find_nul(&text[read_end.saturating_sub(chunk).max(line_start)..nul]).is_some() {
+        return false;
+    }
+    if token_end <= read_end {
+        ends_token(next)
+            && text[token_end..read_end]
+                .iter()
+                .all(|&b| matches!(b, b' ' | b'\t' | b'\r'))
+    } else {
+        let next_read = &text[read_end..(read_end + chunk).min(text.len())];
+        next == 0 && next_read.contains(&b'\n')
     }
 }
 

@@ -403,6 +403,20 @@ Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinc
 The last row is the agreement: with a newline in the chunk jq does not truncate either.
 `tests/jq_cli/i5654_nul.rs` pins both sides, and `tests/jq_cli/i7437.rs` the number tokens with a newline in their chunk.
 
+**A number with a NUL in a chunk with no newline is read where both jq releases read it ([#7921](https://github.com/rust-works/succinctly/issues/7921)).**
+A line longer than 4,095 bytes reaches jq's parser a chunk at a time, and a chunk in the middle of it holds no newline, so jq 1.7.1 hands over such a chunk only up to its first NUL: the number before the NUL stays open, and the bytes from the NUL to the chunk's end are never read.
+jq 1.8.2 reads the whole token and its number parser stops at the NUL.
+The two read the same number, and nothing is lost but the token's own tail and white space, in two shapes: the chunk hides the rest of the token and then only white space, and the next chunk starts with a byte that ends a token; or the token goes on into the next chunk with another NUL, and that chunk holds a newline.
+`succinctly jq` reads the number in both shapes, as it does when the chunk holds a newline (`hidden_tail_reads_alike` in `src/jq/parse_message.rs`).
+Before #7921 the token was left malformed, so the number was lost, and the fault was worded by the model of jq's parser while reading went on from the chunk's end: `}`, a newline, 4,091 spaces, `1`, a NUL, `x`, a quote, a newline and `8`, `9` on lines of their own gave the `}` fault, `Unfinished string at EOF at line 4, column 0`, `8` and `9` to a program reading with `try input`, where both jq releases give the fault, `1` and then the unfinished string, which `8` and `9` are inside.
+**Recorded residual:** in every other alignment the two jq releases differ from each other and `succinctly jq` matches neither.
+With one space fewer the chunk hides the quote too (jq 1.7.1: the fault, `1`, `8`, `9`; jq 1.8.2: the fault, `1`, the unfinished string); with one more the token goes on with a byte of the next chunk (jq 1.7.1: the fault and `Invalid numeric literal at line 1, column 4096`; jq 1.8.2 as before); `succinctly jq` gives the fault, the unfinished string, `8` and `9` for both.
+Matching jq 1.7.1 there is discarding input after a NUL, which this section declines, and matching jq 1.8.2 is adopting its 4,091-byte chunk on every route.
+A number with a NUL that ends a file with no newline, followed by another file, is still an error where both releases read the number ([#7922](https://github.com/rust-works/succinctly/issues/7922)).
+That fault is met in the next file's first read, so it drops the rest of that read: when an earlier number on the same long line is one of the two shapes above (`1`, a NUL, `a`, a space, `2`, a NUL, `b` at the end of one file after 4,092 spaces, and a space, `3` and a newline in the next), `succinctly jq` now reads `1` and loses the `3` to the fault, where before #7921 it lost the `1` and read the `3`; both jq releases read `1`, `2` and `3`, and so will `succinctly jq` once #7922 reads the `2`.
+A column jq 1.7.1 reports later on such a line does not count the bytes its chunk hid, and `succinctly jq` counts them, as jq 1.8.2 does.
+Pinned by `tests/jq_cli/i7921.rs`, which holds the residual rows too.
+
 ## A `-f` program file with a NUL byte is refused, as jq 1.8.2 refuses it; jq 1.7.1 ends the program at the NUL (#7434)
 
 jq 1.7.1 hands a `-f` program file to its compiler as a C string, so the program ends at the first NUL byte and the rest of the file is dropped without a word: `.a\0| .b` runs `.a`, and `# c\0` followed by a newline and `.a` is a comment alone, which fails with `Top-level program not given`.
@@ -13994,6 +14008,19 @@ jq's parser skips a UTF-8 byte-order mark at the front of the stream, but `fgets
 Before #7569 the reads were counted from the text after the mark, so `printf '\xef\xbb\xbf'` and 2,048 `1 ` values, a line break, `2` and a line break printed `input_line_number` 0 for 2,047 values and 1 for one, where jq 1.7.1 prints 0 for 2,046 and 1 for two.
 jq 1.8.2 reads 4,091 bytes at a time, and up to three more to finish a character, so on a line longer than that its counts differ from 1.7.1's with or without a mark (the same input is 0 for 2,044 values and 1 for four); that is a change of its read size, so 1.7.1 stays the reference.
 Pinned by `tests/jq_cli/i7569.rs`.
+
+**The search for the token a file ends in counts the mark too ([#7921](https://github.com/rust-works/succinctly/issues/7921)).**
+A program that reads past a fault with `input` goes on at the end of the read the fault was met in, and the search for what a file leaves open for the next one (`stitch_json_file_seams`) follows it there.
+That search ran before the mark's share of the first read was recorded, so behind a mark it took the first read to end 3 bytes late.
+A mark, 4,090 spaces and `l 1` in one file and `3`, a newline in the next gave the fault and then `3`: the fault's read was taken to run to the end of the file, and the `1` after it was dropped with it.
+With the two bytes `BB BF` in front of the `3` the `1` came out as a value of its own before the second fault.
+jq 1.7.1 ends the first read after `l` and the space, holds the `1` open at the end of the file and gives the fault and `13` (the fault and a second fault for the token `1`, `BB`, `BF`, `3`, in jq 1.8.2 as well).
+The stitch now takes the cuts `strip_leading_json_bom` made and starts each file's seam from its lead, on the route that reads the files whole, on the lazy route that falls back to it, and in the NUL pass's own search (`open_tail_len_before`).
+The pass that reads a number with a NUL (`blank_nul_number_tails_in`) runs before the mark is cut and looked for a whole mark in one file, so behind a mark cut across files (`EF BB`, then `BF`, `1`, a NUL, `x` and a newline) the mark's last byte was the token's first and the run ended in `Invalid JSON text`, where jq prints `1`; it now takes the cuts of `stream_bom_cuts`, as the cut itself does.
+**Recorded residual:** a read boundary after an invalid UTF-8 byte on a line longer than a read is counted over the text after the byte became U+FFFD (three bytes for one), so it falls 2 bytes early for each byte replaced.
+`0`, a newline, 4,092 spaces, `}`, the byte 0x80, a quote, a newline and `8`, `9` on lines of their own give the `}` fault and then `Invalid numeric literal at line 2, column 4095` before `8` and `9`, where both jq releases give the one fault: the read after the fault starts inside the replacement character.
+It is an extra error, not a wrong value.
+Pinned by `tests/jq_cli/i7921.rs`.
 
 ### A malformed nested number raises when read; jq rejects the document (#966, #3034, #3222) — accepted uniform divergence
 

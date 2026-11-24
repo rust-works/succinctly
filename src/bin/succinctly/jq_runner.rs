@@ -6181,7 +6181,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         let mut seams = if args.validate {
             Vec::new()
         } else {
-            stitch_json_file_seams(raw_inputs.iter_mut(), false, false)
+            stitch_json_file_seams(raw_inputs.iter_mut(), false, false, &bom_cuts)
         };
         note_bom_leads(&mut seams, &bom_cuts, raw_inputs.len());
         // Substitution is skipped under `--validate` so the strict validator
@@ -8715,6 +8715,7 @@ fn read_inputs(
             raw_bytes.iter_mut().map(|(_, raw)| raw),
             track_eof,
             args.stream,
+            &bom_cuts,
         )
     } else {
         Vec::new()
@@ -12498,21 +12499,24 @@ fn blank_nul_number_tails_in<'a>(
     stream: bool,
 ) {
     let mut raws: Vec<&mut Vec<u8>> = raws.collect();
-    let front = raws.iter().position(|raw| !raw.is_empty());
+    // #7921: the mark jq's parser skips at the stream's front, which may be cut across the first
+    // files with bytes (#7566), as [`strip_leading_json_bom`] cuts it after this; looked for only
+    // once a file holds a NUL.
+    let mut bom_cuts: Option<Vec<usize>> = None;
     for at in 0..raws.len() {
         if scans.is_some_and(|scans| !scans[at].nul) {
             continue;
         }
-        let (before, rest) = raws.split_at_mut(at);
-        let raw = &mut *rest[0];
-        let Some(nul) = succinctly::jq::find_nul(raw) else {
+        let Some(nul) = succinctly::jq::find_nul(raws[at]) else {
             continue;
         };
-        let bom = if Some(at) == front {
-            crate::cli::front_matter::leading_bom_len(raw)
-        } else {
-            0
-        };
+        let cuts = bom_cuts.get_or_insert_with(|| {
+            crate::cli::front_matter::stream_bom_cuts(raws.iter().map(|raw| raw.as_slice()))
+        });
+        let cut_of = |index: usize| crate::cli::front_matter::bom_cut_at(cuts, index);
+        let (before, rest) = raws.split_at_mut(at);
+        let raw = &mut *rest[0];
+        let bom = cut_of(at);
         // The part of the first line the earlier files hold, when the NUL is on that line, behind
         // the BOM jq skips at the stream's front: where in each file it starts, last file first.
         let mut head: Vec<u8> = Vec::new();
@@ -12522,10 +12526,7 @@ fn blank_nul_number_tails_in<'a>(
                 let line_break = earlier.iter().rposition(|&b| b == b'\n');
                 let from = match line_break {
                     Some(last) => last + 1,
-                    None if Some(index) == front => {
-                        crate::cli::front_matter::leading_bom_len(earlier)
-                    }
-                    None => 0,
+                    None => cut_of(index),
                 };
                 head.splice(0..0, earlier[from..].iter().copied());
                 parts.push((index, from));
@@ -12576,8 +12577,8 @@ fn blank_nul_number_tails_in<'a>(
 fn open_tail_len_before(before: &[&mut Vec<u8>], resumes: bool, stream: bool) -> usize {
     let mut copies: Vec<Vec<u8>> = before.iter().map(|raw| (**raw).clone()).collect();
     copies.push(Vec::new());
-    strip_leading_json_bom(copies.iter_mut());
-    let seams = stitch_json_file_seams(copies.iter_mut(), resumes, stream);
+    let leads = strip_leading_json_bom(copies.iter_mut());
+    let seams = stitch_json_file_seams(copies.iter_mut(), resumes, stream, &leads);
     seams.last().map_or(0, |seam| seam.base)
 }
 
@@ -15061,12 +15062,21 @@ fn string_close_from(bytes: &[u8], mut at: usize) -> usize {
 /// `resumes` is set for a program using `input`/`inputs`, which reads past a parse error the
 /// way jq does (#4311), so the search for the open tail does too ([`open_tail_start`]); any
 /// other program stops at the first parse error and never reads what follows it.
+///
+/// `leads` are the BOM cuts [`strip_leading_json_bom`] made, one per file or none (#7921): the
+/// search past a fault resumes at the end of jq's read, and the reads of a file's first line start
+/// that many bytes before its text ([`Seam::lead`]), so the returned seams carry them.
 fn stitch_json_file_seams<'a>(
     raws: impl Iterator<Item = &'a mut Vec<u8>>,
     resumes: bool,
     stream: bool,
+    leads: &[usize],
 ) -> Vec<Seam> {
-    stitch_json_file_seams_onto(raws, resumes, stream, Vec::new())
+    let seeds = leads
+        .iter()
+        .map(|&lead| Seam { lead, ..Seam::NONE })
+        .collect();
+    stitch_json_file_seams_onto(raws, resumes, stream, seeds)
 }
 
 /// [`stitch_json_file_seams`] over files of which some already start with bytes moved onto them
@@ -17978,7 +17988,9 @@ fn stitch_json_texts(
         .iter_mut()
         .map(|(_, raw)| std::mem::take(raw).into_bytes())
         .collect();
-    *seams = stitch_json_file_seams(bytes.iter_mut(), resumes, stream);
+    // #7921: the seams the files came with hold nothing but the BOM's lead, which the stitch keeps.
+    let leads: Vec<usize> = seams.iter().map(|seam| seam.lead).collect();
+    *seams = stitch_json_file_seams(bytes.iter_mut(), resumes, stream, &leads);
     for ((_, raw), bytes) in raw_inputs.iter_mut().zip(bytes) {
         *raw = stitched_text(bytes);
     }
@@ -30321,7 +30333,7 @@ mod tests {
                 let mut expected = raws.clone();
                 let want = from_scratch(&mut expected, resumes);
                 let mut got = raws.clone();
-                let seams = stitch_json_file_seams(got.iter_mut(), resumes, false);
+                let seams = stitch_json_file_seams(got.iter_mut(), resumes, false, &[]);
                 assert_eq!(got, expected, "{text:?} cut as {raws:?}, resumes {resumes}");
                 assert_eq!(seams, want, "{text:?} cut as {raws:?}, resumes {resumes}");
             }
@@ -30517,7 +30529,7 @@ mod tests {
     fn stitch_json_file_seams_moves_the_open_tail_forward_4305() {
         let stitched = |files: &[&[u8]]| -> Vec<Vec<u8>> {
             let mut raws: Vec<Vec<u8>> = files.iter().map(|f| f.to_vec()).collect();
-            stitch_json_file_seams(raws.iter_mut(), false, false);
+            stitch_json_file_seams(raws.iter_mut(), false, false, &[]);
             raws
         };
         assert_eq!(
@@ -30729,7 +30741,7 @@ mod tests {
     fn stitch_json_file_seams_records_what_it_moved_4316() {
         let seams = |files: &[&[u8]]| -> Vec<Seam> {
             let mut raws: Vec<Vec<u8>> = files.iter().map(|f| f.to_vec()).collect();
-            stitch_json_file_seams(raws.iter_mut(), false, false)
+            stitch_json_file_seams(raws.iter_mut(), false, false, &[])
         };
         let moved = |base, moved_len, moved_newline| Seam {
             base,
@@ -30858,7 +30870,7 @@ mod tests {
     fn seams_record_the_previous_files_lines_and_a_chained_prefix_4376() {
         let seams = |files: &[&[u8]]| -> Vec<Seam> {
             let mut raws: Vec<Vec<u8>> = files.iter().map(|f| f.to_vec()).collect();
-            stitch_json_file_seams(raws.iter_mut(), true, false)
+            stitch_json_file_seams(raws.iter_mut(), true, false, &[])
         };
         // Two newlines ahead of the tail `[1,` in the first file: jq has counted them.
         let one = seams(&[b"1\n2\n[1,", b"2]\n"]);
@@ -31087,7 +31099,7 @@ mod tests {
     fn eof_tail_ignores_the_bytes_moved_onto_the_last_file_4316() {
         let tail = |files: &[&[u8]]| {
             let mut raws: Vec<Vec<u8>> = files.iter().map(|f| f.to_vec()).collect();
-            let seams = stitch_json_file_seams(raws.iter_mut(), false, false);
+            let seams = stitch_json_file_seams(raws.iter_mut(), false, false, &[]);
             let sources: Vec<&[u8]> = raws.iter().map(Vec::as_slice).collect();
             let tail = EofTail::of(&sources, false, &seams, false);
             (!tail.unknown).then_some(tail.newlines)
