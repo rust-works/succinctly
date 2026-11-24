@@ -736,6 +736,29 @@ QUERY_THRESHOLDS = {
     "wide_keys_unsorted": 10.0,
 }
 
+# #7913: nine one-off entries above stayed for up to four weeks after `main` had their changes,
+# because nothing but a comment said they were one-off. Every entry above `DEFAULT_THRESHOLD` is
+# now named in exactly one of these: `ONE_OFF_UNTIL`, with the number of the pull request whose
+# change it covers, or `PERMANENT_LOOSE`. `scripts/test_perf_guard.py` fails once `main` is
+# `ONE_OFF_GRACE_MERGES` merges past that pull request's merge, which leaves the pull request's
+# own runs, the merge queue behind it and the follow-up that removes the entry room to pass.
+ONE_OFF_UNTIL = {"argjson_objects": 7907}
+PERMANENT_LOOSE = frozenset({"wide_keys_unsorted"})
+ONE_OFF_GRACE_MERGES = 50
+
+
+def stale_one_offs(subjects, one_offs=None, grace=ONE_OFF_GRACE_MERGES):
+    """The rows of `one_offs` (row -> pull request number) whose pull request was merged `grace`
+    or more first-parent commits before HEAD. `subjects` is `git log --first-parent --format=%s`,
+    HEAD first; a pull request it does not hold (not merged yet, or a shallow clone) is not stale."""
+    one_offs = ONE_OFF_UNTIL if one_offs is None else one_offs
+    merged = {}
+    for age, subject in enumerate(subjects):
+        words = subject.split()
+        if words[:3] == ["Merge", "pull", "request"] and len(words) > 3:
+            merged.setdefault(words[3], age)
+    return sorted(row for row, pr in one_offs.items() if merged.get(f"#{pr}", -1) >= grace)
+
 # argparse wants a plain string for `epilog`; keeping it as a real constant
 # (not a slice of `__doc__`) means reflowing the module docstring above can
 # never silently truncate or misplace `--help` output.
@@ -1365,8 +1388,9 @@ def failure_advice(baseline_binary: bool) -> str:
             "cannot help here and is rejected outright in this mode. If this is real and "
             "understood (new correctness work that genuinely costs more, or an "
             "optimization that genuinely costs less), add a QUERY_THRESHOLDS override "
-            "sized from this run's own measured drift, with a note to remove it once "
-            "main carries the change (see that dict's own comment for the procedure). "
+            "sized from this run's own measured drift, and name the row in ONE_OFF_UNTIL with "
+            "this pull request's number so it is removed once main carries the change (see "
+            "that dict's own comment for the procedure). "
             "If it's unexpected, that's exactly what this guard exists to catch -- see "
             "docs/guides/benchmarking.md for how to investigate."
         )
