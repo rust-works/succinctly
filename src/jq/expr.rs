@@ -1504,6 +1504,17 @@ impl Expr {
     }
 }
 
+/// How a pure argument that may not be read eagerly is read (`eval::is_eager_arg`,
+/// #7870): its output count is not known to be small.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PureArgRoute {
+    /// One output at a time, as the consumer asks.
+    Lazy,
+    /// Ahead of the consumer while its outputs are few (`eval::settle_within`),
+    /// and as [`Self::Lazy`] once it has yielded more.
+    Probe,
+}
+
 /// What an [`Expr::Shared`] holds: the captured argument, and whether reading
 /// it may be eager (#3287).
 ///
@@ -1524,6 +1535,12 @@ impl Expr {
 pub struct SharedArg {
     expr: Expr,
     eager: core::cell::Cell<Option<bool>>,
+    /// For an eager argument, a bound on how many outputs one read of it yields
+    /// (`eval::is_eager_arg`, #7870): what the argument above it in a chain
+    /// multiplies its own count by.
+    eager_width: core::cell::Cell<u8>,
+    /// For a pure argument that is not eager, how it is read (#7870).
+    pure_route: core::cell::Cell<Option<PureArgRoute>>,
     needs_path_context: core::cell::Cell<Option<bool>>,
     retrying_bind: core::cell::Cell<Option<bool>>,
     /// Whether this argument answers at most once (`tail_call::settles`, #7787), remembered so a
@@ -1544,6 +1561,8 @@ impl SharedArg {
         Self {
             expr,
             eager: core::cell::Cell::new(None),
+            eager_width: core::cell::Cell::new(1),
+            pure_route: core::cell::Cell::new(None),
             needs_path_context: core::cell::Cell::new(None),
             retrying_bind: core::cell::Cell::new(None),
             settles: core::cell::Cell::new(None),
@@ -1584,6 +1603,7 @@ impl SharedArg {
     /// the eagerness already computed, which described the old contents.
     pub fn expr_mut(&mut self) -> &mut Expr {
         self.eager.set(None);
+        self.pure_route.set(None);
         self.needs_path_context.set(None);
         self.retrying_bind.set(None);
         self.settles.set(None);
@@ -1594,6 +1614,28 @@ impl SharedArg {
     /// `classify` on the first call.
     pub fn eager_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
         memo(&self.eager, || classify(&self.expr))
+    }
+
+    /// The bound on an eager argument's output count that its classification
+    /// left here (#7870); `1` until one does.
+    pub(crate) fn eager_width(&self) -> u8 {
+        self.eager_width.get()
+    }
+
+    /// Remember `width` as the bound on this eager argument's output count.
+    pub(crate) fn set_eager_width(&self, width: u8) {
+        self.eager_width.set(width);
+    }
+
+    /// How this argument is read when it is pure and not eager (#7870); `None`
+    /// for an eager argument, one that is not pure, and one not yet classified.
+    pub(crate) fn pure_route(&self) -> Option<PureArgRoute> {
+        self.pure_route.get()
+    }
+
+    /// Remember `route` for this pure argument.
+    pub(crate) fn set_pure_route(&self, route: PureArgRoute) {
+        self.pure_route.set(Some(route));
     }
 
     /// Whether this argument needs path context, computing it with `classify`

@@ -8079,15 +8079,20 @@ Over 300 chains of 120 nested objects `del(.. | .n?) | tojson | length` peaks at
 What is left is the size of a path: each distinct path node such a delete names is a `PathPrefix` of 112 bytes on a 64-bit target (its component is a 96-byte `Expr`), held with a node of the delete trie and its edges for as long as the document, and shrinking it needs a compact path-component type through the path resolver.
 The answers are pinned by `tests/jq_cli/i7789.rs`, and the sharing by the unit tests in `del_path_memory_tests_7789` (`src/jq/eval.rs`).
 
-### A closure argument that adds to a generator at each level is built whole before `first` reads it (#7870)
+### A closure argument that adds to a generator at each level: what is still refused, and the same shape in yq mode (#7870)
 
-`def f(g; $n): if $n <= 0 then g else f(g + (1,3); $n - 1) end; first(f((1,3); 16))` prints `17` here and in jq 1.7.1 and 1.8.2.
-jq pulls one output of `g` at a time, so `first` stops the chain after its first value and `first(f((1,3); 500))` prints `501` at once in both releases.
-`succinctly jq` builds all `2^n` outputs of the argument chain before `first` gets its value, so its time and its memory are exponential in `n`.
-A depth jq answers at once therefore does not finish here: `first(f((1,3); 500))` grows until an allocation fails and the process aborts (`memory allocation of 1073741824 bytes failed`, under a 2 GiB address-space cap on x86_64 Linux).
-The pipe spelling, `f(g | . + (1,3); $n - 1)`, grows the same way.
-An object or a string interpolation around `g` (`f({k: g, v: (1,3)}; $n - 1)`, `f("\(g)\((1,3))"; $n - 1)`) does not grow that way: both answer at 500 levels as jq does, and deeper the recursion is refused at the native-stack floor, as the section on recursive `def`s says.
-Open as [#7870](https://github.com/rust-works/succinctly/issues/7870); no test pins the cost.
+`def f(g; $n): if $n <= 0 then g else f(g + (1,3); $n - 1) end; first(f((1,3); 500))` prints `501` here and in jq 1.7.1 and 1.8.2.
+jq pulls one output of `g` at a time, so `first` stops the chain after its first value.
+`succinctly jq` used to build all `2^n` outputs of the argument chain before `first` got its value: its time and its memory doubled with each level, and at 500 levels an allocation failed and the process aborted.
+Since [#7870](https://github.com/rust-works/succinctly/issues/7870) a pure argument is read eagerly only while its output count cannot grow from one level to the next, and a link of such a chain is read one output at a time, so the program answers as jq does and its cost is linear in `n`.
+Under cachegrind on an AMD Ryzen 9 7950X (x86_64 Linux, release build with the `cli` feature) it retires 2.0 million instructions at 16 levels, 21.5 million at 500 and 162 million at 4,000, about 40 thousand a level, where jq 1.7.1 retires 7.7, 13.2 and 52.4 million.
+The pipe spelling (`f(g | . + (1,3); $n - 1)`), a wider `,` (`g + (1,3,5)`) and a helper `def` that adds the `,` answer the same way.
+Three things are left.
+A deep chain is refused at the native-stack floor where jq answers: in a release build on x86_64 Linux and on macOS arm64 the program answers at 4,000 levels and is refused with `exceeded maximum recursion depth` at 8,000, and jq 1.7.1 prints `20001` for 20,000; the section on recursive `def`s records that limit.
+A chain that reads its closure twice at each level and grows (`f(g + g; $n - 1)` from `f((1,3); n)`, `f((g | (1,3)) + g; $n - 1)`) answers to 13 to 15 levels and is refused past that, where jq 1.7.1 and 1.8.2 answer `first(...)` at 16: the second read runs inside the first read's output sink, so the native stack holds one read for every pending one, as that section says of a tree recursion over a generator leaf (#7787).
+In `succinctly yq --jq-extensions`, where `def` is an extension and yq has no answer to compare with, the closure chain itself is linear too, but two shapes that combine a recursion's outputs still take time and memory that double with each level and pass a 2 GiB memory cap by 100 levels: `def f($n): if $n <= 0 then (1,3) else {a: f($n - 1)} | getpath(["a"]) + (1,3) end; limit(1; f(500)) | type`, and `def f($n): if $n <= 0 then (foreach (1,2) as $x (0; . + $x)) else {k: f($n - 1), v: (foreach (1,2) as $x (0; . + $x))} end; limit(1; f(500)) | type`.
+Those two are not closure arguments: yq mode's operators and its object construction collect their operands' outputs before the consumer sees one, and they stay open as #7870.
+The answers of the chain, the order of its errors and effects and the twice-read shapes that answer are pinned by `tests/jq_cli/i7870.rs`, and the count rule by `eager_arg_output_count_is_bounded_7870` and `eager_arg_counts_a_call_by_its_parameter_reads_7870` (`src/jq/eval.rs`).
 
 ### A memo array a recursion writes to and threads through `as` bindings (#7803)
 
@@ -9805,8 +9810,9 @@ Three differences remain, none of which aborts the process:
   each refused at ~115-220 levels after #3262 and aborted at ~240-330 before
   it. Since [#3287](https://github.com/rust-works/succinctly/issues/3287) any
   argument that is pure and finite, and reads only arguments that are, is read
-  eagerly, and the three stop at ~8,560, ~8,950 and ~9,580 levels (same
-  machine). A link that calls a builtin (`f(n - 1 | select(true))`) or reads
+  eagerly while its output count cannot grow from one level to the next (the
+  count condition is #7870's, below), and the three stop at ~8,560, ~8,950 and
+  ~9,580 levels (same machine). A link that calls a builtin (`f(n - 1 | select(true))`) or reads
   an argument holding an effect or generator further down its chain keeps the
   demand-driven path and its ~150-level ceiling: there the laziness is
   observable, and a bounded-stack evaluator is what would lift it. Tree
@@ -9817,6 +9823,9 @@ Three differences remain, none of which aborts the process:
   single-valued, effect-free operands that both call a `def` (or an `as`
   source that does) are settled before their consumer runs, and the stack
   follows the depth like any other recursion.
+  The count condition on an eager argument is from [#7870](https://github.com/rust-works/succinctly/issues/7870): an argument's output count is bounded by the product of every `,` in it and of every argument it reads, and it is read eagerly when it yields once, or when every argument it reads is eager, no definition in it calls itself, and its count is at most 4, or is that of its own `,`s alone, or is no more than an argument it reads yields (a chain that only carries a `,` along, `f(n - 1)` from `f(1, 2)`).
+  A pure argument past that is read one output at a time when it is a link of a chain (it reads one argument, once), and is otherwise read ahead by at most 32 outputs, so that an argument read twice or a small helper recursion is still done before its consumer runs.
+  Before #7870 a `,` over constants made an argument eager at any count, and `f(g + (1,3); $n - 1)` built `2^n` outputs before a `first` saw one; the section on costs that still grow past jq's says what is left of that shape.
   A pipe whose first stage is such a call (`f($n - 1) | f($n - 1)`, a depth-first walk that threads its state through the value) ran the rest of the pipe inside the call's output sink the same way, and was refused after about 8,000 calls at depth 13 where jq answers; since [#7460](https://github.com/rust-works/succinctly/issues/7460) a call whose arguments and body answer once (the tail-call loop's test of a stage it runs ahead of its call, #5379, with the definition's own calls and bare parameters taken to, by induction) is run to its value before the rest of the pipe (and so is an `as` source that is such a call), and the stack again holds the recursion's depth.
   That test read only the stage shapes a tail loop runs ahead of its call, so a tree recursion whose definition's body (or a helper it calls) used a `try`, `?`, `label`, `reduce`, an object, `first`, `//` with a builtin, a def declared in the body or a call with arguments, or that recursed through a pipe operand (`def count: if type == "array" then (.[0] | count) + (.[1] | count) else 1 end`), was still refused at about 8,192 leaves where jq answers.
   Since [#7713](https://github.com/rust-works/succinctly/issues/7713) the question a call at a pipe's head (or an operand) is asked also reads those shapes when they answer at most once, a pipe that ends in such a call, and a call to another def by the same question, and an operator settles two operands that are such calls.
