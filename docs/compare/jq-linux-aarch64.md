@@ -455,7 +455,7 @@ Each probe has a 10 s deadline. Class: `ok`, `error` (non-zero exit), `crash` (s
 | jq-1.7.1 | 2.5 MiB | 3 | 0.97 |
 | jq-1.8.2 | 2.6 MiB | 3 | 0.97 |
 
-A ratio near 1.00 means one thread. Rust dependencies of the shipped feature set (`cargo tree -e normal`): 52. Build time is not measured (`--build-time` does).
+A ratio near 1.00 means one thread. Rust dependencies of the manifest's feature set (`cargo tree -e normal`): 52. Build time is not measured (`--build-time` does).
 
 | Property | Value | Source |
 |----------|-------|--------|
@@ -1076,7 +1076,7 @@ Above 100 MB both tools fit in RAM on the machines this is run on, so a memory d
 ## Reproduce
 
 ```bash
-cargo build --release --features bench-runner
+cargo build --release --features cli,simd,regex,serde,bench-runner
 ./target/release/succinctly dev compare jq --full --huge
 ```
 

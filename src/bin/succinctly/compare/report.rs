@@ -304,16 +304,11 @@ pub fn render(results: &Results) -> String {
     operational_section(&mut s, r);
     perf_sections(&mut s, r);
 
-    let _ = writeln!(s, "\n## Reproduce\n");
-    let _ = writeln!(s, "```bash\ncargo build --release --features bench-runner");
-    if !e.subject_is_harness {
-        let _ = writeln!(
-            s,
-            "cargo build --release --features {} --target-dir target/subject",
-            e.succinctly_features.join(",")
-        );
-    }
-    let _ = writeln!(s, "{}\n```", r.command);
+    s.push_str(&super::docs::reproduce_section(
+        e.subject_is_harness,
+        &e.succinctly_features.join(","),
+        &r.command,
+    ));
     let _ = writeln!(
         s,
         "\nmanifest sha256 `{}` · succinctly sha256 `{}` · jq sha256 `{}`",
@@ -1339,15 +1334,13 @@ fn operational_section(s: &mut String, r: &Results) {
         "\nStripped is a copy stripped with plain `strip`, as `release.yml` strips the release archive's \
          binary, and is the size to compare: as built, `cargo build --release` keeps the symbol table and \
          the pinned jq builds keep their debug info. The `succinctly jq` row is the binary under test, by \
-         default this harness's own build, which adds `bench-runner` to the shipped `cli` feature set and \
-         so is larger than the archive's."
+         default this harness's own build, which adds `bench-runner`, and any other feature it was built \
+         with, to the release archive's `cli` and so is larger than the archive's."
     );
     let _ = writeln!(
         s,
-        "\nA ratio near 1.00 means one thread. Rust dependencies of the shipped feature set \
-         (`cargo tree -e normal`): {}.{}\n",
-        o.rust_dependencies
-            .map_or_else(|| "n/a".into(), |n| n.to_string()),
+        "\nA ratio near 1.00 means one thread. {}{}\n",
+        super::docs::dependencies_note(o.rust_dependencies),
         if o.build_times.is_empty() {
             " Build time is not measured (`--build-time` does)."
         } else {

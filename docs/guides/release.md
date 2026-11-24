@@ -35,7 +35,8 @@ git pull origin main
 # Run the full quality check
 ./scripts/build.sh
 
-# Run the complete test suite against the shipped feature set --
+# Run the complete test suite against CI's test feature set (the release
+# archives are built with `cli` alone, which these features contain) --
 # NOT --all-features, which builds several non-shipping measurement
 # configurations instead (portable-popcount, broadword-yaml, scalar-yaml)
 # and would let a shipped-shape-only regression pass silently. See
@@ -296,7 +297,8 @@ The Minimum Supported Rust Version (MSRV) is specified in `Cargo.toml`:
 rust-version = "1.89.0"
 ```
 
-It is the oldest toolchain that checks the shipped CLI feature set (`--features cli,simd,regex,serde`)
+It is the oldest toolchain that checks CI's test feature set (`--features cli,simd,regex,serde`, which is
+also what the jq comparison measures; the release archives are built with `cli` alone, a subset of it)
 with the committed `Cargo.lock`, and CI's `MSRV` job (`.github/workflows/ci.yml`) holds it there: it reads
 `rust-version` from `Cargo.toml`, installs that toolchain and runs `cargo check --locked` for the library and
 for that feature set on x86_64 Linux. What sets the floor:
