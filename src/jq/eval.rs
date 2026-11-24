@@ -520,8 +520,8 @@ use super::expr::{
     retention_scope, ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp,
     Expr, FormatType, FuncDefBound, FuncDefData, Libm1, Libm2, Libm3, Literal, LoadKind,
     LuaOptions, MergeFlags, MetaSlot, NumberKey, ObjectEntry, ObjectKey, Origin, Param, Pattern,
-    PatternEntry, PipeStages, SharedArg, SliceBoundKey, StageClass, StringPart, TailPlan,
-    TextCodec, Tracked, XmlOptions, YqOutputEncoder,
+    PatternEntry, PipeStages, PureArgRoute, SharedArg, SliceBoundKey, StageClass, StringPart,
+    TailPlan, TextCodec, Tracked, XmlOptions, YqOutputEncoder,
 };
 use super::value::FieldMap;
 #[cfg(test)]
@@ -8858,10 +8858,12 @@ fn eval_each<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             // #3287: any pure, finite argument is eager -- a pipe, a nested
             // or helper `def` over the parameter -- and one reading an effect
             // or generator further down its chain is not; see `is_eager_arg`.
+            // #7870: the eager read is as it was; an argument that is not
+            // eager is read lazily or ahead, decided out of this frame.
             if is_eager_arg(inner) {
                 drain_result(eval_single::<W, S>(inner, value, optional), sink)
             } else {
-                eval_each::<W, S>(inner, value, optional, sink)
+                each_lazy_arg::<W, S>(inner, value, optional, sink)
             }
         }
 
@@ -11074,6 +11076,45 @@ fn each_index_expr<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     });
 
     escape.resume(flow, direct_pattern_retry(key))
+}
+
+/// Read an argument that is not eager (#7870): lazily, as before, unless it is
+/// pure and probed ([`PureArgRoute::Probe`], [`each_probed_arg`]). Out of line,
+/// so `eval_each`'s `Shared` arm makes the two calls it made before and its
+/// frame, which every level of a recursion holds, does not grow with a third.
+#[inline(never)]
+fn each_lazy_arg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    inner: &SharedArg,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    if inner.pure_route() == Some(PureArgRoute::Probe) {
+        return each_probed_arg::<W, S>(inner, value, optional, sink);
+    }
+    eval_each::<W, S>(inner, value, optional, sink)
+}
+
+/// Read a pure argument whose output count is not known to be small
+/// ([`PureArgRoute::Probe`], #7870): run it to its outputs first when there are
+/// at most [`PROBED_ARG_OUTPUTS`] of them, as an eager read would, so nothing of
+/// the read is live while the consumer runs. An argument that yields more is
+/// remembered as wide and read lazily, here and from then on.
+#[cold]
+#[inline(never)]
+fn each_probed_arg<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    inner: &SharedArg,
+    value: StandardJson<'a, W>,
+    optional: bool,
+    sink: &mut dyn FnMut(Item<'a, W>) -> Demand,
+) -> Flow {
+    match settle_within(|collect| eval_each::<W, S>(inner, value.clone(), optional, collect)) {
+        Some((outputs, flow)) => replay_settled(outputs, flow, sink),
+        None => {
+            inner.set_pure_route(PureArgRoute::Lazy);
+            eval_each::<W, S>(inner, value, optional, sink)
+        }
+    }
 }
 
 /// [`eval_each`], run to its value first when `expr` calls a def and answers once (#7787): an
@@ -122893,11 +122934,49 @@ fn settles_both_with(
 /// `first(f((1, ("B" | stderr))))` run the effect through an arithmetic chain
 /// before this. The answer is computed once per argument, so a chain costs one
 /// walk of each link, not of each prefix.
+///
+/// An eager read hands the consumer every output of the argument at once, so
+/// the argument's output count has to be bounded too (#7870). The walk bounds it:
+/// a `,` multiplies it by its alternatives, and an argument read inside by that
+/// argument's own bound, remembered beside its answer. `f(g + (1, 3); n - 1)`
+/// doubles the count at each level, and read eagerly it built all `2^n` sums
+/// before a `first` saw one. An argument is eager when it yields once; or when
+/// every argument it reads is eager, no definition in it calls itself, and its
+/// count is at most [`EAGER_ARG_WIDTH_LIMIT`], or is its own `,`s' alone (it
+/// reads no argument that yields twice), or is no more than an argument it
+/// reads yields (a chain that only carries a `,` along: `f(n - 1)` from
+/// `f(1, 2)`). What only its count keeps from an eager read is still pure, and
+/// takes one of two routes ([`PureArgRoute`]): a link that reads one argument,
+/// once, is read lazily, one output at a time, and anything else is read
+/// ahead up to [`PROBED_ARG_OUTPUTS`] outputs ([`settle_within`]).
 pub(crate) fn is_eager_arg(arg: &SharedArg) -> bool {
-    arg.eager_or_init(|expr| {
-        let mut walk = PureWalk::new(true);
-        single_valued_pure(expr, None, &mut walk).is_some()
-    })
+    arg.eager_or_init(|expr| classify_eager_arg(arg, expr))
+}
+
+/// The most outputs an argument that multiplies what it reads may yield and
+/// still be read eagerly (#7870): what one read may build that a consumer
+/// stopping at the first output never asks for.
+const EAGER_ARG_WIDTH_LIMIT: u32 = 4;
+
+/// How many outputs a probed argument is read ahead by before it is taken as
+/// wide and read lazily from then on (#7870, [`PureArgRoute::Probe`]).
+pub(crate) const PROBED_ARG_OUTPUTS: usize = 32;
+
+/// [`is_eager_arg`]'s answer for an argument not yet asked, leaving on it the
+/// bound on its output count and, for a pure argument that is not eager, the
+/// route its reads take.
+#[inline(never)]
+fn classify_eager_arg(arg: &SharedArg, expr: &Expr) -> bool {
+    let mut walk = PureWalk::new(true);
+    if single_valued_pure(expr, None, &mut walk).is_none() {
+        return false;
+    }
+    arg.set_eager_width(u8::try_from(walk.width).unwrap_or(u8::MAX));
+    let eager = walk.reads_eagerly();
+    if !eager {
+        arg.set_pure_route(walk.pure_route());
+    }
+    eager
 }
 
 /// How many nodes [`settles_before_consumer`] visits before declining. The
@@ -122923,6 +123002,22 @@ thread_local! {
 pub(crate) struct PureWalk {
     budget: u32,
     for_eager_arg: bool,
+    /// For [`is_eager_arg`], a bound on the output count of what has been
+    /// walked: the product of every `,` and every argument read (#7870).
+    width: u32,
+    /// The widest argument read, by its own bound.
+    max_nested: u32,
+    /// How many times an argument is read.
+    reads: u32,
+    /// Whether every argument read is itself eager.
+    all_nested_eager: bool,
+    /// `width` and `reads` of the arguments of the call whose definition body
+    /// is being walked, which each read of a parameter there counts again.
+    param_width: u32,
+    param_reads: u32,
+    /// Whether a definition that calls itself was walked: its output count is
+    /// not a product of what its body shows.
+    recursive: bool,
 }
 
 impl PureWalk {
@@ -122930,6 +123025,73 @@ impl PureWalk {
         Self {
             budget: SETTLE_ANALYSIS_BUDGET,
             for_eager_arg,
+            width: 1,
+            max_nested: 0,
+            reads: 0,
+            all_nested_eager: true,
+            param_width: 1,
+            param_reads: 0,
+            recursive: false,
+        }
+    }
+
+    /// Multiply the output-count bound by `by` (#7870).
+    fn widen(&mut self, by: u32) {
+        self.width = self.width.saturating_mul(by);
+    }
+
+    /// Count a read of the argument `inner` inside the argument being walked
+    /// (#7870): `None` when it is not pure, by its own remembered answer.
+    #[inline(never)]
+    fn read_argument(&mut self, inner: &SharedArg) -> Option<bool> {
+        let eager = is_eager_arg(inner);
+        if !eager && inner.pure_route().is_none() {
+            return None;
+        }
+        let width = u32::from(inner.eager_width());
+        self.widen(width);
+        self.max_nested = self.max_nested.max(width);
+        self.reads = self.reads.saturating_add(1);
+        self.all_nested_eager &= eager;
+        Some(false)
+    }
+
+    /// Count a read of `def`'s bare parameter `name` in its body, as a read of
+    /// the arguments of the call being walked (#7870). A `$` parameter's bare
+    /// name reads the one value bound for this run.
+    fn read_parameter(&mut self, def: &FuncDefData, name: &str) {
+        if def
+            .params
+            .iter()
+            .any(|p| !p.is_dollar() && p.name() == name)
+        {
+            self.widen(self.param_width);
+            self.reads = self.reads.saturating_add(self.param_reads);
+        }
+    }
+
+    /// Whether the walked argument may be read eagerly (#7870); see
+    /// [`is_eager_arg`] for the rule.
+    fn reads_eagerly(&self) -> bool {
+        self.width == 1
+            || (!self.recursive
+                && self.all_nested_eager
+                && (self.width <= EAGER_ARG_WIDTH_LIMIT
+                    || self.max_nested <= 1
+                    || self.width <= self.max_nested))
+    }
+
+    /// The route of a pure argument that is not eager (#7870). A link that
+    /// reads one argument once is a chain's: a `first` over it pulls one output
+    /// through every link, and reading each link ahead would cost the chain's
+    /// length again at every level. Anything else (a definition that calls
+    /// itself, an argument read twice) is read ahead, so that it is done before
+    /// its outputs reach a consumer that reads it again.
+    fn pure_route(&self) -> PureArgRoute {
+        if !self.recursive && self.reads == 1 {
+            PureArgRoute::Lazy
+        } else {
+            PureArgRoute::Probe
         }
     }
 }
@@ -123007,15 +123169,19 @@ pub(crate) fn single_valued_pure(
         Expr::As { expr, body, .. } => Some(sv(expr)? | sv(body)?),
         // An argument captured in the caller's scope: the definition being
         // analysed, if any, has no bearing on what it names.
-        Expr::Shared(inner) if walk.for_eager_arg => is_eager_arg(inner).then_some(false),
+        Expr::Shared(inner) if walk.for_eager_arg => walk.read_argument(inner),
         // Every alternative is evaluated when the argument is read, including
         // ones a `first`/`limit` consumer never asks for, so `,` is eager only
         // over alternatives that cost nothing to produce: `g(1, (27 | fib))`
         // must not run `fib` for a `first(n)` (#3287 review).
         Expr::Comma(items) if walk.for_eager_arg && items.iter().all(is_constant_cost) => {
+            walk.widen(u32::try_from(items.len()).unwrap_or(u32::MAX));
             Some(false)
         }
         Expr::Shared(inner) => single_valued_pure(inner, None, walk),
+        Expr::DefCall { def, args, .. } if walk.for_eager_arg => {
+            eager_def_call_pure(def, args, within, walk)
+        }
         Expr::DefCall { def, args, .. } => {
             all_single_valued_pure(args, within, walk)?;
             single_valued_pure(&def.body, Some(def), walk)?;
@@ -123023,16 +123189,47 @@ pub(crate) fn single_valued_pure(
         }
         Expr::FuncCall { name, args, .. } => match within {
             Some(def) if args.is_empty() && def.params.iter().any(|p| p.name() == name) => {
+                if walk.for_eager_arg {
+                    walk.read_parameter(def, name);
+                }
                 Some(false)
             }
             Some(def) if *name == def.name && args.len() == def.params.len() => {
                 all_single_valued_pure(args, within, walk)?;
+                walk.recursive = true;
                 Some(true)
             }
             _ => None,
         },
         _ => None,
     }
+}
+
+/// [`single_valued_pure`]'s call arm for [`is_eager_arg`], which also bounds the
+/// call's output count (#7870). The arguments yield their outputs where the body
+/// reads them, once for each read: their count is taken aside for the walk of
+/// the body, which counts it again at each bare parameter it names
+/// ([`PureWalk::read_parameter`]). A `$` parameter runs the body once for each
+/// output instead.
+#[inline(never)]
+fn eager_def_call_pure(
+    def: &FuncDefData,
+    args: &[Expr],
+    within: Option<&FuncDefData>,
+    walk: &mut PureWalk,
+) -> Option<bool> {
+    let outer = (walk.width, walk.reads, walk.param_width, walk.param_reads);
+    (walk.width, walk.reads) = (1, 0);
+    all_single_valued_pure(args, within, walk)?;
+    (walk.param_width, walk.param_reads) = (walk.width, walk.reads);
+    (walk.width, walk.reads) = (outer.0, outer.1);
+    if def.params.iter().any(Param::is_dollar) {
+        walk.widen(walk.param_width);
+        walk.reads = walk.reads.saturating_add(walk.param_reads);
+    }
+    single_valued_pure(&def.body, Some(def), walk)?;
+    (walk.param_width, walk.param_reads) = (outer.2, outer.3);
+    Some(true)
 }
 
 /// Whether `expr` produces its one output in constant time, with no effect:
@@ -123096,6 +123293,44 @@ pub(crate) fn settle_then_replay<I>(
         Demand::Stop => Flow::Stopped { pending: None },
         Demand::Continue => flow,
     }
+}
+
+/// Run `source` into a buffer while it yields at most [`PROBED_ARG_OUTPUTS`]
+/// outputs (#7870): the outputs and how the run ended, or `None` once it yields
+/// more, with the run stopped there. For a pure argument, whose outputs may be
+/// asked for ahead of the consumer ([`PureArgRoute::Probe`]); out of line and
+/// cold, so the buffer is in no evaluator frame.
+#[cold]
+#[inline(never)]
+pub(crate) fn settle_within<I>(
+    source: impl FnOnce(&mut dyn FnMut(I) -> Demand) -> Flow,
+) -> Option<(Vec<I>, Flow)> {
+    let mut outputs = Vec::new();
+    let mut wide = false;
+    let flow = source(&mut |item| {
+        if outputs.len() == PROBED_ARG_OUTPUTS {
+            wide = true;
+            return Demand::Stop;
+        }
+        outputs.push(item);
+        Demand::Continue
+    });
+    (!wide).then_some((outputs, flow))
+}
+
+/// Feed the outputs [`settle_within`] buffered to `sink`, then end as their run
+/// did, or as stopped where `sink` stops.
+pub(crate) fn replay_settled<I>(
+    outputs: Vec<I>,
+    flow: Flow,
+    sink: &mut dyn FnMut(I) -> Demand,
+) -> Flow {
+    for item in outputs {
+        if matches!(sink(item), Demand::Stop) {
+            return Flow::Stopped { pending: None };
+        }
+    }
+    flow
 }
 
 /// The output of an operand evaluated to completion before its consumer
@@ -143471,6 +143706,182 @@ mod tests {
         assert!(is_eager_arg(&arg));
         *arg.expr_mut() = parse("1, (\"B\" | stderr)").unwrap();
         assert!(!is_eager_arg(&arg));
+    }
+
+    /// How [`is_eager_arg`] classifies `arg` (#7870): the bound on its output
+    /// count when it is eager, else the route of a pure argument, else `Err(None)`.
+    fn arg_route_7870(arg: &SharedArg) -> Result<u8, Option<PureArgRoute>> {
+        if is_eager_arg(arg) {
+            Ok(arg.eager_width())
+        } else {
+            Err(arg.pure_route())
+        }
+    }
+
+    /// #7870: an eager argument's output count is bounded. A `,` multiplies it,
+    /// an argument read inside multiplies it by its own remembered bound, and a
+    /// chain whose links each add a `,` leaves the eager path once the product
+    /// passes [`EAGER_ARG_WIDTH_LIMIT`], with every link above it: each is then
+    /// read lazily. A chain that only carries a `,` along keeps its count and
+    /// its eager read, however wide the `,` it started from.
+    #[test]
+    fn eager_arg_output_count_is_bounded_7870() {
+        const LAZY: Result<u8, Option<PureArgRoute>> = Err(Some(PureArgRoute::Lazy));
+        const PROBE: Result<u8, Option<PureArgRoute>> = Err(Some(PureArgRoute::Probe));
+        let arg = |src: &str| Rc::new(SharedArg::new(parse(src).unwrap()));
+        let sum = |left: Expr, right: Expr| {
+            Rc::new(SharedArg::new(Expr::Arithmetic {
+                op: ArithOp::Add,
+                left: Box::new(left),
+                right: Box::new(right),
+                settle: ArithSettleMemo::default(),
+            }))
+        };
+        let read = |arg: &Rc<SharedArg>| Expr::Shared(Rc::clone(arg));
+        let over = |prev: &Rc<SharedArg>, right: &str| sum(read(prev), parse(right).unwrap());
+
+        // `f(g + (1, 3); n - 1)` from `f((1, 3); n)`: 2, 4, 8, ... outputs.
+        let base = arg("1, 3");
+        assert_eq!(arg_route_7870(&base), Ok(2));
+        let four = over(&base, "(1, 3)");
+        assert_eq!(arg_route_7870(&four), Ok(4));
+        let mut link = over(&four, "(1, 3)");
+        for _ in 0..12 {
+            assert_eq!(arg_route_7870(&link), LAZY, "past the limit, one read");
+            // Lazy below means lazy above, whatever the link adds.
+            assert_eq!(arg_route_7870(&over(&link, "1")), LAZY);
+            link = over(&link, "(1, 3)");
+        }
+
+        // `f(g + 1; n - 1)` from the same base: two outputs at every level.
+        let mut link = over(&base, "1");
+        for _ in 0..64 {
+            assert_eq!(arg_route_7870(&link), Ok(2));
+            link = over(&link, "1");
+        }
+        // A pass-through reads as what it wraps.
+        assert_eq!(arg_route_7870(&Rc::new(SharedArg::new(read(&base)))), Ok(2));
+
+        // An argument's own `,`s are its whole count when it reads none that
+        // yields twice: as wide as it is written, and no wider at any depth.
+        let wide = arg("1, 2, 3, 4, 5");
+        assert_eq!(arg_route_7870(&wide), Ok(5));
+        assert_eq!(arg_route_7870(&arg("(1, 2) + (1, 2) + (1, 2)")), Ok(8));
+        assert_eq!(
+            arg_route_7870(&arg("if (1, 2) then (3, 4) else (5, 6) end")),
+            Ok(8)
+        );
+        assert_eq!(arg_route_7870(&over(&arg("7"), "(1, 2, 3, 4, 5)")), Ok(5));
+        // Carried along it stays eager; multiplied, it does not.
+        let mut link = over(&wide, "1");
+        for _ in 0..8 {
+            assert_eq!(arg_route_7870(&link), Ok(5));
+            link = over(&link, "1");
+        }
+        assert_eq!(arg_route_7870(&over(&wide, "(1, 3)")), LAZY);
+
+        // An argument read twice multiplies by itself: read ahead, not lazily.
+        assert_eq!(arg_route_7870(&sum(read(&base), read(&base))), Ok(4));
+        assert_eq!(arg_route_7870(&sum(read(&four), read(&four))), PROBE);
+        assert_eq!(arg_route_7870(&sum(read(&wide), read(&wide))), PROBE);
+        // And an argument that is not pure is neither.
+        let effect = arg("1, (\"B\" | stderr)");
+        assert_eq!(arg_route_7870(&over(&effect, "(1, 3)")), Err(None));
+    }
+
+    /// #7870: a call in an eager argument counts its arguments where the body
+    /// reads them. A bare parameter yields the argument's outputs at each read,
+    /// a `$` parameter runs the body once for each, and a definition that calls
+    /// itself has no bound a walk of its body can give: it is eager only when
+    /// nothing in it yields twice, and read ahead otherwise.
+    #[test]
+    fn eager_arg_counts_a_call_by_its_parameter_reads_7870() {
+        const LAZY: Result<u8, Option<PureArgRoute>> = Err(Some(PureArgRoute::Lazy));
+        const PROBE: Result<u8, Option<PureArgRoute>> = Err(Some(PureArgRoute::Probe));
+        let pair = Rc::new(SharedArg::new(parse("1, 2").unwrap()));
+        let one = Rc::new(SharedArg::new(parse("1").unwrap()));
+        // `h(g)`, or `h(g; 3)`, over the argument `g`.
+        let call = |def: &str, g: &Rc<SharedArg>| {
+            let use_site = if def.contains(';') { "h(0; 3)" } else { "h(0)" };
+            let mut call = installed_use_site_3997(def, use_site);
+            #[rustfmt::skip]
+            let Expr::DefCall { args, .. } = &mut call else { panic!("expected a DefCall") };
+            args[0] = Expr::Shared(Rc::clone(g));
+            arg_route_7870(&SharedArg::new(call))
+        };
+        assert_eq!(call("def h(x): x - 1", &one), Ok(1));
+        assert_eq!(call("def h(x): x - 1", &pair), Ok(2), "carried along");
+        assert_eq!(call("def h(x): x + x", &pair), Ok(4));
+        assert_eq!(call("def h(x): x + x + x", &pair), PROBE, "three reads");
+        assert_eq!(call("def h(x): 5", &pair), Ok(1), "never read");
+        assert_eq!(call("def h($x): 5", &pair), Ok(2), "once for each output");
+        assert_eq!(call("def h($x): $x + $x + x", &pair), Ok(2));
+        assert_eq!(call("def h($x): $x + (1, 2)", &pair), Ok(4));
+        assert_eq!(call("def h(x): x + (1, 2)", &pair), Ok(4));
+        assert_eq!(
+            call("def h(x): x + (1, 2, 3)", &pair),
+            LAZY,
+            "one read, six"
+        );
+        assert_eq!(
+            call("def h(x): x, 7", &one),
+            Err(None),
+            "`x, 7` is not constant-cost"
+        );
+        // A literal argument is the call's own `,`: nothing read twice over.
+        let literal = SharedArg::new(installed_use_site_3997("def h(x): x + x + x", "h(1, 2)"));
+        assert_eq!(arg_route_7870(&literal), Ok(8));
+        // Recursion: single-valued throughout is eager, anything wider is read ahead.
+        let rec = "def h(x; $k): if $k <= 0 then x else h(x + 1; $k - 1) end";
+        assert_eq!(call(rec, &one), Ok(1));
+        assert_eq!(call(rec, &pair), PROBE);
+        let rec = "def h(x; $k): if $k <= 0 then x else h(x + (1, 2); $k - 1) end";
+        assert_eq!(call(rec, &one), PROBE);
+    }
+
+    /// #7870: [`settle_within`] hands back every output and how the run ended
+    /// while there are at most [`PROBED_ARG_OUTPUTS`], stops the run at the
+    /// first one past that, and [`replay_settled`] feeds them on in order,
+    /// stopping where the sink does.
+    #[test]
+    fn settle_within_stops_a_wide_run_7870() {
+        let run = |n: usize, calls: &mut usize| {
+            settle_within(|collect: &mut dyn FnMut(usize) -> Demand| {
+                for i in 0..n {
+                    *calls += 1;
+                    if matches!(collect(i), Demand::Stop) {
+                        return Flow::Stopped { pending: None };
+                    }
+                }
+                Flow::Exhausted
+            })
+        };
+        let mut calls = 0;
+        let (outputs, flow) = run(PROBED_ARG_OUTPUTS, &mut calls).expect("within the limit");
+        assert_eq!(outputs, (0..PROBED_ARG_OUTPUTS).collect::<Vec<_>>());
+        assert!(matches!(flow, Flow::Exhausted));
+        let mut calls = 0;
+        assert!(run(PROBED_ARG_OUTPUTS + 1000, &mut calls).is_none());
+        assert_eq!(
+            calls,
+            PROBED_ARG_OUTPUTS + 1,
+            "stopped at the first one past"
+        );
+
+        let mut seen = Vec::new();
+        let flow = replay_settled(vec![1, 2, 3], Flow::Exhausted, &mut |item| {
+            seen.push(item);
+            Demand::Continue
+        });
+        assert!(matches!(flow, Flow::Exhausted));
+        assert_eq!(seen, [1, 2, 3]);
+        let mut seen = Vec::new();
+        let flow = replay_settled(vec![1, 2, 3], Flow::Exhausted, &mut |item| {
+            seen.push(item);
+            Demand::Stop
+        });
+        assert!(matches!(flow, Flow::Stopped { pending: None }));
+        assert_eq!(seen, [1]);
     }
 
     /// #3296: [`settle_then_replay`] keeps every output in order -- a

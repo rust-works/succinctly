@@ -76,15 +76,15 @@ use super::eval::{
     owned_bound_to_i64_for, owned_index_key_to_expr, owned_to_string,
     pattern_alternatives_var_names, pipe_holds_bind, pipe_needs_path_context,
     prefer_pending_control, probe_def_call, range_from_literal_override, range_max_exceeded_error,
-    range_num, reads_parent, recurse_walk_flow, reduce_forks, reroot_for_reentry, reroot_markers,
-    resolve_computed_slice_bounds, resolve_computed_slice_bounds_for, resume_from_escape,
-    reverse_length_is_empty, select_emits, settle_then_replay, settles_before_consumer,
-    settles_both, shared_arg_depth_refusal, slice_component_value, slice_object_as_yq_children,
-    slice_owned_value_read_computed, sort_like_jq, stop_with_downstream, stop_with_error,
-    stop_with_escape, streams_escaped_generator_prefix, streams_unbounded,
-    substitute_bound_var_from, substitute_deferred_var, substitute_vars, suppresses,
-    tonumber_from_str, tostring_owned, tostring_owned_styled, try_compare_op, try_handler_root,
-    vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
+    range_num, reads_parent, recurse_walk_flow, reduce_forks, replay_settled, reroot_for_reentry,
+    reroot_markers, resolve_computed_slice_bounds, resolve_computed_slice_bounds_for,
+    resume_from_escape, reverse_length_is_empty, select_emits, settle_then_replay, settle_within,
+    settles_before_consumer, settles_both, shared_arg_depth_refusal, slice_component_value,
+    slice_object_as_yq_children, slice_owned_value_read_computed, sort_like_jq,
+    stop_with_downstream, stop_with_error, stop_with_escape, streams_escaped_generator_prefix,
+    streams_unbounded, substitute_bound_var_from, substitute_deferred_var, substitute_vars,
+    suppresses, tonumber_from_str, tostring_owned, tostring_owned_styled, try_compare_op,
+    try_handler_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
     yq_bool_null_key_into_null, yq_dedup_key, yq_empty_context_reemit, yq_empty_left_skips_right,
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
     yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
@@ -113,7 +113,7 @@ use super::expr::YqOutputEncoder;
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, BindOrigin, BoundBody, Builtin, CompareOp, Expr,
     FormatType, FuncDefData, Literal, NumberKey, ObjectEntry, ObjectKey, Pattern, PipeStages,
-    StringPart,
+    PureArgRoute, SharedArg, StringPart,
 };
 use super::path_mode::Route;
 use super::slice::{
@@ -19847,11 +19847,11 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
             eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
         }
         Expr::Shared(inner) => {
-            // #3287: see `eval::is_eager_arg`.
+            // #3287: see `eval::is_eager_arg`; #7870: `eval::each_lazy_arg`.
             if is_eager_arg(inner) {
                 drain_result_generic(eval_single::<S, V>(inner, value, optional, cursor), sink)
             } else {
-                eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
+                each_lazy_arg_generic::<S, V>(inner, value, optional, cursor, sink)
             }
         }
 
@@ -28041,6 +28041,48 @@ fn each_generic_settling<S: EvalSemantics, V: DocumentValue>(
         return each_generic_settled::<S, V>(expr, value, optional, cursor, sink);
     }
     eval_each_generic::<S, V>(expr, value, optional, cursor, sink)
+}
+
+/// The generic evaluator's twin of `eval::each_lazy_arg` (#7870): an argument that is not eager is
+/// read lazily, or ahead when it is pure and probed, out of `eval_each_generic`'s frame.
+#[inline(never)]
+fn each_lazy_arg_generic<S: EvalSemantics, V: DocumentValue>(
+    inner: &SharedArg,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    if inner.pure_route() == Some(PureArgRoute::Probe) {
+        return each_probed_arg_generic::<S, V>(inner, value, optional, cursor, sink);
+    }
+    eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
+}
+
+/// The generic evaluator's twin of `eval::each_probed_arg` (#7870): a pure argument whose output
+/// count is not known to be small is run to its outputs first when they are few, and remembered
+/// as wide and read lazily when they are not.
+#[cold]
+#[inline(never)]
+fn each_probed_arg_generic<S: EvalSemantics, V: DocumentValue>(
+    inner: &SharedArg,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    let settled = settle_within(|collect| {
+        eval_each_generic::<S, V>(inner, value.clone(), optional, cursor, &mut |item| {
+            collect(item)
+        })
+    });
+    match settled {
+        Some((outputs, flow)) => replay_settled(outputs, flow, &mut |item| sink.push(item)),
+        None => {
+            inner.set_pure_route(PureArgRoute::Lazy);
+            eval_each_generic::<S, V>(inner, value, optional, cursor, sink)
+        }
+    }
 }
 
 /// [`each_generic_settling`] for a part that answers once: run to its value, then replayed.
