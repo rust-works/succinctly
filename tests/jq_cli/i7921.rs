@@ -276,15 +276,7 @@ fn the_reads_the_two_jq_releases_differ_on_stay_as_recorded_7921() -> Result<()>
             "",
             0,
         ),
-        // An invalid byte after a fault in one read of a long line: both jq releases give the
-        // fault, 8, 9. The read's end is counted over the text after the byte became U+FFFD.
-        (
-            "an invalid byte before the read's end",
-            READS,
-            vec![padded(b"0\n", 4092, b"}\x80\"\n8\n9\n")],
-            "[0,\"Unmatched '}' at line 2, column 4093\",\"Invalid numeric literal at line 2, column 4095\",8,9,\"break\"]\n",
-            "",
-            0,
-        ),
+        // An invalid byte after a fault in one read of a long line is read where jq reads it since
+        // #7931 (`tests/jq_cli/i7931.rs`).
     ])
 }

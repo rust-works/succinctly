@@ -11406,21 +11406,24 @@ files too, and so does succinctly since [#4311](https://github.com/rust-works/su
 (`1 } 2\n3\n` reads `1`, the error, then `3`). On every route, a number or literal that the
 faulty byte itself completes is lost to the error (`1\n2]` reads only `1`; `1\n2 ]` reads
 `2` too), as in jq. Where jq resumes is counted in 4095-byte reads of the file's own bytes,
-and succinctly counts them in the text after invalid UTF-8 became U+FFFD, so on a line longer
-than one read that holds invalid bytes the resumption point can move by a few bytes, the
-residual recorded below for the line model. Since
+and so does succinctly since [#7934](https://github.com/rust-works/succinctly/issues/7934): it
+used to count them in the text after invalid UTF-8 became U+FFFD, three bytes for each byte
+replaced, so on a line longer than one read that holds invalid bytes the resumption point moved
+two bytes early per byte. Since
 [#4308](https://github.com/rust-works/succinctly/issues/4308) the `(at …)` marker a later
 error names after the parse error has been read matches jq's: every newline up to the end of
 the read in which jq detects the fault, at the fault itself for a malformed container
 (`0\n[1,\n2,\n}\n` → line 4), at the closing quote for a string holding a raw control
-character, and at the end of input for a value cut off there. One case still differs: on a
-line longer than jq's 4095-byte read that holds invalid UTF-8, the read boundary is counted in
-the text after each invalid byte became a three-byte U+FFFD, where jq counts the bytes it read,
-so a value within a few bytes of the boundary can be placed one line off. Invalid bytes are
-substituted before the line model sees the text, and a genuine U+FFFD looks the same.
-A program that reads on past a caught fault meets the moved resumption point as a fault jq does not raise ([#7921](https://github.com/rust-works/succinctly/issues/7921)): with `0`, a newline, 4,092 spaces, `}`, the byte `0x80`, a quote, a newline, `5` and a newline, `[limit(6; repeat(try input catch .))]` under `-n` is `0`, the `}` fault and `5` in jq 1.7.1 and 1.8.2, and here a second fault, `Invalid numeric literal at line 2, column 4095`, comes before the `5`; with 4,091 spaces it is `Unfinished string at EOF at line 4, column 0` in place of the `5`.
-Neither gives a value jq does not: a fault stands where jq reads on.
-Counting the reads in the bytes jq read there is left to the proposed single model of jq's input reader (not decided).
+character, and at the end of input for a value cut off there.
+On a line longer than jq's 4095-byte read that holds invalid UTF-8, the reads are counted in the bytes jq read since [#7934](https://github.com/rust-works/succinctly/issues/7934), through the edits the substitution reports (a genuine U+FFFD in the text is three bytes in both, so the text alone cannot tell them apart).
+Before that, a read boundary after an invalid byte fell 2 bytes early per byte replaced, and three things followed.
+A value within a few bytes of the boundary was placed one line short, in `(at …)` and `input_line_number`.
+A program that read on past a caught fault met the moved resumption point as a fault jq does not raise ([#7921](https://github.com/rust-works/succinctly/issues/7921)): with `0`, a newline, 4,092 spaces, `}`, the byte `0x80`, a quote, a newline, `5` and a newline, `[limit(6; repeat(try input catch .))]` under `-n` gave a second fault, `Invalid numeric literal at line 2, column 4095`, before the `5`, where jq 1.7.1 and 1.8.2 give `0`, the `}` fault and `5`.
+And behind a byte-order mark, whose three bytes #7569 counts in the first read, the resumption point could fall inside a number and read part of it as a value jq never reads, which ran the program again and made the run exit 0 where jq exits 5 ([#7934](https://github.com/rust-works/succinctly/issues/7934); [#7931](https://github.com/rust-works/succinctly/issues/7931) has the `(at f:0)` and double-fault shapes).
+A file that starts inside a replacement, with a character's bytes cut across two files, has its reads counted from its own first byte, inside that replacement, where they were counted from the replacement's end.
+The windowed document loop still counts a value's line over the window's text, since a window does not keep the substitution's edits: on a regular file of 4 MiB or more, a runtime error's `(at …)` line for a value just past a read boundary after invalid UTF-8 on a long line can be one short ([#7938](https://github.com/rust-works/succinctly/issues/7938)).
+A sibling with the same symptom as #7934 on input that is ASCII but for the mark and a NUL has another cause and is not fixed by this ([#7937](https://github.com/rust-works/succinctly/issues/7937)): the NUL pass rewrites a number that a fault's dropped read splits, and the resume reads part of it.
+Since the reads are counted where jq's are, a shape with invalid UTF-8 before such a number reaches it as its ASCII twin does (a mark, a surrogate's three bytes before `]123`, a NUL and a newline one byte past the end of the second read print `[]` and exit 0, where before #7934 the run exited 5 with the fault named a line late).
 The column a parse error names is counted over the bytes jq read, an invalid byte one column, since [#5964](https://github.com/rust-works/succinctly/issues/5964) (`\xff }` is column 2).
 A run jq collapses or drops inside a string (`"\xe1A" }`, where the `A` goes with the lead byte) is counted over the bytes it covered since [#5975](https://github.com/rust-works/succinctly/issues/5975): the substitution reports an edit for each replacement ([`substitute_invalid_utf8_jq_document_mapped`](../../../src/jq/utf8_document.rs)), so an offset in the text maps to the original through them.
 The fault the main loop meets, and `-s` and `--stream`, count it over the bytes read.
@@ -14067,9 +14070,8 @@ With the two bytes `BB BF` in front of the `3` the `1` came out as a value of it
 jq 1.7.1 ends the first read after `l` and the space, holds the `1` open at the end of the file and gives the fault and `13` (the fault and a second fault for the token `1`, `BB`, `BF`, `3`, in jq 1.8.2 as well).
 The stitch now takes the cuts `strip_leading_json_bom` made and starts each file's seam from its lead, on the route that reads the files whole, on the lazy route that falls back to it, and in the NUL pass's own search (`open_tail_len_before`).
 The pass that reads a number with a NUL (`blank_nul_number_tails_in`) runs before the mark is cut and looked for a whole mark in one file, so behind a mark cut across files (`EF BB`, then `BF`, `1`, a NUL, `x` and a newline) the mark's last byte was the token's first and the run ended in `Invalid JSON text`, where jq prints `1`; it now takes the cuts of `stream_bom_cuts`, as the cut itself does.
-**Recorded residual:** a read boundary after an invalid UTF-8 byte on a line longer than a read is counted over the text after the byte became U+FFFD (three bytes for one), so it falls 2 bytes early for each byte replaced.
-`0`, a newline, 4,092 spaces, `}`, the byte 0x80, a quote, a newline and `8`, `9` on lines of their own give the `}` fault and then `Invalid numeric literal at line 2, column 4095` before `8` and `9`, where both jq releases give the one fault: the read after the fault starts inside the replacement character.
-It is an extra error, not a wrong value.
+A read boundary after an invalid UTF-8 byte on a line longer than a read was counted over the text after the byte became U+FFFD (three bytes for one), so it fell 2 bytes early for each byte replaced: `0`, a newline, 4,092 spaces, `}`, the byte 0x80, a quote, a newline and `8`, `9` on lines of their own gave the `}` fault and then `Invalid numeric literal at line 2, column 4095` before `8` and `9`.
+Since [#7934](https://github.com/rust-works/succinctly/issues/7934) the reads are counted in the bytes jq read, and the run gives the one fault, `8` and `9`, as both jq releases do (pinned by `tests/jq_cli/i7931.rs`).
 Pinned by `tests/jq_cli/i7921.rs`.
 
 ### A malformed nested number raises when read; jq rejects the document (#966, #3034, #3222) — accepted uniform divergence
