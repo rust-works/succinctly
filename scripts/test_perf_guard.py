@@ -421,6 +421,18 @@ class SyntheticFixtureRowTests(unittest.TestCase):
                 self.assertIn("-n", perf_guard.QUERY_FLAGS[query_id], query_id)
         self.assertEqual(self.paths["none"], [])
 
+    def test_the_argjson_row_passes_one_array_that_fits_an_argument(self):
+        # #7881: the value is the flag's argument, most of the run and under Linux's 128 KiB
+        # ceiling on one argument (`MAX_ARG_STRLEN`).
+        flags = perf_guard.QUERY_FLAGS["argjson_objects"]
+        self.assertEqual(flags[:3], ["-n", "--argjson", "v"])
+        self.assertEqual(len(flags), 4)
+        value = json.loads(flags[3])
+        self.assertEqual(len(value), perf_guard.ARGJSON_OBJECTS)
+        self.assertEqual(list(value[0]), ["id", "name", "tags"])
+        self.assertGreater(len(flags[3]), 32 * 1024)
+        self.assertLess(len(flags[3]), 128 * 1024)
+
     def test_the_e_row_differs_from_its_twin_only_by_dash_e(self):
         queries = {q[0]: q for q in perf_guard.QUERIES}
         self.assertEqual(queries["nd_e_iterate"][1:], queries["nd_iterate"][1:])

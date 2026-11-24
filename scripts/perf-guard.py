@@ -179,6 +179,14 @@ SYNTHETIC_PATTERNS = (
 # three reps would pay three times over.
 SYNTHETIC_REPS = 1
 
+# #7881: the text the `argjson_objects` row passes to `--argjson`: `ARGJSON_OBJECTS` small objects
+# in one array, about 52 KB (Linux holds one argument to 128 KiB). The row reads no file (pattern
+# `none`); its value is on the command line (`QUERY_FLAGS`), where no fixture row can put one.
+ARGJSON_OBJECTS = 1000
+ARGJSON_OBJECTS_TEXT = "[" + ",".join(
+    '{"id":%d,"name":"user%05d","tags":["alpha","beta"]}' % (i, i) for i in range(ARGJSON_OBJECTS)
+) + "]"
+
 # (id, generate-pattern, size, mode, filter) -- ids are the baseline file's
 # keys, so renaming one here orphans its old baseline entry (caught by
 # `--check`'s own "missing baseline entry" error) rather than silently
@@ -418,6 +426,15 @@ QUERIES = [
      "def f($v): .a = $v; {x: [range(500)]} | [foreach range(200) as $i (.; f($i); .a)] | length"),
     ("fold_bound_getpath", "none", "-", "jq",
      "[range(300)] as $a | reduce range(300) as $i (0; . + ($a | getpath([$i])))"),
+    # #7881: reading an `--argjson` value. No row above passes a named argument larger than a few
+    # bytes, so #7743 (argv-order option errors, #7712), which made the option walk parse each
+    # `--argjson` text to check it and the run parse it again to bind it, doubled the cost of every
+    # such value and passed the guard at +0.0%. `ARGJSON_OBJECTS_TEXT` (~52 KB) makes the value
+    # nearly all of the run: cachegrind on the AMD Ryzen 9 7950X box read this row at about twice
+    # its count with the second parse (a 100 KB value of the same shape: 81.2M instructions against
+    # 39.6M for the commit before #7743). A `--jsonargs` word takes the same route and cannot be a
+    # row here: a word comes after the program, where a row has only its files.
+    ("argjson_objects", "none", "-", "jq", "$v | length"),
 ]
 
 # Per-query extra CLI flags, inserted between the mode (`jq`/`yq`) and the
@@ -459,6 +476,8 @@ QUERY_FLAGS = {
     "fold_def_update": ["-n"],
     "fold_foreach": ["-n"],
     "fold_bound_getpath": ["-n"],
+    # #7881: the value under test is the flag's own argument.
+    "argjson_objects": ["-n", "--argjson", "v", ARGJSON_OBJECTS_TEXT],
 }
 
 # Rows whose fixture is the base `users`/2mb document's records, one compact
@@ -732,8 +751,14 @@ DEFAULT_THRESHOLD = 5.0
 # and `nd_obj_interp` read +0.98% / +1.61% / +1.49% on #7719's first branch, below any threshold
 # that noise allows; they are there for a larger cost per record: about 1,000 instructions added
 # to `path_mode::route`, which they pay once per record, moves them +10.48% / +6.16% / +2.83%.
+#
+# `argjson_objects` (#7881) carries a one-off override: the row arrives with the change that halves
+# it (one parse of an `--argjson` text where #7743 left two), so against a merge-base without that
+# change it reads -50.5% (cachegrind on the AMD Ryzen 9 7950X box). Remove the entry once
+# `main` carries #7881: the row reads ~0% from then on and the default threshold watches it.
 QUERY_THRESHOLDS = {
     "seq_name_bad_last": 3.0,
+    "argjson_objects": 55.0,
     "nd_id": 2.0,
     "nd_select_name": 2.0,
     "nd_pipe30": 2.0,

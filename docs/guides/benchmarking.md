@@ -220,6 +220,11 @@ shapes, over fixtures the script writes itself (`write_synthetic_fixtures`, so b
 | Per-element `and`/`or`, objects, interpolation | `nd_select_and_or`, `nd_obj_interp`, `nd_obj_interp_def`, `doc_select_and_or`, `doc_and_def` | the records, per line and as `{"users":[...]}`                   | #7787's settle check per operator: +2.2% to +5.1%            |
 | Fold steps                                     | `fold_append`, `fold_def_update`, `fold_foreach`, `fold_bound_getpath`                       | none (`-n`, a few hundred steps)                                 | #7451, #7702, #7721 made quadratic folds linear: -94%        |
 
+`argjson_objects` (#7881) is the one row whose input is an argument: `-n --argjson v <text>` with a
+52 KB array of 1,000 small objects as the text, so reading the value is nearly all of the run.
+No row passed a named argument of any size before it, and #7743's second parse of every
+`--argjson` text (about twice the count of this row) passed the guard at +0.0%.
+
 The inputs are small on purpose: an instruction count needs no large file, only enough records,
 files or steps to reach the route (both NDJSON files are past the 256 KiB below which a file is read
 whole instead of a window at a time) and to make the per-unit cost a large share of the run. Each
