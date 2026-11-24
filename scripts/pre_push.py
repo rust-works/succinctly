@@ -8,8 +8,9 @@
 `run` maps the paths changed since the merge base with origin/main to the gates in GATES and runs
 the ones that apply, cheapest first. A failing gate stops the more expensive ones: fix it first.
 The default `fast` tier is what the hook runs on every agent push; `--full` adds the lints CI runs
-(three clippy invocations, rustdoc with warnings denied, the `--no-default-features` build), which
-take minutes. The CI test matrices are `scripts/test.sh`'s job and are not mirrored.
+(three clippy invocations, rustdoc with warnings denied, the `--no-default-features` build, the
+Windows type check when its rustup target is installed), which take minutes. The CI test matrices
+are `scripts/test.sh`'s job and are not mirrored.
 
 Every command in `.github/workflows/*.yml` that looks like a gate is either mirrored by a gate here
 (`Gate.mirrors`) or listed in NOT_MIRRORED with the reason. `scripts/test_pre_push.py` fails when
@@ -55,6 +56,12 @@ RUST_PATHS = ("*.rs", "Cargo.toml", "Cargo.lock", "rust-toolchain*", "clippy.tom
 NESTED_LOCK_PATHS = ("Cargo.toml", "fuzz/Cargo.*", "bench-compare/Cargo.*")
 
 RELEASE_FEATURES = "cli,simd,regex,serde,bench-runner"  # comparison/jq/manifest.toml
+
+# What release.yml's `windows` leg builds (#7388): its target and its `rustflags`. `cargo check` for
+# it needs only the rustup target (`rustup target add x86_64-pc-windows-msvc`), no linker.
+WINDOWS_TARGET = "x86_64-pc-windows-msvc"
+WINDOWS_RUSTFLAGS = "-C target-feature=+popcnt"
+WINDOWS_CHECK = f"cargo check --locked --target {WINDOWS_TARGET} --features cli --lib --bins"
 
 # What the CLI's `bench-runner` unit tests (`--lib cli::` since #7384) read or are: the `compare` and `bench_runner` modules
 # and the dispatch that gates them, the harness's data, the docs whose generated blocks they hold
@@ -244,6 +251,19 @@ GATES = (
         (r"^python3 scripts/crate_size\.py check --verify --features cli$",),
         paths=("src/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "scripts/crate_size.py"),
         cost=4,
+    ),
+    Gate(
+        "windows-check",
+        "full",
+        (
+            f"if rustup target list --installed 2>/dev/null | grep -qx {WINDOWS_TARGET}; then {WINDOWS_CHECK}; "
+            f'else echo "    not run: the {WINDOWS_TARGET} rustup target is not installed '
+            f"(rustup target add {WINDOWS_TARGET}); CI's Windows type check job runs it\"; fi",
+        ),
+        (rf"^{re.escape(WINDOWS_CHECK)}$",),
+        paths=RUST_PATHS,
+        cost=4,
+        env={"RUSTFLAGS": f"{WINDOWS_RUSTFLAGS} -D warnings"},
     ),
     Gate(
         "no-default-features",

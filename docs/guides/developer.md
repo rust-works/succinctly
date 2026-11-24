@@ -559,6 +559,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features std,simd,serde,cli,regex,bench-runner,large-tests,mmap-tests
 ```
 
+No CI test job builds for Windows, which only the release does, so CI's `Windows type check` job and the
+`windows-check` pre-push gate (`--full`) type-check the release's Windows build from any host (#7388). An item
+that only unix code uses needs `#[cfg(unix)]` (`#[cfg(any(unix, test))]` when a unit test calls it), or this fails
+on the unused-item warning:
+
+```bash
+rustup target add x86_64-pc-windows-msvc   # once; no linker or Windows SDK is needed for `cargo check`
+RUSTFLAGS="-C target-feature=+popcnt -D warnings" cargo check --locked --target x86_64-pc-windows-msvc --features cli --lib --bins
+```
+
 The second run documents the SIMD backend of the machine it runs on: CI's `Documentation` job is x86_64 Linux, so
 it covers `x86.rs` and the AVX-512 popcount path, and the `rustdoc-simd-backends` gate on an Apple Silicon machine
 covers `neon.rs` instead. To check the x86_64 backend from there, add `--target x86_64-apple-darwin`.
