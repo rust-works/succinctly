@@ -715,15 +715,8 @@ DEFAULT_THRESHOLD = 5.0
 # and `nd_obj_interp` read +0.98% / +1.61% / +1.49% on #7719's first branch, below any threshold
 # that noise allows; they are there for a larger cost per record: about 1,000 instructions added
 # to `path_mode::route`, which they pay once per record, moves them +10.48% / +6.16% / +2.83%.
-#
-# `argjson_objects` (#7881) carries a one-off override: the row arrives with the changes that cut
-# it (one parse of an `--argjson` text where #7743 left two, then the one-pass reader for plain
-# text), so against a merge-base without them it reads -86.8% (cachegrind on the AMD Ryzen 9
-# 7950X box; -50.5% with the first change alone). Remove the entry once `main` carries #7881:
-# the row reads ~0% from then on and the default threshold watches it.
 QUERY_THRESHOLDS = {
     "seq_name_bad_last": 3.0,
-    "argjson_objects": 92.0,
     "nd_id": 2.0,
     "nd_select_name": 2.0,
     "nd_pipe30": 2.0,
