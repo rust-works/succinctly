@@ -23,7 +23,14 @@
 //!   may recurse, #7787; the door settles a helper's too, which is what writes in place);
 //! - **an `if`** whose condition the tree answers ([`owned_cond_verdict`]) runs the branch it picks;
 //! - **an `as` whose source never reads `.`**, the binding of a `$` parameter, binds its one value
-//!   as [`each_as`] binds a value with no node behind it.
+//!   as [`each_as`] binds a value with no node behind it;
+//! - **a `,` one of whose branches ends in a call to a def that may recurse** runs each branch
+//!   over the value with the sink it was given, as `eval_each`'s arm does (#7893): a branch that
+//!   bridged handed the call a sink of the bridge's, and the outputs of a recursion that emits
+//!   after its call (`def f: if . > 0 then (. - 1 | f), . else . end`) went back up through one
+//!   bridge per level;
+//! - **a pipe ending in such a call that a stage the tree answers leads** (`. - 1 | f`) hands the
+//!   stage's one value to the rest of the pipe, for the same reason (#7893).
 //!
 //! Each runs its parts through [`eval_moved`], the owned evaluator for a value nothing else holds:
 //! the value is handed down rather than borrowed, so the assignment it reaches
@@ -87,6 +94,8 @@ pub(super) fn door_borrowed<S: EvalSemantics>(
 pub(super) fn door_candidate(expr: &Expr) -> bool {
     match unwrap_paren(expr) {
         Expr::DefCall { .. } | Expr::FuncDef { .. } | Expr::If { .. } | Expr::As { .. } => true,
+        // #7893: only a `,` that hands its sink on to a recursion; any other bridges as before.
+        Expr::Comma(branches) => comma_hands_on_a_recursion(branches),
         // A pipe the door can take is led by a call or an assignment, or is one such stage: the
         // first stage's discriminant says so, so a pipe of other stages (the input-free operand of
         // #7451's fold step, `$t | tostring | split("")`, evaluated once per step) pays a compare
@@ -97,16 +106,25 @@ pub(super) fn door_candidate(expr: &Expr) -> bool {
                 unwrap_paren(only),
                 Expr::DefCall { .. } | Expr::FuncDef { .. } | Expr::If { .. } | Expr::As { .. }
             ),
-            [first, ..] => matches!(
-                unwrap_paren(first),
-                Expr::DefCall { .. }
-                    | Expr::Assign { .. }
-                    | Expr::Update { .. }
-                    | Expr::CompoundAssign { .. }
-                    | Expr::AlternativeAssign { .. }
-                    | Expr::Alternative(..)
-                    | Expr::As { .. }
-            ),
+            // #7893: or it ends in a call to a def that may recurse, which a stage the tree answers
+            // may lead ([`value_pipe`]). The last stage's own discriminant, not looked for under
+            // parentheses: a pipe ending in anything else pays this compare and no more (the
+            // fold step's operand above, 800 times a run).
+            [first, .., last] => {
+                matches!(
+                    unwrap_paren(first),
+                    Expr::DefCall { .. }
+                        | Expr::Assign { .. }
+                        | Expr::Update { .. }
+                        | Expr::CompoundAssign { .. }
+                        | Expr::AlternativeAssign { .. }
+                        | Expr::Alternative(..)
+                        | Expr::As { .. }
+                ) || matches!(
+                    last,
+                    Expr::DefCall { def, .. } if crate::jq::tail_call::def_may_recurse(def)
+                )
+            }
         },
         _ => false,
     }
@@ -211,20 +229,59 @@ fn emit_one(value: OwnedValue, sink: &mut dyn FnMut(OwnedValue) -> Demand) -> Fl
 
 /// Whether `expr` is a node the door may take, on its shape alone: a call, a definition, a pipe of two or more
 /// stages that a call settling to its value or an assignment leads, an `if`, an `as` whose source never reads `.`
-/// (a `$`-parameter's binding, `Shared(ARG) as $n | BODY`), or a pipe of one such stage (the copy a
-/// [`RestPipe`] makes of a lone stage that holds evaluation state).
+/// (a `$`-parameter's binding, `Shared(ARG) as $n | BODY`), a `,` that hands its sink on to a
+/// recursion ([`comma_hands_on_a_recursion`]), a pipe ending in a call to a def that may recurse
+/// that no call leads ([`value_pipe`]), or a pipe of one such stage (the copy a [`RestPipe`] makes
+/// of a lone stage that holds evaluation state).
 fn door_shape(expr: &Expr) -> bool {
     match unwrap_paren(expr) {
         Expr::DefCall { .. } | Expr::FuncDef { .. } | Expr::If { .. } => true,
+        Expr::Comma(branches) => comma_hands_on_a_recursion(branches),
         Expr::As { expr: source, .. } => closed_expr_shape(peel_shared(source)),
         Expr::Pipe(stages) => match stages.as_slice() {
             [only] => door_shape(only),
-            [first, _, ..] => {
+            [first, .., last] => {
                 crate::jq::tail_call::call_answers_once(first, true)
                     || is_owned_assign(unwrap_paren(first))
+                    || (!matches!(unwrap_paren(first), Expr::DefCall { .. })
+                        && ends_in_a_recursion(last))
             }
             [] => false,
         },
+        _ => false,
+    }
+}
+
+/// Whether a branch of a `,` ends in a call to a def that may recurse
+/// ([`def_may_recurse`](crate::jq::tail_call::def_may_recurse)): the call itself, the last stage
+/// of a pipe, or a branch of an `if` ([`ends_in_a_recursion`], #7893). Such a call's outputs are
+/// the branch's, so run through the door the call gets the sink the `,` was given, and the outputs
+/// of every level of the recursion reach the one consumer from where they are produced. Through
+/// the bridge each level put its own sink between the two, and an output climbed them all: `def f:
+/// if . > 0 then (. - 1 | f), . else . end; [N | f]` made N²/2 calls through them for its N
+/// outputs.
+///
+/// Any other `,` is the bridge's, as before: it indexes the value once for all its branches,
+/// where the door would index it once for each branch no door answers.
+///
+/// Out of line: the bridges ask this of every `,` that reaches them ([`door_candidate`]), and the
+/// walk has no place in their code.
+#[inline(never)]
+fn comma_hands_on_a_recursion(branches: &[Expr]) -> bool {
+    branches.iter().any(ends_in_a_recursion)
+}
+
+/// Whether `expr`'s outputs are those of a call to a def that may recurse: the call itself, the
+/// last stage of a pipe, or a branch of an `if` (#7893).
+fn ends_in_a_recursion(expr: &Expr) -> bool {
+    match unwrap_paren(expr) {
+        Expr::DefCall { def, .. } => crate::jq::tail_call::def_may_recurse(def),
+        Expr::Pipe(stages) => stages.last().is_some_and(ends_in_a_recursion),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => ends_in_a_recursion(then_branch) || ends_in_a_recursion(else_branch),
         _ => false,
     }
 }
@@ -303,13 +360,17 @@ fn door<S: EvalSemantics>(
             var,
             body,
         } => closed_bind::<S>(source, var, body, input, optional, sink),
+        Expr::Comma(branches) => Ok(comma::<S>(branches, input, optional, sink)),
         Expr::Pipe(stages) => match stages.as_slice() {
             [only] => door::<S>(only, input, optional, sink),
             [first, _, ..] if !pipe_needs_path_context(stages) => {
-                if is_owned_assign(unwrap_paren(first)) {
+                let head = unwrap_paren(first);
+                if is_owned_assign(head) {
                     assign_pipe::<S>(RestTail::whole(stages), input, optional, sink)
-                } else {
+                } else if matches!(head, Expr::DefCall { .. }) {
                     call_pipe::<S>(RestTail::whole(stages), input, optional, sink)
+                } else {
+                    value_pipe::<S>(RestTail::whole(stages), input, optional, sink)
                 }
             }
             _ => Err(input),
@@ -346,13 +407,15 @@ fn call<S: EvalSemantics>(
         Err(error) => return Ok(def_call_failed(error)), // patchcov: coverage tolerate-line reason="unreachable while the probe above succeeded: binding is a pure function of the node, and the probe left the body in its cache (#7483)"
     };
     // #7856: see `eval::each_def_call`, whose error paths are out of line for the same reason.
-    let Some(limit) = def_call_floors() else {
+    let watch = DefOutputWatch::idle();
+    if !watch.admits() {
         return Ok(def_output_refusal(def));
-    };
-    let mut refused = false;
+    }
+    // #7893: unless the sink is the wrapper of the call that handed it on unchanged.
     let mut checked;
-    let sink: &mut dyn FnMut(OwnedValue) -> Demand = if crate::jq::tail_call::def_may_recurse(def) {
-        checked = |item| checked_def_output(limit, &mut refused, sink, item);
+    let sink: &mut dyn FnMut(OwnedValue) -> Demand = if DefOutputWatch::unchecked(def, sink) {
+        checked = |item| checked_def_output(&watch, sink, item);
+        watch.begin(&checked);
         &mut checked
     } else {
         sink
@@ -371,7 +434,7 @@ fn call<S: EvalSemantics>(
         let _guard = def_call_guard(frames, bound.is_hot());
         eval_moved_in::<S>(&body, input, optional, true, sink)
     };
-    if refused {
+    if watch.end() {
         return Ok(def_output_refusal(def));
     }
     Ok(flow)
@@ -431,6 +494,29 @@ fn branch_flow<S: EvalSemantics>(
         Flow::Stopped { .. } => Flow::Stopped { pending: None },
         other => other,
     }
+}
+
+/// `eval_each`'s `,` over an owned `input` (#7893): each branch in turn over the value, with the
+/// sink the `,` was given, until one stops or escapes. Every branch but the last runs over a
+/// handle of its own, so a write in it copies what it writes to; the last is handed the value.
+fn comma<S: EvalSemantics>(
+    branches: &[Expr],
+    input: OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    #[cfg(test)]
+    tests::comma_taken();
+    let Some((last, earlier)) = branches.split_last() else {
+        return Flow::Exhausted; // patchcov: coverage tolerate-line reason="unreachable: door_shape admits a `,` only when one of its branches ends in a call (#7893)"
+    };
+    for branch in earlier {
+        match eval_moved_in::<S>(branch, input.clone(), optional, true, sink) {
+            Flow::Exhausted => {}
+            stopped_or_escaped => return stopped_or_escaped,
+        }
+    }
+    eval_moved_in::<S>(last, input, optional, true, sink)
 }
 
 /// [`each_as`] over an owned `input`, for a source that never reads `.`: its one value, which
@@ -549,6 +635,39 @@ fn assign_pipe<S: EvalSemantics>(
     Ok(flow)
 }
 
+/// [`eval_each_pipe`] over an owned `input`, for a pipe that ends in a call to a def that may
+/// recurse and that a stage the tree answers leads (#7893): `. - 1 | f`. The stage's one value
+/// ([`eval_owned_fast_path`], the first of the front doors, so what the owned evaluator answers
+/// for the stage on its own) is handed down to the rest of the pipe, through the [`RestPipe`] the
+/// document route's driver builds, with the sink the pipe was given. Through the bridge the rest
+/// ran under the bridge's sink, and the recursion's outputs climbed one of those per level. A
+/// stage the fast path does not answer hands `input` back, nothing evaluated.
+fn value_pipe<S: EvalSemantics>(
+    tail: RestTail<'_>,
+    input: OwnedValue,
+    optional: bool,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Result<Flow, OwnedValue> {
+    #[cfg(test)]
+    tests::value_pipe_taken();
+    let value = match eval_owned_fast_path::<S>(&tail.stages()[0], &input, optional) {
+        Some(Ok(Some(value))) => value,
+        Some(Ok(None)) => return Ok(Flow::Exhausted),
+        Some(Err(error)) => return Ok(Flow::Escaped(Control::Error(error))),
+        None => return Err(input),
+    };
+    // The stage's answer may share storage with the value it read (`.` does): the rest is the
+    // only holder once this handle is gone, so a write downstream lands in place.
+    drop(input);
+    // The driver's, as `assign_pipe`: the rest's verdict is the pipe's, an escape marked as it
+    // stops the drive.
+    let flow = RestPipe::of_tail(tail.rest()).run_moved::<S>(value, optional, true, sink);
+    if let Flow::Escaped(control) = &flow {
+        mark_nonretryable_escape(control);
+    }
+    Ok(flow)
+}
+
 impl RestPipe<'_> {
     /// [`Self::run_owned`] for a value nothing else holds: the same doors and the same copy of the
     /// rest, then [`eval_moved`]'s in-place assignment and door with the value handed down.
@@ -608,6 +727,8 @@ pub(super) mod tests {
     thread_local! {
         static CLOSED: Cell<bool> = const { Cell::new(false) };
         static ENTERED: Cell<usize> = const { Cell::new(0) };
+        static COMMAS: Cell<usize> = const { Cell::new(0) };
+        static VALUE_PIPES: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Whether a test closed the door, to compare its answers with the route it replaces.
@@ -622,6 +743,24 @@ pub(super) mod tests {
 
     fn entries() -> usize {
         ENTERED.with(Cell::get)
+    }
+
+    /// Count a pipe [`value_pipe`] was asked to run (#7893).
+    pub(super) fn value_pipe_taken() {
+        VALUE_PIPES.with(|n| n.set(n.get() + 1));
+    }
+
+    fn value_pipes() -> usize {
+        VALUE_PIPES.with(Cell::get)
+    }
+
+    /// Count a `,` the door ran (#7893).
+    pub(super) fn comma_taken() {
+        COMMAS.with(|n| n.set(n.get() + 1));
+    }
+
+    fn commas() -> usize {
+        COMMAS.with(Cell::get)
     }
 
     /// Every output of `program` over `input` through the owned evaluator, then how it ended.
@@ -819,6 +958,103 @@ pub(super) mod tests {
         });
         assert_eq!(entries(), before, "yq mode entered the door");
     }
+    /// #7893: a `,` one of whose branches ends in a call to a def that may recurse answers through
+    /// the door as it did through the bridge: its outputs and their order, a consumer that stops
+    /// it, an error or a `break` in a branch, a write in a branch that must not show in the next,
+    /// `?`, and a `,` under another. The marked rows must run their `,` through the door; a `,`
+    /// with no such call never does.
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)] // STYLE-0004: jq object literals, not format strings
+    fn a_comma_that_hands_on_a_recursion_answers_as_the_bridge_7893() {
+        let number = OwnedValue::Int(4);
+        let object = OwnedValue::object_from([
+            ("a".to_string(), OwnedValue::Int(3)),
+            (
+                "x".to_string(),
+                OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int(2)]),
+            ),
+        ]);
+        for (program, input, taken) in [
+            // The issue's, the call first and last, and three branches.
+            ("def f: if . > 0 then (. - 1 | f), . else . end; [f]", &number, true),
+            ("def f: if . > 0 then ., (. - 1 | f), -. else . end; [f]", &number, true),
+            ("def f: if . > 0 then (. - 1 | f), (. - 2 | f), . else . end; [f]", &number, true),
+            ("def f: (if . > 0 then . - 1 | f else empty end), .; [f]", &number, true),
+            ("def f: if . > 0 then (. - 1 | f), . else . end; first(f)", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), . else . end; [limit(3; f)]", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), . else . end; [f | select(. != 2)]", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), . else . end; reduce f as $x (0; . + $x)", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), . else . end; [foreach f as $x (0; . + $x)]", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), . else . end; last(f)", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), . else . end; [f, f]", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), . else . end; [.[]? , f]", &number, false),
+            // A closure parameter, a second def, a `$`-parameter.
+            ("def f(g): if . > 0 then (. - 1 | f(g)), g else g end; [f(. * 2)]", &number, false),
+            ("def f: def g: if . > 0 then (. - 1 | f), . else . end; g; [f]", &number, false),
+            ("def f($n): if $n > 0 then f($n - 1), $n, . else $n end; [f(3)]", &number, false),
+            ("def f($n): if $n > 0 then (. + 1 | f($n - 1)), . else . end; [f(3)]", &number, false),
+            // Errors, `try`, `?`, `label` and `break`.
+            ("def f: if . > 0 then (. - 1 | f), error(\"e\\(.)\") else . end; [try f catch .]", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), error(\"e\\(.)\") else . end; [f]", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), (.a)? else . end; [f]", &number, false),
+            ("def f: if . > 0 then ((. - 1 | f), .a)? else . end; [f]", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), .a else . end; [.[]?, (f)?]", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), .a else . end; try [f] catch .", &number, false),
+            ("def f: label $out | if . > 0 then (. - 1 | f), break $out, . else . end; [f]", &number, false),
+            ("def f: if . > 0 then (. - 1 | f), ., empty, (1, 2) else . end; [f]", &number, false),
+            ("def f: if . > 2 then (. - 1 | f), (label $l | ., break $l, 9) else . end; [f]", &number, false),
+            // A write in one branch is not seen by the next, nor by the caller's value.
+            ("def f: if .a > 0 then (.a -= 1 | f), . else . end; [f | .a]", &object, true),
+            ("def f: if .a > 0 then (.a -= 1 | .x += [0] | f), (.x[0] = 9), . else . end; [f]", &object, false),
+            ("def f: if .a > 0 then (.a -= 1 | f), .x else .x[1] = 7 end; . as $o | [f, $o]", &object, false),
+            ("def f: if .a > 0 then (.b = 1), (.a -= 1 | f) else . end; [f | [.a, .b]]", &object, false),
+            ("def f: if .a > 0 then (.a -= 1 | f | .c += 1), (.a -= 1 | f) else .c = 0 end; [f | .c]", &object, false),
+            ("def f: if .a > 0 then (.a -= 1 | f), path(.a), getpath([\"x\", 0]) else . end; [f]", &object, false),
+            ("def f: if .a > 0 then (.a -= 1 | f), (.x | length), keys else .a end; [f]", &object, false),
+            ("def f: if .a > 0 then (.a -= 1 | f), del(.x), to_entries else . end; [f]", &object, false),
+            ("def f: if .a > 0 then (.a -= 1 | f), $__loc__, (.x | add) else empty end; [f]", &object, false),
+        ] {
+            let before = commas();
+            let (bridged, bridged_end) = run(program, input, false);
+            assert_eq!(commas(), before, "{program}: the closed door ran a `,`");
+            let (answered, answered_end) = run(program, input, true);
+            // Asserted where the recursion is known to cross the owned route; a row not marked may
+            // or may not (a body under `label` or `?`, a program that binds a variable).
+            assert!(!taken || commas() > before, "{program}: the door ran no `,`");
+            assert_eq!(
+                (answered, answered_end),
+                (bridged, bridged_end),
+                "{program}"
+            );
+        }
+        // The issue's pipe hands the step's value down, and the call under it is given the sink of
+        // the `,`.
+        let before = value_pipes();
+        run(
+            "def f: if . > 0 then (. - 1 | f), . else . end; [f]",
+            &number,
+            true,
+        );
+        assert!(value_pipes() > before, "`. - 1 | f` was not handed down");
+        // No branch ends in a call that may recurse: the bridge's, which indexes the value once.
+        for program in [
+            "(.a, .x[0]), (.x | length)",
+            "def k: .a; [(k, .x[1]), k]",
+            "def k: .a; [(.x[1] | k), k, (.x | length)]",
+            "def f: if .a > 0 then .a -= 1 | f else . end; [(f | .a), .a]",
+        ] {
+            let before = commas();
+            let (bridged, bridged_end) = run(program, &object, false);
+            let (answered, answered_end) = run(program, &object, true);
+            assert_eq!(commas(), before, "{program}: the door ran its `,`");
+            assert_eq!(
+                (answered, answered_end),
+                (bridged, bridged_end),
+                "{program}"
+            );
+        }
+    }
+
     /// #7702: a fold or loop step whose UPDATE is a call to a `def` runs through the door with the
     /// state handed down, so the run re-indexes the state a fixed number of times however many steps
     /// it takes; with the door closed it re-indexes the state at every step, as before. Every row
