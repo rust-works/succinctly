@@ -16097,8 +16097,11 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
     let dash = files.first().is_some_and(|path| is_stdin_dash(path));
     // Whether the source is a terminal (#7742), asked only of a source read as a stream.
     let mut terminal = false;
-    // Its descriptor (#7812).
+    // Its descriptor (#7812), which only a unix build assigns below (#7388).
+    #[cfg(unix)]
     let mut terminal_fd: i32 = 0;
+    #[cfg(not(unix))]
+    let terminal_fd: i32 = 0;
     let (mut reader, len): (Box<dyn std::io::Read>, Option<usize>) = match files.first() {
         // #7478: `-` is standard input, read below as an unnamed one is (named `<stdin>`), unless a
         // route before has read it whole already.

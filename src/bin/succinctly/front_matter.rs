@@ -43,6 +43,10 @@ pub(crate) fn leading_bom_len(bytes: &[u8]) -> usize {
 /// jq's parser keeps its place in the mark between buffers, so a stream that ends inside the mark
 /// has no text and no fault: it is empty input (`printf '\357' | jq .` prints nothing, exit 0). A
 /// mark that breaks off before the end is `Malformed BOM`, which this is not.
+///
+/// Only the windowed route asks (`first_with_bytes_is_a_cut_bom` in `jq_runner.rs`), which is unix
+/// only, so no other build compiles it (#7388).
+#[cfg(any(unix, test))]
 pub(crate) fn truncated_bom_len(bytes: &[u8]) -> usize {
     if !bytes.is_empty() && bytes.len() < UTF8_BOM.len() && UTF8_BOM.starts_with(bytes) {
         bytes.len()

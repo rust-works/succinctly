@@ -57,8 +57,8 @@ concurrency group for merge groups instead: the queue tests several at once, and
 ## Before You Push
 
 `scripts/pre-push.sh` maps the files your branch changed to the CI gates they can fail and runs
-those (`--full` adds the lints CI runs: three clippy invocations, rustdoc, `--no-default-features`;
-`list` shows the gates). `.claude/settings.json` runs it as a `PreToolUse` hook, so an agent's
+those (`--full` adds the lints CI runs: three clippy invocations, rustdoc, `--no-default-features`,
+the Windows type check; `list` shows the gates). `.claude/settings.json` runs it as a `PreToolUse` hook, so an agent's
 `git push` is blocked while it fails -- `--no-verify` does not skip it. `PRE_PUSH_SKIP="gate ..."`
 skips named gates (as a prefix of the push, `PRE_PUSH_SKIP=ledger-only git push`, for an agent), and a
 skip is always printed.

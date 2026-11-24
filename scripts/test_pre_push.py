@@ -147,6 +147,28 @@ class GateTableTests(unittest.TestCase):
         for path in gate.paths:
             self.assertIn(path, listed)
 
+    def test_the_windows_check_is_what_the_release_builds_for_windows(self):
+        # #7388: the check stands in for release.yml's `windows` leg, so its target, features and
+        # flags are that leg's; a release that builds something else needs the check moved with it.
+        with open(os.path.join(ROOT, ".github/workflows/release.yml"), encoding="utf-8") as f:
+            release = f.read()
+        leg = re.search(r"- build: windows\n((?:\s+\S.*\n)+?)(?=\s+- build:|\s*runs-on:)", release).group(1)
+        self.assertIn(f"target: {pre_push.WINDOWS_TARGET}\n", leg)
+        self.assertIn(f"rustflags: {pre_push.WINDOWS_RUSTFLAGS}\n", leg)
+        self.assertIn("run: cargo build --verbose --release --features cli --target ${{ matrix.target }}\n", release)
+        self.assertIn(" --features cli --lib --bins", pre_push.WINDOWS_CHECK)
+        # CI's job and the gate run one command under one RUSTFLAGS, warnings denied.
+        with open(os.path.join(ROOT, ".github/workflows/ci.yml"), encoding="utf-8") as f:
+            ci = f.read()
+        gate = next(g for g in pre_push.GATES if g.name == "windows-check")
+        flags = gate.env["RUSTFLAGS"]
+        self.assertEqual(flags, f"{pre_push.WINDOWS_RUSTFLAGS} -D warnings")
+        self.assertIn(f"targets: {pre_push.WINDOWS_TARGET}\n", ci)
+        self.assertRegex(ci, rf"RUSTFLAGS: {re.escape(flags)}\n\s+run: {re.escape(pre_push.WINDOWS_CHECK)}\n")
+        # Without the rustup target the gate says so and passes; CI is the check then.
+        self.assertIn(f"rustup target list --installed 2>/dev/null | grep -qx {pre_push.WINDOWS_TARGET}", gate.steps[0])
+        self.assertIn("not run:", gate.steps[0])
+
 
 class HookRegistrationTests(unittest.TestCase):
     def test_the_checked_in_settings_run_the_hook_on_bash_calls_with_room_to_build(self):

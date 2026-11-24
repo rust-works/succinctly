@@ -1400,6 +1400,34 @@ jobs:
           RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
         run: cargo check --locked --features cli,simd,regex,serde
 
+  # `release.yml` is the only workflow that builds `x86_64-pc-windows-msvc`, so a change that stops
+  # the Windows build from compiling passed every PR and merge-group check and failed when a release
+  # was cut (#7388: #7279 called a `#[cfg(unix)]` function from code every platform compiles, found
+  # by hand three days later). This type-checks what the release's `windows` leg builds (`--features
+  # cli`, the library and the binary, with that leg's `rustflags`) for that target on a Linux runner:
+  # `cargo check` does not link, so it needs no Windows runner and no MSVC toolchain. It does not
+  # see a link-time or run-time failure; only the release build does. Warnings are denied, as in
+  # Clippy, so an item only the unix builds use is given its `cfg` instead of piling up as a Windows
+  # warning nobody reads. scripts/test_pre_push.py holds the command to release.yml's. Not a
+  # required check; it skips wholesale like MSRV.
+  windows-check:
+    name: Windows type check
+    needs: gate
+    if: needs.gate.outputs.retest != 'false' && needs.gate.outputs.code == 'true'
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Type-check what the release builds for Windows
+        env:
+          RUSTFLAGS: -C target-feature=+popcnt -D warnings
+        run: cargo check --locked --target x86_64-pc-windows-msvc --features cli --lib --bins
+
   # Pull-request coverage: the sticky patch-coverage comment, diffed against the
   # baseline that coverage-baseline.yml published for the PR's merge-base. Only
   # `pull_request` runs it (#3649): a merge-group build has no PR to comment on
