@@ -34488,6 +34488,30 @@ fn translate_posix_brackets(
         } else {
             pattern
         };
+        // #7887: and with a `[` inside a class, and a brace that opens no interval, as the
+        // characters they are.
+        let flat = literal_brackets_and_braces(pattern);
+        let pattern = flat.as_ref();
+        // #7887: where the whole pattern is matched without regard to case, a class that holds a
+        // character whose folding is longer than itself has no one width, and Oniguruma refuses
+        // the look-behind it stands in (`"a" | test("(?<=[[:alpha:]])"; "i")`), unless the body
+        // can match nothing, which makes it no look-behind.
+        if folds_every_case(pattern, ignore_case) {
+            use super::onig_look_behind::Verdict;
+            let wide = super::onig_look_behind::tune_unfolded(pattern)
+                .iter()
+                .any(|t| {
+                    matches!(t.verdict, Verdict::Fixed | Verdict::Invalid)
+                        && pattern
+                            .get(t.body_at..t.close)
+                            .is_some_and(holds_fold_wide_class)
+                });
+            if wide {
+                return Err(EvalError::new(
+                    "Regex failure: invalid pattern in look-behind",
+                ));
+            }
+        }
         let tuned = super::onig_look_behind::tune(pattern, ignore_case);
         if let Some(bad) = tuned.iter().find(|t| {
             matches!(
@@ -34512,6 +34536,186 @@ fn translate_posix_brackets(
         }
     }
     Ok(translated)
+}
+
+/// Whether all of `pattern` is matched without regard to case: under the `i` flag or behind a
+/// leading `(?i)`, with no option run that names `i` after a `-` (#7887). Anything less certain is
+/// `false`.
+#[cfg(feature = "regex")]
+fn folds_every_case(pattern: &str, ignore_case: bool) -> bool {
+    (ignore_case || pattern.starts_with("(?i)"))
+        && !pattern.match_indices("(?").any(|(at, _)| {
+            pattern[at + 2..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
+                .skip_while(|&c| c != '-')
+                .any(|c| c == 'i')
+        })
+}
+
+/// Whether `body`, read with flat classes ([`literal_brackets_and_braces`]), holds a class that is
+/// not negated and has a member set with a character whose case folding is longer than itself
+/// (`ß` folds to `ss`), which makes the class of no one width where case does not count (#7887).
+/// The sets are those captured from jq 1.7.1 and 1.8.2: the POSIX brackets `alpha`, `alnum`,
+/// `lower`, `upper`, `graph`, `print` and `word`, the negated ones of `lower`, `upper`, `punct`,
+/// `digit`, `space`, `xdigit`, `cntrl`, `blank` and `ascii`, and `\D`, `\w` and `\S`. A
+/// character written out (`[ß]`) and a `\p{..}` property are not looked for, and a body with an
+/// item repeated no times (`[[:alpha:]]{0}` is not there at all) is left alone.
+#[cfg(feature = "regex")]
+fn holds_fold_wide_class(body: &str) -> bool {
+    if body.contains("{0}") || body.contains("{0,0}") {
+        return false;
+    }
+    let chars: Vec<char> = body.chars().collect();
+    // `None` outside a class, else whether the class is negated.
+    let mut class: Option<bool> = None;
+    let mut at_start = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            if class == Some(false) && matches!(chars.get(i + 1), Some('D' | 'w' | 'S')) {
+                return true;
+            }
+            at_start = false;
+            i += 2;
+            continue;
+        }
+        match class {
+            None => {
+                if c == '[' {
+                    let negated = chars.get(i + 1) == Some(&'^');
+                    class = Some(negated);
+                    at_start = true;
+                    i += 1 + usize::from(negated);
+                    continue;
+                }
+            }
+            Some(negated) => {
+                if c == '[' {
+                    if let Some((name_end, bracket_negated, name)) = posix_bracket_at(&chars, i) {
+                        let wide = if bracket_negated {
+                            matches!(
+                                name.as_str(),
+                                "lower"
+                                    | "upper"
+                                    | "punct"
+                                    | "digit"
+                                    | "space"
+                                    | "xdigit"
+                                    | "cntrl"
+                                    | "blank"
+                                    | "ascii"
+                            )
+                        } else {
+                            matches!(
+                                name.as_str(),
+                                "alpha" | "alnum" | "lower" | "upper" | "graph" | "print" | "word"
+                            )
+                        };
+                        if wide && !negated {
+                            return true;
+                        }
+                        at_start = false;
+                        i = name_end;
+                        continue;
+                    }
+                } else if c == ']' && !at_start {
+                    class = None;
+                }
+                at_start = false;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `pattern` with each `[` inside a character class written as the escaped member it is in jq's
+/// Oniguruma syntax, which has no nested classes (#7887): `[[ab]]` is the class `[[ab]` and a `]`,
+/// two characters where the `regex-syntax` parser the look-behind checks read with sees one class.
+/// A POSIX bracket (`[:alpha:]`) stays. Outside a class, a brace that opens no interval as jq
+/// reads one is escaped too (`a{0 }` is five characters, which that parser reads as `a{0}`); an
+/// interval is copied whole.
+#[cfg(feature = "regex")]
+fn literal_brackets_and_braces(pattern: &str) -> std::borrow::Cow<'_, str> {
+    // Two `[` at least, or there is none inside a class.
+    if pattern.matches('[').nth(1).is_none() && !pattern.contains(['{', '}']) {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = string_with_capacity(pattern.len() + 4);
+    let mut in_class = false;
+    // Whether the next character is the first of the class, where a `]` is a member, and whether
+    // the class's negating `^` has been read.
+    let mut at_start = false;
+    let mut caret_taken = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            // An escape with braces of its own (`\p{L}`, `\x{61}`, `\o{141}`) and a quoted run
+            // (`\Q..\E`) are copied whole.
+            let end = match chars.get(i + 1) {
+                Some('p' | 'P' | 'x' | 'o') if chars.get(i + 2) == Some(&'{') => chars[i..]
+                    .iter()
+                    .position(|&n| n == '}')
+                    .map_or(chars.len(), |close| i + close + 1),
+                Some('Q') if !in_class => chars[i + 2..]
+                    .windows(2)
+                    .position(|pair| pair == ['\\', 'E'])
+                    .map_or(chars.len(), |at| i + 2 + at + 2),
+                _ => (i + 2).min(chars.len()),
+            };
+            out.extend(&chars[i..end]);
+            at_start = false;
+            i = end;
+            continue;
+        }
+        if !in_class {
+            if chars.get(i..i + 3) == Some(&['(', '?', '#']) {
+                let end = comment_end(&chars, i);
+                out.extend(&chars[i..end]);
+                i = end;
+                continue;
+            }
+            if c == '{' && opens_interval(&chars, i) {
+                let close = chars[i..].iter().position(|&n| n == '}').unwrap_or(0);
+                out.extend(&chars[i..=i + close]);
+                i += close + 1;
+                continue;
+            }
+            if matches!(c, '{' | '}') {
+                out.push('\\');
+            }
+            if c == '[' {
+                in_class = true;
+                at_start = true;
+                caret_taken = false;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        match c {
+            '[' => {
+                if let Some((name_end, _, _)) = posix_bracket_at(&chars, i) {
+                    out.extend(&chars[i..name_end]);
+                    at_start = false;
+                    i = name_end;
+                    continue;
+                }
+                out.push('\\');
+                at_start = false;
+            }
+            ']' if !at_start => in_class = false,
+            '^' if at_start && !caret_taken => caret_taken = true,
+            _ => at_start = false,
+        }
+        out.push(c);
+        i += 1;
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// `pattern` without what the extended mode ignores: blanks and `#` comments outside a class, an
@@ -35413,6 +35617,117 @@ fn look_behind_alternatives_differ_but(pattern: &str, sized: &[usize]) -> bool {
         }
     }
 
+    /// Whether `ast` is sure to match nothing, as Oniguruma sizes it: written as nothing, an option
+    /// run (`(?i)`), an item repeated no times, or those inside a group that does not capture
+    /// (a group that captures is not sure to).
+    fn surely_empty(ast: &Ast) -> bool {
+        match ast {
+            Ast::Empty(_) | Ast::Flags(_) => true,
+            Ast::Repetition(repetition) => matches!(
+                &repetition.op.kind,
+                RepetitionKind::Range(RepetitionRange::Exactly(0) | RepetitionRange::Bounded(0, 0))
+            ),
+            Ast::Group(group) => {
+                matches!(group.kind, regex_syntax::ast::GroupKind::NonCapturing(_))
+                    && surely_empty(&group.ast)
+            }
+            Ast::Concat(concat) => concat.asts.iter().all(surely_empty),
+            _ => false,
+        }
+    }
+
+    /// Whether `ast`, a look-behind's body, is an alternation with a branch that is sure to match
+    /// nothing (#7887). Oniguruma then makes no look-behind of it, whatever the other branches
+    /// are: `(?<=(?i)a{0}|(a))`, which it reads as one option node around the alternation, and
+    /// `(?<=x|(?i)|bc)` are accepted. Not where the body holds something these rules do not
+    /// size ([`holds_unsized`]), nor a group that captures in a pattern with a
+    /// reference or a call, which may name it (`(?<=(a)|(?i))\1` is refused).
+    fn has_surely_empty_branch(ast: &Ast, pattern: &str, unread: &[usize], refers: bool) -> bool {
+        match ast {
+            Ast::Alternation(alternation) => {
+                alternation.asts.iter().any(surely_empty)
+                    && !holds_unsized(ast, pattern, unread)
+                    && !(refers && holds_capture(ast))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `ast` holds a group that captures.
+    fn holds_capture(ast: &Ast) -> bool {
+        match ast {
+            Ast::Group(group) => {
+                !matches!(group.kind, regex_syntax::ast::GroupKind::NonCapturing(_))
+                    || holds_capture(&group.ast)
+            }
+            Ast::Repetition(repetition) => holds_capture(&repetition.ast),
+            Ast::Concat(concat) => concat.asts.iter().any(holds_capture),
+            Ast::Alternation(alternation) => alternation.asts.iter().any(holds_capture),
+            _ => false,
+        }
+    }
+
+    /// Whether `ast` holds a `\z` or a `\Z` that no item repeated no times could hide: Oniguruma
+    /// allows neither in a look-behind (`(?<=a\z)`, `(?<!\Z)` and `(?<=(a|b\z))` are refused).
+    fn holds_text_end(ast: &Ast, pattern: &str) -> bool {
+        use regex_syntax::ast::AssertionKind;
+        match ast {
+            Ast::Assertion(assertion) => {
+                assertion.kind == AssertionKind::EndText
+                    || pattern
+                        .get(assertion.span.start.offset..)
+                        .is_some_and(|rest| rest.starts_with("\\Z"))
+            }
+            Ast::Group(group) => holds_text_end(&group.ast, pattern),
+            Ast::Repetition(repetition) => {
+                !written_empty(ast) && holds_text_end(&repetition.ast, pattern)
+            }
+            Ast::Concat(concat) => concat.asts.iter().any(|ast| holds_text_end(ast, pattern)),
+            Ast::Alternation(alternation) => alternation
+                .asts
+                .iter()
+                .any(|ast| holds_text_end(ast, pattern)),
+            _ => false,
+        }
+    }
+
+    /// Whether `ast` holds a `$`, `\z`, `\Z`, `\K` or `\G`, or one of the groups at `unread` (a
+    /// look-ahead, an atomic group, a comment), whose body these rules do not read. Oniguruma
+    /// allows the first three in no look-behind (`(?<=1\Z|)` is refused) and refuses some bodies
+    /// for the others (`(?<=(a|x(?:\K1))|)`). The shadow writes `\Z`, `\K` and `\G` as `\b`, so
+    /// the pattern says which an assertion is.
+    fn holds_unsized(ast: &Ast, pattern: &str, unread: &[usize]) -> bool {
+        use regex_syntax::ast::AssertionKind;
+        match ast {
+            Ast::Assertion(assertion) => {
+                matches!(
+                    assertion.kind,
+                    AssertionKind::EndLine | AssertionKind::EndText
+                ) || pattern
+                    .get(assertion.span.start.offset..)
+                    .is_some_and(|rest| {
+                        ["\\Z", "\\K", "\\G"]
+                            .iter()
+                            .any(|escape| rest.starts_with(escape))
+                    })
+            }
+            Ast::Group(group) => {
+                unread.contains(&group.span.start.offset)
+                    || holds_unsized(&group.ast, pattern, unread)
+            }
+            Ast::Repetition(repetition) => holds_unsized(&repetition.ast, pattern, unread),
+            Ast::Concat(concat) => concat
+                .asts
+                .iter()
+                .any(|ast| holds_unsized(ast, pattern, unread)),
+            Ast::Alternation(alternation) => alternation
+                .asts
+                .iter()
+                .any(|ast| holds_unsized(ast, pattern, unread)),
+            _ => false,
+        }
+    }
+
     /// Whether no alternation in `ast` has a branch that matches nothing. One that does makes the
     /// body optional, and is held to other rules (`(?<=(?:a|bc)|)` is accepted).
     fn no_empty_branch(ast: &Ast) -> bool {
@@ -35504,26 +35819,44 @@ fn look_behind_alternatives_differ_but(pattern: &str, sized: &[usize]) -> bool {
     }
 
     /// Whether `ast` holds a look-behind with such an alternation in its body.
-    fn refused(ast: &Ast, opaque: &[usize], behind: &[usize], sized: &[usize]) -> bool {
+    fn refused(
+        ast: &Ast,
+        opaque: &[usize],
+        behind: &[usize],
+        sized: &[usize],
+        pattern: &str,
+        unread: &[usize],
+        refers: bool,
+    ) -> bool {
         match ast {
             Ast::Group(group) => {
-                (behind.contains(&group.span.start.offset)
-                    && !sized.contains(&group.span.start.offset)
-                    && ((fixed_counts(&group.ast)
-                        && no_empty_branch(&group.ast)
-                        && differs(&group.ast, opaque, behind))
-                        || repeated_differs(&group.ast, opaque, behind)))
-                    || refused(&group.ast, opaque, behind, sized)
+                (behind.contains(&group.span.start.offset) && holds_text_end(&group.ast, pattern))
+                    || (behind.contains(&group.span.start.offset)
+                        && !sized.contains(&group.span.start.offset)
+                        && !has_surely_empty_branch(&group.ast, pattern, unread, refers)
+                        && ((fixed_counts(&group.ast)
+                            && no_empty_branch(&group.ast)
+                            && differs(&group.ast, opaque, behind))
+                            || repeated_differs(&group.ast, opaque, behind)))
+                    || refused(&group.ast, opaque, behind, sized, pattern, unread, refers)
             }
-            Ast::Repetition(repetition) => refused(&repetition.ast, opaque, behind, sized),
+            Ast::Repetition(repetition) => refused(
+                &repetition.ast,
+                opaque,
+                behind,
+                sized,
+                pattern,
+                unread,
+                refers,
+            ),
             Ast::Concat(concat) => concat
                 .asts
                 .iter()
-                .any(|ast| refused(ast, opaque, behind, sized)),
+                .any(|ast| refused(ast, opaque, behind, sized, pattern, unread, refers)),
             Ast::Alternation(alternation) => alternation
                 .asts
                 .iter()
-                .any(|ast| refused(ast, opaque, behind, sized)),
+                .any(|ast| refused(ast, opaque, behind, sized, pattern, unread, refers)),
             _ => false,
         }
     }
@@ -35552,7 +35885,50 @@ fn look_behind_alternatives_differ_but(pattern: &str, sized: &[usize]) -> bool {
         .copied()
         .filter(|&at| !is_behind(at))
         .collect();
-    refused(&ast, &opaque, &behind, sized)
+    // A backreference is among the opaque offsets; a call is not.
+    let refers = pattern.contains("\\g")
+        || opaque
+            .iter()
+            .any(|&at| pattern.as_bytes().get(at) == Some(&b'\\'));
+    // A look-behind inside another that such a branch makes no look-behind has nothing for the
+    // outer one to differ over (`(?<=(?<=(?-i)|ab))`): it is passed over like the opaque groups.
+    fn exempt(
+        ast: &Ast,
+        pattern: &str,
+        behind: &[usize],
+        unread: &[usize],
+        refers: bool,
+        found: &mut Vec<usize>,
+    ) {
+        match ast {
+            Ast::Group(group) => {
+                if behind.contains(&group.span.start.offset)
+                    && has_surely_empty_branch(&group.ast, pattern, unread, refers)
+                {
+                    found.push(group.span.start.offset);
+                }
+                exempt(&group.ast, pattern, behind, unread, refers, found);
+            }
+            Ast::Repetition(repetition) => {
+                exempt(&repetition.ast, pattern, behind, unread, refers, found);
+            }
+            Ast::Concat(concat) => {
+                for ast in &concat.asts {
+                    exempt(ast, pattern, behind, unread, refers, found);
+                }
+            }
+            Ast::Alternation(alternation) => {
+                for ast in &alternation.asts {
+                    exempt(ast, pattern, behind, unread, refers, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let unread = opaque.clone();
+    let mut opaque = opaque;
+    exempt(&ast, pattern, &behind, &unread, refers, &mut opaque);
+    refused(&ast, &opaque, &behind, sized, pattern, &unread, refers)
 }
 
 /// The index after the comment `(?#...)` that starts at `start`: a backslash escapes the next
@@ -39786,8 +40162,10 @@ fn build_regex_uncached<S: EvalSemantics>(
         let scanned = if extended || inline_extended(&scanned) {
             scanned
         } else {
+            // #7887: read with a `[` inside a class and a brace that opens no interval as the
+            // characters they are, or `(?<=a{0 })` is taken for one that matches nothing.
             match super::onig_look_behind::rewrite_empty(
-                &scanned,
+                &literal_brackets_and_braces(&scanned),
                 flags.is_some_and(|f| f.contains('i')),
             ) {
                 Some(written) => std::borrow::Cow::Owned(written),
@@ -165045,6 +165423,74 @@ mod tests {
             "(?<=a|bc",
         ] {
             assert!(!look_behind_alternatives_differ(pattern), "{pattern}");
+        }
+    }
+
+    /// #7887: the text the look-behind checks read has jq's classes and braces.
+    #[cfg(feature = "regex")]
+    #[test]
+    fn the_look_behind_checks_read_classes_and_braces_as_jq_does_7887() {
+        for (pattern, want) in [
+            // A `[` inside a class is a member, and the first `]` after it closes the class.
+            ("(?<=[[ab]]|ab)", "(?<=[\\[ab]]|ab)"),
+            ("(?<=[a[b]c]|x)", "(?<=[a\\[b]c]|x)"),
+            ("(?<=[]a[]|x)", "(?<=[]a\\[]|x)"),
+            ("(?<=[^[]|x)", "(?<=[^\\[]|x)"),
+            // A POSIX bracket, an escaped bracket and a comment stay.
+            ("(?<=[[:alpha:]b]|[x])", "(?<=[[:alpha:]b]|[x])"),
+            ("(?<=[\\[a]|[x])", "(?<=[\\[a]|[x])"),
+            ("(?#[)(?<=[a]|[x])", "(?#[)(?<=[a]|[x])"),
+            // A brace that opens no interval is the character; an interval is kept.
+            ("(?<=a{0 }|b{2})", "(?<=a\\{0 \\}|b{2})"),
+            ("(?<=a{,2}|b{1,2}c})", "(?<=a\\{,2\\}|b{1,2}c\\})"),
+            ("(?<=[{}]|a)", "(?<=[{}]|a)"),
+            // An escape's own braces and a quoted run stay.
+            ("(?<=\\p{L}|\\x{61}b{ 1})", "(?<=\\p{L}|\\x{61}b\\{ 1\\})"),
+            ("(?<=\\Q{[\\E|[a])", "(?<=\\Q{[\\E|[a])"),
+        ] {
+            assert_eq!(literal_brackets_and_braces(pattern), want, "{pattern}");
+        }
+        // Where case does not count for the whole pattern, and the classes that widen there.
+        assert!(folds_every_case("(?<=[[:alpha:]])", true));
+        assert!(folds_every_case("(?i)(?<=[[:alpha:]])", false));
+        assert!(!folds_every_case("(?<=[[:alpha:]])", false));
+        assert!(!folds_every_case("(?i:a)(?<=[[:alpha:]])", false));
+        assert!(!folds_every_case("(?i)(?-i)(?<=[[:alpha:]])", true));
+        assert!(!folds_every_case("(?x-i:a)", true));
+        for body in ["[[:alpha:]]", "a[b[:^digit:]]", "[\\D]", "[x\\w]", "[\\S]"] {
+            assert!(holds_fold_wide_class(body), "{body}");
+        }
+        for body in [
+            "[^[:alpha:]]",
+            "[[:^alpha:]]",
+            "[[:digit:]]",
+            "[\\d\\W\\s]",
+            "\\w[a-z]",
+            "[[:alpha:]]{0}",
+            "[a]\\D",
+        ] {
+            assert!(!holds_fold_wide_class(body), "{body}");
+        }
+        // The shape rules: an option run in a branch that is sure to match nothing.
+        for pattern in [
+            "(?<=(?i)a{0}|(a))",
+            "(?<=x|(?i)|bc)",
+            "(?<=xy|(?i:))",
+            // A look-behind inside another is judged on its own.
+            "(?<=(?<=a)b|(?i))",
+            "(?<=(?<=(?-i)|ab))",
+        ] {
+            assert!(!look_behind_alternatives_differ(pattern), "{pattern}");
+        }
+        for pattern in [
+            // Not beside a `\Z`, or a group a reference may name.
+            "(?<=1\\Z|(?i))",
+            "(?<=(a)|(?i))\\1",
+            // And `\z` is allowed in no look-behind.
+            "(?<=a\\z)",
+            "(?<!(a|b\\z))",
+        ] {
+            assert!(look_behind_alternatives_differ(pattern), "{pattern}");
         }
     }
 
