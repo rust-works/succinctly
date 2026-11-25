@@ -5724,6 +5724,9 @@ impl OwnedValue {
             if let Self::String(text) = self {
                 reindex_count::bump_string(text.len());
             }
+            if !self.is_scalar_root() {
+                reindex_count::bump_container();
+            }
         }
         ReindexedDoc::new(
             self.to_json_for_reindex::<S>()?,
@@ -5811,6 +5814,7 @@ pub(crate) mod reindex_count {
     thread_local! {
         static COUNT: Cell<usize> = const { Cell::new(0) };
         static STRING_BYTES: Cell<usize> = const { Cell::new(0) };
+        static CONTAINERS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn bump() {
@@ -5829,6 +5833,16 @@ pub(crate) mod reindex_count {
 
     pub(crate) fn string_bytes() -> usize {
         STRING_BYTES.with(Cell::get)
+    }
+
+    /// Records a [`reindexed`](super::OwnedValue::reindexed) of an array or object (#7935): a
+    /// bridged scalar costs a few bytes whatever it is, a bridged container its whole text.
+    pub(crate) fn bump_container() {
+        CONTAINERS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn containers() -> usize {
+        CONTAINERS.with(Cell::get)
     }
 }
 
