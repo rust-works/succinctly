@@ -339,7 +339,8 @@ pub(crate) fn jq_negated_literal(repr: NumberRepr, text: &str) -> Option<(Number
         return None;
     }
     let magnitude = literal_magnitude(text);
-    let zero = literal_is_zero(magnitude);
+    // #7924: zero as decNumber holds it, so `1e-1999999999` (rounded to zero) negates to zero too.
+    let zero = literal_rounds_to_zero(magnitude);
     let spelled = if zero || text.starts_with('-') {
         magnitude.to_string()
     } else {
@@ -6847,8 +6848,9 @@ pub(crate) fn numeric_repr_cmp(a: NumberRepr, b: NumberRepr) -> core::cmp::Order
 /// and `0` are equal.
 pub(crate) fn cmp_decimal_literals(a: &str, b: &str) -> core::cmp::Ordering {
     use core::cmp::Ordering;
-    let (a_negative, a_digits, a_exponent) = decompose_decimal_literal(a);
-    let (b_negative, b_digits, b_exponent) = decompose_decimal_literal(b);
+    // #7924: each side as jq's decNumber holds it, rounded at parse time, not as written.
+    let (a_negative, a_digits, a_exponent) = jq_context_decimal(a);
+    let (b_negative, b_digits, b_exponent) = jq_context_decimal(b);
     let sign = |negative: bool, digits: &[u8]| -> i8 {
         if digits.is_empty() {
             0
@@ -6865,6 +6867,20 @@ pub(crate) fn cmp_decimal_literals(a: &str, b: &str) -> core::cmp::Ordering {
     if a_sign == 0 {
         return Ordering::Equal;
     }
+    // An overflowed literal is decNumber's infinity: equal to another of its sign, past every
+    // finite one.
+    let (a_infinite, b_infinite) = (
+        a_exponent == INFINITE_EXPONENT,
+        b_exponent == INFINITE_EXPONENT,
+    );
+    if a_infinite || b_infinite {
+        let magnitude = a_infinite.cmp(&b_infinite);
+        return if a_negative {
+            magnitude.reverse()
+        } else {
+            magnitude
+        };
+    }
     // Same nonzero sign: the magnitude with its leading digit further left
     // is larger; at the same position, the digit strings (no leading or
     // trailing zeros) order lexicographically, a proper prefix being smaller.
@@ -6876,6 +6892,70 @@ pub(crate) fn cmp_decimal_literals(a: &str, b: &str) -> core::cmp::Ordering {
     } else {
         magnitude
     }
+}
+
+/// The exponent [`jq_context_decimal`] gives a literal that overflows to decNumber's infinity.
+const INFINITE_EXPONENT: i128 = i128::MAX;
+
+/// A literal as jq 1.7.1 and 1.8.2 hold it once `decNumberFromString` has parsed it in jq's
+/// context (#7924): [`decompose_decimal_literal`]'s `(negative, digits, exponent)`, rounded.
+///
+/// That context (`DEC_INIT_BASE`, `digits` raised to 147,483,648, `jv.c`'s `tsd_dec_ctx_get`) has
+/// `Emax` 999,999,999 and `Etiny` -1,147,483,646 ([`LITERAL_EMAX`], [`LITERAL_ETINY`]) and rounds
+/// half-up. A digit whose exponent is below `Etiny` is dropped, rounding on the first one dropped,
+/// so `1e-1999999999` is zero and `12e-1147483647` is `1e-1147483646`: the value the printer
+/// already shows ([`round_to_literal_etiny`]), and the one `decNumberCompare` compares. A value
+/// whose leading digit's exponent is past `Emax` is an infinity of its sign, reported as
+/// [`INFINITE_EXPONENT`]. The coefficient limit of 147,483,648 digits is not modelled.
+fn jq_context_decimal(text: &str) -> (bool, Vec<u8>, i128) {
+    let (negative, mut digits, mut exponent) = decompose_decimal_literal(text);
+    if digits.is_empty() {
+        return (negative, digits, exponent);
+    }
+    if exponent < LITERAL_ETINY {
+        let drop = LITERAL_ETINY - exponent;
+        if drop > digits.len() as i128 {
+            digits.clear();
+        } else {
+            let keep = digits.len() - drop as usize;
+            let round_up = digits[keep] >= b'5';
+            digits.truncate(keep);
+            exponent = LITERAL_ETINY;
+            if round_up {
+                // Add one at the last kept place; a carry out of the top lengthens the coefficient.
+                match digits.iter().rposition(|d| *d != b'9') {
+                    Some(i) => {
+                        digits[i] += 1;
+                        digits.truncate(i + 1);
+                        exponent += (keep - i - 1) as i128;
+                    }
+                    None => {
+                        exponent += digits.len() as i128;
+                        digits.clear();
+                        digits.push(b'1');
+                    }
+                }
+            }
+            while digits.last() == Some(&b'0') {
+                digits.pop();
+                exponent += 1;
+            }
+        }
+    }
+    if !digits.is_empty() && exponent + digits.len() as i128 - 1 > LITERAL_EMAX {
+        exponent = INFINITE_EXPONENT;
+    }
+    (negative, digits, exponent)
+}
+
+/// Whether a number literal is zero as jq's decNumber holds it (#7924): written as zero
+/// ([`literal_is_zero`]), or rounded to zero at parse time past `Etiny` (`1e-1999999999`). A
+/// spelling with no digit (a document's `Infinity`, #7469) decomposes to no digits too, and is not
+/// zero.
+pub(crate) fn literal_rounds_to_zero(magnitude: &str) -> bool {
+    literal_is_zero(magnitude)
+        || (magnitude.bytes().any(|b| b.is_ascii_digit())
+            && jq_context_decimal(magnitude).1.is_empty())
 }
 
 /// `(negative, significant digits, exponent)` with value
@@ -6986,7 +7066,20 @@ pub(crate) fn cmp_literal_texts(a: &str, b: &str) -> core::cmp::Ordering {
     // finite literal spells no letter, so the check is one byte for every other pair.
     match (literal_infinity_sign(a), literal_infinity_sign(b)) {
         (None, None) => cmp_decimal_literals(a, b),
-        (a, b) => a.unwrap_or(0).cmp(&b.unwrap_or(0)),
+        // #7924: a finite spelling past `Emax` is that same infinity (`Infinity == 1e1000000000`).
+        (a_sign, b_sign) => {
+            let overflowed = |text: &str| {
+                let (negative, _, exponent) = jq_context_decimal(text);
+                match exponent {
+                    INFINITE_EXPONENT if negative => -1,
+                    INFINITE_EXPONENT => 1,
+                    _ => 0,
+                }
+            };
+            let a_sign = a_sign.unwrap_or_else(|| overflowed(a));
+            let b_sign = b_sign.unwrap_or_else(|| overflowed(b));
+            a_sign.cmp(&b_sign)
+        }
     }
 }
 
@@ -7474,7 +7567,7 @@ mod tests {
                 parse_i64_or_f64_in::<JqSemantics>(&spelled),
                 "{text}"
             );
-            let zero = literal_is_zero(literal_magnitude(text));
+            let zero = literal_rounds_to_zero(literal_magnitude(text));
             if zero {
                 assert!(!spelled.starts_with('-'), "{text} -> {spelled}");
             } else {
@@ -8832,27 +8925,93 @@ mod tests {
             ("1e999", "1e1000", Less),
             ("1e-400", "0", Greater),
             ("-1e-400", "0", Less),
-            ("1e999999999999999999999", "2e999999999999999999999", Less),
+            // #7924: past `Emax` both are decNumber's infinity, so equal (jq 1.7.1 and 1.8.2).
+            ("1e999999999999999999999", "2e999999999999999999999", Equal),
             // Exponents too long for `i128` saturate; the fraction and
             // digit-count adjustments must not overflow around them.
             (
                 "1.5e999999999999999999999999999999999999999999999",
                 "2e999999999999999999999999999999999999999999999",
-                Less,
+                Equal,
             ),
+            // #7924: past `Etiny` both round to zero.
             (
                 "1.5e-999999999999999999999999999999999999999999999",
                 "0",
-                Greater,
+                Equal,
             ),
             (
                 "-0.25e-999999999999999999999999999999999999999999999",
                 "0",
-                Less,
+                Equal,
             ),
         ] {
             assert_eq!(cmp_decimal_literals(a, b), want, "{a} vs {b}");
             assert_eq!(cmp_decimal_literals(b, a), want.reverse(), "{b} vs {a}");
+        }
+    }
+
+    /// #7924: `cmp_decimal_literals` compares each literal as jq's decNumber holds it once parsed:
+    /// rounded half-up to `Etiny` (-1147483646) below, an infinity past `Emax` (999999999) above.
+    /// Every pair was captured from jq 1.7.1 (`/usr/bin/jq -nc '[A == B, A < B]'`), and jq 1.8.2
+    /// agrees.
+    #[test]
+    fn test_cmp_decimal_literals_rounds_as_decnumber_parses_7924() {
+        use core::cmp::Ordering::{Equal, Greater, Less};
+        for (a, b, want) in [
+            ("1e-1999999999", "0", Equal),
+            ("-1e-1999999999", "0", Equal),
+            ("1e-1147483647", "0", Equal),
+            ("4.99e-1147483647", "0", Equal),
+            ("1e-1147483646", "0", Greater),
+            ("12e-1147483647", "1e-1147483646", Equal),
+            ("15e-1147483647", "2e-1147483646", Equal),
+            ("25e-1147483647", "3e-1147483646", Equal),
+            ("5e-1147483647", "1e-1147483646", Equal),
+            ("-5e-1147483647", "-1e-1147483646", Equal),
+            ("99.5e-1147483647", "1e-1147483645", Equal),
+            ("9.95e-1147483646", "1e-1147483645", Equal),
+            ("1.5e-1147483646", "2e-1147483646", Equal),
+            ("123456789e-1147483650", "12346e-1147483646", Equal),
+            ("1234567895e-1147483655", "12346e-1147483650", Equal),
+            // Rounded down to `100E-1147483646`, whose trailing zeros fold into the exponent.
+            ("1001e-1147483647", "1e-1147483644", Equal),
+            ("1001e-1147483647", "1.01e-1147483644", Less),
+            ("1e-400", "1e-1999999999", Greater),
+            ("1e999999999", "1e1000000000", Less),
+            ("9.99e999999999", "1e1000000000", Less),
+            ("10e999999999", "1e1000000000", Equal),
+            ("1e1000000000", "2e1000000000", Equal),
+            ("1e1999999999", "1e1000000000", Equal),
+            ("-1e1000000000", "-2e1000000000", Equal),
+            ("-1e1000000000", "1e1000000000", Less),
+            ("0.1e1000000000", "1e999999999", Equal),
+        ] {
+            assert_eq!(cmp_decimal_literals(a, b), want, "{a} vs {b}");
+            assert_eq!(cmp_decimal_literals(b, a), want.reverse(), "{b} vs {a}");
+        }
+        // A document's spelled infinity (#7469) is the infinity a literal past `Emax` becomes.
+        for (a, b, want) in [
+            ("Infinity", "1e1000000000", Equal),
+            ("-Infinity", "-2e1000000000", Equal),
+            ("Infinity", "1e999999999", Greater),
+            ("-infinity", "-1e999999999", Less),
+        ] {
+            assert_eq!(cmp_literal_texts(a, b), want, "{a} vs {b}");
+            assert_eq!(cmp_literal_texts(b, a), want.reverse(), "{b} vs {a}");
+        }
+        for zero in ["1e-1999999999", "4.99e-1147483647", "0e5", "0.0"] {
+            assert!(literal_rounds_to_zero(zero), "{zero}");
+        }
+        for nonzero in [
+            "5e-1147483647",
+            "1e-1147483646",
+            "1e-400",
+            "1e1000000000",
+            "Infinity",
+            "infinity",
+        ] {
+            assert!(!literal_rounds_to_zero(nonzero), "{nonzero}");
         }
     }
 
