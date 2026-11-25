@@ -402,6 +402,9 @@ Rows from `printf '<text>' | jq -c .` (a NUL is `\0`), jq 1.7.1 against `succinc
 
 The last row is the agreement: with a newline in the chunk jq does not truncate either.
 `tests/jq_cli/i5654_nul.rs` pins both sides, and `tests/jq_cli/i7437.rs` the number tokens with a newline in their chunk.
+Invalid UTF-8 before such a NUL reaches it as ASCII does since jq's reads are counted in the bytes jq read ([#7934](https://github.com/rust-works/succinctly/issues/7934)): `[1,2]` and a newline, spaces, `xa`, a byte such as `0xC3`, `]` and a NUL that ends the file at line offset 8,190 is the fault at `x` and then `Invalid numeric literal at EOF`, exit 5, where jq 1.7.1 and 1.8.2 drop the NUL, which is the whole of the read after the fault's, and exit 0.
+Before #7934 that read was counted two bytes early over the U+FFFD text, so the run resumed inside the replacement and never met the NUL; the same bytes with `z` for `0xC3` gave the error then as well.
+`tests/jq_cli/i7934_nul.rs` pins the shapes and that each answers as its ASCII twin.
 
 **A number with a NUL in a chunk with no newline is read where both jq releases read it ([#7921](https://github.com/rust-works/succinctly/issues/7921)).**
 A line longer than 4,095 bytes reaches jq's parser a chunk at a time, and a chunk in the middle of it holds no newline, so jq 1.7.1 hands over such a chunk only up to its first NUL: the number before the NUL stays open, and the bytes from the NUL to the chunk's end are never read.
