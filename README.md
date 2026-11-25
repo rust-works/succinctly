@@ -187,12 +187,12 @@ Comparison of `succinctly jq .` vs `jq .` for formatting/printing JSON files.
 
 | Pattern           | jq-1.7.1 | succinctly | Speedup | jq-1.7.1 Mem | succ Mem | Mem Ratio |
 |-------------------|----------|------------|---------|--------------|----------|-----------|
-| **nested**        |  342.3ms |     17.9ms |  19.1x† |        22 MB |    20 MB |     0.89x |
-| **strings**       |  310.6ms |     17.1ms |  18.1x† |        14 MB |    19 MB |     1.29x |
-| **users**         |  346.6ms |     32.4ms |  10.7x† |        68 MB |    16 MB |     0.24x |
-| **wide**          |  655.9ms |     70.5ms |   9.3x† |       143 MB |    34 MB |     0.24x |
-| **numbers**       |  341.4ms |     50.4ms |   6.8x† |        87 MB |    19 MB |     0.22x |
-| **comprehensive** |  610.1ms |    136.6ms |   4.5x† |       149 MB |    38 MB |     0.25x |
+| **nested**        |  342.2ms |     16.9ms |  20.2x† |        22 MB |    18 MB |     0.81x |
+| **strings**       |  311.0ms |     16.7ms |  18.7x† |        14 MB |    17 MB |     1.17x |
+| **users**         |  346.7ms |     31.7ms |  10.9x† |        68 MB |    15 MB |     0.21x |
+| **wide**          |  644.2ms |     67.3ms |   9.6x† |       143 MB |    33 MB |     0.23x |
+| **numbers**       |  337.2ms |     48.5ms |   6.9x† |        87 MB |    17 MB |     0.20x |
+| **comprehensive** |  609.3ms |    136.3ms |   4.5x† |       149 MB |    36 MB |     0.24x |
 
 #### AMD Ryzen 9 7950X 16-Core Processor (10 MB files, jq-1.7.1)
 

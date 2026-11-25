@@ -29,12 +29,12 @@ regenerated and a claim stops holding: change the claim, or the advice, in the s
 
 | Your workload                                                  | Use                                          | Why                                                                                                      |
 |----------------------------------------------------------------|----------------------------------------------|----------------------------------------------------------------------------------------------------------|
-| One document of 1 MB or more: filter, reformat, pretty-print   | `succinctly jq`                              | 2x to 15x faster, in a fraction of jq's memory                                                           |
-| `first`, `limit`, `.[0]` of a large document                   | `succinctly jq`                              | stops reading early: 5x to 7x at 100 MB                                                                  |
-| Regex or case mapping over large strings                       | `succinctly jq`                              | up to 52x                                                                                                |
-| Many short invocations, or documents under about 100 KB        | jq on macOS, either on Linux                 | jq starts faster on macOS (0.70x); 0.92x to 1.23x on Linux; little gain on small documents               |
-| A stream of many values (NDJSON, `--seq`)                      | `succinctly jq`                              | 3x to 7x for `.`, 1.1x to 1.8x for most filters, in 10 to 15 MiB at any length (jq: 3 MiB)               |
-| `input` taken once and the rest of the stream abandoned        | jq on Arm, either on the 7950X               | `succinctly jq` is slower on Arm (0.68x to 0.84x), 1.17x on the 7950X                                    |
+| One document of 1 MB or more: filter, reformat, pretty-print   | `succinctly jq`                              | 2x to 16x faster, in a fraction of jq's memory                                                           |
+| `first`, `limit`, `.[0]` of a large document                   | `succinctly jq`                              | stops reading early: 7x to 10x at 100 MB                                                                 |
+| Regex or case mapping over large strings                       | `succinctly jq`                              | up to 55x                                                                                                |
+| Many short invocations, or documents under about 100 KB        | jq on macOS, either on Linux                 | jq starts faster on macOS (0.70x); 1.05x to 1.23x on Linux; little gain on small documents               |
+| A stream of many values (NDJSON, `--seq`)                      | `succinctly jq`                              | 3x to 7x for `.`, 1.4x to 2.3x for most filters, in 4 to 9 MiB at any length (jq: 3 MiB)                 |
+| `input` taken once and the rest of the stream abandoned        | jq on Arm, either on the 7950X               | `succinctly jq` is slower on Arm (0.68x to 0.99x), 1.17x on the 7950X                                    |
 | Strict RFC 8259 input                                          | either, with `--validate` on `succinctly jq` | neither is strict by default                                                                             |
 | Features new in jq 1.8                                         | jq 1.8                                       | `succinctly jq` follows 1.7.1                                                                            |
 | Binary size                                                    | jq                                           | 23x to 27x smaller (stripped)                                                                            |
@@ -56,12 +56,12 @@ most rows and not all of them (the slurp, raw-file and `tojson` round-trip rows 
 <!-- compare:jq-categories -->
 | Group                         | Queries                                                                                            | [ARM Neoverse-V2](../compare/jq-linux-aarch64.md) | [AMD Ryzen 9 7950X 16-Core Processor](../compare/jq-linux-x86_64.md) | [Apple M4 Pro](../compare/jq-macos-aarch64.md) |
 |-------------------------------|----------------------------------------------------------------------------------------------------|---------------------------------------------------|----------------------------------------------------------------------|------------------------------------------------|
-| Pass-through and reformatting | `identity`, `identity_compact`                                                                     |                                             5.74x |                                                                4.76x |                                          5.17x |
-| Field access and navigation   | `users_field`, `users_length`, `users_names`, `users_to_entries`, `wide_keys`, `users_three_files` |                                             4.43x |                                                                5.36x |                                          3.76x |
-| Early exit                    | `users_first_early_exit`, `users_limit_early_exit`                                                 |                                             5.98x |                                                                6.86x |                                          4.40x |
-| Transforms                    | maps, sorts, groups, reduce, regex, paths, walk, numbers, strings, wide and nested objects         |                                             2.50x |                                                                3.40x |                                          2.79x |
-| Streams (NDJSON, `--seq`)     | `ndjson_*`, `seq_*`                                                                                |                                             1.54x |                                                                2.01x |                                          2.18x |
-| Startup-bound                 | `startup`, `args_many`, `corpus_*`                                                                 |                                             1.14x |                                                                1.53x |                                          0.99x |
+| Pass-through and reformatting | `identity`, `identity_compact`                                                                     |                                             5.97x |                                                                4.76x |                                          5.17x |
+| Field access and navigation   | `users_field`, `users_length`, `users_names`, `users_to_entries`, `wide_keys`, `users_three_files` |                                             4.60x |                                                                5.36x |                                          3.76x |
+| Early exit                    | `users_first_early_exit`, `users_limit_early_exit`                                                 |                                             6.22x |                                                                6.86x |                                          4.40x |
+| Transforms                    | maps, sorts, groups, reduce, regex, paths, walk, numbers, strings, wide and nested objects         |                                             3.03x |                                                                3.40x |                                          2.79x |
+| Streams (NDJSON, `--seq`)     | `ndjson_*`, `seq_*`                                                                                |                                             1.86x |                                                                2.01x |                                          2.18x |
+| Startup-bound                 | `startup`, `args_many`, `corpus_*`                                                                 |                                             1.32x |                                                                1.53x |                                          0.99x |
 <!-- /compare:jq-categories -->
 
 The all-rows geomean of [`docs/compare/jq.md`](../compare/jq.md) averages all of these rows, the 50 `identity` rows
@@ -74,21 +74,21 @@ among them. It is a fair summary of the benchmark and a poor prediction of an ar
 <!-- claim: pass-through-large -->
 <!-- claim: navigation-large -->
 
-`identity_compact` (`-c .`) on the `users` document runs 8.5x faster at 100 MB on the 7950X and 14.7x on the M4 Pro;
-pretty-printed `.` runs 2.5x and 4.5x. A field read (`users_field`) is 6.5x and 5.7x at 100 MB. The lead grows with the
-input, from about 2x to 3x at 1 MB. Rows: `identity`, `identity_compact`, `users_field`, `users_length` in section D of
+`identity_compact` (`-c .`) on the `users` document runs 11.0x faster at 100 MB on the 7950X and 15.9x on the M4 Pro;
+pretty-printed `.` runs 8.0x and 12.6x. A field read (`users_field`) is 8.7x and 5.9x at 100 MB. The lead grows with the
+input, from about 2x to 6x at 1 MB. Rows: `identity`, `identity_compact`, `users_field`, `users_length` in section D of
 each report.
 
 <!-- claim: memory-single-document -->
 
-A single large document also needs far less memory: `users_field` at 100 MB peaks at 0.16x of jq's resident set on the
-7950X and 0.15x on the M4 Pro (96 MB against 614 MB on the 7950X). Rows: `users_field`, section E.
+A single large document also needs far less memory: `users_field` at 100 MB peaks at 0.15x of jq's resident set on the
+7950X and on the M4 Pro (88 MiB against 600 MiB on the 7950X). Rows: `users_field`, section E.
 
 ### Only the start of the document is needed
 
 <!-- claim: early-exit-large -->
 
-`first(...)` and `limit(n; ...)` over a 100 MB document are 6.0x and 7.3x faster on the 7950X, and 6.7x and 6.8x on the
+`first(...)` and `limit(n; ...)` over a 100 MB document are 8.5x and 10.2x faster on the 7950X, and 7.1x each on the
 M4 Pro. Rows: `users_first_early_exit`, `users_limit_early_exit`.
 
 ### The work is a regex or a case mapping over long strings
@@ -96,7 +96,7 @@ M4 Pro. Rows: `users_first_early_exit`, `users_limit_early_exit`.
 <!-- claim: strings-upcase -->
 <!-- claim: regex-gsub-large -->
 
-`strings_upcase` (`ascii_upcase`) is 37x to 47x faster on the 7950X and 32x to 52x on the M4 Pro across 1 MB to 100 MB.
+`strings_upcase` (`ascii_upcase`) is 45x to 55x faster on the 7950X and 33x to 50x on the M4 Pro across 1 MB to 100 MB.
 Regex over large strings is where jq can fail outright: `regex-gsub-large` times out on jq and completes on
 `succinctly jq` (the robustness section of each report).
 
@@ -106,8 +106,8 @@ Regex over large strings is where jq can fail outright: `regex-gsub-large` times
 
 <!-- claim: startup -->
 
-The `startup` row (`jq -n 1`) is 0.70x on the M4 Pro: jq starts faster on macOS. On Linux jq is at most slightly faster
-to start (0.92x on the Neoverse-V2), and on the 7950X `succinctly jq` now starts faster (1.23x). The `corpus_*` rows, real
+The `startup` row (`jq -n 1`) is 0.70x on the M4 Pro: jq starts faster on macOS. On Linux jq is no faster
+to start (1.05x on the Neoverse-V2), and on the 7950X `succinctly jq` now starts faster (1.23x). The `corpus_*` rows, real
 documents of a few KB to 100 KB, run from 0.70x to 4.3x on the M4 Pro (`corpus_tabular_group` is 0.86x; only the
 pretty-printed ones and `corpus_geojson_points` favour `succinctly jq`) and from 1.16x to 4.2x on the 7950X
 (`corpus_tabular_group` is 1.28x). A shell loop on a Mac that starts the tool a thousand times pays that difference a
@@ -119,27 +119,27 @@ thousand times.
 
 On a stream of many small values jq holds one value at a time, about 3 MiB of resident set however long the stream is.
 `succinctly jq` reads a stream a window at a time ([#6920](https://github.com/rust-works/succinctly/issues/6920) and its
-follow-ups) and holds 10 to 15 MiB, which does not grow with the stream either. That is true of a plain filter, of
-`input`/`inputs`, of `-R` and of `--seq`, read from a file or from a pipe. At 100 MB, `ndjson_inputs_reduce` peaks at 15.4 MiB on the 7950X and 13.9 MiB on the M4 Pro,
-`ndjson_raw_lines` (`-R`) at 10.1 and 9.7 MiB and `seq_identity` (`--seq`) at 10.1 and 10.3 MiB, against jq's 3 MiB.
-At 1 GB, `ndjson_inputs_reduce` still peaks at 15 MiB on both machines, and over a pipe at 100 MB (`ndjson_inputs_reduce_stdin`) at 15 MiB.
-That is 3x to 5x jq's resident set, where the reports of 2026-11-12 showed 37x to 48x for the same rows. Rows:
+follow-ups) and holds 4 to 9 MiB, which does not grow with the stream either. That is true of a plain filter, of
+`input`/`inputs`, of `-R` and of `--seq`, read from a file or from a pipe. At 100 MB, `ndjson_inputs_reduce` peaks at 5.8 MiB on the 7950X and 8.8 MiB on the M4 Pro,
+`ndjson_raw_lines` (`-R`) at 5.1 and 7.9 MiB and `seq_identity` (`--seq`) at 4.9 and 8.2 MiB, against jq's 3 MiB.
+At 1 GB, `ndjson_inputs_reduce` still peaks at 5.8 and 9.0 MiB, and over a pipe at 100 MB (`ndjson_inputs_reduce_stdin`) at 6.1 and 9.0 MiB.
+That is 1.7x to 3.4x jq's resident set, where the reports of 2026-11-12 showed 37x to 48x for the same rows. Rows:
 `ndjson_*`, `seq_identity`, sections E, D/E (piped stdin) and D/E (1 GB tier).
 
 Some inputs are still read whole: one under 4 MiB, standard input named on the command line as `-`, a terminal, and a
 file that is one document, not a stream of them. [jq limitations](../compliance/jq/limitations.md) lists each case.
-`succinctly jq` is the faster of the two on every stream row named here but one (1.1x to 4.6x on the 7950X and 1.2x
-to 7.1x on the M4 Pro, at 100 MB), so jq is the better choice only where 10 to 15 MiB is more than the machine can spare.
+`succinctly jq` is the faster of the two on every stream row named here but one (1.4x to 4.6x on the 7950X and 1.7x
+to 7.3x on the M4 Pro, at 100 MB), so jq is the better choice only where 4 to 9 MiB is more than the machine can spare.
 
 <!-- claim: stream-abandon -->
 
 One stream shape is slower on the Arm machines: taking the first `input` and abandoning the rest (`ndjson_inputs_first`
-is 0.68x on the M4 Pro and 0.84x on the Neoverse-V2 at 100 MB, and 0.68x and 0.83x at 1 GB). On the 7950X it is no
+is 0.68x on the M4 Pro and 0.99x on the Neoverse-V2 at 100 MB, and 0.68x and 0.95x at 1 GB). On the 7950X it is no
 longer slower (1.17x at 100 MB, 1.18x at 1 GB). Discarding a `--seq` input that holds no RS byte, which the reports of
 2026-11-12 showed slower too, is now faster (`users_seq_output` is 6.5x on the 7950X and 5.1x on the M4 Pro at 10 MB).
 That row writes no record, whatever its name says: `--seq` skips everything before the first RS, in both tools
 ([#7275](https://github.com/rust-works/succinctly/issues/7275)). `users_seq_records` is the same program over the
-document behind an RS, and no committed report has measured it yet.
+document behind an RS, and all three committed reports measure it: 2.2x on the 7950X and 1.9x on the M4 Pro at 10 MB.
 
 ### The program needs a jq 1.8 feature
 
@@ -149,8 +149,8 @@ document behind an RS, and no committed report has measured it yet.
 them `add/1`, `trimstr` and `trim`; 20 of 20 `uri.test` and 9 of 10 `base64.test` agree. Against 1.7.1 itself it
 agrees on 446 of 447 `jq.test` programs: the other, `fromjson | isnan` on a NaN with a payload, is where succinctly
 follows jq 1.8's fix for CVE-2024-53427 and raises `Invalid numeric literal`
-([#7522](https://github.com/rust-works/succinctly/issues/7522)). The Neoverse-V2 report predates that change and
-records 475 of 550 and 447 of 447. Rows: the differential sections of each report.
+([#7522](https://github.com/rust-works/succinctly/issues/7522)).
+Rows: the differential sections of each report.
 
 ### Binary size matters
 
@@ -159,7 +159,7 @@ records 475 of 550 and 447 of 447. Rows: the differential sections of each repor
 Stripped as `release.yml` strips the archive, the release build (`--features cli`) at `73f049b2c` is 24.8 MB on x86_64
 Linux and 19.9 MB on macOS, against jq 1.7.1's 0.91 MB and 0.85 MB: about 27x and 23.5x (measured in
 [#7383](https://github.com/rust-works/succinctly/pull/7383); aarch64 Linux was not measured stripped). Section H of the
-committed reports sizes the files as built, 30.4 MB, 26.7 MB and 24.9 MB against 2.7 MB, 2.7 MB and 1.1 MB, which
+committed reports sizes the files as built, 25.1 MB, 22.3 MB and 20.7 MB against 2.7 MB, 2.7 MB and 1.1 MB, which
 understates the gap on Linux by more than half: the pinned jq builds keep their debug info, two thirds of jq's file there.
 A report from a run after #7383 also sizes every binary stripped, the harness's own build (which adds `bench-runner`) for
 `succinctly jq`, and the test reads that size where a report has it.
@@ -175,10 +175,10 @@ exact RFC 8259 behaviour matters. Section C of each report.
 ## What this page does not cover
 
 - Inputs larger than 1 GB: the 1 GB tier (`--huge`, section D/E) times six rows, and nothing larger is measured.
-- Piped stdin in depth: section D/E times eight rows over a pipe against the same file named as an argument. A stream
-  on a pipe is read a window at a time, as from a file (`ndjson_field_stdin` peaks at 14 MiB on the 7950X and 16 MiB
+- Piped stdin in depth: section D/E times 6 queries, 24 rows, over a pipe against the same file named as an argument. A stream
+  on a pipe is read a window at a time, as from a file (`ndjson_field_stdin` peaks at 5.5 MiB on the 7950X and 8.6 MiB
   on the M4 Pro at 100 MB). One document on a pipe is read whole before evaluation starts
-  (`users_field_stdin`: 94 and 93 MiB, against jq's 599 and 618 MiB).
+  (`users_field_stdin`: 88 and 92 MiB, against jq's 599 and 618 MiB).
 - Machines other than the three named. A larger or smaller cache, a different allocator, or slower storage changes the
   memory-bound rows in particular.
 
