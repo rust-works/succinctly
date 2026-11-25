@@ -14201,9 +14201,9 @@ pub(crate) fn eval_each_owned_front_doors<S: EvalSemantics>(
         });
     }
     // #7132: a comma of such stages, and `first`/`last`/`nth`/`limit`/`isempty` of `.[]`, answer
-    // zero or several values off the tree.
-    if let Some(values) = eval_owned_many_doors::<S>(expr, input) {
-        return Some(owned_values_flow(values, sink));
+    // zero or several values off the tree; a comma's go to the sink as they are read (#7935).
+    if let Some(flow) = eval_owned_many_doors_flow::<S>(expr, input, sink) {
+        return Some(flow);
     }
     // #5675: an expression that never reads `.` (`$n * 2` once `$n` is a literal, `1 + 2`,
     // `[1, 2]`) is one value whatever the input is, so the input is not written out and indexed to
@@ -98297,14 +98297,17 @@ fn owned_contains_verdict<S: EvalSemantics>(
 /// witnesses while it is live: that read is the evaluator's. Every other value prints, compares and
 /// computes as the bridge's copy of it does.
 fn owned_door_answer_may_leave(answer: OwnedValue) -> Option<OwnedValue> {
+    owned_door_answer_leaves(&answer).then_some(answer)
+}
+
+/// [`owned_door_answer_may_leave`]'s rule, read without taking the value: a comma checks every
+/// child `.[]` yields before it emits the first (#7935).
+#[inline]
+fn owned_door_answer_leaves(answer: &OwnedValue) -> bool {
     match answer {
-        OwnedValue::Int(n) if n.unsigned_abs() > 1 << 53 => None,
-        OwnedValue::Array(_) | OwnedValue::Object(_)
-            if super::eval_generic::embed_table_active() =>
-        {
-            None
-        }
-        answer => Some(answer),
+        OwnedValue::Int(n) => n.unsigned_abs() <= 1 << 53,
+        OwnedValue::Array(_) | OwnedValue::Object(_) => !super::eval_generic::embed_table_active(),
+        _ => true,
     }
 }
 
@@ -98373,11 +98376,15 @@ fn eval_owned_many_doors_answer<S: EvalSemantics>(
         Expr::Comma(branches) => {
             let mut out = Vec::new();
             for branch in branches {
-                match eval_owned_many_doors::<S>(branch, input) {
-                    Some(values) => out.extend(values),
-                    // A stream or comma branch that declined is declined by the other doors too.
-                    None if owned_many_door_shape(branch).is_some() => return None,
-                    None => out.push(eval_owned_comma_branch::<S>(branch, input)?),
+                match owned_comma_part::<S>(branch, input)? {
+                    OwnedCommaPart::One(value) => out.push(value),
+                    OwnedCommaPart::Values(values) => out.extend(values),
+                    OwnedCommaPart::Items(items) => {
+                        items.emit(|value| {
+                            out.push(value);
+                            Demand::Continue
+                        });
+                    }
                 }
             }
             Some(out)
@@ -98437,6 +98444,90 @@ fn owned_loc_value(line: usize, file: Option<&str>) -> OwnedValue {
     );
     obj.insert("line".into(), OwnedValue::Int(line as i64));
     OwnedValue::Object(obj.into())
+}
+
+/// [`eval_owned_many_doors`] for a caller with a sink (#7935): a comma's answers are handed on as
+/// they are read, not collected first. `.[], .[]` over a level's array collected twice its length
+/// before the sink saw the first, and a recursion that yields it at every level held that at every
+/// level. Every branch is still answered before the first value leaves, so a branch that declines
+/// declines the comma with nothing emitted, as [`eval_owned_many_doors`] does; only the children of
+/// a `.[]` branch wait, already checked, to be read as they are emitted.
+#[inline]
+pub(crate) fn eval_owned_many_doors_flow<S: EvalSemantics>(
+    expr: &Expr,
+    input: &OwnedValue,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    match owned_many_door_shape(expr) {
+        Some(shape) if S::TAG == EvalTag::Jq => {
+            eval_owned_many_doors_flow_answer::<S>(shape, input, sink)
+        }
+        _ => None,
+    }
+}
+
+/// [`eval_owned_many_doors_flow`]'s body, for a shape it has already tested.
+#[inline(never)]
+fn eval_owned_many_doors_flow_answer<S: EvalSemantics>(
+    shape: &Expr,
+    input: &OwnedValue,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Option<Flow> {
+    let Expr::Comma(branches) = shape else {
+        return Some(owned_values_flow(
+            eval_owned_many_doors_answer::<S>(shape, input)?,
+            sink,
+        ));
+    };
+    let parts = branches
+        .iter()
+        .map(|branch| owned_comma_part::<S>(branch, input))
+        .collect::<Option<Vec<_>>>()?;
+    for part in parts {
+        let demand = match part {
+            OwnedCommaPart::One(value) => sink(value),
+            OwnedCommaPart::Values(values) => match owned_values_flow(values, sink) {
+                Flow::Exhausted => Demand::Continue,
+                _ => Demand::Stop,
+            },
+            OwnedCommaPart::Items(items) => items.emit(&mut *sink),
+        };
+        if demand == Demand::Stop {
+            return Some(Flow::Stopped { pending: None });
+        }
+    }
+    Some(Flow::Exhausted)
+}
+
+/// One branch of a comma the doors answer, or `None` if it declines, which declines the comma.
+fn owned_comma_part<'v, S: EvalSemantics>(
+    branch: &Expr,
+    input: &'v OwnedValue,
+) -> Option<OwnedCommaPart<'v>> {
+    if let Some(values) = eval_owned_many_doors::<S>(branch, input) {
+        return Some(OwnedCommaPart::Values(values));
+    }
+    // A stream or comma branch that declined is declined by the other doors too.
+    if owned_many_door_shape(branch).is_some() {
+        return None;
+    }
+    // #7935: `.[]` and `.[]?` as a branch (`.[], .`) yield the container's own children, each still
+    // sharing its storage. Without this the whole comma was written out and indexed, and a
+    // recursion that collects `.[], .` at every level wrote out a value whose text doubles per
+    // level. Every child is checked here, so the comma declines before it emits any.
+    match owned_stream_items(branch, input) {
+        Some(items) if items.all_leave() => Some(OwnedCommaPart::Items(items)),
+        Some(_) => None,
+        None => eval_owned_comma_branch::<S>(branch, input).map(OwnedCommaPart::One),
+    }
+}
+
+/// A branch [`owned_comma_part`] answered: one value, a stream door's values, or the children of
+/// `.[]`, each of which may leave and is cloned only when it is emitted.
+enum OwnedCommaPart<'v> {
+    One(OwnedValue),
+    Values(Vec<OwnedValue>),
+    Items(OwnedStream<'v>),
 }
 
 /// One branch of a comma [`eval_owned_many_doors`] answers: a stage a value door answers, or one
@@ -98511,6 +98602,28 @@ impl<'v> OwnedStream<'v> {
 
     fn take(&self, n: usize) -> impl Iterator<Item = &'v OwnedValue> + '_ {
         (0..n.min(self.len())).filter_map(move |i| self.get(i))
+    }
+
+    /// Whether every child may leave as a door's answer ([`owned_door_answer_leaves`]).
+    fn all_leave(&self) -> bool {
+        match self {
+            Self::Array(items) => items.iter().all(owned_door_answer_leaves),
+            Self::Object(map) => map.values().all(owned_door_answer_leaves),
+        }
+    }
+
+    /// Hands each child, in order, to `sink` until it asks to stop, and says whether it did.
+    fn emit(&self, mut sink: impl FnMut(OwnedValue) -> Demand) -> Demand {
+        let mut each = |item: &OwnedValue| sink(item.clone()) == Demand::Continue;
+        let finished = match self {
+            Self::Array(items) => items.iter().all(&mut each),
+            Self::Object(map) => map.values().all(&mut each),
+        };
+        if finished {
+            Demand::Continue
+        } else {
+            Demand::Stop
+        }
     }
 }
 
@@ -126913,6 +127026,66 @@ mod tests {
         );
     }
 
+    /// #7935: a comma with a `.[]` branch (`.[], .`) over an owned container is answered by
+    /// [`eval_owned_many_doors`] from the tree, so a recursion that collects `.[], .` at every level
+    /// shares each level's array as jq does. Through the bridge it wrote each level's array out as
+    /// text, and that text doubles per level (`first(50 | f)` reached 2.6 GB in 3 s; jq 2.6 MB at
+    /// once). `reindex_count` counts every serialize-and-index of an `OwnedValue`. Expected answers
+    /// are jq 1.7.1's (`/usr/bin/jq -nc`).
+    #[test]
+    fn comma_of_iterate_over_an_owned_array_shares_it_7935() {
+        use crate::jq::value::reindex_count;
+        fn run(filter: &str) -> (String, usize) {
+            let expr = parse(filter).expect("filter parses");
+            let doc = alloc::rc::Rc::new(
+                OwnedValue::Null
+                    .reindexed_without_provenance::<JqSemantics>()
+                    .expect("shallow"),
+            );
+            let before = reindex_count::containers();
+            let answer = eval::<Vec<u64>, JqSemantics>(&expr, doc.root())
+                .collect_owned::<JqSemantics>()
+                .iter()
+                .map(OwnedValue::to_json)
+                .collect::<Vec<_>>()
+                .join(" ");
+            (answer, reindex_count::containers() - before)
+        }
+        const F: &str = "def f: if . > 0 then [. - 1 | f] | .[], . else . end;";
+        for (filter, expected) in [
+            (format!("{F} first(14 | f)"), "0"),
+            (format!("{F} [14 | f] | length"), "15"),
+            (
+                format!("{F} [4 | f]"),
+                "[0,[0],[0,[0]],[0,[0],[0,[0]]],[0,[0],[0,[0]],[0,[0],[0,[0]]]]]",
+            ),
+            (
+                "def g: if . > 0 then [. - 1 | g] | ., .[] else . end; [4 | g]".to_string(),
+                "[[[[[0],0],[0],0],[[0],0],[0],0],[[[0],0],[0],0],[[0],0],[0],0]",
+            ),
+            (
+                "def g: if . > 0 then [. - 1 | g] | .[], 1, . else . end; [3 | g]".to_string(),
+                "[0,1,[0],1,[0,1,[0]],1,[0,1,[0],1,[0,1,[0]]]]",
+            ),
+        ] {
+            let (answer, reindexes) = run(&filter);
+            assert_eq!(answer, expected, "{filter}");
+            assert_eq!(
+                reindexes, 0,
+                "{filter}: {reindexes} containers written out and indexed"
+            );
+        }
+        // `.[]` of a branch the doors cannot answer still bridges the container, so the counter
+        // is not one that reads zero for everything.
+        let (answer, reindexes) =
+            run("[range(3) | [.] | (.[] | tostring | ltrimstr(\"x\")), .] | length");
+        assert_eq!(answer, "6");
+        assert!(
+            reindexes >= 3,
+            "a comma no door answers should bridge: {reindexes}"
+        );
+    }
+
     /// #7563, #7452: a fold step that writes an array slot by a negative index (`.[-$k]`, `.[-1]`)
     /// or by one that pads (`.[$k][5]` into the new row, `.[$k * 2]`) is answered in place. Both
     /// declined, and the evaluator's route re-indexed and rebuilt the whole accumulator every step:
@@ -138978,6 +139151,13 @@ mod tests {
             "isempty(.[]?)",
             "first(.[]), last(.[])",
             "limit(2; .[]), length",
+            // #7935: a `.[]` branch yields the container's children.
+            "first, .[]",
+            ".[], .",
+            "., .[]",
+            ".[]?, .",
+            ".[], .[]",
+            "length, .[]?, 1",
         ];
         let mut answered = 0;
         for value in &value_door_matrix_7132() {
@@ -139009,7 +139189,7 @@ mod tests {
             "limit(1.5; .[])",
             "limit(null; .[])",
             "first(.[] | .)",
-            "first, .[]",
+            "first, (.[] | .)",
             "first, error(\"x\")",
             "first",
         ] {
@@ -139034,6 +139214,94 @@ mod tests {
             ),
             Some(vec![])
         );
+    }
+
+    /// #7935: [`eval_owned_many_doors_flow`] hands a sink the values [`eval_owned_many_doors`]
+    /// collects, in order, and declines where it does, before the sink sees any value. A sink that
+    /// stops after `k` values has seen exactly those `k`, and the flow says it stopped.
+    #[test]
+    fn eval_owned_many_doors_flow_streams_what_the_collect_answers_7935() {
+        const SOURCES: &[&str] = &[
+            ".[], .",
+            "., .[]",
+            ".[]?, .",
+            ".[], .[]",
+            "length, .[]?, 1",
+            "first, .[]",
+            "(.[], .), .[]",
+            "limit(2; .[]), .[]?",
+            "first, last",
+            "., length",
+            "first(.[])",
+            "limit(2; .[])",
+            "first, (.[] | .)",
+        ];
+        fn flow(expr: &Expr, value: &OwnedValue, stop_after: usize) -> Option<(Vec<String>, Flow)> {
+            let mut out = Vec::new();
+            let flow = eval_owned_many_doors_flow::<JqSemantics>(expr, value, &mut |v| {
+                out.push(v.to_json());
+                if out.len() == stop_after {
+                    Demand::Stop
+                } else {
+                    Demand::Continue
+                }
+            })?;
+            Some((out, flow))
+        }
+        let mut answered = 0;
+        let mut stopped = 0;
+        for value in &value_door_matrix_7132() {
+            for src in SOURCES {
+                let expr = parse(src).unwrap();
+                let collected = eval_owned_many_doors::<JqSemantics>(&expr, value)
+                    .map(|values| values.iter().map(OwnedValue::to_json).collect::<Vec<_>>());
+                let Some(collected) = collected else {
+                    assert!(
+                        flow(&expr, value, usize::MAX).is_none(),
+                        "{src:?} on {value:?}"
+                    );
+                    continue;
+                };
+                answered += 1;
+                let (all, end) = flow(&expr, value, usize::MAX).expect("the flow answers");
+                assert_eq!(all, collected, "{src:?} on {value:?}");
+                assert!(matches!(end, Flow::Exhausted), "{src:?} on {value:?}");
+                for k in 1..collected.len() {
+                    let (some, end) = flow(&expr, value, k).expect("the flow answers");
+                    assert_eq!(some, collected[..k], "{src:?} on {value:?}, stop after {k}");
+                    assert!(matches!(end, Flow::Stopped { pending: None }), "{src:?}");
+                    stopped += 1;
+                }
+                assert!(
+                    eval_owned_many_doors_flow::<YqSemantics>(&expr, value, &mut |_| {
+                        Demand::Continue
+                    })
+                    .is_none(),
+                    "yq mode: {src:?}"
+                );
+            }
+        }
+        assert!(answered > 80, "the matrix must reach the doors: {answered}");
+        assert!(stopped > 80, "the sink must stop part-way: {stopped}");
+        // A child that may not leave declines the whole comma before any value is emitted: an `Int`
+        // a double cannot hold, behind a branch that answers first.
+        let array =
+            OwnedValue::array_from(vec![OwnedValue::Int(1), OwnedValue::Int((1 << 53) + 1)]);
+        for src in ["., .[]", "length, .[]", ".[], ."] {
+            let expr = parse(src).unwrap();
+            assert_eq!(
+                eval_owned_many_doors::<JqSemantics>(&expr, &array),
+                None,
+                "{src}"
+            );
+            let mut seen = 0;
+            let flow = eval_owned_many_doors_flow::<JqSemantics>(&expr, &array, &mut |_| {
+                seen += 1;
+                Demand::Continue
+            });
+            assert!(flow.is_none(), "{src}");
+            assert_eq!(seen, 0, "{src}: a value left before the decline");
+        }
     }
 
     /// #7132: [`eval_each_owned_front_doors`] spells out the first seven value doors and then asks
