@@ -283,16 +283,9 @@ fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
             false
         }
         Expr::Comma(items) if cx.wide => comma_settles(items, budget, cx),
-        // A `try` or `?`: its body's one output, or else its handler's. #7928: a body that settles
-        // may still raise after its output (`1, error("x")`, `comma_settles`), and jq's `try`
-        // catches that error, or a `break`, and runs the handler too: `try (1, error("x")) catch 0`
-        // is `1, 0`. A handler that yields is therefore taken only over a body that cannot.
+        // A `try` or `?`: its body's one output, or else its handler's.
         Expr::Try { expr, catch } if cx.wide => {
-            settles(expr, budget, cx)
-                && catch.as_deref().map_or(true, |c| {
-                    settles(c, budget, cx)
-                        && (yields_nothing(c) || !may_raise_after_output(expr, cx))
-                })
+            settles(expr, budget, cx) && catch.as_deref().map_or(true, |c| settles(c, budget, cx))
         }
         // A `label` only stops what it holds (a `break` settles, see `comma_settles`).
         Expr::Optional(inner) | Expr::Label { body: inner, .. } if cx.wide => {
@@ -1063,148 +1056,6 @@ fn only_ends(expr: &Expr) -> bool {
             )
         }),
         Expr::Comma(items) => items.iter().all(only_ends),
-        _ => false,
-    }
-}
-
-/// Whether `expr`, which [`settles`], may raise an error or a `break` after its one output (#7928):
-/// a `,` with one after the item that yields (which `comma_settles` admits), anywhere in it, through
-/// a def it calls (whose own recursive calls are taken not to, by induction) and the arguments it
-/// passes. A read of a bare parameter, a call by name to anything but the definition being walked,
-/// a call by namespace and a def declared inside are a yes, since the walk cannot see what they
-/// run; so is running out of budget. Asked only of a `try` body whose handler yields, on each
-/// evaluation of the `try`'s settle question: the walk of a def's body is remembered on the
-/// definition ([`def_raises_late`]), so a `try` around a call costs the call and its arguments.
-fn may_raise_after_output(expr: &Expr, cx: &Ctx<'_>) -> bool {
-    let mut budget = CALL_ARGS_BUDGET;
-    let own = cx
-        .own
-        .filter(|def| !shadowed_by_local(cx, &def.name, def.params.len()));
-    raises_late(expr, own, false, true, &mut Vec::new(), &mut budget)
-}
-
-/// Whether the body of `def` may raise an error or a `break` after an output (#7928), its own
-/// recursive calls taken not to: [`raises_late`] over the body with `def` in scope, out of a budget
-/// of its own, remembered on the definition. The answer is a property of the definition alone: once
-/// `scope` holds a def, a call by name is read against it, never against the `own` definition.
-fn def_raises_late(def: &Rc<FuncDefData>) -> bool {
-    def.raises_late_or_init(|body| {
-        let mut fresh = CALL_ARGS_BUDGET;
-        raises_late(
-            body,
-            None,
-            false,
-            false,
-            &mut Vec::from([Rc::clone(def)]),
-            &mut fresh,
-        )
-    })
-}
-
-/// [`may_raise_after_output`]'s walk. `scope` holds the defs whose bodies are being walked, the
-/// innermost last (then `own`, the definition being asked about, whose body is walked once, with
-/// `inducting`): a call from a body to its own def is taken not to raise late, and a read of a bare
-/// parameter of a def in `scope` reads an argument already walked. With `remember` (a walk not
-/// itself filling a definition's answer, so `scope` is empty), a bound call reads its def's body
-/// through [`def_raises_late`]; without it, the walk descends into the body, so filling one answer
-/// never asks for another.
-fn raises_late(
-    expr: &Expr,
-    own: Option<&FuncDefData>,
-    inducting: bool,
-    remember: bool,
-    scope: &mut Vec<Rc<FuncDefData>>,
-    budget: &mut u32,
-) -> bool {
-    search_subexpr(expr, &mut |e: &Expr| {
-        let Some(left) = budget.checked_sub(1) else {
-            return Visit::Found;
-        };
-        *budget = left;
-        match e {
-            Expr::Comma(items) => {
-                let mut after = items.iter().skip_while(|item| yields_nothing(item)).skip(1);
-                if after.any(|item| !ends_quietly(item)) {
-                    Visit::Found
-                } else {
-                    Visit::Descend
-                }
-            }
-            // What stops at, or collects, everything before its one output.
-            Expr::Array(_) | Expr::FirstExpr(_) | Expr::LastExpr(_) => Visit::Skip,
-            Expr::NamespacedCall { .. } | Expr::FuncDef { .. } => Visit::Found,
-            // An argument is caller-scope code: its names are not the ones in `scope`.
-            Expr::Shared(arg) => {
-                if raises_late(arg.expr(), None, false, remember, &mut Vec::new(), budget) {
-                    Visit::Found
-                } else {
-                    Visit::Skip
-                }
-            }
-            Expr::FuncCall { name, args, .. } => {
-                let innermost = scope.last().cloned();
-                let (def, walked_args) = match &innermost {
-                    Some(def) => (Some(&**def), true),
-                    None => (own, false),
-                };
-                let Some(def) = def else {
-                    return Visit::Found;
-                };
-                if *name == def.name && args.len() == def.params.len() {
-                    // A recursive call: by induction when its body is the one being walked; the
-                    // definition being asked about has its body walked first.
-                    if walked_args || inducting {
-                        return Visit::Descend;
-                    }
-                    return if raises_late(&def.body, own, true, remember, scope, budget) {
-                        Visit::Found
-                    } else {
-                        Visit::Descend
-                    };
-                }
-                if walked_args
-                    && args.is_empty()
-                    && def.params.iter().any(|p| p.name() == name.as_str())
-                {
-                    return Visit::Descend;
-                }
-                Visit::Found
-            }
-            Expr::DefCall { def, args, .. } => {
-                if args
-                    .iter()
-                    .any(|arg| raises_late(arg, own, inducting, remember, scope, budget))
-                {
-                    return Visit::Found;
-                }
-                if scope.iter().any(|walked| Rc::ptr_eq(walked, def)) {
-                    return Visit::Skip;
-                }
-                let body_late = if remember && scope.is_empty() {
-                    def_raises_late(def)
-                } else {
-                    scope.push(Rc::clone(def));
-                    let late = raises_late(&def.body, own, inducting, false, scope, budget);
-                    scope.pop();
-                    late
-                };
-                if body_late {
-                    Visit::Found
-                } else {
-                    Visit::Skip
-                }
-            }
-            _ => Visit::Descend,
-        }
-    })
-}
-
-/// Whether `expr` ends the evaluation without a value or a jump a `try` catches (#7928): `empty`.
-fn ends_quietly(expr: &Expr) -> bool {
-    match expr {
-        Expr::Paren(inner) => ends_quietly(inner),
-        Expr::Builtin(Builtin::Empty) => true,
-        Expr::Comma(items) => items.iter().all(ends_quietly),
         _ => false,
     }
 }
@@ -1989,33 +1840,6 @@ mod tests {
             ("def f: try 1 catch 2; f", true),
             ("def f: try (1, 2); f", false),
             ("def f: try 1 catch (2, 3); f", false),
-            // #7928: a handler that yields runs after an output its body raises behind (an error
-            // or a `break`), so such a body does not settle under it; one that cannot raise late,
-            // or a handler that yields nothing, still does.
-            ("def f: try (1, error(\"x\")) catch 0; f", false),
-            ("def f: label $l | try (1, break $l) catch 0; f", false),
-            ("def f: try (1, error(\"x\")) catch empty; f", true),
-            ("def f: try (1, error(\"x\")); f", true),
-            ("def f: try first(1, error(\"x\")) catch 0; f", true),
-            ("def f: try (error(\"x\"), 1) catch 0; f", true),
-            ("def f: try ([1] | first) catch 0; f", true),
-            ("def f: def g: 1, error(\"x\"); try g catch 0; f", false),
-            (
-                "def f($n): if $n == 0 then (1, error(\"x\")) else try f($n - 1) catch 0 end; f(3)",
-                false,
-            ),
-            (
-                "def f($n): if $n == 0 then 1 else try f($n - 1) catch 0 end; f(3)",
-                true,
-            ),
-            (
-                "def f(g; $n): if $n > 0 then f(try (g + (1, error(\"x\"))) catch 0; $n - 1) + f(g; $n - 1) else g end; f(null; 4)",
-                false,
-            ),
-            (
-                "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) else g end; f((1, error(\"x\")); 3)",
-                false,
-            ),
             ("def f: 1?; f", true),
             ("def f: label $l | 1; f", true),
             ("def f: label $l | (1, 2); f", false),
@@ -2081,44 +1905,6 @@ mod tests {
             true
         ));
         assert!(!stage_settles(&parse("try 1").expect("parses"), true));
-    }
-
-    /// #7928: a `try` with a handler that yields, around a bound call, reads whether the call's body
-    /// may raise after its output from the definition (`def_raises_late`), which asks once; the
-    /// second ask reads the remembered answer and agrees with the first.
-    #[test]
-    fn a_try_around_a_bound_call_reads_the_remembered_late_raise_7928() {
-        for (src, want) in [
-            ("def g: 1, error(\"x\"); try (g + g) catch 0", false),
-            ("def g: 1; try (g + g) catch 0", true),
-            ("def g: 1, error(\"x\"); try (g + g) catch empty", true),
-            (
-                "def g($n): if $n == 0 then (1, error(\"x\")) else g($n - 1) end; try g(3) catch 0",
-                false,
-            ),
-            (
-                "def g($n): if $n == 0 then 1 else g($n - 1) end; try g(3) catch 0",
-                true,
-            ),
-            // The argument is walked at the call, outside the remembered answer.
-            ("def g(h): h; try g(1, error(\"x\")) catch 0", false),
-            ("def g(h): h; try g(1) catch 0", true),
-        ] {
-            let Expr::FuncDef {
-                name,
-                params,
-                body,
-                then,
-                ..
-            } = parse(src).expect("parses")
-            else {
-                panic!("a def");
-            };
-            let def = Rc::new(FuncDefData::new(name, params, *body));
-            let expr = install_def_calls(&then, &def, 0, false);
-            assert_eq!(answers_once(&expr, true), want, "`{src}`");
-            assert_eq!(answers_once(&expr, true), want, "`{src}`, asked again");
-        }
     }
 
     /// A body is run again as it is only when its calls are all jumps and it declares nothing

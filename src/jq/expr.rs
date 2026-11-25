@@ -1887,13 +1887,6 @@ impl FuncDefData {
     pub(crate) fn reads_bare_param_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
         memo(&self.tail.bare_param_read, || classify(&self.body))
     }
-
-    /// Whether `body` may raise an error or a `break` after an output, computing it with `classify`
-    /// on the first call (#7928): asked of every `try` with a handler that yields whose body calls
-    /// this definition, on each evaluation of the `try`'s settle question.
-    pub(crate) fn raises_late_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
-        memo(&self.tail.raises_late, || classify(&self.body))
-    }
 }
 
 /// Deliberately leaves out the remembered answer (the trailing `..`), so a
@@ -1936,9 +1929,6 @@ struct TailMemo {
     may_recurse: core::cell::Cell<Option<bool>>,
     /// Whether the body reads a parameter by its bare name (`eval::bind_def_call_body`, #7699).
     bare_param_read: core::cell::Cell<Option<bool>>,
-    /// Whether the body may raise an error or a `break` after an output
-    /// (`tail_call::def_raises_late`, #7928).
-    raises_late: core::cell::Cell<Option<bool>>,
 }
 
 impl Clone for TailMemo {
