@@ -138,6 +138,11 @@ struct Ctx<'a> {
     /// The bare parameters in scope of the body being walked (#7787, wide only): each reads an
     /// argument the call that bound it was asked about, so a read of one settles.
     params: &'a [&'a str],
+    /// Whether a read of one of `own`'s bare parameters is also taken not to raise after its output
+    /// (#7928): the half of [`call_settles`] asked when the plain question says no, which then
+    /// checks each argument of the call it answers for, and each argument of the recursive calls
+    /// in the body, cannot raise late either.
+    quiet_params: bool,
 }
 
 /// A def declared in a body [`settles`] walks: what a call to it by name settles on.
@@ -180,6 +185,7 @@ pub(crate) fn stage_settles(expr: &Expr, jq: bool) -> bool {
             wide: false,
             local_defs: &[],
             params: &[],
+            quiet_params: false,
         },
     )
 }
@@ -231,7 +237,11 @@ fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
                     || (args.is_empty() && def.params.iter().any(|p| p.name() == name))
             }) && !shadowed_by_local(cx, name, args.len()) =>
         {
-            args.iter().all(|arg| settles(arg, budget, cx))
+            // #7928: under `quiet_params` the induction also needs the recursive call's arguments
+            // not to raise late (a read of a bare parameter is taken not to).
+            args.iter().all(|arg| {
+                settles(arg, budget, cx) && !(cx.quiet_params && may_raise_after_output(arg, cx))
+            })
         }
         // #7460: one value bound, then one body run for it, as `single_valued_pure` reads `as`;
         // asked only for a call at a pipe's head, so the tail loop's own question is unchanged.
@@ -457,6 +467,7 @@ fn settles(expr: &Expr, budget: &mut u32, cx: &Ctx<'_>) -> bool {
                         wide: false,
                         local_defs: &[],
                         params: &[],
+                        quiet_params: false,
                     },
                 )
             }),
@@ -984,19 +995,32 @@ fn holds_recursion(expr: &Expr, budget: &mut u32) -> bool {
 /// [`settles`] for a call to `def` with `args` (#7460): the definition's body, taking its own
 /// recursive calls and its bare parameters to settle (remembered on the definition), then the
 /// arguments, out of `budget`.
+///
+/// #7928: a body that settles only when a read of a bare parameter cannot raise after its output
+/// (`try g catch 0`: jq's `try` runs the handler after an output its body raised behind) is asked
+/// that question too, remembered apart, and then settles a call whose arguments cannot raise late.
 fn call_settles(def: &FuncDefData, args: &[Expr], jq: bool, budget: &mut u32) -> bool {
-    let body_settles = def.call_settles_or_init(jq, |body| {
-        let mut fresh = SETTLE_BUDGET;
-        settles(
-            body,
-            &mut fresh,
-            &Ctx {
-                own: Some(def),
-                ..Ctx::wide(jq)
-            },
-        )
-    });
-    body_settles && args.iter().all(|arg| settles(arg, budget, &Ctx::wide(jq)))
+    let body_settles = |quiet_params: bool| {
+        def.call_settles_or_init(jq, quiet_params, |body| {
+            let mut fresh = SETTLE_BUDGET;
+            settles(
+                body,
+                &mut fresh,
+                &Ctx {
+                    own: Some(def),
+                    quiet_params,
+                    ..Ctx::wide(jq)
+                },
+            )
+        })
+    };
+    if body_settles(false) {
+        return args.iter().all(|arg| settles(arg, budget, &Ctx::wide(jq)));
+    }
+    body_settles(true)
+        && args.iter().all(|arg| {
+            settles(arg, budget, &Ctx::wide(jq)) && !may_raise_after_output(arg, &Ctx::wide(jq))
+        })
 }
 
 /// The arm of [`settles`] for a bound call (wide question).
@@ -1017,6 +1041,7 @@ impl Ctx<'static> {
             wide: true,
             local_defs: &[],
             params: &[],
+            quiet_params: false,
         }
     }
 }
@@ -1080,7 +1105,18 @@ fn may_raise_after_output(expr: &Expr, cx: &Ctx<'_>) -> bool {
     let own = cx
         .own
         .filter(|def| !shadowed_by_local(cx, &def.name, def.params.len()));
-    raises_late(expr, own, false, true, &mut Vec::new(), &mut budget)
+    // Under `quiet_params`, the bare parameters of `own` this position still reads: not one a def
+    // declared around it binds or hides.
+    let quiet: Vec<&str> = match own {
+        Some(def) if cx.quiet_params => def
+            .params
+            .iter()
+            .map(super::expr::Param::name)
+            .filter(|name| !cx.params.contains(name) && !shadowed_by_local(cx, name, 0))
+            .collect(),
+        _ => Vec::new(),
+    };
+    raises_late(expr, own, &quiet, false, true, &mut Vec::new(), &mut budget)
 }
 
 /// Whether the body of `def` may raise an error or a `break` after an output (#7928), its own
@@ -1093,12 +1129,41 @@ fn def_raises_late(def: &Rc<FuncDefData>) -> bool {
         raises_late(
             body,
             None,
+            &[],
             false,
             false,
             &mut Vec::from([Rc::clone(def)]),
             &mut fresh,
         )
     })
+}
+
+/// [`raises_late`] over a closure argument (`remember`), remembered on the argument with the nodes
+/// its walk visited (#7928): a recursion that passes `try g catch 0` down nests the argument it was
+/// given one level deeper at every call, and each call's settle question asked it again, a walk of
+/// the whole chain. A read charges `budget` what the walk cost, so every answer is the one the walk
+/// would give; a walk that ran out of budget is not remembered.
+fn shared_raises_late(arg: &super::expr::SharedArg, budget: &mut u32) -> bool {
+    if let Some((late, cost)) = arg.raises_late_known() {
+        return match budget.checked_sub(u32::from(cost)) {
+            Some(left) => {
+                *budget = left;
+                late
+            }
+            None => {
+                *budget = 0;
+                true
+            }
+        };
+    }
+    let before = *budget;
+    let late = raises_late(arg.expr(), None, &[], false, true, &mut Vec::new(), budget);
+    if *budget > 0 {
+        if let Ok(cost) = u8::try_from(before - *budget) {
+            arg.remember_raises_late(late, cost);
+        }
+    }
+    late
 }
 
 /// [`may_raise_after_output`]'s walk. `scope` holds the defs whose bodies are being walked, the
@@ -1111,6 +1176,7 @@ fn def_raises_late(def: &Rc<FuncDefData>) -> bool {
 fn raises_late(
     expr: &Expr,
     own: Option<&FuncDefData>,
+    quiet: &[&str],
     inducting: bool,
     remember: bool,
     scope: &mut Vec<Rc<FuncDefData>>,
@@ -1130,12 +1196,33 @@ fn raises_late(
                     Visit::Descend
                 }
             }
-            // What stops at, or collects, everything before its one output.
-            Expr::Array(_) | Expr::FirstExpr(_) | Expr::LastExpr(_) => Visit::Skip,
+            // What stops at, or collects, everything before its one output; and a `try` with no
+            // handler or a `?`, which stops at an error or a `break` its body raises (jq 1.7.1:
+            // `[label $l | try (try (1, break $l)) catch 0]` is `[1]`).
+            Expr::Array(_)
+            | Expr::FirstExpr(_)
+            | Expr::LastExpr(_)
+            | Expr::Optional(_)
+            | Expr::Try { catch: None, .. } => Visit::Skip,
+            // `limit(1; f)` stops at `f`'s first output; a `reduce`'s source and update run before
+            // its output, so only its initial value (once per value it yields) can raise after one.
+            Expr::Limit { n, .. } if limit_settles(n) => Visit::Skip,
+            Expr::Reduce { init, .. } => {
+                if raises_late(init, own, quiet, inducting, remember, scope, budget) {
+                    Visit::Found
+                } else {
+                    Visit::Skip
+                }
+            }
             Expr::NamespacedCall { .. } | Expr::FuncDef { .. } => Visit::Found,
             // An argument is caller-scope code: its names are not the ones in `scope`.
             Expr::Shared(arg) => {
-                if raises_late(arg.expr(), None, false, remember, &mut Vec::new(), budget) {
+                let late = if remember {
+                    shared_raises_late(arg, budget)
+                } else {
+                    raises_late(arg.expr(), None, &[], false, false, &mut Vec::new(), budget)
+                };
+                if late {
                     Visit::Found
                 } else {
                     Visit::Skip
@@ -1156,7 +1243,7 @@ fn raises_late(
                     if walked_args || inducting {
                         return Visit::Descend;
                     }
-                    return if raises_late(&def.body, own, true, remember, scope, budget) {
+                    return if raises_late(&def.body, own, quiet, true, remember, scope, budget) {
                         Visit::Found
                     } else {
                         Visit::Descend
@@ -1168,12 +1255,17 @@ fn raises_late(
                 {
                     return Visit::Descend;
                 }
+                // A bare parameter of the definition asked about, under `quiet_params`: every call
+                // that reaches it has its arguments checked not to raise late (`call_settles`).
+                if !walked_args && args.is_empty() && quiet.contains(&name.as_str()) {
+                    return Visit::Descend;
+                }
                 Visit::Found
             }
             Expr::DefCall { def, args, .. } => {
                 if args
                     .iter()
-                    .any(|arg| raises_late(arg, own, inducting, remember, scope, budget))
+                    .any(|arg| raises_late(arg, own, quiet, inducting, remember, scope, budget))
                 {
                     return Visit::Found;
                 }
@@ -1184,7 +1276,7 @@ fn raises_late(
                     def_raises_late(def)
                 } else {
                     scope.push(Rc::clone(def));
-                    let late = raises_late(&def.body, own, inducting, false, scope, budget);
+                    let late = raises_late(&def.body, own, &[], inducting, false, scope, budget);
                     scope.pop();
                     late
                 };
@@ -1236,6 +1328,7 @@ pub(crate) fn pipe_settles_before_last(stages: &PipeStages, jq: bool) -> bool {
             wide: false,
             local_defs: &[],
             params: &[],
+            quiet_params: false,
         },
     )
 }
@@ -1295,6 +1388,7 @@ fn reach<'a>(body: &'a Expr, def: &FuncDefData, jq: bool, locals: &mut Vec<&'a s
                             wide: false,
                             local_defs: &[],
                             params: &[],
+                            quiet_params: false,
                         },
                     )
                 {
@@ -1316,6 +1410,7 @@ fn reach<'a>(body: &'a Expr, def: &FuncDefData, jq: bool, locals: &mut Vec<&'a s
                         wide: false,
                         local_defs: &[],
                         params: &[],
+                        quiet_params: false,
                     },
                 ) {
                     break false;
@@ -1336,6 +1431,7 @@ fn reach<'a>(body: &'a Expr, def: &FuncDefData, jq: bool, locals: &mut Vec<&'a s
                             wide: false,
                             local_defs: &[],
                             params: &[],
+                            quiet_params: false,
                         },
                     ) =>
                 {
@@ -1999,6 +2095,13 @@ mod tests {
             ("def f: try first(1, error(\"x\")) catch 0; f", true),
             ("def f: try (error(\"x\"), 1) catch 0; f", true),
             ("def f: try ([1] | first) catch 0; f", true),
+            // What stops at its first output or collects before it, and a `try` with no handler or
+            // a `?` inside, cannot raise late; a `reduce`'s initial value can.
+            ("def f: try reduce (1, error(\"x\")) as $x (0; $x) catch 0; f", true),
+            ("def f: try reduce empty as $x ((1, error(\"x\")); .) catch 0; f", false),
+            ("def f: try limit(1; 1, error(\"x\")) catch 0; f", true),
+            ("def f: try (try (1, error(\"x\"))) catch 0; f", true),
+            ("def f: try ((1, error(\"x\"))?) catch 0; f", true),
             ("def f: def g: 1, error(\"x\"); try g catch 0; f", false),
             (
                 "def f($n): if $n == 0 then (1, error(\"x\")) else try f($n - 1) catch 0 end; f(3)",
@@ -2014,6 +2117,38 @@ mod tests {
             ),
             (
                 "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) else g end; f((1, error(\"x\")); 3)",
+                false,
+            ),
+            // A read of a bare parameter under such a `try` settles once the call's arguments, and
+            // those of the recursive calls, cannot raise late either.
+            (
+                "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; f(1; 4)",
+                true,
+            ),
+            (
+                "def f(g; $n): if $n > 0 then f(g; $n - 1) + f(try g catch 0; $n - 1) else g end; f(1; 4)",
+                true,
+            ),
+            (
+                "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) else g end; f(1; 3)",
+                true,
+            ),
+            (
+                "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; f((1, error(\"x\")); 4)",
+                false,
+            ),
+            // A recursive call passing an argument that raises late, and a local def's parameter
+            // of the same name, keep it from settling.
+            (
+                "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f((g, error(\"x\")); $n - 1) else g end; f(1; 4)",
+                false,
+            ),
+            (
+                "def f(g; $n): def h(g): try g catch 0; if $n > 0 then h(1, error(\"x\")) + f(g; $n - 1) else g end; f(1; 3)",
+                false,
+            ),
+            (
+                "def f(g; $n): def g: 1, error(\"x\"); if $n > 0 then (try g catch 0) + f(g; $n - 1) else 1 end; f(1; 3)",
                 false,
             ),
             ("def f: 1?; f", true),

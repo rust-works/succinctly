@@ -1546,6 +1546,10 @@ pub struct SharedArg {
     /// Whether this argument answers at most once (`tail_call::settles`, #7787), remembered so a
     /// closure passed down a recursion is asked once, not at every level.
     settles: core::cell::Cell<Option<bool>>,
+    /// Whether this argument may raise an error or a `break` after an output, and how many nodes
+    /// the walk that found it visited (`tail_call::raises_late`, #7928), remembered so a closure
+    /// passed down a recursion is walked once, not at every call that asks.
+    raises_late: core::cell::Cell<Option<(bool, u8)>>,
     /// Whether this is a run of a split tail ([`TailPlan::Split`]), or a link of
     /// the chain of a long pipe ([`PipeStages::chained_tail`], #5679), not an
     /// argument: stages of a pipe, kept as an `Expr::Pipe` of their own (#5441).
@@ -1566,6 +1570,7 @@ impl SharedArg {
             needs_path_context: core::cell::Cell::new(None),
             retrying_bind: core::cell::Cell::new(None),
             settles: core::cell::Cell::new(None),
+            raises_late: core::cell::Cell::new(None),
             run: false,
         }
     }
@@ -1655,6 +1660,17 @@ impl SharedArg {
     /// first call: asked by the call-head question (jq mode only) of every call it captures.
     pub(crate) fn settles_or_init(&self, classify: impl FnOnce(&Expr) -> bool) -> bool {
         memo(&self.settles, || classify(&self.expr))
+    }
+
+    /// The remembered answer of `tail_call::raises_late` over this argument and the nodes its walk
+    /// visited (#7928), if a walk that did not run out of budget has given one.
+    pub(crate) fn raises_late_known(&self) -> Option<(bool, u8)> {
+        self.raises_late.get()
+    }
+
+    /// Remember `tail_call::raises_late`'s answer over this argument, from a walk of `cost` nodes.
+    pub(crate) fn remember_raises_late(&self, late: bool, cost: u8) {
+        self.raises_late.set(Some((late, cost)));
     }
 }
 
@@ -1862,15 +1878,20 @@ impl FuncDefData {
     /// Whether this definition's body settles when its own recursive calls and bare parameters are
     /// taken to, computing it with `classify` on the first call, for jq (`jq`) or yq mode (#7460):
     /// the half of `tail_call::call_head_settles` that is a property of the definition.
+    ///
+    /// With `quiet_params`, the answer taken also with a read of a bare parameter not raising after
+    /// its output (#7928), remembered apart.
     pub(crate) fn call_settles_or_init(
         &self,
         jq: bool,
+        quiet_params: bool,
         classify: impl FnOnce(&Expr) -> bool,
     ) -> bool {
-        let slot = if jq {
-            &self.tail.call_jq
-        } else {
-            &self.tail.call_yq
+        let slot = match (jq, quiet_params) {
+            (true, false) => &self.tail.call_jq,
+            (false, false) => &self.tail.call_yq,
+            (true, true) => &self.tail.call_quiet_jq,
+            (false, true) => &self.tail.call_quiet_yq,
         };
         memo(slot, || classify(&self.body))
     }
@@ -1932,6 +1953,10 @@ struct TailMemo {
     /// (`tail_call::call_head_settles`, #7460), in jq and yq mode.
     call_jq: core::cell::Cell<Option<bool>>,
     call_yq: core::cell::Cell<Option<bool>>,
+    /// The same, with a read of a bare parameter also taken not to raise after its output
+    /// (`tail_call::call_settles`, #7928).
+    call_quiet_jq: core::cell::Cell<Option<bool>>,
+    call_quiet_yq: core::cell::Cell<Option<bool>>,
     /// Whether a call to the definition may recurse (`tail_call::def_may_recurse`, #7787).
     may_recurse: core::cell::Cell<Option<bool>>,
     /// Whether the body reads a parameter by its bare name (`eval::bind_def_call_body`, #7699).

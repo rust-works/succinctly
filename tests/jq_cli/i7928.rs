@@ -79,3 +79,170 @@ fn a_tree_recursion_through_a_try_with_a_handler_still_answers_7928() -> Result<
     }
     Ok(())
 }
+
+/// `(program, stdout, stderr, status)` for a tree recursion whose closure argument wraps the bare
+/// parameter (`try g catch 0`, `g?`, `try g`, `g + 1`). The first #7928 fix took a read of a bare
+/// parameter under a `try` whose handler yields to raise late, so the def's body no longer settled:
+/// the tree recursion streamed and hit the native-stack refusal from depth 12, where jq answers.
+/// The body is now also asked with such a read taken not to raise late, and settles a call whose
+/// arguments cannot; an argument that raises late (`(1, error("x"))`) still streams, as in jq.
+/// The expected outputs are jq 1.7.1's (`/usr/bin/jq`); jq 1.8.2 answers every row the same.
+const BARE_PARAMETER_CASES: &[(&str, &str, &str, i32)] = &[
+    (
+        "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; [f(1; 12)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; [f(1; 13)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; [f(1; 14)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; [f(1; 15)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; [f(1; 16)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; f(1; 13)",
+        "8192\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(g; $n - 1) + f(try g catch 0; $n - 1) else g end; [f(1; 13)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(g?; $n - 1) + f(g; $n - 1) else g end; [f(1; 13)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(g; $n - 1) + f(g?; $n - 1) else g end; [f(1; 13)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(try g; $n - 1) + f(g; $n - 1) else g end; [f(1; 13)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(g; $n - 1) + f(try g; $n - 1) else g end; [f(1; 13)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f((g + 1); $n - 1) + f(g; $n - 1) else g end; [f(1; 13)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(g; $n - 1) + f((g + 1); $n - 1) else g end; [f(1; 13)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(try g catch empty; $n - 1) + f(g; $n - 1) else g end; [f(1; 13)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(g; $n - 1) + f(try g catch empty; $n - 1) else g end; [f(1; 13)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f($g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; [f(1; 14)] | length",
+        "1\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; f((1, error(\"x\")); 2)",
+        "4\n3\n3\n2\n3\n2\n2\n1\n",
+        "jq: error (at <unknown>): x\n",
+        5,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(g; $n - 1) + f(try g catch 0; $n - 1) else g end; f((1, error(\"x\")); 2)",
+        "4\n",
+        "jq: error (at <unknown>): x\n",
+        5,
+    ),
+    (
+        "def f(g; $n): def h(g): try g catch 0; if $n > 0 then f(h(g); $n - 1) + f(g; $n - 1) else g end; f((1, error(\"x\")); 2)",
+        "4\n3\n3\n2\n3\n2\n2\n1\n",
+        "jq: error (at <unknown>): x\n",
+        5,
+    ),
+    (
+        "def f(g; $n): def g: (1, error(\"y\")); if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; f(1; 2)",
+        "4\n",
+        "jq: error (at <unknown>): y\n",
+        5,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; f(1, error(\"x\"); 1)",
+        "2\n1\n",
+        "jq: error (at <unknown>): x\n",
+        5,
+    ),
+    (
+        "def f($g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; f(1, error(\"x\"); 1)",
+        "2\n1\n2\n1\n",
+        "jq: error (at <unknown>): x\n",
+        5,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else try g catch 7 end; [f((1, error(\"x\")); 2)]",
+        "[4,3,3,2,3,2,2,1,10,9,9,8,9,8,8,7]\n",
+        "",
+        0,
+    ),
+    (
+        "def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; first(f((1, error(\"x\")); 3))",
+        "8\n",
+        "",
+        0,
+    ),
+];
+
+#[test]
+fn a_try_around_a_bare_parameter_still_settles_a_tree_recursion_7928() -> Result<()> {
+    for (program, stdout, stderr, code) in BARE_PARAMETER_CASES {
+        let (out, err, status) = run_jq_full(&["-nc", program], None)?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), status),
+            (*stdout, *stderr, *code),
+            "{program}"
+        );
+    }
+    Ok(())
+}
