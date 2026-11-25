@@ -6194,7 +6194,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         // `validate_json_input` rejects.
         // #5964: jq's parser counts the bytes as read, so a message that names where it stopped
         // is worded over the originals of the files the substitution changed.
-        let (raw_inputs, originals): (Vec<Vec<u8>>, Vec<Option<Vec<u8>>>) = if args.validate {
+        let (raw_inputs, originals): (Vec<Vec<u8>>, Vec<Option<LossySource>>) = if args.validate {
             (raw_inputs, Vec::new())
         } else {
             let unmoved = seams_moved_nothing(&seams);
@@ -6462,6 +6462,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             } else {
                 seams.get(idx).cloned().unwrap_or_default()
             };
+            // #7934: a file the substitution changed has its reads counted in the bytes jq read. A
+            // window's text is counted as it is (its edits are not kept).
+            let lossy = (slurped.is_none() && window_place.is_none())
+                .then(|| originals.get(idx).and_then(Option::as_ref))
+                .flatten();
             let locator = ValueLocator::new(
                 raw,
                 filename.as_deref(),
@@ -6474,6 +6479,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }),
                 seam.clone(),
             )
+            .reading(lossy)
             .with_lines_before(lines_before);
             let tail_locator = ValueLocator::new(b"", value_tail.as_deref(), Some(0), Seam::NONE);
             // #7322: what jq's `--seq` reader warns of in a stretch of the window that was not plain
@@ -9701,8 +9707,6 @@ fn read_inputs(
                         chunks,
                         seams: vec![seam.clone()],
                         last_source,
-                        // Every file is UTF-8 on this route, so none is a substitution.
-                        lossy: None,
                         last_span: None,
                         recorded_tail: None,
                         rest: None,
@@ -9830,9 +9834,6 @@ fn read_inputs(
                                 chunks: 1,
                                 seams: seams.clone(),
                                 last_source: locations.last_src(),
-                                // Moved: the stream is this source's alone, and nothing reads it
-                                // from here but the producer's fault tail.
-                                lossy: lossy_sources.get_mut(pos).and_then(Option::take),
                                 last_span: None,
                                 recorded_tail,
                                 rest: None,
@@ -9860,6 +9861,11 @@ fn read_inputs(
                                 spans.shrink_to_fit();
                             }
                             defer_lazy_start(std::rc::Rc::new(raw), spans, src, seam, more);
+                            // Moved: the stream is this source's alone, and nothing reads it from
+                            // here but the producer, its lines and its fault tail.
+                            if let Some(lossy) = lossy_sources.get_mut(pos).and_then(Option::take) {
+                                mark_lazy_read_as(lossy);
+                            }
                             mark_lazy_stream_end(!unopened_tail);
                             lazy_inputs = true;
                             continue;
@@ -9919,6 +9925,7 @@ fn read_inputs(
                         src,
                         &raw,
                         seam.clone(),
+                        lossy,
                         &ends,
                         values.len() - documents_before,
                     );
@@ -9995,7 +10002,7 @@ fn read_inputs(
                         .take(parsed.len())
                         .map(|&(_, end)| end)
                         .collect();
-                    locations.extend_from_ends(src, &raw, seam.clone(), &ends, parsed.len());
+                    locations.extend_from_ends(src, &raw, seam.clone(), lossy, &ends, parsed.len());
                     if let Some(start) = malformed_start {
                         error_line = parse_error_line(raw.as_bytes(), start, seam, args.stream);
                     }
@@ -10826,30 +10833,36 @@ impl InputLocations {
     /// (#1808): a boundary-spanning record's own file can't be recovered
     /// from an isolated `raw`, so `build_seq_values`/`seq_values_with_indices`
     /// track offsets across the whole multi-file stream directly instead.
+    ///
+    /// `lossy` is what the invalid-UTF-8 substitution made `raw` of, whose reads jq counts in the
+    /// bytes it read ([`LineCounter::reading`], #7934).
     fn extend_from_ends(
         &mut self,
         src: usize,
         raw: &str,
         seam: Seam,
+        lossy: Option<&LossySource>,
         ends: &[usize],
         values: usize,
     ) {
-        self.extend_from_ends_after(src, raw, seam, ends, values, 0);
+        self.extend_from_ends_after(src, raw, seam, lossy, ends, values, 0);
     }
 
     /// [`extend_from_ends`](Self::extend_from_ends) over a `raw` that is the file from a line start
     /// on, with `lines_before` line breaks ahead of it (#7023).
+    #[allow(clippy::too_many_arguments)]
     fn extend_from_ends_after(
         &mut self,
         src: usize,
         raw: &str,
         seam: Seam,
+        lossy: Option<&LossySource>,
         ends: &[usize],
         values: usize,
         lines_before: usize,
     ) {
         if ends.len() == values {
-            let mut line_counter = LineCounter::at_seam(raw.as_bytes(), seam);
+            let mut line_counter = LineCounter::at_seam(raw.as_bytes(), seam).reading(lossy);
             line_counter.set_lines_before(lines_before);
             for &end in ends {
                 self.push(src, line_counter.read_end_line(end));
@@ -11067,8 +11080,9 @@ impl ErrorAt<'_> {
 /// ([`Seam::after_substitution`], #4316); `None` for a file nothing was moved on or off.
 ///
 /// The second value is the bytes as read when the substitution changed them (#5964): jq's parser
-/// counts those, so a message that names where it stopped has to as well.
-fn utf8_lossy_document(raw: Vec<u8>, seam: Option<&mut Seam>) -> (Vec<u8>, Option<Vec<u8>>) {
+/// counts those, so a message that names where it stopped has to as well, and the edits that map
+/// the text onto them, over which jq's reads are counted (#7934).
+fn utf8_lossy_document(raw: Vec<u8>, seam: Option<&mut Seam>) -> (Vec<u8>, Option<LossySource>) {
     match succinctly::text::utf8::validate_utf8(&raw) {
         Ok(()) => (raw, None),
         Err(_) => {
@@ -11077,7 +11091,7 @@ fn utf8_lossy_document(raw: Vec<u8>, seam: Option<&mut Seam>) -> (Vec<u8>, Optio
             if let Some(seam) = seam {
                 *seam = std::mem::take(seam).after_substitution(raw.len(), &edits);
             }
-            (substituted.into_bytes(), Some(raw))
+            (substituted.into_bytes(), Some(LossySource::new(raw, edits)))
         }
     }
 }
@@ -11087,13 +11101,13 @@ fn utf8_lossy_document(raw: Vec<u8>, seam: Option<&mut Seam>) -> (Vec<u8>, Optio
 /// when no file was substituted.
 fn parser_chunks<'a>(
     raws: &'a [Vec<u8>],
-    originals: &'a [Option<Vec<u8>>],
+    originals: &'a [Option<LossySource>],
 ) -> impl Iterator<Item = &'a [u8]> {
     raws.iter().enumerate().map(move |(index, raw)| {
         originals
             .get(index)
-            .and_then(Option::as_deref)
-            .unwrap_or(raw.as_slice())
+            .and_then(Option::as_ref)
+            .map_or(raw.as_slice(), |lossy| lossy.original.as_slice())
     })
 }
 
@@ -11104,6 +11118,7 @@ fn parser_chunks<'a>(
 /// invalid bytes into one three-byte U+FFFD, so counted over the text a column is too high by
 /// two for each lone invalid byte. A literal U+FFFD in the document is three bytes to jq as
 /// well, so the two cannot be told apart in the text: the original has to be kept.
+#[derive(Clone)]
 struct LossySource {
     original: Vec<u8>,
     /// Where the substitution changed the document, in order (#5975): a run it replaced by one
@@ -12599,7 +12614,7 @@ fn utf8_lossy_scanned(
     seam: Option<&mut Seam>,
     scan: Option<succinctly::jq::TextScan>,
     unmoved: bool,
-) -> (Vec<u8>, Option<Vec<u8>>) {
+) -> (Vec<u8>, Option<LossySource>) {
     match scan {
         Some(scan) if unmoved && scan.utf8 && !scan.nul => (raw, None),
         _ => utf8_lossy_document(raw, seam),
@@ -14293,6 +14308,10 @@ struct LineCounter<'a> {
     /// The bytes jq's first read held before `bytes` while the counter is on the text's first line
     /// ([`Seam::lead`], #7569), and 0 once it is past a line break.
     lead: usize,
+    /// Where the invalid-UTF-8 substitution changed `bytes` (#7931, #7934): jq's 4,095-byte reads
+    /// are counted over the bytes it read, so a read boundary is placed in those bytes and mapped
+    /// back. Empty for a text that is the bytes jq read.
+    edits: &'a [SubstitutionEdit],
 }
 
 /// A [`LineCounter`]'s position without its text (#5661): only [`LineCounter::resume`] over
@@ -14351,6 +14370,88 @@ impl<'a> LineCounter<'a> {
             next_newline: None,
             lead: seam.lead,
             seam,
+            edits: &[],
+        }
+    }
+
+    /// This counter over a text the invalid-UTF-8 substitution made of the bytes jq read (#7931,
+    /// #7934): its reads are counted over those bytes, as [`LossySource`] has them.
+    fn reading(mut self, lossy: Option<&'a LossySource>) -> Self {
+        self.edits = lossy.map_or(&[], |lossy| lossy.edits.as_slice());
+        self
+    }
+
+    /// `at` in the text, as an offset in the bytes jq read. Inside a replacement it is where the bytes
+    /// it replaced start, but inside a string the substitution rewrote whole it is counted from the
+    /// string's end, so its closing quote, where a fault in it is met, is the quote jq read.
+    fn read_offset(&self, at: usize) -> usize {
+        let edits = self.edits;
+        if edits.is_empty() {
+            return at;
+        }
+        let holding = edits.partition_point(|edit| edit.text.end <= at);
+        match edits.get(holding) {
+            Some(edit) if edit.text.start <= at && edit.text.len() > '\u{FFFD}'.len_utf8() => {
+                (edit.raw.end + at)
+                    .saturating_sub(edit.text.end)
+                    .max(edit.raw.start)
+            }
+            _ => succinctly::jq::utf8_document::original_offset(edits, at),
+        }
+    }
+
+    /// Where the read holding `at` ends in the bytes jq read, when that is inside a run of bytes the
+    /// substitution replaced: the next read starts on a byte the text does not have (#5990, #7934).
+    fn read_end_inside_edit(&self, at: usize) -> Option<usize> {
+        if self.edits.is_empty() {
+            return None;
+        }
+        let raw_end = self.raw_chunk_end(at.max(self.line_start));
+        // Only a run replaced by one U+FFFD (or dropped): its bytes start no token.
+        let edit = self
+            .edit_cut_at(raw_end)
+            .filter(|edit| edit.text.len() <= '\u{FFFD}'.len_utf8())?;
+        // Only when the read ends there, not at a line break before it.
+        (self.read_end(at) == edit.text.end).then_some(raw_end)
+    }
+
+    /// The edit whose replaced bytes `raw`, an offset in the bytes jq read, falls strictly inside.
+    fn edit_cut_at(&self, raw: usize) -> Option<&'a SubstitutionEdit> {
+        let edits = self.edits;
+        let at = edits.partition_point(|edit| edit.raw.end <= raw);
+        edits.get(at).filter(|edit| edit.raw.start < raw)
+    }
+
+    /// Where a read that holds `at` and ends at `raw_end` in the bytes jq read ends in the text (#7934).
+    /// A read that ends inside a replaced run ends past its replacement here, and
+    /// [`read_end_inside_edit`](Self::read_end_inside_edit) says where it ends in the bytes.
+    fn text_read_end(&self, raw_end: usize, at: usize) -> usize {
+        let end = match self.edit_cut_at(raw_end) {
+            // A string rewritten whole: counted from its end, as `read_offset` counts it.
+            Some(edit) if edit.text.len() > '\u{FFFD}'.len_utf8() => (edit.text.end + raw_end)
+                .saturating_sub(edit.raw.end)
+                .max(edit.text.start),
+            Some(edit) => edit.text.end,
+            None => succinctly::jq::utf8_document::substituted_offset(self.edits, raw_end),
+        };
+        // A read holds the byte it is asked about, so reading always moves on.
+        end.max(at + 1)
+    }
+
+    /// The end of the [`JQ_READ_CHUNK`]-byte read holding `at`, in the bytes jq read.
+    fn raw_chunk_end(&self, at: usize) -> usize {
+        self.raw_line_start() + (self.read_of(at) + 1) * JQ_READ_CHUNK - self.lead
+    }
+
+    /// Where the line holding the counter's position starts in the bytes jq read. On the text's first
+    /// line that is where the file's own bytes start, which a replacement spanning the bytes moved onto
+    /// the file's front can put before the text's start ([`Seam::raw_ends`], #5990): jq's reads of the
+    /// file start on its first byte, inside that replacement.
+    fn raw_line_start(&self) -> usize {
+        let base = self.seam.base.min(self.bytes.len());
+        match self.seam.raw_ends.as_deref().and_then(<[usize]>::last) {
+            Some(&raw_base) if !self.edits.is_empty() && self.line_start == base => raw_base,
+            _ => self.read_offset(self.line_start),
         }
     }
 
@@ -14386,6 +14487,7 @@ impl<'a> LineCounter<'a> {
             next_newline: place.next_newline,
             seam: place.seam.clone(),
             lead: place.lead,
+            edits: &[],
         }
     }
 
@@ -14442,7 +14544,14 @@ impl<'a> LineCounter<'a> {
             .iter()
             .rposition(|&b| b == b'\n')
             .map_or(start, |newline| start + newline + 1);
-        let chunk_end = line_start + ((at - line_start) / JQ_READ_CHUNK + 1) * JQ_READ_CHUNK;
+        let chunk_end = if self.edits.is_empty() {
+            line_start + ((at - line_start) / JQ_READ_CHUNK + 1) * JQ_READ_CHUNK
+        } else {
+            // #7934: in the bytes jq read, where the moved bytes hold a replacement.
+            let raw_line = self.read_offset(line_start);
+            let reads = (self.read_offset(at) - raw_line) / JQ_READ_CHUNK + 1;
+            self.text_read_end(raw_line + reads * JQ_READ_CHUNK, at)
+        };
         let read_end = match self.bytes[at..end].iter().position(|&b| b == b'\n') {
             Some(newline) if at + newline < chunk_end => at + newline + 1,
             _ => chunk_end.min(end),
@@ -14466,7 +14575,11 @@ impl<'a> LineCounter<'a> {
     /// it costs nothing more.
     fn read_end(&self, at: usize) -> usize {
         let at = at.max(self.line_start);
-        let chunk_end = self.line_start + (self.read_of(at) + 1) * JQ_READ_CHUNK - self.lead;
+        let chunk_end = if self.edits.is_empty() {
+            self.line_start + (self.read_of(at) + 1) * JQ_READ_CHUNK - self.lead
+        } else {
+            self.text_read_end(self.raw_chunk_end(at), at)
+        };
         match self.next_newline {
             Some(newline) if newline < chunk_end && newline < self.read_len() => newline + 1,
             _ => chunk_end.min(self.read_len()),
@@ -14507,7 +14620,7 @@ impl<'a> LineCounter<'a> {
     /// Which of the reads of the line holding `at` (from `line_start`) holds it, counted from 0: the
     /// first read of the text's first line holds the [`lead`](Self::lead) bytes too (#7569).
     fn read_of(&self, at: usize) -> usize {
-        (at - self.line_start + self.lead) / JQ_READ_CHUNK
+        (self.read_offset(at) - self.raw_line_start() + self.lead) / JQ_READ_CHUNK
     }
 
     /// Same result [`line_at`] would return for this `end`, given every
@@ -14635,6 +14748,15 @@ impl<'a> ValueLocator<'a> {
             counter: RefCell::new(LineCounter::at_seam(raw, seam)),
             filename,
             slurp_eof,
+        }
+    }
+
+    /// This locator over a text the invalid-UTF-8 substitution made of the bytes jq read, whose
+    /// reads are counted in those bytes ([`LineCounter::reading`], #7934).
+    fn reading(self, lossy: Option<&'a LossySource>) -> Self {
+        Self {
+            counter: RefCell::new(self.counter.into_inner().reading(lossy)),
+            ..self
         }
     }
 
@@ -15513,7 +15635,8 @@ fn read_json_tail(
     ends: &mut Vec<usize>,
     resumed_errors: &mut Vec<(usize, TrailingParseError)>,
 ) -> Result<Option<(usize, usize)>> {
-    let mut faults = LineCounter::at_seam(raw.as_bytes(), cx.seam.clone());
+    // #7931, #7934: jq's reads are counted over the bytes it read, not over the substitution.
+    let mut faults = LineCounter::at_seam(raw.as_bytes(), cx.seam.clone()).reading(cx.lossy);
     faults.set_lines_before(cx.lines_before);
     // #5923: where jq's parser stands at the start of each segment. The first is
     // where the file starts; after a fault it is where the fault left the parser,
@@ -15635,7 +15758,13 @@ fn read_json_tail(
         // substitution replaced (a character the next file does not complete).
         let mut inside_edit = cx
             .lossy
-            .and_then(|lossy| cx.seam.raw_start_inside_edit(detected, resume, lossy));
+            .and_then(|lossy| cx.seam.raw_start_inside_edit(detected, resume, lossy))
+            // #7934: or the read of this file's own bytes ends inside a replaced run.
+            .or_else(|| {
+                (detected < raw.len() && faults.moved_source(detected).is_none())
+                    .then(|| faults.read_end_inside_edit(detected))
+                    .flatten()
+            });
         // A read that starts inside a character starts on a byte
         // no JSON token begins with: jq raises there too and
         // discards that read as well (`}` padded so the read ends
@@ -15715,6 +15844,10 @@ struct LazyJsonInputs {
     /// for a source whose text is whole. Kept past the scan's end, which is where the next of several
     /// files starts in jq's input (#7024).
     dropped: DroppedText,
+    /// The bytes jq read, where the text is a substitution of them (#5964): a fault tail is read over
+    /// them, and the line of each document counts jq's reads in them (#7934). Kept for a source whose
+    /// scan is done too, which is one chunk (`LAZY_CHUNK_FIRST_BYTES`) at most.
+    lossy: Option<LossySource>,
 }
 
 /// A lazy stream whose scan is not finished (#5856): the producer scans the next chunk of `text`
@@ -15730,8 +15863,6 @@ struct LazyMore {
     seams: Vec<Seam>,
     /// The tag of the last source, which the end of the stream names.
     last_source: u32,
-    /// The bytes jq read, where the text is a substitution of them (#5964).
-    lossy: Option<LossySource>,
     /// The last document of a chunk already read, which is all the end of the stream is read off:
     /// its first byte, and where it ends in the text. (Not its start: a window drops text before a
     /// document that starts on an earlier line is over, #7023.)
@@ -16136,7 +16267,6 @@ fn defer_windowed_lazy_sources(
             chunks: usize::from(!spans.is_empty()),
             seams: vec![seam.clone()],
             last_source,
-            lossy: None,
             last_span: None,
             recorded_tail: None,
             rest: Some(rest),
@@ -16696,7 +16826,7 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
             .into_iter()
             .map(|seam| seam.after_substitution(len, &edits))
             .collect();
-        more.lossy = Some(LossySource::new(original, edits));
+        lazy.lossy = Some(LossySource::new(original, edits));
         *std::rc::Rc::make_mut(&mut lazy.text) = text;
         return WindowRead::Eof;
     };
@@ -16705,7 +16835,7 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
     }
     // #7738: a window of a stream after one that was substituted is text as read: its bytes are the
     // original's too.
-    if let Some(lossy) = more.lossy.as_mut() {
+    if let Some(lossy) = lazy.lossy.as_mut() {
         lossy
             .original
             .extend_from_slice(&lazy.text.as_bytes()[before..]);
@@ -16724,14 +16854,14 @@ fn lazy_window_read_on(more: &mut LazyMore, rest: LazyRest) -> WindowRead {
 }
 
 /// A window of a stream that is not UTF-8 (#7738): jq's substitution of its bytes is appended to the text,
-/// and the bytes to what the text is a substitution of ([`LazyMore::lossy`], begun here with the text
+/// and the bytes to what the text is a substitution of ([`LazyJsonInputs::lossy`], begun here with the text
 /// before it, which is UTF-8 as read), with the edits moved to where the window falls. The window starts at
 /// a line start and ends at a line break or at the end of the stream, so no character is cut across two
 /// windows. The end of the stream is settled from those bytes when the scan gets there
 /// ([`lossy_stream_end`]); until then nothing of the text is dropped ([`slide_lazy_window`]).
 fn append_lossy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, fresh: &[u8]) {
     let text_len = lazy.text.len();
-    let lossy = more
+    let lossy = lazy
         .lossy
         .get_or_insert_with(|| LossySource::new(lazy.text.as_bytes().to_vec(), Vec::new()));
     let raw_len = lossy.original.len();
@@ -16758,7 +16888,7 @@ fn append_lossy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, fresh: &[
 /// How a stream the lazy route read in windows after a substitution ends (#7738), counted from the bytes
 /// as read, as [`read_lazy_window`] counts a source it reads whole at its substitution; `None` for any other.
 fn lossy_stream_end(lazy: &LazyJsonInputs, more: &LazyMore) -> Option<EofTail> {
-    let lossy = more.lossy.as_ref()?;
+    let lossy = lazy.lossy.as_ref()?;
     let upto = lossy.original_offset(more.scanned_to);
     Some(lazy.dropped.count_in(EofTail::of(
         &[blank_consumed(&lossy.original, lazy.dropped, upto).as_slice()],
@@ -16829,7 +16959,7 @@ fn slide_lazy_window(
     };
     // #7738: a stream read on after a substitution keeps its text, which the bytes it is a
     // substitution of are offsets into.
-    if more.lossy.is_some() {
+    if lazy.lossy.is_some() {
         return;
     }
     // Cheap to keep a little: dropping moves what is left, so it waits for a block's worth.
@@ -17105,7 +17235,8 @@ fn lazy_json_producer_then(
             .lines
             .take()
             .unwrap_or_else(|| LineCounter::at_seam(bytes, lazy.seam.clone()).place());
-        let mut counter = LineCounter::resume(bytes, &place);
+        // #7934: over the bytes jq read where the text is a substitution of them.
+        let mut counter = LineCounter::resume(bytes, &place).reading(lazy.lossy.as_ref());
         let line = counter.read_end_line(end);
         cursor.lines = Some(counter.place());
         debug_assert!(
@@ -17290,7 +17421,7 @@ fn lazy_scan_on(
             None if chunk.open_tail => cut_document_start(&lazy.text, end_of_last),
             None => None,
         };
-        if let Some((start, before)) = cut.filter(|_| !lazy.stitched && more.lossy.is_none()) {
+        if let Some((start, before)) = cut.filter(|_| !lazy.stitched && lazy.lossy.is_none()) {
             lazy.spans.extend(before);
             carry_cut_document(lazy, start, &mut later[0], lines, more.last_source);
             return false;
@@ -17452,6 +17583,8 @@ impl LazyAfterFault {
             ends_stream: lazy.ends_stream,
             stitched: lazy.stitched,
             dropped: lazy.dropped,
+            // Its own as well: the producer counts the lines of the documents before the fault in it.
+            lossy: lazy.lossy.clone(),
         };
         Self {
             lazy,
@@ -17497,7 +17630,7 @@ fn fault_tail(
         file_start: lazy.dropped.window_start(lazy.file_start),
         src: lazy.source as usize,
         seam: &lazy.seam,
-        lossy: more.lossy.as_ref(),
+        lossy: lazy.lossy.as_ref(),
         ends_stream: lazy.ends_stream,
         lines_before: lazy.dropped.newlines,
     };
@@ -17512,6 +17645,7 @@ fn fault_tail(
                 lazy.source as usize,
                 text,
                 lazy.seam.clone(),
+                lazy.lossy.as_ref(),
                 &ends,
                 values.len(),
                 lazy.dropped.newlines,
@@ -17620,7 +17754,6 @@ fn carry_cut_document(
         chunks: 0,
         seams: Vec::new(),
         last_source,
-        lossy: None,
         last_span: None,
         recorded_tail: None,
         rest: None,
@@ -17748,6 +17881,7 @@ fn hand_off_later_sources(
             src,
             text,
             seam.clone(),
+            None,
             &ends,
             values.len() - before,
             lines_before,
@@ -17936,7 +18070,18 @@ fn defer_lazy_start(
                 ends_stream: false,
                 stitched: false,
                 dropped: DroppedText::default(),
+                lossy: None,
             });
+    });
+}
+
+/// Gives the source [`defer_lazy_start`] deferred last the bytes its text, already substituted with its
+/// seams, was made of (#7934): its documents' lines count jq's reads in them.
+fn mark_lazy_read_as(lossy: LossySource) {
+    LAZY_JSON_INPUTS.with(|slot| {
+        if let Some(last) = slot.borrow_mut().as_mut().and_then(|q| q.back_mut()) {
+            last.lossy = Some(lossy);
+        }
     });
 }
 
@@ -17962,7 +18107,7 @@ fn mark_lazy_lossy(lossy: LossySource) {
                     .into_iter()
                     .map(|seam| seam.after_substitution(len, &lossy.edits))
                     .collect();
-                more.lossy = Some(lossy);
+                last.lossy = Some(lossy);
             }
         }
     });
@@ -19795,7 +19940,7 @@ fn reread_stream_fault(files: &[PathBuf]) -> Option<String> {
 /// `get_inputs` has always done.
 fn slurp_documents(
     raw_inputs: Vec<Vec<u8>>,
-    originals: &[Option<Vec<u8>>],
+    originals: &[Option<LossySource>],
     files: &[PathBuf],
     validate: bool,
     seams: &[Seam],
@@ -19824,8 +19969,8 @@ fn slurp_documents(
         if let Some(offset) = split_error {
             let read = originals
                 .get(idx)
-                .and_then(Option::as_deref)
-                .unwrap_or(&raw);
+                .and_then(Option::as_ref)
+                .map_or(raw.as_slice(), |lossy| lossy.original.as_slice());
             // #5497: jq meets its depth limit first when the refused bracket comes first.
             if jq::jq_depth_fault_offset(&raw[offset..]).is_some() {
                 // #6628: and names where its parser stood, as the stream route does. The first
@@ -19848,8 +19993,8 @@ fn slurp_documents(
                 origin,
                 originals
                     .get(idx)
-                    .and_then(Option::as_deref)
-                    .unwrap_or(&raw),
+                    .and_then(Option::as_ref)
+                    .map_or(raw.as_slice(), |lossy| lossy.original.as_slice()),
             );
         }
         for (start, end) in spans {
@@ -27838,6 +27983,7 @@ mod tests {
                             ends_stream: false,
                             stitched: false,
                             dropped: DroppedText::default(),
+                            lossy: None,
                         }]),
                         Box::new(tail),
                         None,
@@ -27995,6 +28141,7 @@ mod tests {
                 ends_stream: false,
                 stitched: false,
                 dropped: DroppedText::default(),
+                lossy: None,
             },
             None,
         );
@@ -28056,6 +28203,7 @@ mod tests {
                 ends_stream: false,
                 stitched: false,
                 dropped: DroppedText::default(),
+                lossy: None,
             },
             None,
         );
@@ -28313,6 +28461,7 @@ mod tests {
                 ends_stream: false,
                 stitched: false,
                 dropped: DroppedText::default(),
+                lossy: None,
             },
             Some((3, 4)),
         );
@@ -28343,6 +28492,7 @@ mod tests {
                     ends_stream: false,
                     stitched: false,
                     dropped: DroppedText::default(),
+                    lossy: None,
                 },
                 None,
             )(),
@@ -30862,6 +31012,41 @@ mod tests {
         };
         let mut counter = LineCounter::at_seam(b"1\n2 [3", moved);
         assert_eq!(counter.read_end_line(1), 3);
+    }
+
+    /// #7934: a read of the bytes moved onto a file is counted in the bytes jq read, where a byte
+    /// the substitution replaced is one byte and not U+FFFD's three.
+    #[test]
+    fn moved_read_counts_the_bytes_jq_read_past_a_replacement_7934() {
+        // The previous file's open tail: an invalid byte in a string, then a long run of white
+        // space, with no line break; the byte at 4094 in the bytes as read ends jq's first read.
+        let mut moved = b"[\"\x80\",".to_vec();
+        moved.resize(4100, b' ');
+        let (text, edits) =
+            succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(&moved);
+        let mut stitched = text.into_bytes();
+        let base = stitched.len();
+        stitched.extend_from_slice(b"1]\n");
+        let mut original = moved.clone();
+        original.extend_from_slice(b"1]\n");
+        let seam = Seam { base, ..Seam::NONE };
+        let lossy = LossySource::new(original, edits);
+        // In the text that byte is at 4096, two bytes on for the replacement.
+        let at = 4094 + 2;
+        let by_text = LineCounter::at_seam(&stitched, seam.clone()).moved_read(at);
+        assert_eq!(
+            by_text,
+            Some((0, base)),
+            "counted over the text, the read runs on"
+        );
+        let by_bytes = LineCounter::at_seam(&stitched, seam)
+            .reading(Some(&lossy))
+            .moved_read(at);
+        assert_eq!(
+            by_bytes,
+            Some((0, 4095 + 2)),
+            "the first read ends after byte 4094"
+        );
     }
 
     /// #4376: what the stitch records about where a file's moved bytes came from, and a bare run

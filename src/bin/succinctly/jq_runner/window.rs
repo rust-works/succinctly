@@ -1297,6 +1297,25 @@ impl WindowedFile {
             }
         };
         self.nul_seen |= scan.nul;
+        if blanks_nul_tails && scan.nul {
+            // #7437: a number token's NUL tail, as the whole-file route blanks it
+            // (`blank_nul_number_tails_in`): the region is whole lines, so its reads are jq's, and
+            // its first line is the file's first when no line has been dropped, behind the BOM.
+            // Before the substitution, as there (#7934): jq's reads are counted in the bytes it read,
+            // where a replaced byte is one byte and not U+FFFD's three. The substitution adds no NUL
+            // (it writes U+FFFD), so a region with none has none after it.
+            let lead = if from == 0 && self.lines_before == 0 {
+                self.front_lead
+            } else {
+                0
+            };
+            succinctly::jq::blank_nul_number_tails(
+                &mut self.buf[from..end],
+                Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
+                lead,
+                &mut [],
+            );
+        }
         if scan.utf8 {
             self.validated = end;
         } else {
@@ -1309,22 +1328,6 @@ impl WindowedFile {
         }
         if self.blank_rs {
             blank_rs_bytes(&mut self.buf[from..self.validated]);
-        } else if blanks_nul_tails && scan.nul {
-            // #7437: a number token's NUL tail, as the whole-file route blanks it
-            // (`blank_nul_number_tails_in`): the region is whole lines, so its reads are jq's, and
-            // its first line is the file's first when no line has been dropped, behind the BOM.
-            // The substitution adds no NUL (it writes U+FFFD), so a region with none has none after it.
-            let lead = if from == 0 && self.lines_before == 0 {
-                self.front_lead
-            } else {
-                0
-            };
-            succinctly::jq::blank_nul_number_tails(
-                &mut self.buf[from..self.validated],
-                Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
-                lead,
-                &mut [],
-            );
         }
     }
 
