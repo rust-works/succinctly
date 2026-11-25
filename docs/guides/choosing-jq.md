@@ -139,7 +139,7 @@ longer slower (1.17x at 100 MB, 1.18x at 1 GB). Discarding a `--seq` input that 
 2026-11-12 showed slower too, is now faster (`users_seq_output` is 6.5x on the 7950X and 5.1x on the M4 Pro at 10 MB).
 That row writes no record, whatever its name says: `--seq` skips everything before the first RS, in both tools
 ([#7275](https://github.com/rust-works/succinctly/issues/7275)). `users_seq_records` is the same program over the
-document behind an RS, and no committed report has measured it yet.
+document behind an RS, and all three committed reports measure it: 2.2x on the 7950X and 1.9x on the M4 Pro at 10 MB.
 
 ### The program needs a jq 1.8 feature
 
@@ -175,7 +175,7 @@ exact RFC 8259 behaviour matters. Section C of each report.
 ## What this page does not cover
 
 - Inputs larger than 1 GB: the 1 GB tier (`--huge`, section D/E) times six rows, and nothing larger is measured.
-- Piped stdin in depth: section D/E times eight rows over a pipe against the same file named as an argument. A stream
+- Piped stdin in depth: section D/E times 6 queries, 24 rows, over a pipe against the same file named as an argument. A stream
   on a pipe is read a window at a time, as from a file (`ndjson_field_stdin` peaks at 5.5 MiB on the 7950X and 8.6 MiB
   on the M4 Pro at 100 MB). One document on a pipe is read whole before evaluation starts
   (`users_field_stdin`: 88 and 92 MiB, against jq's 599 and 618 MiB).
