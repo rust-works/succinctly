@@ -746,8 +746,9 @@ model of jq's input reader. The regex design study's corpus is there as five fam
 text passes read otherwise than Oniguruma (refused in other words, about 11,700 rows; a different refusal around the
 repeat-count limit, about 2,988; an answer where jq refuses, about 623; refused where jq answers, about 2,439; a
 different answer under `x`, about 1,620), left to the regex front-end proposal. No test pins either. The same change
-recorded #7924 and #7926, also with no test. #7928 to #7931, #7934 and #7935 are not yet recorded there; whether to
-record them before the release is the owner's decision.
+recorded #7924 and #7926, also with no test. #7931, #7934 and #7935 have since been fixed (#7941, #7942). A
+later change recorded #7928, #7929 and #7930 there, with three found after this snapshot (#7946, #7947 and #7948), all
+open and with no test.
 
 ### Three design proposals
 

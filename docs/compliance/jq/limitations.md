@@ -314,6 +314,13 @@ substitution into the more sensible WHATWG-consistent shape. See
 substitution-mechanism history and
 [#1717](https://github.com/rust-works/succinctly/issues/1717) for the algorithm fix itself.
 
+**After a caught input fault, a later string does not follow the rule ([#7947](https://github.com/rust-works/succinctly/issues/7947)).**
+A string read from the rest of the stream after a caught fault decodes an overlong, surrogate or out-of-range sequence as one U+FFFD per byte, the WHATWG count, where jq 1.7.1 and 1.8.2 give one U+FFFD for the sequence.
+With a file of `1 a"` and spaces to 4,095 bytes, then a quote, the bytes `E0 80 80`, a quote and a newline, the third value of `[limit(3; repeat(try input catch .))]` under `-n` is three U+FFFD here and one in both jq releases, after `1` and the fault `Invalid numeric literal at line 1, column 4`.
+A surrogate (`ED A0 80`) gives three here and one in jq, a sequence above U+10FFFF (`F4 90 80 80`) four here and one in jq, and `1 }"` in place of `1 a"` gives the same counts.
+The same string as a document of its own decodes as jq decodes it.
+Open as #7947; no test pins it.
+
 ## Under `-R -s`, a truncated lead byte just before a line break keeps the line break (#7866)
 
 The `--raw-input --slurp` row of the table above used to say that the whole buffer is jq's scope too, and that was wrong.
@@ -427,6 +434,13 @@ The family is wider than the issue's case: the number may sit in an array or an 
 No value is wrong: the error stands where jq has values, and with a small first file (followed by a large one or not), or the same bytes in one file, `succinctly jq` reads the number as jq does.
 In a 320,000-row differential of the input reader, 86 rows fall in this family, 65 of them on inputs where the two jq releases agree.
 It is left to a single model of jq's input reader that every route would consult, which is proposed and not decided; no test pins it.
+
+**`input_line_number` is one short after a NUL-ended number in a first read with no newline ([#7948](https://github.com/rust-works/succinctly/issues/7948)).**
+With 4,088 spaces, `123`, a NUL, six spaces and a newline in a file, `[., input_line_number]` is `[123,0]` here and `[123,1]` in jq 1.7.1 and 1.8.2.
+The number is read as both releases read it, and only the line count differs.
+Both releases count the newline their read reaches when the `123` starts at byte 4,087 to 4,090, and all three say `1` from byte 4,091 on.
+With the `123` at byte 4,085 or 4,086 jq 1.7.1 says `1`, and jq 1.8.2 says `0`, as `succinctly jq` does.
+#7948's second shape, a line counted past invalid UTF-8 after a fault, is recorded further down, beside #7938; no test pins either.
 
 ## A `-f` program file with a NUL byte is refused, as jq 1.8.2 refuses it; jq 1.7.1 ends the program at the NUL (#7434)
 
@@ -8114,6 +8128,25 @@ This is a different cost from the constant per call of #7699 (the section on rec
 Past about 4,200 levels the same program is refused at the native-stack floor (`Q/1 exceeded maximum recursion depth` for 5000, where jq prints `2423`), which that section records.
 Open as #7803; no test pins the cost.
 
+### A `try`/`catch` closure argument passed down a doubly recursive `def` (#7928)
+
+`def f(g; $n): if $n > 0 then f(try (g + (1, error("x"))) catch 0; $n - 1) + f(g; $n - 1) else g end; first(f(null; 4) | select(. > 30))` prints `32` here and in jq 1.7.1 and 1.8.2, and jq answers at once.
+On an Apple silicon laptop (indicative only) `succinctly jq` retires about 358 billion instructions, peaks at about 1.1 GB and takes about 16 s for it, where jq 1.7.1 retires 46 million in 2.6 MB.
+At depth 5 (`f(null; 5)`), where jq prints `80` at once, it had not answered after 90 s.
+[#7928](https://github.com/rust-works/succinctly/issues/7928) found the slowdown in the change for #7787, which settles more recursive calls before their consumer runs; a build from before it answers at once.
+A fix (#7939) was reverted for the release (#7945), because it refused tree recursions over `try … catch` closures that answer now: it took every read of a bare parameter to raise late, so such a call was no longer run to its value first, and `def f(g; $n): if $n > 0 then f(try g catch 0; $n - 1) + f(g; $n - 1) else g end; [f(1; 12)] | length`, which prints `1` in jq 1.7.1 and 1.8.2 and here, failed with `exceeded maximum recursion depth` from depth 11 or 12.
+Open as #7928; no test pins the cost.
+
+### A shared value that reaches a stage the owned evaluator does not answer is written out whole (#7946)
+
+`reduce range(24) as $i (0; [., .]) | . as $x | 1` prints `1` here and in jq 1.7.1 and 1.8.2.
+The value is an array whose two members are one array, 24 levels deep: jq holds each level once, by reference count, but the value's text as JSON doubles with each level.
+On an Apple silicon laptop `succinctly jq` peaks at about 97 MB and retires about 6.9 billion instructions, where jq 1.7.1 peaks at 2.5 MB and retires 44 million; at 20 levels it peaks at 10.7 MB and retires 475 million, so both grow nearly twofold a level.
+Without the `. as $x` stage it peaks at 3.8 MB and retires 48 million, so building the value is cheap and the stage is what costs; `[.[] | 1]`, `map(type)` and `[.[] | numbers]` in its place cost the same as the binding.
+The likely cause, which [#7946](https://github.com/rust-works/succinctly/issues/7946) names and has not confirmed, is the bridge from the owned evaluator: when none of its doors answers a stage, the whole value is written out as JSON and indexed again, and that text is exponential in the depth of a shared value.
+#7941 answered one such stage for #7935 (a comma with a `.[]` branch), and #7946 lists shapes it does not reach.
+Open as #7946; no test pins the cost.
+
 ### An `--argjson` value costs more to read than the same JSON through `--slurpfile` (#7881)
 
 This one is not a difference from jq, which was not measured; it is recorded as [#7881](https://github.com/rust-works/succinctly/issues/7881) states it.
@@ -8463,6 +8496,8 @@ Three differences remain.
   What it does not follow keeps the older shape rules of #6201: an alternation whose branches are of fixed, differing widths is refused here as in jq (`(?<=a|bc)`, `(?<!a(?:b|cd))`, `(?<=(?:a|bc){2})`), wherever it sits in a body this does not read.
   The bodies it does not read are those with a case-insensitive flag, a backreference, a nested lookaround, an atomic group or a comment, `\K`, `\G`, `\Z` or `\R`, a character that is not ASCII, a flag group, a quantified group that Oniguruma merges with another quantifier in a way the table of `onig_reduce_nested_quantifier` does not settle, a repeated class whose possessive reading depends on what the class holds (`(?<=\w*\d)`), and two groups of one name.
   Left accepted here though jq refuses them: `(?<=\R|a)` (`\R` is one or two characters) and a `$` (`(?<=a$)`, `(?<=a|b$)`).
+  A `\cX` control escape anywhere before a look-behind turns off its refusal of an alternation of differing widths, which both jq releases refuse with `invalid pattern in look-behind` ([#7930](https://github.com/rust-works/succinctly/issues/7930)).
+  `"a" | test("\\ca(?<=a|bc)")`, `test("a\\ca(?<=a|bc)")` and `test("\\c$+(?<=a|bc)")` are `false` here, where `x(?<=a|bc)` is refused as in jq; a backreference turns off the older rule for a body with a branch that is sure to match nothing (below), and both are open as #7930, with no test.
   Under the `x` flag or an inline `(?x)` the same rules read the pattern without the blanks and `#` comments the mode ignores, following the mode group by group (`(?x)`, `(?x:...)`, `(?-x)`), since [#7865](https://github.com/rust-works/succinctly/issues/7865): `(?x)(?<=a|bc)`, `(?-x)(?<=a|bc)` and `(?<= a | bc )` under `x` are refused as `(?<=a|bc)` is, and `(?<=a b|bc)` under `x` is accepted.
   Before, a pattern under `x` or with an inline flag group naming `x` skipped them and was answered.
   A brace that opens no interval for the blank it holds is the literal characters the mode leaves (`a{ 0}` is the four characters `a{0}`), and an option group that names only `x` is read as the option group it is, so its body is one of those the reader does not follow (`(?<=(?x:a)+)` is refused by jq and answered here, as `(?<=(?m:a)+)` is).
@@ -8474,6 +8509,7 @@ Three differences remain.
   A brace that opens no interval is the characters it is: `(?<=a{0 })` is a look-behind of five characters, where it was taken for one that matches nothing and answered `true`, and `(?<=a{0 }|bc)` is refused.
   An option run in a branch that is sure to match nothing makes the body no look-behind, as a branch written empty does: `(?<=(?i)a{0}|(a))` and `(?<=x|(?i)|bc)` are accepted, which the shape rules refused.
   Where such a body also holds `$`, `\z`, `\Z`, `\K`, `\G`, a look-ahead, an atomic group or a comment, or a group that captures in a pattern with a reference or a call, the older rule stands (`(?<=(a)|(?i))\1` is refused, as in jq).
+  The rule is kept for that pattern, not for every pattern with a reference ([#7930](https://github.com/rust-works/succinctly/issues/7930), open, no test): jq refuses each of these on `"ab"`, and here `\1(?<=(a)|)`, `(?<=(a)|)\1`, `(?<=(a)|a{0})\1` and `\k<1-1>(?<=(a)|a{0})` are `false` and `(?<=(a?)|(?i))\1` is `true`.
   A look-behind inside another is judged on its own, and one that such a branch makes no look-behind is nothing for the outer one to differ over (`(?<=(?<=(?-i)|ab))` and `(?<=(?<=a)b|(?i))` are accepted).
   A `\z` or a `\Z` is allowed in no look-behind, and is refused where the shape rules read the body (`(?<=a\z)`, `(?<!\Z)`, `(?<=(a|b\z))`); `(?<=\z|)`, whose body is written as its empty node first, is still answered.
   Where the whole pattern is matched without regard to case (the `i` flag or a leading `(?i)`, and no option run that turns `i` off), a class that is not negated and holds a character whose folding is longer than itself (`ß` folds to `ss`) has no one length, and the look-behind it stands in is refused as in jq: `"a" | test("(?<=[[:alpha:]])"; "i")`.
@@ -8699,6 +8735,11 @@ They are left to that proposal, which is not decided, and no test pins them; eve
   `\p{Foo}a{2,1}` and `\p{Foo}\k<m>` are `invalid character property name {Foo}` in jq, and `upper is smaller than lower in repeat range` and `undefined name <m> reference` here.
   `\xC3\xAz` is `invalid code point value` in jq and `too short multibyte code string` here.
   `(a)(?(+1)a)` is `invalid backref number/name` in jq and `target of repeat operator is not specified` here.
+  A malformed group reference is reported after a later error, where Oniguruma reports it first: `\k<1 >{2,1}` is `invalid group name <1 >` in jq and `upper is smaller than lower in repeat range` here, `\k<1 >{1,100001}` is `too big number for repeat range` here and `\k<1 >\k<1-1>)` is `unmatched close parenthesis`.
+  A call's name is reported late the same way (`\g<-0>\p{` is `invalid group name <-0>` in jq and `end pattern with unmatched parenthesis` here).
+  The other way round, `(?~\k<1-1>` and `(?!\k<1+0>` are `end pattern with unmatched parenthesis` in jq and `invalid backref number/name` here.
+  Under the `x` flag, an option group with a blank before its `)` is `undefined group option` in jq, and a later error here: `(?i ) ?`, `(?i )(?= ?)` and `(?ix )(?<= ?)` are `target of repeat operator is not specified`.
+  The pre-release differential found these, and the shapes of #7929 in two of the families below, as changes from a build before the fixes for #7887 and #7888; they are open as [#7929](https://github.com/rust-works/succinctly/issues/7929).
   Only the message differs: neither tool gives a value.
 - **A different refusal where the repeat-count limit is involved (about 2,988 rows).** The count check reads the digits after a `{` inside a name as an interval.
   `\k<a{100001}>`, `\g<a{100001}>` and `(?<a{100001}` are `too big number for repeat range` here, and `invalid char in group name <a{100001}>`, `undefined name <a{100001}> reference` and `invalid group name <a{100001>` in jq.
@@ -8706,9 +8747,11 @@ They are left to that proposal, which is not decided, and no test pins them; eve
   The other way round, it misses a count jq reads in a class that holds `[:` and a later `:]`: `"a" | test("[a[:b]{100001}c:]]")` is `too big number for repeat range` in jq and `false` here, an answer where jq has none.
 - **An answer where jq refuses for another reason (about 623 rows, 509 of them `invalid backref number/name` in jq).** These are values jq never gives, so a program that catches the error gets a match result instead.
   `"a" | test("(?(-1)a)")` is `true` here and `"a" | test("(a)(?(-2)a)")` is `false`, where both jq releases refuse them with `invalid backref number/name`.
+  So does a reference at a recursion level to a group the pattern does not have, when a `\c(` follows it: `"a" | test("\\k<1-1>\\c(")` is `false` here and `[match("\\k<1-1>\\c(")]` is `[]` (#7929).
 - **Refused here in Oniguruma's words, where jq answers (about 2,439 rows, 1,617 of them under `x`).** A scan misreads the text and makes a refusal jq does not.
   On `"a"`, `test("^\\c\\A*$")` is `target of repeat operator is invalid` here, `test("(?+1)(a)")` is `undefined group option` and `test("(a)(?(<-1>)a)")` is `undefined name <-1> reference`, and on `"xy"` `test("^(?<a[>x)((?i)y)\\2$")` is `invalid backref number/name`; each is `false` in jq.
   #7877 and #7878 (above) are two shapes of this family under `x`.
+  On `"x"`, `test("\\k{n}(?<=(?i)|(a))")` and `test("(?<=(?:(?i)a{0}|(a))){a}")` are `invalid pattern in look-behind` here and `false` in jq, and `test("(?<=(?:(?i)a{0}|(a)))")` is the same error here and `true` in jq; without the `(?:…)` around the body, the look-behind is answered as in jq (#7929).
 - **A different answer under `x` (about 1,620 rows).** These are wrong answers, not refusals; the first item of #7887 (a group in a look-behind that keeps its text, recorded under #5502) is one shape.
   Another: under `x` jq reads a no-break space (U+00A0) as itself, where the scans here skip it as a blank (`"a " | test("^a +$"; "x")` is `true` in jq and `false` here).
   So `a*`, a no-break space and `+` is the possessive `a*+` here, and so it is with U+3000, U+0085, U+2003 or a vertical tab in its place: `"aa" | test("a* +"; "x")` is `true` here and `false` in jq, and `"aa" | [match("a* +"; "gx") | .string]` is `["aa",""]` here and `[]` in jq (found by the pre-release differential, #7926).
@@ -11425,6 +11468,10 @@ A program that read on past a caught fault met the moved resumption point as a f
 And behind a byte-order mark, whose three bytes #7569 counts in the first read, the resumption point could fall inside a number and read part of it as a value jq never reads, which ran the program again and made the run exit 0 where jq exits 5 ([#7934](https://github.com/rust-works/succinctly/issues/7934); [#7931](https://github.com/rust-works/succinctly/issues/7931) has the `(at f:0)` and double-fault shapes).
 A file that starts inside a replacement, with a character's bytes cut across two files, has its reads counted from its own first byte, inside that replacement, where they were counted from the replacement's end.
 The windowed document loop still counts a value's line over the window's text, since a window does not keep the substitution's edits: on a regular file of 4 MiB or more, a runtime error's `(at …)` line for a value just past a read boundary after invalid UTF-8 on a long line can be one short ([#7938](https://github.com/rust-works/succinctly/issues/7938)).
+`input_line_number` past a fault on a first line that holds invalid UTF-8 can be one short too, on a file of any size ([#7948](https://github.com/rust-works/succinctly/issues/7948)).
+Over a 4,083-byte line of spaces that holds five strings with six invalid bytes in them, a `1`, a bare `0xC3` byte at offset 4,079 and a newline at offset 4,082, `select(type == "number") | input_line_number` prints `0` here, where jq 1.7.1 and 1.8.2 print `1`; all three report the parse error at column 4081 and exit 5.
+With every byte above `0x7F` written as `z`, `succinctly jq` gives `1` too, so on this route the line is counted over the text with U+FFFD in it, as #7938's is.
+Open as #7948, whose other shape, after a NUL, is in the section on NUL bytes near the top of this page; no test pins either.
 A sibling with the same symptom as #7934 on input that is ASCII but for the mark and a NUL has another cause and is not fixed by this ([#7937](https://github.com/rust-works/succinctly/issues/7937)): the NUL pass rewrites a number that a fault's dropped read splits, and the resume reads part of it.
 Since the reads are counted where jq's are, a shape with invalid UTF-8 before such a number reaches it as its ASCII twin does (a mark, a surrogate's three bytes before `]123`, a NUL and a newline one byte past the end of the second read print `[]` and exit 0, where before #7934 the run exited 5 with the fault named a line late).
 The column a parse error names is counted over the bytes jq read, an invalid byte one column, since [#5964](https://github.com/rust-works/succinctly/issues/5964) (`\xff }` is column 2).
