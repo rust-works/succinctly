@@ -77,6 +77,10 @@ fn is_macos(report: &Value) -> bool {
     report["env"]["system"]["os"] == "macos"
 }
 
+fn is_x86_64(report: &Value) -> bool {
+    report["env"]["system"]["arch"] == "x86_64"
+}
+
 /// A tool's binary size: stripped as the release archive is where the report has it (#7383), as
 /// built otherwise.
 fn binary_bytes(report: &Value, tool: &str) -> f64 {
@@ -166,10 +170,10 @@ const CLAIMS: &[Claim] = &[
         let g = geomean(r, streams);
         g > 1.1 && g < 2.5
     }),
-    // And small inputs are where there is no measurable gain: about 1x either side.
+    // And small inputs are where the gain is smallest: about 1x on the Arm machines, 1.5x on the 7950X.
     ("category-small-inputs", |r| {
         let g = geomean(r, small_inputs);
-        g > 0.8 && g < 1.3
+        g > 0.8 && g < 1.7
     }),
     // One large document: 8x for `-c .`, 2x for the pretty-printed identity, 5x for a field read.
     ("pass-through-large", |r| {
@@ -193,14 +197,14 @@ const CLAIMS: &[Claim] = &[
             .iter()
             .all(|input| speedup(r, "strings_upcase", input) > 25.0)
     }),
-    // On macOS jq starts faster and keeps a lead on the small object-heavy documents; on Linux the two
-    // start in about the same time, within 15% either way.
+    // On macOS jq starts faster and keeps a lead on the small object-heavy documents; on Linux jq is at
+    // most 15% faster to start (0.92x on the Neoverse-V2), and `succinctly jq` is 1.23x on the 7950X.
     ("startup", |r| {
         let startup = speedup(r, "startup", "none");
         if is_macos(r) {
             startup < 0.8 && speedup(r, "corpus_tabular_group", "corpus-tabular") < 1.0
         } else {
-            startup > 0.85 && startup < 1.15
+            startup > 0.85 && startup < 1.35
         }
     }),
     // A stream is read a window at a time (#6920 and its slices): under 24 MiB at 100 MB for every
@@ -226,14 +230,20 @@ const CLAIMS: &[Claim] = &[
                 "ndjson-100mb",
             ) < 24.0
     }),
-    // One stream shape where jq is the faster tool, and discarding a `--seq` input with no RS byte
-    // (what `users_seq_output` times, #7275), which no longer is.
+    // One stream shape where jq is the faster tool on the Arm machines and no longer on the 7950X, and
+    // discarding a `--seq` input with no RS byte (what `users_seq_output` times, #7275), which no longer
+    // is anywhere.
     ("stream-abandon", |r| {
-        speedup(r, "ndjson_inputs_first", "ndjson-100mb") < 1.0
-            && speedup(r, "users_seq_output", "users-10mb") > 1.5
+        let first = speedup(r, "ndjson_inputs_first", "ndjson-100mb");
+        (if is_x86_64(r) {
+            first > 1.0
+        } else {
+            first < 1.0
+        }) && speedup(r, "users_seq_output", "users-10mb") > 1.5
     }),
-    // jq 1.8.2's own tests: most of `jq.test` agrees (the guide says 475 of 550), some does not, and all of
-    // 1.7.1's does.
+    // jq 1.8.2's own tests: most of `jq.test` agrees (the guide says 488 of 550), some does not, and all of
+    // 1.7.1's does except where succinctly follows 1.8 on purpose: a 1.7.1 program that differs must be a
+    // `newer-than-primary` entry of the report's ledger (the guide names `fromjson | isnan`, #7522).
     ("jq-1-8", |r| {
         let secondary = suite(r, "differential_secondary", "upstream-1.8.2-jq.test");
         let primary = suite(r, "differential", "upstream-jq.test");
@@ -241,7 +251,22 @@ const CLAIMS: &[Claim] = &[
             secondary["total"].as_f64().unwrap(),
             secondary["matching"].as_f64().unwrap(),
         );
-        matching < total && matching / total > 0.8 && primary["total"] == primary["matching"]
+        let newer: Vec<&str> = r["known_divergences"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|d| d["category"] == "newer-than-primary")
+                    .filter_map(|d| d["id"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let primary_differs_only_as_1_8 = primary["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .filter(|row| row["matches"] != true)
+            .all(|row| newer.contains(&row["id"].as_str().unwrap_or("")));
+        matching < total && matching / total > 0.8 && primary_differs_only_as_1_8
     }),
     // 23x to 27x stripped (10x to 24x as built): more than eight times the size of jq 1.7.1 either way. A
     // report from a run after #7383 carries stripped sizes, and the check reads them where present.
