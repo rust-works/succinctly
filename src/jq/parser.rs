@@ -6680,7 +6680,7 @@ impl<'a> Parser<'a> {
                         // (#3044/#3075) and `-0` kept its sign.
                         Literal::NumberLiteral(repr, text)
                             if self.mode == ParserMode::Jq
-                                && crate::jq::value::literal_is_zero(&text[1..]) =>
+                                && crate::jq::value::literal_rounds_to_zero(&text[1..]) =>
                         {
                             let repr = match repr {
                                 NumberRepr::Int(_) => NumberRepr::Int(0),

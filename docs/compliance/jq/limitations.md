@@ -13963,20 +13963,12 @@ comparison order in jq, and may group differently here.
 jq 1.7.1 keeps a parsed `Infinity` (`infinity`, `+Infinity`, `-Infinity`, from a document, `fromjson`, `tonumber`, `--argjson` or `--jsonargs`) as a decNumber literal, not as the `f64` infinity the section above describes.
 Two literals compare as exact decimals, so it orders past every finite literal, one past `DBL_MAX` included: `printf Infinity | jq '. > 1e1000'` is `true`, `[., 1e1000] | unique` keeps both and `max` picks it.
 Against a computed double it compares as the double infinity (`. == infinite`, `(. + 0) == 1e1000` are `true`), and it prints as `DBL_MAX` either way.
+A literal past decNumber's `Emax` of 999999999 is that same infinity to jq, which overflows it at parse time, so `. == 1e1000000000` is `true` in both releases and, since #7924, here.
 succinctly read it as the computed infinity, so `. == 1e1000` was `true`; it is now a literal whose text is decNumber's word, printed as jq prints it (`OwnedValue::parsed_infinity`).
 Negating it keeps it a literal, as #7453 negates every literal after jqlang/jq#3242, so `-. | . == -1e1000` is `false`, jq 1.8.2's answer, where jq 1.7.1, whose `-` computes a double, says `true`.
 Its `length` keeps it a literal too, as #7534 keeps every literal's after jqlang/jq#3275, so `-Infinity | length > 1e1000` is `true` and `length == 1e1000` is `false`, jq 1.8.2's answers, where jq 1.7.1, whose `length` is `fabs` of the double, says `false` and `true`.
 Under `--preserve-input` (a succinctly extension that echoes a number's source spelling) it now prints as `Infinity` inside a constructed value too (`[., 1]`), as it already did at the top level.
 yq mode keeps the bare double.
-
-### A literal past decNumber's smallest exponent prints as jq rounds it, and compares as written
-
-jq keeps a number literal as a decNumber, and one written with an exponent of -1147483647 or below comes out rounded: `1e-1147483647` and `1e-1999999999` print as the zero `0E-1147483646`, and `12e-1147483647` as `1E-1147483646`, in jq 1.7.1, jq 1.8.2 and `succinctly jq` alike.
-jq compares the rounded value, and `succinctly jq` compares the literal as written, so these are wrong answers here: `1e-1999999999 == 0` and `12e-1147483647 == 1e-1147483646` are `true` in both jq releases and `false` here, `1e-1999999999 > 0` is `false` in jq and `true` here, `[1e-1999999999, 0] | unique` is `[0E-1147483646]` in jq and `[0,0E-1147483646]` here, and `[1e-1999999999] | min == 0` is `true` in jq and `false` here.
-A number read from the input or from `--argjson` is read the same way (`echo '[1e-1999999999, 0]' | jq '.[0] == .[1]'` is `true` in jq and `false` here).
-Negating one keeps the sign of its digits, where #7453 negates a literal zero to a positive zero as jq 1.8.2 does: `-1e-1999999999`, `1e-1999999999 | -.` and `-$a` for `--argjson a 1e-1999999999` print `-0E-1147483646` here, `0E-1147483646` in jq 1.8.2 and `-0` in jq 1.7.1 (whose `-` computes a double), while one written as a zero (`-0e-999999999999999999999999999999`) is `0E-1147483646` here as in jq 1.8.2.
-Arithmetic is not affected, since a computed number is a double: `1e-1999999999 * 1` is `0` in all three.
-This is not a permitted divergence, only one not yet fixed (found by the pre-release differential, #7924, no test).
 
 ### Two equally long slices of one array are `==` in jq, and are compared by content here (#7459)
 
