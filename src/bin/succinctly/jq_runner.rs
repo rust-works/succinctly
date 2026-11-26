@@ -8133,6 +8133,11 @@ struct ModelRead {
     /// The parser is in its `Malformed BOM` state: the last item is that fault, and every read
     /// after it is that fault again.
     malformed_bom: bool,
+    /// Under a slurp, the faults read by the calls after the one that returned the array. jq
+    /// 1.7.1's slurp loop stops at the last data read when nothing is left in the buffer, so a
+    /// fault the end of input raises comes after the array (`-s .` over `2"` prints `[2]`, then the
+    /// parse error); jq 1.8.2's loop reads the closing refill first, so its faults all come ahead.
+    slurp_tail: Vec<reader_model::Item>,
 }
 
 impl ModelRead {
@@ -8148,6 +8153,8 @@ impl ModelRead {
             slurp,
         );
         let mut items = Vec::new();
+        let mut slurp_tail = Vec::new();
+        let mut slurp_end = None;
         if slurp {
             // Each call returns a fault, or at last the array: the faults come first here, and
             // the members after them.
@@ -8176,6 +8183,19 @@ impl ModelRead {
                     reader_model::Step::Value(_) | reader_model::Step::End => break,
                 }
             }
+            // The array's position is where the reader stood when it returned it; what the reader
+            // reads after that is a run that no longer slurps.
+            slurp_end = Some(reader.position());
+            if !reader.malformed_bom() {
+                while let Some(item) = reader.next_item() {
+                    if matches!(item, reader_model::Item::Fault { .. }) {
+                        slurp_tail.push(item);
+                    }
+                    if reader.malformed_bom() {
+                        break;
+                    }
+                }
+            }
         } else {
             while let Some(item) = reader.next_item() {
                 items.push(item);
@@ -8186,14 +8206,16 @@ impl ModelRead {
         }
         Self {
             items,
-            end: reader.position(),
+            end: slurp_end.unwrap_or_else(|| reader.position()),
             malformed_bom: reader.malformed_bom(),
+            slurp_tail,
         }
     }
 
     fn faults(&self) -> usize {
         self.items
             .iter()
+            .chain(&self.slurp_tail)
             .filter(|item| matches!(item, reader_model::Item::Fault { .. }))
             .count()
     }
@@ -8235,6 +8257,37 @@ fn build_from_model(
     *resume_slurp_done = resume_slurp;
     let resumes = track_eof && (!args.slurp || resume_slurp);
     let (mut model_values, mut model_faults, mut refused) = (0usize, 0usize, 0usize);
+    // Under a slurp, a fault read after the array (jq 1.7.1's loop) is queued behind it: a program
+    // that reads on meets it after the array (`SLURP_TAIL_INDEX`), and the main loop reports it as
+    // its parse error once the array has run.
+    for item in read.slurp_tail {
+        if let reader_model::Item::Fault {
+            message,
+            source,
+            line,
+        } = item
+        {
+            model_faults += 1;
+            let (src, line) = model_place(source, line);
+            let line = if line == usize::MAX {
+                UNKNOWN_LINE
+            } else {
+                line as u64
+            };
+            let fault = TrailingParseError {
+                error: EvalError::new(message),
+                source: src,
+                line,
+                seq_warning: false,
+                as_parse_error: !resumes,
+            };
+            if resumes {
+                resumed_errors.push((SLURP_TAIL_INDEX, fault));
+            } else if !args.null_input && trailing_error.is_none() {
+                *trailing_error = Some(fault);
+            }
+        }
+    }
     for item in read.items {
         match item {
             reader_model::Item::Value { text, source, line } => {
@@ -8300,6 +8353,10 @@ fn build_from_model(
     reader_model::trace(route, model_values, model_faults, refused);
     None
 }
+
+/// PROTOTYPE (reader model): the `resumed_errors` index of a fault a slurp's reader met after the
+/// call that returned the array; the slurp's queue puts it behind the array.
+const SLURP_TAIL_INDEX: usize = usize::MAX;
 
 /// PROTOTYPE (reader model): a model position as [`InputLocations::push`] takes it: the source,
 /// and the line, `usize::MAX` for a position with no file.
@@ -9956,6 +10013,13 @@ fn read_inputs(
         // have returned.
         let mut fault_text: Option<Vec<u8>> = None;
         let mut slurp_failure: Option<anyhow::Error> = None;
+        // PROTOTYPE (reader model): invalid UTF-8 is an edge too (#7938, #7947). The decoding
+        // above already found it (`lossy_sources`), so no byte is read again to know it; the bytes
+        // of a lone source as read are kept only then.
+        let lossy_seen = model_scope && lossy_sources.iter().any(Option::is_some);
+        if lossy_seen && last == 0 {
+            fault_text = lossy_sources[0].as_ref().map(|lossy| lossy.original.clone());
+        }
         LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
         LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
         LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
@@ -10013,13 +10077,6 @@ fn read_inputs(
                         seam,
                         more,
                     );
-        // PROTOTYPE (reader model): invalid UTF-8 is an edge too (#7938, #7947). The decoding
-        // above already found it (`lossy_sources`), so no byte is read again to know it; the bytes
-        // of a lone source as read are kept only then.
-        let lossy_seen = model_scope && lossy_sources.iter().any(Option::is_some);
-        if lossy_seen && last == 0 {
-            fault_text = lossy_sources[0].as_ref().map(|lossy| lossy.original.clone());
-        }
                     if pos == last {
                         mark_lazy_stream_end(!unopened_tail);
                     }
@@ -10470,11 +10527,13 @@ fn read_inputs(
             // #6480: the faults go ahead of the array, the one at the end of the text included.
             slurped_locations.fault_at_tail = locations.fault_at_tail;
             slurped_locations.push(src as usize, line as usize);
+            // PROTOTYPE (reader model): a fault met after the array goes behind it.
             let mut ahead: Vec<(usize, TrailingParseError)> = resumed_errors
                 .into_iter()
-                .map(|(_, fault)| (0, fault))
+                .map(|(at, fault)| (usize::from(at == SLURP_TAIL_INDEX), fault))
                 .collect();
             ahead.extend(trailing_error.take().map(|fault| (0, fault)));
+            ahead.sort_by_key(|(at, _)| *at);
             return Ok(Ok((slurped, slurped_locations, None, ahead)));
         }
         // No array, no location: the queue of a program that reads `input` holds nothing (#6589).
