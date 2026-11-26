@@ -760,8 +760,8 @@ unpushed branch. They are proposals, not decisions:
   as jq does, instead of substituting the body per call on the native stack (it would amend
   [ADR-0020](../adrs/adr-0020.md) and [ADR-0025](../adrs/adr-0025.md)).
 - **Regex** (#7864, #7877, #7878, #7887): compile and match jq-mode patterns with Oniguruma itself, at the commit jq
-  1.7.1 pins, and read the pattern text once (it would supersede [ADR-0019](../adrs/adr-0019.md), a decision the
-  owner makes).
+  1.7.1 pins, and read the pattern text once. Accepted as [ADR-0031](../adrs/adr-0031.md), which supersedes
+  [ADR-0019](../adrs/adr-0019.md); the migration is tracked in #7965.
 - **Input reader** (#7904, #7921, #7922): read jq-mode input through one model of jq's reader, entered at sync points,
   with the semi-index running between them (the first ADR for the input layer).
 
