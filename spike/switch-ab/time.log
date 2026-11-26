@@ -1,0 +1,55 @@
+== identity_compact users-10mb
+identity_compact on users-10mb.json: 27 binaries x 12 reps, output identical
+layout spread M: 8 seeds, range 4.38%, sd 1.67% (medians 20.34-21.24 ms)
+layout spread P: 8 seeds, range 4.80%, sd 1.74% (medians 20.05-21.04 ms)
+layout spread P0: 8 seeds, range 3.52%, sd 1.30% (medians 20.33-21.06 ms)
+naive P/M (unseeded links): -0.37%
+paired P/M over 8 seeds: -0.69% +/- 2.10% (95% CI, includes 0); per seed +3.3, -1.8, -3.4, -3.3, -1.8, -0.5, -0.8, +2.7
+naive P0/M (unseeded links): +1.66%
+paired P0/M over 8 seeds: -0.19% +/- 1.19% (95% CI, includes 0); per seed +1.0, +1.6, -2.1, -1.2, -0.6, +0.2, -1.7, +1.3
+naive P/P0 (unseeded links): -2.00%
+paired P/P0 over 8 seeds: -0.51% +/- 1.59% (95% CI, includes 0); per seed +2.3, -3.4, -1.4, -2.1, -1.2, -0.6, +0.9, +1.5
+== ndjson_identity ndjson-10mb
+ndjson_identity on ndjson-10mb.json: 27 binaries x 12 reps, output identical
+layout spread M: 8 seeds, range 1.43%, sd 0.50% (medians 52.93-53.69 ms)
+layout spread P: 8 seeds, range 3.57%, sd 1.11% (medians 52.32-54.21 ms)
+layout spread P0: 8 seeds, range 3.44%, sd 1.17% (medians 52.50-54.33 ms)
+naive P/M (unseeded links): -3.07%
+paired P/M over 8 seeds: -0.41% +/- 1.19% (95% CI, includes 0); per seed +0.6, -1.3, -0.5, -2.6, +0.4, -1.9, +0.4, +1.6
+naive P0/M (unseeded links): -1.37%
+paired P0/M over 8 seeds: -0.36% +/- 1.24% (95% CI, includes 0); per seed +0.7, -1.6, +0.1, -2.2, +0.7, -2.2, -0.1, +1.8
+naive P/P0 (unseeded links): -1.72%
+paired P/P0 over 8 seeds: -0.05% +/- 0.30% (95% CI, includes 0); per seed -0.1, +0.3, -0.5, -0.4, -0.3, +0.2, +0.5, -0.2
+== ndjson_slurp ndjson-10mb
+ndjson_slurp on ndjson-10mb.json: 27 binaries x 12 reps, output identical
+layout spread M: 8 seeds, range 1.43%, sd 0.41% (medians 68.66-69.65 ms)
+layout spread P: 8 seeds, range 2.06%, sd 0.61% (medians 67.95-69.37 ms)
+layout spread P0: 8 seeds, range 1.88%, sd 0.58% (medians 68.11-69.41 ms)
+naive P/M (unseeded links): -0.14%
+paired P/M over 8 seeds: -0.58% +/- 0.68% (95% CI, includes 0); per seed +1.0, -1.0, -0.5, -1.9, -0.4, -1.0, -0.5, -0.5
+naive P0/M (unseeded links): +0.07%
+paired P0/M over 8 seeds: -0.57% +/- 0.73% (95% CI, includes 0); per seed +1.1, -0.9, -0.1, -1.6, -1.0, -1.4, -0.5, -0.1
+naive P/P0 (unseeded links): -0.22%
+paired P/P0 over 8 seeds: -0.01% +/- 0.29% (95% CI, includes 0); per seed -0.1, -0.0, -0.3, -0.2, +0.6, +0.5, -0.0, -0.4
+== ndjson_inputs_reduce ndjson-10mb
+ndjson_inputs_reduce on ndjson-10mb.json: 27 binaries x 12 reps, output identical
+layout spread M: 8 seeds, range 3.92%, sd 1.29% (medians 65.61-68.22 ms)
+layout spread P: 8 seeds, range 3.58%, sd 1.22% (medians 65.43-67.81 ms)
+layout spread P0: 8 seeds, range 3.31%, sd 1.24% (medians 65.50-67.70 ms)
+naive P/M (unseeded links): +2.12%
+paired P/M over 8 seeds: -0.03% +/- 1.46% (95% CI, includes 0); per seed -1.6, -2.1, +2.5, -1.4, +1.5, -0.6, +1.9, -0.3
+naive P0/M (unseeded links): +2.34%
+paired P0/M over 8 seeds: -0.02% +/- 1.51% (95% CI, includes 0); per seed -2.1, -2.1, +2.5, -1.3, +1.7, -0.5, +1.7, -0.1
+naive P/P0 (unseeded links): -0.21%
+paired P/P0 over 8 seeds: -0.01% +/- 0.20% (95% CI, includes 0); per seed +0.5, -0.1, -0.0, -0.2, -0.2, -0.1, +0.2, -0.2
+== identity_compact users-1mb
+identity_compact on users-1mb.json: 27 binaries x 20 reps, output identical
+layout spread M: 8 seeds, range 6.37%, sd 2.39% (medians 3.49-3.72 ms)
+layout spread P: 8 seeds, range 2.55%, sd 1.03% (medians 3.56-3.65 ms)
+layout spread P0: 8 seeds, range 6.30%, sd 2.11% (medians 3.52-3.75 ms)
+naive P/M (unseeded links): +1.68%
+paired P/M over 8 seeds: +0.54% +/- 1.65% (95% CI, includes 0); per seed -1.1, +1.5, +1.4, +4.2, +0.3, +1.3, -2.1, -1.1
+naive P0/M (unseeded links): +2.33%
+paired P0/M over 8 seeds: +1.65% +/- 1.72% (95% CI, includes 0); per seed +1.0, +4.3, +2.5, +4.1, -1.4, +2.6, +0.6, -0.4
+naive P/P0 (unseeded links): -0.64%
+paired P/P0 over 8 seeds: -1.08% +/- 1.23% (95% CI, includes 0); per seed -2.0, -2.7, -1.1, +0.0, +1.7, -1.2, -2.7, -0.7

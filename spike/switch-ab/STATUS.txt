@@ -1,0 +1,39 @@
+2026-11-26T13:45:36Z driver start, pid 2286480
+2026-11-26T13:45:36Z step fetch start (cap 900s)
+2026-11-26T13:45:38Z step fetch rc=0
+2026-11-26T13:45:38Z step build-M waiting for layout-seeds' build
+2026-11-26T13:46:38Z step build-M waiting for layout-seeds' build
+2026-11-26T13:47:38Z step build-M waiting for layout-seeds' build
+2026-11-26T13:48:38Z step build-M waiting for layout-seeds' build
+2026-11-26T13:49:38Z step build-M start (cap 1800s)
+2026-11-26T13:50:19Z driver SIGSTOPped after build-M (Machines: pause until layout-seeds timing is done)
+2026-11-26T13:52:52Z build M: 1455 listed, 1338 found, 1445 symbols ordered (rustc links with lld) 
+2026-11-26T14:00:42Z driver SIGCONT after layout-seeds timing
+2026-11-26T14:00:42Z step build-M rc=0
+2026-11-26T14:00:42Z step build-P start (cap 1800s)
+2026-11-26T14:03:59Z build P: 1455 listed, 1339 found, 1446 symbols ordered (rustc links with lld) 
+2026-11-26T14:03:59Z step build-P rc=0
+2026-11-26T14:03:59Z step relinks start (cap 900s)
+2026-11-26T14:04:00Z relink control M: byte-identical
+2026-11-26T14:04:02Z relink control P: byte-identical
+2026-11-26T14:04:05Z step relinks rc=0
+2026-11-26T14:04:05Z step probe start (cap 1200s)
+2026-11-26T14:04:05Z probe users-1mb '.': P fb4738267153 rc=0 P0 fb4738267153 rc=0 M fb4738267153 rc=0 trace_lines=0
+2026-11-26T14:04:05Z probe ndjson-1mb '.': P f216dc3cb8e4 rc=0 P0 f216dc3cb8e4 rc=0 M f216dc3cb8e4 rc=0 trace_lines=0
+2026-11-26T14:04:05Z probe ndjson-nul-eof-1mb '.': P f216dc3cb8e4 rc=5 P0 f216dc3cb8e4 rc=5 M f216dc3cb8e4 rc=5 trace_lines=1
+2026-11-26T14:04:05Z probe ndjson-nul-mid-1mb '.': P b7847e120bcf rc=5 P0 b7847e120bcf rc=5 M b7847e120bcf rc=5 trace_lines=1
+2026-11-26T14:04:05Z probe ndjson-ef-1mb '.': P e3b0c44298fc rc=5 P0 e3b0c44298fc rc=5 M e3b0c44298fc rc=5 trace_lines=1
+2026-11-26T14:04:06Z Ir M jq -c . users-1mb: I   refs:      23,909,580
+2026-11-26T14:04:06Z Ir P jq -c . users-1mb: I   refs:      23,912,750
+2026-11-26T14:04:06Z Ir P0 jq -c . users-1mb: I   refs:      23,913,594
+2026-11-26T14:04:07Z Ir M jq -c . ndjson-1mb: I   refs:      92,914,339
+2026-11-26T14:04:07Z Ir P jq -c . ndjson-1mb: I   refs:      92,920,481
+2026-11-26T14:04:08Z Ir P0 jq -c . ndjson-1mb: I   refs:      92,921,325
+2026-11-26T14:04:08Z Ir M jq -c . ndjson-nul-mid-1mb: I   refs:      88,948,595
+2026-11-26T14:04:09Z Ir P jq -c . ndjson-nul-mid-1mb: I   refs:      88,950,639
+2026-11-26T14:04:09Z Ir P0 jq -c . ndjson-nul-mid-1mb: I   refs:      88,951,483
+2026-11-26T14:04:09Z step probe rc=0
+2026-11-26T14:04:09Z step clean start (cap 600s)
+2026-11-26T14:04:09Z step clean rc=0
+2026-11-26T14:04:09Z READY for timing
+2026-11-26T14:08:39Z timing start
