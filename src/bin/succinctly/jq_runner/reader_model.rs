@@ -529,8 +529,8 @@ impl<'a> Parser<'a> {
                 .unwrap_or_default();
             // `jv_number_with_literal`: decNumber's grammar. The crate's one definition of it
             // refuses a NaN payload as jq 1.8 does; 1.7.1 accepts `nan5`.
-            if !crate::cli::jq_seq_reader::number_is_valid(c_string)
-                && !(self.nan_payload && is_nan_with_payload(c_string))
+            if !(crate::cli::jq_seq_reader::number_is_valid(c_string)
+                || (self.nan_payload && is_nan_with_payload(c_string)))
             {
                 return Err("Invalid numeric literal");
             }
