@@ -5,10 +5,10 @@ The subset of two jq releases that jq's input reader needs: `jq_util_input_*` (`
 decNumber cannot be dropped: without it literals collapse to doubles (`1.0e2` prints as `100`, `1E1000` as
 `1.7976931348623157e+308`).
 
-| Directory    | Release tarball (github.com/jqlang/jq releases) | sha256 of the tarball                                              |
-|--------------|-------------------------------------------------|--------------------------------------------------------------------|
-| `jq-1.7.1/`  | `jq-1.7.1.tar.gz`                               | `478c9ca129fd2e3443fe27314b455e211e0d8c60bc8ff7df703873deeee580c2` |
-| `jq-1.8.2/`  | `jq-1.8.2.tar.gz`                               | `71b8d6e8f5fe81f6c6d0d110e3892251f6ce76ed095abd315e26e6e1193af3af` |
+| Directory   | Release tarball (github.com/jqlang/jq releases) | sha256 of the tarball                                              |
+|-------------|-------------------------------------------------|--------------------------------------------------------------------|
+| `jq-1.7.1/` | `jq-1.7.1.tar.gz`                               | `478c9ca129fd2e3443fe27314b455e211e0d8c60bc8ff7df703873deeee580c2` |
+| `jq-1.8.2/` | `jq-1.8.2.tar.gz`                               | `71b8d6e8f5fe81f6c6d0d110e3892251f6ce76ed095abd315e26e6e1193af3af` |
 
 Both tarballs match jqlang's published `sha256sum.txt`. Each file here is the tarball's file at the same path, except
 for the patches below. 1.7.1 keeps decNumber in `src/decNumber/`, 1.8.2 in `vendor/decNumber/`. Each directory keeps

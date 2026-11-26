@@ -280,6 +280,12 @@ progress line (rows done, rows/s, ETA) to stderr, so read the first one after a 
 waiting for the end. A sweep cannot find a shape it does not generate: a new class of divergence gets its generator committed
 here, not left in an issue comment.
 
+The input layer (jq's 4,095- and 4,091-byte reads, NUL bytes, BOMs, invalid UTF-8, file seams) has its own oracle:
+[`jq-reader-oracle/`](../../jq-reader-oracle/README.md) links jq 1.7.1's and jq 1.8.2's own readers in-process and
+runs a differential harness against a `succinctly` binary, classifying each difference as a release split, as covered
+by E1 or E2 (#7963), as a recorded divergence, or as a bug (#7970). It is a separate package with its own lockfile,
+not part of the crate, and needs a C compiler; it is not yet folded into `dev compare jq`.
+
 ### Coverage
 
 CI line coverage uses the feature set `cli,simd,regex,serde` (see `CLAUDE.md`'s Coverage
