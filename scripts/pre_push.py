@@ -127,6 +127,13 @@ GATES = (
         cost=0,
     ),
     Gate(
+        "windows-paths",
+        "fast",
+        ("python3 scripts/windows_paths.py check",),
+        (r"^python3 scripts/windows_paths\.py check$",),
+        cost=0,
+    ),
+    Gate(
         "skill-lint",
         "fast",
         ("python3 scripts/skill_lint.py",),
