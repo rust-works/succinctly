@@ -1,0 +1,5 @@
+identity_compact users-10mb 12
+ndjson_identity ndjson-10mb 12
+ndjson_slurp ndjson-10mb 12
+ndjson_inputs_reduce ndjson-10mb 12
+identity_compact users-1mb 20
