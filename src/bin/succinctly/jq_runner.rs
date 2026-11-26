@@ -6184,7 +6184,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 && failures.is_empty()
                 && reader_model::trigger(
                     raw_inputs.iter().map(Vec::as_slice),
-                    scans.iter().any(|scan| scan.nul),
+                    scans.iter().any(|scan| scan.nul || !scan.utf8),
                 )
                 && reader_model::enabled()
             {
@@ -10013,6 +10013,13 @@ fn read_inputs(
                         seam,
                         more,
                     );
+        // PROTOTYPE (reader model): invalid UTF-8 is an edge too (#7938, #7947). The decoding
+        // above already found it (`lossy_sources`), so no byte is read again to know it; the bytes
+        // of a lone source as read are kept only then.
+        let lossy_seen = model_scope && lossy_sources.iter().any(Option::is_some);
+        if lossy_seen && last == 0 {
+            fault_text = lossy_sources[0].as_ref().map(|lossy| lossy.original.clone());
+        }
                     if pos == last {
                         mark_lazy_stream_end(!unopened_tail);
                     }
@@ -10355,8 +10362,10 @@ fn read_inputs(
         // result is dropped and the model reads the sources as they were read: a lone source
         // from the copy made at the fault (behind the BOM the strip took), several regular
         // files from a second read of them. Anything else keeps the loop's result.
-        let faulted =
-            slurp_failure.is_some() || trailing_error.is_some() || !resumed_errors.is_empty();
+        let faulted = lossy_seen
+            || slurp_failure.is_some()
+            || trailing_error.is_some()
+            || !resumed_errors.is_empty();
         let pristine: Option<Vec<Vec<u8>>> = if !(model_scope && faulted) {
             None
         } else if last == 0 {
@@ -16838,7 +16847,7 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
         // off is read whole, before anything rewrites it, for the route that reads it through
         // the model.
         if !streamed
-            && (scan.nul || BROKEN_MARK_STREAM.with(std::cell::Cell::get))
+            && (scan.nul || !scan.utf8 || BROKEN_MARK_STREAM.with(std::cell::Cell::get))
             && reader_model::enabled()
         {
             return Ok(match reader.read_to_end(&mut bytes) {
