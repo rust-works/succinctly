@@ -19,13 +19,33 @@
 //!
 //! `--seq` and `--stream` are not ported here.
 
+/// A jq release whose reader a [`ReaderProfile`] reproduces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Release {
+    /// jq 1.7.1 (`71c2ab5`), the pinned reference.
+    Jq171,
+    /// jq 1.8.2 (`34f7186`), the latest release.
+    Jq182,
+}
+
 /// The release-dependent switches of jq's reader. Every field names the jq source line it models.
+///
+/// A profile is one whole release ([`ReaderProfile::release`]), never a switch-by-switch mixture:
+/// the prototype's first profile paired 1.7.1's 4,095-byte read with 1.8.2's "no NUL cut", and gave
+/// an answer neither release gives on inputs both agree on (a NUL at bytes 4,090-4,093). What the
+/// CLI ships ([`ReaderProfile::shipped_for`]) is the release less the switches in [`EXCEPTIONS`],
+/// each with its reason; a test holds the two lists to each other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReaderProfile {
+    /// The release this profile reads as.
+    pub release: Release,
     /// The most bytes one `fgets` call returns: `sizeof(buf) - 1` = 4095 in jq 1.7.1,
-    /// `max_gets_len - 1` = 4091 in jq 1.8.2 (which also completes a cut UTF-8 sequence with
-    /// `fread`; that backtrack is NOT modelled).
+    /// `max_gets_len - 1` = 4091 in jq 1.8.2 (`util.c` line 302 at jq-1.8.2).
     pub read_len: usize,
+    /// jq 1.8.2's completion of a full read that ends inside a UTF-8 sequence (`util.c` lines
+    /// 335-341): `jvp_utf8_backtrack` finds how many bytes the last sequence lacks and `fread`
+    /// appends that many raw bytes, a newline included, which `current_line` never counts.
+    pub utf8_completion: bool,
     /// `jq_util_input_read_more`'s return value. `false` is 1.7.1's (`curr_file == nfiles &&
     /// (!current_input || feof || ferror)`: the last data chunk can itself be the last buffer);
     /// `true` is 1.8.2's (`curr_file == nfiles && !current_input`: the last buffer is always an
@@ -33,7 +53,7 @@ pub(crate) struct ReaderProfile {
     pub closing_refill: bool,
     /// jq 1.7.1's `if (p == NULL && state->parser != NULL) buf_valid_len = strlen(buf)`: a chunk
     /// with no newline is cut at its first NUL and the rest of that chunk is lost. Removed in
-    /// 1.8.2, where the NUL reaches the parser as a literal byte.
+    /// 1.8.2 (CVE-2026-33948), where the NUL reaches the parser as a literal byte.
     pub nul_cut: bool,
     /// `MAX_PARSING_DEPTH`: 256 in 1.7.1, 10000 in 1.8.2. A `[` or `{` is refused when the stack
     /// (one entry per array, one per object and one per pending key) already holds this many.
@@ -53,54 +73,111 @@ pub(crate) struct ReaderProfile {
     pub nan_payload: bool,
 }
 
+/// One switch a shipped profile takes from somewhere other than its release.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Exception {
+    pub release: Release,
+    /// The [`ReaderProfile`] field, by name.
+    pub field: &'static str,
+    pub reason: &'static str,
+}
+
+/// Every switch in which [`ReaderProfile::shipped_for`] departs from [`ReaderProfile::release`].
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const EXCEPTIONS: &[Exception] = &[
+    Exception {
+        release: Release::Jq171,
+        field: "nan_payload",
+        reason: "the crate's one number grammar refuses a NaN with a payload as jq 1.8 does \
+                 (CVE-2024-53427, recorded in limitations.md, #7522); the model's text goes to that \
+                 grammar, which would refuse a `NaN5` the 1.7.1 parser accepted",
+    },
+    Exception {
+        release: Release::Jq182,
+        field: "max_depth",
+        reason: "every document route caps a document at 1.7.1's 256 levels (limitations.md, \
+                 \"Nesting depth\", #5497); a 1.8.2 depth here would hand the value reader text \
+                 it refuses",
+    },
+];
+
 impl ReaderProfile {
-    /// What `succinctly jq` follows, switch by switch:
-    ///
-    /// - `read_len: 4095`: jq 1.7.1 (the pinned reference; every chunk emulation in the CLI is 4095).
-    /// - `closing_refill: false`: jq 1.7.1's `is_last`, for the non-slurp plain route.
-    /// - `nul_cut: false`: jq 1.8.2. This is the recorded #5654 divergence from the pinned 1.7.1:
-    ///   the bytes after a NUL in a newline-less read are not dropped, the NUL reaches the parser.
-    /// - `max_depth: 256`: jq 1.7.1.
-    /// - `position_after_end_171: true`: jq 1.7.1.
-    /// - `slurp_reads_remaining: true`: jq 1.7.1.
-    /// - `single_quote_message: false`: jq 1.7.1.
-    /// - `nan_payload: false`: jq 1.8.2, as the crate's one number grammar decides it (#7522).
-    pub(crate) const fn succinctly() -> Self {
-        Self {
-            read_len: 4095,
-            closing_refill: false,
-            nul_cut: false,
-            max_depth: 256,
-            position_after_end_171: true,
-            slurp_reads_remaining: true,
-            single_quote_message: false,
-            nan_payload: false,
+    /// `release`'s reader as released.
+    pub(crate) const fn release(release: Release) -> Self {
+        match release {
+            Release::Jq171 => Self {
+                release,
+                read_len: 4095,
+                utf8_completion: false,
+                closing_refill: false,
+                nul_cut: true,
+                max_depth: 256,
+                position_after_end_171: true,
+                slurp_reads_remaining: true,
+                single_quote_message: false,
+                nan_payload: true,
+            },
+            Release::Jq182 => Self {
+                release,
+                read_len: 4091,
+                utf8_completion: true,
+                closing_refill: true,
+                nul_cut: false,
+                max_depth: 10000,
+                position_after_end_171: false,
+                slurp_reads_remaining: false,
+                single_quote_message: true,
+                nan_payload: false,
+            },
         }
     }
 
-    /// jq 1.7.1 as released (tests only).
-    #[cfg(test)]
-    const fn jq171() -> Self {
-        Self {
-            nul_cut: true,
-            nan_payload: true,
-            ..Self::succinctly()
+    /// What the CLI ships for `release`: the release, less [`EXCEPTIONS`].
+    pub(crate) const fn shipped_for(release: Release) -> Self {
+        let base = Self::release(release);
+        match release {
+            Release::Jq171 => Self {
+                nan_payload: false,
+                ..base
+            },
+            Release::Jq182 => Self {
+                max_depth: 256,
+                ..base
+            },
         }
     }
 
-    /// jq 1.8.2 as released, less its UTF-8 backtrack of a full read (tests only).
+    /// The profile `SUCCINCTLY_READER_PROFILE` names (`jq171` or `jq182`; jq 1.8.2 when unset).
+    pub(crate) fn shipped() -> Self {
+        static PROFILE: std::sync::OnceLock<ReaderProfile> = std::sync::OnceLock::new();
+        *PROFILE.get_or_init(|| {
+            let value = std::env::var("SUCCINCTLY_READER_PROFILE").ok();
+            Self::shipped_for(release_named(value.as_deref()))
+        })
+    }
+
+    /// Every switch by name, as a number, for the exception test.
     #[cfg(test)]
-    const fn jq182() -> Self {
-        Self {
-            read_len: 4091,
-            closing_refill: true,
-            nul_cut: false,
-            max_depth: 10000,
-            position_after_end_171: false,
-            slurp_reads_remaining: false,
-            single_quote_message: true,
-            nan_payload: false,
-        }
+    pub(crate) fn fields(&self) -> [(&'static str, usize); 9] {
+        [
+            ("read_len", self.read_len),
+            ("utf8_completion", usize::from(self.utf8_completion)),
+            ("closing_refill", usize::from(self.closing_refill)),
+            ("nul_cut", usize::from(self.nul_cut)),
+            ("max_depth", self.max_depth),
+            ("position_after_end_171", usize::from(self.position_after_end_171)),
+            ("slurp_reads_remaining", usize::from(self.slurp_reads_remaining)),
+            ("single_quote_message", usize::from(self.single_quote_message)),
+            ("nan_payload", usize::from(self.nan_payload)),
+        ]
+    }
+}
+
+/// The release a `SUCCINCTLY_READER_PROFILE` value names; jq 1.8.2 for anything else.
+pub(crate) fn release_named(value: Option<&str>) -> Release {
+    match value {
+        Some("jq171") => Release::Jq171,
+        _ => Release::Jq182,
     }
 }
 
@@ -353,10 +430,14 @@ impl<'a> Parser<'a> {
     }
 
     /// `found_string`: the escapes and control bytes of the finished string token, in the order
-    /// jq meets them, then `value`.
+    /// jq meets them, decoded into the bytes jq's `out` pointer writes; then `value` of
+    /// `jv_string_sized` over them, which replaces what is not UTF-8 by jq's own rule
+    /// ([`jq_string_sized`]). The string goes into the value's text re-escaped, so the text the
+    /// crate's value reader gets is valid UTF-8 and holds the string jq holds.
     fn found_string(&mut self) -> Result<(), Fault> {
         let token = &self.token;
         let end = token.len();
+        let mut body: Vec<u8> = Vec::with_capacity(end);
         let mut at = 0;
         while at < end {
             let c = token[at];
@@ -368,12 +449,17 @@ impl<'a> Parser<'a> {
                 let c = token[at];
                 at += 1;
                 match c {
-                    b'\\' | b'"' | b'/' | b'b' | b'f' | b't' | b'n' | b'r' => {}
+                    b'\\' | b'"' | b'/' => body.push(c),
+                    b'b' => body.push(0x08),
+                    b'f' => body.push(0x0c),
+                    b't' => body.push(b'\t'),
+                    b'n' => body.push(b'\n'),
+                    b'r' => body.push(b'\r'),
                     b'u' => {
                         if at + 4 > end {
                             return Err("Invalid \\uXXXX escape");
                         }
-                        let Some(code) = unhex4(&token[at..at + 4]) else {
+                        let Some(mut code) = unhex4(&token[at..at + 4]) else {
                             return Err("Invalid characters in \\uXXXX escape");
                         };
                         at += 4;
@@ -383,10 +469,16 @@ impl<'a> Parser<'a> {
                                 return Err(PAIR);
                             }
                             match unhex4(&token[at + 2..at + 6]) {
-                                Some(low) if (0xDC00..=0xDFFF).contains(&low) => at += 6,
+                                Some(low) if (0xDC00..=0xDFFF).contains(&low) => {
+                                    at += 6;
+                                    code = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
+                                }
                                 _ => return Err(PAIR),
                             }
                         }
+                        // `if (codepoint > 0x10FFFF) codepoint = 0xFFFD` cannot fire: four hex
+                        // digits or a pair never exceed it.
+                        jvp_utf8_encode(code, &mut body);
                     }
                     _ => return Err("Invalid escape"),
                 }
@@ -395,11 +487,14 @@ impl<'a> Parser<'a> {
                     "Invalid string: control characters from U+0000 through U+001F must be escaped",
                 );
             }
+            else {
+                body.push(c);
+            }
         }
         self.value(Kind::String)?;
-        self.out.push(b'"');
-        self.out.append(&mut self.token);
-        self.out.push(b'"');
+        let string = jq_string_sized(&body);
+        push_json_string(&mut self.out, &string);
+        self.token.clear();
         Ok(())
     }
 
@@ -454,14 +549,9 @@ impl<'a> Parser<'a> {
         }
         self.next = None;
         let text = std::mem::take(&mut self.out);
-        // `jv_string_sized` replaces what is not UTF-8 in a string with U+FFFD; nothing else of an
-        // accepted value can hold such a byte (a number is checked against decNumber's grammar).
-        Some(match String::from_utf8(text) {
-            Ok(text) => text,
-            Err(e) => succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(
-                e.as_bytes(),
-            ),
-        })
+        // Strings were replaced and re-escaped by `found_string`; a number is checked against
+        // decNumber's grammar and a literal is ASCII, so nothing else can hold such a byte.
+        Some(String::from_utf8(text).unwrap_or_else(|e| jq_string_sized(e.as_bytes())))
     }
 
     /// `scan`, without the RS branch.
@@ -593,6 +683,169 @@ fn is_nan_with_payload(token: &[u8]) -> bool {
         && body[3..].iter().all(u8::is_ascii_digit)
 }
 
+/// `utf8_coding_length` of `jv_utf8_tables.h` (the same table in 1.7.1 and 1.8.2):
+/// [`UTF8_CONTINUATION_BYTE`] for 80-BF, 0 for a byte no sequence starts with (C0, C1, F5-FF).
+const fn utf8_coding_length(byte: u8) -> u8 {
+    match byte {
+        0x00..=0x7f => 1,
+        0x80..=0xbf => UTF8_CONTINUATION_BYTE,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 0,
+    }
+}
+
+/// `utf8_coding_bits`: the payload bits of a lead byte.
+const fn utf8_coding_bits(byte: u8) -> u32 {
+    match byte {
+        0x00..=0x7f => 0x7f,
+        0x80..=0xbf => 0x3f,
+        0xc2..=0xdf => 0x1f,
+        0xe0..=0xef => 0x0f,
+        0xf0..=0xf4 => 0x07,
+        _ => 0,
+    }
+}
+
+const UTF8_CONTINUATION_BYTE: u8 = 255;
+
+/// `utf8_first_codepoint`: the least code point a sequence of each length may encode.
+const UTF8_FIRST_CODEPOINT: [i64; 5] = [0, 0, 0x80, 0x800, 0x10000];
+
+/// `jvp_utf8_next` (`jv_unicode.c`, the same rule in 1.7.1 and 1.8.2): the length of the step at
+/// the front of `bytes` (not empty) and its code point, `-1` for a bad one. A lead byte whose
+/// sequence is longer than what is left takes all that is left, ASCII included (the "tail
+/// swallow"); a whole-length overlong, surrogate or out-of-range sequence is one bad step.
+fn jvp_utf8_next(bytes: &[u8]) -> (usize, i64) {
+    let first = bytes[0];
+    let mut length = usize::from(utf8_coding_length(first));
+    let mut codepoint: i64 = -1;
+    if first & 0x80 == 0 {
+        // Fast-path for ASCII
+        codepoint = i64::from(first);
+        length = 1;
+    } else if length == 0 || length == usize::from(UTF8_CONTINUATION_BYTE) {
+        // Bad single byte - either an invalid byte or an out-of-place continuation byte
+        length = 1;
+    } else if length > bytes.len() {
+        // String ends before UTF8 sequence ends
+        length = bytes.len();
+    } else {
+        codepoint = i64::from(u32::from(first) & utf8_coding_bits(first));
+        for (i, &ch) in bytes.iter().enumerate().take(length).skip(1) {
+            if utf8_coding_length(ch) != UTF8_CONTINUATION_BYTE {
+                // Invalid UTF8 sequence - not followed by the right number of continuation bytes
+                codepoint = -1;
+                length = i;
+                break;
+            }
+            codepoint = (codepoint << 6) | i64::from(ch & 0x3f);
+        }
+        if codepoint < UTF8_FIRST_CODEPOINT[length] {
+            // Overlong UTF8 sequence
+            codepoint = -1;
+        }
+        if (0xD800..=0xDFFF).contains(&codepoint) {
+            // Surrogate codepoints can't be encoded in UTF8
+            codepoint = -1;
+        }
+        if codepoint > 0x10FFFF {
+            // Outside Unicode range
+            codepoint = -1;
+        }
+    }
+    (length, codepoint)
+}
+
+/// `jv_string_sized`: `bytes` as they are when they are UTF-8 (`jvp_utf8_is_valid` refuses what
+/// Rust's validation refuses), else `jvp_string_copy_replace_bad`: one U+FFFD per bad step of
+/// [`jvp_utf8_next`].
+pub(crate) fn jq_string_sized(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(bytes.len() + 8);
+    let mut at = 0;
+    while at < bytes.len() {
+        let (length, codepoint) = jvp_utf8_next(&bytes[at..]);
+        at += length;
+        let ch = u32::try_from(codepoint)
+            .ok()
+            .and_then(char::from_u32)
+            .unwrap_or('\u{fffd}');
+        out.push(ch);
+    }
+    out
+}
+
+/// `jvp_utf8_encode`: a code point as UTF-8 bytes, a surrogate included (as `ED A0 80`, which
+/// [`jq_string_sized`] then replaces, as jq's does after a lone `\uDC00`).
+fn jvp_utf8_encode(codepoint: u32, out: &mut Vec<u8>) {
+    if codepoint <= 0x7f {
+        out.push(codepoint as u8);
+    } else if codepoint <= 0x7ff {
+        out.push(0xc0 | (codepoint >> 6) as u8);
+        out.push(0x80 | (codepoint & 0x3f) as u8);
+    } else if codepoint <= 0xffff {
+        out.push(0xe0 | (codepoint >> 12) as u8);
+        out.push(0x80 | ((codepoint >> 6) & 0x3f) as u8);
+        out.push(0x80 | (codepoint & 0x3f) as u8);
+    } else {
+        out.push(0xf0 | (codepoint >> 18) as u8);
+        out.push(0x80 | ((codepoint >> 12) & 0x3f) as u8);
+        out.push(0x80 | ((codepoint >> 6) & 0x3f) as u8);
+        out.push(0x80 | (codepoint & 0x3f) as u8);
+    }
+}
+
+/// `string` as a JSON string literal.
+fn push_json_string(out: &mut Vec<u8>, string: &str) {
+    out.push(b'"');
+    for ch in string.chars() {
+        match ch {
+            '"' => out.extend_from_slice(b"\\\""),
+            '\\' => out.extend_from_slice(b"\\\\"),
+            c if u32::from(c) < 0x20 => {
+                out.extend_from_slice(format!("\\u{:04x}", u32::from(c)).as_bytes());
+            }
+            c => {
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    out.push(b'"');
+}
+
+/// `jvp_utf8_backtrack(end - 1, buf, &len)` as `jq_util_input_read_more` calls it in 1.8.2: how
+/// many bytes the last sequence of `buf` lacks, or `None` (the C `NULL`) when the bytes before the
+/// end hold no lead byte or a bad one.
+fn utf8_backtrack(buf: &[u8]) -> Option<usize> {
+    if buf.len() <= 1 {
+        // `if (min == start) return min;` without writing `*missing_bytes`.
+        return Some(0);
+    }
+    let mut start = buf.len() - 1;
+    let mut seen = 1usize;
+    let mut length;
+    loop {
+        length = utf8_coding_length(buf[start]);
+        if length != UTF8_CONTINUATION_BYTE {
+            break;
+        }
+        if start == 0 {
+            break;
+        }
+        start -= 1;
+        seen += 1;
+    }
+    if length == 0 || length == UTF8_CONTINUATION_BYTE || usize::from(length) < seen {
+        return None;
+    }
+    Some(usize::from(length) - seen)
+}
+
 /// `unhex4`.
 fn unhex4(hex: &[u8]) -> Option<u32> {
     let mut r = 0u32;
@@ -703,6 +956,18 @@ impl<'a> Reader<'a> {
                     read
                 };
                 chunk = &window[..valid];
+                // jq 1.8.2: a full read with no newline (`p == NULL`, not at EOF) that ends inside
+                // a UTF-8 sequence takes the bytes it lacks with `fread`, whatever they are.
+                if self.profile.utf8_completion && newline.is_none() && read == cap {
+                    if let Some(missing) = utf8_backtrack(chunk).filter(|&missing| missing > 0) {
+                        let more = missing.min(rest.len() - read);
+                        self.offset += more;
+                        if more < missing {
+                            self.feof = true;
+                        }
+                        chunk = &rest[..read + more];
+                    }
+                }
             }
         }
         let is_last = self.curr_file == self.sources.len()

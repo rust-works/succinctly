@@ -8144,7 +8144,7 @@ impl ModelRead {
     fn of_sources(sources: &[&[u8]], slurp: bool) -> Self {
         let mut reader = reader_model::Reader::new(
             sources,
-            reader_model::ReaderProfile::succinctly(),
+            reader_model::ReaderProfile::shipped(),
             slurp,
         );
         let mut items = Vec::new();

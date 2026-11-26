@@ -159,24 +159,24 @@ fn reader_model_has_at_least_forty_cases() {
 
 #[test]
 fn reader_model_inputs_equal_jq_171() {
-    check(|case| Some(case.inputs_171), ReaderProfile::jq171(), Program::Inputs);
+    check(|case| Some(case.inputs_171), ReaderProfile::release(Release::Jq171), Program::Inputs);
 }
 
 #[test]
 fn reader_model_main_loop_equals_jq_171() {
-    check(|case| Some(case.main_171), ReaderProfile::jq171(), Program::Main);
+    check(|case| Some(case.main_171), ReaderProfile::release(Release::Jq171), Program::Main);
 }
 
 #[test]
 fn reader_model_slurp_equals_jq_171() {
-    check(|case| Some(case.slurp_171), ReaderProfile::jq171(), Program::Slurp);
+    check(|case| Some(case.slurp_171), ReaderProfile::release(Release::Jq171), Program::Slurp);
 }
 
 #[test]
 fn reader_model_inputs_equal_jq_182() {
     check(
         |case| (!case.skip_182).then_some(case.inputs_182),
-        ReaderProfile::jq182(),
+        ReaderProfile::release(Release::Jq182),
         Program::Inputs,
     );
 }
@@ -185,7 +185,7 @@ fn reader_model_inputs_equal_jq_182() {
 fn reader_model_main_loop_equals_jq_182() {
     check(
         |case| (!case.skip_182).then_some(case.main_182),
-        ReaderProfile::jq182(),
+        ReaderProfile::release(Release::Jq182),
         Program::Main,
     );
 }
@@ -194,34 +194,129 @@ fn reader_model_main_loop_equals_jq_182() {
 fn reader_model_slurp_equals_jq_182() {
     check(
         |case| (!case.skip_182).then_some(case.slurp_182),
-        ReaderProfile::jq182(),
+        ReaderProfile::release(Release::Jq182),
         Program::Slurp,
     );
 }
 
-/// `succinctly()` is jq 1.7.1 but for the NUL cut of a newline-less read (#5654) and a NaN's
-/// payload (#7522), so it equals 1.7.1 on every case with no NUL (none holds such a NaN).
+/// Every profile the CLI can ship is a real release, or departs from one only by a switch listed in
+/// [`EXCEPTIONS`] with its reason; and every listed exception is a real departure.
 #[test]
-fn reader_model_succinctly_profile_is_171_without_the_nul_cut() {
-    let profile = ReaderProfile::succinctly();
-    assert_eq!(
-        ReaderProfile {
-            nul_cut: true,
-            nan_payload: true,
-            ..profile
-        },
-        ReaderProfile::jq171()
-    );
-    let mut checked = 0;
-    for case in CASES {
-        if build(case.files).iter().any(|file| file.contains(&0)) {
-            continue;
+fn reader_model_shipped_profiles_are_releases_or_listed_exceptions() {
+    for release in [Release::Jq171, Release::Jq182] {
+        let real = ReaderProfile::release(release);
+        let shipped = ReaderProfile::shipped_for(release);
+        assert_eq!(shipped.release, release);
+        let listed: Vec<&str> = EXCEPTIONS
+            .iter()
+            .filter(|exception| exception.release == release)
+            .map(|exception| exception.field)
+            .collect();
+        let differing: Vec<&str> = real
+            .fields()
+            .iter()
+            .zip(shipped.fields())
+            .filter(|(a, b)| a.1 != b.1)
+            .map(|(a, _)| a.0)
+            .collect();
+        assert_eq!(differing, listed, "{release:?}: departures vs. EXCEPTIONS");
+        for exception in EXCEPTIONS {
+            assert!(!exception.reason.is_empty(), "{}", exception.field);
         }
-        checked += 1;
-        assert_eq!(render(case, profile, Program::Inputs), case.inputs_171, "{}", case.name);
-        assert_eq!(render(case, profile, Program::Slurp), case.slurp_171, "{}", case.name);
     }
-    assert!(checked >= 30, "{checked} cases without a NUL");
+    // The switch names only these two, and jq 1.8.2 by default.
+    assert_eq!(release_named(None), Release::Jq182);
+    assert_eq!(release_named(Some("jq171")), Release::Jq171);
+    assert_eq!(release_named(Some("jq182")), Release::Jq182);
+    // A shipped profile equals its release on every captured case (none holds a NaN payload or
+    // a document deeper than 256).
+    for release in [Release::Jq171, Release::Jq182] {
+        let shipped = ReaderProfile::shipped_for(release);
+        for case in CASES {
+            if release == Release::Jq182 && case.skip_182 {
+                continue;
+            }
+            let (inputs, slurp) = match release {
+                Release::Jq171 => (case.inputs_171, case.slurp_171),
+                Release::Jq182 => (case.inputs_182, case.slurp_182),
+            };
+            if case.name.contains("depth") {
+                continue;
+            }
+            assert_eq!(render(case, shipped, Program::Inputs), inputs, "{}", case.name);
+            assert_eq!(render(case, shipped, Program::Slurp), slurp, "{}", case.name);
+        }
+    }
+}
+
+/// jq's U+FFFD rule (`jvp_utf8_next`, the same in 1.7.1 and 1.8.2), on the bytes of a string body:
+/// the counts the research ran on both jq binaries (Unicode's Table 3-8 to 3-11 examples and the
+/// tail swallow), where Rust's `from_utf8_lossy` gives 8, 8, 7, 4 and keeps `Zb`.
+#[test]
+fn reader_model_replaces_bad_utf8_as_jq_does() {
+    let count = |bytes: &[u8]| jq_string_sized(bytes).matches('\u{fffd}').count();
+    assert_eq!(count(b"\xC0\xAF\xE0\x80\xBF\xF0\x81\x82\x41"), 4);
+    assert_eq!(count(b"\xED\xA0\x80\xED\xBF\xBF\xED\xAF\x41"), 3);
+    assert_eq!(count(b"\xF4\x91\x92\x93\xFF\x41\x80\xBF\x42"), 4);
+    assert_eq!(jq_string_sized(b"\xE1\x80\xE2\xF0\x91\x92\xF1\xBF\x41"), "\u{fffd}".repeat(4));
+    assert_eq!(jq_string_sized(b"\xF0Zb"), "\u{fffd}");
+    assert_eq!(jq_string_sized(b"a\xC3\xA9"), "a\u{e9}");
+    // Through the parser: a lone low surrogate escape is encoded, then replaced.
+    let files: &[&[u8]] = &[b"\"\\udc00x\" \"\xF0\\n\"\n"];
+    let profile = ReaderProfile::shipped();
+    let mut reader = Reader::new(files, profile, false);
+    assert_eq!(reader.next_input(), Step::Value(String::from("\"\u{fffd}x\"")));
+    // `\n` decodes to a byte the lead takes with it: the string is one U+FFFD.
+    assert_eq!(reader.next_input(), Step::Value(String::from("\"\u{fffd}\"")));
+}
+
+/// jq 1.8.2 completes a full read that ends inside a UTF-8 sequence with raw bytes, a newline
+/// among them, which no read counts; 1.7.1's 4,095-byte read does not.
+#[test]
+fn reader_model_completes_a_utf8_sequence_cut_by_a_full_read_as_jq_182() {
+    let assert_backtrack = |bytes: &[u8], missing: Option<usize>| {
+        assert_eq!(utf8_backtrack(bytes), missing, "{bytes:x?}");
+    };
+    assert_backtrack(b"ab", Some(0));
+    assert_backtrack(b"a\xE2", Some(2));
+    assert_backtrack(b"a\xE2\x82", Some(1));
+    assert_backtrack(b"a\xE2\x82\xAC", Some(0));
+    assert_backtrack(b"a\xFF", None);
+    assert_backtrack(b"\x80\x80", None);
+    assert_backtrack(b"a\xC3\xA9\xA9", None);
+    // `1`, 4,089 spaces, then a three-byte lead at byte 4,090: the read takes `\n2` with it.
+    let mut file = b"1".to_vec();
+    file.resize(4090, b' ');
+    file.extend_from_slice(b"\xE2\n2\n");
+    let files: &[&[u8]] = &[&file];
+    // `jq -nc '[limit(4; repeat(try [input, input_line_number] catch [., input_line_number]))]'`:
+    // 1.8.2 `[[1,0],["Invalid numeric literal at line 2, column 0",0],["break",1],["break",1]]`
+    // (the `2` goes with the buffer the fault throws away); 1.7.1 `[[1,1],[...,1],[2,2],["break",2]]`.
+    let mut reader = Reader::new(files, ReaderProfile::release(Release::Jq182), false);
+    let mut items = Vec::new();
+    while let Some(item) = reader.next_item() {
+        items.push(item);
+    }
+    assert_eq!(
+        items,
+        vec![
+            Item::Value { text: String::from("1"), source: 0, line: 0 },
+            Item::Fault {
+                message: String::from("Invalid numeric literal at line 2, column 0"),
+                source: 0,
+                line: 0,
+            },
+        ]
+    );
+    assert_eq!(reader.position(), Position { source: 0, line: 1 });
+    let mut reader = Reader::new(files, ReaderProfile::release(Release::Jq171), false);
+    let mut lines = Vec::new();
+    while let Some(item) = reader.next_item() {
+        lines.push(match item {
+            Item::Value { line, .. } | Item::Fault { line, .. } => line,
+        });
+    }
+    assert_eq!(lines, [1, 1, 2]);
 }
 
 #[test]
