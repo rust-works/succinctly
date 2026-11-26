@@ -73,8 +73,9 @@ python3 scripts/link-order/generate.py macos target/release/succinctly linux.txt
 - [ ] Rebuild on both platforms and read `target/release/deps/succinctly-*.link-order.log`
       (`N listed, M found, K symbols ordered`): the names not found should be the other platform's only.
 - [ ] `python3 scripts/link-order/generate.py stale target/release` passes.
-      CI's perf-guard job runs the same check on every PR and fails once more than 5% of the listed names no
-      longer resolve; a PR that trips it regenerates the list the same way.
+      CI's perf-guard job runs the same check on every PR, and fails a release branch's PR (`release/*`) once more
+      than 5% of the listed names no longer resolve; any other PR gets a warning, and release.yml fails on it.
+      scheduled.yml's `link-order` job opens a "regenerate the link-order list" issue once main passes 4%.
 - [ ] Only then re-run the jq comparison whose figures the release quotes
       ([reproducing-the-jq-comparison.md](reproducing-the-jq-comparison.md)), and the memory figures of
       [docs/benchmarks/jq.md](../benchmarks/jq.md#memory) with the shipped feature list passed as `--subject`.

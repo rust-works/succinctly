@@ -181,3 +181,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci_leg_times.py report --issue
+
+  # #7894 follow-up: ci.yml's perf-guard job only warns on a stale link-order list (it fails
+  # release branches), so this reads the share from main's newest push run and opens, or rewrites
+  # the body of, one "regenerate the link-order list" issue once it passes 4% (the limit is 5%).
+  # No build: it reads the job log the perf guard already wrote.
+  link-order:
+    name: Link-order list share
+    if: github.repository == 'rust-works/succinctly'
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: File the regeneration once the list is nearly stale
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/link-order/watch.py --issue
