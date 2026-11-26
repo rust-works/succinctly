@@ -1461,6 +1461,12 @@ fn route_walked(program: &Expr, mut labels: LabelHints) -> Route {
     if shipped_only {
         return Route::Shipped;
     }
+    // #7977: with `SUCCINCTLY_CALL_MACHINE` on, a program the call machine takes runs on this
+    // route, where `run_program` hands it to the machine. Off (the default), the machine is
+    // never asked, so nothing of it runs.
+    if extension.is_none() && vm::switched_on() && vm::takes(program) {
+        return Route::Interpreter;
+    }
     if !dynamic {
         // #7719: a program that can observe jq's label values runs here too,
         // where `label` and `break` are jq's; one this interpreter cannot run
@@ -2079,19 +2085,24 @@ fn run_program_seeing(
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
     see: impl FnOnce(&OwnedValue),
 ) -> Option<Control> {
+    let on_machine = vm::switched_on() && vm::takes(program);
     with_prelude(|prelude| {
         let interp = Interp::new(prelude);
         interp.next_label.set(LabelNumbers::resume(program));
         let mut input = input;
         interp.prepare(program, &mut input);
         see(&input);
-        let result = interp.eval(program, &Env::default(), input, Reg::top(), &mut |v, _| {
-            if on_value(v) {
-                Ok(())
-            } else {
-                Err(Raise::Stop)
-            }
-        });
+        let result = if on_machine {
+            vm::run(&interp, program, input, on_value)
+        } else {
+            interp.eval(program, &Env::default(), input, Reg::top(), &mut |v, _| {
+                if on_value(v) {
+                    Ok(())
+                } else {
+                    Err(Raise::Stop)
+                }
+            })
+        };
         LabelNumbers::keep(program, interp.next_label.get());
         match result {
             Ok(()) | Err(Raise::Stop) => None,
@@ -5809,6 +5820,8 @@ fn variant_name(expr: &Expr) -> String {
         .unwrap_or("?")
         .to_string()
 }
+
+mod vm;
 
 #[cfg(test)]
 mod reference;

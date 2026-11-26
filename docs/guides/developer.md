@@ -222,6 +222,15 @@ test, and `tests/jq_cli/i7688.rs` pins both over every source the script reads.
 A new windowed route needs its gate to ask `window::whole_file_forced()` and its start to call
 `window::note_route`, or the fuzz reports that no case took it.
 
+The call machine (#7977, `src/jq/path_mode/vm.rs`) runs a jq-mode program that holds a recursive `def` only
+when `SUCCINCTLY_CALL_MACHINE` is set to a non-empty value but `0`, read once per process; unset, nothing asks it,
+so a run behaves as a build without it. It is a runtime switch, not a feature, so one binary is measured both
+ways with the variable set in both arms (`=1` against `=0`, #7961). `SUCCINCTLY_DEBUG_CALL_MACHINE_LOG=<file>`
+has each routing decision append `taken` or `declined` while the switch is on.
+`scripts/call_machine/check.py check <binary>` runs its 109-program corpus against the jq 1.7.1 answers in
+`tests/data/call-machine-corpus-7977.json` (`tests/jq_cli/i7977.rs` runs the same file in CI), and
+`scripts/call_machine/ladders.py` holds its timing ladders, for the bench boxes only.
+
 ### Differential sweeps against jq
 
 A change to the jq evaluator, the path register above all, is judged against `/usr/bin/jq` (1.7.1) over a
