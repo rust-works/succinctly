@@ -413,7 +413,10 @@ mod tests {
         assert_eq!(refusal("("), "end pattern with unmatched parenthesis");
         // Each as jq 1.7.1 (`/usr/bin/jq`) words it.
         assert_eq!(refusal("*"), "target of repeat operator is not specified");
-        assert_eq!(refusal("a{2,1}"), "upper is smaller than lower in repeat range");
+        assert_eq!(
+            refusal("a{2,1}"),
+            "upper is smaller than lower in repeat range"
+        );
         assert_eq!(refusal("[b-a]"), "empty range in char class");
         assert_eq!(refusal("\\k<nope>"), "undefined name <nope> reference");
     }
