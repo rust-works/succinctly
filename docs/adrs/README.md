@@ -57,6 +57,7 @@ by Michael Nygard.
 | [ADR-0028](adr-0028.md) | 🟡 Proposed | 2026-11-10 | Carry Null and Bool Spellings in OwnedValue (#2802)           |
 | [ADR-0029](adr-0029.md) | ✅ Accepted | 2026-11-12 | An Owned Array Is a Window on Shared Storage (#6659)          |
 | [ADR-0030](adr-0030.md) | 🟡 Proposed | 2026-11-15 | Owned Values Carry a Handle to Their Source Node (#7243)      |
+| [ADR-0032](adr-0032.md) | ✅ Accepted | 2026-11-27 | A Call Machine for jq Programs with a Recursive `def` (#7977) |
 
 The inventory is maintained by the [`update-adr-inventory`](../../.claude/skills/update-adr-inventory/SKILL.md)
 skill, which scans `adr-*.md` for the title and status and derives the date from git history.
