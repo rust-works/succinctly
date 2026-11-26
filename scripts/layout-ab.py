@@ -56,10 +56,10 @@ def no_core():
     resource.setrlimit(resource.RLIMIT_CORE, (1, 1))
 
 
-def run(binary, flags, filt, inp):
+def run(binary, flags, filt, inp, env=None):
     t = time.perf_counter_ns()
     r = subprocess.run([binary, "jq"] + flags + [filt, inp], stdout=subprocess.PIPE,
-                       stderr=subprocess.PIPE, preexec_fn=no_core)
+                       stderr=subprocess.PIPE, preexec_fn=no_core, env=env)
     return time.perf_counter_ns() - t, r
 
 
@@ -68,7 +68,7 @@ def parse_label(label):
     return g, (int(s) if s else None)
 
 
-def summarize(times, groups):
+def summarize(times, groups, pairs=None):
     med = {k: statistics.median(v) for k, v in times.items()}
     out = []
     for g in groups:
@@ -78,8 +78,7 @@ def summarize(times, groups):
             m = statistics.mean(vals)
             out.append(f"layout spread {g}: {len(vals)} seeds, range {100 * (max(vals) - min(vals)) / m:.2f}%, "
                        f"sd {100 * statistics.stdev(vals) / m:.2f}% (medians {min(vals) / 1e6:.2f}-{max(vals) / 1e6:.2f} ms)")
-    base = groups[0]
-    for g in groups[1:]:
+    for g, base in (pairs or [(g, groups[0]) for g in groups[1:]]):
         if base in med and g in med:
             out.append(f"naive {g}/{base} (unseeded links): {100 * (med[g] / med[base] - 1):+.2f}%")
         diffs = []
@@ -109,22 +108,34 @@ def main(argv=None):
     p.add_argument("--csv")
     p.add_argument("--heartbeat", help="file touched after every repetition")
     p.add_argument("--order-seed", type=int, default=1)
+    p.add_argument("--env", action="append", default=[], metavar="GROUP:KEY=VAL",
+                   help="set KEY=VAL for every binary of GROUP (e.g. P0:SUCCINCTLY_READER_MODEL=0)")
+    p.add_argument("--pair", action="append", default=[], metavar="G/BASE",
+                   help="comparisons to report (default: every group against the first)")
+    p.add_argument("--no-gate", action="store_true", help="skip the output-identity gate")
     a = p.parse_args(argv)
     flags, filt = row_spec(a.perf_tsv, a.row)
     bins = dict(b.split("=", 1) for b in a.bin)
     groups = list(dict.fromkeys(parse_label(l)[0] for l in bins))
+    envs = {}
+    for e in a.env:
+        g, kv = e.split(":", 1)
+        k, v = kv.split("=", 1)
+        envs.setdefault(g, dict(os.environ))[k] = v
+    env_of = {l: envs.get(parse_label(l)[0]) for l in bins}
+    pairs = [tuple(x.split("/", 1)) for x in a.pair] or None
 
     digest = {}
     for label, path in bins.items():
-        _, r = run(path, flags, filt, a.input)
+        _, r = run(path, flags, filt, a.input, env_of[label])
         if r.returncode:
             sys.exit(f"{label}: exit {r.returncode}: {r.stderr[:300]!r}")
         digest[label] = hashlib.sha256(r.stdout).hexdigest()
-    if len(set(digest.values())) != 1:
+    if len(set(digest.values())) != 1 and not a.no_gate:
         sys.exit(f"output differs between binaries: {digest}")
     for _ in range(a.warmup - 1):
-        for path in bins.values():
-            run(path, flags, filt, a.input)
+        for label, path in bins.items():
+            run(path, flags, filt, a.input, env_of[label])
 
     rng = random.Random(a.order_seed)
     times = {l: [] for l in bins}
@@ -133,7 +144,7 @@ def main(argv=None):
     for rep in range(a.reps):
         rng.shuffle(labels)
         for label in labels:
-            ns, r = run(bins[label], flags, filt, a.input)
+            ns, r = run(bins[label], flags, filt, a.input, env_of[label])
             if r.returncode:
                 sys.exit(f"{label}: exit {r.returncode} at rep {rep}")
             times[label].append(ns)
@@ -148,7 +159,7 @@ def main(argv=None):
             w.writerow(["rep", "label", "group", "seed", "ns"])
             w.writerows(rows)
     print(f"{a.row} on {os.path.basename(a.input)}: {len(bins)} binaries x {a.reps} reps, output identical")
-    for line in summarize(times, groups):
+    for line in summarize(times, groups, pairs):
         print(line)
 
 
