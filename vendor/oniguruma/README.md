@@ -3,7 +3,7 @@
 These are the C sources of [Oniguruma](https://github.com/kkos/oniguruma) at commit
 `d2f1a14ced5d5d461acac0da0d477ab240a7ab5f` (2023-07-11, the merge of upstream PR #287).
 That is the commit jq 1.7.1's `modules/oniguruma` submodule pins: 18 commits before the 6.9.9 release, with Unicode 15.0 tables, and `onig_version()` still says 6.9.8.
-[ADR-0031](../../docs/adrs/adr-0031.md) records why jq mode compiles and matches with this exact commit (#7965).
+ADR-0031 (`docs/adrs/adr-0031.md`) records why jq mode compiles and matches with this exact commit (#7965).
 
 - **Licence:** BSD-2-Clause, in [COPYING](COPYING).
 - **Subset:** only what UTF-8 and the Perl_NG syntax need: the parser, compiler, matcher, error text, syntax tables, the UTF-8 and ASCII encodings, and the Unicode data that `unicode.c` includes.
