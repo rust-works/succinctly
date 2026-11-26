@@ -379,6 +379,53 @@ In jq 1.7.1 the character is replaced when it starts at or before byte 4094 of i
 One that starts at 4095 or later, or ends by 4094, is read intact.
 Pinned by `tests/jq_cli/i5476.rs`, which asserts succinctly's side and, for the routes above, the output jq 1.8.2 (`/opt/homebrew/bin/jq`) prints; jq 1.7.1's side was captured from `/usr/bin/jq`.
 
+## What the input reader promises at a fault and at a NUL (#7963)
+
+[ADR-0018](../../adrs/adr-0018.md)'s #7963 amendment, accepted by the owner on 2026-11-27, narrows what `succinctly jq` owes jq at the edges of its input reader.
+Its implementation is tracked in [#7966](https://github.com/rust-works/succinctly/issues/7966) (the NUL) and [#7967](https://github.com/rust-works/succinctly/issues/7967) (after the first fault).
+Neither has landed, so `succinctly jq` still reads its input as the sections below this one record.
+This section says which of those behaviours are owed to jq and which are not.
+
+**Up to and including the first fault, everything is owed (E1).**
+The first fault of a stream is the first byte at which jq's parser reports a parse error.
+`succinctly jq` owes jq the values before it and their positions, the fault's message, line and column, and the exit status when the fault ends the run.
+
+**After the first fault, output is best effort above a floor (E1).**
+The floor has three parts:
+
+- reading resumes at the start of the next line, or under `--seq` at the next record separator;
+- every value printed after the fault is a complete JSON text that lies wholly after it;
+- a value that neither jq release prints is a bug.
+
+Above the floor, later faults and their positions, `input_line_number` and `input_filename` after the first fault, the number of U+FFFD in a string read after it, and how many values the fault loses are best effort.
+A difference there, such as #7947's U+FFFD count after a caught fault or #7948's line count past invalid UTF-8 after one, is therefore not owed.
+Today the reader models jq's own resume point, jq's next read: the next newline, or the next 4,095-byte piece of a longer line.
+`1 } 2`, 6,000 spaces and `3` on one line, then `4` on the next, read with `[limit(5; repeat(try input catch .))]` under `-n`, is `[1,"Unmatched '}' at line 1, column 3",3,4,"break"]` in jq 1.7.1, jq 1.8.2 and `succinctly jq` at `0dac2e2d7`.
+When #7967 makes the reader resume at the next line, `succinctly jq` may give `4` where jq gives `3` and `4`.
+
+**A NUL byte outside a string is to be a parse error at its own position (E2).**
+The accepted rule does not reproduce jq 1.7.1's truncation of a newline-less read at the NUL (CVE-2026-33948), or jq 1.8.2's reading through the NUL, which ends the number before it.
+jq master (unreleased; commit fbee8f4, jqlang/jq#3606) reports such a NUL as `Invalid character`.
+#7966 will capture the exact wording from a build of jq master before a test pins it.
+Until #7966 lands, `succinctly jq` keeps the readings the next section records:
+
+- a NUL in a chunk with no newline is an error (#5654);
+- a NUL glued to a number ends the number as both releases end it (#7437, #7749);
+- `--seq` cuts a chunk with no newline at its first NUL, as jq 1.7.1 does (#7340).
+
+A NUL inside a string, a NUL under `-R`, and the NUL rules for a `-f` program (#7434), a module path (#7450) and `tonumber` (#7521) are unchanged by the amendment.
+
+**Every other reader fact follows jq 1.7.1, the pinned reference.**
+These facts are the read size, the position after the last read (#7607), the closing refill and the document depth limit.
+Three adoptions of jq 1.8.2 stay as listed exceptions:
+
+- `--seq` reads every record (#7718);
+- `--stream --slurp` keeps its order and its fault (#7523, #7807);
+- a character that straddles the 4,095-byte `-R` read is kept (#5476).
+
+No further reader fact moves to jq 1.8.2 case by case; moving the reader to a newer jq is revisited when jq 1.9 ships.
+Not adopted: free wording for a malformed byte-order mark, so `Malformed BOM` and #5804's numeric-literal wording stay owed.
+
 ## A NUL byte truncates jq's input in a chunk with no newline; succinctly reports it (#5654)
 
 jq 1.7.1 reads JSON input through `fgets` into a 4096-byte buffer, and `jq_util_input_read_more` then measures a chunk that holds no newline with `strlen`.
@@ -554,7 +601,8 @@ Both changes come from upstream commit 4e3088f ([jqlang/jq#3279](https://github.
 Its message, its PR text and its test name only the `--slurp --stream` fix, which `succinctly jq` follows (#7523, above); neither effect described here is called a bug or a fix upstream, so `succinctly jq` keeps jq 1.7.1's answers, the reference ADR-0018 pins, and the rules modelled on 1.7.1's reader (#2947, #3003, #6146, the directory-last family #6472, #6604, #6625, #6661, #6775, #6789) stand.
 One more such answer is the fault after a number or literal directly before the text's last byte, a `"`, `[` or `{` (`2"`, `true"`, `1 2[`; #6004, #7810): that byte completes the value, so the read that reached the end returned it and the next call meets the fault with the file closed, and jq 1.7.1's `input` names `(at <unknown>)` where jq 1.8.2 names `(at <stdin>:0)`.
 It holds only when that read is a short one: a last line that fills its 4095-byte reads exactly leaves an empty last read, and then both releases name the file.
-Whether to follow jq 1.8.2 here is a question for the owners (#7607); #7461's true line number and #7472's 64-bit count are unaffected either way.
+ADR-0018's #7963 amendment settles the question this paragraph left to the owners (#7607): the position after the last read stays jq 1.7.1's until the reader is moved to a newer jq as one release.
+#7461's true line number and #7472's 64-bit count are unaffected either way.
 `succinctly yq` is not affected: these are jq's reader rules.
 Pinned by `tests/jq_cli/i7607.rs` and `tests/jq_cli/i7810.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`), with jq 1.8.2's (`/opt/homebrew/bin/jq`) answers in its comments.
 
