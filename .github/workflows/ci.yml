@@ -1140,12 +1140,22 @@ jobs:
       # resolve (`STALE_PERCENT` in generate.py says why 5). The startup check alone let the list
       # drift for 222 merges: the functions that went missing were on the paths of ordinary rows,
       # not of the two startup runs it traces, and each kept a page of text resident per run.
+      # #7958: it fails only a release branch's PR (`release/*`). Every other run (a PR, a merge
+      # group, a main push) that meets a stale list gets a warning annotation (`--warn`) and passes:
+      # the list goes stale from the sum of unrelated merges, and regenerating it is no ordinary PR's
+      # job (two that do conflict). On a main push a failure would also skip the binary upload and
+      # the perf guard below. scheduled.yml's `link-order` job reads the share daily from main's
+      # runs and files the regeneration as an issue past 4%; release.yml fails on a stale list.
       - name: Link order covers the startup path
         if: matrix.name == 'x86_64'
+        env:
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           cat "$RUNNER_TEMP/link-order-trace.txt" || echo "the linker wrapper ran for no link"
           ls -t target/release/deps/succinctly*.link-order.log target/release/build/succinctly/*/out/succinctly*.link-order.log 2>/dev/null | head -1 | xargs -r cat
-          python3 scripts/link-order/generate.py stale target/release
+          WARN=--warn
+          [ "${HEAD_REF#release/}" = "$HEAD_REF" ] || WARN=
+          python3 scripts/link-order/generate.py stale target/release $WARN
           python3 scripts/link-order/generate.py check target/release/succinctly scripts/link-order/symbols.txt 65536
 
       # #5704: what the lookup step above finds. Named by arch, SHA and a hash of

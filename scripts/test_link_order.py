@@ -3,7 +3,8 @@
 
 No linker, no build: the decisions `link.py` makes from rustc's arguments, the name normalization
 that lets one list serve GNU and LLVM demanglers, the resolution against an object's symbols, and
-`generate.py`'s staleness check of the wrapper's log and its macOS pass (#7894, #7826).
+`generate.py`'s staleness check of the wrapper's log (and its `--warn`) and its macOS pass (#7894,
+#7826), and `watch.py`'s reading of the perf-guard log.
 """
 import os
 import sys
@@ -13,6 +14,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "link-order"))
 import generate  # noqa: E402
 import link  # noqa: E402
+import watch  # noqa: E402
 
 
 def args_for(out, *extra):
@@ -226,6 +228,83 @@ class Stale(unittest.TestCase):
             os.utime(new, None)
             os.utime(old, (1, 1))
             self.assertEqual(generate.newest_log(d), new)
+
+
+class StaleWarn(unittest.TestCase):
+    """`stale --warn` (pull requests): a warning annotation, and a pass."""
+
+    def run_stale(self, log, warn=False):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            ok = generate.stale(log, generate.STALE_PERCENT, warn)
+        return ok, out.getvalue()
+
+    def test_warn_passes_a_stale_list_with_an_annotation(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "succinctly-01.link-order.log")
+            write(log, Stale.DRIFTED)
+            ok, out = self.run_stale(log, warn=True)
+            self.assertTrue(ok, out)
+            self.assertIn("::warning title=link-order list is stale (8.0% > 5%)::", out)
+            ok, out = self.run_stale(log)
+            self.assertFalse(ok, out)
+            self.assertNotIn("::warning", out)
+            write(log, Stale.FRESH)
+            ok, out = self.run_stale(log, warn=True)
+            self.assertTrue(ok)
+            self.assertNotIn("::warning", out)
+
+    def test_warn_does_not_pass_a_plain_link(self):
+        # `--warn` excuses a stale list, not a link the wrapper did not order.
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "succinctly-01.link-order.log")
+            write(log, "plain link: no symbols.txt\n")
+            ok, _ = self.run_stale(log, warn=True)
+            self.assertFalse(ok)
+
+    def test_the_command_line_takes_warn_anywhere(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "succinctly-01.link-order.log")
+            write(log, Stale.DRIFTED)
+            import contextlib
+            import io
+            for argv, code in ((["stale", log], 1), (["stale", log, "--warn"], 0), (["stale", "--warn", log], 0),
+                               (["stale", log, "9"], 0)):
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e:
+                    generate.main(argv)
+                self.assertEqual(e.exception.code, code, argv)
+
+
+class Watch(unittest.TestCase):
+    LOG = ("2026-11-26T06:40:00.1Z link-order list: 1536 listed, 1468 found, 68 no longer resolve "
+           "(4.4%, limit 5%)\n")
+
+    def test_the_line_stale_prints_is_parsed(self):
+        self.assertEqual(watch.parse(self.LOG), (1536, 1468, 68, 4.4, 5.0))
+        self.assertIsNone(watch.parse("1455 listed, 1338 found, 1442 symbols ordered (rustc links with lld)"))
+
+    def test_the_parser_reads_the_line_stale_writes(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "succinctly-01.link-order.log")
+            write(log, "1536 listed, 1468 found, 1572 symbols ordered (rustc links with lld)\n")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                generate.stale(log, generate.STALE_PERCENT)
+        self.assertEqual(watch.parse(out.getvalue()), (1536, 1468, 68, 4.4, 5.0))
+
+    def test_an_issue_is_opened_once_and_then_edited(self):
+        self.assertIsNone(watch.decide(3.9, 4.0, []))
+        self.assertIsNone(watch.decide(4.0, 4.0, [12]))
+        self.assertEqual(watch.decide(4.4, 4.0, []), "create")
+        self.assertEqual(watch.decide(4.4, 4.0, [12]), "edit")
+        run = {"head_sha": "0dac2e2d7fc9", "html_url": "https://example.invalid/run/1"}
+        text = watch.body(run, watch.parse(self.LOG), 4.0)
+        self.assertIn("68 no longer resolve, 4.4%", text)
+        self.assertIn("generate.py linux", text)
 
 
 class MacosPass(unittest.TestCase):
