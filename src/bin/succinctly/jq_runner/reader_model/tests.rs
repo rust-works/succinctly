@@ -240,11 +240,12 @@ fn reader_model_trigger_reads_the_edges_only() {
     assert!(t(&[b"\xEF"], false));
     assert!(t(&[b"", b"\xEF\xBB", b"\xBF1\n"], false));
     assert!(t(&[b"\xEF1\n"], false));
-    // A source before the last that ends in a byte a bare token or an open container ends in.
-    assert!(t(&[b"1", b"2\n"], false));
-    assert!(t(&[b"1\n", b"[", b"", b"]\n"], false));
-    assert!(t(&[b"[1,", b"2]"], false));
-    assert!(t(&[b"tr", b"ue"], false));
-    // One that ends where a string or container closes, or on white space, does not.
+    // Round 3: a seam is no trigger on its own, whatever byte the source before it ends in (the
+    // perf guard's `split*` rows are a well-formed document cut across files). The token-byte seam
+    // trigger of round 2 is `SUCCINCTLY_READER_MODEL_SEAM=1`, which this test does not set.
+    assert!(!t(&[b"1", b"2\n"], false));
+    assert!(!t(&[b"1\n", b"[", b"", b"]\n"], false));
+    assert!(!t(&[b"[1,", b"2]"], false));
+    assert!(!t(&[b"tr", b"ue"], false));
     assert!(!t(&[b"{\"a\":1}", b"[2]", b"\"x\"", b"3 ", b"4"], false));
 }
