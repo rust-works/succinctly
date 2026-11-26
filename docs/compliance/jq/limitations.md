@@ -314,12 +314,12 @@ substitution into the more sensible WHATWG-consistent shape. See
 substitution-mechanism history and
 [#1717](https://github.com/rust-works/succinctly/issues/1717) for the algorithm fix itself.
 
-**After a caught input fault, a later string does not follow the rule ([#7947](https://github.com/rust-works/succinctly/issues/7947)).**
-A string read from the rest of the stream after a caught fault decodes an overlong, surrogate or out-of-range sequence as one U+FFFD per byte, the WHATWG count, where jq 1.7.1 and 1.8.2 give one U+FFFD for the sequence.
-With a file of `1 a"` and spaces to 4,095 bytes, then a quote, the bytes `E0 80 80`, a quote and a newline, the third value of `[limit(3; repeat(try input catch .))]` under `-n` is three U+FFFD here and one in both jq releases, after `1` and the fault `Invalid numeric literal at line 1, column 4`.
-A surrogate (`ED A0 80`) gives three here and one in jq, a sequence above U+10FFFF (`F4 90 80 80`) four here and one in jq, and `1 }"` in place of `1 a"` gives the same counts.
-The same string as a document of its own decodes as jq decodes it.
-Open as #7947; no test pins it.
+**After a caught input fault, a later string follows the rule, since [#7947](https://github.com/rust-works/succinctly/issues/7947).**
+A string read from the rest of the stream after a caught fault used to decode an overlong, surrogate or out-of-range sequence as one U+FFFD per byte, the WHATWG count, where jq 1.7.1 and 1.8.2 give one U+FFFD for the sequence.
+With a file of `1 a"` and spaces to 4,095 bytes, then a quote, the bytes `E0 80 80`, a quote and a newline, the third value of `[limit(3; repeat(try input catch .))]` under `-n` was three U+FFFD here and one in both jq releases, after `1` and the fault `Invalid numeric literal at line 1, column 4`.
+The text was substituted once, whole, deciding in or out of a string by its quotes, and past a fault jq drops the rest of its read, so the quote of `a"` it never reads put the strings after it out of step.
+A value read past a fault that holds a substituted byte is now substituted again from the bytes jq read, from its own first byte, where jq's lexer is outside a string, and gives one U+FFFD for each of these sequences, as both releases do.
+Pinned by `tests/jq_cli/i7947.rs`.
 
 ## Under `-R -s`, a truncated lead byte just before a line break keeps the line break (#7866)
 
