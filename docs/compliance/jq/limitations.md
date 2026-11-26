@@ -424,6 +424,7 @@ Three adoptions of jq 1.8.2 stay as listed exceptions:
 - a character that straddles the 4,095-byte `-R` read is kept (#5476).
 
 No further reader fact moves to jq 1.8.2 case by case; moving the reader to a newer jq is revisited when jq 1.9 ships.
+A reader answer that follows jq 1.8.2 outside these exceptions is a bug against the pin ([#7971](https://github.com/rust-works/succinctly/issues/7971)).
 Not adopted: free wording for a malformed byte-order mark, so `Malformed BOM` and #5804's numeric-literal wording stay owed.
 
 ## A NUL byte truncates jq's input in a chunk with no newline; succinctly reports it (#5654)
