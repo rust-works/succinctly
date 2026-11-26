@@ -1,32 +1,42 @@
 #!/usr/bin/env python3
-"""Check the stripped release binary's size against a committed per-target budget (#7390).
+"""Check the stripped release binary's size against its base and a committed per-target budget (#7390, #7959).
 
     python3 scripts/binary_size.py check --binary target/release/succinctly [--target TRIPLE]
         [--baseline-binary BASE] [--budget-mode enforce|report] [--commit-range RANGE]
+    python3 scripts/binary_size.py track --binary BIN --target TRIPLE [--measured-at TEXT] [--issue]
 
 #7384 found the stripped release binary at 6x v0.7.0's size with nothing in CI to flag the growth.
 This strips a copy of the binary with plain `strip` (as `release.yml` does before archiving it),
 and compares its size with `tests/data/binary-size-budget.json`, keyed by the target triple
 (`rustc -vV`'s host line unless `--target` names one):
 
-- more than `tolerance` above the budget fails, printing the measured size and the edit that
-  accepts it. An intentional increase bumps the committed number in the same PR, so the reviewer
-  sees it;
+- more than `tolerance` above the budget fails (`--budget-mode report`: warns), printing the
+  measured size and the edit that accepts it. An intended increase bumps the committed number in a
+  PR of its own, so the reviewer sees it;
 - more than `tolerance` below it passes with a warning, printing the edit that tightens it, so the
   slack a size cut frees is not left for later growth to spend unseen;
 - a target with no budget fails, printing the entry to add.
 
-Growth against the base, not only against the budget (spike): a committed absolute number cannot
-tell one PR's growth from the drift of every PR before it. Cumulative growth eats the tolerance until
-an unrelated PR fails, and each PR that raises the number edits the same JSON line, so two in flight
-conflict. With `--baseline-binary`, a copy of the base's release binary (the one perf-guard compares
-against) is stripped the same way, and the PR fails when it grew by more than `max_pr_growth` of the
-base. The absolute budget stays, as a report on a PR (`--budget-mode report`: the same line, as a
-warning) and a gate on a push to main, where it catches the slow drift no single PR trips. A PR that
-means to grow past the threshold says so with a line `[size-growth: ok #N]` in a commit message
+A pull request is gated on its growth against its base, not on the budget (#7959): a committed
+absolute number cannot tell one PR's growth from the drift of every PR before it. That drift ate the
+tolerance until an unrelated PR would fail (+3.99% on x86_64, +4.12% on aarch64, in steps of at most
+0.41%), and each PR that raised the number edited the same JSON line, so two in flight conflicted.
+With `--baseline-binary`, a copy of the base's release binary (the one perf-guard compares against)
+is stripped the same way, and the PR fails when it grew by more than `max_pr_growth` of the base. A
+PR that means to grow past that says so with a line `[size-growth: ok #N]` in a commit message
 (`--commit-range`) or in the PR body (`$PR_BODY`), as `[ledger keeps #N]` and `[no changelog]` do.
+If the base binary is missing, the budget is enforced instead (the check fails towards checking).
 
-CI runs it in the Linux `Perf Regression Guard` legs (`.github/workflows/ci.yml`), whose release
+The budget itself catches the slow drift no single PR trips, in three places:
+
+- CI's pull-request and main-push runs report it (`--budget-mode report`), and never fail on it:
+  failing every push to main would leave main red with no owner;
+- `track`, run daily by `.github/workflows/scheduled.yml` on the binary main's newest push run
+  uploaded, opens one tracking issue per target that is over (label `binary-size`), or rewrites the
+  body of the one that is open;
+- `release.yml` runs `check` (enforcing) on the Linux binaries it ships.
+
+CI runs `check` in the Linux `Perf Regression Guard` legs (`.github/workflows/ci.yml`), whose release
 build is the shipped command, `cargo build --release --features cli`. The committed numbers are the
 sizes those legs measured: a different toolchain, linker or `strip` moves the size by a percent or
 two, so refresh a budget from the number a CI run prints, not from a local build.
@@ -43,6 +53,8 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUDGET = os.path.join(ROOT, "tests", "data", "binary-size-budget.json")
+REPO = os.environ.get("GITHUB_REPOSITORY", "rust-works/succinctly")
+LABEL = "binary-size"  # the tracking issues `track --issue` opens
 
 
 def host_target():
@@ -101,8 +113,8 @@ def verdict(measured, budget, tolerance):
 def check(measured, target, config, budget_path, report=False):
     """`(exit code, lines to print)` for a measured stripped size.
 
-    With `report`, a size past the budget is a warning that exits 0 and asks for no edit: on a PR the
-    committed number is not this PR's to bump (its growth is gated against its base)."""
+    With `report`, a size past the budget is a warning that exits 0: CI's pull-request and main-push
+    runs, where the drift is not the change's own (a PR's growth is gated against its base)."""
     rel = os.path.relpath(budget_path, ROOT)
     tolerance = config["tolerance"]
     entry = config["targets"].get(target)
@@ -121,15 +133,16 @@ def check(measured, target, config, budget_path, report=False):
     v = verdict(measured, budget, tolerance)
     if v == "over" and report:
         return 0, [
-            f"::warning::the stripped release binary for {target} is {change:+.2%} past its budget (report only on a PR)",
+            f"::warning::the stripped release binary for {target} is {change:+.2%} past its budget (a report here)",
             line,
-            "Not this PR's to fix: refresh the budget in a PR of its own when main's push run fails it. " + edit,
+            f"The scheduled binary-size job tracks this in a `{LABEL}` issue and release.yml fails on it.",
+            "Shrink the binary, or accept the size in a PR of its own: " + edit,
         ]
     if v == "over":
         return 1, [
             f"::error::the stripped release binary for {target} grew {change:+.2%} past its budget (#7390)",
             line,
-            "If the growth is intended, accept it in this PR: " + edit,
+            "Shrink the binary, or accept the size in a PR of its own: " + edit,
         ]
     if v == "under":
         return 0, [
@@ -161,6 +174,76 @@ def check_growth(measured, base, max_growth, waiver=None):
     ]
 
 
+def gh(*args):
+    """`gh <args>`'s stdout; a failure is a RuntimeError naming the command."""
+    out = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+    if out.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args[:2])}: {out.stderr.strip()}")
+    return out.stdout
+
+
+ANNOTATION = re.compile(r"^::\w+::")  # a workflow-command prefix, which an issue body shows as text
+
+
+def issue_title(target):
+    return f"ci: the stripped release binary for {target} is over its size budget"
+
+
+def tracking_body(target, lines, measured_at):
+    """The tracking issue's body: what was measured where, and how the issue ends."""
+    shown = "".join(f"    {ANNOTATION.sub('', line)}\n" for line in lines)
+    return (
+        f"The scheduled `Binary size budget` job (`.github/workflows/scheduled.yml`, #7959) found main's stripped "
+        f"release binary for `{target}` over its budget in `tests/data/binary-size-budget.json`:\n\n"
+        f"{shown}\n"
+        f"Measured: {measured_at}.\n\n"
+        "No pull request failed on this: each one is held to `max_pr_growth` against its base binary, and this is "
+        "the drift of many. `release.yml` fails while it lasts. Shrink the binary, or accept the size in a pull "
+        "request of its own that edits the budget (taking the number from a CI log, not a local build) and closes "
+        "this issue.\n\n"
+        "Each daily run rewrites this body while the size stays over; nothing closes the issue automatically.\n"
+    )
+
+
+def file_tracking_issue(target, body):
+    """Open `target`'s tracking issue, or rewrite the body of the open one; says which it did."""
+    title = issue_title(target)
+    listed = gh("issue", "list", "--repo", REPO, "--label", LABEL, "--state", "open", "--limit", "100", "--json", "number,title,body")
+    for issue in json.loads(listed or "[]"):
+        if issue.get("title") == title:
+            number = str(issue["number"])
+            if (issue.get("body") or "").strip() == body.strip():
+                return f"tracking issue #{number} already says this"
+            gh("issue", "edit", number, "--repo", REPO, "--body", body)
+            return f"rewrote tracking issue #{number}"
+    gh("label", "create", LABEL, "--repo", REPO, "--description", "the stripped release binary is over its size budget", "--force")
+    url = gh("issue", "create", "--repo", REPO, "--title", title, "--label", LABEL, "--body", body).strip()
+    return f"opened tracking issue {url}"
+
+
+def track(measured, target, config, budget_path, measured_at, issue):
+    """`(exit code, lines to print)` for main's binary: the budget enforced, filed as an issue when over.
+
+    With `issue`, a size over the budget (or a target with none) opens or rewrites the target's tracking
+    issue and exits 0, since the issue is the signal; without it, it exits 1 as `check` does."""
+    code, lines = check(measured, target, config, budget_path)
+    lines = lines + [f"Measured: {measured_at}."]
+    if code and issue:
+        lines.append(file_tracking_issue(target, tracking_body(target, lines[:-1], measured_at)))
+        return 0, lines
+    return code, lines
+
+
+def emit(lines):
+    for line in lines:
+        print(line)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write("### Stripped binary size (#7390)\n\n")
+            f.write("".join(f"    {line}\n" for line in lines) + "\n")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -178,12 +261,27 @@ def main(argv=None):
         help="`report` turns a budget failure into a warning (a PR, whose own growth is gated against its base); default: %(default)s",
     )
     c.add_argument("--commit-range", help="git range whose commit messages may carry a [size-growth: ok #N] waiver")
+    t = sub.add_parser("track", help="enforce the budget on main's binary, filing a tracking issue when over")
+    t.add_argument("--binary", required=True, help="main's release binary (left unstripped)")
+    t.add_argument("--target", required=True, help="target triple to look up")
+    t.add_argument("--budget", default=BUDGET, help="budget file (default: %(default)s)")
+    t.add_argument("--strip", default="strip", help="strip program (default: %(default)s)")
+    t.add_argument("--measured-at", default="an unnamed binary", help="where the binary came from, for the issue")
+    t.add_argument("--issue", action="store_true", help="open or rewrite the target's tracking issue when over")
     args = parser.parse_args(argv)
 
     with open(args.budget, encoding="utf-8") as f:
         config = json.load(f)
     target = args.target or host_target()
     measured = stripped_size(args.binary, args.strip)
+    if args.command == "track":
+        try:
+            code, lines = track(measured, target, config, args.budget, args.measured_at, args.issue)
+        except RuntimeError as e:
+            print(f"binary_size: {e}", file=sys.stderr)
+            return 2
+        emit(lines)
+        return code
     budget_mode = args.budget_mode
     lines = []
     code = 0
@@ -201,13 +299,7 @@ def main(argv=None):
     budget_code, budget_lines = check(measured, target, config, args.budget, report=budget_mode == "report")
     code = code or budget_code
     lines += budget_lines
-    for line in lines:
-        print(line)
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a", encoding="utf-8") as f:
-            f.write("### Stripped binary size (#7390)\n\n")
-            f.write("".join(f"    {line}\n" for line in lines) + "\n")
+    emit(lines)
     return code
 
 

@@ -933,8 +933,9 @@ jobs:
       - name: cancel-stale-merge-group-runs self-tests
         run: python3 scripts/test_cancel_stale_merge_group_runs.py -v
 
-      # #7390: the stripped-size check run after the release build below (the budget, and a PR's
-      # growth against its base): a fake strip, no build. It also pins that this job's release build is the one release.yml ships.
+      # #7390, #7959: the stripped-size check run after the release build below (a PR's growth against
+      # its base, and the budget as a report), and scheduled.yml's tracking-issue job: a fake strip and a
+      # fake `gh`, no build. It also pins that this job's release build is the one release.yml ships.
       - name: binary_size.py self-tests
         run: python3 scripts/test_binary_size.py -v
 
@@ -1212,24 +1213,28 @@ jobs:
       # #7390: the stripped size of the binary built above (release.yml's own command, so the shipped
       # shape). Runs whether or not the perf guard passed, so each reports on its own.
       #
-      # A pull request is gated on its own growth against its base, the binary the perf guard compares
-      # with (main's push-run artifact, else the merge-base build above), stripped the same way: more than
-      # `max_pr_growth` in tests/data/binary-size-budget.json fails, unless a commit message or the PR body
-      # carries a line `[size-growth: ok #N]`. The committed budget is a report there (`--budget-mode
-      # report`), because a PR cannot bump a number that every other PR also edits and that the drift of
-      # every earlier PR has already used up. A push to main has no PR to waive and no base worth gating,
-      # so it enforces the committed budget: the slow drift no single PR trips. If a PR's baseline binary
-      # is missing, the budget is enforced instead (the check fails towards checking).
+      # #7959: a pull request is gated on its own growth against its base, the binary the perf guard
+      # compares with (main's push-run artifact, else the merge-base build above), stripped the same way:
+      # more than `max_pr_growth` in tests/data/binary-size-budget.json fails, unless a commit message or
+      # the PR body carries a line `[size-growth: ok #N]`. If a PR's base binary is missing, the budget is
+      # enforced instead (the check fails towards checking).
+      #
+      # The committed budget is only a report here, on a PR and on a push to main (`--budget-mode
+      # report`): a PR cannot bump a number that every other PR also edits and that the drift of every
+      # earlier PR has already used up, and failing every push to main would leave main red with no
+      # owner. The slow drift is caught instead by scheduled.yml's `binary-size` job, which opens a
+      # tracking issue per target that is over, and by release.yml, which fails on it.
       - name: Check stripped binary size
         if: ${{ !cancelled() && steps.release-build.outcome == 'success' }}
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
+          EVENT: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "$EVENT" = "pull_request" ]; then
             python3 scripts/binary_size.py check --binary target/release/succinctly \
               --baseline-binary "$PERF_GUARD_BASE_BIN" --budget-mode report --commit-range origin/main..HEAD
           else
-            python3 scripts/binary_size.py check --binary target/release/succinctly
+            python3 scripts/binary_size.py check --binary target/release/succinctly --budget-mode report
           fi
 
   clippy:

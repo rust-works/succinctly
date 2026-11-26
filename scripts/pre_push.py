@@ -293,6 +293,7 @@ NOT_MIRRORED = (
     (r"^\./scripts/gh-release-download\.sh", "fetches a pinned tool onto the CI runner (#6652); scripts/test_ci_release_downloads.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/perf-guard\.py", "needs valgrind and a release binary on Linux"),
     (r"^python3 scripts/binary_size\.py check", "needs the fat-LTO release binary (minutes), a base binary to compare with, and a budget that is CI's own measurement (#7390); scripts/test_binary_size.py, run by the script-tests gate, is the local check"),
+    (r"^python3 scripts/binary_size\.py track", "measures main's binary from a CI artifact and opens an issue with a token (scheduled.yml, #7959); scripts/test_binary_size.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/link-order/generate\.py check", "needs valgrind and a release binary on Linux (#7260); scripts/test_link_order.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/link-order/watch\.py", "reads main's perf-guard job log with a token and opens an issue (scheduled.yml); scripts/test_link_order.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/link-order/generate\.py stale", "reads the link log of the fat-LTO release build on x86_64 Linux (minutes; #7894); scripts/test_link_order.py, run by the script-tests gate, is the local check"),

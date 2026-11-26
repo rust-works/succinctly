@@ -126,6 +126,17 @@ jobs:
       if: matrix.build != 'windows'
       run: strip "target/${{ matrix.target }}/release/succinctly"
 
+    # #7959: the binary-size budget (tests/data/binary-size-budget.json), enforced. CI holds each PR to
+    # its growth against its base and only reports the budget, and scheduled.yml's `binary-size` job
+    # files a tracking issue while main is over it; a release over it stops here,
+    # before its Linux archives are uploaded or the crate is published (the GitHub release already
+    # exists by then: docs/guides/release.md). The budget is CI's perf-guard measurement, which this
+    # build's own image and `+popcnt` barely move: v0.8.0's x86_64 binary was 0.04% smaller than CI's
+    # build of the same commit, and its aarch64 one the same size to the byte.
+    - name: Check the stripped binary against its size budget
+      if: matrix.build == 'linux-x64' || matrix.build == 'linux-arm64'
+      run: python3 scripts/binary_size.py check --binary "target/${{ matrix.target }}/release/succinctly" --target "${{ matrix.target }}"
+
     - name: Build archive
       shell: bash
       run: |
