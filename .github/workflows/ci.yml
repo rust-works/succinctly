@@ -1330,6 +1330,14 @@ jobs:
       - name: Skill lint self-tests (#5971)
         run: python3 scripts/test_skill_lint.py -v
 
+      # A tracked path Windows cannot create (`src/util/simd/nul.rs`) failed the release's Windows
+      # build at checkout; the Windows type check above cross-compiles on Linux and never sees it.
+      - name: Check every tracked path can be checked out on Windows (#7953)
+        run: python3 scripts/windows_paths.py check
+
+      - name: Windows path check self-tests (#7953)
+        run: python3 scripts/test_windows_paths.py -v
+
   docs:
     name: Documentation
     needs: gate
