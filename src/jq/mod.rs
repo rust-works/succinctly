@@ -111,6 +111,8 @@ mod locale_time;
 mod math;
 #[cfg(feature = "regex")]
 mod onig_capture_loop;
+#[cfg(feature = "onig-engine")]
+mod onig_ffi;
 #[cfg(feature = "regex")]
 mod onig_end_search;
 #[cfg(feature = "regex")]

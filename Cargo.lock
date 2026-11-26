@@ -1116,6 +1116,7 @@ dependencies = [
  "anyhow",
  "automod",
  "bytemuck",
+ "cc",
  "clap",
  "criterion",
  "ctrlc",

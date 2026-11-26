@@ -1440,6 +1440,29 @@ jobs:
           RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
         run: cargo check --locked --features cli,simd,regex,serde
 
+  # #7965 (ADR-0031): the vendored Oniguruma, built by `build.rs` through `cc` when the
+  # `onig-engine` feature is on, compiled and run on Linux and on a native Windows host with
+  # MSVC. It is the only job that compiles the C on Windows: the `Clippy` job's Windows step
+  # type-checks from Linux and does not compile C. Not a required check while nothing ships
+  # with the feature; it becomes one with step 4 of #7965.
+  oniguruma:
+    name: Oniguruma (${{ matrix.os }})
+    needs: gate
+    if: needs.gate.outputs.retest != 'false' && needs.gate.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the vendored Oniguruma and run its FFI tests
+        run: cargo test --locked --lib --features onig-engine jq::onig_ffi
+
   # Pull-request coverage: the sticky patch-coverage comment, diffed against the
   # baseline that coverage-baseline.yml published for the PR's merge-base. Only
   # `pull_request` runs it (#3649): a merge-group build has no PR to comment on
