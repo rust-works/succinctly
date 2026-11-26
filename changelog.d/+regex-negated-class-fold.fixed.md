@@ -1,1 +1,0 @@
-- **A negated property or POSIX bracket inside a regex class under `i` matches as in jq** (found by the #7689 fuzz). Oniguruma negates `\P{Lu}`, `\p{^Lu}` or `[:^upper:]` before it case-folds the class, so `"A" | test("[\\P{Lu}]"; "i")` is `true` in jq 1.7.1 and 1.8.2; succinctly folded the property first and answered `false`, and `[^\P{Lu}]` matched every letter under `i`.
