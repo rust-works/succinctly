@@ -37,7 +37,7 @@ Semi-indexing is the unifying architectural idea. Instead of building a DOM tree
 3. **Navigate** — O(1) tree operations (parent, child, sibling) via rank/select on the BP bitvector
 4. **Extract** — Values are parsed only when accessed by a query
 
-This yields 3-6% memory overhead vs 100%+ for DOM parsers. See [architecture/semi-indexing.md](architecture/semi-indexing.md) for the full design.
+The index is 19-38% of the input for JSON (more the denser the nodes), 37.5% for DSV and 50-70% for YAML ([Index Size](architecture/semi-indexing.md#index-size)), where a DOM is a multiple of the input: on the 1 GB `identity` rows of [compare/jq.md](compare/jq.md), `succinctly jq` peaks at 1.24-1.25x the input and jq 1.7.1 at 9.48-9.77x. See [architecture/semi-indexing.md](architecture/semi-indexing.md) for the full design.
 
 ## Academic Foundations
 

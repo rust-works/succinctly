@@ -420,7 +420,7 @@ Sometimes simpler structures outperform theoretically optimal ones.
 Simple cumulative count array
 - O(1) rank (same)
 - O(log n) select
-- ~4% overhead total
+- 50% of the bit vector (a `u32` per 64-bit word): more than the full index, not less
 - Sequential access pattern
 ```
 
@@ -479,9 +479,9 @@ Fewer levels / larger blocks:
 | 3-level RankDir     | `bits/rank.rs`        | O(1) rank queries          | 25%      |
 | SelectIndex         | `bits/select.rs`      | Accelerated select         | 50% x d† |
 | EliasFano           | `bits/elias_fano.rs`  | Compressed monotone ints   | ~23%*    |
-| CumulativeIndex     | `json/light.rs`       | Fast IB select             | ~4%      |
+| CumulativeIndex     | `json/light.rs`       | Fast IB select             | 50%      |
 | RangeMinIndex       | `trees/bp.rs`         | O(1) find_close            | ~39%‡    |
-| LightweightIndex    | `dsv/index_*.rs`      | DSV iteration              | ~0.8%    |
+| LightweightIndex    | `dsv/index_*.rs`      | DSV iteration              | 50%      |
 
 ‡For `BalancedParens` the min-excess levels are ~39% of the bitmap and its own rank directory adds 18.75%, ≈ 58% in all ([balanced-parens.md](../architecture/balanced-parens.md#space-overhead), #5026).
 
@@ -494,7 +494,7 @@ Fewer levels / larger blocks:
 ## Key Lessons
 
 1. **O(1) is achievable**: Hierarchical structures give constant-time queries
-2. **Space overhead is a design choice**: ~3% for the sparse select and cumulative indices, 25% for the rank directory, ~39% for the balanced-parentheses min-excess levels
+2. **Space overhead is a design choice**: 2.5-25% for the sampled select index (by density), 25% for the rank directory, ~39% for the balanced-parentheses min-excess levels, and 50% for the cumulative `u32` arrays the JSON, YAML and DSV indexes use (each a share of the bit vector it indexes; against the *input*, the whole JSON index is 19-38%, [semi-indexing.md](../architecture/semi-indexing.md#index-size))
 3. **Simpler can be faster**: Cache effects dominate for moderate sizes
 4. **Match structure to access pattern**: Random vs sequential needs different designs
 5. **Pack auxiliary data**: Bit-packing reduces memory traffic

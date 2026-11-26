@@ -2,17 +2,21 @@
 
 [Home](../../) > [Docs](../) > [Parsing](./) > JsonIndex
 
-Semi-index for JSON documents. Builds a lightweight structural index (~3-4% overhead) enabling O(1) navigation without constructing a DOM tree.
+Semi-index for JSON documents. Builds a structural index (19-38% of the input, see [Index Size](../architecture/semi-indexing.md#index-size)) enabling O(1) navigation without constructing a DOM tree.
 
 ## What It Does
 
 `JsonIndex` scans a JSON document once, producing:
 
-| Component                  | Purpose                          | Size           |
-|----------------------------|----------------------------------|----------------|
-| Interest Bits (IB)         | Mark structural byte positions   | ~0.5% of input |
-| Balanced Parentheses (BP)  | Encode tree structure            | ~0.5% of input |
-| Rank/Select indices        | Enable O(1) queries on IB and BP | ~2-3% of input |
+| Component                  | Purpose                          | Size                                     |
+|----------------------------|----------------------------------|------------------------------------------|
+| Interest Bits (IB)         | Mark structural byte positions   | 12.5% of input (one bit per byte)        |
+| IB rank (`ib_rank`)        | O(1) rank/select on IB           | 6.25% of input (a `u32` per 64-bit word) |
+| Balanced Parentheses (BP)  | Encode tree structure            | 2 bits per node (a key or a value)       |
+| BP directories             | O(1) navigation on BP            | ~58% of the BP bits                      |
+
+The whole index is 18.75% of the input plus about 0.4 bytes per node: 19-38% on the generator's
+patterns, more the denser the nodes.
 
 After indexing, a cursor API navigates the document structure in O(1) per step, extracting values lazily only when accessed.
 

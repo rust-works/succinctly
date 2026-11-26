@@ -12,7 +12,7 @@ Succinctly uses **semi-indexing** to process JSON, YAML, and CSV/TSV files with 
 | vs jq (JSON queries) | **5-25x less memory** | 1.2-6.3x faster |
 | vs yq (YAML queries) | **similar memory** | 16-40x faster |
 
-**How it works**: Instead of building a full DOM tree, succinctly builds a lightweight structural index (~3-6% overhead) and extracts values lazily only when accessed. This is ideal when queries touch a small fraction of the document.
+**How it works**: Instead of building a full DOM tree, succinctly builds a structural index (19-38% of the input for JSON, 37.5% for CSV/TSV, 50-70% for YAML; see [Index Size](architecture/semi-indexing.md#index-size)) and extracts values lazily only when accessed. This is ideal when queries touch a small fraction of the document.
 
 See [architecture/semi-indexing.md](architecture/semi-indexing.md) for technical details, or [benchmarks/](benchmarks/) for full performance data.
 

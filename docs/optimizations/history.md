@@ -118,7 +118,7 @@ Use lightweight cumulative rank index instead of full BitVec with 3-level rank d
 | **wide**     | 7.1 MiB/s       | 30.6 MiB/s          | **+331% (4.3x)** |
 | **multiline**| 20.3 MiB/s      | 26.8 MiB/s          | **+32%**         |
 
-**Why it worked**: Simpler array structure fits better in cache, reduces memory overhead from ~6% to ~0.8%.
+**Why it worked**: Simpler array structure fits better in cache. (This entry first said it also cut the memory overhead from ~6% to ~0.8%. It did not: a `u32` per 64-bit word is 50% of the bit vector, against the `BitVec`'s 25% rank directory plus select samples, and the DSV index is 37.5% of the input, #7955.)
 
 ### 5. Balanced Parentheses Byte-Level Lookup Tables
 

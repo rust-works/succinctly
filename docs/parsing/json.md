@@ -8,13 +8,17 @@ This document describes how the succinctly library parses and indexes JSON docum
 
 Unlike traditional JSON parsers that build a DOM tree, succinctly creates a **semi-index**: a compact bit-vector representation that enables O(1) navigation without materializing the parse tree.
 
-| Component                | Purpose                   | Size           |
-|--------------------------|---------------------------|----------------|
-| Interest Bits (IB)       | Mark structural positions | ~0.5% of input |
-| Balanced Parentheses (BP)| Encode tree structure     | ~0.5% of input |
-| Rank/Select indices      | Enable O(1) queries       | ~2-3% of input |
+| Component                 | Purpose                   | Size                                         |
+|---------------------------|---------------------------|----------------------------------------------|
+| Interest Bits (IB)        | Mark structural positions | 12.5% of input (one bit per byte)            |
+| IB rank (`ib_rank`)       | O(1) rank/select on IB    | 6.25% of input (a `u32` per 64-bit word)     |
+| Balanced Parentheses (BP) | Encode tree structure     | 2 bits per node (a key or a value)           |
+| BP directories            | O(1) BP navigation        | ~58% of the BP bits                          |
 
-**Total overhead**: ~3-4% of input size vs 10-50x for DOM parsers.
+**Total**: 18.75% of the input plus about 0.4 bytes per node, which is 19-38% on the generator's
+patterns (19.1% on `strings`, 23.8% on `users`, 38.5% on `arrays`), measured with the 0.8.0 library;
+see [Index Size](../architecture/semi-indexing.md#index-size). A DOM parser holds several times the
+input. This page used to say ~3-4%, which no measurement supports (#7955).
 
 ---
 

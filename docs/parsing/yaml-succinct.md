@@ -109,8 +109,9 @@ position, so no advance is needed.
 Position vectors (`Vec<u32>`) store one 32-bit integer per element. For a text
 of L bytes with N nodes (N ~ L/7.5 for typical YAML), a position vector costs
 4N bytes -- roughly 53% of the text size. Three position vectors (one each for
-`ib`, `ib_words`, `newlines`) would cost ~160% of the text, far exceeding the
-3-6% semi-index overhead budget.
+`ib`, `ib_words`, `newlines`) would cost ~160% of the text, more than twice what
+the whole `YamlIndex` measures today (50-70% of the input on the generator's
+patterns, [Index Size](../architecture/semi-indexing.md#index-size)).
 
 Bitmaps cost 1 bit per text byte (L/8 bytes = 12.5% of text). Three bitmaps
 cost 3L/8 = 37.5% of text -- still large, but bitmaps compress well because

@@ -22,9 +22,9 @@ Succinctly provides space-efficient data structures with fast rank and select op
 
 ### What is Semi-Indexing?
 
-Unlike traditional parsers that build a complete in-memory representation (DOM) of documents, succinctly uses **semi-indexing**: it builds a lightweight structural index (~3-6% overhead) and extracts values lazily on demand. This approach offers:
+Unlike traditional parsers that build a complete in-memory representation (DOM) of documents, succinctly uses **semi-indexing**: it builds a structural index and extracts values lazily on demand. The index is 19-38% of the input for JSON (more the denser the values), 37.5% for CSV/TSV and 50-70% for YAML ([measured](docs/architecture/semi-indexing.md#index-size)), where a DOM is several times the input. This approach offers:
 
-- **18-46x less memory** than DOM parsers (index is ~24% of input vs 600-800% for DOM)
+- **18-46x less memory** than DOM parsers at the library level (on 1 MB of JSON, 0.46x the input at peak allocation against serde_json's 8.7x and simd-json's 21x); end to end, `succinctly jq` peaks at 1.24x a 1 GB input where jq 1.7.1 peaks at 9.5x
 - **Faster queries** because only accessed values are materialized
 - **Streaming output** without intermediate allocations
 
@@ -153,7 +153,7 @@ Benchmark comparing succinctly against popular Rust JSON libraries (x86_64, 1MB 
 | simd-json      | 5.10 ms    | 158 MiB/s  | 17.1 MB     | 3.2x slower, **46x more memory** |
 
 **Key findings**:
-- **18-46x less memory** than DOM parsers (consistent 46% overhead vs JSON size)
+- **18-46x less memory** than DOM parsers (a consistent 0.46x of the JSON size at peak allocation, of which the index's resident part is about a quarter of the input; see [Index Size](docs/architecture/semi-indexing.md#index-size))
 - **Competitive parsing speed**: Only 1.6x slower than fastest DOM parser
 - **3-5x faster** than serde_json and simd-json
 

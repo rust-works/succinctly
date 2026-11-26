@@ -2,16 +2,19 @@
 
 [Home](../../) > [Docs](../) > [Parsing](./) > DsvIndex
 
-Semi-index for delimiter-separated value (CSV/TSV) files. Marks field and row boundaries without materializing data, enabling O(1) field lookup with ~3-4% overhead.
+Semi-index for delimiter-separated value (CSV/TSV) files. Marks field and row boundaries without materializing data, enabling O(1) field lookup with an index of 37.5% of the input ([Index Size](../architecture/semi-indexing.md#index-size)).
 
 ## What It Does
 
 `DsvIndex` scans a DSV file once, producing two bitvectors:
 
-| Component | Marks                                             | Size            |
-|-----------|---------------------------------------------------|-----------------|
-| Markers   | Delimiter and newline positions (outside quotes)  | ~1 bit/byte     |
-| Newlines  | Row boundary positions only                       | ~1 bit/64 bytes |
+| Component | Marks                                             | Size                          |
+|-----------|---------------------------------------------------|-------------------------------|
+| Markers   | Delimiter and newline positions (outside quotes)  | 1 bit per byte (12.5%)        |
+| Newlines  | Row boundary positions only                       | 1 bit per byte (12.5%)        |
+
+Each has a `u32` cumulative count per 64-bit word (6.25% of the input each), so the index is 37.5%
+of the input whatever the content.
 
 With rank/select on these bitvectors, any cell `(row, column)` can be located in O(1).
 
