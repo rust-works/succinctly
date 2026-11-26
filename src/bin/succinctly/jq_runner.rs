@@ -8959,6 +8959,10 @@ fn read_inputs(
         && !unopened_tail
         && handed.is_none()
         && reader_model::enabled();
+    // PROTOTYPE (reader model): the bytes the first read of the sources held, which a second read
+    // of them for the model must hold too (a `/dev/fd/N` path on macOS reopens the descriptor at
+    // its offset, so a second read of it is empty).
+    let first_read_len: usize = raw_bytes.iter().map(|(_, raw)| raw.len()).sum();
     let model_nuls: Option<Vec<succinctly::jq::TextScan>> = model_scope.then(|| {
         raw_bytes
             .iter()
@@ -10445,7 +10449,9 @@ fn read_inputs(
                 .all(|path| std::fs::metadata(path).is_ok_and(|meta| meta.is_file()))
         {
             let (_, raws, failures) = read_input_files(&files, false, false);
-            (failures.is_empty() && raws.len() == last + 1).then_some(raws)
+            let again: usize = raws.iter().map(Vec::len).sum();
+            (failures.is_empty() && raws.len() == last + 1 && again == first_read_len)
+                .then_some(raws)
         } else {
             None
         };
