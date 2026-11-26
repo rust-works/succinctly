@@ -13,7 +13,12 @@ Succinct data structures store data in space close to the information-theoretic 
 ### Space Efficiency
 - Store n bits in n + o(n) bits
 - Overhead is sublinear in data size
-- Often 3-6% overhead for full functionality
+- Compact designs in the literature reach ~3% (Poppy); succinctly spends more for speed: its rank
+  directory is 25% of the bit vector, and a full `BitVec` with select is 27.5-47.5%
+  ([bitvec.md](bitvec.md#space-analysis))
+- The semi-indexes built on these structures are measured against their *input*, not a bit vector:
+  19-38% of the input for JSON, 37.5% for DSV, 50-70% for YAML
+  ([semi-indexing.md](semi-indexing.md#index-size))
 
 ### Time Efficiency
 - O(1) rank operations
@@ -60,7 +65,11 @@ For each superblock: cumulative popcount from start
 For each block:      popcount within the superblock
 ```
 
-This allows O(1) rank with only ~3-4% space overhead.
+This allows O(1) rank. The space depends on how wide the counts are: compact layouts in the
+literature spend ~3% of the bit vector, while succinctly's `RankDirectory` spends one 128-bit entry
+(a 32-bit cumulative count and seven 9-bit offsets) per 512 bits, 25% of the bit vector, to keep each
+query to one cache line ([bitvec.md](bitvec.md#space-analysis)). The JSON, YAML and DSV indexes use a
+plainer form still, a `u32` cumulative count per 64-bit word, which is 50% of the bit vector it counts.
 
 ## Balanced Parentheses
 

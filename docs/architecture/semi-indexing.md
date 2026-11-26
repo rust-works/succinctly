@@ -121,13 +121,83 @@ Semi-indexing delivers significant memory and speed improvements over traditiona
 | vs jq | **5-25x less** | 1.2-6.3x faster |
 | vs yq | similar | **16-40x faster** |
 
-The index overhead (3-6%) is dwarfed by the memory savings from not materializing the entire document.
+The index is not small (19-38% of the input for JSON, see [Index Size](#index-size)), but it is a
+fraction of the input where a DOM is a multiple of it. On the 1 GB `identity` rows of the committed
+jq comparisons ([compare/jq.md](../compare/jq.md)), `succinctly jq` peaks at 1.24-1.25x the input,
+the text plus an index of about a quarter of it, and jq 1.7.1 at 9.48-9.77x.
 
 See [../benchmarks/](../benchmarks/) for detailed numbers across file sizes and patterns.
 
+## Index Size
+
+What the index costs depends on the format and, for JSON and YAML, on how many nodes the text holds
+per byte: the interest bits are one bit per input byte whatever the text says, and the balanced
+parentheses are two bits per node. The figures below are the heap the 0.8.0 library's index holds
+over 10 MB inputs from `succinctly {json,yaml,dsv} generate 10mb -p <pattern>`, as a percentage of the
+input; the input itself is not counted. Sizes are deterministic, so they do not depend on the machine.
+Earlier revisions of this page and others said "~3-6%" (or "3-4%"); no measurement supports that, and
+it is not true of any of the three indexes (#7955).
+
+**How they were measured.** A probe linked against the library built each index once per file and
+read its size with a counting global allocator: the live heap before and after a clone of the index
+(a clone allocates each vector at its length, so spare capacity is left out). For JSON and DSV, whose
+vectors are public, it also summed them (for JSON, `ib`, the IB rank array, the BP words and
+`BalancedParens::index_heap_size`), and the two agree to the byte.
+
+### JSON (`JsonIndex`)
+
+| Part                                  | Size                         | Grows with |
+|---------------------------------------|------------------------------|------------|
+| Interest bits (IB)                    | 12.5% (one bit per byte)     | Bytes      |
+| IB rank (`ib_rank`)                   | 6.25% (a `u32` per word)     | Bytes      |
+| Balanced parentheses (BP)             | 2 bits per node              | Nodes      |
+| BP directories (`index_heap_size`)    | ~58% of the BP bits          | Nodes      |
+
+A node is a key or a value. The index is therefore 18.75% of the input plus about 0.4 bytes per
+node:
+
+| Pattern         | Input bytes per node | Index / input |
+|-----------------|---------------------:|--------------:|
+| `nested`        |              499,318 |         18.8% |
+| `strings`       |                123.0 |         19.1% |
+| `unicode`       |                 24.3 |         20.4% |
+| `numbers`       |                 14.5 |         21.5% |
+| `pretty`        |                 12.3 |         22.0% |
+| `wide`          |                  8.3 |         23.5% |
+| `users`         |                  7.8 |         23.8% |
+| `ndjson`        |                  7.8 |         23.8% |
+| `comprehensive` |                  6.0 |         25.3% |
+| `literals`      |                  5.3 |         26.2% |
+| `pathological`  |                  3.2 |         31.1% |
+| `arrays`        |                  2.0 |         38.5% |
+
+`JsonIndex::build` reserves the BP buffer at its worst case, two bits per input byte (25% of the
+input), and does not shrink it. An allocator that counts capacity therefore sees 44-51% of the input,
+which matches the 0.46x that [rust-parsers.md](../benchmarks/rust-parsers.md) reports. The unwritten pages
+of that buffer are never touched, so the process's resident size grows by the table's figure plus 1-3
+points (measured on macOS), not by the allocator's.
+
+### YAML (`YamlIndex`)
+
+`YamlIndex::build_yq`, the index `succinctly yq` builds, is 50-70% of the input on the generator's
+patterns: 50% on `block-scalars`, 56% on `strings`, 61% on `comprehensive`, 63% on `users` and 70%
+on `multi-doc`. Beside the interest bits and their rank array (18.75%), it keeps a map from each node
+to where its text starts (19-28%); a map to where each scalar ends, the container bits and the
+comment and anchor maps are the remaining 13-22%, and the BP and its directories are under 7%. On
+`anchors` it is 2.0x the input, because the anchor and alias names and their positions are kept in
+ordered maps. Building it peaks at 1.75x the input on most patterns and 2.75x on `flow`, `multi-doc`
+and `sequences`; that peak is freed before a query runs.
+
+### DSV (`DsvIndex`)
+
+`DsvIndex` is 37.5% of the input on every pattern: two bit vectors of one bit per byte (markers for
+delimiters and row ends outside quotes, and row ends alone) and a `u32` cumulative count per 64-bit
+word of each (6.25% each). Nothing in it depends on the content.
+
 ## Trade-offs
 
-1. **Memory**: Index overhead (3-6%)
+1. **Memory**: An index of 19-38% of the input for JSON, 37.5% for DSV and 50-70% for YAML (see
+   [Index Size](#index-size)), against a multiple of the input for a DOM
 2. **Latency**: Index build is upfront cost
 3. **Complexity**: More complex than DOM parsing
 4. **Validation**: Minimal; a malformed value is found when it is read, not when the document is

@@ -94,9 +94,9 @@ Succinctly is a high-performance Rust library implementing succinct data structu
 
 ### Semi-Indexing Architecture
 
-Succinctly uses **semi-indexing** rather than traditional DOM parsing. Instead of building a complete in-memory tree, it creates a lightweight structural index (~3-6% overhead) and extracts values lazily. This enables:
+Succinctly uses **semi-indexing** rather than traditional DOM parsing. Instead of building a complete in-memory tree, it creates a structural index and extracts values lazily. The index is a fraction of the input where a DOM is a multiple: 19-38% for JSON (more the denser the nodes), 37.5% for DSV and 50-70% for YAML, measured in [docs/architecture/semi-indexing.md](docs/architecture/semi-indexing.md#index-size) (it was long misquoted as ~3-6%, #7955). This enables:
 
-- **18-46x less memory** than DOM parsers
+- **18-46x less memory** than DOM parsers (library allocation peak against serde_json and simd-json, [docs/benchmarks/rust-parsers.md](docs/benchmarks/rust-parsers.md)); end to end, `succinctly jq` peaks at 1.24-1.25x a 1 GB input where jq 1.7.1 peaks at 9.48-9.77x ([docs/compare/jq.md](docs/compare/jq.md))
 - **Fast queries** because only accessed values are materialized
 - **Streaming output** without intermediate allocations
 

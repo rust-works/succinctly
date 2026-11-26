@@ -399,15 +399,15 @@ all body rows share one column width. Prefer this:
 ```markdown
 | Structure    | Overhead |
 |--------------|----------|
-| BitVec       | 3–4%     |
-| BalancedParens | 6%     |
+| BitVec       | 25%      |
+| BalancedParens | 58%    |
 ```
 → align to:
 ```markdown
 | Structure      | Overhead |
 |----------------|----------|
-| BitVec         | 3–4%     |
-| BalancedParens | 6%       |
+| BitVec         | 25%      |
+| BalancedParens | 58%      |
 ```
 
 The [`markdown-tables` / `format-md-tables` skill](../.claude/skills/markdown-tables/SKILL.md)

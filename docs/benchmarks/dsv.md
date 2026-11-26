@@ -391,7 +391,10 @@ Direct API usage without JSON serialization overhead.
 | 10 MB     | 17-21 MB    |
 | 100 MB    | 138-143 MB  |
 
-**Index overhead**: ~3-4% of input size.
+**Index size**: 37.5% of the input, on every pattern: two bit vectors of one bit per byte (markers
+and row ends) and a `u32` cumulative count per 64-bit word of each, measured with the 0.8.0 library
+([Index Size](../architecture/semi-indexing.md#index-size)). This page used to say ~3-4%, which no
+measurement supports (#7955).
 
 ## Optimization Impact
 
@@ -412,10 +415,14 @@ Replaced scalar prefix XOR (6 shifts + 6 XORs) with carryless multiplication via
 
 Replaced full BitVec with simple cumulative rank arrays:
 
-| Metric          | Before    | After          | Improvement  |
-|-----------------|-----------|----------------|--------------|
-| Field iteration | 145 MiB/s | 792-1331 MiB/s | **5-9x**     |
-| Memory overhead | ~6%       | ~3-4%          | **50% less** |
+| Metric          | Before    | After          | Improvement |
+|-----------------|-----------|----------------|-------------|
+| Field iteration | 145 MiB/s | 792-1331 MiB/s | **5-9x**    |
+
+This entry also claimed the change halved the memory overhead, from ~6% to ~3-4%. It did not: a
+`u32` cumulative count per 64-bit word is 50% of the bit vector it counts, against the 25% rank
+directory plus select samples (27.5-47.5% in all, [bitvec.md](../architecture/bitvec.md#space-analysis))
+of the `BitVec` it replaced. The change bought iteration speed, not space (#7955).
 
 ## Running Benchmarks
 

@@ -12,8 +12,9 @@ and DSV/CSV, and a `jq`-style query engine over them.
 
 ## The core idea: semi-indexing
 
-Rather than building a full in-memory DOM, succinctly builds a lightweight structural index
-(~3–6% overhead) and materialises values lazily. The pipeline is:
+Rather than building a full in-memory DOM, succinctly builds a structural index (19-38% of the
+input for JSON, 37.5% for DSV and 50-70% for YAML, [measured](docs/architecture/semi-indexing.md#index-size))
+and materialises values lazily. The pipeline is:
 
 1. **Scan** — a SIMD-accelerated pass finds structural characters (braces, brackets, quotes,
    newlines).

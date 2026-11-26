@@ -25,7 +25,11 @@ Before reviewing the benchmarks, it's important to understand the fundamental di
 | **Validation**       | Minimal (syntax only)             | Full YAML validation              |
 | **Tags**             | Not supported                     | Full support (`!custom`, `!!str`) |
 | **Anchors/Aliases**  | Supported                         | Supported                         |
-| **Memory model**     | ~3-6% index overhead              | Full DOM in memory                |
+| **Memory model**     | Input plus a 50-70% index¹        | Full DOM in memory                |
+
+¹ `YamlIndex` measured over the generator's 10 MB patterns; about 2x on anchor-dense input, and its
+build peaks at 1.75-2.75x the input before the query runs
+([Index Size](../architecture/semi-indexing.md#index-size)).
 
 **What this means for benchmarks**: The performance differences shown below come from two sources:
 

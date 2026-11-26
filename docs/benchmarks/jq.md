@@ -16,11 +16,16 @@ Every other table and figure in this page is a `bench run jq_bench` or `dev benc
 
 Before reviewing the benchmarks, it's important to understand the fundamental differences between these tools:
 
-| Aspect           | succinctly                        | jq                              |
-|------------------|-----------------------------------|---------------------------------|
-| **Architecture** | Semi-indexer                      | Full parser                     |
-| **Approach**     | Build structural index, lazy eval | Parse entire document into DOM  |
-| **Memory model** | ~3-6% index overhead              | Full DOM in memory (6-8x input) |
+| Aspect           | succinctly                         | jq                              |
+|------------------|------------------------------------|---------------------------------|
+| **Architecture** | Semi-indexer                       | Full parser                     |
+| **Approach**     | Build structural index, lazy eval  | Parse entire document into DOM  |
+| **Memory model** | Input plus a 19-38% index¹         | Full DOM in memory (6-8x input) |
+
+¹ The JSON index is 18.75% of the input plus about 0.4 bytes per node
+([Index Size](../architecture/semi-indexing.md#index-size)). On the 1 GB `identity` rows of
+[compare/jq.md](../compare/jq.md), `succinctly jq` peaks at 1.24-1.25x the input and jq 1.7.1 at
+9.48-9.77x.
 
 **What this means for benchmarks**: The performance and memory differences shown below come from architectural choices:
 

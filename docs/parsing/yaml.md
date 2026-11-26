@@ -806,6 +806,11 @@ Errors include byte offset and line number for IDE integration.
 | Queries           | O(1)         | Match JSON implementation |
 | Memory overhead   | <5% of input | IB + BP + TY              |
 
+The memory target was not met and could not have been: the interest bits alone are one bit per input
+byte, 12.5%. The 0.8.0 `YamlIndex` measures 50-70% of the input on the generator's patterns, most of
+it the interest bits and the maps from each node to where its text starts and ends
+([Index Size](../architecture/semi-indexing.md#index-size), #7955).
+
 ### 10. Phased Implementation Plan
 
 Implementation proceeds in phases, each building on the previous and adding YAML features incrementally.

@@ -475,7 +475,7 @@ cargo bench --bench json_parsers -- "100mb"
 | **Parse-Only (10MB)**     | **2nd** | 539 MiB/s  | 74% of sonic-rs, 3x faster than serde_json   |
 | **Parse-Only (100MB)**    | **2nd** | 550 MiB/s  | 77% of sonic-rs, 3.7x faster than serde_json |
 | **Parse+Traverse (10MB)** | **2nd** | 302 MiB/s  | 67% of sonic-rs, 1.9x faster than serde_json |
-| **Memory Overhead**       | **1st** | 2-3%       | 30-50x less than DOM parsers                 |
+| **Memory Overhead**       | **1st** | 24-46%     | 30-50x less than DOM parsers                 |
 
 **Overall Position**: Succinctly is the **2nd fastest** JSON parser tested, while using **~24% memory overhead** compared to **600-670%** for DOM parsers (27x more efficient). It offers an excellent speed/memory tradeoff for applications where memory efficiency matters.
 

@@ -8,13 +8,15 @@ This document describes how the succinctly library parses and indexes delimiter-
 
 The DSV parser creates a **semi-index** that marks field and row boundaries without materializing the data. This enables streaming access with minimal memory overhead.
 
-| Component    | Purpose                         | Size            |
-|--------------|--------------------------------|-----------------|
-| Markers      | Delimiter and newline positions | ~1 bit/byte     |
-| Newlines     | Row boundary positions          | ~1 bit/64 bytes |
-| Rank indices | Enable O(1) field lookup        | ~3-4% of input  |
+| Component    | Purpose                         | Size                                       |
+|--------------|---------------------------------|--------------------------------------------|
+| Markers      | Delimiter and newline positions | 1 bit per byte (12.5% of input)            |
+| Newlines     | Row boundary positions          | 1 bit per byte (12.5% of input)            |
+| Rank indices | Enable O(1) field lookup        | a `u32` per 64-bit word of each (12.5%)    |
 
-**Total overhead**: ~3-4% of input size vs 6-40x for materialized parsers.
+**Total**: 37.5% of the input whatever the content, measured with the 0.8.0 library
+([Index Size](../architecture/semi-indexing.md#index-size)), vs 6-40x for materialized parsers. This
+page used to say ~3-4%, which no measurement supports (#7955).
 
 ---
 
@@ -247,13 +249,13 @@ The DSV parser uses a **lightweight index** instead of full BitVec:
 ### Full BitVec (Not Used)
 - 3-level RankDirectory
 - SelectIndex with sampling
-- ~6% memory overhead
+- 27.5-47.5% of each bit vector ([bitvec.md](../architecture/bitvec.md#space-analysis))
 - Complex cache access patterns
 
 ### Lightweight Index (Used)
 - Simple cumulative rank array
 - Binary search for select
-- ~3-4% memory overhead
+- 50% of each bit vector (a `u32` per 64-bit word): more space, not less
 - **5-9x faster iteration**
 
 ```rust

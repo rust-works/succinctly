@@ -39,11 +39,11 @@ Input → Full Parse → DOM/Rows → Query
 ```
 Input → Bit Index → Lazy Navigation → Query
            ↓
-      ~3-4% memory overhead
+      19-38% of input (JSON), 37.5% (DSV)
 ```
 
 **Benefits**:
-- Memory efficient: 3-4% overhead vs 10-50x
+- Memory efficient: an index of 19-38% of the input (JSON) or 37.5% (DSV) vs 10-50x
 - Fast construction: SIMD-accelerated
 - Lazy evaluation: Decode values only when accessed
 - Random access: O(1) rank, O(log n) select
@@ -78,11 +78,16 @@ Both parsers share optimization techniques:
 
 ### Memory Overhead
 
-| Approach           | Overhead       |
-|--------------------|----------------|
-| Semi-index         | ~3-4% of input |
-| DOM parser (JSON)  | 10-50x input   |
-| Materialized (CSV) | 6-40x input    |
+| Approach            | Overhead                     |
+|---------------------|------------------------------|
+| Semi-index (JSON)   | 19-38% of input              |
+| Semi-index (DSV)    | 37.5% of input               |
+| Semi-index (YAML)   | 50-70% of input              |
+| DOM parser (JSON)   | 10-50x input                 |
+| Materialized (CSV)  | 6-40x input                  |
+
+The semi-index figures are measured with the 0.8.0 library; what they depend on is in
+[Index Size](../architecture/semi-indexing.md#index-size).
 
 ---
 
