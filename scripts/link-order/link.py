@@ -221,15 +221,20 @@ def save_link(args, save_dir):
     import tempfile
     os.makedirs(save_dir, exist_ok=True)
     tmp = os.path.realpath(tempfile.gettempdir())
-    out_args = []
-    for i, a in enumerate(args):
+    def keep(i, a):
         p = os.path.realpath(a) if os.path.isfile(a) else None
         if p and (a.endswith(".o") or p.startswith(tmp) or "/rustc" in p):
             dst = os.path.join(save_dir, f"{i:04d}-{os.path.basename(a)}")
             shutil.copyfile(a, dst)
-            out_args.append(dst)
+            return dst
+        return a
+
+    out_args = []
+    for i, a in enumerate(args):
+        if a.startswith("-Wl,"):  # `-Wl,-exported_symbols_list,<tmp file>` and the like
+            out_args.append(",".join(keep(i, part) for part in a.split(",")))
         else:
-            out_args.append(a)
+            out_args.append(keep(i, a))
     with open(os.path.join(save_dir, "link.json"), "w") as f:
         json.dump({"args": out_args, "cwd": os.getcwd(), "list": LIST}, f, indent=0)
 
