@@ -1,0 +1,35 @@
+2026-11-26T13:41:29Z driver start, pid 62480
+2026-11-26T13:41:29Z step fetch start (cap 900s)
+2026-11-26T13:41:29Z step fetch rc=1
+2026-11-26T13:42:27Z driver start, pid 62561
+2026-11-26T13:42:27Z step fetch start (cap 900s)
+2026-11-26T13:42:42Z step fetch rc=0
+2026-11-26T13:42:42Z step build-A start (cap 1800s)
+2026-11-26T13:45:36Z build A: 1455 listed, 1347 found, 1442 symbols ordered (ld64) 
+2026-11-26T13:45:36Z step build-A rc=0
+2026-11-26T13:45:36Z step build-B start (cap 1800s)
+2026-11-26T13:48:38Z build B: 1536 listed, 1500 found, 1596 symbols ordered (ld64) 
+2026-11-26T13:48:38Z step build-B rc=0
+2026-11-26T13:48:38Z step build-C start (cap 1800s)
+2026-11-26T13:51:35Z build C: 1455 listed, 1347 found, 1442 symbols ordered (ld64) 
+2026-11-26T13:51:36Z step build-C rc=0
+2026-11-26T13:51:36Z step relinks start (cap 1200s)
+2026-11-26T13:51:36Z relink control A: differs from cargo's binary
+2026-11-26T13:51:39Z relinks A:        9 binaries
+2026-11-26T13:51:39Z relink control B: differs from cargo's binary
+2026-11-26T13:51:42Z relinks B:        9 binaries
+2026-11-26T13:51:42Z relink control C: differs from cargo's binary
+2026-11-26T13:51:45Z relinks C:        9 binaries
+2026-11-26T13:51:45Z step relinks rc=0
+2026-11-26T13:51:45Z step cachegrind start (cap 600s)
+2026-11-26T13:51:46Z input strings-1mb sha256 f806bb632c7bcab1
+2026-11-26T13:51:46Z input strings-10mb sha256 8964a217192551b9
+2026-11-26T13:51:46Z input ndjson-1mb sha256 f216dc3cb8e4fb0e
+2026-11-26T13:51:46Z input ndjson-10mb sha256 ab0932e7e5ebc480
+2026-11-26T13:51:46Z input jsonseq-1mb sha256 5e80fe18728ae994
+2026-11-26T13:51:46Z input jsonseq-10mb sha256 9d80828da5fe1e81
+2026-11-26T13:51:46Z step cachegrind rc=0
+2026-11-26T13:51:46Z step clean start (cap 600s)
+2026-11-26T13:51:46Z step clean rc=0
+2026-11-26T13:51:46Z READY for timing
+2026-11-26T13:55:56Z timing start (mac)

@@ -1,0 +1,33 @@
+2026-11-26T13:38:57Z driver start, pid 2283481
+2026-11-26T13:38:57Z step fetch start
+2026-11-26T13:39:07Z step fetch rc=0
+2026-11-26T13:39:07Z step build-A start
+2026-11-26T13:42:24Z build A: 1455 listed, 1339 found, 1446 symbols ordered (rustc links with lld) 
+2026-11-26T13:42:24Z step build-A rc=0
+2026-11-26T13:42:24Z step build-B start
+2026-11-26T13:45:38Z build B: 1536 listed, 1496 found, 1604 symbols ordered (rustc links with lld) 
+2026-11-26T13:45:38Z step build-B rc=0
+2026-11-26T13:45:38Z step build-C start
+2026-11-26T13:48:53Z build C: 1455 listed, 1339 found, 1446 symbols ordered (rustc links with lld) 
+2026-11-26T13:48:53Z step build-C rc=0
+2026-11-26T13:48:53Z step relinks start
+2026-11-26T13:48:53Z relink control A: byte-identical to cargo's binary
+2026-11-26T13:48:58Z relinks A: 17 binaries
+2026-11-26T13:48:58Z relink control B: byte-identical to cargo's binary
+2026-11-26T13:49:02Z relinks B: 17 binaries
+2026-11-26T13:49:02Z relink control C: byte-identical to cargo's binary
+2026-11-26T13:49:06Z relinks C: 17 binaries
+2026-11-26T13:49:06Z step relinks rc=0
+2026-11-26T13:49:06Z step cachegrind start
+2026-11-26T13:49:06Z input strings-1mb sha256 f806bb632c7bcab1
+2026-11-26T13:49:06Z input strings-10mb sha256 8964a217192551b9
+2026-11-26T13:49:07Z input strings-100mb sha256 2cc551cb4004df4d
+2026-11-26T13:49:07Z Ir A strings_upcase 1mb: I   refs:      112,398,939
+2026-11-26T13:49:08Z Ir B strings_upcase 1mb: I   refs:      112,403,959
+2026-11-26T13:49:08Z Ir C strings_upcase 1mb: I   refs:      115,544,319
+2026-11-26T13:49:08Z step cachegrind rc=0
+2026-11-26T13:49:08Z step clean start
+2026-11-26T13:49:08Z step clean rc=0
+2026-11-26T13:49:08Z READY for timing
+2026-11-26T13:53:39Z timing start (linux)
+2026-11-26T13:54:43Z timing start (linux)
