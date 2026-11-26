@@ -21,8 +21,12 @@ WORKFLOWS = os.path.join(b.ROOT, ".github", "workflows")
 LINUX_CI_TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu")
 
 
-def config(bytes_, tolerance=0.05, target="t"):
-    return {"tolerance": tolerance, "targets": {target: {"bytes": bytes_, "measured": "test"}}}
+def config(bytes_, tolerance=0.05, target="t", max_pr_growth=0.01):
+    return {
+        "tolerance": tolerance,
+        "max_pr_growth": max_pr_growth,
+        "targets": {target: {"bytes": bytes_, "measured": "test"}},
+    }
 
 
 class VerdictTests(unittest.TestCase):
@@ -67,6 +71,71 @@ class CheckTests(unittest.TestCase):
         self.assertIn('"other": {"bytes": 1234', "\n".join(lines))
 
 
+class ReportModeTests(unittest.TestCase):
+    def test_a_budget_overrun_is_a_warning_that_passes(self):
+        code, lines = b.check(1_100_000, "t", config(1_000_000), b.BUDGET, report=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(lines[0].startswith("::warning::"), lines[0])
+        self.assertIn("+10.00%", lines[0])
+        self.assertNotIn("::error::", "\n".join(lines))
+        self.assertIn("PR of its own", "\n".join(lines))
+
+    def test_report_mode_leaves_the_other_verdicts_alone(self):
+        self.assertEqual(b.check(1_040_000, "t", config(1_000_000), b.BUDGET, report=True)[0], 0)
+        self.assertEqual(b.check(1_234, "other", config(1_000_000), b.BUDGET, report=True)[0], 1)
+
+
+class GrowthTests(unittest.TestCase):
+    def test_growth_past_the_limit_fails_and_names_the_waiver(self):
+        code, lines = b.check_growth(1_020_000, 1_000_000, 0.01)
+        self.assertEqual(code, 1)
+        text = "\n".join(lines)
+        self.assertTrue(lines[0].startswith("::error::"), lines[0])
+        self.assertIn("+2.00%", text)
+        self.assertIn("[size-growth: ok #N]", text)
+
+    def test_the_limit_itself_passes(self):
+        self.assertEqual(b.check_growth(1_010_000, 1_000_000, 0.01)[0], 0)
+        self.assertEqual(b.check_growth(1_010_001, 1_000_000, 0.01)[0], 1)
+
+    def test_a_shrink_or_no_change_passes_quietly(self):
+        for measured in (900_000, 1_000_000):
+            code, lines = b.check_growth(measured, 1_000_000, 0.01)
+            self.assertEqual((code, len(lines)), (0, 1))
+            self.assertNotIn("::", lines[0])
+
+    def test_a_waiver_accepts_the_growth_with_a_notice(self):
+        code, lines = b.check_growth(1_300_000, 1_000_000, 0.01, waiver="7960")
+        self.assertEqual(code, 0)
+        self.assertTrue(lines[0].startswith("::notice::"), lines[0])
+        self.assertIn("#7960", lines[0])
+
+
+class WaiverTests(unittest.TestCase):
+    def test_a_line_of_its_own_names_the_issue(self):
+        self.assertEqual(b.find_waiver(["feat(regex): x\n\n[size-growth: ok #7960]\n"]), "7960")
+        self.assertEqual(b.find_waiver(["title", "body\n  [size-growth: ok #12]  \n"]), "12")
+
+    def test_a_mention_inside_a_sentence_does_not_count(self):
+        self.assertIsNone(b.find_waiver(["add [size-growth: ok #7] to waive it"]))
+        self.assertIsNone(b.find_waiver(["[size-growth: ok]"]))  # no issue number
+        self.assertIsNone(b.find_waiver(["[size-growth: ok #x]"]))
+
+    def test_a_template_comment_does_not_count(self):
+        body = "<!--\nwaive with\n[size-growth: ok #N]\n[size-growth: ok #1]\n-->\nreal text"
+        self.assertIsNone(b.find_waiver([body]))
+        self.assertIsNone(b.find_waiver(["", None]))
+
+    def test_commit_messages_reads_a_git_range(self):
+        with mock.patch("subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="one\n\x00two\n[size-growth: ok #5]\n\x00")
+            msgs = b.commit_messages("origin/main..HEAD")
+        self.assertEqual(b.find_waiver(msgs), "5")
+        with mock.patch("subprocess.run") as run:
+            run.return_value = mock.Mock(returncode=128, stdout="")
+            self.assertEqual(b.commit_messages("nope..HEAD"), [])
+
+
 class StripTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -98,6 +167,67 @@ class StripTests(unittest.TestCase):
         with open(summary) as f:
             self.assertIn("stripped binary 600 bytes", f.read())
 
+    def _run(self, base_size, env=None, extra=(), budget_bytes=600, budget_extra=None):
+        """`main` over the 600-byte binary against a base of `base_size` bytes (a fake-strip result)."""
+        base = os.path.join(self.tmp.name, "base")
+        with open(base, "wb") as f:
+            f.write(b"x" * base_size)
+        # The fake strip keeps 600 bytes at most, so make the base smaller than that by hand instead.
+        cfg = config(budget_bytes, target="x86_64-unknown-linux-gnu")
+        cfg.update(budget_extra or {})
+        budget = os.path.join(self.tmp.name, "budget.json")
+        with open(budget, "w") as f:
+            json.dump(cfg, f)
+        argv = ["check", "--binary", self.binary, "--target", "x86_64-unknown-linux-gnu", "--budget", budget]
+        argv += ["--strip", self.strip, "--baseline-binary", base, *extra]
+        with mock.patch.dict(os.environ, env or {}, clear=False), mock.patch("builtins.print") as out:
+            code = b.main(argv)
+        return code, "\n".join(c.args[0] for c in out.call_args_list)
+
+    def test_main_fails_a_pr_that_outgrew_its_base(self):
+        code, printed = self._run(300, env={"PR_BODY": ""})  # base 300, head 600: +100%
+        self.assertEqual(code, 1)
+        self.assertIn("against its base 300 bytes", printed)
+
+    def test_main_passes_a_pr_within_the_limit_of_its_base(self):
+        code, printed = self._run(598, env={"PR_BODY": ""})  # +0.33%
+        self.assertEqual(code, 0)
+
+    def test_main_reads_the_waiver_from_the_pr_body(self):
+        code, printed = self._run(300, env={"PR_BODY": "why\n\n[size-growth: ok #7960]\n"})
+        self.assertEqual(code, 0)
+        self.assertIn("accepted by [size-growth: ok #7960]", printed)
+
+    def test_main_reads_the_waiver_from_commit_messages(self):
+        with mock.patch.object(b, "commit_messages", return_value=["feat: x\n\n[size-growth: ok #9]\n"]) as cm:
+            code, printed = self._run(300, env={"PR_BODY": ""}, extra=["--commit-range", "origin/main..HEAD"])
+        cm.assert_called_once_with("origin/main..HEAD")
+        self.assertEqual(code, 0)
+
+    def test_report_mode_leaves_the_budget_to_the_growth_check(self):
+        # 600 bytes against a 500-byte budget (+20%, past 5%) but equal to its base: passes in report mode.
+        code, printed = self._run(600, env={"PR_BODY": ""}, extra=["--budget-mode", "report"], budget_bytes=500)
+        self.assertEqual(code, 0)
+        self.assertIn("::warning::", printed)
+        self.assertNotIn("::error::", printed)
+
+    def test_enforce_mode_still_fails_the_budget_when_the_growth_is_fine(self):
+        code, printed = self._run(600, env={"PR_BODY": ""}, budget_bytes=500)
+        self.assertEqual(code, 1)
+        self.assertIn("past its budget", printed)
+
+    def test_a_missing_baseline_falls_back_to_enforcing_the_budget(self):
+        budget = os.path.join(self.tmp.name, "budget.json")
+        with open(budget, "w") as f:
+            json.dump(config(500, target="x86_64-unknown-linux-gnu"), f)
+        argv = ["check", "--binary", self.binary, "--target", "x86_64-unknown-linux-gnu", "--budget", budget]
+        argv += ["--strip", self.strip, "--baseline-binary", "/nonexistent/succinctly", "--budget-mode", "report"]
+        with mock.patch("builtins.print") as out:
+            code = b.main(argv)
+        printed = "\n".join(c.args[0] for c in out.call_args_list)
+        self.assertEqual(code, 1)
+        self.assertIn("no baseline binary", printed)
+
     def test_a_failing_strip_is_an_error_not_a_size(self):
         with open(self.strip, "w") as f:
             f.write("#!/bin/sh\nexit 1\n")
@@ -113,6 +243,10 @@ class CommittedBudgetTests(unittest.TestCase):
     def test_tolerance_is_five_percent(self):
         # The issue's figure; docs in binary_size.py and the PR explain why a toolchain bump stays inside it.
         self.assertEqual(self.config["tolerance"], 0.05)
+
+    def test_the_per_pr_growth_limit_is_a_fraction_inside_the_tolerance(self):
+        self.assertGreater(self.config["max_pr_growth"], 0)
+        self.assertLess(self.config["max_pr_growth"], self.config["tolerance"])
 
     def test_every_linux_ci_leg_has_a_budget(self):
         for target in LINUX_CI_TARGETS:
@@ -131,7 +265,11 @@ class CommittedBudgetTests(unittest.TestCase):
         shipped = re.search(r"run: cargo build --verbose --release (--features \S+) --target", release)
         self.assertIsNotNone(shipped)
         self.assertIn(f"run: cargo build --release {shipped.group(1)}\n", ci)
-        self.assertIn("python3 scripts/binary_size.py check --binary target/release/succinctly\n", ci)
+        self.assertIn("python3 scripts/binary_size.py check --binary target/release/succinctly", ci)
+        # A PR gates its growth against the base the perf guard compares with, and reports the budget;
+        # a push to main gates the budget.
+        self.assertIn("--baseline-binary", ci.split("Check stripped binary size", 1)[1])
+        self.assertIn("--budget-mode report", ci)
         self.assertIn("python3 scripts/test_binary_size.py -v\n", ci)
 
 

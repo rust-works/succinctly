@@ -1,6 +1,7 @@
 {
-  "about": "Stripped size in bytes of `cargo build --release --features cli` (release.yml's command), per target, checked by scripts/binary_size.py in ci.yml's Linux `Perf Regression Guard` legs (#7390). A size more than `tolerance` above a budget fails CI: if the growth is intended, set `bytes` to the size the failing run printed, in the same PR. Take the number from CI's log, not a local build: another toolchain, linker or strip moves it by a percent or two.",
+  "about": "Stripped size in bytes of `cargo build --release --features cli` (release.yml's command), per target, checked by scripts/binary_size.py in ci.yml's Linux `Perf Regression Guard` legs (#7390). A pull request fails when its stripped binary grew more than `max_pr_growth` over its base's (a line `[size-growth: ok #N]` in a commit message or the PR body waives it); the budget is only a report there. A push to main fails when the size is more than `tolerance` above a budget: set `bytes` to the size the failing run printed, in a PR of its own. Take the number from CI's log, not a local build: another toolchain, linker or strip moves it by a percent or two.",
   "tolerance": 0.05,
+  "max_pr_growth": 0.01,
   "targets": {
     "aarch64-unknown-linux-gnu": {
       "bytes": 15932024,
