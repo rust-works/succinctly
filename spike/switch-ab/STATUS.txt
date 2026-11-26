@@ -37,3 +37,4 @@
 2026-11-26T14:04:09Z step clean rc=0
 2026-11-26T14:04:09Z READY for timing
 2026-11-26T14:08:39Z timing start
+2026-11-26T14:15:41Z timing start (eq)
