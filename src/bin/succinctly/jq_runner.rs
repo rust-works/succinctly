@@ -8354,6 +8354,12 @@ fn build_from_model(
     None
 }
 
+/// PROTOTYPE (reader model): whether the shipped profile keeps the last file's position past the end
+/// of input (jq 1.8.2).
+fn model_holds_end() -> bool {
+    !reader_model::ReaderProfile::shipped().position_after_end_171
+}
+
 /// PROTOTYPE (reader model): the `resumed_errors` index of a fault a slurp's reader met after the
 /// call that returned the array; the slurp's queue puts it behind the array.
 const SLURP_TAIL_INDEX: usize = usize::MAX;
@@ -9805,6 +9811,7 @@ fn read_inputs(
     let mut locations =
         InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
     locations.eof_tail = eof_tail;
+    locations.holds_end = use_model && model_holds_end();
 
     // `--slurp`'s single combined value has no content of its own to name a
     // line in -- jq instead names the *last source*'s own newline count at
@@ -10452,6 +10459,7 @@ fn read_inputs(
                 LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
                 let mut fresh = InputLocations::new(locations.files().to_vec());
                 fresh.eof_tail = records_eof.then_some(read.eof_tail());
+                fresh.holds_end = model_holds_end();
                 locations = fresh;
                 slurp_eof_line = read.slurp_eof_line();
                 model_built = true;
@@ -10526,6 +10534,7 @@ fn read_inputs(
             slurped_locations.unopened_tail = locations.unopened_tail;
             // #6480: the faults go ahead of the array, the one at the end of the text included.
             slurped_locations.fault_at_tail = locations.fault_at_tail;
+            slurped_locations.holds_end = locations.holds_end;
             slurped_locations.push(src as usize, line as usize);
             // PROTOTYPE (reader model): a fault met after the array goes behind it.
             let mut ahead: Vec<(usize, TrailingParseError)> = resumed_errors
@@ -10552,7 +10561,9 @@ fn read_inputs(
             slurped.push(src as usize, line as usize);
             slurped
         } else {
-            InputLocations::single_at_end(at, locations.unopened_tail)
+            let mut single = InputLocations::single_at_end(at, locations.unopened_tail);
+            single.holds_end = locations.holds_end;
+            single
         };
         Ok(Ok((
             slurped,
@@ -10924,6 +10935,10 @@ pub struct InputLocations {
     /// Whether the text's first fault is at its end, after jq's reader asked past the last file,
     /// and so is raised at that file, line 0 (#6480).
     fault_at_tail: bool,
+    /// PROTOTYPE (reader model): the reader model read the input with a profile that keeps the
+    /// last file's position past the end (jq 1.8.2 clears it only when a next file opens), so
+    /// every read past the end stays there.
+    holds_end: bool,
 }
 
 /// How an input stream ends, which decides jq's `(at ...)` marker once every
@@ -11172,6 +11187,7 @@ impl InputLocations {
             unopened_tail: false,
             last_value_at_tail: false,
             fault_at_tail: false,
+            holds_end: false,
         }
     }
 
@@ -11205,7 +11221,7 @@ impl InputLocations {
     /// Has the reads past the end move on from it as jq's do (#4303), where the stream's own end
     /// was recorded or after a slurp, or stay at a last file that did not open (#6480).
     fn count_reads_past_end(&self, slurp: bool) {
-        if self.unopened_tail {
+        if self.unopened_tail || self.holds_end {
             jq::hold_reads_past_end();
         } else if self.eof_tail.is_some() || slurp {
             jq::count_reads_past_end();
@@ -11419,7 +11435,12 @@ impl InputLocations {
             return Some((last_src, 0));
         }
         if slurping {
-            return None;
+            // PROTOTYPE (reader model): jq 1.8.2 still names the last file after the array.
+            return self
+                .holds_end
+                .then(|| self.per_value.last())
+                .flatten()
+                .filter(|&(src, _)| src != NO_SOURCE);
         }
         // #4303: the stream's own end, where it was recorded. The fallback
         // below reads the last document's line instead, which differs after
