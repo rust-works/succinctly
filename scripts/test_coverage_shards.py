@@ -44,10 +44,10 @@ class ShardTests(unittest.TestCase):
             for target in selected_tests(shards.shard_args(shard)):
                 seen.setdefault(target, []).append(shard)
         every = set(shards.test_targets())
-        # jq_cli_tests is split in two by name, so it is the one target two shards select.
+        # jq_cli_tests is split in three by name, so it is the one target several shards select.
         self.assertEqual(set(seen), every)
         for target, where in seen.items():
-            expected = ["jq-cli", "jq-cli-heavy"] if target == shards.JQ_CLI else None
+            expected = ["jq-cli-issues", "jq-cli-main", "jq-cli-heavy"] if target == shards.JQ_CLI else None
             with self.subTest(target=target):
                 if expected:
                     self.assertEqual(sorted(where), sorted(expected))
@@ -63,19 +63,50 @@ class ShardTests(unittest.TestCase):
         self.assertIn("jq_library_eval_nesting_depth_tests", selected_tests(args))
 
     def test_the_jq_cli_shards_split_the_target_by_name_without_overlap(self):
-        skip = shards.shard_args("jq-cli")
+        issues = shards.shard_args("jq-cli-issues")
+        main = shards.shard_args("jq-cli-main")
         heavy = shards.shard_args("jq-cli-heavy")
-        skipped = skip[skip.index("--") + 1 :]
+        issues_tail = issues[issues.index("--") + 1 :]
+        main_tail = main[main.index("--") + 1 :]
         ran = heavy[heavy.index("--") + 1 :]
-        self.assertEqual(skipped[0], "--exact")
+        # #7978: `jq-cli-issues` keeps only the `per_issue::` tests and `jq-cli-main` skips exactly
+        # those, so between them every name is in one of the two; neither is `--exact`, which
+        # would turn the prefix into a whole name and match nothing.
+        self.assertEqual(issues_tail[0], shards.PER_ISSUE)
+        self.assertEqual(main_tail[:2], ["--skip", shards.PER_ISSUE])
+        self.assertNotIn("--exact", issues_tail)
+        self.assertNotIn("--exact", main_tail)
         self.assertEqual(ran[0], "--exact")
-        skipped_names = skipped[2::2]
+        # Both skip the same deep-recursion names: what `jq-cli-heavy` runs, plus the two stack
+        # tests, which are `#[ignore]`d under coverage and so belong to no run.
+        issues_skips = issues_tail[1:]
+        main_skips = main_tail[2:]
+        self.assertEqual(issues_skips, main_skips)
+        self.assertEqual(issues_skips[0::2], ["--skip"] * (len(issues_skips) // 2))
+        skipped_names = issues_skips[1::2]
         ran_names = ran[1:]
         self.assertEqual(len(ran_names), len(set(ran_names)))
-        # What `jq-cli` skips is what `jq-cli-heavy` runs, plus the two stack tests, which are
-        # `#[ignore]`d under coverage and so belong to neither run.
         self.assertEqual(skipped_names[2:], ran_names)
         self.assertEqual(len(skipped_names), len(ran_names) + 2)
+
+    def test_a_substring_skip_matches_only_its_own_test(self):
+        # The split shards match names by substring (see coverage-shards.py), so `--skip X` also
+        # skips any other test whose name contains X: that test would then run in no shard. Pin
+        # that each skipped name's last segment is a function name exactly once in the target's
+        # sources and is contained in no other function name there, and that `per_issue` is the
+        # one module of that name, so the `per_issue::` filter selects tests/jq_cli/ alone.
+        sources = [ROOT / "tests" / "jq_cli_tests.rs", *sorted((ROOT / "tests" / "jq_cli").glob("*.rs"))]
+        fns = [n for p in sources for n in re.findall(r"\bfn\s+(\w+)", p.read_text(encoding="utf-8"))]
+        args = shards.shard_args("jq-cli-main")
+        names = args[args.index("--") + 3 :][1::2]
+        self.assertTrue(names)
+        for name in names:
+            last = name.rsplit("::", 1)[-1]
+            with self.subTest(name=name):
+                self.assertEqual(fns.count(last), 1, f"{last} is defined {fns.count(last)} times")
+                self.assertEqual([f for f in fns if last in f and f != last], [])
+        modules = [m for p in sources for m in re.findall(r"\bmod\s+per_issue\b", p.read_text(encoding="utf-8"))]
+        self.assertEqual(len(modules), 1)
 
     @unittest.skipUnless(shutil.which("cargo"), "needs cargo")
     def test_the_glob_finds_the_test_targets_cargo_does(self):

@@ -11,16 +11,21 @@ name: Coverage
 # shards below run concurrently, each building only its own targets, and `report` combines their
 # lcov files with patchcov-action's thin mode (`run-coverage: false`, `shard-reports`).
 #
-#   jq-cli         `jq_cli_tests` without the tests in scripts/deep-recursion-tests.sh
+#   jq-cli-issues  the `per_issue::` tests of `jq_cli_tests`, without the tests in
+#                  scripts/deep-recursion-tests.sh
+#   jq-cli-main    the rest of `jq_cli_tests`, without those tests
 #   jq-cli-heavy   exactly those tests
 #   rest           the lib, the bins and every other test target
+#
+# #7978 cut the one `jq-cli` shard in two: on x86_64 it ran `jq_cli_tests` for 24 of its 27
+# minutes and finished last in 15 of 20 pull-request runs.
 #
 # scripts/coverage-shards.py defines what each runs; scripts/test_coverage_shards.py fails when
 # this matrix and that file disagree, or when a test target would run in no shard or in two.
 # Doctests run in no shard: stable `cargo llvm-cov` does not instrument them.
 #
 # Costs, accepted on #5711: two jobs per pull request became ten (four shards and a report job
-# per architecture; eight since #5844 folded `jq-nesting` into `rest`), and thin mode has no merge-base recompute, so a pull request whose
+# per architecture; eight since #5844 folded `jq-nesting` into `rest`, ten again since #7978), and thin mode has no merge-base recompute, so a pull request whose
 # ancestors have no published baseline gets a comment without deltas.
 on:
   workflow_call:
@@ -45,7 +50,7 @@ jobs:
     strategy:
       fail-fast: false              # a failed shard must still fail the run by name, not cancel its siblings
       matrix:
-        shard: [jq-cli, jq-cli-heavy, rest]
+        shard: [jq-cli-issues, jq-cli-main, jq-cli-heavy, rest]
     permissions:
       contents: read
     env:

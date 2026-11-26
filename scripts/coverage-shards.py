@@ -11,16 +11,24 @@ shard below, and combines their lcov reports. This file is the single definition
 
 The shards, and why they are cut where they are (times are the #5711 measurement, 4 CPUs):
 
-    jq-cli        `jq_cli_tests` without the tests in scripts/deep-recursion-tests.sh
-    jq-cli-heavy  exactly those tests (the 328 s `recurse` cap test is the floor)
-    rest          the lib, the bins and every other test target
+    jq-cli-issues  the `per_issue::` tests of `jq_cli_tests` (tests/jq_cli/*.rs), without the tests
+                   in scripts/deep-recursion-tests.sh
+    jq-cli-main    the rest of `jq_cli_tests` (tests/jq_cli_tests.rs), without those tests
+    jq-cli-heavy   exactly those tests (the 328 s `recurse` cap test is the floor)
+    rest           the lib, the bins and every other test target
+
+#7978 cut the one `jq-cli` shard in two by name: it ran `jq_cli_tests` for 24 of its 27 minutes on
+x86_64 and finished last in 15 of 20 pull-request runs. The 2,395 `per_issue::` tests and the
+2,849 others are about half each.
 
 `jq_library_eval_nesting_depth_tests` had a shard of its own while one of its tests took 224 s;
 #5844 brought that test to a few seconds and it moved back into `rest`.
 
-`jq-cli` and `jq-cli-heavy` both come from deep-recursion-tests.sh, so a test cannot be in both or
-in neither, and a heavy name that goes stale falls out of the skip list and runs in `jq-cli`: no
-test is lost to a rename. `rest` is every test target under tests/ that no other shard names, so
+The three `jq-cli*` shards all come from deep-recursion-tests.sh, so a test cannot be in two or
+in none, and a heavy name that goes stale falls out of the skip list and runs in `jq-cli-issues` or
+`jq-cli-main`: no test is lost to a rename. Those two match by substring, not `--exact`: libtest
+applies `--exact` to every filter, and `per_issue::` is a prefix. So a skip name also skips any test
+whose name contains it; scripts/test_coverage_shards.py fails when one would. `rest` is every test target under tests/ that no other shard names, so
 a new test file lands in it by construction. Doctests are in no shard: stable `cargo llvm-cov`
 does not instrument them (#3778 measured the 52 of them adding no covered line).
 
@@ -41,7 +49,10 @@ COMMON = ["--features", "cli,simd,regex,serde", "--workspace"]
 
 JQ_CLI = "jq_cli_tests"
 
-SHARDS = ("jq-cli", "jq-cli-heavy", "rest")
+# The prefix libtest gives every test in tests/jq_cli/ (`mod per_issue;` in tests/jq_cli_tests.rs).
+PER_ISSUE = "per_issue::"
+
+SHARDS = ("jq-cli-issues", "jq-cli-main", "jq-cli-heavy", "rest")
 
 
 def test_targets():
@@ -63,9 +74,19 @@ def deep_recursion_args(subcommand):
     return out.stdout.split()
 
 
+def heavy_skips():
+    """`--skip <name>` for every deep-recursion test, without skip-args' `--exact` (see above)."""
+    args = deep_recursion_args("skip-args")
+    if args[:1] != ["--exact"]:
+        raise SystemExit(f"deep-recursion-tests.sh skip-args no longer starts with --exact: {args[:3]}")
+    return args[1:]
+
+
 def shard_args(shard):
-    if shard == "jq-cli":
-        return COMMON + ["--test", JQ_CLI, "--"] + deep_recursion_args("skip-args")
+    if shard == "jq-cli-issues":
+        return COMMON + ["--test", JQ_CLI, "--", PER_ISSUE] + heavy_skips()
+    if shard == "jq-cli-main":
+        return COMMON + ["--test", JQ_CLI, "--", "--skip", PER_ISSUE] + heavy_skips()
     if shard == "jq-cli-heavy":
         return COMMON + ["--test", JQ_CLI, "--"] + deep_recursion_args("heavy-args")
     if shard == "rest":
