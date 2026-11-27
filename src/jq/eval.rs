@@ -5555,13 +5555,16 @@ fn query_result_yields<W>(result: &QueryResult<'_, W>) -> Option<bool> {
 
 /// [`yq_reemit_after_empty_stage`] over the values `body` was evaluated on, one context list: a
 /// stage's input was empty when the stages before it yield nothing over any of them. yq mode
-/// only, over a non-empty list: every caller asks under `S::TAG == EvalTag::Yq` for one node.
+/// only, over a non-empty list (`None` otherwise): every caller asks under
+/// `S::TAG == EvalTag::Yq`, for one node.
 fn yq_reemit_over_values<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     body: &Expr,
     context: &[StandardJson<'_, W>],
     optional: bool,
 ) -> Option<Expr> {
-    debug_assert!(S::TAG == EvalTag::Yq && !context.is_empty());
+    if S::TAG != EvalTag::Yq || context.is_empty() {
+        return None; // patchcov: coverage tolerate-line reason="guard: every caller asks in yq mode, for one node; it keeps a future jq-mode caller from getting yq's rule"
+    }
     yq_reemit_after_empty_stage(body, &mut |prefix| {
         for value in context {
             if query_result_yields(&eval_single::<W, S>(prefix, value.clone(), optional))? {
@@ -5581,8 +5584,9 @@ fn yq_owned_reemit_after_empty_stage<S: EvalSemantics>(
     input: &OwnedValue,
     reentry: Reentry,
 ) -> Option<Expr> {
-    // Asked only under `S::TAG == EvalTag::Yq`, as every caller of the rule is.
-    debug_assert_eq!(S::TAG, EvalTag::Yq);
+    if S::TAG != EvalTag::Yq {
+        return None; // patchcov: coverage tolerate-line reason="guard: every caller asks in yq mode; it keeps a future jq-mode caller from getting yq's rule"
+    }
     yq_reemit_after_empty_stage_as(body, as_written, &mut |prefix| {
         let mut seen = false;
         let flow = eval_each_owned::<S>(prefix, input, false, reentry, &mut |_| {
