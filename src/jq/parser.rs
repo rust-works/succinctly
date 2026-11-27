@@ -13522,47 +13522,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
         }
 
-        // #2451 rule 2: a union of two identities yields the list *once*.
-        //
-        // Real yq's `,` (`pkg/yqlib/operator_union.go:32`, v4.53.3) appends
-        // its right operand's nodes only `if rhs.MatchingNodes !=
-        // lhs.MatchingNodes` -- a Go pointer comparison on the backing
-        // `*list.List`, there so that two self-modifying operands don't get
-        // double-counted. `.` (`operator_self.go`, `return context, nil`)
-        // hands back its input context object untouched, and so does a pipe
-        // of `.`s (`operator_pipe.go` builds its RHS context with
-        // `ChildContext(lhs.MatchingNodes)`, reusing the same list), so the
-        // guard fires for them too. Every other operator builds a fresh list
-        // via `ChildContext(list.New())` and is always appended.
-        //
-        // Chained `,` is right-associative in yq (`expression_postfix.go`
-        // pops only on *strictly* greater precedence, and `,`'s is equal to
-        // its own), so only the innermost pair can ever collapse -- which,
-        // for the flat operand list this parser builds, is exactly "drop the
-        // last operand when the last two are both identity-transparent",
-        // applied once. Live-captured on `a: {c: 3, d: 4}\nb: {c: 5, d: 6}`,
-        // where `(.a, .b) | (., ., ...)` with 1..7 dots prints
-        // `2, 2, 4, 6, 8, 10, 12` lines -- `2 * max(1, n - 1)`, which is what
-        // one dropped operand and no other change produces.
-        //
-        // The survivor is kept as a **one-branch `Expr::Comma`**, not
-        // unwrapped to the bare operand: a union always builds itself a
-        // *fresh* list, so an enclosing `,` must still append it. Real yq
-        // agrees -- `(.a, .b) | ((., .), .)` and `(.a, .b) | (., (., .))`
-        // both print 4 lines, where unwrapping the inner pair back to `.`
-        // would collapse the outer pair too and print 2. A one-branch union
-        // evaluates to exactly its branch, so nothing else changes.
-        if exprs.len() >= 2 {
-            let tail = &exprs[exprs.len() - 2..];
-            let key = |e: &Expr| yq_union_list_identity(e, Some(YqUnionList::Input), true);
-            let (left, right) = (key(&tail[0]), key(&tail[1]));
-            if left.is_some() && left == right {
-                exprs.pop();
-                return Ok(Expr::Comma(exprs));
-            }
-        }
-
-        Ok(Expr::comma(exprs))
+        Ok(yq_union(exprs))
     }
 
     /// Parse a yq-mode `and`/`or` chain: `chain and chain or chain ...`, where
@@ -13858,8 +13818,7 @@ impl<'a> Parser<'a> {
         }
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_expr()?;
-        self.skip_ws();
+        let update = self.parse_ireduce_update()?;
         self.expect(')')?;
         let (expr, patterns, update) = bind_ireduce_node_reads(expr, patterns, update);
         Ok(Expr::Reduce {
@@ -13868,6 +13827,55 @@ impl<'a> Parser<'a> {
             init: Box::new(init),
             update: Box::new(update),
         })
+    }
+
+    /// A yq `ireduce`'s UPDATE, from just after INIT's `;` to the closing `)`, which it leaves
+    /// unread.
+    ///
+    /// yq's `;` is a BLOCK, of `,`'s precedence and associating to the right as `,` does (#7617), so
+    /// a second `;` makes the block's right side a block too: `(0; U; V)` is `0; (U; V)`, with
+    /// `U; V` as UPDATE (#8001). A BLOCK evaluated as a value is yq's `emptyOperator`, which
+    /// yields nothing and evaluates neither side, so UPDATE is its unions up to the operand before
+    /// the first `;`: `(0; A, B; V)` is `0; (A, (B; V))`, whose UPDATE is `A` alone, and
+    /// `(0; U; V)` drops every accumulator at the first source node (the fold then prints nothing,
+    /// and prints INIT over an empty source). The operands after the first `;` are parsed as yq's
+    /// would be and discarded, so an `error` there never fires. That union is a fresh list next to
+    /// the block, so identity operands do not collapse (`(0; ., .; 9)` keeps both, [`yq_union`]).
+    #[inline(never)] // out of line, so its operand list stays off `parse_ireduce`'s frame
+    fn parse_ireduce_update(&mut self) -> Result<Expr, ParseError> {
+        let expd = core::mem::replace(&mut self.expd_operand, false);
+        let operands = self.parse_yq_union_operands();
+        self.expd_operand = expd;
+        let mut operands = operands?;
+        if self.peek() != Some(';') {
+            return Ok(yq_union(operands));
+        }
+        operands.pop();
+        while self.peek() == Some(';') {
+            self.next();
+            self.skip_ws();
+            self.parse_expr()?;
+            self.skip_ws();
+        }
+        Ok(if operands.is_empty() {
+            Expr::Builtin(Builtin::Empty)
+        } else {
+            Expr::comma(operands)
+        })
+    }
+
+    /// The operands of a yq-mode `,` list, each a whole pipe chain (see
+    /// [`Self::parse_yq_comma_expr`]), up to the first character that is not a `,`.
+    fn parse_yq_union_operands(&mut self) -> Result<Vec<Expr>, ParseError> {
+        let mut operands = vec![self.parse_yq_boolean_expr()?];
+        self.skip_ws();
+        while self.peek() == Some(',') {
+            self.next();
+            self.skip_ws();
+            operands.push(self.parse_yq_boolean_expr()?);
+            self.skip_ws();
+        }
+        Ok(operands)
     }
 
     /// The rest of a yq `ireduce (INIT, ...` whose INIT is an unparenthesised union (#7617), from
@@ -14380,11 +14388,56 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// The yq-mode union of the operands `exprs` of one unparenthesised `,` list, at least one.
+///
+/// #2451 rule 2: a union of two identities yields the list *once*.
+///
+/// Real yq's `,` (`pkg/yqlib/operator_union.go:32`, v4.53.3) appends
+/// its right operand's nodes only `if rhs.MatchingNodes !=
+/// lhs.MatchingNodes` -- a Go pointer comparison on the backing
+/// `*list.List`, there so that two self-modifying operands don't get
+/// double-counted. `.` (`operator_self.go`, `return context, nil`)
+/// hands back its input context object untouched, and so does a pipe
+/// of `.`s (`operator_pipe.go` builds its RHS context with
+/// `ChildContext(lhs.MatchingNodes)`, reusing the same list), so the
+/// guard fires for them too. Every other operator builds a fresh list
+/// via `ChildContext(list.New())` and is always appended.
+///
+/// Chained `,` is right-associative in yq (`expression_postfix.go`
+/// pops only on *strictly* greater precedence, and `,`'s is equal to
+/// its own), so only the innermost pair can ever collapse -- which,
+/// for the flat operand list this parser builds, is exactly "drop the
+/// last operand when the last two are both identity-transparent",
+/// applied once. Live-captured on `a: {c: 3, d: 4}\nb: {c: 5, d: 6}`,
+/// where `(.a, .b) | (., ., ...)` with 1..7 dots prints
+/// `2, 2, 4, 6, 8, 10, 12` lines -- `2 * max(1, n - 1)`, which is what
+/// one dropped operand and no other change produces.
+///
+/// The survivor is kept as a **one-branch `Expr::Comma`**, not
+/// unwrapped to the bare operand: a union always builds itself a
+/// *fresh* list, so an enclosing `,` must still append it. Real yq
+/// agrees -- `(.a, .b) | ((., .), .)` and `(.a, .b) | (., (., .))`
+/// both print 4 lines, where unwrapping the inner pair back to `.`
+/// would collapse the outer pair too and print 2. A one-branch union
+/// evaluates to exactly its branch, so nothing else changes.
+fn yq_union(mut exprs: Vec<Expr>) -> Expr {
+    if exprs.len() >= 2 {
+        let tail = &exprs[exprs.len() - 2..];
+        let key = |e: &Expr| yq_union_list_identity(e, Some(YqUnionList::Input), true);
+        let (left, right) = (key(&tail[0]), key(&tail[1]));
+        if left.is_some() && left == right {
+            exprs.pop();
+            return Expr::Comma(exprs);
+        }
+    }
+    Expr::comma(exprs)
+}
+
 /// The list a yq-mode `,` operand evaluates to when the operand does not build one, `None` when
 /// it does.
 ///
 /// That is the property real yq's `,` pointer-compares on -- see
-/// [`Parser::parse_yq_comma_expr`] for the mechanism and the captured sequence. In the surface
+/// [`yq_union`] for the mechanism and the captured sequence. In the surface
 /// language `.` hands back the list it was given, and so do the two shapes that are transparently
 /// `.`: parentheses, and a pipe whose every stage is itself transparent (`. | .`, live-verified to
 /// collapse: `(.a, .b) | ((. | .), .)` prints 2 lines, not 4). A `$name` hands back the list the
