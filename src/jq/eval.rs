@@ -50439,7 +50439,9 @@ pub struct FileNamesScope(#[allow(dead_code)] super::eval_generic::FileNamesGuar
 ///
 /// The refusal is raised when the operator runs, as an error named `env operations have been
 /// disabled` or `file operations have been disabled`, and `?` does not swallow it. yq also raises
-/// it for an operator no node reaches (`select(false) | strenv(X)`), which this does not.
+/// it for an operator no node reaches (`select(false) | load("f")`), which this does not, except for
+/// `env(..)` and `strenv(..)`: yq mode runs those once for their whole context, whatever reaches
+/// them (#7996), so `select(false) | strenv(X)` is refused here too.
 ///
 /// The setting belongs to the calling thread, as the file-names table does: the CLI evaluates on
 /// one thread, and a caller that moves evaluation to another must enter the scope there, or the
