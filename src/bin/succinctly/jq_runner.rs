@@ -6075,880 +6075,907 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     // PROTOTYPE (reader model): the sources may hold an edge jq's reader decides, so the run takes
     // the route below that reads them through the model (not re-indented: a scratch branch).
     let mut reader_model_declined = false;
-    if lazy_path_taken { 'lazy_route: {
-        // Lazy path: read files as raw bytes and process directly
-        // This preserves original number formatting like "4e4"
-        // #6920: regular files are read a window at a time (#7024: several, as the one stream jq reads),
-        // so the run holds a window of them where it held the whole files; the loop below then has an
-        // empty buffer for each file and is handed their windows.
-        let mut windowed: Option<window::WindowedFiles> = None;
-        let mut reread: Option<std::rc::Rc<window::Reread>> = None;
-        let (files, mut raw_inputs, mut failures) = match seq_plain.take() {
-            Some(prepared) => prepared,
-            None => match seq_windowed.take().or_else(|| windowed_plain_file(&args)) {
-                Some((files, reader, again)) => {
-                    window::note_route(if args.seq { "seq" } else { "plain" });
-                    windowed = Some(reader);
-                    reread = Some(again);
-                    // One empty buffer for each file: the windows are what the loop reads, and the
-                    // files after the one it is at are all empty to the check for the last value.
-                    let buffers = vec![Vec::new(); files.len().max(1)];
-                    (files, buffers, Vec::new())
-                }
-                None => {
-                    let files = get_input_files(&args);
-                    if files.is_empty() {
-                        (files, vec![read_stdin_bytes()?], Vec::new())
-                    } else {
-                        // #7478: a named pipe the windowed gate read and found short hands its
-                        // bytes on here, since it gives them once.
-                        take_named_pushback(&files).unwrap_or_else(|| {
-                            read_input_files(&files, false, stops_at_broken_mark(&args))
-                        })
+    if lazy_path_taken {
+        'lazy_route: {
+            // Lazy path: read files as raw bytes and process directly
+            // This preserves original number formatting like "4e4"
+            // #6920: regular files are read a window at a time (#7024: several, as the one stream jq reads),
+            // so the run holds a window of them where it held the whole files; the loop below then has an
+            // empty buffer for each file and is handed their windows.
+            let mut windowed: Option<window::WindowedFiles> = None;
+            let mut reread: Option<std::rc::Rc<window::Reread>> = None;
+            let (files, mut raw_inputs, mut failures) = match seq_plain.take() {
+                Some(prepared) => prepared,
+                None => match seq_windowed.take().or_else(|| windowed_plain_file(&args)) {
+                    Some((files, reader, again)) => {
+                        window::note_route(if args.seq { "seq" } else { "plain" });
+                        windowed = Some(reader);
+                        reread = Some(again);
+                        // One empty buffer for each file: the windows are what the loop reads, and the
+                        // files after the one it is at are all empty to the check for the last value.
+                        let buffers = vec![Vec::new(); files.len().max(1)];
+                        (files, buffers, Vec::new())
+                    }
+                    None => {
+                        let files = get_input_files(&args);
+                        if files.is_empty() {
+                            (files, vec![read_stdin_bytes()?], Vec::new())
+                        } else {
+                            // #7478: a named pipe the windowed gate read and found short hands its
+                            // bytes on here, since it gives them once.
+                            take_named_pushback(&files).unwrap_or_else(|| {
+                                read_input_files(&files, false, stops_at_broken_mark(&args))
+                            })
+                        }
+                    }
+                },
+            };
+            // A slurp reads every file in the one fetch that meets the first failure, so it
+            // reports them all up front and cuts nothing. Otherwise jq reports a file when its
+            // reader gets there, which the loop below does too (#5472).
+            let mut stop_at = failures.first().map(|(at, _)| *at).filter(|_| !args.slurp);
+            // #7024: the files of a long list that did not open when the windowed reader reached them,
+            // until the run is past them.
+            let mut noted: Vec<(usize, InputFileOpenError)> = Vec::new();
+            if args.slurp {
+                // #7754, #7755: jq's slurp ends at the first fault of the text, which its main loop
+                // reports as a parse error, after the files its reader met before it: the program
+                // never runs. The scan that places the failures has found that fault, so it is
+                // reported as jq reports it, whatever the program would have read of the array (the
+                // lazy slurp of #2847 reads only that, so `-s length` printed `2` and exited 0 with a
+                // file that did not open after `[1,x]`, and a directory in the list read the members
+                // a fault after it as its own error). A fault at the end of the text is the slurp's
+                // own (#6004), and a run with no failure is not scanned (#7176).
+                // `--seq` reads its records with its own reader, and `--validate` checks each file.
+                let scanned = !failures.is_empty() && !args.validate && !args.seq;
+                let fault = scanned.then(|| first_stream_fault(&raw_inputs)).flatten();
+                // The failures [`open_failures_reached`] names, from the one scan.
+                let reached = match fault {
+                    Some((file, false)) => {
+                        failures.iter().take_while(|&&(at, _)| at <= file).count()
+                    }
+                    _ if scanned => failures.len(),
+                    _ => open_failures_reached(&failures, &raw_inputs, &args, false).len(),
+                };
+                report_open_failures(&failures[..reached], &mut open_failed);
+                if let Some((_, false)) = fault {
+                    if let Some(message) = jq::jq_stream_fault(past_stream_bom(&raw_inputs), 1, 0) {
+                        sink.report_parse_error(&message);
+                        return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
                     }
                 }
-            },
-        };
-        // A slurp reads every file in the one fetch that meets the first failure, so it
-        // reports them all up front and cuts nothing. Otherwise jq reports a file when its
-        // reader gets there, which the loop below does too (#5472).
-        let mut stop_at = failures.first().map(|(at, _)| *at).filter(|_| !args.slurp);
-        // #7024: the files of a long list that did not open when the windowed reader reached them,
-        // until the run is past them.
-        let mut noted: Vec<(usize, InputFileOpenError)> = Vec::new();
-        if args.slurp {
-            // #7754, #7755: jq's slurp ends at the first fault of the text, which its main loop
-            // reports as a parse error, after the files its reader met before it: the program
-            // never runs. The scan that places the failures has found that fault, so it is
-            // reported as jq reports it, whatever the program would have read of the array (the
-            // lazy slurp of #2847 reads only that, so `-s length` printed `2` and exited 0 with a
-            // file that did not open after `[1,x]`, and a directory in the list read the members
-            // a fault after it as its own error). A fault at the end of the text is the slurp's
-            // own (#6004), and a run with no failure is not scanned (#7176).
-            // `--seq` reads its records with its own reader, and `--validate` checks each file.
-            let scanned = !failures.is_empty() && !args.validate && !args.seq;
-            let fault = scanned.then(|| first_stream_fault(&raw_inputs)).flatten();
-            // The failures [`open_failures_reached`] names, from the one scan.
-            let reached = match fault {
-                Some((file, false)) => failures.iter().take_while(|&&(at, _)| at <= file).count(),
-                _ if scanned => failures.len(),
-                _ => open_failures_reached(&failures, &raw_inputs, &args, false).len(),
+            }
+            let mut next_failure = if args.slurp { failures.len() } else { 0 };
+            let mut run_stopped = false;
+            // `input_filename`'s names for this route's source tags, which are the
+            // indexes into `raw_inputs` below (#3046). Only the files that opened have a tag, so
+            // the names are taken after the ones that did not are dropped (#5472).
+            // #6480: a slurp reads to the end, which leaves jq's reader at a last file that did not
+            // open, so the slurped document answers for that file, at line 0, from one more source.
+            let tail_name = unopened_tail_name(&failures, files.len());
+            let slurp_tail = tail_name.clone().filter(|_| args.slurp);
+            // #6480: the same for a last value that completes only at the end of the input: jq's parser
+            // asks for more before it is complete, which reaches the missing file.
+            let value_tail = tail_name
+                .clone()
+                .filter(|_| !args.slurp && last_value_reaches_end(&raw_inputs, &args));
+            // #6683: and a directory given last, which has a source of its own and so no tail name:
+            // the same last value is read on into it, so the read counts the failure, `halt` or
+            // `halt_error` after that value included (jq exits 2 for it, not the halt's status).
+            let value_dir_tail = !args.slurp
+                && ends_in_last_directory(&failures)
+                && last_value_reaches_end(&raw_inputs, &args);
+            // With no file open, the tail is the only source: there is no stdin entry before it.
+            let names = match &tail_name {
+                Some(tail) => {
+                    let mut names: Vec<Option<String>> =
+                        files.iter().map(|p| Some(input_display_name(p))).collect();
+                    names.push(Some(tail.clone()));
+                    names
+                }
+                None => input_names(&files),
             };
-            report_open_failures(&failures[..reached], &mut open_failed);
-            if let Some((_, false)) = fault {
-                if let Some(message) = jq::jq_stream_fault(past_stream_bom(&raw_inputs), 1, 0) {
-                    sink.report_parse_error(&message);
-                    return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
-                }
-            }
-        }
-        let mut next_failure = if args.slurp { failures.len() } else { 0 };
-        let mut run_stopped = false;
-        // `input_filename`'s names for this route's source tags, which are the
-        // indexes into `raw_inputs` below (#3046). Only the files that opened have a tag, so
-        // the names are taken after the ones that did not are dropped (#5472).
-        // #6480: a slurp reads to the end, which leaves jq's reader at a last file that did not
-        // open, so the slurped document answers for that file, at line 0, from one more source.
-        let tail_name = unopened_tail_name(&failures, files.len());
-        let slurp_tail = tail_name.clone().filter(|_| args.slurp);
-        // #6480: the same for a last value that completes only at the end of the input: jq's parser
-        // asks for more before it is complete, which reaches the missing file.
-        let value_tail = tail_name
-            .clone()
-            .filter(|_| !args.slurp && last_value_reaches_end(&raw_inputs, &args));
-        // #6683: and a directory given last, which has a source of its own and so no tail name:
-        // the same last value is read on into it, so the read counts the failure, `halt` or
-        // `halt_error` after that value included (jq exits 2 for it, not the halt's status).
-        let value_dir_tail = !args.slurp
-            && ends_in_last_directory(&failures)
-            && last_value_reaches_end(&raw_inputs, &args);
-        // With no file open, the tail is the only source: there is no stdin entry before it.
-        let names = match &tail_name {
-            Some(tail) => {
-                let mut names: Vec<Option<String>> =
-                    files.iter().map(|p| Some(input_display_name(p))).collect();
-                names.push(Some(tail.clone()));
-                names
-            }
-            None => input_names(&files),
-        };
-        jq::cli_context::set_input_names(names);
-        // #7437: each source validated and searched for a NUL in the one read of it, which the
-        // substitution below takes the verdict of.
-        let scans = reads_plain_json(&args).then(|| scan_sources(&raw_inputs));
-        // PROTOTYPE (reader model): the trigger, from the scan just made and the ends of the
-        // sources. The bytes go to the route below as a route that read them for nothing hands
-        // them on (`seq_plain_json_inputs`).
-        if let Some(scans) = &scans {
-            if windowed.is_none()
-                && failures.is_empty()
-                && reader_model::trigger(
-                    raw_inputs.iter().map(Vec::as_slice),
-                    scans.iter().any(|scan| scan.nul || !scan.utf8),
-                )
-                && reader_model::enabled()
-            {
-                reader_model::trace("default-route-declined", 0, 0, 0);
-                if files.is_empty() {
-                    STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = raw_inputs.pop());
-                } else {
-                    let named = get_input_files(&args);
-                    NAMED_PUSHBACK.with(|slot| {
-                        *slot.borrow_mut() = Some((named, (files, raw_inputs, failures)));
-                    });
-                }
-                reader_model_declined = true;
-                break 'lazy_route;
-            }
-        }
-        if let Some(scans) = &scans {
-            blank_nul_number_tails_in(raw_inputs.iter_mut(), Some(scans), false, false);
-        }
-        // #5291: jq skips a BOM at the start of its input, `--validate` included.
-        let bom_cuts = strip_leading_json_bom(raw_inputs.iter_mut());
-        // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
-        let mut seams = if args.validate {
-            Vec::new()
-        } else {
-            stitch_json_file_seams(raw_inputs.iter_mut(), false, false, &bom_cuts)
-        };
-        note_bom_leads(&mut seams, &bom_cuts, raw_inputs.len());
-        // Substitution is skipped under `--validate` so the strict validator
-        // in the loop below still sees the *original* bytes (#1247).
-        // Substituting first silently repaired a non-UTF-8 document, leaving
-        // the one check `--validate` exists to perform with nothing to find:
-        // `sjq --validate` exited 0 where `succinctly json validate` on the
-        // same file still exits 1. Nothing is lost by skipping it here --
-        // any document that would have been substituted is a document
-        // `validate_json_input` rejects.
-        // #5964: jq's parser counts the bytes as read, so a message that names where it stopped
-        // is worded over the originals of the files the substitution changed.
-        let (raw_inputs, originals): (Vec<Vec<u8>>, Vec<Option<LossySource>>) = if args.validate {
-            (raw_inputs, Vec::new())
-        } else {
-            let unmoved = seams_moved_nothing(&seams);
-            raw_inputs
-                .into_iter()
-                .enumerate()
-                .map(|(index, raw)| {
-                    let scan = scans.as_ref().map(|scans| scans[index]);
-                    utf8_lossy_scanned(raw, seams.get_mut(index), scan, unmoved)
-                })
-                .unzip()
-        };
-        // Given back before the documents are read: an allocation the run holds through them moves
-        // where glibc's allocator puts theirs (+0.7% instructions on NDJSON `-c .id` at 1 MB, in
-        // `_int_malloc` and `_int_free`).
-        drop(scans);
-
-        // #2847: `--slurp` replaces the per-file documents with the single
-        // synthesized array, evaluated once below. Everything the per-file
-        // loop derives from a file (its name, its source tag, the line a
-        // diagnostic names) is carried here instead, since the one document
-        // no longer belongs to any single file.
-        let (raw_inputs, slurped) = if args.slurp {
-            match slurp_documents(raw_inputs, &originals, &files, args.validate, &seams) {
-                Ok(mut slurped) => (vec![std::mem::take(&mut slurped.combined)], Some(slurped)),
-                // `--validate` already printed its own report.
-                Err(SlurpFailure::Validation(exit_code)) => return Ok(exit_code),
-                // #6476: a file that did not open makes the run exit 2 after any of these faults.
-                Err(SlurpFailure::DepthLimit(message)) => {
-                    sink.report_parse_error(
-                        message
-                            .as_deref()
-                            .unwrap_or("Exceeds depth limit for parsing"),
-                    );
-                    return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
-                }
-                // Line 0 of the first file, where `get_inputs` has always
-                // named a `--slurp` stream it could not finish splitting: the
-                // one combined value has no document position of its own.
-                Err(SlurpFailure::Unsplittable(Some(message))) => {
-                    sink.report_parse_error(&message);
-                    return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
-                }
-                // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `slurp_fault` names one; kept so a disagreement between them prints the old line-0 message rather than none (#5555)"
-                Err(SlurpFailure::Unsplittable(None)) => {
-                    let file = files.first().map(|p| input_display_name(p));
-                    sink.report(
-                        DiagStyle::Jq,
-                        &EvalError::new("Invalid JSON text"),
-                        &InputLocation::at(file.as_deref(), 0),
-                    );
-                    return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
-                } // patchcov: coverage end
-            }
-        } else {
-            (raw_inputs, None)
-        };
-        // #5576: a malformed member this route meets when the filter reads it is worded as jq's
-        // parser words it, from the stream's first fault. The buffers are shared with the loop
-        // below, not copied; a slurped stream's are gone, so it is read again from its files.
-        let raw_inputs = std::rc::Rc::new(raw_inputs);
-        // A slurped stream is one buffer now, and its fault is read again from the files.
-        let originals = std::rc::Rc::new(if slurped.is_some() {
-            Vec::new()
-        } else {
-            originals
-        });
-        sink.set_stream_fault(match (&slurped, &reread) {
-            // #6920: the text before a window is gone, so the fault is read again from the file.
-            (None, Some(reread)) => {
-                let reread = std::rc::Rc::clone(reread);
-                StreamFault::new(move || reread.stream_fault())
-            }
-            (None, None) => {
-                let raw_inputs = std::rc::Rc::clone(&raw_inputs);
-                let originals = std::rc::Rc::clone(&originals);
-                StreamFault::new(move || {
-                    jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
-                })
-            }
-            (Some(_), _) => {
-                let files = files.clone();
-                StreamFault::new(move || reread_stream_fault(&files))
-            }
-        });
-
-        // Check if we can use the identity fast path (raw bytes output, no materialization)
-        let use_identity_fast_path = expr.is_identity() && output_config.can_use_raw_identity();
-        // #1653 introduced streaming, gated so only a cursor-transparent
-        // filter took it; #2103 dropped the gate, so every M2 filter streams
-        // unconditionally now. That means a filter validates only what it
-        // reads: `1+1` on a malformed document answers `2` at exit 0 where
-        // jq 1.7.1 exits 5. See "Every M2 filter streams" in
-        // `docs/compliance/jq/limitations.md` for the full list of affected
-        // rows and the reasoning, and `scripts/jq-m2-streaming-sweep.sh` for
-        // the sweep that measures them.
-
-        // A seam belongs to the file at its position; a lookup that missed would count that
-        // file's lines as #4305 left them (#4316).
-        let seams_align = seams.is_empty() || seams.len() == raw_inputs.len();
-        debug_assert!(slurped.is_some() || seams_align);
-        let mut whole_files = raw_inputs.iter().enumerate();
-        // #7332: where the last value of the run or of a window leaves its index (see `RunIndex`); the
-        // one left when the loop ends is forgotten below, unless the run goes on.
-        let mut held_index: Option<JsonIndex> = None;
-        // #7697: likewise the document a program the path-mode interpreter runs had as its tree,
-        // which that run would otherwise take apart (see `jq::path_mode::kept_document`), unless
-        // the program can walk it with `..`: such a run frees the tree as it walks it, and the
-        // handle would hold all of it beside what the walk builds.
-        let keeps_document = matches!(
-            jq::path_mode::route(&expr),
-            jq::path_mode::Route::Interpreter
-        ) && !jq::path_mode::walks_recursively(&expr);
-        let mut held_document: Option<OwnedValue> = None;
-        'files: loop {
-            // The next file's text, or for a windowed file its next window with the documents the
-            // window holds (#6920): the splitter already ran over it, and `lines_before` line
-            // breaks and `window_substituted` come with it.
-            let (idx, raw, window_split, lines_before, window_substituted, window_place, notes) =
-                match windowed.as_mut() {
-                    Some(reader) => match reader.next_window_noting(&mut |at, failure| {
-                        noted.push((at, failure));
-                    }) {
-                        Ok(Some((idx, next))) => (
-                            idx,
-                            next.raw,
-                            Some((next.values, next.split_error)),
-                            next.lines_before,
-                            next.substituted,
-                            Some((next.seam, next.origin)),
-                            next.notes,
-                        ),
-                        Ok(None) => break,
-                        // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
-                        Err(error) => {
-                            report_input_read_failure(&error);
-                            break;
-                        } // patchcov: coverage end
-                    },
-                    None => match whole_files.next() {
-                        Some((idx, raw)) => (idx, raw.as_slice(), None, 0, false, None, Vec::new()),
-                        None => break,
-                    },
-                };
-            // #7332: the next window is here, so the last index of the one before it is given back,
-            // and its last document (#7697).
-            held_index = None;
-            held_document = None;
-            // #7024: a file of a long list that did not open when the windowed reader reached it is
-            // one jq's reader meets once the run is past it, as a file the whole-file route could not
-            // open is: up to this window's file, and, for a window that ends in a fault, only before
-            // the file the fault lies in, since the reader read on for the document's end and jq's
-            // stops at the fault. Once met, it is reported below and the run ends after the next
-            // value (`stop_at`).
-            if !noted.is_empty() {
-                // A fault whose file the second read cannot tell (it declined a file replaced since)
-                // meets none of them: jq's reader may have stopped before any.
-                let fault_at = match (&window_split, &reread) {
-                    (Some((_, Some(_))), Some(reread)) => Some(reread.fault_source().unwrap_or(0)),
-                    _ => None,
-                };
-                let met = noted
-                    .iter()
-                    .take_while(|(at, _)| *at <= idx && fault_at.map_or(true, |fault| *at < fault))
-                    .count();
-                for (at, failure) in noted.drain(..met) {
-                    stop_at.get_or_insert(at);
-                    failures.push((at, failure));
-                }
-            }
-            // The files that would not open before this one, reported now: jq's reader meets
-            // them as it moves on to this file (#5472).
-            while let Some((_, e)) = failures.get(next_failure).filter(|(at, _)| *at <= idx) {
-                report_unopenable_input(e, &mut open_failed);
-                next_failure += 1;
-            }
-            // The slurped document answers for the last file (`input_filename`,
-            // and the file a diagnostic names), as the materializing route's
-            // `InputLocations::single` always did.
-            let source = match (&slurped, &slurp_tail) {
-                (Some(_), Some(_)) => files.len(),
-                (Some(s), None) => s.last_source,
-                (None, _) => idx,
-            };
-            jq::cli_context::set_current_source(u32::try_from(source).ok());
-            let filename: Option<String> = match &slurp_tail {
-                Some(tail) if slurped.is_some() => Some(tail.clone()),
-                _ => files.get(source).map(|p| input_display_name(p)),
-            };
-            // Validate JSON if --validate flag is set. Under `--slurp` this
-            // already ran per file, on each file's own bytes, inside
-            // `slurp_documents`; the synthesized buffer is not input.
-            if args.validate && slurped.is_none() {
-                if let Err(exit_code) = validate_json_input(raw, filename.as_deref()) {
-                    // Every other return from this loop that can run after
-                    // `out` has already buffered real output flushes
-                    // explicitly first (#1563; review: not a blanket claim
-                    // about the whole function -- the separate materializing
-                    // branch below has its own early returns that provably
-                    // run before anything is ever written to `out`, so
-                    // nothing to flush there). This one used to rely on
-                    // `out`'s own `Drop` impl to flush any already-buffered
-                    // output from files processed before this one, which
-                    // works today but silently swallows a flush error (e.g.
-                    // a closed stdout) instead of propagating it, unlike
-                    // every sibling return path in this loop.
-                    out.flush()?;
-                    return Ok(exit_code);
-                }
-            }
-            // Process as JSON stream (handle multiple JSON values in one input).
-            // Every value before a malformed one is still processed, and the
-            // parse error is reported after them, as jq's incremental parser
-            // does (#2961) -- see the report below the per-value loop.
-            //
-            // A slurped input is already split: the one span is the whole
-            // synthesized array, and scanning it again would be a second pass
-            // over the entire input for nothing.
-            let (mut values, split_error) = if slurped.is_some() {
-                (vec![(0, raw.len())], None)
-            } else if let Some(split) = window_split {
-                split
-            } else {
-                split_json_values(raw)
-            };
-            // jq's main loop ends the run once an open has failed, after the one value it was
-            // fetching when it met the failure: the first the files past it hold. It reads
-            // nothing beyond that value, so a fault further on is never reached (#5472).
-            // #6480: the file's last value before the cut below, which keeps one value past a
-            // file that did not open: that one is the input's last only if it was already.
-            let last_span = values.last().copied();
-            // #4311: a number or literal the fault's own byte completes is
-            // never read (`1\n2]` reads `1`, then the error).
-            // #7752: before the cut below, which keeps the one value past a file that did not open:
-            // when that value is such a token (`1}`), jq's fetch past the failure returns the fault
-            // instead, so the run reports it.
-            if let (Some(offset), Some(&last)) = (split_error, values.last()) {
-                if bare_token_lost_to_fault(raw, last, offset, false) {
-                    values.pop();
-                }
-            }
-            let past_open_failure = stop_at.is_some_and(|at| idx >= at) && !values.is_empty();
-            let split_error = if past_open_failure {
-                values.truncate(1);
-                None
-            } else {
-                split_error
-            };
-            // `values`' end offsets are non-decreasing (find_json_values is
-            // a single left-to-right scan), so one LineCounter shared across
-            // every value in this file keeps the whole loop O(n) (#1213).
-            // `locator` wraps it and must be asked for non-decreasing `end`s.
-            //
-            // jq names the line the input value ends on, counted in the whole
-            // file rather than in this value's slice. Only a diagnostic reads
-            // it, so it is resolved when one does (#4160 on the M2 fast path,
-            // #4178 on the general path through `LazyLocation`).
-            // #4316: the bytes a stitched file starts with came from the previous file, so
-            // its lines start after them.
-            let seam = if slurped.is_some() {
-                Seam::NONE
-            } else if let Some((seam, _)) = &window_place {
-                // #7024: what the files stitched into one stream did to this window.
-                seam.clone()
-            } else {
-                seams.get(idx).cloned().unwrap_or_default()
-            };
-            // #7934: a file the substitution changed has its reads counted in the bytes jq read. A
-            // window's text is counted as it is (its edits are not kept).
-            let lossy = (slurped.is_none() && window_place.is_none())
-                .then(|| originals.get(idx).and_then(Option::as_ref))
-                .flatten();
-            let locator = ValueLocator::new(
-                raw,
-                filename.as_deref(),
-                slurped.as_ref().map(|slurped| {
-                    if slurp_tail.is_some() {
-                        0
-                    } else {
-                        slurped.eof_line
-                    }
-                }),
-                seam.clone(),
-            )
-            .reading(lossy)
-            .with_lines_before(lines_before);
-            let tail_locator = ValueLocator::new(b"", value_tail.as_deref(), Some(0), Seam::NONE);
-            // #7322: what jq's `--seq` reader warns of in a stretch of the window that was not plain
-            // records, each printed when the run reaches where the reader met it, as jq's main loop
-            // prints it between the values it reads.
-            let mut notes = notes.into_iter().peekable();
-            for (start, end) in values {
-                if !finished.next_input(args.on_error, &mut sink, &mut had_output, &mut last_output)
+            jq::cli_context::set_input_names(names);
+            // #7437: each source validated and searched for a NUL in the one read of it, which the
+            // substitution below takes the verdict of.
+            let scans = reads_plain_json(&args).then(|| scan_sources(&raw_inputs));
+            // PROTOTYPE (reader model): the trigger, from the scan just made and the ends of the
+            // sources. The bytes go to the route below as a route that read them for nothing hands
+            // them on (`seq_plain_json_inputs`).
+            if let Some(scans) = &scans {
+                if windowed.is_none()
+                    && failures.is_empty()
+                    && reader_model::trigger(
+                        raw_inputs.iter().map(Vec::as_slice),
+                        scans.iter().any(|scan| scan.nul || !scan.utf8),
+                    )
+                    && reader_model::enabled()
                 {
-                    run_stopped = true;
-                    break 'files;
-                }
-                // #7455: what the program took, for where a halt leaves standard input.
-                super::stdin_offset::note_taken();
-                while let Some((_, warning)) = notes.next_if(|&(at, _)| at < start) {
-                    eprintln!("{warning}");
-                }
-                // #6480: the last value, read at a last file that did not open, which its read
-                // reports first.
-                // The stitch can have moved the value into a later file, so its file is the last
-                // with bytes as they stand now.
-                let is_last_value = Some((start, end)) == last_span
-                    && raw_inputs[idx + 1..].iter().all(Vec::is_empty);
-                let at_tail = value_tail.is_some() && is_last_value;
-                // #6683: the last value of a text read on into a directory given last counts the
-                // failure (and says whatever failed before it) when it is read, before the program
-                // runs on it.
-                if value_dir_tail && is_last_value {
-                    report_open_failures(&failures[next_failure..], &mut open_failed);
-                    next_failure = failures.len();
-                }
-                let locator = if at_tail {
-                    report_open_failures(&failures[next_failure..], &mut open_failed);
-                    next_failure = failures.len();
-                    jq::cli_context::set_current_source(u32::try_from(files.len()).ok());
-                    &tail_locator
-                } else {
-                    &locator
-                };
-                let json_bytes = &raw[start..end];
-
-                // Fast path for identity query: output raw bytes directly without materialization.
-                // This avoids building the index and materializing JqValue, saving significant memory.
-                if use_identity_fast_path {
-                    had_output = true;
-                    // For exit_status, inspect the raw JSON token so that `null`
-                    // and `false` inputs still produce the falsy exit code (jq: 1)
-                    // on the identity fast path. Only these two literals are falsy;
-                    // a quoted "false"/"null" string or any number stays truthy.
-                    if args.exit_status {
-                        last_output = Some(identity_exit_status_value(json_bytes));
+                    reader_model::trace("default-route-declined", 0, 0, 0);
+                    if files.is_empty() {
+                        STDIN_PUSHBACK.with(|slot| *slot.borrow_mut() = raw_inputs.pop());
+                    } else {
+                        let named = get_input_files(&args);
+                        NAMED_PUSHBACK.with(|slot| {
+                            *slot.borrow_mut() = Some((named, (files, raw_inputs, failures)));
+                        });
                     }
-                    output_config.write_identity_bytes(&mut out, json_bytes)?;
-                    out.write_all(b"\n")?;
-                    continue;
+                    reader_model_declined = true;
+                    break 'lazy_route;
                 }
+            }
+            if let Some(scans) = &scans {
+                blank_nul_number_tails_in(raw_inputs.iter_mut(), Some(scans), false, false);
+            }
+            // #5291: jq skips a BOM at the start of its input, `--validate` included.
+            let bom_cuts = strip_leading_json_bom(raw_inputs.iter_mut());
+            // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
+            let mut seams = if args.validate {
+                Vec::new()
+            } else {
+                stitch_json_file_seams(raw_inputs.iter_mut(), false, false, &bom_cuts)
+            };
+            note_bom_leads(&mut seams, &bom_cuts, raw_inputs.len());
+            // Substitution is skipped under `--validate` so the strict validator
+            // in the loop below still sees the *original* bytes (#1247).
+            // Substituting first silently repaired a non-UTF-8 document, leaving
+            // the one check `--validate` exists to perform with nothing to find:
+            // `sjq --validate` exited 0 where `succinctly json validate` on the
+            // same file still exits 1. Nothing is lost by skipping it here --
+            // any document that would have been substituted is a document
+            // `validate_json_input` rejects.
+            // #5964: jq's parser counts the bytes as read, so a message that names where it stopped
+            // is worded over the originals of the files the substitution changed.
+            let (raw_inputs, originals): (Vec<Vec<u8>>, Vec<Option<LossySource>>) = if args.validate
+            {
+                (raw_inputs, Vec::new())
+            } else {
+                let unmoved = seams_moved_nothing(&seams);
+                raw_inputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, raw)| {
+                        let scan = scans.as_ref().map(|scans| scans[index]);
+                        utf8_lossy_scanned(raw, seams.get_mut(index), scan, unmoved)
+                    })
+                    .unzip()
+            };
+            // Given back before the documents are read: an allocation the run holds through them moves
+            // where glibc's allocator puts theirs (+0.7% instructions on NDJSON `-c .id` at 1 MB, in
+            // `_int_malloc` and `_int_free`).
+            drop(scans);
 
-                // #7537: a document of 4 GiB or more (a slurp of that much included) is indexed
-                // like any other unless it holds more than 2^31 values; #7425: one no index can
-                // hold is read into a tree without one, and the program runs on the tree. Its
-                // index is boxed, so every other document carries a pointer here and builds its
-                // own in place below.
-                let long_index = if JsonIndex::can_index(json_bytes.len()) {
+            // #2847: `--slurp` replaces the per-file documents with the single
+            // synthesized array, evaluated once below. Everything the per-file
+            // loop derives from a file (its name, its source tag, the line a
+            // diagnostic names) is carried here instead, since the one document
+            // no longer belongs to any single file.
+            let (raw_inputs, slurped) = if args.slurp {
+                match slurp_documents(raw_inputs, &originals, &files, args.validate, &seams) {
+                    Ok(mut slurped) => (vec![std::mem::take(&mut slurped.combined)], Some(slurped)),
+                    // `--validate` already printed its own report.
+                    Err(SlurpFailure::Validation(exit_code)) => return Ok(exit_code),
+                    // #6476: a file that did not open makes the run exit 2 after any of these faults.
+                    Err(SlurpFailure::DepthLimit(message)) => {
+                        sink.report_parse_error(
+                            message
+                                .as_deref()
+                                .unwrap_or("Exceeds depth limit for parsing"),
+                        );
+                        return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
+                    }
+                    // Line 0 of the first file, where `get_inputs` has always
+                    // named a `--slurp` stream it could not finish splitting: the
+                    // one combined value has no document position of its own.
+                    Err(SlurpFailure::Unsplittable(Some(message))) => {
+                        sink.report_parse_error(&message);
+                        return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
+                    }
+                    // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `slurp_fault` names one; kept so a disagreement between them prints the old line-0 message rather than none (#5555)"
+                    Err(SlurpFailure::Unsplittable(None)) => {
+                        let file = files.first().map(|p| input_display_name(p));
+                        sink.report(
+                            DiagStyle::Jq,
+                            &EvalError::new("Invalid JSON text"),
+                            &InputLocation::at(file.as_deref(), 0),
+                        );
+                        return Ok(halt_exit_code(DiagStyle::Jq.error_exit_code(), open_failed));
+                    } // patchcov: coverage end
+                }
+            } else {
+                (raw_inputs, None)
+            };
+            // #5576: a malformed member this route meets when the filter reads it is worded as jq's
+            // parser words it, from the stream's first fault. The buffers are shared with the loop
+            // below, not copied; a slurped stream's are gone, so it is read again from its files.
+            let raw_inputs = std::rc::Rc::new(raw_inputs);
+            // A slurped stream is one buffer now, and its fault is read again from the files.
+            let originals = std::rc::Rc::new(if slurped.is_some() {
+                Vec::new()
+            } else {
+                originals
+            });
+            sink.set_stream_fault(match (&slurped, &reread) {
+                // #6920: the text before a window is gone, so the fault is read again from the file.
+                (None, Some(reread)) => {
+                    let reread = std::rc::Rc::clone(reread);
+                    StreamFault::new(move || reread.stream_fault())
+                }
+                (None, None) => {
+                    let raw_inputs = std::rc::Rc::clone(&raw_inputs);
+                    let originals = std::rc::Rc::clone(&originals);
+                    StreamFault::new(move || {
+                        jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
+                    })
+                }
+                (Some(_), _) => {
+                    let files = files.clone();
+                    StreamFault::new(move || reread_stream_fault(&files))
+                }
+            });
+
+            // Check if we can use the identity fast path (raw bytes output, no materialization)
+            let use_identity_fast_path = expr.is_identity() && output_config.can_use_raw_identity();
+            // #1653 introduced streaming, gated so only a cursor-transparent
+            // filter took it; #2103 dropped the gate, so every M2 filter streams
+            // unconditionally now. That means a filter validates only what it
+            // reads: `1+1` on a malformed document answers `2` at exit 0 where
+            // jq 1.7.1 exits 5. See "Every M2 filter streams" in
+            // `docs/compliance/jq/limitations.md` for the full list of affected
+            // rows and the reasoning, and `scripts/jq-m2-streaming-sweep.sh` for
+            // the sweep that measures them.
+
+            // A seam belongs to the file at its position; a lookup that missed would count that
+            // file's lines as #4305 left them (#4316).
+            let seams_align = seams.is_empty() || seams.len() == raw_inputs.len();
+            debug_assert!(slurped.is_some() || seams_align);
+            let mut whole_files = raw_inputs.iter().enumerate();
+            // #7332: where the last value of the run or of a window leaves its index (see `RunIndex`); the
+            // one left when the loop ends is forgotten below, unless the run goes on.
+            let mut held_index: Option<JsonIndex> = None;
+            // #7697: likewise the document a program the path-mode interpreter runs had as its tree,
+            // which that run would otherwise take apart (see `jq::path_mode::kept_document`), unless
+            // the program can walk it with `..`: such a run frees the tree as it walks it, and the
+            // handle would hold all of it beside what the walk builds.
+            let keeps_document = matches!(
+                jq::path_mode::route(&expr),
+                jq::path_mode::Route::Interpreter
+            ) && !jq::path_mode::walks_recursively(&expr);
+            let mut held_document: Option<OwnedValue> = None;
+            'files: loop {
+                // The next file's text, or for a windowed file its next window with the documents the
+                // window holds (#6920): the splitter already ran over it, and `lines_before` line
+                // breaks and `window_substituted` come with it.
+                let (idx, raw, window_split, lines_before, window_substituted, window_place, notes) =
+                    match windowed.as_mut() {
+                        Some(reader) => match reader.next_window_noting(&mut |at, failure| {
+                            noted.push((at, failure));
+                        }) {
+                            Ok(Some((idx, next))) => (
+                                idx,
+                                next.raw,
+                                Some((next.values, next.split_error)),
+                                next.lines_before,
+                                next.substituted,
+                                Some((next.seam, next.origin)),
+                                next.notes,
+                            ),
+                            Ok(None) => break,
+                            // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+                            Err(error) => {
+                                report_input_read_failure(&error);
+                                break;
+                            } // patchcov: coverage end
+                        },
+                        None => match whole_files.next() {
+                            Some((idx, raw)) => {
+                                (idx, raw.as_slice(), None, 0, false, None, Vec::new())
+                            }
+                            None => break,
+                        },
+                    };
+                // #7332: the next window is here, so the last index of the one before it is given back,
+                // and its last document (#7697).
+                held_index = None;
+                held_document = None;
+                // #7024: a file of a long list that did not open when the windowed reader reached it is
+                // one jq's reader meets once the run is past it, as a file the whole-file route could not
+                // open is: up to this window's file, and, for a window that ends in a fault, only before
+                // the file the fault lies in, since the reader read on for the document's end and jq's
+                // stops at the fault. Once met, it is reported below and the run ends after the next
+                // value (`stop_at`).
+                if !noted.is_empty() {
+                    // A fault whose file the second read cannot tell (it declined a file replaced since)
+                    // meets none of them: jq's reader may have stopped before any.
+                    let fault_at = match (&window_split, &reread) {
+                        (Some((_, Some(_))), Some(reread)) => {
+                            Some(reread.fault_source().unwrap_or(0))
+                        }
+                        _ => None,
+                    };
+                    let met = noted
+                        .iter()
+                        .take_while(|(at, _)| {
+                            *at <= idx && fault_at.map_or(true, |fault| *at < fault)
+                        })
+                        .count();
+                    for (at, failure) in noted.drain(..met) {
+                        stop_at.get_or_insert(at);
+                        failures.push((at, failure));
+                    }
+                }
+                // The files that would not open before this one, reported now: jq's reader meets
+                // them as it moves on to this file (#5472).
+                while let Some((_, e)) = failures.get(next_failure).filter(|(at, _)| *at <= idx) {
+                    report_unopenable_input(e, &mut open_failed);
+                    next_failure += 1;
+                }
+                // The slurped document answers for the last file (`input_filename`,
+                // and the file a diagnostic names), as the materializing route's
+                // `InputLocations::single` always did.
+                let source = match (&slurped, &slurp_tail) {
+                    (Some(_), Some(_)) => files.len(),
+                    (Some(s), None) => s.last_source,
+                    (None, _) => idx,
+                };
+                jq::cli_context::set_current_source(u32::try_from(source).ok());
+                let filename: Option<String> = match &slurp_tail {
+                    Some(tail) if slurped.is_some() => Some(tail.clone()),
+                    _ => files.get(source).map(|p| input_display_name(p)),
+                };
+                // Validate JSON if --validate flag is set. Under `--slurp` this
+                // already ran per file, on each file's own bytes, inside
+                // `slurp_documents`; the synthesized buffer is not input.
+                if args.validate && slurped.is_none() {
+                    if let Err(exit_code) = validate_json_input(raw, filename.as_deref()) {
+                        // Every other return from this loop that can run after
+                        // `out` has already buffered real output flushes
+                        // explicitly first (#1563; review: not a blanket claim
+                        // about the whole function -- the separate materializing
+                        // branch below has its own early returns that provably
+                        // run before anything is ever written to `out`, so
+                        // nothing to flush there). This one used to rely on
+                        // `out`'s own `Drop` impl to flush any already-buffered
+                        // output from files processed before this one, which
+                        // works today but silently swallows a flush error (e.g.
+                        // a closed stdout) instead of propagating it, unlike
+                        // every sibling return path in this loop.
+                        out.flush()?;
+                        return Ok(exit_code);
+                    }
+                }
+                // Process as JSON stream (handle multiple JSON values in one input).
+                // Every value before a malformed one is still processed, and the
+                // parse error is reported after them, as jq's incremental parser
+                // does (#2961) -- see the report below the per-value loop.
+                //
+                // A slurped input is already split: the one span is the whole
+                // synthesized array, and scanning it again would be a second pass
+                // over the entire input for nothing.
+                let (mut values, split_error) = if slurped.is_some() {
+                    (vec![(0, raw.len())], None)
+                } else if let Some(split) = window_split {
+                    split
+                } else {
+                    split_json_values(raw)
+                };
+                // jq's main loop ends the run once an open has failed, after the one value it was
+                // fetching when it met the failure: the first the files past it hold. It reads
+                // nothing beyond that value, so a fault further on is never reached (#5472).
+                // #6480: the file's last value before the cut below, which keeps one value past a
+                // file that did not open: that one is the input's last only if it was already.
+                let last_span = values.last().copied();
+                // #4311: a number or literal the fault's own byte completes is
+                // never read (`1\n2]` reads `1`, then the error).
+                // #7752: before the cut below, which keeps the one value past a file that did not open:
+                // when that value is such a token (`1}`), jq's fetch past the failure returns the fault
+                // instead, so the run reports it.
+                if let (Some(offset), Some(&last)) = (split_error, values.last()) {
+                    if bare_token_lost_to_fault(raw, last, offset, false) {
+                        values.pop();
+                    }
+                }
+                let past_open_failure = stop_at.is_some_and(|at| idx >= at) && !values.is_empty();
+                let split_error = if past_open_failure {
+                    values.truncate(1);
                     None
                 } else {
-                    // A previous window's last index is given back before this one is built.
-                    held_index = None;
-                    Some(JsonIndex::try_build(json_bytes).map(Box::new))
+                    split_error
                 };
-                if let Some(None) = long_index {
-                    let at = ErrorAt::Fixed(locator.at(end));
-                    evaluate_unindexable_document(
-                        json_bytes,
-                        &expr,
-                        &context,
-                        &at,
-                        &mut sink,
-                        &output_config,
-                        &mut |sink, result| {
-                            had_output = true;
-                            let stop = route_write_error(
-                                sink,
-                                &mut out,
-                                || at.resolve(),
-                                |o| write_output_owned_value(o, &result, &output_config),
-                            )?;
-                            if !stop {
-                                observe_exit_status(args.exit_status, &mut last_output, || {
-                                    result.is_truthy()
-                                });
-                            }
-                            Ok(!stop)
-                        },
-                    )?;
-                    if let Some(code) = sink.halted() {
-                        out.flush()?;
-                        return Ok(halt_exit_code(code, open_failed));
-                    }
-                    continue;
-                }
-
-                // Slow path: build index and evaluate expression
-                let index = match long_index.flatten() {
-                    None => RunIndex::build(json_bytes, &mut held_index, is_last_value),
-                    Some(index) => RunIndex::of_built(*index, &mut held_index, is_last_value),
-                };
-                // #5497: jq's parser refuses a document past its depth limit before any filter
-                // runs, and reads nothing after it, this file or any later one.
-                let source = if slurped.is_some() {
-                    jq::InputSource::Slurped
-                } else {
-                    jq::InputSource::Stream
-                };
-                if let Some(message) =
-                    jq::jq_input_depth_fault(json_bytes, index.bp(), source, || {
-                        if let Some((_, origin)) = &window_place {
-                            // Where the window starts in jq's input, which reads the files as one stream.
-                            advance_position(*origin, &raw[..start])
-                        } else {
-                            jq_stream_position(&raw_inputs, idx, start)
-                        }
-                    })
-                {
-                    // #6465: that position and column are counted over the substituted text; where
-                    // the substitution changed the stream, jq's parser read the originals.
-                    let reworded = if let Some(reread) = &reread {
-                        // #6920: the file read again, where a window was substituted.
-                        window_substituted.then(|| reread.stream_fault()).flatten()
-                    } else {
-                        originals
-                            .iter()
-                            .any(Option::is_some)
-                            .then(|| {
-                                jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
-                            })
-                            .flatten()
-                    };
-                    let message = reworded
-                        .filter(|read| jq::is_jq_depth_fault(read))
-                        .unwrap_or(message);
-                    // #6628: a slurp joined the documents, so the position is that of the files
-                    // read again as one stream, and the fault is the first jq meets there (stdin
-                    // and a pipe cannot be read again, and keep the bare message).
-                    let message = if source == jq::InputSource::Slurped {
-                        reread_stream_fault(&files).unwrap_or(message)
-                    } else {
-                        message
-                    };
-                    sink.report_parse_error(&message);
-                    run_stopped = true;
-                    break 'files;
-                }
-                // #1576: the M2 fast path, mirroring `yq_runner.rs`'s own
-                // (`can_use_m2_streaming`/`GenericResult::stream_json`) but
-                // scoped to jq's own atomicity contract for array
-                // construction (see `evaluate_m2_fast_path`'s own doc
-                // comment for why `map`/`sort`/etc. buffer while plain
-                // navigation streams straight to `out`). Wrapped in the
-                // same `catch_unwind` as the general path below, for the
-                // same #1793 reason -- `eval_with_cursor`'s own fallback
-                // arms (`LazyKeys`'s sorted branch, `sequence_streamable_
-                // cursors`'s `None` fallback) can still reach
-                // `to_owned_cursor_at_depth`'s panic guard.
-                // #5415: `-C` takes it too, colored as it is written, with
-                // two exceptions that keep `-C`'s bytes what the materializing
-                // route made them. `color_streams` is false under
-                // `--preserve-input`, which echoes source text the colored
-                // route re-renders, and for a document `colored_stream_safe`
-                // does not vouch for. And a result that is not one cursor,
-                // which `evaluate_m2_fast_path` hands back (see there).
-                let color_streams = output_config.color_output
-                    && !output_config.convention.preserves_source_values()
-                    && colored_stream_safe(json_bytes);
-                if can_json_fast_path && (!output_config.color_output || color_streams) {
-                    let color = output_config
-                        .color_output
-                        .then_some(&output_config.color_scheme);
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        evaluate_m2_fast_path(
-                            json_bytes,
-                            &expr,
-                            &index,
-                            &mut sink,
-                            &mut out,
-                            json_indent,
-                            args.sort_keys,
-                            json_numbers,
-                            color,
-                            args.exit_status,
-                            &mut had_output,
-                            &mut last_output,
-                        )
-                    }));
-                    // `Ok(true)`: written (or halted), move on to the next
-                    // document. `Ok(false)`: this document was malformed --
-                    // `evaluate_m2_fast_path`'s own doc comment explains why
-                    // nothing was written and why falling through to the
-                    // general path below (rather than reporting from here)
-                    // is the right way to handle it (#1576 review). The
-                    // panic arm is unrelated to that distinction -- an
-                    // adversarial-depth panic is already fully handled here,
-                    // same as before this fast path existed.
-                    let handled = match outcome {
-                        Ok(handled) => handled?,
-                        Err(payload) => {
-                            let Some(message) = depth_guard_panic_message(&*payload) else {
-                                std::panic::resume_unwind(payload);
-                            };
-                            sink.report(DiagStyle::Jq, &EvalError::new(message), &locator.at(end));
-                            true
-                        }
-                    };
-                    if let Some(code) = sink.halted() {
-                        out.flush()?;
-                        return Ok(halt_exit_code(code, open_failed));
-                    }
-                    if handled {
-                        continue;
-                    }
-                    // Else: fall through to the general path just below,
-                    // for this one document only.
-                }
-
-                // The general path reads the location in several places below,
-                // all of them diagnostics; it is counted on the first read (#4178).
-                let at = LazyLocation::new(locator, end);
-                // #7697: the last value's document is held as its index is (`RunIndex`), when it is
-                // large enough for its tree to matter (`KEEP_DOCUMENT_MIN_BYTES`).
-                let keep_this_document =
-                    keeps_document && is_last_value && json_bytes.len() >= KEEP_DOCUMENT_MIN_BYTES;
-                if keep_this_document {
-                    jq::path_mode::kept_document::keep_next();
-                }
-
-                // A builtin with no native lazy fast path (`sort`, `join`,
-                // ...) falls back to a full `to_owned_cursor` materialization
-                // of whatever value it's handed -- for a bare `sort`/`join`
-                // piped directly off `.`, that's the whole document. Unlike
-                // `#1194`-style malformed-document errors (handled a few
-                // lines below via `sink.report` + `continue`, isolating just
-                // this one document), an adversarially/accidentally deep
-                // document here used to escape as an uncaught panic instead,
-                // aborting the whole run and silently dropping every
-                // subsequent document in the stream (#1793). `catch_unwind`
-                // isolates it the same way #1194's own error already is,
-                // without touching `to_owned_cursor_at_depth`'s panic itself
-                // -- that guard's docs (`eval_generic.rs`, above
-                // `assert_nesting_depth`) explain why threading this through
-                // `EvalError` at its 58+ interior call sites was tried and
-                // reverted (#1021): only the two outermost call sites
-                // reachable from ordinary CLI usage are wrapped here, not
-                // the guard itself.
+                // `values`' end offsets are non-decreasing (find_json_values is
+                // a single left-to-right scan), so one LineCounter shared across
+                // every value in this file keeps the whole loop O(n) (#1213).
+                // `locator` wraps it and must be asked for non-decreasing `end`s.
                 //
-                // The write now happens *inside* the guard, because a
-                // streaming filter panics from within the sink callback
-                // rather than before the caller's loop starts. That puts
-                // `out`, `sink`, `had_output` and `last_output` under
-                // `AssertUnwindSafe`, which stays sound: `write_output_jq_value`
-                // below is panic-free for depth as of #2850 (`try_materialize`,
-                // not the panicking `materialize`), but `evaluate_bytes_streaming`
-                // above it is not -- `to_owned_cursor_at_depth`'s own panic
-                // (sort/join, described just above) and `eval_generic.rs`'s
-                // path-tracking `assert_nesting_depth` calls (`path()`/
-                // `setpath`/`del()`/assignment operators on deep input) both
-                // still reach the panicking guard during *evaluation*, ahead
-                // of this closure's write. `out`'s writer is not mid-record
-                // when either unwinds, and the other three are plain data
-                // regardless.
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut on_value =
-                        |sink: &mut ErrorSink, result: OutputItem<'_>| -> Result<bool> {
-                            had_output = true;
-                            // A malformed document is a data error, not an I/O
-                            // one: it belongs in jq's diagnostic channel (exit 5)
-                            // rather than aborting the process through `anyhow`
-                            // (#1194). Stop emitting results for *this* document,
-                            // but fall through to the halt check below and carry
-                            // on with the rest of the stream (#355) -- real jq
-                            // stops at the first parse error instead, which the
-                            // sink does too when jq's parser also stops on the
-                            // stream (#5576); the rest is a divergence recorded in
-                            // `docs/compliance/jq/limitations.md`.
-                            let stop = route_write_error(
-                                sink,
-                                &mut out,
-                                || at.get().clone(),
-                                |o| match &result {
-                                    OutputItem::Lazy(v) => write_output_jq_value_colored(
-                                        o,
-                                        v,
-                                        &output_config,
-                                        &mut record_scratch,
-                                        color_streams,
-                                    ),
-                                    OutputItem::Owned(v) => {
-                                        write_output_owned_value(o, v, &output_config)
-                                    }
-                                },
-                            )?;
-                            // #7757: `-e` observes what was written, after the write, so
-                            // a fault ends the document as it does without `-e`.
-                            if !stop {
-                                observe_exit_status(args.exit_status, &mut last_output, || {
-                                    match &result {
-                                        OutputItem::Lazy(v) => v.is_truthy(),
-                                        OutputItem::Owned(v) => v.is_truthy(),
-                                    }
-                                });
-                            }
-                            Ok(!stop)
-                        };
-                    evaluate_bytes_streaming(
-                        json_bytes,
-                        &expr,
-                        &index,
-                        &at,
-                        &mut sink,
-                        &mut on_value,
-                    )
-                }));
-                match outcome {
-                    Ok(written) => written?,
-                    Err(payload) => {
-                        // `&*payload`, not `&payload` -- `payload` is a
-                        // `Box<dyn Any + Send>`, and a bare `&payload`
-                        // coerces to `&(dyn Any + Send)` by treating the
-                        // *Box* as the concrete type under test (`Box<T>`
-                        // is itself `Any` via a blanket impl), not the value
-                        // it holds -- so every `downcast_ref` inside the
-                        // helper would silently miss regardless of the
-                        // panic's real payload type. Confirmed live: `&payload`
-                        // here made the panic-message helper return
-                        // `None` even for this exact panic.
-                        let Some(message) = depth_guard_panic_message(&*payload) else {
-                            // Not the specific guard this catch exists for --
-                            // an unexpected panic must still crash loudly,
-                            // not be silently absorbed as if it were #1793.
-                            std::panic::resume_unwind(payload);
-                        };
-                        // Reported through the same channel, and so with
-                        // the same exit code (5), as any other uncaught
-                        // EvalError on this loop -- deliberately: this is an
-                        // internal architectural ceiling, not a jq-level
-                        // type/arity error, but the alternative (keeping the
-                        // panic's own exit 101) would still be a hard,
-                        // uncontrolled process exit for what #1793 exists to
-                        // turn into an ordinary, recoverable diagnostic.
-                        sink.report(DiagStyle::Jq, &EvalError::new(message), at.get());
-                        // Mirrors the same check a few lines below, after the
-                        // ordinary per-result loop -- halt/halt_error (#791)
-                        // outranks everything else, including remaining
-                        // values/files, and this `continue` would otherwise
-                        // skip straight past that check for this iteration
-                        // (review: every other early-exit in this loop still
-                        // reaches it on the same iteration; this one didn't).
-                    }
-                }
-                if keep_this_document {
-                    held_document = jq::path_mode::kept_document::take();
-                }
-                // halt/halt_error (#791) outranks everything else, including
-                // remaining values/files still to process. The panic arm above
-                // used to `continue` past this check and repeat it itself;
-                // with the write loop folded into the guard there is nothing
-                // left between the two, so the single check below now covers
-                // both paths.
-                if let Some(code) = sink.halted() {
-                    out.flush()?;
-                    return Ok(halt_exit_code(code, open_failed));
-                }
-            }
-            if past_open_failure {
-                run_stopped = true;
-                break;
-            }
-            // The malformed value, reported only once everything before it
-            // has been processed. jq's parser stops at the first malformed
-            // value and reads nothing after it, this file or any later one
-            // (#4313), so the files that follow are not run either.
-            if stopped(args.on_error, &sink) {
-                run_stopped = true;
-                break;
-            }
-            // #7322: the warnings met after the window's last value.
-            for (_, warning) in notes {
-                eprintln!("{warning}");
-            }
-            if let Some(offset) = split_error {
-                // #5497: jq meets its depth limit first when the refused bracket comes before
-                // the fault the splitter stopped at.
-                // #5555: jq's parser names the first fault of its input, whether it is the depth
-                // limit or not, and a value the splitter delimits can hold one ahead of the
-                // splitter's.
-                if let Some(message) = if let Some(reread) = &reread {
-                    // #6920: the stream's first fault, from the file read again.
-                    reread.stream_fault()
+                // jq names the line the input value ends on, counted in the whole
+                // file rather than in this value's slice. Only a diagnostic reads
+                // it, so it is resolved when one does (#4160 on the M2 fast path,
+                // #4178 on the general path through `LazyLocation`).
+                // #4316: the bytes a stitched file starts with came from the previous file, so
+                // its lines start after them.
+                let seam = if slurped.is_some() {
+                    Seam::NONE
+                } else if let Some((seam, _)) = &window_place {
+                    // #7024: what the files stitched into one stream did to this window.
+                    seam.clone()
                 } else {
-                    jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
-                } {
-                    // #6476: a text that ends inside a value is a fault jq's parser meets at the end
-                    // of the last file's bytes, after its reader has moved on to the files that
-                    // would not open, so it reports them first and the run exits 2 with them.
-                    if fault_is_at_eof(&message) {
+                    seams.get(idx).cloned().unwrap_or_default()
+                };
+                // #7934: a file the substitution changed has its reads counted in the bytes jq read. A
+                // window's text is counted as it is (its edits are not kept).
+                let lossy = (slurped.is_none() && window_place.is_none())
+                    .then(|| originals.get(idx).and_then(Option::as_ref))
+                    .flatten();
+                let locator = ValueLocator::new(
+                    raw,
+                    filename.as_deref(),
+                    slurped.as_ref().map(|slurped| {
+                        if slurp_tail.is_some() {
+                            0
+                        } else {
+                            slurped.eof_line
+                        }
+                    }),
+                    seam.clone(),
+                )
+                .reading(lossy)
+                .with_lines_before(lines_before);
+                let tail_locator =
+                    ValueLocator::new(b"", value_tail.as_deref(), Some(0), Seam::NONE);
+                // #7322: what jq's `--seq` reader warns of in a stretch of the window that was not plain
+                // records, each printed when the run reaches where the reader met it, as jq's main loop
+                // prints it between the values it reads.
+                let mut notes = notes.into_iter().peekable();
+                for (start, end) in values {
+                    if !finished.next_input(
+                        args.on_error,
+                        &mut sink,
+                        &mut had_output,
+                        &mut last_output,
+                    ) {
+                        run_stopped = true;
+                        break 'files;
+                    }
+                    // #7455: what the program took, for where a halt leaves standard input.
+                    super::stdin_offset::note_taken();
+                    while let Some((_, warning)) = notes.next_if(|&(at, _)| at < start) {
+                        eprintln!("{warning}");
+                    }
+                    // #6480: the last value, read at a last file that did not open, which its read
+                    // reports first.
+                    // The stitch can have moved the value into a later file, so its file is the last
+                    // with bytes as they stand now.
+                    let is_last_value = Some((start, end)) == last_span
+                        && raw_inputs[idx + 1..].iter().all(Vec::is_empty);
+                    let at_tail = value_tail.is_some() && is_last_value;
+                    // #6683: the last value of a text read on into a directory given last counts the
+                    // failure (and says whatever failed before it) when it is read, before the program
+                    // runs on it.
+                    if value_dir_tail && is_last_value {
                         report_open_failures(&failures[next_failure..], &mut open_failed);
                         next_failure = failures.len();
                     }
-                    sink.report_parse_error(&message);
+                    let locator = if at_tail {
+                        report_open_failures(&failures[next_failure..], &mut open_failed);
+                        next_failure = failures.len();
+                        jq::cli_context::set_current_source(u32::try_from(files.len()).ok());
+                        &tail_locator
+                    } else {
+                        &locator
+                    };
+                    let json_bytes = &raw[start..end];
+
+                    // Fast path for identity query: output raw bytes directly without materialization.
+                    // This avoids building the index and materializing JqValue, saving significant memory.
+                    if use_identity_fast_path {
+                        had_output = true;
+                        // For exit_status, inspect the raw JSON token so that `null`
+                        // and `false` inputs still produce the falsy exit code (jq: 1)
+                        // on the identity fast path. Only these two literals are falsy;
+                        // a quoted "false"/"null" string or any number stays truthy.
+                        if args.exit_status {
+                            last_output = Some(identity_exit_status_value(json_bytes));
+                        }
+                        output_config.write_identity_bytes(&mut out, json_bytes)?;
+                        out.write_all(b"\n")?;
+                        continue;
+                    }
+
+                    // #7537: a document of 4 GiB or more (a slurp of that much included) is indexed
+                    // like any other unless it holds more than 2^31 values; #7425: one no index can
+                    // hold is read into a tree without one, and the program runs on the tree. Its
+                    // index is boxed, so every other document carries a pointer here and builds its
+                    // own in place below.
+                    let long_index = if JsonIndex::can_index(json_bytes.len()) {
+                        None
+                    } else {
+                        // A previous window's last index is given back before this one is built.
+                        held_index = None;
+                        Some(JsonIndex::try_build(json_bytes).map(Box::new))
+                    };
+                    if let Some(None) = long_index {
+                        let at = ErrorAt::Fixed(locator.at(end));
+                        evaluate_unindexable_document(
+                            json_bytes,
+                            &expr,
+                            &context,
+                            &at,
+                            &mut sink,
+                            &output_config,
+                            &mut |sink, result| {
+                                had_output = true;
+                                let stop = route_write_error(
+                                    sink,
+                                    &mut out,
+                                    || at.resolve(),
+                                    |o| write_output_owned_value(o, &result, &output_config),
+                                )?;
+                                if !stop {
+                                    observe_exit_status(args.exit_status, &mut last_output, || {
+                                        result.is_truthy()
+                                    });
+                                }
+                                Ok(!stop)
+                            },
+                        )?;
+                        if let Some(code) = sink.halted() {
+                            out.flush()?;
+                            return Ok(halt_exit_code(code, open_failed));
+                        }
+                        continue;
+                    }
+
+                    // Slow path: build index and evaluate expression
+                    let index = match long_index.flatten() {
+                        None => RunIndex::build(json_bytes, &mut held_index, is_last_value),
+                        Some(index) => RunIndex::of_built(*index, &mut held_index, is_last_value),
+                    };
+                    // #5497: jq's parser refuses a document past its depth limit before any filter
+                    // runs, and reads nothing after it, this file or any later one.
+                    let source = if slurped.is_some() {
+                        jq::InputSource::Slurped
+                    } else {
+                        jq::InputSource::Stream
+                    };
+                    if let Some(message) =
+                        jq::jq_input_depth_fault(json_bytes, index.bp(), source, || {
+                            if let Some((_, origin)) = &window_place {
+                                // Where the window starts in jq's input, which reads the files as one stream.
+                                advance_position(*origin, &raw[..start])
+                            } else {
+                                jq_stream_position(&raw_inputs, idx, start)
+                            }
+                        })
+                    {
+                        // #6465: that position and column are counted over the substituted text; where
+                        // the substitution changed the stream, jq's parser read the originals.
+                        let reworded = if let Some(reread) = &reread {
+                            // #6920: the file read again, where a window was substituted.
+                            window_substituted.then(|| reread.stream_fault()).flatten()
+                        } else {
+                            originals
+                                .iter()
+                                .any(Option::is_some)
+                                .then(|| {
+                                    jq::jq_stream_fault(
+                                        parser_chunks(&raw_inputs, &originals),
+                                        1,
+                                        0,
+                                    )
+                                })
+                                .flatten()
+                        };
+                        let message = reworded
+                            .filter(|read| jq::is_jq_depth_fault(read))
+                            .unwrap_or(message);
+                        // #6628: a slurp joined the documents, so the position is that of the files
+                        // read again as one stream, and the fault is the first jq meets there (stdin
+                        // and a pipe cannot be read again, and keep the bare message).
+                        let message = if source == jq::InputSource::Slurped {
+                            reread_stream_fault(&files).unwrap_or(message)
+                        } else {
+                            message
+                        };
+                        sink.report_parse_error(&message);
+                        run_stopped = true;
+                        break 'files;
+                    }
+                    // #1576: the M2 fast path, mirroring `yq_runner.rs`'s own
+                    // (`can_use_m2_streaming`/`GenericResult::stream_json`) but
+                    // scoped to jq's own atomicity contract for array
+                    // construction (see `evaluate_m2_fast_path`'s own doc
+                    // comment for why `map`/`sort`/etc. buffer while plain
+                    // navigation streams straight to `out`). Wrapped in the
+                    // same `catch_unwind` as the general path below, for the
+                    // same #1793 reason -- `eval_with_cursor`'s own fallback
+                    // arms (`LazyKeys`'s sorted branch, `sequence_streamable_
+                    // cursors`'s `None` fallback) can still reach
+                    // `to_owned_cursor_at_depth`'s panic guard.
+                    // #5415: `-C` takes it too, colored as it is written, with
+                    // two exceptions that keep `-C`'s bytes what the materializing
+                    // route made them. `color_streams` is false under
+                    // `--preserve-input`, which echoes source text the colored
+                    // route re-renders, and for a document `colored_stream_safe`
+                    // does not vouch for. And a result that is not one cursor,
+                    // which `evaluate_m2_fast_path` hands back (see there).
+                    let color_streams = output_config.color_output
+                        && !output_config.convention.preserves_source_values()
+                        && colored_stream_safe(json_bytes);
+                    if can_json_fast_path && (!output_config.color_output || color_streams) {
+                        let color = output_config
+                            .color_output
+                            .then_some(&output_config.color_scheme);
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                evaluate_m2_fast_path(
+                                    json_bytes,
+                                    &expr,
+                                    &index,
+                                    &mut sink,
+                                    &mut out,
+                                    json_indent,
+                                    args.sort_keys,
+                                    json_numbers,
+                                    color,
+                                    args.exit_status,
+                                    &mut had_output,
+                                    &mut last_output,
+                                )
+                            }));
+                        // `Ok(true)`: written (or halted), move on to the next
+                        // document. `Ok(false)`: this document was malformed --
+                        // `evaluate_m2_fast_path`'s own doc comment explains why
+                        // nothing was written and why falling through to the
+                        // general path below (rather than reporting from here)
+                        // is the right way to handle it (#1576 review). The
+                        // panic arm is unrelated to that distinction -- an
+                        // adversarial-depth panic is already fully handled here,
+                        // same as before this fast path existed.
+                        let handled = match outcome {
+                            Ok(handled) => handled?,
+                            Err(payload) => {
+                                let Some(message) = depth_guard_panic_message(&*payload) else {
+                                    std::panic::resume_unwind(payload);
+                                };
+                                sink.report(
+                                    DiagStyle::Jq,
+                                    &EvalError::new(message),
+                                    &locator.at(end),
+                                );
+                                true
+                            }
+                        };
+                        if let Some(code) = sink.halted() {
+                            out.flush()?;
+                            return Ok(halt_exit_code(code, open_failed));
+                        }
+                        if handled {
+                            continue;
+                        }
+                        // Else: fall through to the general path just below,
+                        // for this one document only.
+                    }
+
+                    // The general path reads the location in several places below,
+                    // all of them diagnostics; it is counted on the first read (#4178).
+                    let at = LazyLocation::new(locator, end);
+                    // #7697: the last value's document is held as its index is (`RunIndex`), when it is
+                    // large enough for its tree to matter (`KEEP_DOCUMENT_MIN_BYTES`).
+                    let keep_this_document = keeps_document
+                        && is_last_value
+                        && json_bytes.len() >= KEEP_DOCUMENT_MIN_BYTES;
+                    if keep_this_document {
+                        jq::path_mode::kept_document::keep_next();
+                    }
+
+                    // A builtin with no native lazy fast path (`sort`, `join`,
+                    // ...) falls back to a full `to_owned_cursor` materialization
+                    // of whatever value it's handed -- for a bare `sort`/`join`
+                    // piped directly off `.`, that's the whole document. Unlike
+                    // `#1194`-style malformed-document errors (handled a few
+                    // lines below via `sink.report` + `continue`, isolating just
+                    // this one document), an adversarially/accidentally deep
+                    // document here used to escape as an uncaught panic instead,
+                    // aborting the whole run and silently dropping every
+                    // subsequent document in the stream (#1793). `catch_unwind`
+                    // isolates it the same way #1194's own error already is,
+                    // without touching `to_owned_cursor_at_depth`'s panic itself
+                    // -- that guard's docs (`eval_generic.rs`, above
+                    // `assert_nesting_depth`) explain why threading this through
+                    // `EvalError` at its 58+ interior call sites was tried and
+                    // reverted (#1021): only the two outermost call sites
+                    // reachable from ordinary CLI usage are wrapped here, not
+                    // the guard itself.
+                    //
+                    // The write now happens *inside* the guard, because a
+                    // streaming filter panics from within the sink callback
+                    // rather than before the caller's loop starts. That puts
+                    // `out`, `sink`, `had_output` and `last_output` under
+                    // `AssertUnwindSafe`, which stays sound: `write_output_jq_value`
+                    // below is panic-free for depth as of #2850 (`try_materialize`,
+                    // not the panicking `materialize`), but `evaluate_bytes_streaming`
+                    // above it is not -- `to_owned_cursor_at_depth`'s own panic
+                    // (sort/join, described just above) and `eval_generic.rs`'s
+                    // path-tracking `assert_nesting_depth` calls (`path()`/
+                    // `setpath`/`del()`/assignment operators on deep input) both
+                    // still reach the panicking guard during *evaluation*, ahead
+                    // of this closure's write. `out`'s writer is not mid-record
+                    // when either unwinds, and the other three are plain data
+                    // regardless.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut on_value =
+                            |sink: &mut ErrorSink, result: OutputItem<'_>| -> Result<bool> {
+                                had_output = true;
+                                // A malformed document is a data error, not an I/O
+                                // one: it belongs in jq's diagnostic channel (exit 5)
+                                // rather than aborting the process through `anyhow`
+                                // (#1194). Stop emitting results for *this* document,
+                                // but fall through to the halt check below and carry
+                                // on with the rest of the stream (#355) -- real jq
+                                // stops at the first parse error instead, which the
+                                // sink does too when jq's parser also stops on the
+                                // stream (#5576); the rest is a divergence recorded in
+                                // `docs/compliance/jq/limitations.md`.
+                                let stop = route_write_error(
+                                    sink,
+                                    &mut out,
+                                    || at.get().clone(),
+                                    |o| match &result {
+                                        OutputItem::Lazy(v) => write_output_jq_value_colored(
+                                            o,
+                                            v,
+                                            &output_config,
+                                            &mut record_scratch,
+                                            color_streams,
+                                        ),
+                                        OutputItem::Owned(v) => {
+                                            write_output_owned_value(o, v, &output_config)
+                                        }
+                                    },
+                                )?;
+                                // #7757: `-e` observes what was written, after the write, so
+                                // a fault ends the document as it does without `-e`.
+                                if !stop {
+                                    observe_exit_status(args.exit_status, &mut last_output, || {
+                                        match &result {
+                                            OutputItem::Lazy(v) => v.is_truthy(),
+                                            OutputItem::Owned(v) => v.is_truthy(),
+                                        }
+                                    });
+                                }
+                                Ok(!stop)
+                            };
+                        evaluate_bytes_streaming(
+                            json_bytes,
+                            &expr,
+                            &index,
+                            &at,
+                            &mut sink,
+                            &mut on_value,
+                        )
+                    }));
+                    match outcome {
+                        Ok(written) => written?,
+                        Err(payload) => {
+                            // `&*payload`, not `&payload` -- `payload` is a
+                            // `Box<dyn Any + Send>`, and a bare `&payload`
+                            // coerces to `&(dyn Any + Send)` by treating the
+                            // *Box* as the concrete type under test (`Box<T>`
+                            // is itself `Any` via a blanket impl), not the value
+                            // it holds -- so every `downcast_ref` inside the
+                            // helper would silently miss regardless of the
+                            // panic's real payload type. Confirmed live: `&payload`
+                            // here made the panic-message helper return
+                            // `None` even for this exact panic.
+                            let Some(message) = depth_guard_panic_message(&*payload) else {
+                                // Not the specific guard this catch exists for --
+                                // an unexpected panic must still crash loudly,
+                                // not be silently absorbed as if it were #1793.
+                                std::panic::resume_unwind(payload);
+                            };
+                            // Reported through the same channel, and so with
+                            // the same exit code (5), as any other uncaught
+                            // EvalError on this loop -- deliberately: this is an
+                            // internal architectural ceiling, not a jq-level
+                            // type/arity error, but the alternative (keeping the
+                            // panic's own exit 101) would still be a hard,
+                            // uncontrolled process exit for what #1793 exists to
+                            // turn into an ordinary, recoverable diagnostic.
+                            sink.report(DiagStyle::Jq, &EvalError::new(message), at.get());
+                            // Mirrors the same check a few lines below, after the
+                            // ordinary per-result loop -- halt/halt_error (#791)
+                            // outranks everything else, including remaining
+                            // values/files, and this `continue` would otherwise
+                            // skip straight past that check for this iteration
+                            // (review: every other early-exit in this loop still
+                            // reaches it on the same iteration; this one didn't).
+                        }
+                    }
+                    if keep_this_document {
+                        held_document = jq::path_mode::kept_document::take();
+                    }
+                    // halt/halt_error (#791) outranks everything else, including
+                    // remaining values/files still to process. The panic arm above
+                    // used to `continue` past this check and repeat it itself;
+                    // with the write loop folded into the guard there is nothing
+                    // left between the two, so the single check below now covers
+                    // both paths.
+                    if let Some(code) = sink.halted() {
+                        out.flush()?;
+                        return Ok(halt_exit_code(code, open_failed));
+                    }
+                }
+                if past_open_failure {
                     run_stopped = true;
                     break;
                 }
-                // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `jq_stream_fault` names one; kept so a disagreement between them prints the old line placement rather than none (#5555)"
-                let at = InputLocation::at(
-                    filename.as_deref(),
-                    parse_error_line_after(raw, offset, seam, false, lines_before),
-                );
-                sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
-                run_stopped = true;
-                break;
-                // patchcov: coverage end
+                // The malformed value, reported only once everything before it
+                // has been processed. jq's parser stops at the first malformed
+                // value and reads nothing after it, this file or any later one
+                // (#4313), so the files that follow are not run either.
+                if stopped(args.on_error, &sink) {
+                    run_stopped = true;
+                    break;
+                }
+                // #7322: the warnings met after the window's last value.
+                for (_, warning) in notes {
+                    eprintln!("{warning}");
+                }
+                if let Some(offset) = split_error {
+                    // #5497: jq meets its depth limit first when the refused bracket comes before
+                    // the fault the splitter stopped at.
+                    // #5555: jq's parser names the first fault of its input, whether it is the depth
+                    // limit or not, and a value the splitter delimits can hold one ahead of the
+                    // splitter's.
+                    if let Some(message) = if let Some(reread) = &reread {
+                        // #6920: the stream's first fault, from the file read again.
+                        reread.stream_fault()
+                    } else {
+                        jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
+                    } {
+                        // #6476: a text that ends inside a value is a fault jq's parser meets at the end
+                        // of the last file's bytes, after its reader has moved on to the files that
+                        // would not open, so it reports them first and the run exits 2 with them.
+                        if fault_is_at_eof(&message) {
+                            report_open_failures(&failures[next_failure..], &mut open_failed);
+                            next_failure = failures.len();
+                        }
+                        sink.report_parse_error(&message);
+                        run_stopped = true;
+                        break;
+                    }
+                    // patchcov: coverage tolerate reason="defensive: the splitter stops only at a fault jq's parser also meets, so `jq_stream_fault` names one; kept so a disagreement between them prints the old line placement rather than none (#5555)"
+                    let at = InputLocation::at(
+                        filename.as_deref(),
+                        parse_error_line_after(raw, offset, seam, false, lines_before),
+                    );
+                    sink.report(DiagStyle::Jq, &EvalError::new("Invalid JSON text"), &at);
+                    run_stopped = true;
+                    break;
+                    // patchcov: coverage end
+                }
+            }
+            // Past the last file that opened: the ones that would not open after it, which jq's
+            // reader meets when it asks for more and finds none -- unless the run had stopped.
+            // #7221: or, for `--seq` files whose windows stopped at one that is not plain, as it moves on
+            // to that one, whose first value then ends the run.
+            let past_open_failure = stop_at.is_some() || !noted.is_empty();
+            if !run_stopped {
+                failures.append(&mut noted);
+                report_open_failures(&failures[next_failure..], &mut open_failed);
+            }
+            // A run that stopped reads no further, as jq's main loop does.
+            seq_tail_handed_on = !run_stopped
+                && (hand_on_seq_pipe_tail(&args)
+                    || hand_on_seq_files_tail(&args, past_open_failure));
+            // #7332: the last value's index is not given back when the run ends here, see `RunIndex`; a
+            // run that goes on frees it. So is its document (#7697).
+            if !seq_tail_handed_on {
+                std::mem::forget(held_index);
+                std::mem::forget(held_document);
             }
         }
-        // Past the last file that opened: the ones that would not open after it, which jq's
-        // reader meets when it asks for more and finds none -- unless the run had stopped.
-        // #7221: or, for `--seq` files whose windows stopped at one that is not plain, as it moves on
-        // to that one, whose first value then ends the run.
-        let past_open_failure = stop_at.is_some() || !noted.is_empty();
-        if !run_stopped {
-            failures.append(&mut noted);
-            report_open_failures(&failures[next_failure..], &mut open_failed);
-        }
-        // A run that stopped reads no further, as jq's main loop does.
-        seq_tail_handed_on = !run_stopped
-            && (hand_on_seq_pipe_tail(&args) || hand_on_seq_files_tail(&args, past_open_failure));
-        // #7332: the last value's index is not given back when the run ends here, see `RunIndex`; a
-        // run that goes on frees it. So is its document (#7697).
-        if !seq_tail_handed_on {
-            std::mem::forget(held_index);
-            std::mem::forget(held_document);
-        }
-    } }
+    }
     if !lazy_path_taken || seq_tail_handed_on || reader_model_declined {
         // The materializing path: reads every document up front into a
         // `Vec<OwnedValue>`, which is what the input-builtin queue below needs
@@ -8147,11 +8174,8 @@ impl ModelRead {
     }
 
     fn of_sources(sources: &[&[u8]], slurp: bool) -> Self {
-        let mut reader = reader_model::Reader::new(
-            sources,
-            reader_model::ReaderProfile::shipped(),
-            slurp,
-        );
+        let mut reader =
+            reader_model::Reader::new(sources, reader_model::ReaderProfile::shipped(), slurp);
         let mut items = Vec::new();
         let mut slurp_tail = Vec::new();
         let mut slurp_end = None;
@@ -10029,7 +10053,9 @@ fn read_inputs(
         // of a lone source as read are kept only then.
         let lossy_seen = model_scope && lossy_sources.iter().any(Option::is_some);
         if lossy_seen && last == 0 {
-            fault_text = lossy_sources[0].as_ref().map(|lossy| lossy.original.clone());
+            fault_text = lossy_sources[0]
+                .as_ref()
+                .map(|lossy| lossy.original.clone());
         }
         LAZY_JSON_INPUTS.with(|slot| *slot.borrow_mut() = None);
         LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);

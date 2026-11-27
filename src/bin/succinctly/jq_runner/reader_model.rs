@@ -165,9 +165,18 @@ impl ReaderProfile {
             ("closing_refill", usize::from(self.closing_refill)),
             ("nul_cut", usize::from(self.nul_cut)),
             ("max_depth", self.max_depth),
-            ("position_after_end_171", usize::from(self.position_after_end_171)),
-            ("slurp_reads_remaining", usize::from(self.slurp_reads_remaining)),
-            ("single_quote_message", usize::from(self.single_quote_message)),
+            (
+                "position_after_end_171",
+                usize::from(self.position_after_end_171),
+            ),
+            (
+                "slurp_reads_remaining",
+                usize::from(self.slurp_reads_remaining),
+            ),
+            (
+                "single_quote_message",
+                usize::from(self.single_quote_message),
+            ),
             ("nan_payload", usize::from(self.nan_payload)),
         ]
     }
@@ -190,7 +199,11 @@ pub(crate) const NO_SOURCE: u32 = u32::MAX;
 pub(crate) enum Item {
     /// A value: its JSON text as jq understood it, and what `input_filename` (as a source index, or
     /// [`NO_SOURCE`]) and `input_line_number` answer right after the read that completed it.
-    Value { text: String, source: u32, line: u64 },
+    Value {
+        text: String,
+        source: u32,
+        line: u64,
+    },
     /// A parse error, worded as jq words it, and the same position.
     Fault {
         message: String,
@@ -486,8 +499,7 @@ impl<'a> Parser<'a> {
                 return Err(
                     "Invalid string: control characters from U+0000 through U+001F must be escaped",
                 );
-            }
-            else {
+            } else {
                 body.push(c);
             }
         }
@@ -620,8 +632,7 @@ impl<'a> Parser<'a> {
                 Ok(None) => {}
                 Ok(Some(value)) => return Next::Value(value),
                 Err(msg) => {
-                    let message =
-                        format!("{msg} at line {}, column {}", self.line, self.column);
+                    let message = format!("{msg} at line {}, column {}", self.line, self.column);
                     self.reset();
                     // We're not parsing a JSON text sequence; throw this buffer away.
                     self.buf = None;
@@ -645,10 +656,7 @@ impl<'a> Parser<'a> {
             return Next::Fault(message);
         }
         if let Err(msg) = self.check_literal() {
-            let message = format!(
-                "{msg} at EOF at line {}, column {}",
-                self.line, self.column
-            );
+            let message = format!("{msg} at EOF at line {}, column {}", self.line, self.column);
             self.reset();
             return Next::Fault(message);
         }
@@ -1015,9 +1023,9 @@ impl<'a> Reader<'a> {
     /// `jq_util_input_get_position`, as it stands now.
     pub(crate) fn position(&self) -> Position {
         Position {
-            source: self
-                .current_source
-                .map_or(NO_SOURCE, |source| u32::try_from(source).unwrap_or(NO_SOURCE)),
+            source: self.current_source.map_or(NO_SOURCE, |source| {
+                u32::try_from(source).unwrap_or(NO_SOURCE)
+            }),
             line: self.current_line,
         }
     }

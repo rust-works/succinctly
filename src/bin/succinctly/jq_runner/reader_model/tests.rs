@@ -159,17 +159,29 @@ fn reader_model_has_at_least_forty_cases() {
 
 #[test]
 fn reader_model_inputs_equal_jq_171() {
-    check(|case| Some(case.inputs_171), ReaderProfile::release(Release::Jq171), Program::Inputs);
+    check(
+        |case| Some(case.inputs_171),
+        ReaderProfile::release(Release::Jq171),
+        Program::Inputs,
+    );
 }
 
 #[test]
 fn reader_model_main_loop_equals_jq_171() {
-    check(|case| Some(case.main_171), ReaderProfile::release(Release::Jq171), Program::Main);
+    check(
+        |case| Some(case.main_171),
+        ReaderProfile::release(Release::Jq171),
+        Program::Main,
+    );
 }
 
 #[test]
 fn reader_model_slurp_equals_jq_171() {
-    check(|case| Some(case.slurp_171), ReaderProfile::release(Release::Jq171), Program::Slurp);
+    check(
+        |case| Some(case.slurp_171),
+        ReaderProfile::release(Release::Jq171),
+        Program::Slurp,
+    );
 }
 
 #[test]
@@ -243,8 +255,18 @@ fn reader_model_shipped_profiles_are_releases_or_listed_exceptions() {
             if case.name.contains("depth") {
                 continue;
             }
-            assert_eq!(render(case, shipped, Program::Inputs), inputs, "{}", case.name);
-            assert_eq!(render(case, shipped, Program::Slurp), slurp, "{}", case.name);
+            assert_eq!(
+                render(case, shipped, Program::Inputs),
+                inputs,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                render(case, shipped, Program::Slurp),
+                slurp,
+                "{}",
+                case.name
+            );
         }
     }
 }
@@ -258,16 +280,25 @@ fn reader_model_replaces_bad_utf8_as_jq_does() {
     assert_eq!(count(b"\xC0\xAF\xE0\x80\xBF\xF0\x81\x82\x41"), 4);
     assert_eq!(count(b"\xED\xA0\x80\xED\xBF\xBF\xED\xAF\x41"), 3);
     assert_eq!(count(b"\xF4\x91\x92\x93\xFF\x41\x80\xBF\x42"), 4);
-    assert_eq!(jq_string_sized(b"\xE1\x80\xE2\xF0\x91\x92\xF1\xBF\x41"), "\u{fffd}".repeat(4));
+    assert_eq!(
+        jq_string_sized(b"\xE1\x80\xE2\xF0\x91\x92\xF1\xBF\x41"),
+        "\u{fffd}".repeat(4)
+    );
     assert_eq!(jq_string_sized(b"\xF0Zb"), "\u{fffd}");
     assert_eq!(jq_string_sized(b"a\xC3\xA9"), "a\u{e9}");
     // Through the parser: a lone low surrogate escape is encoded, then replaced.
     let files: &[&[u8]] = &[b"\"\\udc00x\" \"\xF0\\n\"\n"];
     let profile = ReaderProfile::shipped();
     let mut reader = Reader::new(files, profile, false);
-    assert_eq!(reader.next_input(), Step::Value(String::from("\"\u{fffd}x\"")));
+    assert_eq!(
+        reader.next_input(),
+        Step::Value(String::from("\"\u{fffd}x\""))
+    );
     // `\n` decodes to a byte the lead takes with it: the string is one U+FFFD.
-    assert_eq!(reader.next_input(), Step::Value(String::from("\"\u{fffd}\"")));
+    assert_eq!(
+        reader.next_input(),
+        Step::Value(String::from("\"\u{fffd}\""))
+    );
 }
 
 /// jq 1.8.2 completes a full read that ends inside a UTF-8 sequence with raw bytes, a newline
@@ -300,7 +331,11 @@ fn reader_model_completes_a_utf8_sequence_cut_by_a_full_read_as_jq_182() {
     assert_eq!(
         items,
         vec![
-            Item::Value { text: String::from("1"), source: 0, line: 0 },
+            Item::Value {
+                text: String::from("1"),
+                source: 0,
+                line: 0
+            },
             Item::Fault {
                 message: String::from("Invalid numeric literal at line 2, column 0"),
                 source: 0,
