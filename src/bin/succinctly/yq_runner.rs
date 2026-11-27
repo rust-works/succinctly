@@ -3365,8 +3365,8 @@ fn stream_yaml_sort_keys_alias_fallback<W: Write>(
 
 /// Evaluate a jq expression on an OwnedValue by converting to JSON and back.
 ///
-/// Variables (`--arg`/`--argjson`, `$ARGS`) are substituted into `expr` up
-/// front in `run_yq`, so this function needs no evaluation context (#284).
+/// Variables (`--arg`/`--argjson`, and `$ARGS` under `--jq-extensions`, #7616) are substituted
+/// into `expr` up front in `run_yq`, so this function needs no evaluation context (#284).
 ///
 /// This is `yq_runner.rs`'s own function (`jq_runner.rs` has an unrelated,
 /// separate `evaluate_input` for jq mode). It always *evaluates* with
@@ -13599,10 +13599,16 @@ fn run_yq_inner(mut args: YqCommand) -> Result<i32> {
     // variable into the expression AST before evaluating, mirroring the jq
     // runner (see jq_runner.rs). Without this, filter references like `$g`
     // error as "undefined variable" even though the values were parsed (#284).
+    //
+    // #7616: yq has no `$ARGS` (`yq -n '[$ARGS] | length'` is `0`, as for any unbound name), so it
+    // is bound only under `--jq-extensions`; without the flag it is an ordinary variable name, like
+    // `$ENV` (`dollar_var_expr` in `parser.rs`).
     let args_value = build_args_var(&context);
     let mut all_vars: Vec<(&str, &OwnedValue)> =
         context.named.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    all_vars.push(("ARGS", &args_value));
+    if args.jq_extensions {
+        all_vars.push(("ARGS", &args_value));
+    }
     program.expr = jq::substitute_vars(&program.expr, all_vars.iter().copied());
 
     // #1473: same compile-time function resolution the jq runner does, before

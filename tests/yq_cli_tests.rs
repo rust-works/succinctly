@@ -14957,14 +14957,21 @@ fn test_multiple_variables() -> Result<()> {
 
 #[test]
 fn test_args_named_object() -> Result<()> {
-    // $ARGS.named exposes all --arg/--argjson values (jq special variable).
+    // $ARGS.named exposes all --arg/--argjson values (jq special variable), under
+    // --jq-extensions: yq has no `$ARGS`, so without the flag it is an unbound name (#7616).
     let (output, code) = run_yq_stdin(
         "$ARGS.named",
         "a: 1",
-        &["--arg", "g", "hello", "-o=json", "-I=0"],
+        &["--jq-extensions", "--arg", "g", "hello", "-o=json", "-I=0"],
     )?;
     assert_eq!(output.trim(), r#"{"g":"hello"}"#);
     assert_eq!(code, 0);
+    let (output, code) = run_yq_stdin(
+        "[$ARGS] | length",
+        "a: 1",
+        &["--arg", "g", "hello", "-o=json", "-I=0"],
+    )?;
+    assert_eq!((output.trim(), code), ("0", 0));
     Ok(())
 }
 
@@ -43433,9 +43440,8 @@ fn test_yq_namespaced_call_whitespace_around_colons_is_a_syntax_error() -> Resul
 ///   parser's reject is jq-mode-only and succinctly yq keeps accepting it.
 /// - `$ENV` shadows like any other `as`-binding in yq (`1 as $ENV | $ENV` →
 ///   `1`, confirmed live), which the resolve-side rewrite (shared, and not
-///   gated) now reproduces; the unbound `$ENV` row is a pre-existing
-///   divergence outside this issue's scope (real yq answers empty, succinctly
-///   answers the environment object).
+///   gated) now reproduces; the unbound `$ENV` row (real yq answers empty)
+///   matches since #7616, see `tests/yq_cli/i7616.rs`.
 #[test]
 fn test_yq_loc_and_env_matches_real_yq_3029() -> Result<()> {
     let (out, code) = run_yq_stdin("1 as $__loc__ | 2", "a: 1\n", &["-n"])?;

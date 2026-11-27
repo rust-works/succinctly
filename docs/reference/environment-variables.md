@@ -348,6 +348,7 @@ variables, so the set of variables that matter is ultimately whatever your queri
 Values are strings; nothing is coerced to a number or boolean, except by `env(VAR)` in `succinctly yq`.
 There `env(VAR)` decodes the value as YAML and answers its first document, as yq does: `12` is a number, `true` a boolean, `{b: fish}` a mapping, and an empty value is an error (#6771).
 `strenv(VAR)` is the text, and an unset variable is the empty string in yq (`succinctly jq`'s `strenv(VAR)` extension raises).
+In `succinctly yq`, `$ENV`, like bare `env` and `env.VAR`, needs `--jq-extensions`: yq has no `$ENV`, so without the flag it is an unbound variable and reads as nothing (#7616), and bare `env` is a parse error (#5444).
 
 ```bash
 API_KEY=secret succinctly jq -n 'env.API_KEY'      # "secret"
@@ -358,6 +359,7 @@ succinctly yq '.image = strenv(TAG)' deployment.yaml
 These are gated on the `std` feature rather than `cli`, so they are available to any program
 embedding the `succinctly::jq` library — meaning an embedder exposes its own process environment to
 whoever writes the queries. Under `no_std` they return an empty object, `null`, or an error.
+A program parsed with `ParserMode::Yq` gets `jq_extensions = false` unless it asks for them (`parse_with_mode_and_extensions`), so there `$ENV` is an unbound variable and bare `env` a parse error; `env(VAR)` and `strenv(VAR)` still read the environment.
 
 ## See Also
 

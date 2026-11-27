@@ -805,6 +805,11 @@ surface (#1512):
 The flag also reaches the text `eval(...)` runs (#7012): `eval("paths")` is a parse error by
 default and runs with the flag.
 
+jq's `$ENV` and `$ARGS` are not rejected, since yq lexes any `$name`, but yq has neither, so by
+default each is an unbound variable name and reads as nothing, as `$foo` does (`[$ENV] | length` is
+`0`, #7616).
+With the flag they are jq's environment object and `{named, positional}` object.
+
 The flag also enables jq's generic postfix `?` after an expression such as
 `length?` or `(.x)?` (#3378). Default yq accepts optional navigation on
 fields and brackets (`.x?`, `.[0]?`), as in real yq. `.?` is optional access
@@ -888,7 +893,7 @@ A file without a leading `---` line errors. `--front-matter` is incompatible wit
 
 **Real yq surface, not a succinctly invention** — same correction as [Cross-File Operations](#cross-file-operations) above; `yq --help` lists `-s, --split-exp` (the long-only spelling below is a separate, deliberate divergence, not the extension question).
 
-Splits output into one file per result instead of printing to stdout, named by evaluating `EXPR` against that result (`.` is the result; `$index` is its zero-based output index across the whole run; `--arg`/`--argjson` values and `$ARGS` are also available, same as the main filter).
+Splits output into one file per result instead of printing to stdout, named by evaluating `EXPR` against that result (`.` is the result; `$index` is its zero-based output index across the whole run; `--arg`/`--argjson` values are also available, and `$ARGS` under `--jq-extensions`, same as the main filter).
 
 ```bash
 # One file per array element, named by index
