@@ -276,6 +276,9 @@ struct Build {
     jumps: bool,
     /// Dropping dead fork points ([`Vm::drop_dead_forks`]).
     drops: bool,
+    /// Leaves that collect the generators they hold ([`compile::compile_built`]); without them
+    /// step 1's rule, under which the machine runs every `.[]` and `range` itself.
+    leaves: bool,
 }
 
 impl Build {
@@ -283,6 +286,14 @@ impl Build {
         moves: true,
         jumps: true,
         drops: true,
+        leaves: true,
+    };
+
+    /// Step 1's leaves: the machine's own code for every `[...]`, `reduce`, `.[]` and `range`,
+    /// which the tests of moves and of instructions read.
+    const NARROW: Self = Self {
+        leaves: false,
+        ..Self::SHIPPED
     };
 }
 
@@ -291,7 +302,7 @@ fn machine_built(limits: Limits, filter: &str, build: Build) -> Result<Answer, S
     let program = program(filter);
     with_prelude(|prelude| {
         let it = Interp::new(prelude);
-        let code = compile::compile_built(&it, &program, build.moves, build.jumps)?;
+        let code = compile::compile_built(&it, &program, build.moves, build.jumps, build.leaves)?;
         let mut input = OwnedValue::Null;
         it.prepare(&program, &mut input);
         let mut outputs = Vec::new();
@@ -319,10 +330,16 @@ fn machine_built(limits: Limits, filter: &str, build: Build) -> Result<Answer, S
 /// The instructions `filter`'s own functions compile to, by name: the main program, its `def`s
 /// and closure arguments, not the prelude bodies it calls.
 fn own_instructions(filter: &str) -> BTreeSet<&'static str> {
+    own_instructions_built(filter, Build::SHIPPED)
+}
+
+/// [`own_instructions`] of the build `build` says.
+fn own_instructions_built(filter: &str, build: Build) -> BTreeSet<&'static str> {
     let program = program(filter);
     with_prelude(|prelude| {
         let it = Interp::new(prelude);
-        let code = compile::compile(&it, &program).unwrap_or_else(|e| panic!("{filter}: {e}"));
+        let code = compile::compile_built(&it, &program, build.moves, build.jumps, build.leaves)
+            .unwrap_or_else(|e| panic!("{filter}: {e}"));
         let mut entries: Vec<usize> = code.funcs.iter().map(|f| f.entry).collect();
         entries.sort_unstable();
         let mut own = BTreeSet::new();
@@ -359,6 +376,11 @@ fn every_instruction_runs_as_jq_7977() {
     EXECUTED.with(|seen| seen.borrow_mut().clear());
     for (filter, want) in INSTRUCTION_ROWS {
         assert_eq!(machine(filter), ok(want), "{filter}");
+        assert_eq!(
+            machine_built(SHIPPED, filter, Build::NARROW),
+            Ok(ok(want)),
+            "{filter}"
+        );
     }
     // `INSTRUCTIONS` is every name `compile::insn_name` can return, read from its own source:
     // a variant named there and missing here fails, as one missing from both cannot compile.
@@ -417,7 +439,12 @@ fn last_reads_move_only_where_no_fork_point_can_read_again_7977() {
     let mut moves = 0;
     for (filter, want) in LAST_USE_ROWS {
         assert_eq!(machine(filter), ok(want), "{filter}");
-        let insns = own_instructions(filter);
+        assert_eq!(
+            machine_built(SHIPPED, filter, Build::NARROW),
+            Ok(ok(want)),
+            "{filter}"
+        );
+        let insns = own_instructions_built(filter, Build::NARROW);
         if insns.contains("LoadLast") || insns.contains("Kill") {
             moves += 1;
         }
@@ -992,11 +1019,16 @@ proptest! {
     /// `LoadLast` and `Kill` as with plain `Load`s, which never move.
     #[test]
     fn the_last_use_moves_change_no_answer_7977(filter in moving_program()) {
-        let moved = machine_compiled(SHIPPED, &filter, true);
-        let copied = machine_compiled(SHIPPED, &filter, false);
+        // Over step 1's leaves, where the machine's own code holds the moves.
+        let moved = machine_built(SHIPPED, &filter, Build::NARROW);
+        let copied = machine_built(SHIPPED, &filter, Build { moves: false, ..Build::NARROW });
         prop_assert_eq!(moved.is_ok(), copied.is_ok(), "{}", filter);
-        if let (Ok(moved), Ok(copied)) = (moved, copied) {
-            prop_assert_eq!(moved, copied, "{}", filter);
+        if let (Ok(moved), Ok(copied)) = (&moved, copied) {
+            prop_assert_eq!(moved, &copied, "{}", filter);
+        }
+        // And the shipped build, whose leaves take some of them, answers the same.
+        if let (Ok(moved), Ok(leafed)) = (moved, machine_built(SHIPPED, &filter, Build::SHIPPED)) {
+            prop_assert_eq!(moved, leafed, "{}", filter);
         }
     }
 }
@@ -1016,7 +1048,7 @@ fn the_move_programs_reach_loadlast_and_kill_7977() {
         if declines(&filter) {
             continue;
         }
-        let own = own_instructions(&filter);
+        let own = own_instructions_built(&filter, Build::NARROW);
         last += usize::from(own.contains("LoadLast"));
         kill += usize::from(own.contains("Kill"));
     }
@@ -1341,6 +1373,7 @@ fn a_growth_past_the_budget_or_the_allocator_is_refused_7977() {
 
 /// `range` keeps the shipped cap (#5292), `range/2` on the machine's own `RANGE` and `range/3` on
 /// the prelude's `while`, each with the shipped wording; a consumer that stops is not charged.
+/// Under step 1's leaves, so that a test's cap reaches every `range`.
 #[test]
 fn a_range_past_its_cap_is_refused_as_the_shipped_range_is_7977() {
     let limits = Limits {
@@ -1348,23 +1381,17 @@ fn a_range_past_its_cap_is_refused_as_the_shipped_range_is_7977() {
         ..small(BUDGET, 1 << 24, 1 << 20)
     };
     let error = "range: maximum iterations exceeded";
-    assert_eq!(machine_within(limits, "[range(50)] | length"), ok(&["50"]));
-    assert_eq!(machine_within(limits, "[range(51)]"), refused(0, error));
-    assert_eq!(
-        machine_within(limits, "[range(0; 40; 1)] | length"),
-        ok(&["40"])
-    );
-    assert_eq!(
-        machine_within(limits, "[range(0; 100; 1)]"),
-        refused(0, error)
-    );
-    assert_eq!(
-        machine_within(limits, "[limit(3; range(1e9))]"),
-        ok(&["[0,1,2]"])
-    );
+    // The machine's own `RANGE` (a `[range(n)]` is a leaf, whose `range` is `Interp::eval`'s,
+    // which keeps the same cap of its own).
+    let narrow = |limits, filter| machine_built(limits, filter, Build::NARROW).expect(filter);
+    assert_eq!(narrow(limits, "[range(50)] | length"), ok(&["50"]));
+    assert_eq!(narrow(limits, "[range(51)]"), refused(0, error));
+    assert_eq!(narrow(limits, "[range(0; 40; 1)] | length"), ok(&["40"]));
+    assert_eq!(narrow(limits, "[range(0; 100; 1)]"), refused(0, error));
+    assert_eq!(narrow(limits, "[limit(3; range(1e9))]"), ok(&["[0,1,2]"]));
     // `range/3`'s `while` is its own: a program's own `while` keeps `while`'s cap and wording.
     assert_eq!(
-        machine_within(limits, "[0 | while(. < 100; . + 1)] | length"),
+        narrow(limits, "[0 | while(. < 100; . + 1)] | length"),
         ok(&["100"])
     );
 }
@@ -1994,5 +2021,164 @@ proptest! {
         ] {
             prop_assert_eq!(&machine_built(limits, &filter, build), &plain, "{} {:?}", filter, build);
         }
+    }
+}
+
+/// #7977 step 3: a call-free `[...]` or `reduce` is one leaf with the `.[]` and `range` it holds,
+/// and so is a call-free node that holds them only under one (an object constructor, a string
+/// interpolation), which the machine declined before: their every output is taken, so the leaf
+/// does the work jq does. A generator a consumer can stop stays the machine's: under `first`,
+/// `limit` or a label, or with no collector around it. So does one that runs a call or an
+/// effect, a `range/2` (`Interp::eval` would start it at its bound as written, which negates to
+/// `0`, not jq's `-0`), and a pattern `Interp::eval` binds otherwise than jq. Every answer is jq
+/// 1.7.1's, with and without the wide leaves.
+#[test]
+fn a_collected_generator_is_one_leaf_and_a_stoppable_one_is_not_7977() {
+    const R: &str = "def r: if false then r else . end; ";
+    let leafed: &[(&str, &[&str])] = &[
+        ("[range(5)]", &["[0,1,2,3,4]"]),
+        ("[1,2,3] | [.[] | . * 2]", &["[2,4,6]"]),
+        ("{a: [1, 2]} | {b: [.a[] | . + 1]}", &[r#"{"b":[2,3]}"#]),
+        ("[1,2,3] | reduce .[] as $x (0; . + $x)", &["6"]),
+        ("reduce range(5) as $i ([]; . + [$i])", &["[0,1,2,3,4]"]),
+        ("[[1,2],[3]] | [.[] | [.[] | . * 10]]", &["[[10,20],[30]]"]),
+        (r#"{"a":1,"b":2} | [.[]?] | length"#, &["2"]),
+        (r#""\([range(3)])""#, &[r#""[0,1,2]""#]),
+        (
+            "[[1], 2] | try [.[] | .[]] catch .",
+            &[r#""Cannot iterate over number (2)""#],
+        ),
+        ("[range(3) | -.]", &["[-0,-1,-2]"]),
+    ];
+    for (filter, want) in leafed {
+        let filter = format!("{R}{filter}");
+        assert_eq!(machine(&filter), ok(want), "{filter}");
+        let own = own_instructions(&filter);
+        assert!(
+            own.contains("Leaf") && !own.contains("Each") && !own.contains("Range"),
+            "{filter}: {own:?}"
+        );
+    }
+    let native: &[(&str, &[&str])] = &[
+        ("[1,2,3] | first(.[])", &["1"]),
+        ("[1,2,3] | [limit(2; .[])]", &["[1,2]"]),
+        ("[1,2,3] | [label $x | .[] | ., break $x]", &["[1]"]),
+        ("[1,2,3] | [.[] | r]", &["[1,2,3]"]),
+        // `select` is the prelude's: a call.
+        ("[3,1,2] | [.[] | select(. > 1)]", &["[3,2]"]),
+        ("[range(0; 3) | -.]", &["[-0,-1,-2]"]),
+        ("[1,2] | [.[] | debug]", &["[1,2]"]),
+        ("[[1,2],[3,4]] | reduce .[] as [$a, $a] (0; . + $a)", &["6"]),
+        ("[1,2,3] | .[] | . + 1", &["2", "3", "4"]),
+    ];
+    for (filter, want) in native {
+        let filter = format!("{R}{filter}");
+        assert_eq!(machine(&filter), ok(want), "{filter}");
+        let own = own_instructions(&filter);
+        assert!(
+            own.contains("Each") || own.contains("Range"),
+            "{filter}: {own:?}"
+        );
+    }
+    // An error inside a leaf ends it where jq's run ends, after nothing is output.
+    assert_eq!(
+        machine(&format!(
+            r#"{R}[range(3) | if . == 1 then error("e") else . end]"#
+        )),
+        Answer {
+            outputs: Vec::new(),
+            error: Some(String::from("e")),
+        }
+    );
+    // Step 1's leaves declined the constructor and the interpolation.
+    for (filter, _) in [&leafed[2], &leafed[7]] {
+        assert!(machine_built(SHIPPED, &format!("{R}{filter}"), Build::NARROW).is_err());
+    }
+}
+
+/// A leaf reads its free variables from the slots where they are (#7977 step 3), at any level
+/// out, under a name the leaf binds again itself, and from a definition's `$` parameter. Every
+/// answer is jq 1.7.1's.
+#[test]
+fn a_leaf_reads_its_variables_from_the_slots_7977() {
+    const R: &str = "def r: if false then r else . end; ";
+    for (filter, want) in [
+        ("2 as $n | [range($n) | . + $n]", "[2,3]"),
+        ("1 as $x | [range(2) | (10 as $x | $x), $x]", "[10,1,10,1]"),
+        (
+            "5 as $k | def g($m): [range($m) | . * $k]; g(3)",
+            "[0,5,10]",
+        ),
+        ("[1,2] as $a | [$a[] | . + ($a | length)]", "[3,4]"),
+        (
+            "def f($n): if $n == 0 then [range(3) | . + $n] else f($n - 1) end; f(2)",
+            "[0,1,2]",
+        ),
+        (
+            "3 as $a | 4 as $b | {s: [$a, $b], t: [range($a) | $b]}",
+            r#"{"s":[3,4],"t":[4,4,4]}"#,
+        ),
+    ] {
+        let filter = format!("{R}{filter}");
+        assert_eq!(machine(&filter), ok(&[want]), "{filter}");
+        // Step 1's leaves answer the same, where they take the program (not the constructor).
+        if let Ok(narrow) = machine_built(SHIPPED, &filter, Build::NARROW) {
+            assert_eq!(narrow, ok(&[want]), "{filter}");
+        }
+    }
+}
+
+/// Recursive programs whose bodies hold `[...]`, `reduce`, `length`, `.[]`, `range`, `first`,
+/// `limit`, a label, `//`, `try` and an effect, in and around what can be a leaf.
+fn leaf_program() -> impl Strategy<Value = String> {
+    let gen = prop_oneof![
+        Just(".[]"),
+        Just(".[]?"),
+        Just("range(3)"),
+        Just("range(.[0]? // 2)"),
+        Just("(.[] | . * 2)"),
+        Just("(1, 2)"),
+        Just("empty"),
+    ];
+    let wrap = prop_oneof![
+        Just("[G]"),
+        Just("([G] | length)"),
+        Just("reduce G as $x (0; . + $x)"),
+        Just("first(G)"),
+        Just("[limit(2; G)]"),
+        Just("(label $l | G | ., break $l)"),
+        Just("(G // 7)"),
+        Just("try (G | if . == 2 then error(\"e\") else . end) catch 9"),
+        Just("[G | select(. > 0)]"),
+        Just("{a: [G]}"),
+        Just("[G | debug]"),
+        Just("(G)"),
+        Just("[G | f($n - 1)]"),
+    ];
+    (
+        gen,
+        wrap,
+        prop_oneof![Just("[1,2,3]"), Just("[4]"), Just("[]"), Just("5")],
+    )
+        .prop_map(|(g, w, input)| {
+            let body = w.replace('G', g);
+            format!("def f($n): if $n <= 0 then . else [{input} | {body}] end; [{input} | f(2)]")
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// The wide leaves change no answer (#7977 step 3): every program answers the same as with
+    /// step 1's leaves, which run every `.[]` and `range` on the machine.
+    #[test]
+    fn the_wide_leaves_change_no_answer_7977(filter in leaf_program()) {
+        let narrow = machine_built(SHIPPED, &filter, Build::NARROW);
+        let wide = machine_built(SHIPPED, &filter, Build::SHIPPED);
+        if let (Ok(narrow), Ok(wide)) = (&narrow, &wide) {
+            prop_assert_eq!(narrow, wide, "{}", filter);
+        }
+        // The wide rule declines nothing step 1's took.
+        prop_assert!(narrow.is_err() || wide.is_ok(), "{}", filter);
     }
 }

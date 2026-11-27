@@ -339,25 +339,30 @@ struct Compiler<'c, 'e> {
     self_calls: Vec<usize>,
     /// Whether those become [`Insn::TailJump`]s; off only in a test.
     jumps: bool,
+    /// Whether a leaf may hold the generators it collects ([`blocked_in_leaf`]); off only in a
+    /// test.
+    wide: bool,
 }
 
 /// Compile `program`, or say why the machine declines it.
 pub(super) fn compile<'e>(it: &Interp<'e>, program: &'e Expr) -> Result<Code, String> {
     super::note(super::super::CallMachineEvent::Compiled);
-    compile_moving(it, program, true, true)
+    compile_moving(it, program, true, true, true)
 }
 
-/// [`compile`] with or without last-use moves (`moves: false`: every read a `Load`, no `Kill`) and
-/// tail jumps (`jumps: false`: every self tail call a `Tail::Pop` call), for the differential tests
-/// that they change no answer and no bound.
+/// [`compile`] with or without last-use moves (`moves: false`: every read a `Load`, no `Kill`),
+/// tail jumps (`jumps: false`: every self tail call a `Tail::Pop` call) and collecting leaves
+/// (`leaves: false`: step 1's leaf rule, every `.[]` and `range` run by the machine), for the
+/// differential tests that they change no answer and no bound.
 #[cfg(test)]
 pub(super) fn compile_built<'e>(
     it: &Interp<'e>,
     program: &'e Expr,
     moves: bool,
     jumps: bool,
+    leaves: bool,
 ) -> Result<Code, String> {
-    compile_moving(it, program, moves, jumps)
+    compile_moving(it, program, moves, jumps, leaves)
 }
 
 fn compile_moving<'e>(
@@ -365,6 +370,7 @@ fn compile_moving<'e>(
     program: &'e Expr,
     moves: bool,
     jumps: bool,
+    leaves: bool,
 ) -> Result<Code, String> {
     if any_subexpr(program, &mut declined_anywhere) {
         return Err(String::from(
@@ -393,6 +399,7 @@ fn compile_moving<'e>(
         moves,
         self_calls: Vec::new(),
         jumps,
+        wide: leaves,
     };
     let main = c.new_func("", 0, 0, Vec::new());
     c.pending.push((main, Body::Main(program), Vec::new()));
@@ -452,8 +459,8 @@ fn not_yet_the_machines(e: &Expr) -> bool {
     }
 }
 
-/// What a leaf may not hold: a call (jq-defined builtins included), `.[]`, `range`, or the
-/// control the machine runs itself.
+/// What a leaf may not hold: a call (jq-defined builtins included), the control the machine runs
+/// itself, or (unless collected, [`blocked_in_leaf`]) `.[]` and `range`.
 fn blocks_leaf(e: &Expr) -> bool {
     match e {
         Expr::FuncCall { .. }
@@ -480,8 +487,14 @@ fn blocks_leaf(e: &Expr) -> bool {
 /// used, so it may not hold a side effect ([`is_effect`]) unless it is that builtin alone, with
 /// none in its arguments: in a leaf that can answer more than once, the effect of a later output
 /// would fire before the consumer had seen the earlier one, and past a consumer that stops.
-fn is_leaf(e: &Expr) -> bool {
-    if any_subexpr(e, &mut blocks_leaf) {
+///
+/// For the same reason a leaf holds a generator that can run long (`.[]`, `range`) only where
+/// no consumer can stop it within the leaf's own outputs ([`blocked_in_leaf`], #7977 step 3):
+/// under a `[...]`, or in a `reduce`'s source or update, inside the leaf. There every output is
+/// taken, so running the subtree to its end on `Interp::eval` is the work jq does, where
+/// buffering the outputs of `first(range(1e9))` would not be.
+fn is_leaf(e: &Expr, wide: bool) -> bool {
+    if blocked_in_leaf(e, false, wide) {
         return false;
     }
     let mut effects = 0;
@@ -490,6 +503,95 @@ fn is_leaf(e: &Expr) -> bool {
         false
     });
     effects == 0 || (effects == 1 && is_effect(e))
+}
+
+/// Whether `e` holds what a leaf may not ([`blocks_leaf`]). A `.[]` or `range(n)` counts only when
+/// it is not `collected`: when a consumer outside `e`, or one inside it that can stop early,
+/// could take fewer than all of its outputs. Inside `e`, a `[...]` collects its operand, and a
+/// `reduce` its source and update (it takes every output of each, keeping the update's last);
+/// a `reduce`'s init is not collected by it, as each of its outputs starts a fold that is one of
+/// the `reduce`'s outputs. `first`, `limit` and a label, which can stop what they run, are
+/// blocked outright.
+///
+/// `wide: false` is step 1's rule, in which `.[]` and `range` always count; a test compares the
+/// two.
+fn blocked_in_leaf(e: &Expr, collected: bool, wide: bool) -> bool {
+    search_subexpr(e, &mut |n| match n {
+        Expr::Iterate => {
+            if collected {
+                Visit::Descend
+            } else {
+                Visit::Found
+            }
+        }
+        // `range/1` alone: `Interp::eval` starts it at the spelling-less `0` jq's `range(0; $x)`
+        // has, as the machine's `RANGE` does. A `range/2` it starts at its first bound as
+        // written, so `[range(0; 2) | -.]` would be `[0,-1]` in a leaf, where jq and the machine
+        // answer `[-0,-1]`; `range/3` is the prelude's.
+        Expr::Range {
+            from,
+            to: Some(_),
+            step: None,
+        } if collected && matches!(**from, Expr::Literal(Literal::Int(0))) => Visit::Descend,
+        Expr::Array(inner) if wide => found(blocked_in_leaf(inner, true, wide)),
+        Expr::Reduce {
+            input: source,
+            patterns,
+            init,
+            update,
+        } if wide => found(
+            patterns.iter().any(differs_in_interp)
+                || blocked_in_leaf(source, true, wide)
+                || blocked_in_leaf(update, true, wide)
+                || blocked_in_leaf(init, collected, wide)
+                || patterns.iter().any(|p| {
+                    super::super::super::walk::any_pattern_key(p, &mut |k| {
+                        blocked_in_leaf(k, collected, wide)
+                    })
+                }),
+        ),
+        Expr::AsPattern { patterns, .. } | Expr::Foreach { patterns, .. }
+            if wide && patterns.iter().any(differs_in_interp) =>
+        {
+            Visit::Found
+        }
+        n if blocks_leaf(n) => Visit::Found,
+        _ => Visit::Descend,
+    })
+}
+
+/// A destructuring pattern `Interp::eval` binds otherwise than jq 1.7.1, which the machine's own
+/// matcher follows: one that binds a name twice (jq keeps the first store that runs, the last
+/// element of an array pattern; `Interp` the last, so `[1,2] as [$a, $a] | $a` is `1` there and
+/// `2` in jq) or computes a key (`Interp` evaluates `{a: $x, ($x): $y}`'s key with the pattern's
+/// own `$x` in scope, which jq does not). A leaf holding one would answer as `Interp` does.
+fn differs_in_interp(p: &Pattern) -> bool {
+    fn stores<'p>(p: &'p Pattern, out: &mut Vec<&'p str>) {
+        match p {
+            Pattern::Var(name) => out.push(name),
+            Pattern::Array(elems) => elems.iter().for_each(|e| stores(e, out)),
+            Pattern::Object(entries) => {
+                for entry in entries {
+                    out.extend(entry.bind.as_deref());
+                    stores(&entry.pattern, out);
+                }
+            }
+        }
+    }
+    let mut names = Vec::new();
+    stores(p, &mut names);
+    let mut seen = BTreeSet::new();
+    names.iter().any(|n| !seen.insert(*n))
+        || super::super::super::walk::any_pattern_key(p, &mut |_| true)
+}
+
+/// A search's answer for a node whose children were searched apart.
+fn found(blocked: bool) -> Visit {
+    if blocked {
+        Visit::Found
+    } else {
+        Visit::Skip
+    }
 }
 
 /// A C builtin that touches the outside world at the moment it runs: `debug` and `stderr`
@@ -843,7 +945,7 @@ impl<'e> Compiler<'_, 'e> {
 
     /// `e` as a [`Insn::Leaf`], its free variables resolved to slots.
     fn leaf(&mut self, e: &'e Expr) -> C {
-        if !is_leaf(e) {
+        if !is_leaf(e, self.wide) {
             return Err(format!(
                 "a call, a generator the machine runs, or a side effect inside {}",
                 variant_name(e)
@@ -1025,7 +1127,7 @@ impl<'e> Compiler<'_, 'e> {
             Expr::Not => {
                 self.emit(Insn::Not);
             }
-            Expr::Negate(inner) if !is_leaf(e) => {
+            Expr::Negate(inner) if !is_leaf(e, self.wide) => {
                 self.expr(inner)?;
                 self.emit(Insn::Negate);
             }
@@ -1065,11 +1167,18 @@ impl<'e> Compiler<'_, 'e> {
                 Expr::Iterate => {
                     self.emit(Insn::Each(true));
                 }
-                _ if is_leaf(e) => self.leaf(e)?,
+                _ if is_leaf(e, self.wide) => self.leaf(e)?,
                 _ => self.try_(inner, None)?,
             },
             Expr::Error(None) => {
                 self.emit(Insn::Raise);
+            }
+            // A call-free `[...]` or `reduce` takes every output of the generators it runs, so it
+            // is one leaf, `.[]` and `range` included (#7977 step 3): `Interp::eval` builds
+            // `[range(1e6)]` in one pass, where the machine's own code takes a fork point and a
+            // backtrack per element.
+            Expr::Array(_) | Expr::Reduce { .. } if self.wide && is_leaf(e, true) => {
+                self.leaf(e)?
             }
             Expr::Error(Some(msg)) => {
                 self.expr(msg)?;
