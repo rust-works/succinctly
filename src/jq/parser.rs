@@ -2314,9 +2314,10 @@ struct Parser<'a> {
     /// (#2734, closing the position-misattribution gap #2085 already fixed
     /// for calls): every `Expr::Var`-producing `$name` occurrence this
     /// parse has built, with the byte offset of its `$` sigil. `$__loc__`/
-    /// `$ENV` are never recorded — they lower to `Expr::Loc`/`Expr::Env`,
+    /// `$ENV` are never recorded in jq mode — they lower to `Expr::Loc`/`Expr::Env`,
     /// never `Expr::Var`, so they can never be the subject of an unbound-
-    /// variable diagnostic in the first place.
+    /// variable diagnostic in the first place. (Plain yq mode reads `$ENV` as
+    /// an ordinary name, #7616, and records it like any other.)
     var_sites: Vec<VarSite>,
     /// jq's `check_object_key` errors (#5510), by position: jq's parser records one and keeps
     /// going, so they are reported together at the end (see [`Self::finish`]). Keyed by the
