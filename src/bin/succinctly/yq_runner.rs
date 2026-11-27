@@ -7845,6 +7845,10 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
     // own (`input`, `debug`, `halt`) is not run twice: the target runs as written.
     let explicit_tags = cursor.index().has_explicit_tags();
     let mut effectful = false;
+    // A condition that reads node metadata is resolved on the cursor only when the cursor answers
+    // all of it as yq does ([`jq::yq_condition_is_cursor_exact`]); `eval(..)` runs its program
+    // detached from the document, so `eval("style")` answers `""` there. Such a target refuses.
+    let mut inexact = false;
     let filters = navigation.iter().any(|stage| {
         if answers_without_selecting(stage, &is_reader) {
             return false;
@@ -7862,7 +7866,26 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
                                 | Builtin::System(..)
                         )
                     });
-                !jq::yq_condition_is_value_only(cond)
+                let beyond = !jq::yq_condition_is_value_only(cond);
+                inexact |= beyond
+                    && (!jq::yq_condition_is_cursor_exact(cond)
+                        && (jq::walk::uses_cursor_metadata_builtins(cond)
+                            || jq::walk::contains_builtin(cond, |b| {
+                                matches!(
+                                    b,
+                                    Builtin::Tag
+                                        | Builtin::Type
+                                        | Builtin::Kind
+                                        | Builtin::Key
+                                        | Builtin::PathNoArg
+                                        | Builtin::FileIndex
+                                        | Builtin::Filename
+                                )
+                            }))
+                        || jq::walk::contains_builtin(cond, |b| {
+                            matches!(b, Builtin::EvalExpr(..) | Builtin::Load(..))
+                        }));
+                beyond
             }
             _ => false,
         });
@@ -7884,7 +7907,7 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
     let navigation_expr = Expr::pipe(navigation.iter().map(|stage| (*stage).clone()).collect());
     // The cursor's `..` stops at an alias as yq's does (`[.e | .. | path]` is `[["e"]]` in both), so
     // a descent below an alias resolves here; only the owned walk goes on through it.
-    if !navigates_and_filters_only(&navigation_expr) {
+    if inexact || !navigates_and_filters_only(&navigation_expr) {
         return Some(Expr::Error(Some(Box::new(Expr::Literal(Literal::String(
             "Invalid path expression: a target that selects by node metadata must only navigate \
              and filter here"

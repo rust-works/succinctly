@@ -322,6 +322,10 @@ const REVIEW_ROWS: &[(&str, &str, &str)] = &[
 const REFUSED_ROWS: &[(&str, &str)] = &[
     (STYLED, "del(.[] | select(style == \"\") | tostring)"),
     (ALIASED, "del(.e | .. | tostring)"),
+    // `eval(..)` runs its program detached from the document, so even the cursor answers
+    // `eval("style")` with `""`: yq keeps `a: "x"` in both.
+    (STYLED, "del(.[] | select(eval(\"style\") == \"\") | line)"),
+    (STYLED, "del(.[] | select(eval(\"style\") == \"\"))"),
     (
         CONTAINERS,
         "(.b | select(kind == \"map\") | {\"a\": 1} | .a) = 9",
@@ -363,8 +367,8 @@ const TAGGED: &str = "a: !Foo x\nb: y\nc: 1\n";
 const INNER: &str = "x: {a: \"q\", b: 2}\n";
 
 /// Selections the owned value cannot run exactly though they name no metadata reader: `type` (yq's
-/// tag), `eval(..)`, a `..` below an alias and yq's `first(f)`, all resolved on the cursor (#8020
-/// second review). (document, filter, yq's stdout.)
+/// tag), a `..` below an alias and yq's `first(f)`, all resolved on the cursor (#8020 second
+/// review). (document, filter, yq's stdout.)
 const ALLOWLIST_ROWS: &[(&str, &str, &str)] = &[
     (
         TAGGED,
@@ -385,16 +389,6 @@ const ALLOWLIST_ROWS: &[(&str, &str, &str)] = &[
         TAGGED,
         "(.[] | select(type == \"!!str\")) = 9",
         "a: !Foo x\nb: 9\nc: 1\n",
-    ),
-    (
-        STYLED,
-        "del(.[] | select(eval(\"style\") == \"\") | line)",
-        "a: \"x\"\n",
-    ),
-    (
-        STYLED,
-        "del(.[] | select(eval(\"style\") == \"\"))",
-        "a: \"x\"\n",
     ),
     (
         ALIASED,
@@ -602,8 +596,8 @@ fn inplace_review_rows_keep_the_file_8020() -> Result<()> {
         (
             STYLED,
             "del(.[] | select(eval(\"style\") == \"\") | line)",
-            "a: \"x\"\n",
-            0,
+            STYLED,
+            1,
         ),
         (
             STYLED,

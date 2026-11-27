@@ -83795,7 +83795,26 @@ fn yq_owned_navigation_is_exact(stage: &Expr) -> bool {
 /// `eval`, a call of a `def`, a variable and any builtin not listed answers `false`.
 #[doc(hidden)]
 pub fn yq_condition_is_value_only(cond: &Expr) -> bool {
+    yq_condition_within(cond, &|_| false)
+}
+
+/// [`yq_condition_is_value_only`], with the node readers yq's document answers (`style`, the
+/// comment readers, `anchor`, `alias`, `tag`, `type`, `kind`, `line`, `column`, `path`, `key`,
+/// `document_index`, `file_index`, `filename`) allowed too: a condition the document's cursor
+/// answers exactly as yq does, so the paths it selects there are yq's (#8020). `eval(..)` is not
+/// one: it evaluates its program on a value detached from the document.
+#[doc(hidden)]
+pub fn yq_condition_is_cursor_exact(cond: &Expr) -> bool {
+    yq_condition_within(cond, &|b| {
+        is_yq_metadata_reader_builtin(b) || matches!(b, Builtin::Type | Builtin::Key)
+    })
+}
+
+/// The allowlist behind [`yq_condition_is_value_only`] and [`yq_condition_is_cursor_exact`]:
+/// `reader` admits the builtins beyond the values-only ones.
+fn yq_condition_within(cond: &Expr, reader: &dyn Fn(&Builtin) -> bool) -> bool {
     use Builtin as B;
+    let within = |e: &Expr| yq_condition_within(e, reader);
     match cond {
         Expr::Identity
         | Expr::Field(_)
@@ -83805,16 +83824,14 @@ pub fn yq_condition_is_value_only(cond: &Expr) -> bool {
         | Expr::Iterate
         | Expr::Literal(_)
         | Expr::Not => true,
-        Expr::Optional(inner) | Expr::Paren(inner) | Expr::Negate(inner) => {
-            yq_condition_is_value_only(inner)
-        }
-        Expr::Pipe(stages) => stages.iter().all(yq_condition_is_value_only),
-        Expr::Comma(items) => items.iter().all(yq_condition_is_value_only),
+        Expr::Optional(inner) | Expr::Paren(inner) | Expr::Negate(inner) => within(inner),
+        Expr::Pipe(stages) => stages.iter().all(within),
+        Expr::Comma(items) => items.iter().all(within),
         Expr::Compare { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
-            yq_condition_is_value_only(left) && yq_condition_is_value_only(right)
+            within(left) && within(right)
         }
         Expr::And(left, right) | Expr::Or(left, right) | Expr::Alternative(left, right) => {
-            yq_condition_is_value_only(left) && yq_condition_is_value_only(right)
+            within(left) && within(right)
         }
         Expr::Builtin(builtin) => match builtin {
             B::Length
@@ -83831,11 +83848,9 @@ pub fn yq_condition_is_value_only(cond: &Expr) -> bool {
             | B::Contains(arg)
             | B::Startswith(arg)
             | B::Endswith(arg)
-            | B::Test(arg) => yq_condition_is_value_only(arg),
-            B::TestFlags(re, flags) => {
-                yq_condition_is_value_only(re) && yq_condition_is_value_only(flags)
-            }
-            _ => false,
+            | B::Test(arg) => within(arg),
+            B::TestFlags(re, flags) => within(re) && within(flags),
+            other => reader(other),
         },
         _ => false,
     }
