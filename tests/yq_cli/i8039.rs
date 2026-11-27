@@ -261,7 +261,7 @@ fn the_other_routes_read_the_same_position_8039() -> Result<()> {
 }
 
 /// `with` is not a jq builtin: `succinctly jq` refuses it as jq 1.7.1 does, and a nested `. |= f`
-/// is unchanged there.
+/// is unchanged there, `parent` included.
 #[test]
 fn jq_mode_is_unchanged_8039() -> Result<()> {
     let (stdout, stderr, code) = run_jq_stdin_with_stderr("with(.b; . |= 7)", FLAT, &["-c"])?;
@@ -274,5 +274,14 @@ fn jq_mode_is_unchanged_8039() -> Result<()> {
     let (stdout, code) = run_jq_stdin(".b |= (. |= 7)", FLAT, &["-c"])?;
     assert_eq!(code, 0);
     assert_eq!(stdout, "{\"a\":1,\"b\":7}\n");
+    // `parent` is a succinctly extension in jq mode, and a nested update at its own input still
+    // climbs nothing there: the yq-mode ancestry is not installed.
+    let (stdout, code) = run_jq_stdin(
+        ".a.b |= (. |= (parent | keys))",
+        "{\"a\":{\"b\":1,\"c\":2}}",
+        &["-c"],
+    )?;
+    assert_eq!(code, 0);
+    assert_eq!(stdout, "{\"a\":{\"b\":null,\"c\":2}}\n");
     Ok(())
 }
