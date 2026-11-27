@@ -45,22 +45,76 @@ use super::*;
 
 mod compile;
 
-use compile::{ArgSpec, Callee, Code, Insn, NO_LEVEL};
+use compile::{ArgSpec, Callee, Code, Insn, Tail, NO_LEVEL};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// The byte budget of the control state: the stacks' blocks, slots and fork points. Past it a
-/// call or a fork point refuses with the shipped evaluators' recursion wording ([`refusal`]).
-/// jq itself has no such bound: it runs until memory runs out (a divergence #7977 step 2 records).
+/// The byte budget of the control state ([`Vm::bytes`]): the capacity of the data, frame, slot
+/// and fork stacks. Past it a call, a fork point or a growth refuses with the shipped
+/// evaluators' recursion wording ([`refusal`]), and so does a failed allocation of any of them.
+/// jq itself has no such bound: it runs until memory runs out, an ADR-0018 rule 4(c) divergence
+/// recorded in `docs/compliance/jq/limitations.md`. It bounds the machine's own state, not
+/// memory: what the values hold is not counted, nor are `[...]` accumulators and buffered leaf
+/// outputs, which hold values the program builds (they grow fallibly, so a failed allocation is
+/// a refusal too).
 const BUDGET: usize = 1 << 30;
 
-/// No return address: the main program's frame, whose `RET` is an output.
-const NO_RET: usize = usize::MAX;
+/// A frame's `rounds` in a `repeat` loop a consumer can stop (`limit`, `first`), which the
+/// shipped evaluators do not bound ([`Vm::repeat_is_eager`]): its rounds are not counted, and
+/// `emitted` holds [`QUIET`] and its rounds in a row that output nothing.
+const UNCOUNTED: u32 = u32::MAX;
 
-/// One block of a [`Stack`]: a value and the index of the block below it (`-1`: none).
+/// The `emitted` of an uncounted `repeat`: above every output bound, so each of its outputs
+/// takes [`Vm::charge_output`]'s path, which marks the round [`HEARD`].
+const QUIET: u32 = 1 << 31;
+
+/// An uncounted `repeat`'s round that has output something.
+const HEARD: u32 = 1 << 30;
+
+/// A [`Counts::owner`] for a loop entered by a tail call: the frame's own, and its outputs
+/// counted although it is not yet a round.
+const COUNTED: i32 = -2;
+
+// A frame counts its loop's rounds and outputs in `u32`s, below `UNCOUNTED` and `HEARD`.
+const _: () = assert!(MAX_LOOP_ROUNDS < u32::MAX as usize - BOUND_ROUND_WEIGHT);
+const _: () = assert!(MAX_LOOP_OUTPUTS < HEARD as usize);
+const _: () = assert!(MAX_REPEAT_ROUNDS < MAX_LOOP_ROUNDS);
+const _: () = assert!(REPEAT_WIDTH_BUDGET < MAX_LOOP_OUTPUTS);
+
+/// The bounds one run keeps: [`SHIPPED`] for every run, smaller ones in the unit tests.
+#[derive(Clone, Copy)]
+struct Limits {
+    /// The byte budget ([`BUDGET`]).
+    bytes: usize,
+    /// The rounds a tail loop may run: the shipped `MAX_LOOP_ROUNDS` (#5379, #5292).
+    rounds: u32,
+    /// The outputs a zero-argument `def`'s tail loop may emit once it has run
+    /// `OUTPUT_BUDGET_AFTER_ROUNDS` rounds: the shipped `MAX_LOOP_OUTPUTS` (#5379).
+    outputs: u32,
+    /// The numbers one `range` may produce: the shipped `MAX_RANGE_TOTAL` (#5292).
+    range: usize,
+}
+
+/// The bounds of every run, the shipped evaluators' own.
+const SHIPPED: Limits = Limits {
+    bytes: BUDGET,
+    rounds: MAX_LOOP_ROUNDS as u32,
+    outputs: MAX_LOOP_OUTPUTS as u32,
+    range: MAX_RANGE_TOTAL,
+};
+
+/// No return address: the main program's frame, whose `RET` is an output.
+const NO_RET: u32 = u32::MAX;
+
+/// One block of a [`Stack`]: a value and the index of the block below it (`-1`: none). An index
+/// fits in an `i32`, as the budget bounds the stacks well below that.
 struct Block<T> {
     value: T,
-    next: isize,
+    next: i32,
 }
+
+// A frame block is as small as step 1's (#7977): 36 bytes of frame and a 4-byte link.
+const _: () = assert!(core::mem::size_of::<FrameRec>() == 36);
+const _: () = assert!(core::mem::size_of::<Block<FrameRec>>() == 40);
 
 /// gojq's `stack` (`stack.go`): a forest of blocks in one `Vec`, with a protection watermark.
 ///
@@ -91,7 +145,7 @@ impl<T> Stack<T> {
         let at = self.index.max(self.limit) + 1;
         let block = Block {
             value,
-            next: self.index,
+            next: self.index as i32,
         };
         let u = at as usize;
         if u < self.data.len() {
@@ -100,6 +154,11 @@ impl<T> Stack<T> {
             self.data.push(block);
         }
         self.index = at;
+    }
+
+    /// Whether [`Stack::push`] has room without growing the vector.
+    fn has_room(&self) -> bool {
+        ((self.index.max(self.limit) + 1) as usize) < self.data.capacity()
     }
 
     /// Whether the top block is above the watermark: no fork point reaches it.
@@ -131,7 +190,7 @@ impl Stack<OwnedValue> {
     fn pop(&mut self) -> OwnedValue {
         let i = self.index as usize;
         let free = self.top_free();
-        self.index = self.data[i].next;
+        self.index = self.data[i].next as isize;
         if free {
             let value = core::mem::replace(&mut self.data[i].value, OwnedValue::Null);
             self.data.truncate(i);
@@ -145,7 +204,7 @@ impl Stack<OwnedValue> {
     fn pop_n(&mut self) -> OwnedValue {
         let i = self.index as usize;
         let free = self.top_free();
-        self.index = self.data[i].next;
+        self.index = self.data[i].next as isize;
         let value = core::mem::replace(&mut self.data[i].value, OwnedValue::Null);
         if free {
             self.data.truncate(i);
@@ -159,12 +218,89 @@ impl Stack<OwnedValue> {
 struct FrameRec {
     /// The function it runs, an index into [`Code::funcs`].
     func: u32,
-    /// The frame this one closes over (its static link), or -1.
-    env: isize,
+    /// The counts of the loop it is in.
+    counts: Counts,
     /// Where its `RET` resumes ([`NO_RET`]: the main program's, whose `RET` is an output).
-    ret: usize,
+    ret: u32,
+    /// The frame its `RET` returns into, when it is not the one below it (`-1`): a callee that
+    /// closes over its caller's frame, called in tail position (`Tail::Keep`), returns past
+    /// the caller, whose frame it needed only while it ran.
+    exit: i32,
+    /// The frame this one closes over (its static link), or -1. A frame index fits in an `i32`
+    /// and a slot index in a `u32`, as the budget bounds both stacks well below that.
+    env: i32,
     /// Where its slots start.
-    base: usize,
+    base: u32,
+}
+
+/// A frame's loop counts ([`Vm::loop_counts`]). A tail call hands them on; a protected frame's
+/// counts are written in place, as they are the loop's, whichever path through it runs.
+#[derive(Clone, Copy)]
+struct Counts {
+    /// The rounds of the loop: the tail calls to its definitions since the ordinary call that
+    /// started it, charged against [`Limits::rounds`] ([`UNCOUNTED`] in a `repeat` a consumer
+    /// can stop).
+    rounds: u32,
+    /// The outputs (`RET`s) the loop has made so far, charged against [`Limits::outputs`]
+    /// ([`QUIET`] in an uncounted `repeat`).
+    emitted: u32,
+    /// The frame whose loop this frame's outputs are charged to, when it is not this one's own:
+    /// a helper or a closure the loop's round tail-called, while a fork point keeps the loop's
+    /// frame (`-1`: its own, counted once it is a round; [`COUNTED`]: its own, counted from the
+    /// call that entered the loop).
+    owner: i32,
+    /// The definition the loop started at, which a refusal is named for, as the shipped tail
+    /// loop names it (the low [`ENTRY_BITS`]), and the loop's rounds unweighted, saturating at
+    /// `OUTPUT_BUDGET_AFTER_ROUNDS` (the bits above): the shipped output bound starts after that
+    /// many tail rounds, however much each one costs.
+    entry: u32,
+}
+
+/// The bits of [`Counts::entry`] that name the definition; the compiler declines a program of
+/// more functions.
+pub(super) const ENTRY_BITS: u32 = 25;
+
+const ENTRY_MASK: u32 = (1 << ENTRY_BITS) - 1;
+
+// The unweighted round count fits above the function index.
+const _: () = assert!(OUTPUT_BUDGET_AFTER_ROUNDS < (1 << (32 - ENTRY_BITS)));
+
+impl Counts {
+    /// The counts of a loop that starts at `func`.
+    const fn fresh(func: u32) -> Self {
+        Self {
+            rounds: 0,
+            emitted: 0,
+            owner: -1,
+            entry: func,
+        }
+    }
+
+    /// The definition the loop started at.
+    fn entry(self) -> u32 {
+        self.entry & ENTRY_MASK
+    }
+
+    /// The loop's tail rounds, unweighted, up to `OUTPUT_BUDGET_AFTER_ROUNDS`.
+    fn taken(self) -> u32 {
+        self.entry >> ENTRY_BITS
+    }
+
+    /// The counts of the loop's next round, its weighted rounds now `rounds`.
+    #[inline(always)]
+    fn next_round(self, rounds: u32) -> Self {
+        let taken = self.taken();
+        let taken = if taken < OUTPUT_BUDGET_AFTER_ROUNDS as u32 {
+            taken + 1
+        } else {
+            taken
+        };
+        Self {
+            rounds,
+            entry: self.entry() | (taken << ENTRY_BITS),
+            ..self
+        }
+    }
 }
 
 /// A closure: code over a frame (jq's `struct closure`).
@@ -186,8 +322,12 @@ enum Handler {
     /// `try` without `catch`, and `?`: an error ends the body with no output.
     None,
     Code(usize),
-    /// A label's: stops this label's break, re-raises anything else.
-    Label(u64),
+    /// A label's: stops this label's break, re-raises anything else. `stops` marks a label of
+    /// the prelude's (`first`, `limit`, `nth`), the consumers that can stop a `repeat`.
+    Label {
+        id: u64,
+        stops: bool,
+    },
 }
 
 /// What a fork point resumes when backtracked into.
@@ -204,8 +344,13 @@ enum Kind {
         next: usize,
         resume: usize,
     },
-    /// `RANGE`: the next number.
-    Range { cur: f64, max: f64, resume: usize },
+    /// `RANGE`: the next number, and how many it has produced.
+    Range {
+        cur: f64,
+        max: f64,
+        made: usize,
+        resume: usize,
+    },
     /// A leaf's outputs past its first, then the error it ended with, if any.
     Values {
         vals: alloc::vec::IntoIter<OwnedValue>,
@@ -242,16 +387,53 @@ struct Vm<'c, 'e> {
     forks: Vec<Fork>,
     /// A call's arguments on their way into the callee's slots, kept between calls.
     scratch: Vec<Slot>,
+    limits: Limits,
+    /// The instructions run, for the tests that pin how work scales.
+    #[cfg(test)]
+    steps: u64,
 }
 
-/// The refusal past [`BUDGET`]: succinctly's own recursion-limit wording (ADR-0025), naming the
-/// definition (`f/1 exceeded maximum recursion depth`).
+/// Make room for one more element in `v` by doubling it, or say it cannot: when the bytes the
+/// control state holds while it grows (`used` now, plus the new block, the old one still held
+/// until it is copied) pass `budget`, or the allocation fails. Answers the bytes the vector grew
+/// by.
+#[cold]
+#[inline(never)]
+fn grow<T>(v: &mut Vec<T>, used: usize, budget: usize) -> Result<usize, ()> {
+    let cap = v.capacity();
+    let want = cap.saturating_mul(2).max(4);
+    let size = core::mem::size_of::<T>();
+    if used.saturating_add(want.saturating_mul(size)) > budget {
+        return Err(());
+    }
+    v.try_reserve_exact(want - v.len()).map_err(|_| ())?;
+    Ok((v.capacity() - cap) * size)
+}
+
+/// Make room for one more value in an accumulator, fallibly: values the program builds are not
+/// the budget's, but a failed allocation is still a refusal, not an abort.
+#[cold]
+#[inline(never)]
+fn reserve<T>(items: &mut Vec<T>) -> Result<(), ()> {
+    items.try_reserve(1).map_err(|_| ())
+}
+
+/// The refusal past [`BUDGET`] or [`Limits::rounds`]: succinctly's own recursion-limit wording
+/// (ADR-0025), naming the definition (`f/1 exceeded maximum recursion depth`).
 fn refusal(name: &str, arity: usize) -> Raise {
-    Raise::Fatal(EvalError::resource_limit(format!(
-        "{}/{} exceeded maximum recursion depth",
-        ModuleRun::display_name(name.strip_prefix("_sp_").unwrap_or(name)),
-        arity
-    )))
+    Raise::Fatal(named_depth_refusal(
+        name.strip_prefix("_sp_").unwrap_or(name),
+        arity,
+    ))
+}
+
+/// The refusal of a zero-argument `def`'s tail loop past [`Limits::outputs`]: the shipped tail
+/// loop's (`f/0: maximum outputs exceeded`, #5379).
+fn loop_outputs_refusal(name: &str) -> Raise {
+    Raise::Fatal(outputs_refusal(
+        name.strip_prefix("_sp_").unwrap_or(name),
+        0,
+    ))
 }
 
 /// `RANGE`'s first output, as the shipped evaluator's `range` emits it (#3103, #6064): over
@@ -324,52 +506,183 @@ pub(super) fn run<'e>(
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
 ) -> R {
     let code = compile::compile(it, program).map_err(unsupported)?;
-    run_code(it, &code, input, on_value)
+    run_code(SHIPPED, it, &code, input, on_value)
 }
 
-/// [`run`] of a compiled program.
+/// [`run`] of a compiled program, within `limits`.
 fn run_code(
+    limits: Limits,
     it: &Interp<'_>,
     code: &Code<'_>,
     input: OwnedValue,
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
 ) -> R {
-    let mut vm = Vm {
-        it,
-        code,
-        data: Stack::new(),
-        frames: Stack::new(),
-        slots: Vec::new(),
-        forks: Vec::new(),
-        scratch: Vec::new(),
-    };
-    vm.exec(input, on_value)
+    Vm::new(it, code, limits).exec(input, on_value)
 }
 
-impl Vm<'_, '_> {
-    /// The bytes the control state holds, for [`BUDGET`].
-    fn bytes(&self) -> usize {
-        self.data.data.len() * core::mem::size_of::<Block<OwnedValue>>()
-            + self.frames.data.len() * core::mem::size_of::<Block<FrameRec>>()
-            + self.slots.len() * core::mem::size_of::<Slot>()
-            + self.forks.len() * core::mem::size_of::<Fork>()
+impl<'c, 'e> Vm<'c, 'e> {
+    fn new(it: &'c Interp<'e>, code: &'c Code<'e>, limits: Limits) -> Self {
+        Self {
+            it,
+            code,
+            data: Stack::new(),
+            frames: Stack::new(),
+            slots: Vec::new(),
+            forks: Vec::new(),
+            scratch: Vec::new(),
+            limits,
+            #[cfg(test)]
+            steps: 0,
+        }
     }
 
-    /// The innermost definition on the call chain, for a refusal.
+    /// The bytes the control state holds, for [`BUDGET`]: the stacks, slots and fork points by
+    /// capacity.
+    fn bytes(&self) -> usize {
+        self.data.data.capacity() * core::mem::size_of::<Block<OwnedValue>>()
+            + self.frames.data.capacity() * core::mem::size_of::<Block<FrameRec>>()
+            + self.slots.capacity() * core::mem::size_of::<Slot>()
+            + self.forks.capacity() * core::mem::size_of::<Fork>()
+    }
+
+    /// Push onto the data stack, growing it within the budget.
+    #[inline(always)]
+    fn push(&mut self, value: OwnedValue) -> Result<(), Raise> {
+        let at = (self.data.index.max(self.data.limit) + 1) as usize;
+        if at >= self.data.data.capacity() {
+            self.grow_data()?;
+        }
+        self.data.push(value);
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_data(&mut self) -> Result<(), Raise> {
+        let used = self.bytes();
+        grow(&mut self.data.data, used, self.limits.bytes).map_err(|()| self.current_def())?;
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_frames(&mut self) -> Result<(), ()> {
+        let used = self.bytes();
+        grow(&mut self.frames.data, used, self.limits.bytes).map(|_| ())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_slots(&mut self, room: usize) -> Result<(), ()> {
+        while self.slots.capacity() - self.slots.len() < room {
+            let used = self.bytes();
+            grow(&mut self.slots, used, self.limits.bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Grow the frame stack and the slots, within the budget, so that a call's frame and its
+    /// `nslots` slots fit without growing either: the budget check of a call. Whether they fit.
+    #[inline(always)]
+    fn room_for_call(&mut self, nslots: usize) -> bool {
+        (self.frames.has_room() || self.grow_frames().is_ok())
+            && (self.slots.capacity() - self.slots.len() >= nslots
+                || self.grow_slots(nslots).is_ok())
+    }
+
+    /// Push a slot, growing the slots within the budget.
+    #[inline(always)]
+    fn push_slot(&mut self, slot: Slot) -> Result<(), Raise> {
+        if self.slots.len() == self.slots.capacity() && self.grow_slots(1).is_err() {
+            return Err(self.current_def());
+        }
+        self.slots.push(slot);
+        Ok(())
+    }
+
+    /// `APPEND` into the accumulator in slot `at`, growing it fallibly.
+    #[inline(always)]
+    fn append(&mut self, at: usize, value: OwnedValue) -> Result<(), Raise> {
+        let Slot::Acc(items) = &mut self.slots[at] else {
+            return Ok(());
+        };
+        if items.len() < items.capacity() {
+            items.push(value);
+            return Ok(());
+        }
+        if reserve(items).is_err() {
+            return Err(self.current_def());
+        }
+        items.push(value);
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_forks(&mut self) -> Result<(), Raise> {
+        let used = self.bytes();
+        grow(&mut self.forks, used, self.limits.bytes).map_err(|()| self.current_def())?;
+        Ok(())
+    }
+
+    /// The refusal of a loop that started at `entry` past [`Limits::rounds`]: a prelude loop's
+    /// own wording (`until: maximum iterations exceeded`), or the recursion wording naming the
+    /// definition (the innermost user definition when the loop is another prelude one's).
+    #[cold]
+    #[inline(never)]
+    fn loop_refusal(&self, entry: u32) -> Raise {
+        let func = &self.code.funcs[entry as usize];
+        match func.loop_name {
+            Some(name) => Raise::Fatal(iterations_refusal(name)),
+            None if func.prelude || func.name.is_empty() => self.current_def(),
+            None => refusal(func.name, func.arity),
+        }
+    }
+
+    /// Whether the `repeat` starting now is eager, as the shipped evaluators tell it: the nearest
+    /// consumer that can bound it is a `[...]` or a `reduce`, which take every output, rather
+    /// than one of the prelude's labels (`first`, `limit`, `nth`), which can stop it, or the
+    /// run's own output. The shipped evaluators stop an eager `repeat` after
+    /// `MAX_REPEAT_ROUNDS` rounds and `REPEAT_WIDTH_BUDGET` outputs, and run any other
+    /// unbounded (#2014).
+    ///
+    /// A label consumes the `repeat` only while the `repeat` runs inside its body. One whose
+    /// body has already output (`first(1) | repeat(1)`) left a `TRY_END` fork point above its
+    /// own, so the walk pairs each `TRY_END` with the `try` or label below it and passes both.
+    fn repeat_is_eager(&self) -> bool {
+        let mut ended = 0usize;
+        for fork in self.forks.iter().rev() {
+            match fork.kind {
+                Kind::TryEnd => ended += 1,
+                Kind::Try(_) if ended > 0 => ended -= 1,
+                Kind::Try(Handler::Label { stops: true, .. }) => return false,
+                Kind::Branch(at) if self.code.collects.binary_search(&at).is_ok() => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The refusal naming the innermost user definition on the call chain (the prelude's are
+    /// passed, as the shipped evaluators name the user's `f` in `def f: first(f); f`), or the
+    /// shipped unnamed one when none is on it.
+    #[cold]
+    #[inline(never)]
     fn current_def(&self) -> Raise {
         let mut f = self.frames.index;
         while f >= 0 {
             let fr = self.frames.data[f as usize].value;
             let func = &self.code.funcs[fr.func as usize];
-            if !func.name.is_empty() {
+            if !func.name.is_empty() && !func.prelude {
                 return refusal(func.name, func.arity);
             }
-            f = self.frames.data[f as usize].next;
+            f = self.frames.data[f as usize].next as isize;
         }
-        refusal("<program>", 0)
+        Raise::Fatal(shared_arg_depth_refusal())
     }
 
     /// A fork point resuming `kind`, protecting what the stacks hold now (`stack_save`).
+    #[inline(always)]
     fn save(&mut self, kind: Kind) -> Fork {
         Fork {
             kind,
@@ -380,10 +693,12 @@ impl Vm<'_, '_> {
     }
 
     /// Push a fork point, or refuse past [`BUDGET`].
+    #[inline(always)]
     fn fork(&mut self, kind: Kind) -> Result<(), Raise> {
-        if self.bytes() > BUDGET {
-            return Err(self.current_def());
+        if self.forks.len() == self.forks.capacity() {
+            self.grow_forks()?;
         }
+        // Built in place: a fork point is large, and is not passed through a call.
         let fork = self.save(kind);
         self.forks.push(fork);
         Ok(())
@@ -393,7 +708,7 @@ impl Vm<'_, '_> {
     fn frame_at(&self, level: u16) -> isize {
         let mut f = self.frames.index;
         for _ in 0..level {
-            f = self.frames.data[f as usize].value.env;
+            f = self.frames.data[f as usize].value.env as isize;
         }
         f
     }
@@ -407,12 +722,12 @@ impl Vm<'_, '_> {
     /// The index in [`Vm::slots`] of slot `idx` of the frame `level` links out.
     fn slot_at(&self, level: u16, idx: u16) -> usize {
         let f = self.frame_at(level);
-        self.frames.data[f as usize].value.base + idx as usize
+        self.frames.data[f as usize].value.base as usize + idx as usize
     }
 
     fn slot(&mut self, level: u16, idx: u16) -> &mut Slot {
         let f = self.frame_at(level);
-        let base = self.frames.data[f as usize].value.base;
+        let base = self.frames.data[f as usize].value.base as usize;
         &mut self.slots[base + idx as usize]
     }
 
@@ -424,28 +739,65 @@ impl Vm<'_, '_> {
         }
     }
 
-    /// `frame_push`, without its slots: the caller pushes those.
-    fn push_frame(&mut self, func: u32, env: isize, ret: usize) {
-        let base = self.slots.len();
+    /// `frame_push`, without its slots: the caller pushes those. `counts` are the loop's so far,
+    /// and `exit` the frame its `RET` returns into when it is not the one below.
+    #[inline(always)]
+    fn push_frame(
+        &mut self,
+        func: u32,
+        env: isize,
+        (ret, exit): (u32, i32),
+        counts: Counts,
+    ) -> Result<(), Raise> {
+        if !self.frames.has_room() && self.grow_frames().is_err() {
+            return Err(self.current_def());
+        }
+        let base = self.slots.len() as u32;
         self.frames.push(FrameRec {
             func,
-            env,
+            counts,
             ret,
+            exit,
+            env: env as i32,
             base,
         });
+        Ok(())
     }
 
-    /// `frame_pop`: a frame above the watermark frees its slots.
+    /// `frame_pop`: back to the frame the top one returns into, freeing what no fork point
+    /// protects. A frame with an `exit` returns past the frames between, which are freed too.
+    #[inline(always)]
     fn pop_frame(&mut self) -> FrameRec {
         let i = self.frames.index as usize;
         let free = self.frames.top_free();
         let fr = self.frames.data[i].value;
-        self.frames.index = self.frames.data[i].next;
-        if free {
-            self.slots.truncate(fr.base);
-            self.frames.data.truncate(i);
+        if fr.exit < 0 {
+            self.frames.index = self.frames.data[i].next as isize;
+            if free {
+                self.slots.truncate(fr.base as usize);
+                self.frames.data.truncate(i);
+            }
+        } else {
+            self.frames.index = fr.exit as isize;
+            if free {
+                // Every block above the target and the watermark is unreachable, and the
+                // first of them holds the lowest slots of the frames being dropped.
+                let keep = (self.frames.index.max(self.frames.limit) + 1) as usize;
+                if keep < self.frames.data.len() {
+                    self.slots
+                        .truncate(self.frames.data[keep].value.base as usize);
+                    self.frames.data.truncate(keep);
+                }
+            }
         }
         fr
+    }
+
+    /// Where a frame that takes over from the top one (a tail call's callee) returns into: the
+    /// top one's own `exit`, or (`-1`) the frame below it, which is below the callee too.
+    #[inline(always)]
+    fn exit_of_top(&self) -> i32 {
+        self.frames.data[self.frames.index as usize].value.exit
     }
 
     /// The dispatch loop (`jq_next`): run from the main function's entry until no fork point is
@@ -453,13 +805,17 @@ impl Vm<'_, '_> {
     fn exec(&mut self, input: OwnedValue, on_value: &mut dyn FnMut(OwnedValue) -> bool) -> R {
         let code = self.code;
         let main = &code.funcs[code.main as usize];
-        self.push_frame(code.main, -1, NO_RET);
+        self.push_frame(code.main, -1, (NO_RET, -1), Counts::fresh(code.main))?;
         for _ in 0..main.nslots {
-            self.slots.push(Slot::Val(OwnedValue::Null));
+            self.push_slot(Slot::Val(OwnedValue::Null))?;
         }
-        self.data.push(input);
+        self.push(input)?;
         let mut pc = main.entry;
         loop {
+            #[cfg(test)]
+            {
+                self.steps += 1;
+            }
             let flow = match self.step(pc, on_value) {
                 Ok(flow) => flow,
                 Err(raise) => match self.backtrack(Some(raise))? {
@@ -497,13 +853,13 @@ impl Vm<'_, '_> {
         match &code.insns[pc] {
             Insn::Dup => {
                 let v = self.data.pop();
-                self.data.push(v.clone());
-                self.data.push(v);
+                self.push(v.clone())?;
+                self.push(v)?;
             }
             Insn::DupN => {
                 let v = self.data.pop_n();
-                self.data.push(v.clone());
-                self.data.push(v);
+                self.push(v.clone())?;
+                self.push(v)?;
             }
             Insn::Pop => {
                 self.data.pop();
@@ -511,12 +867,12 @@ impl Vm<'_, '_> {
             Insn::Swap => {
                 let a = self.data.pop();
                 let b = self.data.pop();
-                self.data.push(a);
-                self.data.push(b);
+                self.push(a)?;
+                self.push(b)?;
             }
             Insn::Const(k) => {
                 self.data.pop();
-                self.data.push(code.consts[*k as usize].clone());
+                self.push(code.consts[*k as usize].clone())?;
             }
             Insn::Leaf(k) => return self.leaf(*k, pc),
             Insn::Each(opt) => {
@@ -544,7 +900,7 @@ impl Vm<'_, '_> {
                         resume: pc + 1,
                     })?;
                 }
-                self.data.push(first);
+                self.push(first)?;
             }
             Insn::Range => {
                 let max = self.data.pop();
@@ -559,10 +915,11 @@ impl Vm<'_, '_> {
                     self.fork(Kind::Range {
                         cur: cur + 1.0,
                         max: hi,
+                        made: 1,
                         resume: pc + 1,
                     })?;
                 }
-                self.data.push(range_start(start, &max));
+                self.push(range_start(start, &max))?;
             }
             Insn::Fork(t) => self.fork(Kind::Branch(*t))?,
             Insn::Jump(t) => return Ok(Flow::Next(*t)),
@@ -584,11 +941,11 @@ impl Vm<'_, '_> {
                 self.fork(Kind::Try(handler))?;
             }
             Insn::TryEnd => self.fork(Kind::TryEnd)?,
-            Insn::Label(s) => {
+            Insn::Label(s, stops) => {
                 let id = self.it.next_label.get();
                 self.it.next_label.set(id + 1);
                 *self.slot(0, *s) = Slot::Val(OwnedValue::Int(id as i64));
-                self.fork(Kind::Try(Handler::Label(id)))?;
+                self.fork(Kind::Try(Handler::Label { id, stops: *stops }))?;
             }
             Insn::Break(level, idx) => {
                 let id = match self.value(*level, *idx) {
@@ -604,7 +961,7 @@ impl Vm<'_, '_> {
             Insn::Load(level, idx) => {
                 self.data.pop();
                 let v = self.value(*level, *idx);
-                self.data.push(v);
+                self.push(v)?;
             }
             Insn::LoadMove(level, idx) => {
                 self.data.pop();
@@ -612,7 +969,7 @@ impl Vm<'_, '_> {
                     Slot::Val(v) => core::mem::replace(v, OwnedValue::Null),
                     _ => OwnedValue::Null,
                 };
-                self.data.push(v);
+                self.push(v)?;
             }
             Insn::LoadLast(level, idx) => {
                 self.data.pop();
@@ -623,7 +980,7 @@ impl Vm<'_, '_> {
                     Slot::Val(v) => v.clone(),
                     _ => OwnedValue::Null,
                 };
-                self.data.push(v);
+                self.push(v)?;
             }
             Insn::Kill(s) => {
                 let at = self.slot_at(0, *s);
@@ -631,57 +988,58 @@ impl Vm<'_, '_> {
                     self.slots[at] = Slot::Val(OwnedValue::Null);
                 }
             }
-            Insn::NewAcc(s) => *self.slot(0, *s) = Slot::Acc(Vec::new()),
+            Insn::NewAcc(s) => {
+                let at = self.slot_at(0, *s);
+                self.slots[at] = Slot::Acc(Vec::new());
+            }
             Insn::Append(s) => {
                 let v = self.data.pop();
-                if let Slot::Acc(items) = self.slot(0, *s) {
-                    items.push(v);
-                }
+                let at = self.slot_at(0, *s);
+                self.append(at, v)?;
             }
             Insn::LoadAcc(s) => {
                 self.data.pop();
-                let items = match self.slot(0, *s) {
+                let at = self.slot_at(0, *s);
+                let items = match &mut self.slots[at] {
                     Slot::Acc(items) => core::mem::take(items),
                     _ => Vec::new(),
                 };
-                self.data.push(OwnedValue::Array(items.into()));
+                self.push(OwnedValue::Array(items.into()))?;
             }
             Insn::Bin(op) => {
                 let l = self.data.pop();
                 let r = self.data.pop();
-                self.data.push(combine(*op, &l, &r).map_err(raise_eval)?);
+                self.push(combine(*op, &l, &r).map_err(raise_eval)?)?;
             }
             Insn::Cmp(op) => {
                 let l = self.data.pop();
                 let r = self.data.pop();
-                self.data
-                    .push(OwnedValue::Bool(apply_compare_op::<JqSemantics>(
-                        *op, &l, &r,
-                    )));
+                self.push(OwnedValue::Bool(apply_compare_op::<JqSemantics>(
+                    *op, &l, &r,
+                )))?;
             }
             Insn::ToBool => {
                 let v = self.data.pop();
-                self.data.push(OwnedValue::Bool(truthy(&v)));
+                self.push(OwnedValue::Bool(truthy(&v)))?;
             }
             Insn::Not => {
                 let v = self.data.pop();
-                self.data.push(OwnedValue::Bool(!truthy(&v)));
+                self.push(OwnedValue::Bool(!truthy(&v)))?;
             }
             Insn::Negate => {
                 let v = self.data.pop();
-                self.data
-                    .push(arith_negate::<JqSemantics>(v).map_err(raise_eval)?);
+                self.push(arith_negate::<JqSemantics>(v).map_err(raise_eval)?)?;
             }
             Insn::Index => {
                 let k = self.data.pop();
                 let c = self.data.pop();
                 let v = self.it.jv_get(&c, &k)?;
-                self.data.push(v);
+                self.push(v)?;
             }
             Insn::IndexK(k) => {
                 let c = self.data.pop();
                 let v = self.it.jv_get(&c, &code.consts[*k as usize])?;
-                self.data.push(v);
+                self.push(v)?;
             }
             Insn::Raise => {
                 let v = self.data.pop();
@@ -718,23 +1076,80 @@ impl Vm<'_, '_> {
                         out.ok_or_else(|| unsupported("setpath answered nothing"))?
                     }
                 };
-                self.data.push(written);
+                self.push(written)?;
             }
             Insn::Call { callee, args, tail } => return self.call(pc, *callee, args, *tail),
             Insn::Ret => {
+                // Outputs are counted in a loop's frames (and charged to an owner's), where a
+                // bound can apply; a frame of an ordinary call that is not yet a loop counts none.
+                let top = self.frames.index as usize;
+                let counts = self.frames.data[top].value.counts;
+                if counts.rounds != 0 || counts.owner != -1 {
+                    self.count_output(top, counts.owner)?;
+                }
                 let fr = self.pop_frame();
                 if fr.ret == NO_RET {
                     let v = self.data.pop();
                     return Ok(if on_value(v) { Flow::Back } else { Flow::Stop });
                 }
-                return Ok(Flow::Next(fr.ret));
+                return Ok(Flow::Next(fr.ret as usize));
             }
         }
         Ok(next)
     }
 
+    /// An output of the frame at `top`, charged to its loop, or to its owner's.
+    #[inline(always)]
+    fn count_output(&mut self, top: usize, owner: i32) -> Result<(), Raise> {
+        let owner = if owner >= 0 { owner as usize } else { top };
+        let counts = &mut self.frames.data[owner].value.counts;
+        if counts.emitted < self.limits.outputs {
+            counts.emitted += 1;
+            Ok(())
+        } else {
+            self.charge_output(owner)
+        }
+    }
+
+    /// An output charged to the loop of the frame at `owner`, once its count has reached
+    /// [`Limits::outputs`] (or the loop is an uncounted `repeat`, whose `emitted` is above it):
+    /// the shipped tail loop's output bound (#5379), checked before this output as the shipped
+    /// loop checks after the one before; an eager `repeat`'s width (`REPEAT_WIDTH_BUDGET`, its
+    /// count started that far below the bound); or an uncounted `repeat`'s round marked
+    /// [`HEARD`].
+    #[cold]
+    #[inline(never)]
+    fn charge_output(&mut self, owner: usize) -> Result<(), Raise> {
+        let limit = self.limits.outputs;
+        let counts = &mut self.frames.data[owner].value.counts;
+        if counts.rounds == UNCOUNTED {
+            counts.emitted |= HEARD;
+            return Ok(());
+        }
+        if counts.emitted > limit {
+            let entry = &self.code.funcs[counts.entry() as usize];
+            if entry.loop_name == Some("range") {
+                // `range/3`'s numbers: the round that would output the one past
+                // `MAX_RANGE_TOTAL` is refused, as the shipped `range` counts what it emits.
+                if counts.rounds >= self.limits.rounds {
+                    return Err(Raise::Fatal(range_max_exceeded_error()));
+                }
+                return Ok(());
+            }
+            if entry.loop_name == Some("repeat") {
+                return Err(Raise::Fatal(iterations_refusal("repeat")));
+            }
+            if counts.taken() >= OUTPUT_BUDGET_AFTER_ROUNDS as u32 && entry.bounds_outputs() {
+                return Err(loop_outputs_refusal(entry.name));
+            }
+        }
+        counts.emitted = counts.emitted.saturating_add(1);
+        Ok(())
+    }
+
     /// Run leaf `k` on `Interp::eval` over its free variables: the first output continues at
     /// once, the rest (and an error after them) become a [`Kind::Values`] fork point.
+    #[inline(never)]
     fn leaf(&mut self, k: u32, pc: usize) -> Result<Flow, Raise> {
         let leaf = &self.code.leaves[k as usize];
         let input = self.data.pop();
@@ -745,16 +1160,25 @@ impl Vm<'_, '_> {
         }
         let mut first = None;
         let mut rest = Vec::new();
+        let mut full = false;
         let end = self
             .it
             .eval(leaf.expr, &env, input, Reg::top(), &mut |v, _| {
                 if first.is_none() {
                     first = Some(v);
                 } else {
+                    // Uncounted, as an accumulator is, but grown fallibly.
+                    if rest.len() == rest.capacity() && reserve(&mut rest).is_err() {
+                        full = true;
+                        return Err(Raise::Stop);
+                    }
                     rest.push(v);
                 }
                 Ok(())
             });
+        if full {
+            return Err(self.current_def());
+        }
         let Some(v) = first else {
             return match end {
                 Ok(()) => Ok(Flow::Back),
@@ -768,19 +1192,23 @@ impl Vm<'_, '_> {
                 resume: pc + 1,
             })?;
         }
-        self.data.push(v);
+        self.push(v)?;
         Ok(Flow::Next(pc + 1))
     }
 
     /// `CALL_JQ` / `TAIL_CALL_JQ`: bind the arguments into a new frame and jump to the
     /// callee's entry. A tail call pops the caller's frame first (it holds nothing the callee
-    /// refers to, [`compile`]'s `mark_tails`), so a tail loop runs in constant frames.
+    /// refers to, [`compile`]'s `mark_tails`), so a tail loop runs in constant frames. A tail call
+    /// to a callee that closes over the caller's frame (`Tail::Keep`) keeps that frame, and the
+    /// callee returns past it, so an output of a loop through a nested `def` returns at once
+    /// rather than through every frame the loop has kept.
+    #[inline(never)]
     fn call(
         &mut self,
         pc: usize,
         callee: Callee,
         args: &[ArgSpec],
-        tail: bool,
+        tail: Tail,
     ) -> Result<Flow, Raise> {
         let code = self.code;
         let input = self.data.pop();
@@ -800,9 +1228,29 @@ impl Vm<'_, '_> {
             },
         };
         let f = &code.funcs[func as usize];
-        if self.bytes() > BUDGET {
-            return Err(refusal(f.name, f.arity));
+        if !self.room_for_call(f.nslots as usize) {
+            return Err(self.call_refusal(func));
         }
+        let caller = self.frames.data[cur as usize].value;
+        let counts = if tail == Tail::No && f.loop_name.is_none() {
+            Counts::fresh(func)
+        } else if tail == Tail::Pop
+            && caller.func == func
+            && caller.counts.rounds != UNCOUNTED
+            && !f.binds
+            && caller.counts.rounds < self.limits.rounds
+        {
+            // A self tail call: the next round of the loop, charged one.
+            caller.counts.next_round(caller.counts.rounds + 1)
+        } else {
+            let declared = matches!(callee, Callee::Def { level: 0, .. });
+            match self.loop_counts(func, tail, declared)? {
+                Some(counts) => counts,
+                // An uncounted `repeat` past its empty rounds: its stream ends, as on the
+                // shipped routes.
+                None => return Ok(Flow::Back),
+            }
+        };
         // The arguments, last first: values come off the data stack.
         let mut scratch = core::mem::take(&mut self.scratch);
         scratch.clear();
@@ -820,14 +1268,40 @@ impl Vm<'_, '_> {
                 },
             });
         }
-        let ret = if tail {
-            // `TAIL_CALL_JQ`: the frame goes before its successor comes; nothing the new
-            // frame holds refers to it.
-            self.pop_frame().ret
-        } else {
-            pc + 1
+        let link = match tail {
+            Tail::No => {
+                // The compiler declines a program of `u32::MAX` instructions or more.
+                ((pc + 1) as u32, -1)
+            }
+            Tail::Pop => {
+                // `TAIL_CALL_JQ`: the frame goes before its successor comes; nothing the new
+                // frame holds refers to it. Only that frame goes: the callee may close over the
+                // one below it, which an `exit` would return past.
+                if !self.frames.top_free() && !self.forks.is_empty() {
+                    self.drop_dead_forks();
+                }
+                let exit = self.exit_of_top();
+                (self.pop_top_frame().ret, exit)
+            }
+            Tail::Keep => {
+                let exit = if caller.exit >= 0 {
+                    caller.exit
+                } else {
+                    self.frames.data[cur as usize].next
+                };
+                (caller.ret, exit)
+            }
         };
-        self.push_frame(func, env, ret);
+        // `room_for_call` made room for the frame and its slots, so these pushes do not grow.
+        let base = self.slots.len() as u32;
+        self.frames.push(FrameRec {
+            func,
+            counts,
+            ret: link.0,
+            exit: link.1,
+            env: env as i32,
+            base,
+        });
         while let Some(slot) = scratch.pop() {
             self.slots.push(slot);
         }
@@ -835,12 +1309,202 @@ impl Vm<'_, '_> {
             self.slots.push(Slot::Val(OwnedValue::Null));
         }
         self.scratch = scratch;
-        self.data.push(input);
+        // The input may land above a protected block, so this one is checked.
+        self.push(input)?;
         Ok(Flow::Next(f.entry))
+    }
+
+    /// Drop the fork points at the top that can only answer nothing, so a loop whose round left
+    /// one (an update `. + 1, empty`, or `x // d` once `x` gave a truthy output) does not keep a
+    /// frame per round. A `FORK` resuming at a `BACKTRACK`, or at `//`'s check of a `found` slot
+    /// that is set, would backtrack at once with no effect, so dropping it, and lowering the
+    /// watermarks to what it saved, is the state its resumption would reach. The shipped
+    /// evaluators run these loops in constant memory too, stepping in place a round whose update
+    /// answers once.
+    #[cold]
+    #[inline(never)]
+    fn drop_dead_forks(&mut self) {
+        while let Some(fork) = self.forks.last() {
+            let Kind::Branch(at) = fork.kind else {
+                break;
+            };
+            let dead = match self.code.insns[at] {
+                Insn::Backtrack => true,
+                Insn::JumpIfSet(s, t) => {
+                    matches!(self.code.insns[t], Insn::Backtrack) && fork.frames.0 >= 0 && {
+                        let base = self.frames.data[fork.frames.0 as usize].value.base as usize;
+                        matches!(&self.slots[base + s as usize], Slot::Val(v) if truthy(v))
+                    }
+                }
+                _ => false,
+            };
+            if !dead {
+                break;
+            }
+            let (data, frames) = (fork.data.1, fork.frames.1);
+            self.forks.pop();
+            self.data.limit = data;
+            self.frames.limit = frames;
+        }
+    }
+
+    /// The refusal of a call to `func` whose frame does not fit: named for it, or for the
+    /// innermost user definition when it is a closure or a prelude definition.
+    #[cold]
+    #[inline(never)]
+    fn call_refusal(&self, func: u32) -> Raise {
+        let f = &self.code.funcs[func as usize];
+        if f.name.is_empty() || f.prelude {
+            self.current_def()
+        } else {
+            refusal(f.name, f.arity)
+        }
+    }
+
+    /// `frame_pop` of the top frame alone, for a tail call: its `exit` passes to the callee.
+    #[inline(always)]
+    fn pop_top_frame(&mut self) -> FrameRec {
+        let i = self.frames.index as usize;
+        let free = self.frames.top_free();
+        let fr = self.frames.data[i].value;
+        self.frames.index = self.frames.data[i].next as isize;
+        if free {
+            self.slots.truncate(fr.base as usize);
+            self.frames.data.truncate(i);
+        }
+        fr
+    }
+
+    /// The loop counts of the frame a call to `func` pushes ([`Counts`]), or a refusal past
+    /// them; `None` ends an uncounted `repeat` past `MAX_EMPTY_REPEAT_ROUNDS` empty rounds.
+    ///
+    /// A tail call to the caller's own definition, to one it is nested in (a wrapper, the other
+    /// half of a mutual recursion) or to one declared in it is the next round of the caller's
+    /// loop: it inherits the loop's counts and is charged a round against `MAX_LOOP_ROUNDS`, as
+    /// the shipped tail loop and `until`/`while` charge it, `BOUND_ROUND_WEIGHT` rounds for a
+    /// definition that declares definitions of its own, as the shipped loop charges a round
+    /// that binds a body. A tail call to a closure is part of the round it is in, and one to any
+    /// other definition (a helper) starts a loop of its own, whose outputs are still charged to
+    /// the caller's loop, as the shipped loop counts a helper's outputs in a comma in front of
+    /// its call. A loop never runs through a closure (a closure argument makes its call an
+    /// ordinary one). An ordinary call starts a loop of its own ([`Vm::loop_start`]).
+    fn loop_counts(&self, func: u32, tail: Tail, declared: bool) -> Result<Option<Counts>, Raise> {
+        let funcs = &self.code.funcs;
+        let f = &funcs[func as usize];
+        if tail == Tail::No || (tail == Tail::Keep && f.loop_name.is_some()) {
+            return Ok(Some(self.loop_start(func)));
+        }
+        let top = self.frames.index;
+        let caller = self.frames.data[top as usize].value;
+        let c = caller.counts;
+        let caller_named = !funcs[caller.func as usize].name.is_empty();
+        // Where the outputs of a frame that is not one of the loop's rounds go.
+        let owner = if c.owner >= 0 || !caller_named {
+            c.owner
+        } else if self.frames.top_free() {
+            -1
+        } else {
+            top as i32
+        };
+        if f.name.is_empty() {
+            return Ok(Some(Counts { owner, ..c }));
+        }
+        if c.rounds == UNCOUNTED {
+            if f.loop_name == Some("repeat") {
+                let empty = if c.emitted & HEARD == 0 {
+                    (c.emitted & !QUIET) + 1
+                } else {
+                    0
+                };
+                if empty as usize >= MAX_EMPTY_REPEAT_ROUNDS {
+                    return Ok(None);
+                }
+                return Ok(Some(Counts {
+                    emitted: QUIET | empty,
+                    owner: -1,
+                    ..c
+                }));
+            }
+        } else if caller_named
+            && ((tail == Tail::Keep && declared)
+                || caller.func == func
+                || self.in_static_chain(func))
+        {
+            let weight = if f.binds {
+                BOUND_ROUND_WEIGHT as u32
+            } else {
+                1
+            };
+            let rounds = c.rounds + weight;
+            if rounds > self.limits.rounds {
+                return Err(self.loop_refusal(c.entry()));
+            }
+            return Ok(Some(c.next_round(rounds)));
+        }
+        // The call that enters a loop is not one of its rounds, as the shipped tail loop
+        // counts: `def f: if . >= 16777216 then . else . + 1 | f end; 0 | f` answers. Its
+        // outputs are counted from the start all the same ([`COUNTED`]).
+        Ok(Some(Counts {
+            owner: if owner < 0 { COUNTED } else { owner },
+            ..Counts::fresh(func)
+        }))
+    }
+
+    /// The counts of a loop that starts at `func`. Four prelude loops start with the shipped
+    /// evaluators' own caps, counting the round that starts here, as they count it: `until` and
+    /// `while` with `MAX_LOOP_ROUNDS` rounds, `range/3`'s `while` with `MAX_RANGE_TOTAL`, an
+    /// eager `repeat` with `MAX_REPEAT_ROUNDS` rounds and `REPEAT_WIDTH_BUDGET` outputs, and one a
+    /// consumer can stop with neither ([`UNCOUNTED`]).
+    fn loop_start(&self, func: u32) -> Counts {
+        let f = &self.code.funcs[func as usize];
+        let limits = self.limits;
+        let start = |cap: usize| limits.rounds.saturating_sub(cap as u32).saturating_add(1);
+        match f.loop_name {
+            None => Counts::fresh(func),
+            Some("repeat") if self.repeat_is_eager() => Counts {
+                rounds: start(MAX_REPEAT_ROUNDS),
+                emitted: limits
+                    .outputs
+                    .saturating_sub(REPEAT_WIDTH_BUDGET as u32 - 1),
+                ..Counts::fresh(func)
+            },
+            Some("repeat") => Counts {
+                rounds: UNCOUNTED,
+                emitted: QUIET,
+                ..Counts::fresh(func)
+            },
+            // Its rounds reach the cap at the round that would output the number past
+            // `MAX_RANGE_TOTAL`, which `charge_output` refuses; a round whose condition fails
+            // (the one after the last number) is not refused, as the shipped `range` does not
+            // count it. Every output takes that path ([`QUIET`]).
+            Some("range") => Counts {
+                rounds: limits.rounds.saturating_sub(limits.range as u32),
+                emitted: QUIET,
+                ..Counts::fresh(func)
+            },
+            Some(_) => Counts {
+                rounds: 1,
+                ..Counts::fresh(func)
+            },
+        }
+    }
+
+    /// Whether the current frame, or one it is nested in, runs `func`.
+    fn in_static_chain(&self, func: u32) -> bool {
+        let mut f = self.frames.index;
+        while f >= 0 {
+            let frame = self.frames.data[f as usize].value;
+            if frame.func == func {
+                return true;
+            }
+            f = frame.env as isize;
+        }
+        false
     }
 
     /// `stack_restore` and the `ON_BACKTRACK` arms: the address to resume at, `None` when no
     /// fork point is left and nothing is raised.
+    #[inline(never)]
     fn backtrack(&mut self, mut err: Option<Raise>) -> Result<Option<usize>, Raise> {
         loop {
             let Some(fork) = self.forks.pop() else {
@@ -879,10 +1543,10 @@ impl Vm<'_, '_> {
                         Handler::None => {}
                         Handler::Code(at) => {
                             self.data.pop();
-                            self.data.push(caught(raise));
+                            self.push(caught(raise))?;
                             return Ok(Some(at));
                         }
-                        Handler::Label(id) => {
+                        Handler::Label { id, .. } => {
                             let mine = match &raise {
                                 Raise::Break(n) => *n == id,
                                 Raise::Error(e) => is_label_payload(e, id),
@@ -903,28 +1567,36 @@ impl Vm<'_, '_> {
                     if err.is_none() {
                         let v = element(&container, next);
                         if next + 1 < length(&container) {
-                            let fork = self.save(Kind::Each {
+                            self.fork(Kind::Each {
                                 container,
                                 next: next + 1,
                                 resume,
-                            });
-                            self.forks.push(fork);
+                            })?;
                         }
-                        self.data.push(v);
+                        self.push(v)?;
                         return Ok(Some(resume));
                     }
                 }
-                Kind::Range { cur, max, resume } => {
+                Kind::Range {
+                    cur,
+                    max,
+                    made,
+                    resume,
+                } => {
                     if err.is_none() {
+                        // The shipped `range`'s cap (#5292): past `MAX_RANGE_TOTAL` numbers.
+                        if made >= self.limits.range {
+                            return Err(Raise::Fatal(range_max_exceeded_error()));
+                        }
                         if cur + 1.0 < max || cur.is_nan() || max.is_nan() {
-                            let fork = self.save(Kind::Range {
+                            self.fork(Kind::Range {
                                 cur: cur + 1.0,
                                 max,
+                                made: made + 1,
                                 resume,
-                            });
-                            self.forks.push(fork);
+                            })?;
                         }
-                        self.data.push(number_owned(cur));
+                        self.push(number_owned(cur))?;
                         return Ok(Some(resume));
                     }
                 }
@@ -937,10 +1609,9 @@ impl Vm<'_, '_> {
                         match vals.next() {
                             Some(v) => {
                                 if vals.len() > 0 || end.is_some() {
-                                    let fork = self.save(Kind::Values { vals, end, resume });
-                                    self.forks.push(fork);
+                                    self.fork(Kind::Values { vals, end, resume })?;
                                 }
-                                self.data.push(v);
+                                self.push(v)?;
                                 return Ok(Some(resume));
                             }
                             None => err = end,

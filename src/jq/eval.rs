@@ -64034,7 +64034,7 @@ fn resolve_repeat_sink<'a, S: EvalSemantics>(
     keep: Keep,
     sink: &mut dyn FnMut(PathBranch<'a>) -> Demand,
 ) -> ResolveFlow {
-    const MAX_ITERATIONS: usize = 1000;
+    const MAX_ITERATIONS: usize = MAX_REPEAT_ROUNDS;
     let mut budget = REPEAT_WIDTH_BUDGET;
     for _ in 0..MAX_ITERATIONS {
         let mut stopped = false;
@@ -64056,9 +64056,7 @@ fn resolve_repeat_sink<'a, S: EvalSemantics>(
         if over_budget {
             // #2132: `resource_limit`, not `new` -- a cap `?`/`try` must not
             // swallow. Same for every other raise below; see the constructor.
-            return ResolveFlow::Escaped(
-                EvalError::resource_limit("repeat: maximum iterations exceeded").into(),
-            );
+            return ResolveFlow::Escaped(iterations_refusal("repeat").into());
         }
         if stopped {
             return ResolveFlow::Stopped;
@@ -95000,6 +94998,13 @@ pub(crate) const REDUCE_FOREACH_MAX_STEPS: usize = 100_000;
 /// `reduce`/`foreach` do not.
 pub(crate) const REPEAT_WIDTH_BUDGET: usize = 10_000;
 
+/// The rounds an eager `repeat` runs before it raises `repeat: maximum
+/// iterations exceeded`: one whose consumer takes every output (`[...]`,
+/// `reduce`), where jq loops forever (#2014). One that `limit` or `first`
+/// can stop is not bounded by it. The call machine keeps the same bound
+/// (#7977).
+pub(crate) const MAX_REPEAT_ROUNDS: usize = 1000;
+
 /// Check-and-charge one unit against a shared step budget (#695).
 /// `what` names the construct in the resulting error message. (`while`/`until`
 /// charge their rounds, forks and emissions through [`LoopBudget`] instead.)
@@ -102362,9 +102367,7 @@ fn reduce_list_yq<S: EvalSemantics>(
                     let extra = next.len().saturating_sub(1);
                     if extra > extra_budget {
                         // #2132: uncatchable, as every step budget's.
-                        failure = Some(Control::Error(EvalError::resource_limit(
-                            "reduce: maximum iterations exceeded".to_string(),
-                        )));
+                        failure = Some(Control::Error(iterations_refusal("reduce")));
                         return Demand::Stop;
                     }
                     extra_budget -= extra;
@@ -103872,7 +103875,7 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // truncated-but-successful result with no signal. Now raises the same
     // way the per-value `budget` two lines below already does, matching
     // `resolve_repeat_sink`'s identical guard.
-    const MAX_ITERATIONS: usize = 1000;
+    const MAX_ITERATIONS: usize = MAX_REPEAT_ROUNDS;
     // Bounds total output size independent of `expr`'s own fan-out (#855
     // follow-up): the per-round loop below used to push at most one
     // (collapsed) value per round, implicitly capping output at
@@ -103912,10 +103915,7 @@ fn eval_repeat<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         }
     }
 
-    // #2132: uncatchable -- see `EvalError::resource_limit`.
-    let control = Control::Error(EvalError::resource_limit(
-        "repeat: maximum iterations exceeded",
-    ));
+    let control = Control::Error(iterations_refusal("repeat"));
     finish_fork(outputs, Some(control), optional)
 }
 

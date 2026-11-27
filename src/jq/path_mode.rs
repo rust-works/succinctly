@@ -63,20 +63,19 @@ use super::c_builtin_identity::{array_index, binop_keeps, format_keeps_input, ke
 use super::error::{dump_truncated_with, Control, EvalError};
 use super::eval::{
     apply_compare_op, arith_combine, arith_negate, compare_values, definition_zero_for,
-    is_tree_descending_f, named_depth_refusal, native_stack_exhausted, owned_to_string,
-    range_max_exceeded_error, recurse_max_items, recurse_node_cost, recurse_value_size,
-    shared_arg_depth_refusal, with_native_stack_floor_lifted, EvalTag, JqSemantics, LoopCounters,
-    QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_LOOP_ROUNDS, MAX_RANGE,
-    MAX_RANGE_TOTAL, REPEAT_WIDTH_BUDGET,
+    is_tree_descending_f, iterations_refusal, named_depth_refusal, native_stack_exhausted,
+    owned_to_string, range_max_exceeded_error, recurse_max_items, recurse_node_cost,
+    recurse_value_size, shared_arg_depth_refusal, with_native_stack_floor_lifted, EvalTag,
+    JqSemantics, LoopCounters, QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES,
+    MAX_LOOP_ROUNDS, MAX_RANGE, MAX_RANGE_TOTAL, MAX_REPEAT_ROUNDS, REPEAT_WIDTH_BUDGET,
 };
 use super::expr::{
     ArithOp, Builtin, CompareOp, Expr, Literal, MergeFlags, NumberKey, ObjectKey, Param, Pattern,
     SliceBoundKey, StringPart,
 };
 use super::parser::parse;
-use super::resolve::ModuleRun;
 use super::tail_call::{
-    declared_tail_call, outputs_refusal, stage_settles, MAX_LOOP_OUTPUTS,
+    declared_tail_call, outputs_refusal, stage_settles, BOUND_ROUND_WEIGHT, MAX_LOOP_OUTPUTS,
     OUTPUT_BUDGET_AFTER_ROUNDS,
 };
 use super::value::FieldMap;
@@ -4047,7 +4046,7 @@ impl<'e> Interp<'e> {
         reg: Reg,
         sink: &mut Sink<'_>,
     ) -> R {
-        const PATH_MODE_ROUNDS: usize = 1000;
+        const PATH_MODE_ROUNDS: usize = MAX_REPEAT_ROUNDS;
         let tracking = reg.tracking();
         let (mut rounds, mut empty_rounds, mut outputs) = (0usize, 0usize, 0usize);
         loop {
@@ -4060,9 +4059,7 @@ impl<'e> Interp<'e> {
                 produced = true;
                 outputs += 1;
                 if tracking && outputs > REPEAT_WIDTH_BUDGET {
-                    return Err(Raise::Fatal(EvalError::resource_limit(
-                        "repeat: maximum iterations exceeded",
-                    )));
+                    return Err(Raise::Fatal(iterations_refusal("repeat")));
                 }
                 sink(v, r)
             })?;

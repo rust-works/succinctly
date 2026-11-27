@@ -1315,7 +1315,7 @@ pub(crate) const OUTPUT_BUDGET_AFTER_ROUNDS: usize = 64;
 
 /// What a round that binds a body of its own is charged against [`MAX_LOOP_ROUNDS`], in
 /// rounds that bind none (#5379).
-const BOUND_ROUND_WEIGHT: usize = 16;
+pub(crate) const BOUND_ROUND_WEIGHT: usize = 16;
 
 /// What a tail loop may still spend (#5379).
 ///
