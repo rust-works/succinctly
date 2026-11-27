@@ -7856,7 +7856,7 @@ fn cursor_navigation_to<W: AsRef<[u64]> + Clone>(
 /// and the owned value cannot run the selection (every metadata reader answers its default there,
 /// so the `select` would keep every node). A node at the root keeps the readers as written, a
 /// parentless target the evaluator stops at. `None` for any other shape, a tail with `key` after
-/// `key` (a key node has no key: yq deletes nothing), a walk with `..` or `.[]` on a document with
+/// `key` (a key node has no key: yq deletes nothing), a `..` below a step down on a document with
 /// aliases (yq's `..` stops at an alias), and a root node under a tail with `key`; the evaluator
 /// then refuses or deletes less than yq. `Some(None)` declines the rewrite as well, and keeps the
 /// caller from resolving the target another way.
@@ -7894,11 +7894,19 @@ fn cursor_reader_tail_del_target<W: AsRef<[u64]> + Clone>(
         .skip_while(|s| !is_key(s))
         .skip(1)
         .any(|s| is_key(&s));
-    let walks = jq::walk::any_subexpr(&navigation, &mut |e| {
-        matches!(
-            e,
-            Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys | Expr::Iterate
-        )
+    // yq's `..` stops at an alias; a `..` below a step down on a document with aliases could reach
+    // an anchor outside the walk through one, and the alias redirect would delete from it.
+    let descent = |e: &Expr| matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys);
+    let mut stepped = false;
+    let walks = stages[..split].iter().any(|stage| {
+        if descent(stage) {
+            return stepped;
+        }
+        if jq::walk::any_subexpr(stage, &mut |e| descent(e)) {
+            return true;
+        }
+        stepped |= !matches!(stage, Expr::Identity | Expr::Builtin(Builtin::Select(_)));
+        false
     });
     if key_after_key
         || !navigates_and_filters_only(&navigation)

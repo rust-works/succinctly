@@ -83749,9 +83749,10 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
 ///   cursor before it gets here.
 /// - `key` after `key` in the tail: yq's key node has no key of its own, so `.b | key | key`
 ///   answers nothing and deletes nothing.
-/// - `..` or `.[]` on a document with aliases (`.e | .. | line`): yq's `..` stops at an alias,
-///   where the owned walk goes on through the anchor's copy and the alias redirect would delete
-///   from the anchor's node.
+/// - `..` below a step down on a document with aliases (`.e | .. | line`): yq's `..` stops at an
+///   alias, where the owned walk goes on through the anchor's copy and the alias redirect deletes
+///   from the anchor's node, which can lie outside the walk. A `..` from the root also reaches
+///   every anchor itself, so the redirect deletes nothing that walk does not.
 fn yq_slot_rewrite_is_sound(navigation: &[Expr], tail: &[Expr]) -> bool {
     let reads_metadata = navigation.iter().any(|stage| {
         contains_builtin(stage, |b| {
@@ -83764,16 +83765,28 @@ fn yq_slot_rewrite_is_sound(navigation: &[Expr], tail: &[Expr]) -> bool {
         .skip_while(|stage| !matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key)))
         .skip(1)
         .any(|stage| matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key)));
-    let walks_through_aliases = alias_identity::active()
-        && navigation.iter().any(|stage| {
-            any_subexpr(stage, &mut |e| {
-                matches!(
-                    e,
-                    Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys | Expr::Iterate
-                )
-            })
-        });
+    let walks_through_aliases = alias_identity::active() && descends_below_a_step(navigation);
     !(reads_metadata || key_after_key || walks_through_aliases)
+}
+
+/// Whether a `..` in `navigation` can start below the root (#8020): after a stage that steps down,
+/// or inside a stage of its own shape (`(.e | ..)`, `(.a, ..)`), which this does not follow.
+fn descends_below_a_step(navigation: &[Expr]) -> bool {
+    let descent = |e: &Expr| matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys);
+    let mut stepped = false;
+    for stage in navigation {
+        let stage = unwrap_paren(stage);
+        if descent(stage) {
+            if stepped {
+                return true;
+            }
+        } else if any_subexpr(stage, &mut |e| descent(e)) {
+            return true;
+        } else {
+            stepped |= del_target_steps_down(stage);
+        }
+    }
+    false
 }
 
 /// Whether `stage` is one of yq's node metadata readers (#8020): `line`, `column`, `kind`, `style`,
