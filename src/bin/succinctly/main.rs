@@ -1730,8 +1730,9 @@ pub struct YqCommand {
     /// Split output into multiple files, one per result, named by evaluating
     /// EXPR against each result (`.` is the result; `$index` is that
     /// result's zero-based output index across the whole run; --arg/
-    /// --argjson values and $ARGS are also available, same as the main
-    /// filter). Suppresses normal stdout output.
+    /// --argjson values are also available, and $ARGS under
+    /// --jq-extensions, same as the main filter). Suppresses normal stdout
+    /// output.
     ///
     /// Deliberately long-only, unlike real yq's `-s`/`--split-exp`:
     /// succinctly's `-s` is already `--slurp` (#715).

@@ -141,6 +141,17 @@ fn test_env_and_args_under_jq_extensions_and_in_jq_7616() -> Result<()> {
             ][..],
             "1\n",
         ),
+        // The flag reaches an `eval(..)` text too (#7012); without it the row is in `PLAIN_ROWS`.
+        (
+            &[
+                "yq",
+                "--jq-extensions",
+                "-o=json",
+                "-I=0",
+                "eval(\"$ENV.I7616_FOO\")",
+            ][..],
+            "\"bar\"\n",
+        ),
         (&["jq", "-c", "$ENV.I7616_FOO"][..], "\"bar\"\n"),
         (&["jq", "-c", "[$ENV] | length"][..], "1\n"),
         (

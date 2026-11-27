@@ -3365,8 +3365,8 @@ fn stream_yaml_sort_keys_alias_fallback<W: Write>(
 
 /// Evaluate a jq expression on an OwnedValue by converting to JSON and back.
 ///
-/// Variables (`--arg`/`--argjson`, `$ARGS`) are substituted into `expr` up
-/// front in `run_yq`, so this function needs no evaluation context (#284).
+/// Variables (`--arg`/`--argjson`, and `$ARGS` under `--jq-extensions`, #7616) are substituted
+/// into `expr` up front in `run_yq`, so this function needs no evaluation context (#284).
 ///
 /// This is `yq_runner.rs`'s own function (`jq_runner.rs` has an unrelated,
 /// separate `evaluate_input` for jq mode). It always *evaluates* with
