@@ -293,6 +293,90 @@ fn a_write_reads_with_dtf_over_a_once_stage_once_8028() -> Result<()> {
 
 /// `succinctly jq` keeps jq's per-value pipe for its `with_dtf` extension (jq 1.7.1 has no
 /// `with_dtf`): the body runs once per input.
+const PREFIX_INPUT: &str = "s: [A, B]\nm: [{a: 1}, {b: 2}]\nx: [1, 2, 3]\n";
+
+/// The stages of a body before its once-stage run over every node of the context, not over a
+/// stand-in: (filter, yq's `-o json -I0` stdout) over [`PREFIX_INPUT`].
+const PREFIX_ROWS: &[(&str, &str)] = &[
+    (
+        "[.s[] | with_dtf(\"2006\"; test(\"A\") | now)] | length",
+        "1\n",
+    ),
+    (
+        "[.s[] | with_dtf(\"2006\"; downcase | now)] | length",
+        "1\n",
+    ),
+    ("[.m[] | with_dtf(\"2006\"; keys | now)] | length", "1\n"),
+    (
+        "[.s[] | select(. == \"Z\") | with_dtf(\"2006\"; downcase | now)] | length",
+        "1\n",
+    ),
+    (
+        "[.x[] | with_dtf(\"2006\"; tostring | now | tostring)] | length",
+        "1\n",
+    ),
+    (
+        "[.s[] | with_dtf(\"2006\"; downcase | strenv(X))]",
+        "[\"hi\"]\n",
+    ),
+    (
+        ".s | map(with_dtf(\"2006\"; downcase | now)) | length",
+        "1\n",
+    ),
+    (
+        ".y = [.s[] | with_dtf(\"2006\"; downcase | strenv(X))] | .y",
+        "[\"hi\"]\n",
+    ),
+    (
+        "[.s[] | with_dtf(\"2006\"; test(\"A\") | with_dtf(\"2006\"; now))] | length",
+        "1\n",
+    ),
+    (
+        "[.s[] | with_dtf(\"2006\"; with_dtf(\"2006\"; test(\"A\") | now))] | length",
+        "1\n",
+    ),
+    (
+        "[.s[] | with_dtf(\"2006\"; downcase) | with_dtf(\"2006\"; now)] | length",
+        "1\n",
+    ),
+];
+
+/// So an error of theirs over a node surfaces, as yq's `cannot split !!int, can only split strings`.
+const PREFIX_ERROR_ROWS: &[&str] = &[
+    "[.x[] | with_dtf(\"2006\"; split(\"x\") | now)] | length",
+    ".x | map(with_dtf(\"2006\"; split(\"x\") | now)) | length",
+    ".y = [.x[] | with_dtf(\"2006\"; split(\"x\") | strenv(X))] | .y",
+];
+
+#[test]
+fn stages_before_the_once_stage_read_every_node_8028() -> Result<()> {
+    for (filter, want) in PREFIX_ROWS {
+        let got = run(&["-o", "json", "-I0"], filter, PREFIX_INPUT)?;
+        assert_eq!(
+            (got.0.as_str(), got.1.as_str(), got.2),
+            (*want, "", 0),
+            "{filter}"
+        );
+    }
+    for filter in PREFIX_ERROR_ROWS {
+        let got = run(&["-o", "json", "-I0"], filter, PREFIX_INPUT)?;
+        assert_eq!(
+            (got.0.as_str(), got.1.as_str(), got.2),
+            ("", "Error: cannot split !!int, can only split strings\n", 1),
+            "{filter}"
+        );
+    }
+    // yq words this one `!!int has no keys`; the error itself is the point here.
+    let got = run(
+        &["-o", "json", "-I0"],
+        "[.x[] | with_dtf(\"2006\"; to_entries | now)] | length",
+        PREFIX_INPUT,
+    )?;
+    assert_eq!((got.0.as_str(), got.2), ("", 1), "{}", got.1);
+    assert!(got.1.starts_with("Error: "), "{}", got.1);
+    Ok(())
+}
+
 #[test]
 fn jq_mode_reads_with_dtf_per_value_8028() -> Result<()> {
     for (filter, want) in [

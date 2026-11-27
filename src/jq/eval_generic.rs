@@ -24835,14 +24835,27 @@ pub(super) fn is_empty_object_literal(stage: &Expr) -> bool {
 /// `select(false) | env(X)`. [`yq_pipe_has_list_stage`] (the entry check), [`yq_list_stage`] (the
 /// split) and the parser's `map` rewrite all ask it: they must agree on which pipes the walk owns,
 /// or a pipe is sent in that the split then declines. A wrapper yq evaluates over the whole context
-/// is one too when its body holds such a stage ([`yq_once_wrapper_body`], #8028).
+/// is one too when its body starts with such a stage ([`yq_once_wrapper_body`], #8028): the walk
+/// builds the stage over a stand-in, so a body whose once-stage comes after other stages
+/// (`with_dtf(L; test("A") | now)`) is not one here, as those stages would read the stand-in, not
+/// the nodes; the parser cuts such a body at its once-stage first (`yq_once_wrapper_split`).
 pub(super) fn yq_stage_built_once(stage: &Expr) -> bool {
     is_empty_object_literal(stage)
         || matches!(
             unwrap_paren(stage),
             Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now)
         )
-        || yq_once_wrapper_body(unwrap_paren(stage)).is_some_and(yq_has_flat_built_once_stage)
+        || yq_once_wrapper_body(unwrap_paren(stage)).is_some_and(yq_head_built_once)
+}
+
+/// Whether `expr` is a stage [`yq_stage_built_once`] answers, or a parenthesis or pipe whose first
+/// stage is one.
+fn yq_head_built_once(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => yq_head_built_once(inner),
+        Expr::Pipe(stages) => stages.first().is_some_and(yq_head_built_once),
+        other => yq_stage_built_once(other),
+    }
 }
 
 /// The one definition of a wrapper that passes "once per context" through (#8028): the body of
@@ -24851,11 +24864,12 @@ pub(super) fn yq_stage_built_once(stage: &Expr) -> bool {
 /// handed rather than once per node. So the call answers once however many nodes reach it exactly
 /// when `E` holds a stage yq answers once: `[.x[] | with_dtf("2006"; now)]` is one timestamp over
 /// three members in yq, and so are `with_dtf("2006"; now | tostring)` and
-/// `with_dtf("2006"; select(true) | strenv(X))`, where `with_dtf("2006"; .)` and
-/// `with_dtf("2006"; [now])` are three. No other yq operator hands its argument the whole context
-/// and returns what it answers (`(E)` is a parenthesis, which both predicates already look through).
-/// [`yq_stage_built_once`] (the context-list walk) and the parser's `yq_stage_head_once` (its
-/// once-stage rewrite) both ask it, each reading the body with its own notion of a once-stage.
+/// `with_dtf("2006"; test("A") | strenv(X))` (the stages before the once-stage still run over
+/// every node, so `split("x") | now` over integers raises `cannot split`), where
+/// `with_dtf("2006"; .)` and `with_dtf("2006"; [now])` are three. No other yq operator hands its
+/// argument the whole context and returns what it answers (`(E)` is a parenthesis, which both
+/// predicates already look through). [`yq_stage_built_once`] (the context-list walk) and the
+/// parser's `yq_stage_head_once` and `yq_once_wrapper_split` (its once-stage rewrite) all ask it.
 pub(super) fn yq_once_wrapper_body(stage: &Expr) -> Option<&Expr> {
     match stage {
         Expr::Builtin(Builtin::WithDtf(_, body)) => Some(body),
