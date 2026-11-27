@@ -83869,11 +83869,20 @@ fn del_target_shape(expr: &Expr) -> DelTargetShape {
         // `del(env(X), .a)` deletes `.a`.
         Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now) => Parentless,
         Expr::Optional(inner) | Expr::Paren(inner) => del_target_shape(inner),
-        Expr::Pipe(stages) => match stages.last().map(del_target_shape) {
-            Some(Parentless) => Parentless,
-            _ if stages.iter().all(|s| del_target_shape(s) == Navigation) => Navigation,
-            _ => Other,
-        },
+        Expr::Pipe(stages) => {
+            // A trailing `select` hands its input on (#8020): `1 | select(true)` and
+            // `line | select(true)` are still that parentless node, so `del(.a, (1 | select(true)))`
+            // deletes nothing and `del((1 | select(true)), .a)` deletes `.a`, as in yq.
+            let judged = stages
+                .iter()
+                .rposition(|s| !matches!(s, Expr::Builtin(Builtin::Select(_))))
+                .map_or(stages.len(), |at| at + 1);
+            match stages[..judged].last().map(del_target_shape) {
+                Some(Parentless) => Parentless,
+                _ if stages.iter().all(|s| del_target_shape(s) == Navigation) => Navigation,
+                _ => Other,
+            }
+        }
         Expr::Comma(branches) => {
             let mut shape = Navigation;
             for branch in branches {

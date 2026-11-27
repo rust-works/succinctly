@@ -178,6 +178,17 @@ const CURSOR_ROWS: &[(&str, &str)] = &[
     ("del(.a | select(style == \"double\"))", "b: hi\n"),
 ];
 
+/// A `select` after a parentless target hands that node on, so the target still stops the loop:
+/// (filter, yq's stdout over [`QUOTED`]).
+const SELECT_ROWS: &[(&str, &str)] = &[
+    ("del(.a, (1 | select(true)))", QUOTED),
+    ("del((1 | select(true)), .a)", "b: hi\n"),
+    ("del(.a, (1 | select(false)))", "b: hi\n"),
+    ("del(.a, (line | select(true)))", QUOTED),
+    ("del((line | select(true)), .a)", "b: hi\n"),
+    ("del((kind | select(. == \"map\")), .a)", "b: hi\n"),
+];
+
 fn run(args: &[&str], stdin: &str) -> Result<(String, String, i32)> {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
@@ -263,6 +274,14 @@ fn a_metadata_reader_del_target_on_the_owned_route_8020() -> Result<()> {
 #[test]
 fn a_reader_or_literal_beside_a_cursor_selection_is_not_the_document_8020() -> Result<()> {
     for (filter, want) in CURSOR_ROWS {
+        assert_row(&[filter], QUOTED, want)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_select_after_a_parentless_target_still_stops_the_loop_8020() -> Result<()> {
+    for (filter, want) in SELECT_ROWS {
         assert_row(&[filter], QUOTED, want)?;
     }
     Ok(())
