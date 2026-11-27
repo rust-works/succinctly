@@ -46891,9 +46891,12 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         }
         _ => ObjectMapOf::with_capacity(members.len()),
     };
-    // #8002: a body that may re-emit after an empty stage keeps its members to ask about it.
-    let reemits = S::TAG == EvalTag::Yq && yq_pipe_may_reemit(f);
-    let mut listed: Vec<(OwnedValue, OwnedValue)> = Vec::new();
+    // #8002: `map_values(f)` is `.[] |= f` and `with_entries(f)` runs `f` on each entry, so a body
+    // that may re-emit after an empty stage keeps each member to ask about it. (yq's `map(f)` with
+    // such a body never reaches here: the parser spells it `[.[] | f]`, the pipe's own rule.)
+    let reemits = S::TAG == EvalTag::Yq
+        && matches!(family, MapFamily::MapValues | MapFamily::WithEntries)
+        && yq_pipe_may_reemit(f);
     for (component, member) in members {
         let member_id = id.child(&parent, component.clone());
         // #6129: yq's `map_values(f)` is `.[] |= f`, which leaves a member `f` has no output for.
@@ -46920,38 +46923,29 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         if let Flow::Escaped(control) = flow {
             return Some(Flow::Escaped(control));
         }
-        if let Some(kept) = kept {
-            match family {
-                // `map(f)` runs `f` over its members as one list, asked once they have all run.
-                MapFamily::Map => listed.push((component.clone(), kept)),
-                // `map_values(f)` is `.[] |= f` and `with_entries(f)` runs `f` on each entry, so
-                // each member is a context of its own.
-                MapFamily::MapValues | MapFamily::WithEntries if outputs.is_empty() => {
-                    let reemitted = super::eval::yq_reemit_after_empty_stage(f, &mut |prefix| {
-                        yq_positioned_prefix_yields::<S, V>(
-                            prefix,
-                            &kept,
-                            id.child(&parent, component.clone()),
-                            optional,
-                        )
-                    });
-                    if let Some(reemitted) = reemitted {
-                        let flow = eval_each_owned::<S>(
-                            &reemitted,
-                            &OwnedValue::Null,
-                            optional,
-                            Reentry::REBUILT,
-                            &mut |v| {
-                                outputs.push(v);
-                                Demand::Continue
-                            },
-                        );
-                        if let Flow::Escaped(control) = flow {
-                            return Some(Flow::Escaped(control));
-                        }
-                    }
+        if let Some(kept) = kept.filter(|_| outputs.is_empty()) {
+            let reemitted = super::eval::yq_reemit_after_empty_stage(f, &mut |prefix| {
+                yq_positioned_prefix_yields::<S, V>(
+                    prefix,
+                    &kept,
+                    id.child(&parent, component.clone()),
+                    optional,
+                )
+            });
+            if let Some(reemitted) = reemitted {
+                let flow = eval_each_owned::<S>(
+                    &reemitted,
+                    &OwnedValue::Null,
+                    optional,
+                    Reentry::REBUILT,
+                    &mut |v| {
+                        outputs.push(v);
+                        Demand::Continue
+                    },
+                );
+                if let Flow::Escaped(control) = flow {
+                    return Some(Flow::Escaped(control));
                 }
-                MapFamily::MapValues | MapFamily::WithEntries => {}
             }
         }
         match family {
@@ -46970,32 +46964,6 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
                         object.insert(owned_to_string::<S>(&component), value);
                     }
                 }
-            }
-        }
-    }
-    if array.is_empty() && !listed.is_empty() {
-        let reemitted = super::eval::yq_reemit_after_empty_stage(f, &mut |prefix| {
-            for (component, member) in &listed {
-                let member_id = id.child(&parent, component.clone());
-                if yq_positioned_prefix_yields::<S, V>(prefix, member, member_id, optional)? {
-                    return Some(true);
-                }
-            }
-            Some(false)
-        });
-        if let Some(reemitted) = reemitted {
-            let flow = eval_each_owned::<S>(
-                &reemitted,
-                &OwnedValue::Null,
-                optional,
-                Reentry::REBUILT,
-                &mut |v| {
-                    array.push(v);
-                    Demand::Continue
-                },
-            );
-            if let Flow::Escaped(control) = flow {
-                return Some(Flow::Escaped(control));
             }
         }
     }
@@ -47025,8 +46993,9 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
     })
 }
 
-/// Whether the stages before a candidate of yq's empty-stage rule ([`super::eval::yq_reemit_after_empty_stage`],
-/// #8002) yield anything over one member of a positioned map-family body, or `None` when they raise.
+/// Whether the stages before a candidate of yq's empty-stage rule (#8002,
+/// [`super::eval::yq_reemit_after_empty_stage`]) yield anything over one member of a positioned
+/// map-family body, or `None` when they raise.
 fn yq_positioned_prefix_yields<S: EvalSemantics, V: DocumentValue>(
     prefix: &Expr,
     member: &OwnedValue,

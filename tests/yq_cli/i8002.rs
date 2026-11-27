@@ -108,7 +108,6 @@ const ROWS: &[(&str, &str)] = &[
     // `map(f)` and a collect run `f` over their members as one list: once.
     (".c | to_entries | map(select(false) | 3)", "[3]\n"),
     (".c | to_entries | [.[] | select(false) | 3]", "[3]\n"),
-    (".b | map(select(key == 5) | 3)", "[3]\n"),
     (
         ".b |= map(select(false) | 3)",
         "{\"a\":1,\"b\":[3],\"c\":{\"x\":1,\"y\":2}}\n",

@@ -23336,77 +23336,45 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     let mut results = Vec::new();
-    // #8002: yq's `map(f)` runs `f` over its members as one context list, so a literal or `error`
-    // after a stage that matched none of them still runs once (`map(select(false) | 3)` is `[3]`,
-    // #6943); the members are kept only for a body that may answer that way.
-    let mut kept: Option<Vec<StandardJson<'a, W>>> =
-        (S::TAG == EvalTag::Yq && yq_pipe_may_reemit(f)).then(Vec::new);
     for elem in elements {
-        if let Some(kept) = kept.as_mut() {
-            kept.push(elem.clone());
-        }
         // STYLE-0012: `map(f)` is `[.[] | f]` -- array construction, atomic in
         // jq for the same reason `eval_array_construction` is (this function's
         // own `Partial` arm below already says so). `optional` is forwarded
         // into `f`'s evaluation and never consulted here; the inner filter's
         // own `QueryResult::Error` arm returns bare too.
-        let outputs = eval_single::<W, S>(f, elem, optional);
-        if let Err(escape) = push_map_outputs::<W, S>(outputs, &mut results) {
-            return escape;
-        }
-    }
-    if results.is_empty() {
-        if let Some(reemitted) = kept
-            .as_deref()
-            .and_then(|kept| yq_reemit_over_values::<W, S>(f, kept, optional))
-        {
-            let outputs = eval_single::<W, S>(&reemitted, StandardJson::Null, optional);
-            if let Err(escape) = push_map_outputs::<W, S>(outputs, &mut results) {
-                return escape;
+        match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
+            // STYLE-0012: atomic array construction -- see the `map(f)` comment
+            // at the top of this loop.
+            QueryResult::One(v) => match to_owned::<S, _>(&v) {
+                Ok(owned) => results.push(owned),
+                Err(e) => return QueryResult::Error(e),
+            },
+            QueryResult::OneCursor(_) => unreachable!(),
+            QueryResult::Owned(v) => results.push(v),
+            QueryResult::Many(vs) => {
+                for v in &vs {
+                    // STYLE-0012: same array-construction atomicity as the
+                    // `One` arm above.
+                    match to_owned::<S, _>(v) {
+                        Ok(owned) => results.push(owned),
+                        Err(e) => return QueryResult::Error(e),
+                    }
+                }
             }
+            QueryResult::ManyOwned(vs) => results.extend(vs),
+            QueryResult::None => {}
+            QueryResult::Error(e) => return QueryResult::Error(e),
+            QueryResult::Break(label) => return QueryResult::Break(label),
+            QueryResult::Halt(code) => return QueryResult::Halt(code),
+            // `map(f)` is `[.[] | f]` — array construction, atomic in jq
+            // (see `eval_array_construction`) — so a `Partial` just
+            // surfaces its control, same as a bare one.
+            QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
+            QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
+            QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
         }
     }
     QueryResult::Owned(OwnedValue::array_from(results))
-}
-
-/// One member's outputs of `map(f)`'s body, appended to `results` ([`map_over`]), or the result
-/// that ends the map.
-fn push_map_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
-    outputs: QueryResult<'a, W>,
-    results: &mut Vec<OwnedValue>,
-) -> Result<(), QueryResult<'a, W>> {
-    match outputs.materialize_cursor() {
-        // STYLE-0012: atomic array construction -- see the `map(f)` comment
-        // in `map_over`'s loop.
-        QueryResult::One(v) => match to_owned::<S, _>(&v) {
-            Ok(owned) => results.push(owned),
-            Err(e) => return Err(QueryResult::Error(e)),
-        },
-        QueryResult::OneCursor(_) => unreachable!(),
-        QueryResult::Owned(v) => results.push(v),
-        QueryResult::Many(vs) => {
-            for v in &vs {
-                // STYLE-0012: same array-construction atomicity as the
-                // `One` arm above.
-                match to_owned::<S, _>(v) {
-                    Ok(owned) => results.push(owned),
-                    Err(e) => return Err(QueryResult::Error(e)),
-                }
-            }
-        }
-        QueryResult::ManyOwned(vs) => results.extend(vs),
-        QueryResult::None => {}
-        QueryResult::Error(e) => return Err(QueryResult::Error(e)),
-        QueryResult::Break(label) => return Err(QueryResult::Break(label)),
-        QueryResult::Halt(code) => return Err(QueryResult::Halt(code)),
-        // `map(f)` is `[.[] | f]` — array construction, atomic in jq
-        // (see `eval_array_construction`) — so a `Partial` just
-        // surfaces its control, same as a bare one.
-        QueryResult::Partial(_, Control::Error(e)) => return Err(QueryResult::Error(e)),
-        QueryResult::Partial(_, Control::Break(label)) => return Err(QueryResult::Break(label)),
-        QueryResult::Partial(_, Control::Halt(code)) => return Err(QueryResult::Halt(code)),
-    }
-    Ok(())
 }
 
 fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -52014,7 +51982,8 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // own (`.x = (.a.zz | true)` is `x: true` in real yq, see
     // `yq_empty_context_reemit`). The rewrite reads nothing from the input,
     // so it is evaluated against `null` inside this same still-open scope.
-    if S::READ_ONLY_ABSENT_KEY_IS_EMPTY && matches!(evaluated, QueryResult::None) {
+    // #8002: an empty fan-out (`.a[]` over `[]`) answers an empty list rather than `None`.
+    if S::READ_ONLY_ABSENT_KEY_IS_EMPTY && query_result_is_empty(&evaluated) {
         if let Some(reemit) = yq_empty_context_reemit(value_expr) {
             evaluated =
                 eval_owned_input::<W, S>(&reemit, &OwnedValue::Null, optional, Reentry::REBUILT)
