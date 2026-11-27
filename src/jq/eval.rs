@@ -102501,12 +102501,18 @@ fn reduce_list_yq<S: EvalSemantics>(
         accumulators.push(seed);
         Demand::Continue
     });
-    // #8022: INIT's failure, an UPDATE step's and a binding's are each held while the rest of the
-    // source is read, since yq has read all of it before INIT and an error in it wins.
-    let mut failure: Option<Control> = match init_flow {
-        Flow::Escaped(control) => Some(control),
-        _ => None,
-    };
+    // #8022: INIT's error, an UPDATE step's and a binding's are each held while the rest of the
+    // source is read, since yq has read all of it before INIT and an error in it wins. A
+    // `break`, a `halt` and the step budget's refusal are not held: yq has none of them, and
+    // each ends the fold at once ([`held_until_the_source_ends`]).
+    let mut failure: Option<Control> = None;
+    if let Flow::Escaped(control) = init_flow {
+        if !held_until_the_source_ends(&control) {
+            return finish_fork_flow(Some(control), optional);
+        }
+        failure = Some(control);
+    }
+    let mut immediate: Option<Control> = None;
 
     // The list's growth is what is charged: a step on one accumulator is free, as the first fork of
     // jq's fold is, and each accumulator past the first spends a unit, so a union in UPDATE that
@@ -102514,11 +102520,12 @@ fn reduce_list_yq<S: EvalSemantics>(
     // process dies (`ireduce (0; (. + 1, . + 2))` over 30 elements is 2^30).
     let mut extra_budget = REDUCE_FOREACH_MAX_STEPS;
     let source_flow = drive_source(SourceInput::Real, &mut |element| {
-        // Nothing left to fold (INIT yielded nothing, or UPDATE dropped every accumulator) or a
-        // failure held: the element is read only for the error a later one may raise.
+        // Nothing left to fold (INIT yielded nothing, or UPDATE dropped every accumulator) or an
+        // error held: the element is read only for the error a later one may raise.
         if failure.is_some() || accumulators.is_empty() {
             return Demand::Continue;
         }
+        let mut step_failure: Option<Control> = None;
         let sets_flow = each_pattern_binding_set::<S>(pattern, &element, false, &mut |bindings| {
             let current = core::mem::take(&mut accumulators);
             let stepped: Result<Vec<OwnedValue>, Control> = if current.len() == 1 {
@@ -102546,8 +102553,9 @@ fn reduce_list_yq<S: EvalSemantics>(
                 Ok(next) => {
                     let extra = next.len().saturating_sub(1);
                     if extra > extra_budget {
-                        // #2132: uncatchable, as every step budget's.
-                        failure = Some(Control::Error(iterations_refusal("reduce")));
+                        // #2132: uncatchable, as every step budget's, so it ends the fold at
+                        // once rather than waiting for the source's own errors.
+                        step_failure = Some(Control::Error(iterations_refusal("reduce")));
                         return Demand::Stop;
                     }
                     extra_budget -= extra;
@@ -102560,17 +102568,30 @@ fn reduce_list_yq<S: EvalSemantics>(
                     }
                 }
                 Err(control) => {
-                    failure = Some(control);
+                    step_failure = Some(control);
                     Demand::Stop
                 }
             }
         });
         if let Flow::Escaped(control) = sets_flow {
-            failure.get_or_insert(control);
+            step_failure.get_or_insert(control);
         }
-        Demand::Continue
+        match step_failure {
+            Some(control) if held_until_the_source_ends(&control) => {
+                failure = Some(control);
+                Demand::Continue
+            }
+            Some(control) => {
+                immediate = Some(control);
+                Demand::Stop
+            }
+            None => Demand::Continue,
+        }
     });
-    // An error in the source outranks every failure held above (#8022).
+    if let Some(control) = immediate {
+        return finish_fork_flow(Some(control), optional);
+    }
+    // An error in the source outranks every error held above (#8022).
     if let Flow::Escaped(control) = source_flow {
         return finish_fork_flow(Some(control), optional);
     }
@@ -102583,6 +102604,14 @@ fn reduce_list_yq<S: EvalSemantics>(
         }
     }
     finish_fork_flow(None, optional)
+}
+
+/// Whether a yq fold holds `control` while it reads the rest of its source, which outranks it
+/// (#8022): an ordinary error, which yq raises only after it has read the whole source. A
+/// `break` and a `halt` (`--jq-extensions` builtins yq has no form of) and the step budget's
+/// uncatchable refusal (#2132) end the fold at once, as they do in jq's `reduce`.
+fn held_until_the_source_ends(control: &Control) -> bool {
+    matches!(control, Control::Error(error) if !error.is_resource_limit())
 }
 
 /// The tail both fold cores share: adjudicate the fork verdict `terminal`

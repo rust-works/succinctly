@@ -186,3 +186,42 @@ fn jq_reduce_keeps_init_first_8022() -> Result<()> {
     );
     Ok(())
 }
+
+/// Only an ordinary error waits for the rest of the source. A `break` and a `halt` (behind
+/// `--jq-extensions`; yq has neither) end the fold at once, as in jq's `reduce` (jq 1.7.1: nothing,
+/// and `bye`), so a later error in the source never outranks them and an endless source stops at
+/// the `break`.
+#[test]
+fn break_and_halt_end_the_fold_at_once_8022() -> Result<()> {
+    let ext = &["--jq-extensions", "-n", "-o", "json", "-I0"];
+    for filter in [
+        "label $f | (1, 2, error(\"s\")) as $x ireduce (0; break $f)",
+        "label $f | range(infinite) as $x ireduce (0; break $f)",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "", ext)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("", "", 0),
+            "{filter}"
+        );
+    }
+    let filter = "(1, error(\"s\")) as $x ireduce (0; \"bye\" | halt_error)";
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "", ext)?;
+    assert_eq!((stdout.as_str(), stderr.as_str(), code), ("", "bye", 1));
+    Ok(())
+}
+
+/// The step budget's refusal (#2132) is uncatchable and ends the fold at once: a union in UPDATE
+/// that doubles the list past 100,000 accumulators over 20 elements is refused before the
+/// source's own error is read.
+#[test]
+fn the_step_budget_refusal_is_not_held_8022() -> Result<()> {
+    let input = format!("{:?}\n", (0..20).collect::<Vec<i32>>());
+    let filter = "(.[], error(\"s\")) as $x ireduce (0; (. + 1, . + 2))";
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, &input, JSON)?;
+    assert_eq!(
+        (stdout.as_str(), stderr.trim_end(), code),
+        ("", "Error: reduce: maximum iterations exceeded", 1)
+    );
+    Ok(())
+}
