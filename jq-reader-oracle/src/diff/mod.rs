@@ -238,6 +238,12 @@ fn spawn(
             break s;
         }
         if start.elapsed() > Duration::from_secs(10) {
+            // The child leads its own process group (`limit_child`): kill the whole group.
+            let pgid = libc::pid_t::try_from(child.id()).unwrap_or(0);
+            if pgid > 0 {
+                // SAFETY: a plain syscall on a process group this harness created.
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            }
             let _ = child.kill();
             let _ = child.wait();
             if let Some(w) = writer {
@@ -268,10 +274,11 @@ fn exit_code(s: std::process::ExitStatus) -> i32 {
     s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
 }
 
-/// No core dumps (a limit of 1, which a piped `core_pattern` also honours) and 2 GiB of address
-/// space for each child.
+/// Each child gets its own process group (killed whole on a timeout), no core dumps (a limit of
+/// 1, which a piped `core_pattern` also honours) and 2 GiB of address space.
 fn limit_child(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
     // SAFETY: `setrlimit` is async-signal-safe; nothing else runs between fork and exec.
     unsafe {
         cmd.pre_exec(|| {
