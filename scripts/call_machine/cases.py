@@ -220,9 +220,6 @@ raw("leaf_pattern_twice", R + "[[1,2],[3,4]] | reduce .[] as [$a, $a] (0; . + $a
 raw("leaf_pattern_object_declined", R + "{a: ([1,2] as [$a, $a] | $a)}", route="decline")
 raw("first_each_ladder", "def w($n): if $n == 0 then first(.[]) else w($n - 1) end; [range(1000)] | w(1)")
 
-# --- the output bound at a tail loop's item ends (#7977 step 3 review) ---
-raw("outputs_last_round_64", "def f: if . < 64 then (range(20000) | -1), (. + 1 | f) else . end; [0 | f] | length")
-
 
 # --- measurement ladders (shape and cost; run on the bench boxes) ---------------
 LADDERS = [

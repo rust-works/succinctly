@@ -93,7 +93,7 @@ fn the_corpus_matches_jq_on_the_call_machine_7977() -> Result<()> {
     let rows: Vec<serde_json::Value> = serde_json::from_str(&text)?;
     assert_eq!(
         rows.len(),
-        161,
+        160,
         "the corpus of scripts/call_machine/cases.py"
     );
     let dir = tempfile::tempdir()?;

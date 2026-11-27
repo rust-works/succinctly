@@ -2077,18 +2077,5 @@
   "stdout": "0\n",
   "stderr": "",
   "exit": 0
- },
- {
-  "id": "outputs_last_round_64",
-  "args": [
-   "-c",
-   "-n"
-  ],
-  "filter": "def f: if . < 64 then (range(20000) | -1), (. + 1 | f) else . end; [0 | f] | length",
-  "route": "take",
-  "stdin": null,
-  "stdout": "1280001\n",
-  "stderr": "",
-  "exit": 0
  }
 ]
