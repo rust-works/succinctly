@@ -55854,7 +55854,11 @@ fn ambient_update_ancestor(path: &[OwnedValue], len: usize) -> Option<OwnedValue
             for component in path.get(entry.base_len..len)? {
                 cur = owned_component(cur, component)?;
             }
-            return Some(cur.clone());
+            // A scalar there (the `null` a target was created as) holds none of the path below
+            // it: the filter navigated through a node yq would create and this snapshot never did
+            // (#2435), so nothing is there, as for a missing component.
+            return matches!(cur, OwnedValue::Array(_) | OwnedValue::Object(_))
+                .then(|| cur.clone());
         }
         ancestry.clone_from(&entry.outer);
     }
