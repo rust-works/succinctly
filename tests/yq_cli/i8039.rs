@@ -20,6 +20,7 @@ use crate::{run_jq_stdin, run_jq_stdin_with_stderr, run_yq_stdin};
 const FLAT: &str = "{\"a\":1,\"b\":5}";
 const NESTED: &str = "{\"a\":{\"b\":{\"c\":1},\"d\":2}}";
 const LIST: &str = "{\"a\":[1,2,3]}";
+const SPINE: &str = "{\"x\":{\"b\":{\"c\":1},\"d\":2}}";
 
 /// (input, filter, yq's stdout with `-p=json -o=json -I0`).
 const ROWS: &[(&str, &str, &str)] = &[
@@ -132,6 +133,64 @@ const ROWS: &[(&str, &str, &str)] = &[
         "{\"a\":[[\"a\",0],[\"a\",1],[\"a\",2]]}\n",
     ),
     (LIST, ".a[] |= (. |= key)", "{\"a\":[0,1,2]}\n"),
+    // An update whose own reads cannot all be resolved at its target still names it for the
+    // updates nested in its filter: after a write, through navigation, `to_entries` and a binding.
+    (
+        SPINE,
+        "with(.x; . |= (.d = 1 | .b |= path))",
+        "{\"x\":{\"b\":[\"x\",\"b\"],\"d\":1}}\n",
+    ),
+    (
+        SPINE,
+        "with(.x; . |= (.b | .c |= path))",
+        "{\"x\":{\"c\":[\"x\",\"b\",\"c\"]}}\n",
+    ),
+    (
+        SPINE,
+        ".x |= (. |= (.b | . |= path))",
+        "{\"x\":[\"x\",\"b\"]}\n",
+    ),
+    (
+        SPINE,
+        ".x |= (. |= (to_entries | .[0] |= path))",
+        "{\"x\":[[\"x\",0],{\"key\":\"d\",\"value\":2}]}\n",
+    ),
+    (
+        SPINE,
+        ".x |= (. as $v | . |= (.b | . |= path))",
+        "{\"x\":[\"x\",\"b\"]}\n",
+    ),
+    (
+        SPINE,
+        ".x |= (.b |= (.c | . |= path))",
+        "{\"x\":{\"b\":[\"x\",\"b\",\"c\"],\"d\":2}}\n",
+    ),
+    (
+        SPINE,
+        ".x |= (.b |= (.d = 1 | .c |= path))",
+        "{\"x\":{\"b\":{\"c\":[\"x\",\"b\",\"c\"],\"d\":1},\"d\":2}}\n",
+    ),
+    (
+        SPINE,
+        ".x |= (.b |= (.c |= path, (5 | key)))",
+        "{\"x\":{\"b\":{\"c\":[\"x\",\"b\",\"c\"]},\"d\":2}}\n",
+    ),
+    (
+        SPINE,
+        "with(.x.b; .d = 1 | .c |= key)",
+        "{\"x\":{\"b\":{\"c\":\"c\",\"d\":1},\"d\":2}}\n",
+    ),
+    // A scalar the body builds still has no position under such an update.
+    (
+        SPINE,
+        ".x |= (.b |= (5 | . |= key))",
+        "{\"x\":{\"b\":5,\"d\":2}}\n",
+    ),
+    (
+        SPINE,
+        ".x |= (.b |= (5 | . |= path))",
+        "{\"x\":{\"b\":[],\"d\":2}}\n",
+    ),
 ];
 
 #[test]

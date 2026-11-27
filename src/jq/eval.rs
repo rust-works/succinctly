@@ -55848,7 +55848,7 @@ fn ambient_update_ancestor(path: &[OwnedValue], len: usize) -> Option<OwnedValue
     let mut ancestry = super::eval_generic::ambient_update_ancestry();
     while let Some(entry) = ancestry.take() {
         if entry.base_len <= len {
-            let mut cur = &entry.pre;
+            let mut cur: &OwnedValue = &entry.pre;
             for component in path.get(entry.base_len..len)? {
                 cur = owned_component(cur, component)?;
             }
