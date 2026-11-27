@@ -2,7 +2,8 @@
 
 CORRECT: the machine must give jq 1.7.1's stdout, stderr and exit status on each.
   `route` says whether the machine is expected to take the program ("take") or to decline it
-  ("decline": the shipped evaluators answer). The machine may take more of them, never fewer of
+  ("decline": the shipped evaluators answer), or whether jq rejects it at compile time, before any
+  route is decided ("compile-error"). The machine may take more of them, never fewer of
   the "take" set.
 LADDERS: the measurement ladders (`ladders.py`, run on the bench boxes). `{N}` is replaced.
 
@@ -185,6 +186,19 @@ raw("dup_foreach", R + "[foreach ([1,2],[3,4]) as [$a, $a] (0; . + $a)]")
 raw("range2_negate", R + "range(0;1) | -.")
 raw("range3_negate", R + "[range(0;3;1) | -.]")
 raw("range2_pairs", R + "[range(0;2) | [., -.]]")
+
+# --- from the re-review of #7984 ---
+raw("leaf_halt_error_first", R + r'first({a: (1, ("bye\n" | halt_error(1)))})', route="decline")
+raw("leaf_halt_error_interp", R + r'first("\(1, ("bye\n" | halt_error(1)))")', route="decline")
+raw("range3_negate_var", R + "0 as $x | [range($x; 2; 1) | -.]")
+raw("range3_negate_input", R + "[0 | range(.;3;1) | -.]")
+raw("range3_negate_gen", R + "[range((0,1);3;1) | -.]")
+raw("range3_negate_param", R + "def g($n): [range($n; 2; 1) | -.]; g(0)")
+raw("pattern_key_outer", R + '"z" as $x | {"a":"b","b":"c","z":9} as {a: $x, ($x): $y} | [$x, $y]')
+raw("pattern_key_outer_shorthand", R + '"z" as $x | {"x":1,"z":9} as {$x, ($x): $y} | [$x,$y]')
+raw("pattern_key_outer_reduce", R + '"z" as $x | reduce ({"a":"b","z":1},{"a":"c","z":2}) as {a: $x, ($x): $y} (0; . + $y)')
+raw("pattern_key_outer_nested", R + '"z" as $x | {"a":{"k":"b"},"z":5} as {a: {k: $x}, ($x): $y} | [$x,$y]')
+raw("pattern_key_unbound", R + '{"a":"b"} as {a: $x, ($x): $y} | $y', route="compile-error")
 
 
 # --- measurement ladders (shape and cost; run on the bench boxes) ---------------

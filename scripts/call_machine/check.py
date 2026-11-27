@@ -12,7 +12,8 @@ the same golden file through the test binary, so CI checks what this script chec
 `check` runs each case, with its standard input if it has one, under `SUCCINCTLY_CALL_MACHINE=1`
 (`=0` with `--off`) and `SUCCINCTLY_DEBUG_CALL_MACHINE_LOG` naming a file, from which it reads the
 machine's routing decisions. With the switch on, a case is ok when the three answers equal jq's
-and every decision is `taken` for a "take" case, `declined` for a "decline" one. With `--off` no
+and every decision is `taken` for a "take" case, `declined` for a "decline" one, with none for a
+"compile-error" one. With `--off` no
 decision may be made, and a case whose `off_known` says why the shipped route answers otherwise
 (`deep_ok_10000`, refused at the native-stack floor) is reported `known`, not a failure.
 
@@ -82,10 +83,11 @@ def check(binary, off=False):
         same = got == want
         if off:
             route_ok = not decisions
-        elif c["route"] == "take":
-            route_ok = bool(decisions) and all(d == "taken" for d in decisions)
+        elif c["route"] == "compile-error":
+            route_ok = not decisions
         else:
-            route_ok = bool(decisions) and all(d == "declined" for d in decisions)
+            want_decision = "taken" if c["route"] == "take" else "declined"
+            route_ok = bool(decisions) and all(d == want_decision for d in decisions)
         if not same:
             status = "known" if off and c.get("off_known") else "WRONG"
         else:
@@ -103,13 +105,20 @@ def check(binary, off=False):
 
 
 def main(argv):
-    if len(argv) >= 2 and argv[1] == "capture":
-        jq = argv[argv.index("--jq") + 1] if "--jq" in argv else JQ
-        capture(jq)
+    import argparse
+
+    ap = argparse.ArgumentParser(description="The call machine's corpus gate against jq 1.7.1.")
+    sub = ap.add_subparsers(dest="command", required=True)
+    cap = sub.add_parser("capture", help="record jq's answers into the golden file")
+    cap.add_argument("--jq", default=JQ)
+    chk = sub.add_parser("check", help="run `BIN jq ...` on every case and compare")
+    chk.add_argument("binary")
+    chk.add_argument("--off", action="store_true", help="with SUCCINCTLY_CALL_MACHINE=0")
+    a = ap.parse_args(argv[1:])
+    if a.command == "capture":
+        capture(a.jq)
         return 0
-    if len(argv) >= 3 and argv[1] == "check":
-        return 1 if check(argv[2], "--off" in argv) else 0
-    sys.exit(__doc__)
+    return 1 if check(a.binary, a.off) else 0
 
 
 if __name__ == "__main__":
