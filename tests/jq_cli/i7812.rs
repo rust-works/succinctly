@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::cargo_run_exit::succinctly_bin;
+use crate::small_window;
 
 /// What a run over an endless stream may hold before it is killed: it answers holding the look-ahead and
 /// a few windows, and the route that read on for the close grew without bound.
@@ -68,7 +69,25 @@ enum Route {
     Terminal,
 }
 
+/// The reader's window a run over an endless stream uses: the shipped one, or the debug build's small one
+/// ([`small_window`]), which brings the look-ahead a run reads before its open-value check to a quarter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Window {
+    Shipped,
+    Small,
+}
+
 fn over_endless(
+    route: Route,
+    args: &[&str],
+    head: &[u8],
+    fill: &'static [u8],
+) -> (String, String, i32) {
+    over_endless_with(Window::Shipped, route, args, head, fill)
+}
+
+fn over_endless_with(
+    window: Window,
     route: Route,
     args: &[&str],
     head: &[u8],
@@ -81,6 +100,9 @@ fn over_endless(
         String::from_utf8_lossy(&head[..head.len().min(20)])
     );
     let mut command = jq(args);
+    if window == Window::Small {
+        small_window::apply(&mut command);
+    }
     let (stdout, stderr, code, name, placeholder) = match route {
         Route::Pipe => {
             command.stdin(Stdio::piped());
@@ -157,57 +179,119 @@ fn at(route: Route) -> &'static str {
 
 const ROUTES: [Route; 3] = [Route::Pipe, Route::Fifo, Route::Terminal];
 
-#[test]
-fn a_fault_inside_a_container_that_never_closes_is_reported_7812() {
-    for (head, message) in [
-        (&b"[tru,"[..], "Invalid literal at line 1, column 5"),
-        (&b"{x"[..], "Invalid numeric literal at line 1, column 4"),
-        (&b"[1 2"[..], "Invalid numeric literal at line 1, column 6"),
-        (
-            &b"{\"a\" 1"[..],
-            "Invalid numeric literal at line 1, column 8",
-        ),
-        (
-            &b"[{\"a\":[1,"[..],
-            "Invalid numeric literal at line 1, column 11",
-        ),
-        (
-            &b"[1,2,3\n"[..],
-            "Invalid numeric literal at line 2, column 2",
-        ),
-        (
-            &b"{\"a\":\n1 2"[..],
-            "Invalid numeric literal at line 2, column 5",
-        ),
-    ] {
-        // A terminal is read a line a read, which is slow to the look-ahead: two shapes there.
-        let routes: &[Route] = if head == b"[tru," || head == b"{\"a\":\n1 2" {
-            &ROUTES
-        } else {
-            &ROUTES[..2]
-        };
-        for &route in routes {
-            let line = if message.contains("line 2") { 2 } else { 1 };
+/// Every run of a fault inside an open container: `-c .` on the plain filter's route and `input` and
+/// `[inputs]` on the lazy `input` route, over each of `routes`, answered as jq 1.7.1 answers.
+fn assert_fault_reported(window: Window, routes: &[Route], head: &[u8], message: &str) {
+    let line = if message.contains("line 2") { 2 } else { 1 };
+    for &route in routes {
+        assert_eq!(
+            over_endless_with(window, route, &["-c", "."], head, FILL),
+            (String::new(), format!("jq: parse error: {message}\n"), 5),
+            "-c . {route:?} {window:?} {:?}",
+            String::from_utf8_lossy(head)
+        );
+        for program in ["input", "[inputs]"] {
             assert_eq!(
-                over_endless(route, &["-c", "."], head, FILL),
-                (String::new(), format!("jq: parse error: {message}\n"), 5),
-                "-c . {route:?} {:?}",
+                over_endless_with(window, route, &["-n", "-c", program], head, FILL),
+                (
+                    String::new(),
+                    format!("jq: error (at {}:{line}): {message}\n", at(route)),
+                    5
+                ),
+                "-n {program} {route:?} {window:?} {:?}",
                 String::from_utf8_lossy(head)
             );
-            for program in ["input", "[inputs]"] {
-                assert_eq!(
-                    over_endless(route, &["-n", "-c", program], head, FILL),
-                    (
-                        String::new(),
-                        format!("jq: error (at {}:{line}): {message}\n", at(route)),
-                        5
-                    ),
-                    "-n {program} {route:?} {:?}",
-                    String::from_utf8_lossy(head)
-                );
-            }
         }
     }
+}
+
+// The cases below ran as one test of 48 runs, the last of `jq_cli_tests` to finish: at least 548 s on
+// the macOS merge-queue leg and 408 s under coverage on x86_64, longer than the rest of the binary's
+// tail (#7979). Each shape is now its own test, so they run side by side, and all but the first run on
+// the small window, which reads a quarter of the look-ahead before the open-value check. The first
+// keeps the shipped window over a pipe and a FIFO, so the shipped constants still reach the fault
+// end to end; `a_long_valid_value_is_read_to_its_close_7812` and
+// `stream_and_raw_input_answer_as_before_7812` also run on them. A terminal is read a line a read,
+// which is slow to the look-ahead: two shapes there.
+
+#[test]
+fn a_fault_inside_a_container_that_never_closes_is_reported_7812() {
+    assert_fault_reported(
+        Window::Shipped,
+        &ROUTES[..2],
+        b"[tru,",
+        "Invalid literal at line 1, column 5",
+    );
+}
+
+#[test]
+fn a_bad_literal_in_an_open_array_is_reported_7812() {
+    assert_fault_reported(
+        Window::Small,
+        &ROUTES,
+        b"[tru,",
+        "Invalid literal at line 1, column 5",
+    );
+}
+
+#[test]
+fn a_bad_key_in_an_open_object_is_reported_7812() {
+    assert_fault_reported(
+        Window::Small,
+        &ROUTES[..2],
+        b"{x",
+        "Invalid numeric literal at line 1, column 4",
+    );
+}
+
+#[test]
+fn a_missing_comma_in_an_open_array_is_reported_7812() {
+    assert_fault_reported(
+        Window::Small,
+        &ROUTES[..2],
+        b"[1 2",
+        "Invalid numeric literal at line 1, column 6",
+    );
+}
+
+#[test]
+fn a_missing_colon_in_an_open_object_is_reported_7812() {
+    assert_fault_reported(
+        Window::Small,
+        &ROUTES[..2],
+        b"{\"a\" 1",
+        "Invalid numeric literal at line 1, column 8",
+    );
+}
+
+#[test]
+fn a_fault_in_nested_open_containers_is_reported_7812() {
+    assert_fault_reported(
+        Window::Small,
+        &ROUTES[..2],
+        b"[{\"a\":[1,",
+        "Invalid numeric literal at line 1, column 11",
+    );
+}
+
+#[test]
+fn a_fault_on_the_second_line_of_an_open_array_is_reported_7812() {
+    assert_fault_reported(
+        Window::Small,
+        &ROUTES[..2],
+        b"[1,2,3\n",
+        "Invalid numeric literal at line 2, column 2",
+    );
+}
+
+#[test]
+fn a_fault_on_the_second_line_of_an_open_object_is_reported_7812() {
+    assert_fault_reported(
+        Window::Small,
+        &ROUTES,
+        b"{\"a\":\n1 2",
+        "Invalid numeric literal at line 2, column 5",
+    );
 }
 
 /// `--stream` read a chunk at a time already, and answers the same; `-R` reads lines, which the open
