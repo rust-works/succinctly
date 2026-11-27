@@ -11,9 +11,10 @@ the same golden file through the test binary, so CI checks what this script chec
 
 `check` runs each case, with its standard input if it has one, under `SUCCINCTLY_CALL_MACHINE=1`
 (`=0` with `--off`) and `SUCCINCTLY_DEBUG_CALL_MACHINE_LOG` naming a file, from which it reads the
-machine's routing decisions. With the switch on, a case is ok when the three answers equal jq's
-and every decision is `taken` for a "take" case, `declined` for a "decline" one, with none for a
-"compile-error" one. With `--off` no
+machine's routing decisions and compilations. With the switch on, a case is ok when the three
+answers equal jq's and the run decides once, `taken` for a "take" case and `declined` for a
+"decline" one, with no decision for a "compile-error" one; a run compiles at most once, whatever its
+number of documents (#7977 step 5). With `--off` no
 decision may be made, and a case whose `off_known` says why the shipped route answers otherwise
 (`deep_ok_10000`, refused at the native-stack floor) is reported `known`, not a failure.
 
@@ -73,21 +74,23 @@ def check(binary, off=False):
         env = dict(os.environ, LC_ALL="C", **{SWITCH: "0" if off else "1", LOG: log.name})
         got = run([binary, "jq"] + c["args"] + [c["filter"]], env, c["stdin"])
         with open(log.name) as f:
-            decisions = f.read().split()
+            events = f.read().split()
         os.unlink(log.name)
+        decisions = [e for e in events if e != "compiled"]
+        compiles = len(events) - len(decisions)
         taken = "taken" in decisions
         want = golden.get(c["id"])
         if want is None or any(want[k] != c[k] for k in ("filter", "args", "route", "stdin")):
             sys.exit(f"{c['id']}: {GOLDEN} is stale, run `check.py capture`")
         want = dict(stdout=want["stdout"], stderr=want["stderr"], exit=want["exit"])
         same = got == want
-        if off:
-            route_ok = not decisions
-        elif c["route"] == "compile-error":
-            route_ok = not decisions
+        if off or c["route"] == "compile-error":
+            route_ok = not events
         else:
             want_decision = "taken" if c["route"] == "take" else "declined"
-            route_ok = bool(decisions) and all(d == want_decision for d in decisions)
+            # A program the machine takes is compiled to be taken; one it declines may have
+            # been declined before compiling (no recursive `def`).
+            route_ok = decisions == [want_decision] and compiles == (1 if c["route"] == "take" else min(compiles, 1))
         if not same:
             status = "known" if off and c.get("off_known") else "WRONG"
         else:

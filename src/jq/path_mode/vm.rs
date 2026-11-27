@@ -38,8 +38,12 @@
 //! backtrack.
 //!
 //! The machine runs only once a caller turns it on ([`super::set_call_machine`]; the CLI does so
-//! for `SUCCINCTLY_CALL_MACHINE`, #7961). Off, the default, [`takes`] is never asked and nothing
+//! for `SUCCINCTLY_CALL_MACHINE`, #7961). Off, the default, [`decide`] is never asked and nothing
 //! here runs.
+//!
+//! A program is compiled once, by [`decide`], and the [`Compiled`] code it answers is what [`run`]
+//! runs. The code owns what it holds and nothing in it changes as it runs, so a run whose route is
+//! pinned keeps it with the pin and runs it on every document (#7977 step 5).
 
 use super::*;
 
@@ -377,10 +381,10 @@ enum Flow {
     Stop,
 }
 
-/// The machine's state for one run of one program.
+/// The machine's state for one run of one program on one document.
 struct Vm<'c, 'e> {
     it: &'c Interp<'e>,
-    code: &'c Code<'e>,
+    code: &'e Code,
     data: Stack<OwnedValue>,
     frames: Stack<FrameRec>,
     slots: Vec<Slot>,
@@ -492,28 +496,41 @@ fn element(container: &OwnedValue, i: usize) -> OwnedValue {
     }
 }
 
-/// Run `program` on `input`, a prepared document, on the machine, handing each output to
-/// `on_value` (which answers whether it wants more). Asked only for a program [`takes`]
-/// accepted.
+/// A program the machine takes, compiled ([`decide`]): what [`run`] runs, on as many documents as
+/// the caller keeps it for.
+pub(super) struct Compiled {
+    code: Code,
+    /// [`hands_out_keys`] of the program, which [`Interp::prepare`] asks for each document.
+    keys: bool,
+}
+
+impl Compiled {
+    /// Whether the program can hand a key out ([`hands_out_keys`]), decided with the code.
+    pub(super) fn hands_out_keys(&self) -> bool {
+        self.keys
+    }
+}
+
+/// Run `program`, compiled ([`decide`]), on `input`, a prepared document, on the machine,
+/// handing each output to `on_value` (which answers whether it wants more).
 ///
 /// Out of line and cold, so the shipped routes' frames do not grow by the machine's.
 #[cold]
 #[inline(never)]
 pub(super) fn run<'e>(
     it: &Interp<'e>,
-    program: &'e Expr,
+    program: &'e Compiled,
     input: OwnedValue,
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
 ) -> R {
-    let code = compile::compile(it, program).map_err(unsupported)?;
-    run_code(SHIPPED, it, &code, input, on_value)
+    run_code(SHIPPED, it, &program.code, input, on_value)
 }
 
 /// [`run`] of a compiled program, within `limits`.
-fn run_code(
+fn run_code<'e>(
     limits: Limits,
-    it: &Interp<'_>,
-    code: &Code<'_>,
+    it: &Interp<'e>,
+    code: &'e Code,
     input: OwnedValue,
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
 ) -> R {
@@ -521,7 +538,7 @@ fn run_code(
 }
 
 impl<'c, 'e> Vm<'c, 'e> {
-    fn new(it: &'c Interp<'e>, code: &'c Code<'e>, limits: Limits) -> Self {
+    fn new(it: &'c Interp<'e>, code: &'e Code, limits: Limits) -> Self {
         Self {
             it,
             code,
@@ -635,7 +652,7 @@ impl<'c, 'e> Vm<'c, 'e> {
         match func.loop_name {
             Some(name) => Raise::Fatal(iterations_refusal(name)),
             None if func.prelude || func.name.is_empty() => self.current_def(),
-            None => refusal(func.name, func.arity),
+            None => refusal(&func.name, func.arity),
         }
     }
 
@@ -674,7 +691,7 @@ impl<'c, 'e> Vm<'c, 'e> {
             let fr = self.frames.data[f as usize].value;
             let func = &self.code.funcs[fr.func as usize];
             if !func.name.is_empty() && !func.prelude {
-                return refusal(func.name, func.arity);
+                return refusal(&func.name, func.arity);
             }
             f = self.frames.data[f as usize].next as isize;
         }
@@ -1140,7 +1157,7 @@ impl<'c, 'e> Vm<'c, 'e> {
                 return Err(Raise::Fatal(iterations_refusal("repeat")));
             }
             if counts.taken() >= OUTPUT_BUDGET_AFTER_ROUNDS as u32 && entry.bounds_outputs() {
-                return Err(loop_outputs_refusal(entry.name));
+                return Err(loop_outputs_refusal(&entry.name));
             }
         }
         counts.emitted = counts.emitted.saturating_add(1);
@@ -1151,11 +1168,12 @@ impl<'c, 'e> Vm<'c, 'e> {
     /// once, the rest (and an error after them) become a [`Kind::Values`] fork point.
     #[inline(never)]
     fn leaf(&mut self, k: u32, pc: usize) -> Result<Flow, Raise> {
-        let leaf = &self.code.leaves[k as usize];
+        let code = self.code;
+        let leaf = &code.leaves[k as usize];
         let input = self.data.pop();
         let mut env = Env::default();
-        for &(name, level, idx) in &leaf.vars {
-            let v = self.value(level, idx);
+        for (name, level, idx) in &leaf.vars {
+            let v = self.value(*level, *idx);
             env = env.var_ref(name, v);
         }
         let mut first = None;
@@ -1163,7 +1181,7 @@ impl<'c, 'e> Vm<'c, 'e> {
         let mut full = false;
         let end = self
             .it
-            .eval(leaf.expr, &env, input, Reg::top(), &mut |v, _| {
+            .eval(&leaf.expr, &env, input, Reg::top(), &mut |v, _| {
                 if first.is_none() {
                     first = Some(v);
                 } else {
@@ -1357,7 +1375,7 @@ impl<'c, 'e> Vm<'c, 'e> {
         if f.name.is_empty() || f.prelude {
             self.current_def()
         } else {
-            refusal(f.name, f.arity)
+            refusal(&f.name, f.arity)
         }
     }
 
@@ -1655,74 +1673,54 @@ pub(super) fn set_switched_on(on: bool) {
     ON.store(on, Ordering::Relaxed);
 }
 
-/// The function told of each routing decision while the machine is on
+/// The function told of each routing decision and each compilation while the machine is on
 /// ([`super::observe_call_machine`]).
 #[cfg(feature = "std")]
-static OBSERVER: std::sync::Mutex<Option<fn(bool)>> = std::sync::Mutex::new(None);
+static OBSERVER: std::sync::Mutex<Option<fn(CallMachineEvent)>> = std::sync::Mutex::new(None);
 
 /// Install `observer` ([`super::observe_call_machine`]).
 #[cfg(feature = "std")]
-pub(super) fn set_observer(observer: Option<fn(bool)>) {
+pub(super) fn set_observer(observer: Option<fn(CallMachineEvent)>) {
     if let Ok(mut slot) = OBSERVER.lock() {
         *slot = observer;
     }
 }
 
-#[cfg(feature = "std")]
-std::thread_local! {
-    /// [`takes`]'s answer for the pinned program, by address: `(0, _)` when none is kept.
-    static TAKES: Cell<(usize, bool)> = const { Cell::new((0, false)) };
-}
-
-/// Whether the machine runs `program` ([`decide`]). The answer is remembered while the
-/// program's route is pinned (`PINNED_ROUTE`, #7719), so a CLI run decides twice whatever its
-/// number of documents: once as its route is pinned, once more on its first document. A program
-/// that is not pinned is decided afresh.
+/// The routing rule: a program with a self-recursive `def` whose every node [`compile`] accepts
+/// (it declines the input builtins among the rest), answered with its code. The compiler is the
+/// decliner, so there is one definition of what the machine runs.
+///
+/// A run whose route is pinned (`pin_route`) decides once, as its route is pinned, and keeps the
+/// code with the pin for its documents; a program that is not pinned is decided per call.
 ///
 /// Callers ask [`switched_on`] first: this compiles the program.
-#[inline(never)]
-pub(super) fn takes(program: &Expr) -> bool {
-    #[cfg(feature = "std")]
-    {
-        let key = program as *const Expr as usize;
-        let pinned = PINNED_ROUTE.with(Cell::get).0 == key;
-        let (seen, answer) = TAKES.with(Cell::get);
-        if pinned && seen == key {
-            return answer;
-        }
-        let answer = decide(program);
-        TAKES.with(|t| t.set(if pinned { (key, answer) } else { (0, false) }));
-        answer
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        decide(program)
-    }
-}
-
-/// The routing rule: a program with a self-recursive `def` whose every node [`compile`] accepts
-/// (it declines the input builtins among the rest). The compiler is the decliner, so there is one
-/// definition of what the machine runs.
 #[cold]
 #[inline(never)]
-fn decide(program: &Expr) -> bool {
-    let answer = self_recursive(program)
-        && with_prelude(|prelude| {
-            let it = Interp::new(prelude);
-            compile::compile(&it, program).is_ok()
-        });
-    note_decision(answer);
-    answer
+pub(super) fn decide(program: &Expr) -> Option<Compiled> {
+    let code = if self_recursive(program) {
+        with_prelude(|prelude| compile::compile(&Interp::new(prelude), program).ok())
+    } else {
+        None
+    };
+    note(if code.is_some() {
+        CallMachineEvent::Taken
+    } else {
+        CallMachineEvent::Declined
+    });
+    code.map(|code| Compiled {
+        code,
+        keys: hands_out_keys(program),
+    })
 }
 
-/// Tell the observer, if one is installed, of a decision.
-fn note_decision(taken: bool) {
+/// Tell the observer, if one is installed, of a decision or a compilation.
+fn note(event: CallMachineEvent) {
     #[cfg(feature = "std")]
     if let Some(observer) = OBSERVER.lock().ok().and_then(|slot| *slot) {
-        observer(taken);
+        observer(event);
     }
     #[cfg(not(feature = "std"))]
-    let _ = taken;
+    let _ = event;
 }
 
 #[cfg(test)]

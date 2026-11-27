@@ -362,7 +362,7 @@ fn an_error_after_an_output_ends_the_run_after_the_output_7977() {
 
 #[test]
 fn a_consumer_that_stops_stops_the_producer_7977() {
-    let program = program("def nat: ., (. + 1 | nat); 0 | nat");
+    let program = decide(&program("def nat: ., (. + 1 | nat); 0 | nat")).expect("takes");
     let outputs = with_prelude(|prelude| {
         let it = Interp::new(prelude);
         let mut seen = Vec::new();
@@ -537,7 +537,7 @@ fn the_router_takes_recursive_programs_and_declines_the_rest_7977() {
         "def f: if . > 0 then (. - 1 | f), . else . end; [5 | f]",
         "def nat: ., (. + 1 | nat); first(0 | nat | select(. > 5))",
     ] {
-        assert!(decide(&program(filter)), "takes {filter}");
+        assert!(decide(&program(filter)).is_some(), "takes {filter}");
     }
     for filter in [
         // No recursive def.
@@ -553,7 +553,86 @@ fn the_router_takes_recursive_programs_and_declines_the_rest_7977() {
         "def f($n): if $n == 0 then 1 else f($n - 1) end; {a: f(2)}",
         r#"def f($n): if $n == 0 then 1 else f($n - 1) end; "\(f(2))""#,
     ] {
-        assert!(!decide(&program(filter)), "declines {filter}");
+        assert!(decide(&program(filter)).is_none(), "declines {filter}");
+    }
+}
+
+/// #7977 step 5: a pinned program is decided and compiled once, as its route is pinned, and every
+/// document of the run runs that code; the pin frees it. A program that is not pinned is decided
+/// per call, and a pinned program the machine declined is not decided again. `no_std` pins
+/// nothing.
+#[cfg(feature = "std")]
+#[test]
+fn a_pinned_program_keeps_its_code_for_the_run_7977() {
+    let taken = program("def f($n): if $n == 0 then 0 else f($n - 1) + 1 end; f(10)");
+    let pin = super::super::pin(&taken, &Route::Interpreter, decide(&taken));
+    assert!(matches!(route(&taken), Route::Interpreter));
+    let first = machine_for(&taken).expect("pinned with its code");
+    for _ in 0..3 {
+        let again = machine_for(&taken).expect("pinned with its code");
+        assert!(Rc::ptr_eq(&first, &again), "one compilation for the run");
+    }
+    // Another program is decided afresh, per call, and leaves the pin as it is.
+    let other = program("def g: if . > 0 then . - 1 | g else . end; 3 | g");
+    let (a, b) = (machine_for(&other), machine_for(&other));
+    assert!(a.is_some() && b.is_some() && !Rc::ptr_eq(&a.unwrap(), &b.unwrap()));
+    assert!(Rc::ptr_eq(
+        &first,
+        &machine_for(&taken).expect("still pinned")
+    ));
+    drop(first);
+    drop(pin);
+    assert!(PINNED_MACHINE.with(|machine| machine.borrow().is_none()));
+
+    // A pinned program the machine was not given finds no code, though it would take it.
+    let _pin = super::super::pin(&taken, &Route::Interpreter, None);
+    assert!(machine_for(&taken).is_none());
+}
+
+/// The code a run keeps answers each document as a fresh compilation does: nothing in it changes
+/// as it runs (#7977 step 5), and labels keep counting across documents in the interpreter.
+#[test]
+fn one_compilation_answers_every_document_7977() {
+    let filter = "def f($n): if $n == 0 then [label $out | 1, break $out] else f($n - 1) end; \
+                  [f(. % 3)], ([.] as $a | $a | setpath([0]; 9)), [label $l | try break $l catch .]";
+    let program = program(filter);
+    let machine = Rc::new(decide(&program).expect("takes"));
+    let run_on = |code: &vm::Compiled, input: i64| {
+        with_prelude(|prelude| {
+            let it = Interp::new(prelude);
+            it.next_label.set(LabelNumbers::resume(&program));
+            let mut input = OwnedValue::Int(input);
+            it.prepare(&program, &mut input);
+            let mut outputs = Vec::new();
+            vm::run(&it, code, input, &mut |v| {
+                outputs.push(v.to_json_jq_preserve());
+                true
+            })
+            .unwrap_or_else(|_| panic!("{filter}"));
+            LabelNumbers::keep(&program, it.next_label.get());
+            outputs
+        })
+    };
+    let mut kept = Vec::new();
+    for input in 0..6 {
+        kept.push(run_on(&machine, input));
+    }
+    LabelNumbers::keep(&program, 0);
+    let mut fresh = Vec::new();
+    for input in 0..6 {
+        fresh.push(run_on(&decide(&program).expect("takes"), input));
+    }
+    assert_eq!(kept, fresh);
+    // jq 1.7.1 over `0 1 2 3 4 5`: the label value counts on from one document to the next.
+    // `no_std` keeps no count across documents (`LabelNumbers`), so there each starts at 0.
+    for (input, outputs) in kept.iter().enumerate() {
+        let n = if cfg!(feature = "std") {
+            2 * input + 1
+        } else {
+            1
+        };
+        let label = format!(r#"[{{"__jq":{n}}}]"#);
+        assert_eq!(outputs, &["[[1]]", "[9]", label.as_str()], "{input}");
     }
 }
 
@@ -967,7 +1046,7 @@ fn a_call_or_a_fork_point_past_the_budget_is_refused_7977() {
         let func = |name: &str| {
             code.funcs
                 .iter()
-                .position(|f| f.name == name)
+                .position(|f| &*f.name == name)
                 .expect("compiled") as u32
         };
         let (f, g) = (func("f"), func("g"));

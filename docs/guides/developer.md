@@ -232,6 +232,10 @@ has each routing decision append `taken` or `declined` while the switch is on.
 `scripts/call_machine/check.py check <binary>` runs its 142-program corpus against the jq 1.7.1 answers in
 `tests/data/call-machine-corpus-7977.json` (`tests/jq_cli/i7977.rs` runs the same file in CI), and
 `scripts/call_machine/ladders.py` holds its timing ladders, for the bench boxes only.
+The log also records each compilation for the machine as `compiled`: a run compiles a routed program once, as its
+route is pinned, and runs that code on every document (#7977 step 5), which `check.py` and `i7977.rs` hold it to.
+`scripts/call_machine/per_record.py` compares a routed program's per-record cost over NDJSON with one document
+holding the same records, for the bench boxes too.
 
 ### Differential sweeps against jq
 
