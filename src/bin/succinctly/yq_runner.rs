@@ -7822,11 +7822,23 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
     if navigation.is_empty() {
         return None;
     }
-    let navigation_expr = Expr::pipe(navigation.iter().map(|stage| (*stage).clone()).collect());
-    let by_tag = || selects_by_tag(&navigation_expr) && cursor.index().has_explicit_tags();
-    if !(selects_by_node_metadata(&navigation_expr) || by_tag()) {
+    // A selection that reads node metadata in a condition (`select(style == "")`); a reader that
+    // is a stage of its own answers a fresh node and selects nothing.
+    let explicit_tags = cursor.index().has_explicit_tags();
+    let filters = navigation
+        .iter()
+        .any(|stage| selects_by_node_metadata(stage) || (explicit_tags && selects_by_tag(stage)));
+    // A navigation that starts at a fresh node (`1 | select(kind == "scalar")`, `line |
+    // select(true)`) selects among nodes of its own, whose metadata the owned value answers as yq
+    // does, and has no document node to resolve: it runs as written.
+    let fresh_start = matches!(
+        strip_parens(navigation[0]),
+        Expr::Literal(_) | Expr::Array(_) | Expr::Object(_)
+    ) || is_reader(navigation[0]);
+    if !filters || fresh_start {
         return None;
     }
+    let navigation_expr = Expr::pipe(navigation.iter().map(|stage| (*stage).clone()).collect());
     let descent = |e: &Expr| matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys);
     let mut stepped = false;
     let descends_below_a_step = navigation.iter().any(|stage| {
