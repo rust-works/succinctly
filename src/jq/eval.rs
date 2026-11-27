@@ -51940,13 +51940,13 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     //
     // #8039: a yq update whose reads cannot all be resolved at its target
     // still names the target for the updates nested in its filter, which
-    // stand at it unless a scalar the filter builds comes first
+    // stand at it unless a value the filter builds with no position comes first
     // (`.b |= (.d = 1 | .c |= path)` is `["b","c"]`, `.b |= (5 | . |= path)`
     // is `[]`); only the rewrite is skipped.
     let placed = S::TAG == EvalTag::Yq
         && !positioned
         && needs_path_context(filter_expr)
-        && !nested_update_follows_scalar(filter_expr);
+        && !nested_update_follows_unplaced_stage(filter_expr);
     let base = if positioned || placed {
         super::eval_generic::current_path_base()
     } else {
@@ -51954,8 +51954,10 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     };
     // #8039: an update nested in the filter at the target itself climbs out of
     // this update's snapshot for a `parent` above its own input.
+    // `placed` updates hand theirs on too: a target they create is in it
+    // (`.x |= (.zz |= (.b | . |= (parent(2) | keys)))` lists `zz`).
     let shares_pre =
-        S::TAG == EvalTag::Yq && positioned && nests_parent_reading_update(filter_expr);
+        S::TAG == EvalTag::Yq && (positioned || placed) && nests_parent_reading_update(filter_expr);
     // `parent`'s source, and only built for a filter that actually climbs:
     // every target auto-created, none of them written yet. `Expr::Identity`
     // as the filter is exactly `yq_prepare_assign_targets`' own vivification
@@ -51964,7 +51966,7 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // filter is about to be handed. Named apart from `pre` above
     // (`alias_identity`'s own snapshot, taken for a different reason and
     // consumed after the loop).
-    let pre_update = (positioned && reads_parent(filter_expr)).then(|| {
+    let pre_update = ((positioned || placed) && reads_parent(filter_expr)).then(|| {
         let mut vivified = result.clone();
         for path in &paths {
             // A path that cannot even be walked contributes no vivification;
@@ -55861,8 +55863,8 @@ fn ambient_update_ancestor(path: &[OwnedValue], len: usize) -> Option<OwnedValue
 
 /// Whether `filter` holds a `|=` whose own filter climbs with `parent` (#8039): the
 /// one update that needs the enclosing update's snapshot handed on
-/// ([`UpdatePos::shares_pre`]). Asked once per update, only of a filter that is
-/// positioned.
+/// ([`UpdatePos::shares_pre`]). Asked once per update, only of a yq filter that
+/// names a position.
 fn nests_parent_reading_update(filter: &Expr) -> bool {
     any_subexpr(
         filter,
@@ -55870,19 +55872,33 @@ fn nests_parent_reading_update(filter: &Expr) -> bool {
     )
 }
 
+/// Whether yq gives the value `stage` builds no position of its own (#8039): a
+/// scalar literal, an object constructor, a string interpolation, `keys` and
+/// `with_entries` make a node with no parent (`.a |= (keys | .[0] |= path)` is
+/// `[[0],"d"]` in yq v4.53.3), where a collect `[...]`, `to_entries`, `map_values`,
+/// arithmetic and `del` hand the context's position on (`[.[]] | .[0] |= path`
+/// is `["a",0]`).
+fn builds_unplaced_value(stage: &Expr) -> bool {
+    matches!(
+        unwrap_paren(stage),
+        Expr::Literal(_)
+            | Expr::Object(_)
+            | Expr::StringInterpolation(_)
+            | Expr::Builtin(Builtin::Keys | Builtin::KeysUnsorted | Builtin::WithEntries(_))
+    )
+}
+
 /// Whether a pipe in `filter` runs an update that reads path context after a
-/// stage that builds a scalar (`5 | . |= key`, #8039). yq gives such a node no
-/// position, so its `key` answers nothing and its `path` is `[]`, and the
-/// position of the update `filter` belongs to must not reach it.
-fn nested_update_follows_scalar(filter: &Expr) -> bool {
+/// stage that builds a value with no position (`5 | . |= key`,
+/// [`builds_unplaced_value`], #8039). Its `key` answers nothing and its `path`
+/// is `[]` in yq, so the position of the update `filter` belongs to must not
+/// reach it.
+fn nested_update_follows_unplaced_stage(filter: &Expr) -> bool {
     any_subexpr(filter, &mut |e| {
         let Expr::Pipe(stages) = e else {
             return false;
         };
-        let Some(first) = stages
-            .iter()
-            .position(|stage| matches!(unwrap_paren(stage), Expr::Literal(_)))
-        else {
+        let Some(first) = stages.iter().position(builds_unplaced_value) else {
             return false;
         };
         stages[first + 1..].iter().any(|stage| {
@@ -56097,9 +56113,9 @@ fn update_root_with_filter<S: EvalSemantics>(
                 .map(|pre| (Rc::clone(pre), pos.base_len)),
             run,
         )?,
-        // #8039: a yq update that names no position for a filter that reads one (a scalar the
-        // filter builds stands ahead of a nested update, [`nested_update_follows_scalar`]) leaves
-        // its nested updates none either, rather than the enclosing update's.
+        // #8039: a yq update that names no position for a filter that reads one (a value with
+        // no position stands ahead of a nested update, `nested_update_follows_unplaced_stage`)
+        // leaves its nested updates none either, rather than the enclosing update's.
         None if S::TAG == EvalTag::Yq
             && super::eval_generic::update_base_installed()
             && needs_path_context(filter_expr) =>
