@@ -13838,9 +13838,11 @@ impl<'a> Parser<'a> {
     /// yields nothing and evaluates neither side, so UPDATE is its unions up to the operand before
     /// the first `;`: `(0; A, B; V)` is `0; (A, (B; V))`, whose UPDATE is `A` alone, and
     /// `(0; U; V)` drops every accumulator at the first source node (the fold then prints nothing,
-    /// and prints INIT over an empty source). The block's sides stay in the tree behind `empty`,
-    /// `empty | (B, V)`, which never runs them, so an `error` or a `$name` there never fires, while
-    /// the resolver still rejects an undefined function in them, as yq's lexer rejects one. That
+    /// and prints INIT over an empty source). The block's sides stay in the tree as the untaken
+    /// branch of `if false then (B, V) else empty end`, which never runs them, so an `error` or a
+    /// `$name` there never fires, while the resolver still rejects an undefined function in them,
+    /// as yq's lexer rejects one. (`empty | (B, V)` would not do: a yq literal after a stage that
+    /// yields nothing still answers.) That
     /// union is a fresh list next to the block, so identity operands do not collapse
     /// (`(0; ., .; 9)` keeps both, [`yq_union`]).
     #[inline(never)] // out of line, so its operand list stays off `parse_ireduce`'s frame
@@ -13859,10 +13861,11 @@ impl<'a> Parser<'a> {
             block.push(self.parse_expr()?);
             self.skip_ws();
         }
-        operands.push(Expr::pipe(vec![
-            Expr::Builtin(Builtin::Empty),
-            Expr::comma(block),
-        ]));
+        operands.push(Expr::If {
+            cond: Box::new(Expr::Literal(Literal::Bool(false))),
+            then_branch: Box::new(Expr::comma(block)),
+            else_branch: Box::new(Expr::Builtin(Builtin::Empty)),
+        });
         Ok(Expr::comma(operands))
     }
 
