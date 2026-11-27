@@ -7818,10 +7818,21 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         }
         _ => false,
     };
-    // The tail starts at a reader and holds readers and the `select`s that test a reader's answer
-    // without reading metadata (`line | select(. > 1)`), which keep its fresh node.
+    // A value derived from a node keeps that node's slot as a `del()` target in yq (#4476):
+    // `tostring`, `length`, `tojson`, `type`, `not`, `@json`.
+    let is_deriving = |stage: &Expr| {
+        matches!(
+            strip_parens(stage),
+            Expr::Builtin(Builtin::ToString | Builtin::Length | Builtin::ToJson | Builtin::Type)
+                | Expr::Not
+                | Expr::Format(FormatType::Json | FormatType::YqJson(_) | FormatType::YqYaml(_))
+        )
+    };
+    let opens_tail = |stage: &Expr| is_reader(stage) || is_deriving(stage);
+    // The tail starts at a reader or a deriving stage and holds those and the `select`s that test
+    // their answer without reading metadata (`line | select(. > 1)`), which keep its fresh node.
     let in_tail = |stage: &Expr| {
-        is_reader(stage)
+        opens_tail(stage)
             || matches!(strip_parens(stage), Expr::Builtin(Builtin::Select(cond))
                 if !selects_by_node_metadata(cond) && !jq::walk::uses_cursor_metadata_builtins(cond))
     };
@@ -7829,7 +7840,7 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         .iter()
         .rposition(|stage| !in_tail(stage))
         .map_or(0, |at| at + 1);
-    while split < stages.len() && !is_reader(stages[split]) {
+    while split < stages.len() && !opens_tail(stages[split]) {
         split += 1;
     }
     let (navigation, tail) = stages.split_at(split);
@@ -7891,12 +7902,27 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         strip_parens(navigation[0]),
         Expr::Literal(_) | Expr::Array(_) | Expr::Object(_)
     ) || is_reader(navigation[0]);
-    if !filters || fresh_start {
+    // A tail of readers or deriving stages after anything but pure navigation, or after a `..` on a
+    // document with aliases: the evaluator rewrites such a tail to its navigation only for pure
+    // navigation, since the owned value expands aliases and merge keys and loses scalar spellings,
+    // so even a `select` over values (`has("p")`, `. == true`) can keep nodes yq leaves. The
+    // cursor's `..` stops at an alias as yq's does (`[.e | .. | path]` is `[["e"]]` in both).
+    let descends = navigation.iter().any(|stage| {
+        jq::walk::any_subexpr(stage, &mut |e| {
+            matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys)
+        })
+    });
+    let tail_needs_cursor = !tail.is_empty()
+        && (!navigation.iter().all(|stage| is_pure_navigation(stage))
+            || (descends && cursor.index().has_aliases()));
+    if !(filters || tail_needs_cursor) || fresh_start {
         return None;
     }
     let navigation_expr = Expr::pipe(navigation.iter().map(|stage| (*stage).clone()).collect());
-    // The cursor's `..` stops at an alias as yq's does (`[.e | .. | path]` is `[["e"]]` in both), so
-    // a descent below an alias resolves here; only the owned walk goes on through it.
+    if !filters && !navigates_and_filters_only(&navigation_expr) {
+        // Not a metadata selection: the evaluator keeps such a tail parentless or refuses it.
+        return None;
+    }
     if inexact || !navigates_and_filters_only(&navigation_expr) {
         return Some(Expr::Error(Some(Box::new(Expr::Literal(Literal::String(
             "Invalid path expression: a target that selects by node metadata must only navigate \
@@ -7974,6 +8000,26 @@ fn answers_without_selecting(stage: &Expr, is_reader: &dyn Fn(&Expr) -> bool) ->
             .iter()
             .all(|s| answers_without_selecting(s, is_reader)),
         other => is_reader(other),
+    }
+}
+
+/// Whether `stage` only navigates, without a condition: keys, indexes, slices, `.[]`, `..`, through
+/// pipes, commas, `?` and parentheses (#8020). The evaluator rewrites a reader tail after such a
+/// navigation on the owned value; any other navigation is resolved on the cursor first.
+fn is_pure_navigation(stage: &Expr) -> bool {
+    match strip_parens(stage) {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate
+        | Expr::RecursiveDescent
+        | Expr::RecursiveDescentWithKeys => true,
+        Expr::Optional(inner) => is_pure_navigation(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_pure_navigation),
+        Expr::Comma(items) => items.iter().all(is_pure_navigation),
+        _ => false,
     }
 }
 

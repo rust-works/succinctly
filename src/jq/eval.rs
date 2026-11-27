@@ -83743,33 +83743,38 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
 /// nodes (#8020). Each case it declines leaves the target to the general rule, under which the tail
 /// is parentless or refused, so it deletes no more than yq:
 ///
-/// - A navigation the owned value cannot run exactly ([`yq_owned_navigation_is_exact`]), such as
-///   one that reads node metadata (`.[] | select(style == "") | line`): on the owned value every
-///   metadata reader answers its default, so the `select` would keep every node, where yq keeps
-///   only the ones whose metadata matches. The document route resolves that shape on the cursor
-///   before it gets here.
+/// - A navigation that is not pure navigation ([`yq_owned_navigation_is_exact`]): any `select`
+///   (`.[] | select(style == "") | line`, `.[] | select(has("p")) | line`) can keep nodes on the
+///   owned value that yq leaves, through a metadata reader answering its default or an alias,
+///   merge key or scalar spelling the owned value no longer holds. The document route resolves
+///   such a navigation on the cursor before it gets here.
 /// - `key` straight after `key` in the tail: yq's key node has no key of its own, so `.b | key |
 ///   key` answers nothing and deletes nothing (`.b | key | line | key` deletes `.b`: the answer of
 ///   `line` on a key node keeps that node as its key).
-/// - `..` below a step down on a document with aliases (`.e | .. | line`): yq's `..` stops at an
-///   alias, where the owned walk goes on through the anchor's copy and the alias redirect deletes
-///   from the anchor's node, which can lie outside the walk. A `..` from the root also reaches
-///   every anchor itself, so the redirect deletes nothing that walk does not.
+/// - `..` on a document with aliases (`.e | .. | line`): yq's `..` stops at an alias, where the
+///   owned walk goes on through the anchor's copy and the alias redirect deletes from the anchor's
+///   node. The document route resolves it on the cursor, whose `..` stops as yq's does.
 fn yq_slot_rewrite_is_sound(navigation: &[Expr], tail: &[Expr]) -> bool {
     let reads_metadata = !navigation.iter().all(yq_owned_navigation_is_exact);
     let is_key = |stage: &Expr| matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key));
     let key_after_key = tail
         .windows(2)
         .any(|pair| is_key(&pair[0]) && is_key(&pair[1]));
-    let walks_through_aliases = alias_identity::active() && descends_below_a_step(navigation);
+    let walks_through_aliases = alias_identity::active()
+        && navigation.iter().any(|stage| {
+            any_subexpr(stage, &mut |e| {
+                matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys)
+            })
+        });
     !(reads_metadata || key_after_key || walks_through_aliases)
 }
 
-/// Whether a `del()` navigation stage selects on the owned value exactly the nodes yq selects on the
-/// document (#8020): an allowlist, not a list of the reads that differ. Navigation (keys, indexes,
-/// slices, `.[]`, `..`) and `select` over a condition [`yq_condition_is_value_only`] passes.
-/// Anything else -- `type` (yq's tag), `eval`, a call of a `def`, a variable -- may read what only
-/// the document holds, and declines.
+/// Whether a `del()` navigation stage reaches on the owned value exactly the nodes yq reaches on the
+/// document (#8020): pure navigation only -- keys, indexes, slices, `.[]` and `..` (the caller
+/// guards `..` on a document with aliases). An allowlist, and deliberately one without `select`:
+/// the owned value expands aliases and merge keys and loses scalar spellings (`True`, `~`), so even
+/// a condition over values alone (`has("p")`, `. == true`) can keep nodes yq leaves. A `select` is
+/// resolved on the document's cursor before it gets here, or the tail stays parentless.
 fn yq_owned_navigation_is_exact(stage: &Expr) -> bool {
     match stage {
         Expr::Identity
@@ -83780,81 +83785,11 @@ fn yq_owned_navigation_is_exact(stage: &Expr) -> bool {
         | Expr::Iterate
         | Expr::RecursiveDescent
         | Expr::RecursiveDescentWithKeys => true,
-        Expr::Builtin(Builtin::Select(cond)) => yq_condition_is_value_only(cond),
         Expr::Optional(inner) | Expr::Paren(inner) => yq_owned_navigation_is_exact(inner),
         Expr::Pipe(stages) => stages.iter().all(yq_owned_navigation_is_exact),
         Expr::Comma(items) => items.iter().all(yq_owned_navigation_is_exact),
         _ => false,
     }
-}
-
-/// Whether a yq `select` condition reads values alone, so the owned value answers it exactly as the
-/// document does (#8020): navigation, literals, comparisons, arithmetic, `and`/`or`/`not`, `//`,
-/// and a short list of builtins over values (`length`, `has`, `contains`, `test`, ...). An
-/// allowlist: every metadata read (`style`, `line_comment`, `tag`, `type`, `kind`, `anchor`, ...),
-/// `eval`, a call of a `def`, a variable and any builtin not listed answers `false`.
-fn yq_condition_is_value_only(cond: &Expr) -> bool {
-    use Builtin as B;
-    let within = yq_condition_is_value_only;
-    match cond {
-        Expr::Identity
-        | Expr::Field(_)
-        | Expr::Index { .. }
-        | Expr::Slice { .. }
-        | Expr::ArrayKey(_)
-        | Expr::Iterate
-        | Expr::Literal(_)
-        | Expr::Not => true,
-        Expr::Optional(inner) | Expr::Paren(inner) | Expr::Negate(inner) => within(inner),
-        Expr::Pipe(stages) => stages.iter().all(within),
-        Expr::Comma(items) => items.iter().all(within),
-        Expr::Compare { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
-            within(left) && within(right)
-        }
-        Expr::And(left, right) | Expr::Or(left, right) | Expr::Alternative(left, right) => {
-            within(left) && within(right)
-        }
-        Expr::Builtin(builtin) => match builtin {
-            B::Length
-            | B::Keys
-            | B::KeysUnsorted
-            | B::ToString
-            | B::ToNumber
-            | B::AsciiDowncase
-            | B::AsciiUpcase
-            | B::Downcase
-            | B::Upcase => true,
-            B::Select(arg)
-            | B::Has(arg)
-            | B::Contains(arg)
-            | B::Startswith(arg)
-            | B::Endswith(arg)
-            | B::Test(arg) => within(arg),
-            B::TestFlags(re, flags) => within(re) && within(flags),
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-/// Whether a `..` in `navigation` can start below the root (#8020): after a stage that steps down,
-/// or inside a stage of its own shape (`(.e | ..)`, `(.a, ..)`), which this does not follow.
-fn descends_below_a_step(navigation: &[Expr]) -> bool {
-    let descent = |e: &Expr| matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys);
-    let mut stepped = false;
-    for stage in navigation {
-        let stage = unwrap_paren(stage);
-        if descent(stage) {
-            if stepped {
-                return true;
-            }
-        } else if any_subexpr(stage, &mut |e| descent(e)) {
-            return true;
-        } else {
-            stepped |= del_target_steps_down(stage);
-        }
-    }
-    false
 }
 
 /// Whether `stage` is one of yq's node metadata readers (#8020): `line`, `column`, `kind`, `style`,
