@@ -7379,6 +7379,8 @@ Pinned in `tests/yq_cli/i6699.rs` and `tests/jq_cli/i6699.rs`.
 yq's lexer tries its number tokens (`-?\d+`, `-?\d+(\.\d+)`, `-?[1-9](\.\d+)?[Ee][-+]?\d+`) before `Subtract`, so `1 -16`, `1-16`, `.a -1` and `(1) -2` are a value and a negative number side by side, which yq refuses as `bad expression, please check expression syntax` (exit 1), and `succinctly yq` now refuses them with the same words where it subtracted before.
 A `-` before a space, a newline, a comment, `(`, `.` or another `-` is still a subtraction (`1 - 16`, `1 -.a`, `.a - -1`), a negative number where a value may start is unchanged (`1 + -1`, `[1,-1]`, `.[1:-1]`), and `succinctly jq` still subtracts (`1 -16` is `-15` in jq).
 Where yq's lexer fails first, on `-0` followed by `x1` or `e3` (`1 -0x1`, `1 -0e3`: `lexer: invalid input text "x1"`), the refusal here is the `bad expression` one; both exit 1.
+Inside a pair group (`{("a": 1 -1)}`), the refusal makes the group be read again as a parenthesised expression, so it is reported at the `:` (`expected ')', found ':'`) where yq says `bad expression`; both exit 1.
+An unspaced keyword form (`length-1`, `true-1`, `null-1`) is read as a hyphenated name here (#1890), so it reports `length-1/0 is not defined` where yq says `bad expression`; both exit 1.
 Pinned in `tests/yq_cli/i7998.rs`.
 
 A wildcard key costs one pass over the mapping's keys plus one keyed lookup per match, and
