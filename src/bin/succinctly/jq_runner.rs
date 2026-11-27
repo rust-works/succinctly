@@ -38,6 +38,7 @@ use crate::cli::output::{
     DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, StreamFault, Terminator,
 };
 
+mod call_machine;
 mod eof_location;
 mod window;
 
@@ -5359,6 +5360,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     FIRST_OPEN_FAILURE_AT.with(|first| first.set(None));
     // Nor may one carry a standard input that failed (#7126).
     INPUT_READ_FAILED.with(|failed| failed.set(false));
+    // #7977: the call machine's switch, before anything decides a route.
+    call_machine::configure();
     super::stdin_offset::start_run();
     silence_depth_guard_panic_line();
     args.resolve_positional_args();

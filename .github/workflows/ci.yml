@@ -939,6 +939,12 @@ jobs:
       - name: binary_size.py self-tests
         run: python3 scripts/test_binary_size.py -v
 
+      # #7977: the call machine's corpus harness (scripts/call_machine/): the golden file the
+      # jq_cli test runs holds exactly cases.py's programs, and a ladder binary gets its own
+      # environment. No build, no jq.
+      - name: call-machine harness self-tests
+        run: python3 scripts/test_call_machine.py -v
+
       # #7260: the release binary's function-order linker wrapper (scripts/link-order/link.py):
       # which links it orders, and the name normalization one list needs for GNU and LLVM
       # demanglers. No linker, no build.

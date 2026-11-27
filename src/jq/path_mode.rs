@@ -1391,7 +1391,9 @@ pub fn run_compiled(program: &Expr, input: OwnedValue) -> Run {
 /// How `succinctly jq` runs a program ([`route`]).
 #[derive(Debug)]
 pub(crate) enum Route {
-    /// Through this interpreter: the program holds a dynamic path target.
+    /// Through this interpreter: the program holds a dynamic path target, or observes jq's label
+    /// values; or, with the call machine on ([`set_call_machine`]), the machine takes it, and
+    /// `run_program` runs it there instead (#7977).
     Interpreter,
     /// Through the shipped evaluator: every path target is static.
     Shipped,
@@ -1402,7 +1404,9 @@ pub(crate) enum Route {
 
 /// How `succinctly jq` runs `program` (#5223, #5233): through this interpreter
 /// when it holds a path target the shipped walkers cannot take natively, and
-/// through the shipped evaluator otherwise.
+/// through the shipped evaluator otherwise. With the call machine on
+/// ([`set_call_machine`], #7977), a program the machine takes goes to this route too, and runs
+/// on the machine.
 ///
 /// A program goes to the interpreter (#5223) when it holds a path target the
 /// shipped walkers cannot take natively, and nothing the interpreter declines.
@@ -1460,6 +1464,12 @@ fn route_walked(program: &Expr, mut labels: LabelHints) -> Route {
     });
     if shipped_only {
         return Route::Shipped;
+    }
+    // #7977: with the call machine on (`set_call_machine`), a program it takes runs on this
+    // route, where `run_program_seeing` hands it to the machine. Off (the default), the machine
+    // is never asked, so nothing of it runs.
+    if extension.is_none() && vm::switched_on() && vm::takes(program) {
+        return Route::Interpreter;
     }
     if !dynamic {
         // #7719: a program that can observe jq's label values runs here too,
@@ -1536,6 +1546,23 @@ impl Drop for RoutePin {
         #[cfg(feature = "std")]
         PINNED_ROUTE.with(|pin| pin.set((0, PIN_NONE)));
     }
+}
+
+/// Turn the call machine (#7977) on or off for this process: programs it takes then run on it.
+/// Off until a caller turns it on; the library reads no environment for it. Experimental and for
+/// measurement (#7961): `succinctly jq` turns it on for `SUCCINCTLY_CALL_MACHINE=1`.
+#[doc(hidden)]
+pub fn set_call_machine(on: bool) {
+    vm::set_switched_on(on);
+}
+
+/// While the call machine is on, have `observer` told of each routing decision: `true` when the
+/// machine takes the program, `false` when it declines it (#7977). `None` removes it. The CLI uses
+/// it for `SUCCINCTLY_DEBUG_CALL_MACHINE_LOG`.
+#[doc(hidden)]
+#[cfg(feature = "std")]
+pub fn observe_call_machine(observer: Option<fn(bool)>) {
+    vm::set_observer(observer);
 }
 
 /// Decide `program`'s route once and pin it for this thread (#7719).
@@ -2079,19 +2106,24 @@ fn run_program_seeing(
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
     see: impl FnOnce(&OwnedValue),
 ) -> Option<Control> {
+    let on_machine = vm::switched_on() && vm::takes(program);
     with_prelude(|prelude| {
         let interp = Interp::new(prelude);
         interp.next_label.set(LabelNumbers::resume(program));
         let mut input = input;
         interp.prepare(program, &mut input);
         see(&input);
-        let result = interp.eval(program, &Env::default(), input, Reg::top(), &mut |v, _| {
-            if on_value(v) {
-                Ok(())
-            } else {
-                Err(Raise::Stop)
-            }
-        });
+        let result = if on_machine {
+            vm::run(&interp, program, input, on_value)
+        } else {
+            interp.eval(program, &Env::default(), input, Reg::top(), &mut |v, _| {
+                if on_value(v) {
+                    Ok(())
+                } else {
+                    Err(Raise::Stop)
+                }
+            })
+        };
         LabelNumbers::keep(program, interp.next_label.get());
         match result {
             Ok(()) | Err(Raise::Stop) => None,
@@ -5809,6 +5841,8 @@ fn variant_name(expr: &Expr) -> String {
         .unwrap_or("?")
         .to_string()
 }
+
+mod vm;
 
 #[cfg(test)]
 mod reference;
