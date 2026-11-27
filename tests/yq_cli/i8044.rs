@@ -109,6 +109,41 @@ fn a_fold_after_an_empty_stage_is_its_init_8044() -> Result<()> {
     assert_rows(INPUT, FOLD_ROWS)
 }
 
+/// A fold that answered nothing over a context with nodes is not an empty context's fold: its
+/// UPDATE dropped the accumulators, so it stays empty where it is an operand or a binding's source.
+#[test]
+fn a_fold_that_dropped_its_accumulators_stays_empty_8044() -> Result<()> {
+    assert_rows(
+        INPUT,
+        &[
+            (
+                "(.[] as $x ireduce (0; select(false))) as $q | [$q]",
+                "[]\n",
+            ),
+            ("[.[] as $x ireduce (0; select(false))]", "[]\n"),
+            (".[0] = (.[] as $x ireduce (0; select(false)))", "[1,2]\n"),
+            ("(.[] as $x ireduce (0; . + $x; .)) as $q | [$q]", "[]\n"),
+            ("(.[] as $y | select(false)) as $q | [$q]", "[]\n"),
+            // After an empty stage it is INIT, there too.
+            (
+                "(select(false) | (.[] as $x ireduce (0; . + 1))) as $q | $q",
+                "0\n",
+            ),
+            (
+                ".[0] = (select(false) | (.[] as $x ireduce (0; . + 1)))",
+                "[0,2]\n",
+            ),
+            (
+                "1 + (select(false) | (.[] as $x ireduce (0; . + 1)))",
+                "1\n",
+            ),
+            ("[select(false) | (.[] as $x ireduce (0; . + 1))]", "[0]\n"),
+            ("(select(false) | (. as $y | 3)) as $q | $q", "3\n"),
+            ("1 + (select(false) | (. as $y | 3))", "4\n"),
+        ],
+    )
+}
+
 /// Bodies a write, a builtin or a fold evaluates itself (#8002, #8035).
 #[test]
 fn a_binding_in_a_body_over_an_empty_context_8044() -> Result<()> {
