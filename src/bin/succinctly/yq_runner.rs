@@ -7902,27 +7902,24 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         strip_parens(navigation[0]),
         Expr::Literal(_) | Expr::Array(_) | Expr::Object(_)
     ) || is_reader(navigation[0]);
-    // A tail of readers or deriving stages after anything but pure navigation, or after a `..` on a
-    // document with aliases: the evaluator rewrites such a tail to its navigation only for pure
-    // navigation, since the owned value expands aliases and merge keys and loses scalar spellings,
-    // so even a `select` over values (`has("p")`, `. == true`) can keep nodes yq leaves. The
-    // cursor's `..` stops at an alias as yq's does (`[.e | .. | path]` is `[["e"]]` in both).
+    // A tail of readers or deriving stages after a `..` on a document with aliases: the evaluator
+    // does not rewrite it to its navigation there, as the owned walk goes on through an alias where
+    // yq's `..` stops, and the cursor's `..` stops as yq's does (`[.e | .. | path]` is `[["e"]]` in
+    // both). Only pure navigation: a value condition (`has("p")`, `. == true`) is not answered as
+    // yq does on such a document even on the cursor, which reads through an alias.
     let descends = navigation.iter().any(|stage| {
         jq::walk::any_subexpr(stage, &mut |e| {
             matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys)
         })
     });
     let tail_needs_cursor = !tail.is_empty()
-        && (!navigation.iter().all(|stage| is_pure_navigation(stage))
-            || (descends && cursor.index().has_aliases()));
+        && descends
+        && cursor.index().has_aliases()
+        && navigation.iter().all(|stage| is_pure_navigation(stage));
     if !(filters || tail_needs_cursor) || fresh_start {
         return None;
     }
     let navigation_expr = Expr::pipe(navigation.iter().map(|stage| (*stage).clone()).collect());
-    if !filters && !navigates_and_filters_only(&navigation_expr) {
-        // Not a metadata selection: the evaluator keeps such a tail parentless or refuses it.
-        return None;
-    }
     if inexact || !navigates_and_filters_only(&navigation_expr) {
         return Some(Expr::Error(Some(Box::new(Expr::Literal(Literal::String(
             "Invalid path expression: a target that selects by node metadata must only navigate \
