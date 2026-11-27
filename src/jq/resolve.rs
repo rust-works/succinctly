@@ -2412,8 +2412,7 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         | Expr::Not
         | Expr::Format(_)
         | Expr::TrackedVar(_)
-        | Expr::DeferredVar(_)
-        | Expr::Loc { .. } => {}
+        | Expr::DeferredVar(_) => {}
 
         // #3029: `$ENV` is an ordinary, shadowable binding in jq (and in
         // real yq -- both oracles answer `1` for `1 as $ENV | $ENV`,
@@ -2433,6 +2432,17 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         Expr::Env => {
             if in_var_scope(&cx.var_scope, "ENV").hit.is_some() {
                 *expr = Expr::Var("ENV".to_string());
+            }
+        }
+
+        // #7997: the same for `$__loc__` under `succinctly yq --jq-extensions`, where the parser
+        // reads every `$__loc__` as the location but yq's own `as` still binds the name (`1 as
+        // $__loc__ | $__loc__` is `1`, as without the flag). No mode test is needed: jq mode
+        // rejects every binding of the name at parse time (`reject_loc_as_binding_name`), so
+        // `__loc__` is never in its scope, and plain yq mode parses `$__loc__` as `Expr::Var`.
+        Expr::Loc { .. } => {
+            if in_var_scope(&cx.var_scope, "__loc__").hit.is_some() {
+                *expr = Expr::Var("__loc__".to_string());
             }
         }
 
@@ -2463,8 +2473,9 @@ fn check(expr: &mut Expr, cx: &mut CheckCtx, reachable: &BTreeSet<usize>) {
         }
 
         // #2734: the leaf this whole pass exists to add. `$ENV`/`$__loc__`
-        // never reach here at all -- the parser lowers them straight to
-        // `Expr::Env`/`Expr::Loc` (see `UnboundVar`'s own doc comment) -- and
+        // never reach here in jq mode -- the parser lowers them straight to
+        // `Expr::Env`/`Expr::Loc` (see `UnboundVar`'s own doc comment); plain
+        // yq mode parses both as ordinary names (#7616, #7997) -- and
         // `TrackedVar` is an evaluation-time-only substitute for a `Var` that
         // already resolved, never present on the freshly parsed tree this
         // pass runs on (same reasoning as the `Shared`/`DefCall` arm above).
