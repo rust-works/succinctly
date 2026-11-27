@@ -10109,6 +10109,7 @@ Everywhere else the machine keeps the shipped evaluators' caps, with their wordi
 
 **The byte budget.**
 The machine's control state is held to 1 GiB: its data, frame, slot and fork-point stacks, by capacity.
+A run over several documents reuses those stacks' allocations, and each document is charged only the capacity it grows them to, so each document has the whole budget (#7977 step 5).
 It is checked whenever one of those stacks grows, counting a vector's old block and its new one while it grows, and they grow fallibly (`try_reserve`), so a run under a cap on the address space (`ulimit -v`) refuses instead of aborting.
 Past the budget, or when such an allocation fails, the run is refused with the wording the shipped evaluators give at their depth limit, naming the innermost user definition: `jq: error (at <unknown>): f/0 exceeded maximum recursion depth`, exit 5, uncatchable by `try`.
 jq has no bound: `def f: [f]; f` grows until an allocation fails, and jq dies with `cannot allocate memory`, exit 134 (ADR-0020).

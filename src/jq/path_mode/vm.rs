@@ -53,7 +53,8 @@ use compile::{ArgSpec, Callee, Code, Insn, Tail, NO_LEVEL};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// The byte budget of the control state ([`Vm::bytes`]): the capacity of the data, frame, slot
-/// and fork stacks. Past it a call, a fork point or a growth refuses with the shipped
+/// and fork stacks, as this run has grown them ([`grow`]; a stack kept from an earlier document
+/// is charged as it is grown into, [`Spare`]). Past it a call, a fork point or a growth refuses with the shipped
 /// evaluators' recursion wording ([`refusal`]), and so does a failed allocation of any of them.
 /// jq itself has no such bound: it runs until memory runs out, an ADR-0018 rule 4(c) divergence
 /// recorded in `docs/compliance/jq/limitations.md`. It bounds the machine's own state, not
@@ -132,14 +133,27 @@ struct Stack<T> {
     data: Vec<Block<T>>,
     index: isize,
     limit: isize,
+    /// The capacity the budget charges ([`Vm::bytes`]): what this run has grown the stack to,
+    /// never more than `data`'s own capacity, which may be larger when the vector is kept from
+    /// an earlier document ([`Spare`]).
+    cap: usize,
 }
 
 impl<T> Stack<T> {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::over(Vec::new())
+    }
+
+    /// An empty stack over `data`, an empty vector kept from an earlier run, none of whose
+    /// capacity is charged yet.
+    fn over(data: Vec<Block<T>>) -> Self {
+        debug_assert!(data.is_empty());
         Self {
-            data: Vec::new(),
+            data,
             index: -1,
             limit: -1,
+            cap: 0,
         }
     }
 
@@ -160,9 +174,9 @@ impl<T> Stack<T> {
         self.index = at;
     }
 
-    /// Whether [`Stack::push`] has room without growing the vector.
+    /// Whether [`Stack::push`] has room within the charged capacity, so without growing.
     fn has_room(&self) -> bool {
-        ((self.index.max(self.limit) + 1) as usize) < self.data.capacity()
+        ((self.index.max(self.limit) + 1) as usize) < self.cap
     }
 
     /// Whether the top block is above the watermark: no fork point reaches it.
@@ -389,6 +403,9 @@ struct Vm<'c, 'e> {
     frames: Stack<FrameRec>,
     slots: Vec<Slot>,
     forks: Vec<Fork>,
+    /// The charged capacities of `slots` and `forks` (as [`Stack::cap`]).
+    slots_cap: usize,
+    forks_cap: usize,
     /// A call's arguments on their way into the callee's slots, kept between calls.
     scratch: Vec<Slot>,
     limits: Limits,
@@ -397,21 +414,28 @@ struct Vm<'c, 'e> {
     steps: u64,
 }
 
-/// Make room for one more element in `v` by doubling it, or say it cannot: when the bytes the
-/// control state holds while it grows (`used` now, plus the new block, the old one still held
-/// until it is copied) pass `budget`, or the allocation fails. Answers the bytes the vector grew
-/// by.
+/// Make room for one more element in `v` by doubling its charged capacity `cap`, or say it
+/// cannot: when the bytes the control state holds while it grows (`used` now, plus the new
+/// block, the old one still held until it is copied) pass `budget`, or the allocation fails.
+/// Answers the bytes the charge grew by.
+///
+/// The charge is what a fresh vector would have grown to, so a run's bounds do not depend on
+/// what an earlier document left in a kept vector ([`Spare`]): one kept with room allocates
+/// nothing until the charge passes its capacity.
 #[cold]
 #[inline(never)]
-fn grow<T>(v: &mut Vec<T>, used: usize, budget: usize) -> Result<usize, ()> {
-    let cap = v.capacity();
+fn grow<T>(v: &mut Vec<T>, cap: &mut usize, used: usize, budget: usize) -> Result<usize, ()> {
     let want = cap.saturating_mul(2).max(4);
     let size = core::mem::size_of::<T>();
     if used.saturating_add(want.saturating_mul(size)) > budget {
         return Err(());
     }
-    v.try_reserve_exact(want - v.len()).map_err(|_| ())?;
-    Ok((v.capacity() - cap) * size)
+    if v.capacity() < want {
+        v.try_reserve_exact(want - v.len()).map_err(|_| ())?;
+    }
+    let grew = (want - *cap) * size;
+    *cap = want;
+    Ok(grew)
 }
 
 /// Make room for one more value in an accumulator, fallibly: values the program builds are not
@@ -502,6 +526,9 @@ pub(super) struct Compiled {
     code: Code,
     /// [`hands_out_keys`] of the program, which [`Interp::prepare`] asks for each document.
     keys: bool,
+    /// The stacks the last document's run left ([`Spare`]): nothing of a run's state, only
+    /// allocations, which the next document's run reuses.
+    spare: core::cell::Cell<Spare>,
 }
 
 impl Compiled {
@@ -523,10 +550,28 @@ pub(super) fn run<'e>(
     input: OwnedValue,
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
 ) -> R {
-    run_code(SHIPPED, it, &program.code, input, on_value)
+    run_within(SHIPPED, it, program, input, on_value)
 }
 
-/// [`run`] of a compiled program, within `limits`.
+/// [`run`] within `limits`.
+fn run_within<'e>(
+    limits: Limits,
+    it: &Interp<'e>,
+    program: &'e Compiled,
+    input: OwnedValue,
+    on_value: &mut dyn FnMut(OwnedValue) -> bool,
+) -> R {
+    // The vectors an earlier document of the run left, if no other run of this code holds them
+    // (a nested one starts empty).
+    let spare = program.spare.take();
+    let mut vm = Vm::with_spare(it, &program.code, limits, spare);
+    let result = vm.exec(input, on_value);
+    program.spare.set(vm.into_spare());
+    result
+}
+
+/// [`run`] of a compiled program, within `limits`, on vectors of its own.
+#[cfg(test)]
 fn run_code<'e>(
     limits: Limits,
     it: &Interp<'e>,
@@ -537,36 +582,84 @@ fn run_code<'e>(
     Vm::new(it, code, limits).exec(input, on_value)
 }
 
+/// The vectors a run leaves for the next document of the same code (#7977 step 5): empty, each
+/// with the capacity it grew to, cut back to [`KEEP_BYTES`]. A per-record run then allocates its
+/// stacks once. Nothing else carries over: a run's bounds, counts and state are its own
+/// [`Vm`]'s, and the budget charges a kept vector's capacity only as the run grows into it
+/// ([`grow`]).
+#[derive(Default)]
+pub(super) struct Spare {
+    data: Vec<Block<OwnedValue>>,
+    frames: Vec<Block<FrameRec>>,
+    slots: Vec<Slot>,
+    forks: Vec<Fork>,
+    scratch: Vec<Slot>,
+}
+
+/// The most a kept vector holds on to between documents, so that a document that grew its
+/// stacks near the budget does not leave that memory held, uncharged, for the rest of the run.
+const KEEP_BYTES: usize = 64 << 10;
+
+/// Empty `v` for the next document, keeping at most [`KEEP_BYTES`] of its capacity.
+fn keep<T>(mut v: Vec<T>) -> Vec<T> {
+    v.clear();
+    let most = KEEP_BYTES / core::mem::size_of::<T>().max(1);
+    if v.capacity() > most {
+        v.shrink_to(most);
+    }
+    v
+}
+
 impl<'c, 'e> Vm<'c, 'e> {
+    #[cfg(test)]
     fn new(it: &'c Interp<'e>, code: &'e Code, limits: Limits) -> Self {
+        Self::with_spare(it, code, limits, Spare::default())
+    }
+
+    /// A machine for one document, over the empty vectors `spare` (kept from an earlier
+    /// document, or new).
+    fn with_spare(it: &'c Interp<'e>, code: &'e Code, limits: Limits, spare: Spare) -> Self {
         Self {
             it,
             code,
-            data: Stack::new(),
-            frames: Stack::new(),
-            slots: Vec::new(),
-            forks: Vec::new(),
-            scratch: Vec::new(),
+            data: Stack::over(spare.data),
+            frames: Stack::over(spare.frames),
+            slots: spare.slots,
+            forks: spare.forks,
+            slots_cap: 0,
+            forks_cap: 0,
+            scratch: spare.scratch,
             limits,
             #[cfg(test)]
             steps: 0,
         }
     }
 
+    /// The vectors for the next document: emptied, which drops every value, frame, slot and fork
+    /// point this run left, whether it ended, stopped, refused or failed.
+    fn into_spare(self) -> Spare {
+        Spare {
+            data: keep(self.data.data),
+            frames: keep(self.frames.data),
+            slots: keep(self.slots),
+            forks: keep(self.forks),
+            scratch: keep(self.scratch),
+        }
+    }
+
     /// The bytes the control state holds, for [`BUDGET`]: the stacks, slots and fork points by
-    /// capacity.
+    /// the capacity this run has grown them to ([`grow`]).
     fn bytes(&self) -> usize {
-        self.data.data.capacity() * core::mem::size_of::<Block<OwnedValue>>()
-            + self.frames.data.capacity() * core::mem::size_of::<Block<FrameRec>>()
-            + self.slots.capacity() * core::mem::size_of::<Slot>()
-            + self.forks.capacity() * core::mem::size_of::<Fork>()
+        self.data.cap * core::mem::size_of::<Block<OwnedValue>>()
+            + self.frames.cap * core::mem::size_of::<Block<FrameRec>>()
+            + self.slots_cap * core::mem::size_of::<Slot>()
+            + self.forks_cap * core::mem::size_of::<Fork>()
     }
 
     /// Push onto the data stack, growing it within the budget.
     #[inline(always)]
     fn push(&mut self, value: OwnedValue) -> Result<(), Raise> {
-        let at = (self.data.index.max(self.data.limit) + 1) as usize;
-        if at >= self.data.data.capacity() {
+        if !self.data.has_room() {
             self.grow_data()?;
         }
         self.data.push(value);
@@ -577,7 +670,13 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[inline(never)]
     fn grow_data(&mut self) -> Result<(), Raise> {
         let used = self.bytes();
-        grow(&mut self.data.data, used, self.limits.bytes).map_err(|()| self.current_def())?;
+        grow(
+            &mut self.data.data,
+            &mut self.data.cap,
+            used,
+            self.limits.bytes,
+        )
+        .map_err(|()| self.current_def())?;
         Ok(())
     }
 
@@ -585,15 +684,26 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[inline(never)]
     fn grow_frames(&mut self) -> Result<(), ()> {
         let used = self.bytes();
-        grow(&mut self.frames.data, used, self.limits.bytes).map(|_| ())
+        grow(
+            &mut self.frames.data,
+            &mut self.frames.cap,
+            used,
+            self.limits.bytes,
+        )
+        .map(|_| ())
     }
 
     #[cold]
     #[inline(never)]
     fn grow_slots(&mut self, room: usize) -> Result<(), ()> {
-        while self.slots.capacity() - self.slots.len() < room {
+        while self.slots_cap - self.slots.len() < room {
             let used = self.bytes();
-            grow(&mut self.slots, used, self.limits.bytes)?;
+            grow(
+                &mut self.slots,
+                &mut self.slots_cap,
+                used,
+                self.limits.bytes,
+            )?;
         }
         Ok(())
     }
@@ -603,14 +713,13 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[inline(always)]
     fn room_for_call(&mut self, nslots: usize) -> bool {
         (self.frames.has_room() || self.grow_frames().is_ok())
-            && (self.slots.capacity() - self.slots.len() >= nslots
-                || self.grow_slots(nslots).is_ok())
+            && (self.slots_cap - self.slots.len() >= nslots || self.grow_slots(nslots).is_ok())
     }
 
     /// Push a slot, growing the slots within the budget.
     #[inline(always)]
     fn push_slot(&mut self, slot: Slot) -> Result<(), Raise> {
-        if self.slots.len() == self.slots.capacity() && self.grow_slots(1).is_err() {
+        if self.slots.len() == self.slots_cap && self.grow_slots(1).is_err() {
             return Err(self.current_def());
         }
         self.slots.push(slot);
@@ -638,7 +747,13 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[inline(never)]
     fn grow_forks(&mut self) -> Result<(), Raise> {
         let used = self.bytes();
-        grow(&mut self.forks, used, self.limits.bytes).map_err(|()| self.current_def())?;
+        grow(
+            &mut self.forks,
+            &mut self.forks_cap,
+            used,
+            self.limits.bytes,
+        )
+        .map_err(|()| self.current_def())?;
         Ok(())
     }
 
@@ -712,7 +827,7 @@ impl<'c, 'e> Vm<'c, 'e> {
     /// Push a fork point, or refuse past [`BUDGET`].
     #[inline(always)]
     fn fork(&mut self, kind: Kind) -> Result<(), Raise> {
-        if self.forks.len() == self.forks.capacity() {
+        if self.forks.len() == self.forks_cap {
             self.grow_forks()?;
         }
         // Built in place: a fork point is large, and is not passed through a call.
@@ -1710,6 +1825,7 @@ pub(super) fn decide(program: &Expr) -> Option<Compiled> {
     code.map(|code| Compiled {
         code,
         keys: hands_out_keys(program),
+        spare: core::cell::Cell::default(),
     })
 }
 
