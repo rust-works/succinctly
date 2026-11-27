@@ -28,6 +28,19 @@ non-debug profile, the link makes a shared library, `SUCCINCTLY_LINK_ORDER=0`, t
 neither Linux nor macOS, or anything in the resolution step fails. For the release binary the
 resolved file and a one-line summary (or why it linked plain) are left next to the output as
 `<output>.link-order.txt` and `<output>.link-order.log`.
+
+Measurement builds only (#7960; docs/guides/benchmarking.md, "Layout-seeded A/B"). Three variables
+let an A/B vary the code layout and nothing else; none is ever set for a shipped build:
+
+- `SUCCINCTLY_LINK_LAYOUT_SEED=N` perturbs the layout by seed `N`, so two binaries linked with the
+  same seed are placed alike and N seeds give N layouts. `SUCCINCTLY_LINK_LAYOUT_MODE` picks how:
+  `pad` (lld's `--randomize-section-padding=N`, which keeps the order; the Linux default) and/or
+  `shuffle` (a seeded permutation of the ordered block, which stays first; the only one ld64 has).
+  The link log names the seed and modes; a bad value fails the ordering, and the log says so.
+- `SUCCINCTLY_LINK_ORDER_LIST=PATH` orders by another tree's list, so an older commit's objects
+  link with that commit's own `symbols.txt` through this wrapper.
+- `SUCCINCTLY_LINK_SAVE_DIR=DIR` keeps the link: the objects and temporary files rustc deletes
+  afterwards, and the arguments. `relink.py` links them again under other seeds in seconds.
 """
 import os
 import re
@@ -35,7 +48,8 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LIST = os.path.join(HERE, "symbols.txt")
+# `SUCCINCTLY_LINK_ORDER_LIST`: another tree's list (measurement builds, see above).
+LIST = os.environ.get("SUCCINCTLY_LINK_ORDER_LIST") or os.path.join(HERE, "symbols.txt")
 
 
 def real_cc():
@@ -180,6 +194,76 @@ def resolve(names, table, platform=sys.platform):
     return out, missing
 
 
+def layout_seed(env=os.environ):
+    """The layout seed of a measurement build (`SUCCINCTLY_LINK_LAYOUT_SEED`), or None.
+
+    The same seed given to a baseline and a candidate link places both alike, and N seeds give N
+    layouts: a difference that holds over the seeds is the change's, one that changes sign
+    between them is placement (scripts/layout-ab.py). A seed that is not a non-negative integer
+    raises ValueError, which `main` reports as a plain link."""
+    s = env.get("SUCCINCTLY_LINK_LAYOUT_SEED", "").strip()
+    if not s:
+        return None
+    if not s.isdigit():
+        raise ValueError(f"SUCCINCTLY_LINK_LAYOUT_SEED={s!r} is not a non-negative integer")
+    return int(s)
+
+
+def layout_modes(platform=sys.platform, env=os.environ):
+    """Which perturbations a seeded link applies: `pad` (lld's `--randomize-section-padding`,
+    which keeps the order) and/or `shuffle` (a permutation of the ordered block, which stays
+    first), from `SUCCINCTLY_LINK_LAYOUT_MODE` (`pad`, `shuffle`, or both joined by `,` or `+`).
+    The default is `pad` on Linux and `shuffle` on macOS, where ld64 has no padding option, so
+    asking for `pad` there raises ValueError rather than linking unperturbed."""
+    default = "shuffle" if platform == "darwin" else "pad"
+    modes = {m for m in env.get("SUCCINCTLY_LINK_LAYOUT_MODE", default).replace("+", ",").split(",") if m}
+    unknown = modes - {"pad", "shuffle"}
+    if unknown or not modes:
+        raise ValueError(f"SUCCINCTLY_LINK_LAYOUT_MODE: expected pad and/or shuffle, got {sorted(unknown) or 'nothing'}")
+    if platform == "darwin" and "pad" in modes:
+        raise ValueError("SUCCINCTLY_LINK_LAYOUT_MODE=pad: ld64 has no padding option; use shuffle")
+    return modes
+
+
+def shuffled(order, seed, platform=sys.platform):
+    """`order` with everything after the C runtime start-up block permuted by `seed`: the
+    ordered functions stay first, so the pages a run touches stay together, and only their
+    places within the block change."""
+    import random
+    k = len(CRT_STARTUP) if platform.startswith("linux") else 0
+    head, rest = order[:k], order[k:]
+    random.Random(seed).shuffle(rest)
+    return head + rest
+
+
+def save_link(args, save_dir):
+    """Copy the link's inputs that rustc deletes afterwards (its objects, and the files in its
+    temporary directory, including those named inside a `-Wl,` argument) into `save_dir`, and
+    write the arguments, the working directory and the list there as `link.json`, so relink.py
+    can link the same objects again under other seeds without rebuilding."""
+    import json
+    import shutil
+    import tempfile
+    os.makedirs(save_dir, exist_ok=True)
+    tmp = os.path.realpath(tempfile.gettempdir())
+    def keep(i, a):
+        p = os.path.realpath(a) if os.path.isfile(a) else None
+        if p and (a.endswith(".o") or p.startswith(tmp) or "/rustc" in p):
+            dst = os.path.join(save_dir, f"{i:04d}-{os.path.basename(a)}")
+            shutil.copyfile(a, dst)
+            return dst
+        return a
+
+    out_args = []
+    for i, a in enumerate(args):
+        if a.startswith("-Wl,"):  # `-Wl,-exported_symbols_list,<tmp file>` and the like
+            out_args.append(",".join(keep(i, part) for part in a.split(",")))
+        else:
+            out_args.append(keep(i, a))
+    with open(os.path.join(save_dir, "link.json"), "w") as f:
+        json.dump({"args": out_args, "cwd": os.getcwd(), "list": LIST}, f, indent=0)
+
+
 def expand(args):
     """`args` with each `@file` (rustc writes one when the command line is long) read in: one
     argument per line, with `\\` before a backslash or a space."""
@@ -215,14 +299,22 @@ def main(argv):
                 table = demangled_to_mangled(mangled, demangle(mangled))
                 names = read_list(LIST)
                 order, missing = resolve(names, table)
+                seed = layout_seed()
+                modes = layout_modes() if seed is not None else set()
+                if "shuffle" in modes:
+                    order = shuffled(order, seed)
                 path = out + ".link-order.txt"
                 with open(path, "w") as f:
                     f.write("".join(m + "\n" for m in order))
                 extra = driver + [opt.format(path)]
                 if opt.startswith("-Wl,--symbol"):
                     extra.append("-Wl,--no-warn-symbol-ordering")
+                    if "pad" in modes:
+                        extra.append(f"-Wl,--randomize-section-padding={seed}")
                 msg = (f"{len(names)} listed, {len(names) - missing} found, {len(order)} symbols "
                        f"ordered ({why})\n")
+                if seed is not None:
+                    msg += f"layout seed {seed}, modes {sorted(modes)}\n"
             except (OSError, ValueError, subprocess.CalledProcessError) as e:
                 extra, msg = [], f"plain link: {e}\n"
         try:
@@ -230,6 +322,9 @@ def main(argv):
                 f.write(msg)
         except OSError:
             pass
+        save = os.environ.get("SUCCINCTLY_LINK_SAVE_DIR")
+        if save:
+            save_link(args, save)
     os.execvp(real_cc(), [real_cc()] + argv + extra)
 
 
