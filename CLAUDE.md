@@ -385,8 +385,7 @@ Both are succinctly's own, not in jq 1.7.1 or yq; examples are in
 | `simd`              | Explicit SIMD intrinsics                                                                                      |
 | `portable-popcount` | Non-additive: replaces intrinsic popcount with the portable bitwise one                                       |
 | `serde`             | Serde serialize/deserialize support                                                                           |
-| `regex`             | Regex builtins in jq (included in `cli`)                                                                      |
-| `onig-engine`       | Builds the vendored Oniguruma jq-mode regex moves to (#7965, ADR-0031); not in `cli` yet, needs a C compiler  |
+| `regex`             | Regex builtins in jq (in `cli`); builds the vendored Oniguruma (needs a C compiler; #7965, ADR-0031)          |
 | `cli`               | CLI tool (jq, yq, locate, generators)                                                                         |
 | `local-zone`        | System local zone for jq `localtime`/`strflocaltime` via jiff (in `cli`; not Windows)                         |
 | `locale-time`       | Localized `strftime`/`strflocaltime` names via libc `strftime_l` (in `cli`; Apple and Linux libc only; #5754) |
