@@ -6313,32 +6313,50 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // The next file's text, or for a windowed file its next window with the documents the
             // window holds (#6920): the splitter already ran over it, and `lines_before` line
             // breaks and `window_substituted` come with it.
-            let (idx, raw, window_split, lines_before, window_substituted, window_place, notes) =
-                match windowed.as_mut() {
-                    Some(reader) => match reader.next_window_noting(&mut |at, failure| {
-                        noted.push((at, failure));
-                    }) {
-                        Ok(Some((idx, next))) => (
-                            idx,
-                            next.raw,
-                            Some((next.values, next.split_error)),
-                            next.lines_before,
-                            next.substituted,
-                            Some((next.seam, next.origin)),
-                            next.notes,
-                        ),
-                        Ok(None) => break,
-                        // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
-                        Err(error) => {
-                            report_input_read_failure(&error);
-                            break;
-                        } // patchcov: coverage end
-                    },
-                    None => match whole_files.next() {
-                        Some((idx, raw)) => (idx, raw.as_slice(), None, 0, false, None, Vec::new()),
-                        None => break,
-                    },
-                };
+            let (
+                idx,
+                raw,
+                window_split,
+                lines_before,
+                window_substituted,
+                window_place,
+                notes,
+                window_edits,
+            ) = match windowed.as_mut() {
+                Some(reader) => match reader.next_window_noting(&mut |at, failure| {
+                    noted.push((at, failure));
+                }) {
+                    Ok(Some((idx, next))) => (
+                        idx,
+                        next.raw,
+                        Some((next.values, next.split_error)),
+                        next.lines_before,
+                        next.substituted,
+                        Some((next.seam, next.origin)),
+                        next.notes,
+                        next.edits,
+                    ),
+                    Ok(None) => break,
+                    // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+                    Err(error) => {
+                        report_input_read_failure(&error);
+                        break;
+                    } // patchcov: coverage end
+                },
+                None => match whole_files.next() {
+                    Some((idx, raw)) => (
+                        idx,
+                        raw.as_slice(),
+                        None,
+                        0,
+                        false,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    None => break,
+                },
+            };
             // #7332: the next window is here, so the last index of the one before it is given back,
             // and its last document (#7697).
             held_index = None;
@@ -6462,11 +6480,16 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             } else {
                 seams.get(idx).cloned().unwrap_or_default()
             };
-            // #7934: a file the substitution changed has its reads counted in the bytes jq read. A
-            // window's text is counted as it is (its edits are not kept).
+            // #7934: a file the substitution changed has its reads counted in the bytes jq read; a
+            // window's text through the edits the window kept (#7938).
             let lossy = (slurped.is_none() && window_place.is_none())
                 .then(|| originals.get(idx).and_then(Option::as_ref))
                 .flatten();
+            let edits: &[SubstitutionEdit] = match (lossy, slurped.is_none()) {
+                (Some(lossy), _) => &lossy.edits,
+                (None, true) => &window_edits,
+                (None, false) => &[],
+            };
             let locator = ValueLocator::new(
                 raw,
                 filename.as_deref(),
@@ -6479,7 +6502,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }),
                 seam.clone(),
             )
-            .reading(lossy)
+            .reading_edits(edits)
             .with_lines_before(lines_before);
             let tail_locator = ValueLocator::new(b"", value_tail.as_deref(), Some(0), Seam::NONE);
             // #7322: what jq's `--seq` reader warns of in a stretch of the window that was not plain
@@ -14768,9 +14791,12 @@ impl<'a> ValueLocator<'a> {
 
     /// This locator over a text the invalid-UTF-8 substitution made of the bytes jq read, whose
     /// reads are counted in those bytes ([`LineCounter::reading`], #7934).
-    fn reading(self, lossy: Option<&'a LossySource>) -> Self {
+    /// The edits are a file's ([`LossySource`]) or a window's (#7938).
+    fn reading_edits(self, edits: &'a [SubstitutionEdit]) -> Self {
+        let mut counter = self.counter.into_inner();
+        counter.edits = edits;
         Self {
-            counter: RefCell::new(self.counter.into_inner().reading(lossy)),
+            counter: RefCell::new(counter),
             ..self
         }
     }
