@@ -7409,10 +7409,11 @@ Pinned in `tests/yq_cli/i7998.rs`.
 **Resolved ([#8048](https://github.com/rust-works/succinctly/issues/8048)):** a `-` with no left operand is refused, as yq refuses it.
 yq has no unary minus, only `Subtract` (`operation.go`, v4.53.3), so a `-` that is not the sign of a number token (#7998) is a subtraction missing its left argument: `-(1)`, `-.a`, `- 1`, `1 | -.`, `[-.a]` and `.a, -.b` all exit 1, where `succinctly yq` negated.
 yq's tree builder works from a postfix stack, so such a `-` pops the operand just before it and every enclosing operator pops one further left, until the outermost runs out; its message names that operator, `'<op>' expects 2 args but there is 1`, and the refusal here names the same one: `'-'` when nothing stands before the `-` (`-.a | .b`, `select(-.a > 0)`), `'|'` for `1 | -.`, `','` for `.a, -.b`, `':'` for `{"a": -.b}`, `'and'`, `'//'`, `'+'`, `'=='`, `'|='`, `'*=+'` and the rest after their operators, `';'` in a later function argument (`with(.a; -.b)`), and the traversal yq inserts before a bracket (`'TRAVERSE_ARRAY'` for `.[-.a]`, `''` for `.a[-.b]`, `'.'` for `.a.b[-.c]`).
-A string interpolation is parsed on its own in yq, so `.a | "\(-.b)"` names `'-'`, and so does `eval("-.a")`.
+A string interpolation is parsed on its own in yq, so `.a | "\(-.b)"` names `'-'`.
+`eval("-.a")` is refused too, but with the `bad expression, please check expression syntax` that `eval` here gives every parse error of its text, where yq names the operator (`'-'`); both exit 1.
 `--jq-extensions` does not bring jq's unary minus back: it stands for jq surface yq's lexer rejects (#1512), and yq's lexer takes `-.a` (its tree builder refuses it), so with the flag the refusal is the same.
 A negative number where a value may start (`-1`, `.a | -1`, `1 - -1`, `[.a, -1]`) and a subtraction (`1 -.a`, `.a -(1)`) are unchanged, and `succinctly jq` keeps jq's unary minus (`-(1)` is `-1`, `1 | -.` is `-1`).
-yq lexes the whole filter first, so where the filter also holds a token its lexer rejects (`if -.a then 1 else 2 end`: `lexer: invalid input text`) yq reports that and this parser may report the `-`; both exit 1.
+yq lexes the whole filter first, so where the filter also holds a token its lexer rejects (`if -.a then 1 else 2 end`: `lexer: invalid input text`) yq reports that, and so does this parser where it refuses the token before it reaches the `-` (`"if" is not part of yq's syntax`); both exit 1.
 Pinned in `tests/yq_cli/i8048.rs`.
 
 A wildcard key costs one pass over the mapping's keys plus one keyed lookup per match, and

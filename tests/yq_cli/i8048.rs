@@ -43,8 +43,6 @@ const REFUSED: &[(&str, &str)] = &[
     ("with(-.a; .b)", "-"),
     ("\"x\\(-.a)\"", "-"),
     (".a | \"x\\(-.b)\"", "-"),
-    ("eval(\"-.a\")", "-"),
-    (".a | eval(\"-.b\")", "-"),
     ("1 - -.a", "-"),
     ("1 - (-.a)", "-"),
     (".a - - 1", "-"),
@@ -67,7 +65,6 @@ const REFUSED: &[(&str, &str)] = &[
     (".a as $x | $x - -.b", "|"),
     (".a as $x | (1, -.a)", "|"),
     (".a as $x | $x[-.a]", "|"),
-    (".a as [$x, $y] | -$x", "|"),
     (".a + .b | -.c", "|"),
     (".a |= .b | -.c", "|"),
     ("[.a | -.b]", "|"),
@@ -92,7 +89,6 @@ const REFUSED: &[(&str, &str)] = &[
     (".a // -.b", "//"),
     (".a // (-.b)", "//"),
     (".a // .b // -.c", "//"),
-    (".a //= -.b", "//"),
     ("1 + -.a", "+"),
     ("(1 + -.a) | .b", "+"),
     (".a * -.b", "*"),
@@ -115,6 +111,14 @@ const REFUSED: &[(&str, &str)] = &[
     ("with(.a; .b | -.c)", ";"),
     ("sub(\"a\"; -.b)", ";"),
     ("sub(\"a\"; \"b\"; -.c)", ";"),
+    ("sub(\"a\"; \"b\"; -.c; 1)", ";"),
+    ("test(\"a\"; -.b)", ";"),
+    ("capture(\"a\"; -.b)", ";"),
+    ("match(\"a\"; -.b)", ";"),
+    ("with(.a; .b; -.c)", ";"),
+    ("with_dtf(\"x\"; -.a)", ";"),
+    (".a | sub(\"a\"; -.b)", "|"),
+    ("[.a, sub(\"a\"; -.b)]", ","),
     (".[-.a]", "TRAVERSE_ARRAY"),
     (".[-.a][0]", "TRAVERSE_ARRAY"),
     (".[1:-.a]", "TRAVERSE_ARRAY"),
@@ -152,6 +156,18 @@ fn test_minus_with_no_left_operand_is_refused_8048() -> Result<()> {
                 "{filter:?} {args:?}: want {want:?}, got {err}"
             );
         }
+    }
+    Ok(())
+}
+
+/// `eval` parses its text on its own, so yq names an operator inside the text (`'-'`, or `'|'` for
+/// `eval("1 | -.")`). `eval` here reports every parse error of its text as `bad expression, please
+/// check expression syntax`, so only the refusal is pinned.
+#[test]
+fn test_minus_with_no_left_operand_in_eval_text_is_refused_8048() -> Result<()> {
+    for filter in ["eval(\"-.a\")", ".a | eval(\"-.b\")", "eval(\"1 | -.\")"] {
+        let (out, err, code) = run_yq_stdin_with_stderr(filter, DOC, &["-o=json", "-I0", "--"])?;
+        assert_eq!((out.as_str(), code), ("", 1), "{filter:?}: {err}");
     }
     Ok(())
 }

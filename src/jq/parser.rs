@@ -3946,22 +3946,21 @@ impl<'a> Parser<'a> {
         claim
     }
 
+    /// yq mode (#8048): an expression straight after a `;` (a later function argument) is the
+    /// right side of yq's `;` operator. Out of line so [`Self::parse_expr`]'s frame, which every
+    /// level of nesting pays, gains only the answer.
+    #[inline(never)]
+    fn claim_yq_semicolon_owner(&mut self) -> bool {
+        self.input[..self.pos].trim_end().ends_with(';')
+            && self.claim_yq_minus_owner(YqMinusOwner::Named(";"))
+    }
+
     /// Give back what [`Self::claim_yq_minus_owner`] took, once the right side is parsed.
     #[inline]
     fn release_yq_minus_owner(&mut self, claimed: bool) {
         if claimed {
             self.yq_minus_owner = None;
         }
-    }
-
-    /// [`Self::parse_expr`] for a function argument. One after a `;` is the right side of yq's
-    /// `;` operator (#8048).
-    #[inline]
-    fn parse_call_arg(&mut self, after_semicolon: bool) -> Result<Expr, ParseError> {
-        let claimed = after_semicolon && self.claim_yq_minus_owner(YqMinusOwner::Named(";"));
-        let arg = self.parse_expr();
-        self.release_yq_minus_owner(claimed);
-        arg
     }
 
     /// Peek at the current character without consuming it.
@@ -8184,7 +8183,7 @@ impl<'a> Parser<'a> {
         }
         self.expect(';')?;
         self.skip_ws();
-        let update = self.parse_call_arg(true)?;
+        let update = self.parse_expr()?;
         self.skip_ws();
         // yq accepts more arguments and ignores all but the path: `with(.a; . = 7; . = 8)`
         // answers the input untouched, having evaluated `.a` (#4327).
@@ -8192,7 +8191,7 @@ impl<'a> Parser<'a> {
             while self.peek() == Some(';') {
                 self.next();
                 self.skip_ws();
-                self.parse_call_arg(true)?;
+                self.parse_expr()?;
                 self.skip_ws();
             }
             self.expect(')')?;
@@ -9061,7 +9060,7 @@ impl<'a> Parser<'a> {
                 loop {
                     // Each `;`-separated slot is a full expression — comma
                     // included (#155) — matching jq's `Arg: Exp` grammar.
-                    let arg = self.parse_call_arg(!args.is_empty())?;
+                    let arg = self.parse_expr()?;
                     args.push(arg);
                     self.skip_ws();
 
@@ -9208,7 +9207,7 @@ impl<'a> Parser<'a> {
                 Some(';') => {
                     self.next();
                     self.skip_ws();
-                    args.push(self.parse_call_arg(true)?);
+                    args.push(self.parse_expr()?);
                     self.skip_ws();
                 }
                 Some(')') => break,
@@ -9647,7 +9646,7 @@ impl<'a> Parser<'a> {
         }
         self.next();
         self.skip_ws();
-        let second = self.parse_call_arg(true)?;
+        let second = self.parse_expr()?;
         self.skip_ws();
         if self.peek() != Some(')') {
             return self.builtin_wrong_arity_or_expect(start_pos, ')', vec![first, second]);
@@ -9686,7 +9685,7 @@ impl<'a> Parser<'a> {
         }
         self.next();
         self.skip_ws();
-        let second = self.parse_call_arg(true)?;
+        let second = self.parse_expr()?;
         self.skip_ws();
         if self.peek() != Some(')') {
             return self.builtin_wrong_arity_or_expect(start_pos, ')', vec![first, second]);
@@ -13700,10 +13699,12 @@ impl<'a> Parser<'a> {
         // #3397: a nested expression is its own scope, even inside an object
         // value.
         let expd = core::mem::replace(&mut self.expd_operand, false);
+        let claimed = self.mode == ParserMode::Yq && self.claim_yq_semicolon_owner();
         let expr = match self.mode {
             ParserMode::Jq => self.parse_pipe_expr(),
             ParserMode::Yq => self.parse_yq_comma_expr(),
         };
+        self.release_yq_minus_owner(claimed);
         self.expd_operand = expd;
         expr
     }
