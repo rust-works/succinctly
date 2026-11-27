@@ -1543,6 +1543,20 @@ yq's `nowOp` returns one new node for the nodes it is given, as `envOperator` do
 The three differences recorded for `env(NAME)` above hold for `now` too: `.y = [.x[] | (now, now)]` writes six values here and two in yq, `limit(1; repeat(1) | now)` under `--jq-extensions` runs `repeat` to its limit, and `now | document_index` over three documents is `0 1 2` here and `0 0 0` in yq.
 yq also tags the node `!!timestamp`, which an owned value cannot carry ([#2802](https://github.com/rust-works/succinctly/issues/2802)), so `now | type` is still `!!str` here, as the datetime section records.
 
+### `with_dtf(layout; f)` over a once-stage is answered once ([#8028](https://github.com/rust-works/succinctly/issues/8028))
+
+yq's `withDateTimeFormat` sets the layout and evaluates `f` over the whole context it was given, not once per node.
+So a `with_dtf` whose `f` holds a stage yq answers once for its whole context (`now`, `env(NAME)`, `strenv(NAME)`, `{}`, a `$name`) is answered once too: `[.x[] | with_dtf("2006"; now)] | length` is `1`, and so is `with_dtf("2006"; select(true) | now)`.
+`succinctly yq` follows that through the walk and the parser rewrite above, which look through `with_dtf` to its body (`yq_once_wrapper_body`).
+Any other body is still read once per node, which differs from yq wherever the body's answer depends on the whole list.
+- **A union in the body.**
+  `[.x[] | with_dtf("2006"; ., 0)]` over `x: [1, 2, 3]` is `[1,2,3,0,0,0]` in yq, branch-major over the list, and `[1,0,2,0,3,0]` here.
+  `[.x[] | with_dtf("2006"; now, now)]` holds two values in yq and six here.
+- **A body that answers over an empty context.**
+  `[.x[] | select(false) | with_dtf("2006"; "x")]` is `["x"]` in yq, as `[.x[] | select(false) | "x"]` is in both, and `[]` here; `with_dtf("2006"; [now])` there is `[[]]` in yq and `[]` here.
+- **The layout of a call answered once** is read over `null` here, where yq reads it from the first node of the context, so a layout that reads the node (`with_dtf(.f; now)`) is the layout `null` here.
+- A `{}` body in a write's right side is read per node, as a bare `{}` stage there is: `.y = [.x[] | with_dtf("2006"; {})]` writes three `{}` here and one in yq.
+
 ### Duplicate mapping keys — an owned value keeps every entry (#1344); a few narrower gaps remain
 
 **Since [#1344](https://github.com/rust-works/succinctly/issues/1344) ([ADR-0027](../../adrs/adr-0027.md)) an `OwnedValue::Object` keeps a repeated mapping key's earlier entries beside its collapsed `IndexMap`.**

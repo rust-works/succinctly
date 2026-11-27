@@ -156,7 +156,10 @@ fn fresh_regardless(stage: &Expr, cx: Cx<'_>) -> bool {
         // `env(NAME)` and `strenv(NAME)` read no node: `envOperator` returns one new node (#7996),
         // and so does `nowOp` (#8007).
         Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now) => true,
-        Expr::Paren(inner) => fresh_regardless(inner, cx),
+        // `with_dtf(LAYOUT; E)` is `E` under a layout (`withDateTimeFormat`, #8028).
+        Expr::Paren(inner) | Expr::Builtin(Builtin::WithDtf(_, inner)) => {
+            fresh_regardless(inner, cx)
+        }
         Expr::Comma(items) => items.iter().all(|item| fresh_regardless(item, cx)),
         Expr::Alternative(left, _) => {
             matches!(left.as_ref(), Expr::Literal(literal) if truthy_literal(literal))
@@ -212,6 +215,8 @@ fn result_node(expr: &Expr, input: Node, cx: Cx<'_>) -> Option<Node> {
     match expr {
         Expr::Identity => Some(input),
         Expr::Paren(inner) | Expr::Optional(inner) => result_node(inner, input, cx),
+        // `with_dtf(LAYOUT; E)` yields what `E` yields over the same input (#8028).
+        Expr::Builtin(Builtin::WithDtf(_, body)) => result_node(body, input, cx),
         Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => Some(child(input)),
         Expr::IndexExpr { target, .. } => result_node(target, input, cx).map(child),
         // A stage that builds fresh results over any input decides alone, so an unknown stage

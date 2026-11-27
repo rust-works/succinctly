@@ -38,7 +38,7 @@ use super::eval::{
     pattern_alternatives_var_names, try_compare_op, yields_at_most_one_value, EvalError,
     EvalSemantics, JqSemantics, YqSemantics,
 };
-use super::eval_generic::yq_stage_built_once;
+use super::eval_generic::{yq_has_flat_built_once_stage, yq_once_wrapper_body};
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import,
     Include, Libm1, Libm2, Libm3, Literal, LoadKind, MergeFlags, MetaObject, MetaSlot, MetaValue,
@@ -2860,19 +2860,6 @@ fn has_flat_union(expr: &Expr) -> bool {
     }
 }
 
-/// Whether `expr` is, or is a stage of, a stage yq builds once however many nodes reach it: an
-/// empty `{}` (#6801), `env(NAME)` / `strenv(NAME)` (#7996) or `now` (#8007), the stages the
-/// context-list walk owns in `[.[] | f]` ([`yq_stage_built_once`]). Looks through parentheses and
-/// nested pipes as `has_flat_union` does, and stops at an `as` body: `. as $v | {}` is one `{}` per
-/// node in yq, and `map(. as $v | env(X))` one `env(X)` per member, so the walk does not own it.
-fn has_flat_built_once_stage(expr: &Expr) -> bool {
-    match expr {
-        Expr::Paren(inner) => has_flat_built_once_stage(inner),
-        Expr::Pipe(stages) => stages.iter().any(has_flat_built_once_stage),
-        other => yq_stage_built_once(other),
-    }
-}
-
 /// Whether a pipe in `expr` has a stage after its first that yq answers once over an empty context
 /// list (#6943, [`yq_stage_can_reemit`](super::eval::yq_stage_can_reemit)): `select(c) | "x"` is `"x"`
 /// when `c` holds for no member, where each member's own run of it would answer nothing. Looks
@@ -2923,23 +2910,10 @@ fn yq_stage_single_valued(stage: &Expr) -> bool {
     }
 }
 
-/// Whether `expr` is, or holds as a stage of its pipes, a bare `$name` (#6821): the stage yq
-/// answers once however many nodes reach it. Looks through parentheses and nested pipes as
-/// [`has_flat_built_once_stage`] does, and stops at an `as` body: `. as $w | $v` is one `$v` per node in
-/// yq.
-fn has_flat_var_stage(expr: &Expr, env_args_pseudo: bool) -> bool {
-    match expr {
-        Expr::Paren(inner) => has_flat_var_stage(inner, env_args_pseudo),
-        Expr::Pipe(stages) => stages
-            .iter()
-            .any(|stage| has_flat_var_stage(stage, env_args_pseudo)),
-        other => yq_stage_head_var(other, env_args_pseudo),
-    }
-}
-
 /// Whether `stage` is one [`yq_var_stage_once`] answers once: a bare `$name` (#6821), or
 /// `env(NAME)` / `strenv(NAME)` (#7996) or `now` (#8007), whose handler returns one node for its
-/// whole context without reading it, or a pipe or parenthesised pipe that starts with one.
+/// whole context without reading it, a `with_dtf(LAYOUT; E)` whose `E` holds such a stage (#8028,
+/// [`yq_once_wrapper_body`]), or a pipe or parenthesised pipe that starts with one.
 fn yq_stage_head_once(stage: &Expr, env_args_pseudo: bool) -> bool {
     match stage {
         Expr::Paren(inner) => yq_stage_head_once(inner, env_args_pseudo),
@@ -2947,11 +2921,17 @@ fn yq_stage_head_once(stage: &Expr, env_args_pseudo: bool) -> bool {
             .first()
             .is_some_and(|stage| yq_stage_head_once(stage, env_args_pseudo)),
         Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now) => true,
-        other => yq_stage_head_var(other, env_args_pseudo),
+        other => match yq_once_wrapper_body(other) {
+            Some(body) => has_flat_once_stage(body, env_args_pseudo),
+            None => yq_stage_head_var(other, env_args_pseudo),
+        },
     }
 }
 
-/// [`has_flat_var_stage`] for every stage [`yq_stage_head_once`] answers.
+/// Whether `expr` is, or holds as a stage of its pipes, a stage [`yq_stage_head_once`] answers: a
+/// bare `$name` (#6821), `env(NAME)`, `strenv(NAME)`, `now` or a `with_dtf` over one. Looks through
+/// parentheses and nested pipes as [`yq_has_flat_built_once_stage`] does, and stops at an `as`
+/// body: `. as $w | $v` is one `$v` per node in yq.
 fn has_flat_once_stage(expr: &Expr, env_args_pseudo: bool) -> bool {
     match expr {
         Expr::Paren(inner) => has_flat_once_stage(inner, env_args_pseudo),
@@ -3137,7 +3117,7 @@ fn yq_var_stage_once(stages: Vec<Expr>, env_args_pseudo: bool) -> Expr {
 /// (`mapOperator`, `GetMatchingNodes(splatted, RHS)`), so a union in `f` runs each branch over every
 /// member before the next: `map(.a, .b)` is every `.a`, then every `.b`. An empty `{}` stage in `f`
 /// is built once, not per member (#6801: `.x | map({})` is `[{}]`), as are `env(X)` and `strenv(X)` (#7996:
-/// `map(env(X))` is `[hi]`), `now` (#8007) and a bare `$name` stage (#6821: `.n as $v | .x | map($v)` is `[7]`). That is the walk
+/// `map(env(X))` is `[hi]`), `now` (#8007), a bare `$name` stage (#6821: `.n as $v | .x | map($v)` is `[7]`) and a `with_dtf` over any of them (#8028). That is the walk
 /// `[.[] | f]` already takes (the context-list model, `eval_yq_context_pipe`), so a union-bodied
 /// (or empty-`{}`-bodied) `map` over a sequence or a mapping with members is written
 /// `(if has-members then [.[] | f] else . end) | map(.)`.
@@ -3156,9 +3136,9 @@ fn yq_map_union_body_over_the_list(
         return call;
     };
     let owned_by_the_list = has_flat_union(body)
-        || has_flat_built_once_stage(body)
+        || yq_has_flat_built_once_stage(body)
         || has_flat_reemit_stage(body)
-        || (var_stage_once && has_flat_var_stage(body, env_args_pseudo));
+        || (var_stage_once && has_flat_once_stage(body, env_args_pseudo));
     if !owned_by_the_list {
         return call;
     }
