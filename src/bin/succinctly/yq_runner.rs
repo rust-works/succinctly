@@ -6220,11 +6220,15 @@ fn propagate_assign_alias_marks(
     // A negative index (`.a[-1] = .a[0]`) counts from the end of an array a write to an existing
     // element leaves as long as it was, so a lone plain assignment resolves it against the
     // finished value. With more stages a later write may have grown the array (#5407).
+    // A spelled key (#7999) names a field or a slot by the kind of node it indexes, which a later
+    // write rarely changes, so it is resolved against the finished value in every stage.
     let resolve = stages.len() == 1 && is_plain_assign_chain(expr);
     for (stage, (path_expr, value_expr)) in stages.into_iter().enumerate() {
-        let resolved = resolve
-            .then(|| resolve_static_steps(path_expr, value))
-            .flatten();
+        let resolved = if resolve {
+            resolve_static_steps(path_expr, value)
+        } else {
+            resolve_spelled_brackets(path_expr, value)
+        };
         let path_expr = resolved.as_ref().unwrap_or(path_expr);
         let Some(targets) = static_nav_targets(path_expr) else {
             continue;
@@ -6331,6 +6335,11 @@ fn propagate_compound_alias_mark(
     pristine: &CommentTree,
     tree: &mut CommentTree,
 ) {
+    // A spelled key (#7999) is the field or the slot the document has there.
+    let resolved_path = resolve_spelled_brackets(path_expr, pristine_value);
+    let path_expr = resolved_path.as_ref().unwrap_or(path_expr);
+    let resolved_value = resolve_spelled_brackets(value_expr, pristine_value);
+    let value_expr = resolved_value.as_ref().unwrap_or(value_expr);
     let Some(mut targets) = static_nav_targets(path_expr) else {
         return;
     };
@@ -6804,7 +6813,7 @@ fn resolve_static_steps(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
 /// replaced by the step it names in `root`, as the evaluator reads it: the field of its text on a
 /// mapping, the index of its value anywhere else. `None` when it holds none, or one is reached
 /// through a step this walk does not follow (only fields, indexes and pipes, parentheses and a
-/// comma of them are), which [`static_nav_steps`] then declines.
+/// comma of them are), which [`static_nav_steps`] then reads as the index of its value.
 fn resolve_spelled_brackets(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
     /// `expr` rewritten, and the node it lands on (`None` past the document).
     fn walk<'v>(

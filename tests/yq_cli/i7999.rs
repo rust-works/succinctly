@@ -219,6 +219,7 @@ fn test_spelled_bracket_key_in_a_pipe_keeps_presentation_7999() -> Result<()> {
     const INNER: &str = "s:\n  - x\n  - - a # c0\n    - \"b\" # c1\n    - c # c2\n";
     const MAP_SEQ: &str = "m:\n  \"0x1\":\n    - p # p0\n    - \"q\" # q1\n  \"1\": [z] # z1\n";
     const MAP_MAP: &str = "m:\n  \"0x1\":\n    a: 1 # c\n    b: \"two\" # d\n  \"1\": {a: 3} # e\n";
+    const ALIASED: &str = "a: &x 1\nb: *x\nm:\n  \"0x1\": null\n  k: 2\n";
     let rows: &[(&str, &str, &str)] = &[
         (
             "del(.s[0]) | del(.s[0][0x0])",
@@ -290,6 +291,17 @@ fn test_spelled_bracket_key_in_a_pipe_keeps_presentation_7999() -> Result<()> {
             ".m[0x1].a = 5 | .m[0x1]",
             MAP_MAP,
             "a: 5 # c\nb: \"two\" # d\n",
+        ),
+        // An alias copied into the key keeps its mark, by `+=` and by a stage of a chain.
+        (
+            ".m[0x1] += .b",
+            ALIASED,
+            "a: &x 1\nb: *x\nm:\n  \"0x1\": *x\n  k: 2\n",
+        ),
+        (
+            ".m[0x1] = .b | .z = 1",
+            ALIASED,
+            "a: &x 1\nb: *x\nm:\n  \"0x1\": *x\n  k: 2\nz: 1\n",
         ),
     ];
     for (filter, input, want) in rows {
