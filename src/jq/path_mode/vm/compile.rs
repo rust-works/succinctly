@@ -1178,7 +1178,7 @@ impl<'e> Compiler<'_, 'e> {
             // `[range(1e6)]` in one pass, where the machine's own code takes a fork point and a
             // backtrack per element.
             Expr::Array(_) | Expr::Reduce { .. } if self.wide && is_leaf(e, true) => {
-                self.leaf(e)?
+                self.leaf(e)?;
             }
             Expr::Error(Some(msg)) => {
                 self.expr(msg)?;
