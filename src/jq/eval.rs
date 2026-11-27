@@ -20099,11 +20099,10 @@ fn arith_sub<S: EvalSemantics>(
 ///
 /// **The past-`2^53` rounding is jq-mode only**: real yq has no unary-minus
 /// operator at all (confirmed live against yq v4.53.3: `-.a` is a hard
-/// parse error, `'-' expects 2 args but there is 1`) -- succinctly's own
-/// support for it in yq mode is a pre-existing, unrelated extension (#1056
-/// doesn't touch whether it exists), so there's no oracle to say a
-/// yq-mode `Int` past that magnitude should round to a double rather than
-/// stay exact. `S::OVERFLOW_WRAPS` gates the whole jq-only branch, matching
+/// parse error, `'-' expects 2 args but there is 1`), and since #8048
+/// `succinctly yq` refuses it the same way, so no yq-mode filter reaches
+/// this function and there's no oracle to say a yq-mode `Int` past that
+/// magnitude should round to a double rather than stay exact. `S::OVERFLOW_WRAPS` gates the whole jq-only branch, matching
 /// every other call site of this rounding model (`arith_add`/`arith_sub`/
 /// `arith_mul`).
 ///
@@ -137196,7 +137195,6 @@ mod tests {
             "error(\"x\")",
             "{\"a\": 1}",
             "(1 | select(false)), 2",
-            "-(1)",
             "1 + 2",
             "1 == 2",
             "true and false",
@@ -137210,7 +137208,6 @@ mod tests {
             "error(1 | select(false))",
             "{\"a\": (1 | select(false))}",
             "(1 | select(false)), (2 | select(false))",
-            "-(1 | select(false))",
             "1 + (1 | select(false))",
             "(1 | select(false)) == 2",
             "true and (1 | select(false))",
@@ -137219,6 +137216,14 @@ mod tests {
         ] {
             assert!(!answers(src), "`{src}`");
         }
+        // yq has no unary minus (#8048), so a negation is built rather than parsed.
+        let negated_answers = |src: &str| {
+            let operand = parse_with_mode_and_extensions(src, ParserMode::Yq, true).unwrap();
+            let expr = Expr::Negate(Box::new(operand));
+            reemit_always_answers(&yq_empty_context_reemit(&expr).expect(src))
+        };
+        assert!(negated_answers("1"));
+        assert!(!negated_answers("1 | select(false)"));
     }
 
     /// #6943: the allocation-free test the pipe entry asks never says `false` where the rewrite
@@ -148763,31 +148768,31 @@ mod tests {
     /// only. Real yq has no unary-minus operator at all (confirmed live
     /// against yq v4.53.3: `-.a` is a hard parse error, `'-' expects 2 args
     /// but there is 1`), so there's no oracle backing an integer-to-float
-    /// type change for a yq config field's zero value (`-.replicas` on `0`
-    /// silently becoming `-0.0`) -- an earlier draft applied the promotion
-    /// unconditionally and was caught by code review with zero yq-mode test
-    /// coverage of this exact case. yq mode's `Float` operand still
-    /// preserves sign correctly (unaffected by the gate, since that's a
-    /// genuine `f64` value with no type-change question), and a non-numeric
-    /// operand still errors rather than silently succeeding.
+    /// type change for a yq config field's zero value -- an earlier draft
+    /// applied the promotion unconditionally and was caught by code review.
+    /// Since #8048 `succinctly yq` refuses `-.a` as yq does, so no yq-mode
+    /// filter reaches `arith_negate`, and this pins the yq arm directly: an
+    /// `Int` zero stays an integer, a `Float` keeps its sign, and a
+    /// non-numeric operand still errors.
     #[test]
     fn test_unary_minus_yq_mode_integer_zero_stays_integer_1056() {
-        yq_query!(br"null", "-(1 - 1)",
-            QueryResult::Owned(OwnedValue::Int(0)) => {}
-        );
-
-        yq_query!(br#"{"a":0.0}"#, "-.a",
-            QueryResult::Owned(OwnedValue::Float(f)) => {
+        assert!(matches!(
+            arith_negate::<YqSemantics>(OwnedValue::Int(0)),
+            Ok(OwnedValue::Int(0))
+        ));
+        match arith_negate::<YqSemantics>(OwnedValue::Float(0.0)) {
+            Ok(OwnedValue::Float(f)) => {
                 assert_eq!(f, 0.0);
                 assert!(f.is_sign_negative());
             }
-        );
-
-        yq_query!(br#"{"a":"abc"}"#, "-.a",
-            QueryResult::Error(e) => {
-                assert_eq!(e.message, r#"string ("abc") cannot be negated"#);
-            }
-        );
+            other => panic!("{other:?}"),
+        }
+        match arith_negate::<YqSemantics>(OwnedValue::String("abc".to_string().into())) {
+            Err(e) => assert_eq!(e.message, r#"string ("abc") cannot be negated"#),
+            other => panic!("{other:?}"),
+        }
+        let refused = parse_with_mode_and_extensions("-.a", ParserMode::Yq, true).unwrap_err();
+        assert_eq!(refused.message, "'-' expects 2 args but there is 1");
     }
 
     /// #1056 review: an earlier draft implemented unary minus as

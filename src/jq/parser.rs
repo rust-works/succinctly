@@ -710,6 +710,59 @@ fn yq_adjacent_negative_number(position: usize) -> ParseError {
     ParseError::new("bad expression, please check expression syntax", position)
 }
 
+/// The operator yq's tree builder is left one argument short of by a `-` that has no left operand
+/// (#8048), as [`Parser::yq_minus_owner`] holds it.
+#[derive(Clone, Copy, Debug)]
+enum YqMinusOwner {
+    /// An operator whose spelling is fixed: `,`, `|`, `:`, `;`, `and`, `or`, or a traversal yq's
+    /// lexer inserts (`''` after a value, `TRAVERSE_ARRAY` after a bare `.`).
+    Named(&'static str),
+    /// An operator spelled by the token at this byte offset (`+`, `*+`, `//`, `==`, `|=`, `*=+` ...),
+    /// read back by [`yq_operator_token`].
+    Token(usize),
+}
+
+/// The operator token at `at` in `input`, leading space skipped, as yq's lexer reads it: an
+/// arithmetic, comparison or assignment operator with any merge flags (`*+`, `*=+d`). yq has no
+/// `//=` token, so `//` followed by `=` is `//` (`'//' expects 2 args`, v4.53.3).
+#[cold]
+#[inline(never)]
+fn yq_operator_token(input: &str, at: usize) -> &str {
+    let rest = input.get(at..).unwrap_or("").trim_start();
+    let bytes = rest.as_bytes();
+    let mut end = match bytes {
+        [b'/', b'/', ..] => return &rest[..2],
+        [b'|' | b'+' | b'-' | b'/' | b'%' | b'=' | b'!' | b'<' | b'>', b'=', ..] => 2,
+        [b'*', b'=', ..] => 2,
+        [_, ..] => 1,
+        [] => 0,
+    };
+    if bytes.first() == Some(&b'*') {
+        while bytes
+            .get(end)
+            .is_some_and(|b| matches!(b, b'+' | b'?' | b'n' | b'd' | b'c'))
+        {
+            end += 1;
+        }
+    }
+    &rest[..end]
+}
+
+/// yq's refusal of a `-` with no left operand (#8048): yq has no unary minus, only `Subtract`, so
+/// its tree builder pops whatever operand stands before the `-` and the operator that owned that
+/// operand is the one left short. `owner` is that operator ([`Parser::yq_minus_owner`]); with none,
+/// the `-` itself is short. `position` is the `-`'s.
+#[cold]
+#[inline(never)]
+fn yq_unary_minus(input: &str, owner: Option<YqMinusOwner>, position: usize) -> ParseError {
+    let name = match owner {
+        None => "-",
+        Some(YqMinusOwner::Named(name)) => name,
+        Some(YqMinusOwner::Token(at)) => yq_operator_token(input, at),
+    };
+    ParseError::new(format!("'{name}' expects 2 args but there is 1"), position)
+}
+
 /// One link of yq's right-folding arithmetic level ([`Parser::parse_yq_arithmetic`]).
 enum YqArithLink {
     Arith(ArithOp),
@@ -2492,6 +2545,19 @@ struct Parser<'a> {
     /// Whether the outermost completed primary consumed jq's generic `?`.
     /// Navigation optionals inside that primary do not close a `try` body.
     last_primary_ended_generic_optional: bool,
+    /// yq mode (#8048): the outermost binary operator whose right side is being parsed, which is
+    /// the one yq's tree builder is left short of when a `-` with no left operand turns up
+    /// ([`yq_unary_minus`]). yq builds its tree from a postfix stack, so that `-` pops the operand
+    /// just before it, and every enclosing operator one further left, until the outermost runs out.
+    /// `None` while no operand stands before the cursor: the `-` itself is short. A string
+    /// interpolation is a separate parse in yq, so its slot starts from `None` again.
+    ///
+    /// Set only where it is `None` ([`Self::claim_yq_minus_owner`]), so the outermost claim stands.
+    yq_minus_owner: Option<YqMinusOwner>,
+    /// yq mode (#8048): where the last arithmetic, comparison or assignment operator began, for
+    /// the [`YqMinusOwner::Token`] its right side claims. A field, not a local, so the recursive
+    /// frames that read it stay as they were.
+    yq_op_at: usize,
 }
 
 /// Where one ordinary function call's identifier begins in the filter source
@@ -3863,6 +3929,37 @@ impl<'a> Parser<'a> {
             expd_operand: false,
             in_path_arg: 0,
             last_primary_ended_generic_optional: false,
+            yq_minus_owner: None,
+            yq_op_at: 0,
+        }
+    }
+
+    /// yq mode (#8048): record `owner` as the operator whose right side is about to be parsed,
+    /// unless an enclosing one already holds [`Self::yq_minus_owner`]. Whether this call took it,
+    /// for [`Self::release_yq_minus_owner`].
+    #[inline]
+    fn claim_yq_minus_owner(&mut self, owner: YqMinusOwner) -> bool {
+        let claim = self.mode == ParserMode::Yq && self.yq_minus_owner.is_none();
+        if claim {
+            self.yq_minus_owner = Some(owner);
+        }
+        claim
+    }
+
+    /// yq mode (#8048): an expression straight after a `;` (a later function argument) is the
+    /// right side of yq's `;` operator. Out of line so [`Self::parse_expr`]'s frame, which every
+    /// level of nesting pays, gains only the answer.
+    #[inline(never)]
+    fn claim_yq_semicolon_owner(&mut self) -> bool {
+        self.input[..self.pos].trim_end().ends_with(';')
+            && self.claim_yq_minus_owner(YqMinusOwner::Named(";"))
+    }
+
+    /// Give back what [`Self::claim_yq_minus_owner`] took, once the right side is parsed.
+    #[inline]
+    fn release_yq_minus_owner(&mut self, claimed: bool) {
+        if claimed {
+            self.yq_minus_owner = None;
         }
     }
 
@@ -4739,9 +4836,12 @@ impl<'a> Parser<'a> {
         if !current_literal.is_empty() {
             parts.push(StringPart::Literal(core::mem::take(current_literal)));
         }
-        // Parse the expression inside \(...)
+        // Parse the expression inside \(...). yq parses a slot on its own, so no operator
+        // outside it is short of a `-` inside (#8048).
         self.interp_depth += 1;
+        let outer_owner = self.yq_minus_owner.take();
         let expr = self.parse_expr();
+        self.yq_minus_owner = outer_owner;
         self.interp_depth -= 1;
         let expr = expr?;
         self.skip_ws();
@@ -5532,8 +5632,18 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse an index bracket and check for optional marker.
-    fn parse_index_bracket_with_optional(&mut self) -> Result<Bracket, ParseError> {
-        let bracket = self.parse_index_bracket()?;
+    ///
+    /// `traversal` is the name yq's lexer gives the traversal it inserts before the `[`, which
+    /// takes what stands before the bracket as its left side (#8048): `TRAVERSE_ARRAY` after a bare
+    /// `.`, nothing after any other value.
+    fn parse_index_bracket_with_optional(
+        &mut self,
+        traversal: &'static str,
+    ) -> Result<Bracket, ParseError> {
+        let claimed = self.claim_yq_minus_owner(YqMinusOwner::Named(traversal));
+        let bracket = self.parse_index_bracket();
+        self.release_yq_minus_owner(claimed);
+        let bracket = bracket?;
         let bracket_end = self.pos;
         self.skip_ws();
         if self.mode == ParserMode::Yq
@@ -5785,7 +5895,7 @@ impl<'a> Parser<'a> {
             if let Some(group) = pair_group {
                 entries.extend(group);
             } else if yq_entry {
-                let entry = self.parse_yq_object_entry()?;
+                let entry = self.parse_yq_object_entry_after(after_comma)?;
                 entries.push(entry);
             } else {
                 // #7716: a syntax error in the entry is one jq's parser may recover from at
@@ -6205,6 +6315,7 @@ impl<'a> Parser<'a> {
         self.pair_group_budget -= 1;
         let saved_pos = self.pos;
         let saved_depth = self.expr_depth;
+        let saved_owner = self.yq_minus_owner;
         self.expr_depth += 1;
         let group = if self.expr_depth > MAX_EXPR_DEPTH {
             None
@@ -6221,6 +6332,7 @@ impl<'a> Parser<'a> {
         self.expr_depth = saved_depth;
         if group.is_none() {
             self.pos = saved_pos;
+            self.yq_minus_owner = saved_owner;
         }
         group
     }
@@ -6315,6 +6427,20 @@ impl<'a> Parser<'a> {
         Some(group)
     }
 
+    /// [`Self::parse_yq_object_entry`] for an entry of the object itself; one after a `,` is the
+    /// right side of yq's `,` (#8048). Out of line so the object parser's frame, which every level
+    /// of nesting pays, stays as it was.
+    #[inline(never)]
+    fn parse_yq_object_entry_after(
+        &mut self,
+        after_comma: bool,
+    ) -> Result<ObjectEntry, ParseError> {
+        let claimed = after_comma && self.claim_yq_minus_owner(YqMinusOwner::Named(","));
+        let entry = self.parse_yq_object_entry();
+        self.release_yq_minus_owner(claimed);
+        entry
+    }
+
     /// One entry of a yq-mode `{...}` (#2783): `key: value`, or a bare expression.
     ///
     /// yq parses the key as a full expression (`{.a: 5}`, `{1: 2}`,
@@ -6334,7 +6460,10 @@ impl<'a> Parser<'a> {
         self.next();
         self.skip_yq_space();
         self.skip_ws();
-        let value = self.parse_object_value()?;
+        let claimed = self.claim_yq_minus_owner(YqMinusOwner::Named(":"));
+        let value = self.parse_object_value();
+        self.release_yq_minus_owner(claimed);
+        let value = value?;
         let key = match first {
             Expr::Literal(Literal::String(s)) => ObjectKey::Literal(s.into_string()),
             other => ObjectKey::Expr(Box::new(other)),
@@ -6815,6 +6944,14 @@ impl<'a> Parser<'a> {
                     // semantics that have nothing to do with negation, so
                     // `-"abc"`/`-null` silently returned `null` instead of
                     // erroring.
+                    //
+                    // #8048: yq has no unary minus. Its `-` is `Subtract` alone, so
+                    // a `-` that is no number's sign leaves its tree builder one
+                    // argument short, `--jq-extensions` or not (it is the builder
+                    // that refuses, not the lexer #1512's gate stands in for).
+                    if self.mode == ParserMode::Yq {
+                        return Err(yq_unary_minus(self.input, self.yq_minus_owner, self.pos));
+                    }
                     self.next(); // consume '-'
                                  // #3038: jq's grammar has `Term: '-' Term` but negating
                                  // a non-Term needs the separate, non-Term `Exp: '-'
@@ -6844,9 +6981,8 @@ impl<'a> Parser<'a> {
                     };
                     // jq's `'-' Exp` makes the negation cover the
                     // multiplicative chain after its operand: `-.a * 2` is
-                    // `-(.a * 2)`. yq has no unary minus (`-E` is its own
-                    // extension, `E * -1`), and keeps the single operand.
-                    let operand = if self.mode == ParserMode::Jq && !self.expd_operand {
+                    // `-(.a * 2)`. (yq mode refused the `-` above.)
+                    let operand = if !self.expd_operand {
                         self.parse_multiplicative_from(first)?
                     } else {
                         first
@@ -6921,7 +7057,7 @@ impl<'a> Parser<'a> {
                 // Check for `.[...]` (index/iterate). A leading bracket indexes
                 // the identity, so a dynamic key gets `.` as its target.
                 if self.peek() == Some('[') && !yq_gap {
-                    let bracket = self.parse_index_bracket_with_optional()?;
+                    let bracket = self.parse_index_bracket_with_optional("TRAVERSE_ARRAY")?;
                     let mut chain = vec![Expr::Identity];
                     push_bracket(&mut chain, bracket);
                     let first = match chain.len() {
@@ -12462,6 +12598,10 @@ impl<'a> Parser<'a> {
 
     fn parse_postfix(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
         let mut chain = vec![expr];
+        // #8048: whether a `.name` step was read. yq's lexer joins one to what precedes it with
+        // a `.` operator (`SHORT_PIPE`), which binds looser than a bracket's traversal, so a later
+        // bracket's traversal is inside that `.` operator's right side.
+        let mut dotted = false;
 
         loop {
             self.skip_ws();
@@ -12504,7 +12644,8 @@ impl<'a> Parser<'a> {
                     // Check for bracket after dot
                     if self.peek() == Some('[') {
                         let bracket_start = self.pos;
-                        let bracket = self.parse_index_bracket_with_optional()?;
+                        // #8048: the `.` before the bracket is yq's `.` operator itself.
+                        let bracket = self.parse_index_bracket_with_optional(".")?;
                         // jq's grammar has `Term '.' '[' Exp ']'` and `Term '.' '[' ']'` but no
                         // slice after a dot (#5454): `[1,2,3].[1:]` is a syntax error there.
                         if self.mode == ParserMode::Jq && Self::bracket_is_slice(&bracket) {
@@ -12526,6 +12667,7 @@ impl<'a> Parser<'a> {
                                     self.next();
                                 }
                                 push_bracket(&mut chain, Bracket::Dynamic { key, optional });
+                                dotted = true;
                                 continue;
                             }
                             None => self.parse_field_ident()?,
@@ -12552,10 +12694,12 @@ impl<'a> Parser<'a> {
                         }
 
                         chain.push(field_expr);
+                        dotted = true;
                     }
                 }
                 Some('[') => {
-                    let bracket = self.parse_index_bracket_with_optional()?;
+                    let bracket =
+                        self.parse_index_bracket_with_optional(if dotted { "." } else { "" })?;
                     let bracket = self.keep_string_key_after_sum_or_merge(&chain, bracket);
                     push_bracket(&mut chain, bracket);
                 }
@@ -12813,6 +12957,7 @@ impl<'a> Parser<'a> {
     #[inline(never)]
     fn take_yq_arithmetic_op(&mut self) -> Result<Option<YqArithLink>, ParseError> {
         self.skip_ws();
+        self.yq_op_at = self.pos;
         let peek2 = self.peek_str(2);
         if matches!(peek2, "+=" | "-=" | "*=" | "%=" | "/=") || self.peek_str(3) == "//=" {
             return Ok(None);
@@ -12856,11 +13001,16 @@ impl<'a> Parser<'a> {
     fn parse_yq_arithmetic(&mut self) -> Result<Expr, ParseError> {
         let mut operands = vec![self.parse_operand()?];
         let mut links = Vec::new();
+        let mut claimed = false;
         while let Some(link) = self.take_yq_arithmetic_op()? {
+            if links.is_empty() {
+                claimed = self.claim_yq_minus_owner(YqMinusOwner::Token(self.yq_op_at));
+            }
             links.push(link);
             self.check_expr_nesting(links.len())?;
             operands.push(self.parse_operand()?);
         }
+        self.release_yq_minus_owner(claimed);
         let mut folded = operands.pop().unwrap_or(Expr::Identity);
         while let (Some(link), Some(left)) = (links.pop(), operands.pop()) {
             folded = match link {
@@ -13196,9 +13346,11 @@ impl<'a> Parser<'a> {
     #[inline(never)]
     fn parse_yq_forty_group_operand(&mut self) -> Result<Expr, ParseError> {
         self.check_expr_nesting(YQ_FORTY_GROUP_WEIGHT)?;
+        let claimed = self.claim_yq_minus_owner(YqMinusOwner::Token(self.yq_op_at));
         self.expr_depth += YQ_FORTY_GROUP_WEIGHT;
         let result = self.parse_assignment_level();
         self.expr_depth -= YQ_FORTY_GROUP_WEIGHT;
+        self.release_yq_minus_owner(claimed);
         result
     }
 
@@ -13411,6 +13563,7 @@ impl<'a> Parser<'a> {
         }
 
         // Check for assignment operators
+        self.yq_op_at = self.pos;
         let peek2 = self.peek_str(2);
         let peek3 = self.peek_str(3);
 
@@ -13547,10 +13700,12 @@ impl<'a> Parser<'a> {
         // #3397: a nested expression is its own scope, even inside an object
         // value.
         let expd = core::mem::replace(&mut self.expd_operand, false);
+        let claimed = self.mode == ParserMode::Yq && self.claim_yq_semicolon_owner();
         let expr = match self.mode {
             ParserMode::Jq => self.parse_pipe_expr(),
             ParserMode::Yq => self.parse_yq_comma_expr(),
         };
+        self.release_yq_minus_owner(claimed);
         self.expd_operand = expd;
         expr
     }
@@ -13570,6 +13725,7 @@ impl<'a> Parser<'a> {
         }
 
         let mut exprs = vec![first];
+        let claimed = self.claim_yq_minus_owner(YqMinusOwner::Named(","));
 
         while self.peek() == Some(',') {
             self.next();
@@ -13578,6 +13734,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
         }
 
+        self.release_yq_minus_owner(claimed);
         Ok(yq_union(exprs))
     }
 
@@ -13625,6 +13782,7 @@ impl<'a> Parser<'a> {
     fn parse_yq_boolean_expr(&mut self) -> Result<Expr, ParseError> {
         let mut operands = vec![self.parse_pipe_no_comma()?];
         let mut ops: Vec<bool> = Vec::new();
+        let mut claimed = false;
 
         loop {
             self.skip_ws();
@@ -13637,10 +13795,18 @@ impl<'a> Parser<'a> {
             };
             self.consume_keyword(if is_and { "and" } else { "or" });
             self.skip_ws();
+            if ops.is_empty() {
+                claimed = self.claim_yq_minus_owner(YqMinusOwner::Named(if is_and {
+                    "and"
+                } else {
+                    "or"
+                }));
+            }
             ops.push(is_and);
             self.check_expr_nesting(ops.len())?;
             operands.push(self.parse_pipe_no_comma()?);
         }
+        self.release_yq_minus_owner(claimed);
 
         // Right-associative fold: the last operand is the innermost right-hand
         // side, and each operator wraps the operand to its left around it.
@@ -13988,7 +14154,11 @@ impl<'a> Parser<'a> {
             // (#4183). Still a scope of its own, as `parse_expr` makes it.
             ParserMode::Yq => {
                 let expd = core::mem::replace(&mut self.expd_operand, false);
+                // #8048: yq's `as` is an operator of its own, and the `|` after the pattern
+                // takes the binding as its left side.
+                let claimed = self.claim_yq_minus_owner(YqMinusOwner::Named("|"));
                 let body = self.parse_pipe_no_comma();
+                self.release_yq_minus_owner(claimed);
                 self.expd_operand = expd;
                 body?
             }
@@ -14053,6 +14223,7 @@ impl<'a> Parser<'a> {
         }
 
         let mut exprs = vec![first];
+        let claimed = self.claim_yq_minus_owner(YqMinusOwner::Named("|"));
 
         while self.peek() == Some('|') {
             self.next();
@@ -14063,6 +14234,7 @@ impl<'a> Parser<'a> {
             exprs.push(stage);
             self.skip_ws();
         }
+        self.release_yq_minus_owner(claimed);
 
         if self.mode == ParserMode::Yq && self.in_path_arg == 0 {
             return Ok(yq_var_stage_once(
@@ -15559,8 +15731,9 @@ mod tests {
         );
 
         // jq's `'-' Exp` also covers the multiplicative chain after its
-        // operand: `-.a * 2` is `-(.a * 2)`, and so is `-2 * 3`. yq keeps the
-        // single operand (`-E` is its own `E * -1` extension there).
+        // operand: `-.a * 2` is `-(.a * 2)`, and so is `-2 * 3`. yq has no
+        // unary minus (#8048), only a negative number token: `-2 * 3` is
+        // `(-2) * 3` there.
         assert!(matches!(
             parse("-.a * 2").unwrap(),
             Expr::Negate(inner) if matches!(*inner, Expr::Arithmetic { .. })
@@ -15569,7 +15742,13 @@ mod tests {
             parse("-2 * 3").unwrap(),
             Expr::Negate(inner) if matches!(*inner, Expr::Arithmetic { .. })
         ));
-        assert!(matches!(yq("-.a * 2"), Expr::Arithmetic { .. }));
+        assert!(matches!(yq("-2 * 3"), Expr::Arithmetic { .. }));
+        assert_eq!(
+            parse_with_mode("-.a * 2", ParserMode::Yq)
+                .unwrap_err()
+                .message,
+            "'-' expects 2 args but there is 1"
+        );
         // A plain negative literal still folds its sign, so `.[-1]` keeps
         // its static index fast path.
         assert_eq!(parse("-1").unwrap(), int(-1));

@@ -2209,7 +2209,10 @@ fn test_yq_loc_and_hyphen_digit_variables_are_unbound_2776_2767() -> Result<()> 
 /// into yq mode: real yq's `and`/`or` are ordinary operators, not a lexer
 /// rejection like `empty`/`leaf_paths`, so a live divergence here is not an
 /// ADR-0018 extension exemption. Confirmed live against yq v4.53.3: each of
-/// these silently no-ops (exit 0, document unchanged) -- caught in code
+/// these silently no-ops (exit 0, document unchanged). yq has no unary minus,
+/// so `del(1 | -(.a) | select(false))` exits 1 there (`'|' expects 2 args but
+/// there is 1`) and is refused here too since #8048; the negation row is
+/// spelled `.a * -1`, as in yq. The `and`/`or` leak was caught in code
 /// review as a regression from an earlier draft of the #2760 fix that was
 /// missing the `S::TAG == EvalTag::Jq` guard `array_resolves_live` already
 /// has for the sibling `[E]` arm, and raised
@@ -2224,7 +2227,8 @@ fn test_and_or_negate_untracked_navigation_stays_unfixed_in_yq_mode_2760() -> Re
             "(1 | (.a and true) | select(false)) |= 5",
             "a: false\nk: 2\n",
         ),
-        ("del(1 | -(.a) | select(false))", "a: false\nk: 2\n"),
+        // yq has no unary minus (#8048); `* -1` is its spelling of a negation.
+        ("del(1 | (.a * -1) | select(false))", "a: false\nk: 2\n"),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, doc, &[])?;
         assert_eq!(code, 0, "{filter}: stdout {stdout:?} stderr {stderr:?}");
@@ -2233,26 +2237,24 @@ fn test_and_or_negate_untracked_navigation_stays_unfixed_in_yq_mode_2760() -> Re
     Ok(())
 }
 
-/// #2760: succinctly's own documented yq-mode equivalence `-E == E * -1`
-/// (real yq has no unary-minus operator at all, confirmed live: `yq '(-
-/// .a)'` errors `'-' expects 2 args but there is 1`; `docs/compliance/yq/
-/// limitations.md` records `-E` as succinctly's extension spelling) must
-/// hold on an untracked-and-navigating operand too, not just on a plain
-/// value -- an earlier draft of the #2760 fix left `Expr::Negate` reachable
-/// in yq mode while `Expr::Arithmetic`'s `* -1` path was untouched, so the
-/// two spellings disagreed (`-(.a)` raised, `.a * -1` silently no-op'd) on
-/// exactly the shape this test uses. Caught in code review.
+/// #2760: `-E` and `E * -1` used to be two yq-mode spellings of one negation that had to agree
+/// on an untracked-and-navigating operand. Since #8048 `-E` is refused as real yq refuses it (yq
+/// has no unary minus: `del(1 | -(.a) | select(false))` is `'|' expects 2 args but there is 1`,
+/// exit 1, v4.53.3), and `E * -1` still no-ops on that shape, as in yq.
 #[test]
-fn test_yq_unary_minus_extension_agrees_with_times_negative_one_on_untracked_navigation_2760(
+fn test_yq_unary_minus_refused_and_times_negative_one_no_ops_on_untracked_navigation_2760(
 ) -> Result<()> {
     let doc = "a: false\nk: 2\n";
     let (neg_out, neg_err, neg_code) =
         run_yq_stdin_with_stderr("del(1 | -(.a) | select(false))", doc, &[])?;
+    assert_eq!((neg_out.as_str(), neg_code), ("", 1), "neg: {neg_err:?}");
+    assert!(
+        neg_err.contains("'|' expects 2 args but there is 1"),
+        "neg: {neg_err:?}"
+    );
     let (mul_out, mul_err, mul_code) =
         run_yq_stdin_with_stderr("del(1 | (.a * -1) | select(false))", doc, &[])?;
-    assert_eq!(neg_code, mul_code, "neg: {neg_err:?} mul: {mul_err:?}");
-    assert_eq!(neg_out, mul_out);
-    assert_eq!(neg_out, doc);
+    assert_eq!((mul_out.as_str(), mul_code), (doc, 0), "mul: {mul_err:?}");
     Ok(())
 }
 
@@ -3870,9 +3872,9 @@ fn test_1398_dup_key_format_parity_across_filters() -> Result<()> {
 /// $ printf 'a: 1\n---\nb: 2\n' | yq -o=json -I=0 'di + 0'              # 0 then 1
 /// ```
 ///
-/// Real yq has no unary minus, so `-length` has no oracle of its own; its
-/// yq-spelled twin `length * -1` is the oracle row, and `(-length)` is
-/// asserted alongside it as internal consistency.
+/// Real yq has no unary minus, so its spelling of `-length` is `length * -1`;
+/// since #8048 `succinctly yq` refuses `-length` as yq does
+/// (`tests/yq_cli/i8048.rs`).
 ///
 /// `column` was absent from the rows below until #2712: succinctly's bare
 /// `.b | column` answered 9 where yq v4.53.3 answers 4 (yq reports the
@@ -3888,14 +3890,9 @@ fn test_arithmetic_reads_the_real_document_2626() -> Result<()> {
         ("(keys|length) + 0", "3"),
         ("(to_entries|length) + 0", "3"),
         ("length * -1", "-3"),
-        // Parenthesized so the leading `-` is not read as a CLI flag; the
-        // parse is the same `Expr::Negate`.
-        ("(-length)", "-3"),
         // Under a lazy consumer these take `eval_each_generic`'s own arms.
-        // Its `Expr::Negate` arm bridged too, so `limit(1; -length)` was the
-        // last spelling still answering `-2` once the arms above were fixed.
         ("limit(1; length + 0)", "3"),
-        ("limit(1; -length)", "-3"),
+        ("limit(1; length * -1)", "-3"),
     ] {
         let (out, code) = run_yq_stdin(filter, dup, &["--jq-extensions", "-o=json", "-I=0"])?;
         assert_eq!(code, 0, "filter {filter}");
@@ -4061,7 +4058,7 @@ fn test_arithmetic_validates_only_what_it_reads_2626() -> Result<()> {
         ("limit(1; length + 0)", "2"),
         ("(keys|length)", "2"),
         ("(keys|length) + 0", "2"),
-        ("(-length)", "-2"),
+        ("length * -1", "-2"),
     ] {
         let (stdout, stderr, code) =
             run_yq_stdin_with_stderr(filter, doc, &["--jq-extensions", "-o=json", "-I=0"])?;
@@ -57728,12 +57725,12 @@ fn test_truthiness_probes_validate_nothing_2692() -> Result<()> {
         // #2626 gave `Expr::Arithmetic`/`Expr::Negate` native arms, so they
         // reach `bridge_ambient_input`'s closed-term path no longer -- they
         // never materialize at all now. Either way the answer is #2173's:
-        // a term that reads nothing validates nothing. `(-(1))`, not `-1`,
-        // because the parser constant-folds the latter into a literal that
-        // never reaches `Expr::Negate`.
+        // a term that reads nothing validates nothing. yq has no unary minus
+        // (`(-(1))` is refused since #8048), so `Expr::Negate` is the jq
+        // twin's row alone.
         ("1 + 1", "2"),
         ("0 - 0", "0"),
-        ("(-(1))", "-1"),
+        ("0 - 1", "-1"),
     ];
     for (label, doc) in corpus {
         let mut seen: Vec<(String, i32, String)> = Vec::new();
