@@ -92625,6 +92625,10 @@ fn del_target_shape(expr: &Expr) -> DelTargetShape {
         // `select(cond)` hands its input on, with its path: it only filters (#4476).
         Expr::Builtin(Builtin::Select(_)) => Navigation,
         Expr::Literal(_) | Expr::Array(_) | Expr::Object(_) => Parentless,
+        // yq's `env(NAME)`, `strenv(NAME)` and `now` build a node of their own whatever their
+        // input, as a literal does (#8008): `del(.[] | env(X))` deletes nothing and
+        // `del(env(X), .a)` deletes `.a`.
+        Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now) => Parentless,
         Expr::Optional(inner) | Expr::Paren(inner) => del_target_shape(inner),
         Expr::Pipe(stages) => match stages.last().map(del_target_shape) {
             Some(Parentless) => Parentless,
