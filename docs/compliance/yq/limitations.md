@@ -7415,7 +7415,7 @@ A string interpolation is parsed on its own in yq, so `.a | "\(-.b)"` names `'-'
 A negative number where a value may start (`-1`, `.a | -1`, `1 - -1`, `[.a, -1]`) and a subtraction (`1 -.a`, `.a -(1)`) are unchanged, and `succinctly jq` keeps jq's unary minus (`-(1)` is `-1`, `1 | -.` is `-1`).
 yq lexes the whole filter first, so where the filter also holds a token its lexer rejects (`if -.a then 1 else 2 end`: `lexer: invalid input text`) yq reports that, and so does this parser where it refuses the token before it reaches the `-` (`"if" is not part of yq's syntax`); both exit 1.
 Two positions name a different operator; both exit 1 in both tools.
-Inside `ireduce`'s arguments yq names `'ireduce'` (`.a as $x ireduce (0; -$x)`, `(-$x; 0)`, `(0; . + -$x)`, `(0; . | -$x)`), where `succinctly yq` names the operator inside the argument (`'-'`, `';'`, `'+'`, `'|'`).
+Inside `ireduce`'s arguments yq names `'ireduce'` (`.a as $x ireduce (0; -$x)`, `(-$x; 0)`, `(0; . + -$x)`, `(0; . | -$x)`), where `succinctly yq` names the operator inside the argument, or `'-'` when there is none (`'-'`, `'-'`, `'+'`, `'|'` for those four).
 A pair group (`{("a": -.b)}`) is read again as a parenthesised expression when one of its pairs fails, so the refusal is that reading's `expected ')', found ':'`, where yq says `':' expects 2 args but there is 1`.
 Pinned in `tests/yq_cli/i8048.rs`.
 
