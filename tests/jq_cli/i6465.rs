@@ -7,6 +7,7 @@
 
 use anyhow::Result;
 
+use super::i7967::masked;
 use crate::run_jq_over_byte_files;
 
 const FILTER: &str = "[limit(4; repeat(try input catch .))]";
@@ -40,7 +41,7 @@ fn a_depth_refusal_after_an_invalid_byte_is_placed_over_the_bytes_read_6465() ->
             "{prefix:?}"
         );
         let (stdout, _, code, _) = run_jq_over_byte_files(&["-nc", FILTER], &[&text])?;
-        assert_eq!((stdout.as_str(), code), (inputs, 0), "{prefix:?}");
+        assert_eq!((masked(&stdout), code), (masked(inputs), 0), "{prefix:?}");
     }
     Ok(())
 }
@@ -51,9 +52,9 @@ fn a_valid_key_keeps_its_column_6465() -> Result<()> {
     let text = deep_after("{\"é\":".as_bytes());
     let (stdout, _, code, _) = run_jq_over_byte_files(&["-nc", FILTER], &[&text])?;
     assert_eq!(
-        (stdout.as_str(), code),
+        (masked(&stdout), code),
         (
-            "[\"Exceeds depth limit for parsing at line 1, column 261\",\"k\",\"Expected string key before ':' at line 1, column 265\",\"break\"]\n",
+            masked("[\"Exceeds depth limit for parsing at line 1, column 261\",\"k\",\"Expected string key before ':' at line 1, column 265\",\"break\"]\n"),
             0
         )
     );

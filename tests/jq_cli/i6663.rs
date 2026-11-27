@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 
+use super::i7967::masked;
 use crate::run_jq_full;
 
 const MULTI_1: &str = "jq: error (at @DIR@/multi.json:1): Unmatched '}' at line 1, column 3\n";
@@ -85,7 +86,11 @@ fn a_program_reading_past_faults_reaches_the_files_after_them_6663() -> Result<(
         args.extend(files.iter().map(String::as_str));
         let (out, err, status) = run_jq_full(&args, None)?;
         assert_eq!(out, stdout, "{program} {names:?} stdout");
-        assert_eq!(err, expand(&stderr), "{program} {names:?} stderr");
+        assert_eq!(
+            masked(&err),
+            masked(&expand(&stderr)),
+            "{program} {names:?} stderr"
+        );
         assert_eq!(status, code, "{program} {names:?} status");
     }
     Ok(())

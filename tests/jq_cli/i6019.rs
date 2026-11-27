@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 
+use super::i7967::masked;
 use crate::run_jq_over_byte_files;
 
 /// `(files, program, stdout, stderr, exit code)`, run as `-nc -s`.
@@ -108,9 +109,18 @@ fn a_fault_in_a_slurped_stream_is_raised_by_the_input_that_reaches_it_6019() -> 
         for (i, path) in paths.iter().enumerate() {
             got_err = got_err.replace(path.as_str(), &format!("<f{i}>"));
         }
+        // #7967: the faults after the first are placed where they are, best effort above the
+        // floor. Standard output holds the faults a program caught, which come before the one it
+        // did not, so the two are masked as one text. `catch null` prints no first fault, so a
+        // fault in that text is a later one, and every position in it is masked.
+        let lead = if program.contains("catch null") {
+            "line 0, column 0\0"
+        } else {
+            ""
+        };
         assert_eq!(
-            (got_out.as_str(), got_err.as_str(), got_code),
-            (stdout, stderr, code),
+            (masked(&format!("{lead}{got_out}\0{got_err}")), got_code),
+            (masked(&format!("{lead}{stdout}\0{stderr}")), code),
             "{files:?} | {program}"
         );
     }

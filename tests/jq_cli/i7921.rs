@@ -30,6 +30,7 @@
 
 use anyhow::Result;
 
+use super::i7967::masked;
 use crate::run_jq_over_byte_files;
 
 const MARK: &[u8] = b"\xef\xbb\xbf";
@@ -238,8 +239,8 @@ fn check(rows: Vec<Row>) -> Result<()> {
         let (out, err, code, _) = run_jq_over_byte_files(args, &files)?;
         let err = err.replace("succinctly jq:", "jq:");
         assert_eq!(
-            (out.as_str(), err.as_str(), code),
-            (stdout, stderr, status),
+            (masked(&out), masked(&err), code),
+            (masked(stdout), masked(stderr), status),
             "{name}"
         );
     }

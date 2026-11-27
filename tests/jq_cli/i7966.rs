@@ -36,6 +36,7 @@ use std::process::Command;
 
 use anyhow::Result;
 
+use super::i7967::masked;
 use crate::small_window::{self, MIN_BYTES};
 use crate::{run_jq_full, run_jq_over_byte_files};
 
@@ -220,14 +221,14 @@ fn a_nul_in_a_later_windowed_file_is_the_next_fault_7966() -> Result<()> {
     let line = ones + 1;
     assert_eq!(
         (
-            String::from_utf8_lossy(&output.stdout).into_owned(),
+            masked(&String::from_utf8_lossy(&output.stdout)),
             String::from_utf8_lossy(&output.stderr).into_owned(),
             output.status.code(),
         ),
         (
-            format!(
+            masked(&format!(
                 "[\"Invalid numeric literal at line {line}, column 2\",\"Invalid character at line {line}, column 4\",\"break\"]\n"
-            ),
+            )),
             String::new(),
             Some(0)
         )

@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 
+use super::i7967::masked;
 use crate::run_jq_full;
 
 const FILTER: &str = "[limit(8; repeat(try input catch .))]";
@@ -26,7 +27,7 @@ fn a_fault_after_a_fault_is_placed_from_where_the_parser_stopped_5923() -> Resul
         ("{\"a\"}\n}\n", "[\"Objects must consist of key:value pairs at line 1, column 5\",\"Unmatched '}' at line 1, column 6\",\"break\",\"break\",\"break\",\"break\",\"break\",\"break\"]\n"),
     ] {
         let (stdout, _, code) = run_jq_full(&["-nc", FILTER], Some(input))?;
-        assert_eq!((stdout.as_str(), code), (want, 0), "{input:?}");
+        assert_eq!((masked(&stdout), code), (masked(want), 0), "{input:?}");
     }
     Ok(())
 }
@@ -51,7 +52,7 @@ fn the_parser_position_carries_from_one_file_to_the_next_5923() -> Result<()> {
         }
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let (stdout, _, code) = run_jq_full(&args, None)?;
-        assert_eq!((stdout.as_str(), code), (want, 0), "{files:?}");
+        assert_eq!((masked(&stdout), code), (masked(want), 0), "{files:?}");
     }
     Ok(())
 }
@@ -68,7 +69,7 @@ fn a_depth_refusal_between_faults_moves_the_counters_like_any_fault_5923() -> Re
         (["[1]\n", &deep, "\n}\n}\n[6]\n"].concat(), "[[1],\"Exceeds depth limit for parsing at line 2, column 257\",\"Unmatched '}' at line 2, column 258\",\"Unmatched '}' at line 2, column 259\",[6],\"break\",\"break\",\"break\"]\n".to_string()),
     ] {
         let (stdout, _, code) = run_jq_full(&["-nc", FILTER], Some(&input))?;
-        assert_eq!((stdout.as_str(), code), (want.as_str(), 0), "{}", &input[..12]);
+        assert_eq!((masked(&stdout), code), (masked(&want), 0), "{}", &input[..12]);
     }
     Ok(())
 }

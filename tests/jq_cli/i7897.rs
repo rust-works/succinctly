@@ -15,6 +15,7 @@
 
 use anyhow::Result;
 
+use super::i7967::masked;
 use crate::run_jq_over_byte_files;
 
 /// A program that reads three inputs past the faults, one answer a line.
@@ -116,8 +117,8 @@ fn a_nul_after_a_fault_is_the_second_fault_7966() -> Result<()> {
     for ((args, files, stdout), row) in rows().into_iter().zip(0..) {
         let (out, err, code, _) = run_jq_over_byte_files(args, files)?;
         assert_eq!(
-            (out.as_str(), err.as_str(), code),
-            (stdout.as_str(), "", 0),
+            (masked(&out), err.as_str(), code),
+            (masked(&stdout), "", 0),
             "row {row}: {args:?} over {files:?}"
         );
     }

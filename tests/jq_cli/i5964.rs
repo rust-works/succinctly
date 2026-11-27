@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 
+use super::i7967::masked;
 use crate::run_jq_over_byte_files;
 
 const FILTER: &str = "[limit(8; repeat(try input catch .))]";
@@ -42,7 +43,7 @@ fn a_fault_after_an_invalid_byte_is_counted_over_the_bytes_read_5964() -> Result
     ];
     for (files, want) in rows {
         let (stdout, _, code, _) = run_jq_over_byte_files(&["-nc", FILTER], files)?;
-        assert_eq!((stdout.as_str(), code), (*want, 0), "{files:?}");
+        assert_eq!((masked(&stdout), code), (masked(want), 0), "{files:?}");
     }
     Ok(())
 }

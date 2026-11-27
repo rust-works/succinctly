@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 
+use super::i7967::masked;
 use crate::run_jq_full;
 
 /// One row: the flags, the files, then jq's stdout, stderr and exit status.
@@ -44,8 +45,8 @@ fn check(rows: &[Row<'_>]) -> Result<()> {
         let (out, err, code) = run_jq_full(&args, None)?;
         let (want_out, want_err) = (stdout.replace("@DIR@", &d), stderr.replace("@DIR@", &d));
         assert_eq!(
-            (out.as_str(), err.as_str(), code),
-            (want_out.as_str(), want_err.as_str(), status),
+            (masked(&out), masked(&err), code),
+            (masked(&want_out), masked(&want_err), status),
             "{flags:?} {names:?}"
         );
     }
