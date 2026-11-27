@@ -2787,10 +2787,10 @@ fn has_flat_union(expr: &Expr) -> bool {
 }
 
 /// Whether `expr` is, or is a stage of, a stage yq builds once however many nodes reach it: an
-/// empty `{}` (#6801) or `env(NAME)` / `strenv(NAME)` (#7996), the stages the context-list walk
-/// owns in `[.[] | f]` ([`yq_stage_built_once`]). Looks through parentheses and nested pipes as
-/// `has_flat_union` does, and stops at an `as` body: `. as $v | {}` is one `{}` per node in yq, and
-/// `map(. as $v | env(X))` one `env(X)` per member, so the walk does not own it.
+/// empty `{}` (#6801), `env(NAME)` / `strenv(NAME)` (#7996) or `now` (#8007), the stages the
+/// context-list walk owns in `[.[] | f]` ([`yq_stage_built_once`]). Looks through parentheses and
+/// nested pipes as `has_flat_union` does, and stops at an `as` body: `. as $v | {}` is one `{}` per
+/// node in yq, and `map(. as $v | env(X))` one `env(X)` per member, so the walk does not own it.
 fn has_flat_built_once_stage(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(inner) => has_flat_built_once_stage(inner),
@@ -2864,15 +2864,15 @@ fn has_flat_var_stage(expr: &Expr, env_args_pseudo: bool) -> bool {
 }
 
 /// Whether `stage` is one [`yq_var_stage_once`] answers once: a bare `$name` (#6821), or
-/// `env(NAME)` / `strenv(NAME)` (#7996), whose handler returns one node for its whole context
-/// without reading it, or a pipe or parenthesised pipe that starts with one.
+/// `env(NAME)` / `strenv(NAME)` (#7996) or `now` (#8007), whose handler returns one node for its
+/// whole context without reading it, or a pipe or parenthesised pipe that starts with one.
 fn yq_stage_head_once(stage: &Expr, env_args_pseudo: bool) -> bool {
     match stage {
         Expr::Paren(inner) => yq_stage_head_once(inner, env_args_pseudo),
         Expr::Pipe(stages) => stages
             .first()
             .is_some_and(|stage| yq_stage_head_once(stage, env_args_pseudo)),
-        Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_)) => true,
+        Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now) => true,
         other => yq_stage_head_var(other, env_args_pseudo),
     }
 }
@@ -3016,7 +3016,8 @@ fn yq_assign_after_descent(stages: Vec<Expr>) -> Vec<Expr> {
 /// one node for its whole context, so `.x[] | env(X)` is one value, and `.x[] | select(. > 5) |
 /// strenv(X)` too. The context-list walk answers that on the document route already
 /// (`yq_stage_built_once`); the rewrite carries it to the owned-value evaluator, which a write's
-/// right side takes (`.x = [.x[] | env(X)]` writes `[hi]`).
+/// right side takes (`.x = [.x[] | env(X)]` writes `[hi]`). `now` takes it too (#8007): `nowOp`
+/// returns one node for its whole context, so `[.x[] | now] | length` is `1`.
 fn yq_var_stage_once(stages: Vec<Expr>, env_args_pseudo: bool) -> Expr {
     // A nested pipe is the same stages spliced in (`A | (B | $v)` is `A | B | $v`), so the variable
     // is found wherever it stands; a pipe with none is returned as it was parsed.
@@ -3062,7 +3063,7 @@ fn yq_var_stage_once(stages: Vec<Expr>, env_args_pseudo: bool) -> Expr {
 /// (`mapOperator`, `GetMatchingNodes(splatted, RHS)`), so a union in `f` runs each branch over every
 /// member before the next: `map(.a, .b)` is every `.a`, then every `.b`. An empty `{}` stage in `f`
 /// is built once, not per member (#6801: `.x | map({})` is `[{}]`), as are `env(X)` and `strenv(X)` (#7996:
-/// `map(env(X))` is `[hi]`) and a bare `$name` stage (#6821: `.n as $v | .x | map($v)` is `[7]`). That is the walk
+/// `map(env(X))` is `[hi]`), `now` (#8007) and a bare `$name` stage (#6821: `.n as $v | .x | map($v)` is `[7]`). That is the walk
 /// `[.[] | f]` already takes (the context-list model, `eval_yq_context_pipe`), so a union-bodied
 /// (or empty-`{}`-bodied) `map` over a sequence or a mapping with members is written
 /// `(if has-members then [.[] | f] else . end) | map(.)`.
