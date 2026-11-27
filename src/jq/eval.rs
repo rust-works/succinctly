@@ -51956,8 +51956,9 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // this update's snapshot for a `parent` above its own input.
     // `placed` updates hand theirs on too: a target they create is in it
     // (`.x |= (.zz |= (.b | . |= (parent(2) | keys)))` lists `zz`).
+    let names_position = positioned || placed;
     let shares_pre =
-        S::TAG == EvalTag::Yq && (positioned || placed) && nests_parent_reading_update(filter_expr);
+        S::TAG == EvalTag::Yq && names_position && nests_parent_reading_update(filter_expr);
     // `parent`'s source, and only built for a filter that actually climbs:
     // every target auto-created, none of them written yet. `Expr::Identity`
     // as the filter is exactly `yq_prepare_assign_targets`' own vivification
@@ -51966,7 +51967,7 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // filter is about to be handed. Named apart from `pre` above
     // (`alias_identity`'s own snapshot, taken for a different reason and
     // consumed after the loop).
-    let pre_update = ((positioned || placed) && reads_parent(filter_expr)).then(|| {
+    let pre_update = (names_position && reads_parent(filter_expr)).then(|| {
         let mut vivified = result.clone();
         for path in &paths {
             // A path that cannot even be walked contributes no vivification;
@@ -51993,7 +51994,7 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut deletes = DeferredUpdateDeletes::default();
     let mut untouched = true;
     for path in &paths {
-        let pos = (positioned || placed).then(|| UpdatePos {
+        let pos = names_position.then(|| UpdatePos {
             path: base.clone(),
             base_len: base.len(),
             pre: pre_update.as_ref(),
