@@ -7947,7 +7947,10 @@ fn navigates_and_filters_only(target: &Expr) -> bool {
         | Expr::Iterate
         | Expr::RecursiveDescent
         | Expr::Builtin(Builtin::Select(_)) => true,
-        Expr::Optional(inner) => navigates_and_filters_only(inner),
+        // yq's `first(f)`/`last(f)` pick a child of the context (`first(.[]? | select(f))`).
+        Expr::Optional(inner) | Expr::FirstExpr(inner) | Expr::LastExpr(inner) => {
+            navigates_and_filters_only(inner)
+        }
         Expr::Pipe(stages) => stages.iter().all(navigates_and_filters_only),
         Expr::Comma(items) => items.iter().all(navigates_and_filters_only),
         _ => false,

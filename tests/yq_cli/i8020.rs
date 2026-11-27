@@ -275,6 +275,20 @@ const REVIEW_ROWS: &[(&str, &str, &str)] = &[
         "del(.. | select(style == \"\") | key)",
         "a: \"x\"\n",
     ),
+    // yq's `first(f)` is the first child for which `f` holds: a condition, resolved on the cursor.
+    (STYLED, "del(first(.a, line))", "b: 1\nc: 2 # hi\n"),
+    (
+        STYLED,
+        "del(first(style == \"double\"))",
+        "b: 1\nc: 2 # hi\n",
+    ),
+    (
+        STYLED,
+        "(first(style == \"double\")) = 9",
+        "a: 9\nb: 1\nc: 2 # hi\n",
+    ),
+    // A reader that only answers a node, beside navigation: a fresh node and the node itself.
+    (STYLED, "del(.b | (style, .))", "a: \"x\"\nc: 2 # hi\n"),
     (NESTED, "del(.b | key | key)", NESTED),
     (NESTED, "del(.[] | key | key)", NESTED),
     (NESTED, "del(.. | key | key)", NESTED),
