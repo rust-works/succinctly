@@ -1845,14 +1845,18 @@ fn meta_from_owned(value: &OwnedValue) -> MetaValue {
 /// on which names get pseudo-variable treatment -- the exact "duplicated
 /// predicates diverge silently" shape #2728 found for identifier-start
 /// rules, per CLAUDE.md's #106 note.
-fn dollar_var_expr(name: String, line: usize) -> Expr {
+///
+/// `env_pseudo` is false in `succinctly yq` without `--jq-extensions` (#7616): yq has no `$ENV`, so
+/// there it is an ordinary variable, unbound unless the program binds it, and reads as nothing, as
+/// `$foo` does (`yq -n '[$ENV] | length'` is `0`). See [`Parser::env_is_pseudo_var`].
+fn dollar_var_expr(name: String, line: usize, env_pseudo: bool) -> Expr {
     if name == "__loc__" {
         // #2774: the parser has no notion of which file it is reading (a
         // module's text arrives here identically to the main filter's), so
         // `file` always starts `None` -- `ModuleLoader` stamps it in after
         // the fact for a def sourced from an `include`d module or `~/.jq`.
         Expr::Loc { line, file: None }
-    } else if name == "ENV" {
+    } else if name == "ENV" && env_pseudo {
         Expr::Env
     } else {
         Expr::Var(name)
@@ -2808,12 +2812,17 @@ fn has_flat_reemit_stage(expr: &Expr) -> bool {
 }
 
 /// Whether `stage` is a bare `$name`, or a pipe or parenthesised pipe that starts with one
-/// (`$v`, `($v)`, `$v | keys`, `$v.a`). `$ENV` and `$ARGS` are not variables of yq's.
-fn yq_stage_head_var(stage: &Expr) -> bool {
+/// (`$v`, `($v)`, `$v | keys`, `$v.a`). `$ENV` and `$ARGS` are not variables of yq's, so under
+/// `--jq-extensions` (`env_args_pseudo`), where they are jq's environment and arguments objects,
+/// they are left out; without it they are names like any other (#7616: `1 as $ENV | (1, 2) | $ENV`
+/// is one `1` in yq).
+fn yq_stage_head_var(stage: &Expr, env_args_pseudo: bool) -> bool {
     match stage {
-        Expr::Paren(inner) => yq_stage_head_var(inner),
-        Expr::Pipe(stages) => stages.first().is_some_and(yq_stage_head_var),
-        Expr::Var(name) => !matches!(name.as_str(), "ENV" | "ARGS"),
+        Expr::Paren(inner) => yq_stage_head_var(inner, env_args_pseudo),
+        Expr::Pipe(stages) => stages
+            .first()
+            .is_some_and(|stage| yq_stage_head_var(stage, env_args_pseudo)),
+        Expr::Var(name) => !(env_args_pseudo && matches!(name.as_str(), "ENV" | "ARGS")),
         _ => false,
     }
 }
@@ -2842,11 +2851,13 @@ fn yq_stage_single_valued(stage: &Expr) -> bool {
 /// answers once however many nodes reach it. Looks through parentheses and nested pipes as
 /// [`has_flat_empty_object`] does, and stops at an `as` body: `. as $w | $v` is one `$v` per node in
 /// yq.
-fn has_flat_var_stage(expr: &Expr) -> bool {
+fn has_flat_var_stage(expr: &Expr, env_args_pseudo: bool) -> bool {
     match expr {
-        Expr::Paren(inner) => has_flat_var_stage(inner),
-        Expr::Pipe(stages) => stages.iter().any(has_flat_var_stage),
-        other => yq_stage_head_var(other),
+        Expr::Paren(inner) => has_flat_var_stage(inner, env_args_pseudo),
+        Expr::Pipe(stages) => stages
+            .iter()
+            .any(|stage| has_flat_var_stage(stage, env_args_pseudo)),
+        other => yq_stage_head_var(other, env_args_pseudo),
     }
 }
 
@@ -2973,7 +2984,7 @@ fn yq_assign_after_descent(stages: Vec<Expr>) -> Vec<Expr> {
 /// still refuse, and an `if` that passes `.` on (which keeps the bound node's `line`) leaves the
 /// register at the root, so that write would replace the whole document (#3758). A `$name` that is not a stage (`[$v]`, `{"k": $v}`, `. + $v`) is read
 /// per node in yq too and is left as it is, as is a pipe's first stage, which has one input.
-fn yq_var_stage_once(stages: Vec<Expr>) -> Expr {
+fn yq_var_stage_once(stages: Vec<Expr>, env_args_pseudo: bool) -> Expr {
     // A nested pipe is the same stages spliced in (`A | (B | $v)` is `A | B | $v`), so the variable
     // is found wherever it stands; a pipe with none is returned as it was parsed.
     fn splice(stage: &Expr, out: &mut Vec<Expr>) {
@@ -2983,7 +2994,10 @@ fn yq_var_stage_once(stages: Vec<Expr>) -> Expr {
             other => out.push(other.clone()),
         }
     }
-    if !stages.iter().any(has_flat_var_stage) {
+    if !stages
+        .iter()
+        .any(|stage| has_flat_var_stage(stage, env_args_pseudo))
+    {
         return Expr::pipe(stages);
     }
     let mut flat = Vec::with_capacity(stages.len());
@@ -2992,17 +3006,17 @@ fn yq_var_stage_once(stages: Vec<Expr>) -> Expr {
     }
     // A prefix that answers one node per input leaves one node for the variable either way, so it
     // is left alone, with the bound node's position and its path context as they were.
-    let Some(at) = (1..flat.len())
-        .rev()
-        .find(|&i| yq_stage_head_var(&flat[i]) && !flat[..i].iter().all(yq_stage_single_valued))
-    else {
+    let Some(at) = (1..flat.len()).rev().find(|&i| {
+        yq_stage_head_var(&flat[i], env_args_pseudo)
+            && !flat[..i].iter().all(yq_stage_single_valued)
+    }) else {
         return Expr::pipe(stages);
     };
     let mut prefix = flat;
     let rest = prefix.split_off(at);
     let mut out = Vec::with_capacity(rest.len() + 1);
     out.push(Expr::Reduce {
-        input: Box::new(yq_var_stage_once(prefix)),
+        input: Box::new(yq_var_stage_once(prefix, env_args_pseudo)),
         patterns: vec![Pattern::Var("_".to_string())],
         init: Box::new(Expr::Literal(Literal::Null)),
         update: Box::new(Expr::Literal(Literal::Null)),
@@ -3025,14 +3039,18 @@ fn yq_var_stage_once(stages: Vec<Expr>) -> Expr {
 /// collection is `.a`'s own position), and it answers a scalar (itself, `f` never runs), `null` (`[]`)
 /// and an empty mapping (itself, #5918) exactly as the arm did, whatever `f` is. `f` appears once,
 /// so a nest of such maps stays linear.
-fn yq_map_union_body_over_the_list(call: Expr, var_stage_once: bool) -> Expr {
+fn yq_map_union_body_over_the_list(
+    call: Expr,
+    var_stage_once: bool,
+    env_args_pseudo: bool,
+) -> Expr {
     let Expr::Builtin(Builtin::Map(body)) = &call else {
         return call;
     };
     let owned_by_the_list = has_flat_union(body)
         || has_flat_empty_object(body)
         || has_flat_reemit_stage(body)
-        || (var_stage_once && has_flat_var_stage(body));
+        || (var_stage_once && has_flat_var_stage(body, env_args_pseudo));
     if !owned_by_the_list {
         return call;
     }
@@ -3057,7 +3075,7 @@ fn yq_map_union_body_over_the_list(call: Expr, var_stage_once: bool) -> Expr {
         _ => stages.push((**body).clone()),
     }
     let over_the_list = Expr::array(if var_stage_once {
-        yq_var_stage_once(stages)
+        yq_var_stage_once(stages, env_args_pseudo)
     } else {
         Expr::pipe(stages)
     });
@@ -4071,6 +4089,12 @@ impl<'a> Parser<'a> {
                 .chars()
                 .next()
                 .is_some_and(is_ident_continue_char)
+    }
+
+    /// Whether `$ENV` is jq's environment object (#7616): always in jq mode and under
+    /// `--jq-extensions`; in plain yq mode it is an ordinary variable name, as in yq.
+    fn env_is_pseudo_var(&self) -> bool {
+        self.mode == ParserMode::Jq || self.jq_extensions
     }
 
     /// Real yq's lexer has no token for jq-only surface like `paths`,
@@ -5735,7 +5759,7 @@ impl<'a> Parser<'a> {
                                     self.pos,
                                 ));
                             }
-                            let key_value = dollar_var_expr(name, line);
+                            let key_value = dollar_var_expr(name, line, self.env_is_pseudo_var());
                             if let Expr::Var(name) = &key_value {
                                 self.var_sites.push(VarSite {
                                     name: name.clone(),
@@ -5744,7 +5768,8 @@ impl<'a> Parser<'a> {
                             }
                             (ObjectKey::Expr(Box::new(key_value)), None)
                         } else {
-                            let value = dollar_var_expr(name.clone(), line);
+                            let value =
+                                dollar_var_expr(name.clone(), line, self.env_is_pseudo_var());
                             if let Expr::Var(name) = &value {
                                 self.var_sites.push(VarSite {
                                     name: name.clone(),
@@ -6944,7 +6969,7 @@ impl<'a> Parser<'a> {
                 let line = self.current_line();
                 self.next();
                 let name = self.parse_variable_name()?;
-                let expr = dollar_var_expr(name, line);
+                let expr = dollar_var_expr(name, line, self.env_is_pseudo_var());
                 if let Expr::Var(name) = &expr {
                     self.var_sites.push(VarSite {
                         name: name.clone(),
@@ -7242,6 +7267,7 @@ impl<'a> Parser<'a> {
                                     yq_map_union_body_over_the_list(
                                         bind_retrying_value_arg(builtin),
                                         self.in_path_arg == 0,
+                                        self.jq_extensions,
                                     )
                                 } else {
                                     bind_value_args(builtin)
@@ -13892,7 +13918,10 @@ impl<'a> Parser<'a> {
         }
 
         if self.mode == ParserMode::Yq && self.in_path_arg == 0 {
-            return Ok(yq_var_stage_once(yq_assign_after_descent(exprs)));
+            return Ok(yq_var_stage_once(
+                yq_assign_after_descent(exprs),
+                self.jq_extensions,
+            ));
         }
         Ok(Expr::pipe(exprs))
     }

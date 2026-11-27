@@ -7403,8 +7403,10 @@ Still diverging: over a `null` or absent operand yq's empty index creates the co
 does), where this tool leaves the document unchanged; a slice bound with no output is an error in yq (`.[$nope:]` is `expected to find 1
 number, got 0 instead`) and nothing here (#4197); `1 as $y | select(false) as $y | $y` is `1` in yq
 and nothing here, because the outer `$y` is not substituted into a body that rebinds the name;
-`$ENV` is an unbound variable in yq, so `$ENV.x` prints nothing, where it is the environment object
-here (#3029), and a `--arg __loc__` is not honoured in yq mode.
+and a `--arg __loc__` is not honoured in yq mode.
+
+`$ENV` and `$ARGS` are not variables of yq's, so here too they are unbound names unless the program binds them: `$ENV.x` prints nothing and `[$ENV, $ARGS] | length` is `0` (#7616).
+Under `--jq-extensions` they are jq's environment object and `{named, positional}` object.
 
 ### `..` stops at an alias node — resolved for reads ([#4214](https://github.com/rust-works/succinctly/issues/4214)); the write path, owned routes and merge keys are residual ([#4223](https://github.com/rust-works/succinctly/issues/4223))
 

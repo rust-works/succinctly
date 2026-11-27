@@ -426,7 +426,7 @@ succinctly yq '.users[]' input.yaml
 - `-P, --prettyPrint`: Pretty print, expand flow styles to block style
 - `--tab`: Use tabs for indentation (write-only — see [yq Language Reference § Known Limitations](../reference/yq-language.md#known-limitations))
 - `-a, --ascii-output`: Output ASCII only, escaping non-ASCII as `\uXXXX`. **Not a real yq flag** — v4.53.3 rejects it as an unknown flag; this is a succinctly extension borrowed from jq's own `-a` (ADR-0018 rule 5), so it carries no fidelity obligation to yq. JSON output only: `-o yaml --ascii-output` emits raw UTF-8, since YAML has no `\uXXXX` escape convention to borrow. Escaping happens at the output sink (`AsciiEscapeWriter`), so the flag keeps the streaming path and its duplicate mapping keys; the routes that materialize a DOM anyway (`-P` without `-I0`, `--arg`/`--argjson`, `-r`/`-j`/`-0`, `--eval-all`, `--split-exp`) still collapse duplicates and carry the DOM emitter's own divergences (#1700, #1982)
-- `--split-exp <EXPR>`: Split output into one file per result, named by evaluating `EXPR` against it (`.` is the result, `$index` its 0-based output index; `--arg`/`--argjson` values and `$ARGS` are also available, same as the main filter). Suppresses stdout. Long-only, unlike real yq's `-s`/`--split-exp` — succinctly's `-s` is already `--slurp` (#715). Incompatible with `--slurp`, `--inplace`, `--front-matter`; `--raw-input` not yet supported
+- `--split-exp <EXPR>`: Split output into one file per result, named by evaluating `EXPR` against it (`.` is the result, `$index` its 0-based output index; `--arg`/`--argjson` values are also available, and `$ARGS` under `--jq-extensions`, same as the main filter). Suppresses stdout. Long-only, unlike real yq's `-s`/`--split-exp` — succinctly's `-s` is already `--slurp` (#715). Incompatible with `--slurp`, `--inplace`, `--front-matter`; `--raw-input` not yet supported
 
 ### Input Options
 
@@ -876,7 +876,7 @@ A command-line flag always beats an environment variable.
 | `HOME`                      | `jq`       | Locates `~/.jq`, which is loaded automatically |
 | `TZ`                        | `jq`, `yq` | Timezone for the date builtins                 |
 
-Queries can read any variable via `env`, `$ENV`, `env(NAME)` and `strenv(NAME)`.
+Queries can read any variable via `env(NAME)` and `strenv(NAME)`, and via `env` and `$ENV` in `succinctly jq` or under `succinctly yq --jq-extensions`.
 
 See [Environment Variables](../reference/environment-variables.md) for accepted values, precedence,
 and the library-only `SUCCINCTLY_SIMD` and `SUCCINCTLY_SVE2`.

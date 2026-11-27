@@ -888,7 +888,7 @@ A file without a leading `---` line errors. `--front-matter` is incompatible wit
 
 **Real yq surface, not a succinctly invention** — same correction as [Cross-File Operations](#cross-file-operations) above; `yq --help` lists `-s, --split-exp` (the long-only spelling below is a separate, deliberate divergence, not the extension question).
 
-Splits output into one file per result instead of printing to stdout, named by evaluating `EXPR` against that result (`.` is the result; `$index` is its zero-based output index across the whole run; `--arg`/`--argjson` values and `$ARGS` are also available, same as the main filter).
+Splits output into one file per result instead of printing to stdout, named by evaluating `EXPR` against that result (`.` is the result; `$index` is its zero-based output index across the whole run; `--arg`/`--argjson` values are also available, and `$ARGS` under `--jq-extensions`, same as the main filter).
 
 ```bash
 # One file per array element, named by index
