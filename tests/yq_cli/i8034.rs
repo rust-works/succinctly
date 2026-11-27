@@ -93,6 +93,8 @@ fn a_postfix_index_on_a_path_reading_candidate_does_not_re_emit_8034() -> Result
     for (filter, expected) in [
         (".b | map(select(key == \"zz\") | [key][0])", "[]"),
         (".b | map(select(key == \"zz\") | [key][])", "[]"),
+        (".b | map(select(key == \"zz\") | [key][0]?)", "[]"),
+        (".b | map(select(key == \"zz\") | [key][1:])", "[[]]"),
         (
             ".b | map_values(select(key == \"zz\") | [key][0])",
             "{\"x\":1,\"y\":2}",

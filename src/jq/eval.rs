@@ -5541,10 +5541,11 @@ fn yq_reemit_after_empty_stage_as(
 }
 
 /// Whether `stage` is a navigation the parser may have split off a postfix term (`[key][0]`,
-/// `[key].a`, `[key][]`, `[key][1:]`, `[key][0]?`), for [`yq_reemit_after_empty_stage_as`].
+/// `[key].a`, `[key][]`, `[key][0]?`), for [`yq_reemit_after_empty_stage_as`]. Not a slice: yq
+/// answers `select(false) | [key][1:]` with `[]`, the re-emitted collect sliced.
 fn yq_stage_navigates(stage: &Expr) -> bool {
     match unwrap_paren(stage) {
-        Expr::Index { .. } | Expr::Field(_) | Expr::Iterate | Expr::Slice { .. } => true,
+        Expr::Index { .. } | Expr::Field(_) | Expr::Iterate => true,
         Expr::Optional(inner) => yq_stage_navigates(inner),
         _ => false,
     }
