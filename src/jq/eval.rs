@@ -5455,6 +5455,182 @@ pub(crate) fn yq_stage_can_reemit_in(expr: &Expr, arrays: bool) -> bool {
     }
 }
 
+/// What yq emits for `body` over a context that holds nodes and over which `body` answered
+/// nothing (#8002): the pipe's rule (#6943, the generic pipe entry's `eval_yq_empty_context_pipe`)
+/// for a body a write or a builtin evaluates itself, like the right side of `|=`.
+///
+/// The first stage after the head that builds a node of its own and whose input was empty emits
+/// it once, and the stages after it run on that node: the answer is that node and those stages, an
+/// expression that reads no input. `prefix_matched` says whether a pipe of the stages before a
+/// candidate yields anything over the context, or `None` to give up (it raised; the run that
+/// answered nothing did not, so the generic route gives up the same way).
+///
+/// A candidate, and every stage after it, must read no path context (`key`, `path`, `parent`) as
+/// written: the node a candidate emits is a new one with no position of its own, and a `key`
+/// after it would otherwise read the target's (`select(false) | 3 | key` writes nothing in yq).
+///
+/// `None` for a body with no such stage, the common case, which costs one walk of its stages.
+pub(crate) fn yq_reemit_after_empty_stage(
+    body: &Expr,
+    prefix_matched: &mut dyn FnMut(&Expr) -> Option<bool>,
+) -> Option<Expr> {
+    yq_reemit_after_empty_stage_as(body, None, prefix_matched)
+}
+
+/// [`yq_reemit_after_empty_stage`] for a `body` that is `as_written` with its path-context reads
+/// rewritten to the target's constants (`position_update_filter`): the prefixes run as `body`, and
+/// which stages may re-emit is asked of `as_written`, where `key` is not the literal it became.
+fn yq_reemit_after_empty_stage_as(
+    body: &Expr,
+    as_written: Option<&Expr>,
+    prefix_matched: &mut dyn FnMut(&Expr) -> Option<bool>,
+) -> Option<Expr> {
+    let written = as_written.unwrap_or(body);
+    if !yq_pipe_may_reemit(written) {
+        return None;
+    }
+    let (Expr::Pipe(stages), Expr::Pipe(written_stages)) =
+        (unwrap_paren(body), unwrap_paren(written))
+    else {
+        return None; // patchcov: coverage tolerate-line reason="defensive: `written` is a pipe (`yq_pipe_may_reemit`), and positioning rewrites a pipe's stages in place, never the pipe away"
+    };
+    // A pipe nested as a stage is the same evaluation as the flat one in yq.
+    let mut flat: Vec<Expr> = Vec::new();
+    super::eval_generic::yq_flatten_pipe_stages(stages, &mut flat);
+    let mut written_flat: Vec<Expr> = Vec::new();
+    super::eval_generic::yq_flatten_pipe_stages(written_stages, &mut written_flat);
+    if written_flat.len() != flat.len() {
+        return None; // patchcov: coverage tolerate-line reason="defensive: positioning rewrites each stage in place, so the two flat pipes line up stage for stage"
+    }
+    for at in 1..flat.len() {
+        if !yq_stage_can_reemit(&written_flat[at]) {
+            continue;
+        }
+        if written_flat[at..].iter().any(needs_path_context) {
+            return None;
+        }
+        let Some(head) = yq_empty_context_reemit(&written_flat[at]) else {
+            continue; // patchcov: coverage tolerate-line reason="an object with a computed key (`{(\"a\" + \"b\"): 1}`) may re-emit and then declines; the plain pipe declines it the same way (#6943), so no row of yq's answer can pin it"
+        };
+        if prefix_matched(&Expr::pipe(flat[..at].to_vec()))? {
+            continue;
+        }
+        let mut rest = vec_with_capacity(flat.len() - at);
+        rest.push(head);
+        rest.extend(written_flat[at + 1..].iter().cloned());
+        return Some(Expr::pipe(rest));
+    }
+    None
+}
+
+/// Whether `body` is a pipe [`yq_reemit_after_empty_stage`] may answer for: a stage of it (a nested
+/// pipe at its head included) may re-emit. Allocation-free.
+pub(crate) fn yq_pipe_may_reemit(body: &Expr) -> bool {
+    matches!(unwrap_paren(body), Expr::Pipe(stages) if stages.iter().any(yq_stage_can_reemit))
+}
+
+/// Whether `result` holds no output and no control: what [`yq_reemit_over_values`]'s callers ask
+/// before they look for a stage that re-emits.
+fn query_result_is_empty<W>(result: &QueryResult<'_, W>) -> bool {
+    match result {
+        QueryResult::None => true,
+        QueryResult::Many(vs) => vs.is_empty(),
+        QueryResult::ManyOwned(vs) => vs.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether `result` holds an output, for the `prefix_matched` question of
+/// [`yq_reemit_after_empty_stage`]: `None` for one that raised.
+fn query_result_yields<W>(result: &QueryResult<'_, W>) -> Option<bool> {
+    match result {
+        result if query_result_is_empty(result) => Some(false),
+        QueryResult::Error(_)
+        | QueryResult::Break(_)
+        | QueryResult::Halt(_)
+        | QueryResult::Partial(..) => None, // patchcov: coverage tolerate-line reason="a prefix is part of a body that already ran to its end without raising; only a stage that reads outside input could raise on the second run"
+        _ => Some(true),
+    }
+}
+
+/// [`yq_reemit_after_empty_stage`] over the values `body` was evaluated on, one context list: a
+/// stage's input was empty when the stages before it yield nothing over any of them. yq mode
+/// only, over a non-empty list (`None` otherwise): every caller asks under
+/// `S::TAG == EvalTag::Yq`, for one node.
+fn yq_reemit_over_values<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    body: &Expr,
+    context: &[StandardJson<'_, W>],
+    optional: bool,
+) -> Option<Expr> {
+    if S::TAG != EvalTag::Yq || context.is_empty() {
+        return None; // patchcov: coverage tolerate-line reason="guard: every caller asks in yq mode, for one node; it keeps a future jq-mode caller from getting yq's rule"
+    }
+    yq_reemit_after_empty_stage(body, &mut |prefix| {
+        for value in context {
+            if query_result_yields(&eval_single::<W, S>(prefix, value.clone(), optional))? {
+                return Some(true);
+            }
+        }
+        Some(false)
+    })
+}
+
+/// [`yq_reemit_after_empty_stage`] over the one owned node a body was evaluated on; `as_written`
+/// is the body before its path-context reads were rewritten, where they were
+/// ([`yq_reemit_after_empty_stage_as`]).
+fn yq_owned_reemit_after_empty_stage<S: EvalSemantics>(
+    body: &Expr,
+    as_written: Option<&Expr>,
+    input: &OwnedValue,
+    reentry: Reentry,
+) -> Option<Expr> {
+    if S::TAG != EvalTag::Yq {
+        return None; // patchcov: coverage tolerate-line reason="guard: every caller asks in yq mode; it keeps a future jq-mode caller from getting yq's rule"
+    }
+    yq_reemit_after_empty_stage_as(body, as_written, &mut |prefix| {
+        let mut seen = false;
+        let flow = eval_each_owned::<S>(prefix, input, false, reentry, &mut |_| {
+            seen = true;
+            Demand::Stop
+        });
+        (!matches!(flow, Flow::Escaped(_))).then_some(seen)
+    })
+}
+
+/// [`eval_each_owned`] of a body a builtin runs on one owned node as a context of its own (yq's
+/// `with_entries(f)` runs `f` on each entry), under yq's empty-stage rule (#8002): a body that
+/// answered nothing and whose literal or `error` stage had an empty input still emits it.
+pub(crate) fn eval_each_owned_reemitting<S: EvalSemantics>(
+    body: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    let mut produced = false;
+    let flow = eval_each_owned::<S>(body, input, optional, reentry, &mut |value| {
+        produced = true;
+        sink(value)
+    });
+    if produced
+        || !matches!(flow, Flow::Exhausted)
+        || S::TAG != EvalTag::Yq
+        || !yq_pipe_may_reemit(body)
+    {
+        return flow;
+    }
+    match yq_owned_reemit_after_empty_stage::<S>(body, None, input, reentry) {
+        Some(reemitted) => eval_each_owned::<S>(
+            &reemitted,
+            &OwnedValue::Null,
+            optional,
+            Reentry::REBUILT,
+            sink,
+        ),
+        None => flow,
+    }
+}
+
 /// The operands of a binary operator under [`yq_empty_context_reemit`]: both
 /// must re-emit. An operand that reads its input is empty against an empty
 /// context, but what yq then does is not one rule -- `1 == .b` is `false`
@@ -5592,7 +5768,21 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #8002: in yq a collect's body is a pipe over its input like any other, so a literal or
+    // `error` after a stage that matched nothing still runs once: `[.[] | select(false) | 3]` is
+    // `[3]` over a computed array as over the document (#6943).
+    let context = (S::TAG == EvalTag::Yq && yq_pipe_may_reemit(inner)).then(|| [value.clone()]);
     match collect_array_items::<W, S>(inner, value, optional) {
+        Ok(items) if items.is_empty() => {
+            match context
+                .and_then(|context| yq_reemit_over_values::<W, S>(inner, &context, optional))
+            {
+                Some(reemitted) => {
+                    eval_array_construction::<W, S>(&reemitted, StandardJson::Null, optional)
+                }
+                None => QueryResult::Owned(OwnedValue::array_from(items)),
+            }
+        }
         Ok(items) => QueryResult::Owned(OwnedValue::array_from(items)),
         Err(escape) => escape,
     }
@@ -23314,6 +23504,20 @@ fn map_values_member<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     if take_first {
         return eval_first_expr::<W, S>(f, member, optional).materialize_cursor();
     }
+    // #8002: yq's `map_values(f)` is `.[] |= f`, whose right side keeps the pipe's empty-stage
+    // rule: `map_values(select(false) | 3)` writes `3` to every member.
+    if S::TAG == EvalTag::Yq && yq_pipe_may_reemit(f) {
+        let result = eval_single::<W, S>(f, member.clone(), optional).materialize_cursor();
+        if !query_result_is_empty(&result) {
+            return result;
+        }
+        return match yq_reemit_over_values::<W, S>(f, core::slice::from_ref(&member), optional) {
+            Some(reemitted) => {
+                eval_single::<W, S>(&reemitted, StandardJson::Null, optional).materialize_cursor()
+            }
+            None => result,
+        };
+    }
     eval_single::<W, S>(f, member, optional).materialize_cursor()
 }
 
@@ -26984,7 +27188,17 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // against, so `v` can never carry an undecodable string here --
         // fixed anyway for the same structural-consistency reason as
         // `collect_rhs_outputs`'s masked fix (#1778).
-        match eval_single::<Vec<u64>, S>(f, cursor.value(), optional).materialize_cursor() {
+        let mut outputs = eval_single::<Vec<u64>, S>(f, cursor.value(), optional);
+        // #8002: yq runs `f` on each entry as a context of its own, so a literal or `error` after
+        // a stage that matched nothing still runs (`with_entries(select(false) | error("x"))`
+        // raises `x`), as in a pipe (#6943).
+        if S::TAG == EvalTag::Yq && query_result_is_empty(&outputs) {
+            let entry = [cursor.value()];
+            if let Some(reemitted) = yq_reemit_over_values::<Vec<u64>, S>(f, &entry, optional) {
+                outputs = eval_single::<Vec<u64>, S>(&reemitted, StandardJson::Null, optional);
+            }
+        }
+        match outputs.materialize_cursor() {
             QueryResult::One(v) => match to_owned::<S, _>(&v) {
                 Ok(v) => transformed.push(v),
                 Err(e) => return suppress_or_raise(e, optional),
@@ -51830,8 +52044,18 @@ fn collect_rhs_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // own (`.x = (.a.zz | true)` is `x: true` in real yq, see
     // `yq_empty_context_reemit`). The rewrite reads nothing from the input,
     // so it is evaluated against `null` inside this same still-open scope.
-    if S::READ_ONLY_ABSENT_KEY_IS_EMPTY && matches!(evaluated, QueryResult::None) {
-        if let Some(reemit) = yq_empty_context_reemit(value_expr) {
+    // #8002: an empty fan-out (`.a[]` over `[]`) answers an empty list rather than `None`, and the
+    // stage that re-emits is the first one whose input was empty, as in a pipe
+    // ([`yq_reemit_after_empty_stage`]): `.x = ([.a[]] | select(length == 0))` over `a: [1]`
+    // leaves the head's `[...]` alone and writes `null`.
+    if S::READ_ONLY_ABSENT_KEY_IS_EMPTY && query_result_is_empty(&evaluated) {
+        let reemit = yq_reemit_after_empty_stage(value_expr, &mut |prefix| {
+            query_result_yields(&match vivified {
+                Some(doc) => eval_owned_input::<W, S>(prefix, doc, optional, Reentry::REBUILT),
+                None => eval_single::<W, S>(prefix, input.clone(), optional),
+            })
+        });
+        if let Some(reemit) = reemit {
             evaluated =
                 eval_owned_input::<W, S>(&reemit, &OwnedValue::Null, optional, Reentry::REBUILT)
                     .materialize_cursor();
@@ -55696,8 +55920,9 @@ fn update_root_with_filter<S: EvalSemantics>(
     mut deletes: Option<&mut DeferredUpdateDeletes>,
 ) -> Result<bool, EvalEscape> {
     let positioned = position_update_filter::<S>(filter_expr, pos)?;
+    let as_written = positioned.is_some().then_some(filter_expr);
     let filter_expr = positioned.as_ref().unwrap_or(filter_expr);
-    let run = || eval_owned_multi_first::<S>(filter_expr, root, reentry);
+    let run = || eval_owned_multi_first_as::<S>(filter_expr, as_written, root, reentry);
     let output = match pos {
         Some(pos) => super::eval_generic::with_absolute_path_base(pos.path.clone(), run)?,
         None => run()?,
@@ -59198,6 +59423,19 @@ fn eval_owned_multi_first<S: EvalSemantics>(
     input: &OwnedValue,
     reentry: Reentry,
 ) -> Result<Option<OwnedValue>, EvalEscape> {
+    eval_owned_multi_first_as::<S>(expr, None, input, reentry)
+}
+
+/// [`eval_owned_multi_first`] of an update filter `expr` that is `as_written` positioned at its
+/// target ([`position_update_filter`]): yq's empty-stage rule (#8002) asks which stages may re-emit
+/// of the filter as written, since a `key` positioned into a literal is not one
+/// (`.[] |= (select(. > 3) | key)` leaves the members `select` drops).
+fn eval_owned_multi_first_as<S: EvalSemantics>(
+    expr: &Expr,
+    as_written: Option<&Expr>,
+    input: &OwnedValue,
+    reentry: Reentry,
+) -> Result<Option<OwnedValue>, EvalEscape> {
     // yq mode (#1779): the whole filter is evaluated before its first output is taken
     // (`assignUpdateOperator` reads `GetMatchingNodes`, then the front of the list), so a
     // trailing error aborts the command with no document -- `.x |= (1, error("boom"))` raises
@@ -59210,6 +59448,17 @@ fn eval_owned_multi_first<S: EvalSemantics>(
         });
         return match flow {
             Flow::Escaped(control) => Err(control.into()),
+            // #8002: the filter is a pipe over the one target node, and a literal or `error` after
+            // a stage that matched nothing still runs, as in a plain pipe (#6943):
+            // `.[0] |= (select(false) | 3)` writes `3`.
+            Flow::Exhausted if first.is_none() => {
+                match yq_owned_reemit_after_empty_stage::<S>(expr, as_written, input, reentry) {
+                    Some(reemitted) => {
+                        eval_owned_multi_first::<S>(&reemitted, &OwnedValue::Null, Reentry::REBUILT)
+                    }
+                    None => Ok(None),
+                }
+            }
             _ => Ok(first),
         };
     }

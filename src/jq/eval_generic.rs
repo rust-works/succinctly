@@ -89,11 +89,12 @@ use super::eval::{
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
     yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
     yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
-    yq_read_only_context, yq_scalar_text, yq_sort_by, yq_stage_can_reemit, yq_stage_can_reemit_in,
-    yq_together_rhs, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd,
-    RangeNum, Reentry, RestPipe, RestTail, RootWitness, SliceTargetKind, StashedEscape,
-    StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
+    yq_pipe_may_reemit, yq_read_only_context, yq_scalar_text, yq_sort_by, yq_stage_can_reemit,
+    yq_stage_can_reemit_in, yq_together_rhs, BinaryFanoutRules, ComputedSliceBound, Control,
+    Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN,
+    PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RestTail, RootWitness,
+    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED,
+    MAX_RANGE_TOTAL,
 };
 use super::eval::{
     collect_tostream_events, share_path_component, yq_yaml_unwrapped_text, LoopAbort,
@@ -24866,7 +24867,7 @@ fn yq_pipe_has_list_stage(stages: &[Expr], seen: bool) -> bool {
 /// associative), but this is only ever called from the yq-mode union route:
 /// its point is to put a union that sits at the head of a *nested* pipe --
 /// `(.a, .b) | ((.c, .d) | .)` -- at a stage index the union walk can see.
-fn yq_flatten_pipe_stages(stages: &[Expr], out: &mut Vec<Expr>) {
+pub(crate) fn yq_flatten_pipe_stages(stages: &[Expr], out: &mut Vec<Expr>) {
     for stage in stages {
         match unwrap_paren(stage) {
             Expr::Pipe(inner) => yq_flatten_pipe_stages(inner, out),
@@ -42412,15 +42413,41 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Owned(entries) => entries,
                 other => return other,
             };
-            let mapped = Expr::Builtin(Builtin::Map(f.clone()));
             let mut outputs: Vec<OwnedValue> = Vec::new();
-            if let Flow::Escaped(control) =
-                eval_each_owned::<S>(&mapped, &entries, optional, Reentry::REBUILT, &mut |v| {
-                    outputs.push(v);
-                    Demand::Continue
-                })
-            {
-                return partial_generic(Vec::new(), control);
+            // #8002: yq runs `f` on each entry as a context of its own (`withEntriesOperator`), so
+            // a literal or `error` after a stage that matched nothing still runs once per entry:
+            // `with_entries(select(false) | error("x"))` raises `x`. `map(f)` would run it once
+            // over the whole list.
+            if S::TAG == EvalTag::Yq && yq_pipe_may_reemit(f) {
+                let OwnedValue::Array(listed) = &entries else {
+                    return GenericResult::None; // patchcov: coverage tolerate-line reason="unreachable: `to_entries` of an object is an array"
+                };
+                let mut mapped: Vec<OwnedValue> = Vec::new();
+                for entry in listed {
+                    if let Flow::Escaped(control) = super::eval::eval_each_owned_reemitting::<S>(
+                        f,
+                        entry,
+                        optional,
+                        Reentry::REBUILT,
+                        &mut |v| {
+                            mapped.push(v);
+                            Demand::Continue
+                        },
+                    ) {
+                        return partial_generic(Vec::new(), control);
+                    }
+                }
+                outputs.push(OwnedValue::array_from(mapped));
+            } else {
+                let mapped = Expr::Builtin(Builtin::Map(f.clone()));
+                if let Flow::Escaped(control) =
+                    eval_each_owned::<S>(&mapped, &entries, optional, Reentry::REBUILT, &mut |v| {
+                        outputs.push(v);
+                        Demand::Continue
+                    })
+                {
+                    return partial_generic(Vec::new(), control);
+                }
             }
             // `map` on an array emits exactly one array. `optional` is never
             // `true` here (same reasoning as `ToEntries`'s own arm below:
@@ -46866,11 +46893,18 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         }
         _ => ObjectMapOf::with_capacity(members.len()),
     };
+    // #8002: `map_values(f)` is `.[] |= f` and `with_entries(f)` runs `f` on each entry, so a body
+    // that may re-emit after an empty stage keeps each member to ask about it. (yq's `map(f)` with
+    // such a body never reaches here: the parser spells it `[.[] | f]`, the pipe's own rule.)
+    let reemits = S::TAG == EvalTag::Yq
+        && matches!(family, MapFamily::MapValues | MapFamily::WithEntries)
+        && yq_pipe_may_reemit(f);
     for (component, member) in members {
         let member_id = id.child(&parent, component.clone());
         // #6129: yq's `map_values(f)` is `.[] |= f`, which leaves a member `f` has no output for.
         let original = (S::TAG == EvalTag::Yq && matches!(family, MapFamily::MapValues))
             .then(|| member.clone());
+        let kept = reemits.then(|| member.clone());
         let mut outputs: Vec<OwnedValue> = Vec::new();
         let flow = eval_owned_identity_stages::<S, V>(
             stages,
@@ -46890,6 +46924,31 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         );
         if let Flow::Escaped(control) = flow {
             return Some(Flow::Escaped(control));
+        }
+        if let Some(kept) = kept.filter(|_| outputs.is_empty()) {
+            let reemitted = super::eval::yq_reemit_after_empty_stage(f, &mut |prefix| {
+                yq_positioned_prefix_yields::<S, V>(
+                    prefix,
+                    &kept,
+                    id.child(&parent, component.clone()),
+                    optional,
+                )
+            });
+            if let Some(reemitted) = reemitted {
+                let flow = eval_each_owned::<S>(
+                    &reemitted,
+                    &OwnedValue::Null,
+                    optional,
+                    Reentry::REBUILT,
+                    &mut |v| {
+                        outputs.push(v);
+                        Demand::Continue
+                    },
+                );
+                if let Flow::Escaped(control) = flow {
+                    return Some(Flow::Escaped(control));
+                }
+            }
         }
         match family {
             MapFamily::Map | MapFamily::WithEntries => array.extend(outputs),
@@ -46934,6 +46993,29 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
         Demand::Continue => Flow::Exhausted,
         Demand::Stop => Flow::Stopped { pending: None },
     })
+}
+
+/// Whether the stages before a candidate of yq's empty-stage rule (#8002,
+/// [`super::eval::yq_reemit_after_empty_stage`]) yield anything over one member of a positioned
+/// map-family body, or `None` when they raise.
+fn yq_positioned_prefix_yields<S: EvalSemantics, V: DocumentValue>(
+    prefix: &Expr,
+    member: &OwnedValue,
+    id: OwnedIdentity<V>,
+    optional: bool,
+) -> Option<bool> {
+    let mut seen = false;
+    let flow = eval_owned_identity_stages::<S, V>(
+        owned_identity_body_stages(prefix),
+        Cow::Borrowed(member),
+        id,
+        optional,
+        OwnedIdentityTail::Pairs(&mut |_, _| {
+            seen = true;
+            Flow::Stopped { pending: None }
+        }),
+    );
+    (!matches!(flow, Flow::Escaped(_))).then_some(seen)
 }
 
 /// [`eval_map_family_positioned`] for a caller that wants a `GenericResult`
