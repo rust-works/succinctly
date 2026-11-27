@@ -261,11 +261,6 @@ const REVIEW_ROWS: &[(&str, &str, &str)] = &[
     ),
     (
         STYLED,
-        "(.[] | select(style == \"double\") | line | key) = 9",
-        "9: \"x\"\nb: 1\nc: 2 # hi\n",
-    ),
-    (
-        STYLED,
         "(.[] | select(line_comment == \"# hi\") | key) = 9",
         STYLED,
     ),
@@ -341,6 +336,14 @@ const REFUSED_ROWS: &[(&str, &str)] = &[
 /// `e`, where the owned walk would go through it into the anchor, so `succinctly yq` deletes
 /// nothing (the safe direction, recorded). (filter, `succinctly yq`'s stdout over [`ALIASED`].)
 const LESS_ROWS: &[(&str, &str)] = &[("del(.e | .. | line)", ALIASED)];
+
+/// A key rename through a reader's answer (`.a | line | key`): yq renames `.a`'s key (`9: "x"`),
+/// and `succinctly yq` writes nothing, as it did before (the safe direction, recorded).
+/// (filter, `succinctly yq`'s stdout over [`STYLED`].)
+const WRITES_LESS_ROWS: &[(&str, &str)] = &[(
+    "(.[] | select(style == \"double\") | line | key) = 9",
+    STYLED,
+)];
 
 fn run(args: &[&str], stdin: &str) -> Result<(String, String, i32)> {
     use std::io::Write;
@@ -474,6 +477,14 @@ fn a_target_whose_path_is_not_yqs_node_is_refused_8020() -> Result<()> {
 fn a_descent_below_an_alias_deletes_less_than_yq_8020() -> Result<()> {
     for (filter, want) in LESS_ROWS {
         assert_row(&[filter], ALIASED, want)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_key_rename_through_a_reader_writes_less_than_yq_8020() -> Result<()> {
+    for (filter, want) in WRITES_LESS_ROWS {
+        assert_row(&[filter], STYLED, want)?;
     }
     Ok(())
 }

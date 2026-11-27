@@ -3070,6 +3070,7 @@ A metadata selection whose navigation does more than navigate and filter refuses
 So does a metadata selection under a `..` below a step down on a document with aliases (`del(.e | .. | select(style == "") | line)`).
 Where there is no cursor to resolve it on (`--eval-all`, a `del()` inside a collect), a navigation that reads node metadata before a reader, `key` or a deriving stage is not rewritten to its own nodes, so the tail stays parentless (it deletes nothing) or the target refuses.
 `key` straight after `key` answers nothing in yq (a key node has no key), so `del(.b | key | key)` deletes nothing, while `del(.b | key | line | key)` deletes `.b`.
+A key rename through a reader's answer (`(.a | line | key) = 9`) renames `.a`'s key in yq and writes nothing in `succinctly yq`, as before (the safe direction).
 yq's `..` stops at an alias, where the owned walk goes on through the anchor's copy and the alias redirect would delete from the anchor's node, so a reader after a `..` below a step down on a document with aliases is not rewritten: `del(.e | .. | line)` on `d: &x {p: 1, q: 2}` / `e: *x` deletes nothing, where yq deletes `e` (the safe direction; `del(.e | ..)` itself already empties `d` there, an older divergence).
 `parent` is not one of them: yq answers the parent node itself, so `del(.c[0] | parent)` deletes `.c` and `del(.b | parent)` deletes the whole document (`(.b | parent) = 5` prints `5`), where `succinctly yq` leaves the document unchanged: still open, in the safe direction.
 Any other target -- arithmetic
