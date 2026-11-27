@@ -10113,6 +10113,53 @@ jq 1.7.1 and 1.8.2 grow until memory runs out (jq 1.7.1 aborts with `jq: error: 
 There is no output to differ over, only the way the run ends.
 Without its `label $q |` the same program runs on without growing in jq 1.7.1 too, so jq's growth comes with the label; the cause was not traced further (found by the pre-release differential, no issue, and no test, since the program does not end).
 
+## The call machine's bounds (#7977)
+
+These apply only with `SUCCINCTLY_CALL_MACHINE=1`, which is off by default until #7977's step 6 turns it on.
+With the switch on, a jq-mode program that holds a recursive `def` runs on the call machine (ADR-0032), which keeps its calls on stacks of its own on the heap, not on the native stack, so the native-stack floor above does not bound it.
+So the machine answers where the shipped evaluators meet their floor: recursion a million levels deep, recursion through `map(f)` (`def f: if . > 0 then [. - 1] | map(f) | .[0] else . end; 100000 | f` answers `0`), and #7870's closure chains (`first(f(g + (1,3); n))` at n = 128,000), all as jq answers them.
+Two bounds of its own stop what would otherwise take the host process down or never end, and both are ADR-0018 rule 4(c) divergences, since jq 1.7.1 has neither.
+Everywhere else the machine keeps the shipped evaluators' caps, with their wording: `range`'s `MAX_RANGE_TOTAL`, `until`'s and `while`'s `MAX_LOOP_ROUNDS`, an eager `repeat`'s 1,000 rounds and 10,000 outputs, and the end of a `repeat` after 1,000 empty rounds, all recorded above.
+
+**The byte budget.**
+The machine's control state is held to 1 GiB: its data, frame, slot and fork-point stacks, by capacity.
+It is checked whenever one of those stacks grows, counting a vector's old block and its new one while it grows, and they grow fallibly (`try_reserve`), so a run under a cap on the address space (`ulimit -v`) refuses instead of aborting.
+Past the budget, or when such an allocation fails, the run is refused with the wording the shipped evaluators give at their depth limit, naming the innermost user definition: `jq: error (at <unknown>): f/0 exceeded maximum recursion depth`, exit 5, uncatchable by `try`.
+jq has no bound: `def f: [f]; f` grows until an allocation fails, and jq dies with `cannot allocate memory`, exit 134 (ADR-0020).
+Measured at the refusal on an Apple M4 Pro, peak RSS is 0.79 GB for `def f: [f]; f`, 0.85 GB for `def f: 1 + f; f` and 1.25 GB for `def f(n): f(n + 1) + 1; f(0)`.
+The values a program builds are not counted, `[...]`'s collected values and a leaf's buffered outputs included, so the budget is not a bound on memory: such a program runs out of memory as on the shipped routes (and as in jq), and an accumulator that cannot grow is refused rather than aborting.
+
+**The loop cap.**
+A tail call drops its caller's frame before it pushes its own, so a loop through one does not deepen and the budget alone would not stop it.
+A tail call to a definition declared in the caller keeps the caller's frame while the callee runs (the callee closes over it), so a loop through such calls keeps a frame a round; the round cap applies to it all the same, and so does the budget.
+A tail call to the caller's own definition, to one it is nested in or to one declared in it, at any arity, is charged one round against the shipped evaluators' `MAX_LOOP_ROUNDS` (2^24), counted from the ordinary call that started the loop (`BOUND_ROUND_WEIGHT` rounds for a definition that declares definitions of its own, as the shipped tail loop charges a round that binds a body).
+Past it the loop is refused naming the definition it started at, `f/1 exceeded maximum recursion depth`, uncatchable.
+A tail call to any other definition (a helper), with closure arguments or without, starts a count of its own, and what the helper outputs is charged to the caller's loop: `def h(g): if . >= 1000 then g else . + 1 | h(g) end; def f: if . < 16777000 then . + 1 | f else 0 | h(.) end; 0 | f` answers `1000` on the machine, as jq does, where the shipped evaluators refuse it with `f/0 exceeded maximum recursion depth`.
+A `while` or `until` whose update leaves a fork point that can only answer nothing (`. + 1, empty`, or `(. + 1) // 0` once its left side answered) runs in constant control state: the machine drops such a fork point at the next round, so `0 | until(. >= 4000000; (. + 1) // 0)` answers in 4 MB, as on the shipped routes.
+The machine makes more calls tail calls than the shipped tail loop does: a call passing a `$` argument (`def f($n): f($n); f(0)`) and one forwarding a closure (`def f(g): f(g); f(.)`) both are, so these reach the cap after 2^24 rounds, where jq spins until it is killed and the shipped evaluators meet their native-stack floor instead.
+The two refusals do not always read the same: the floor names the call that met it or none, so with `-n` `def f($n): if $n < 0 then $n elif $n % 2 == 0 then f($n + 1) else f($n + 1) end; f(0)` is the unnamed `exceeded maximum recursion depth` on the shipped routes (given `null` on standard input they name `f/1`) and `f/1 exceeded maximum recursion depth` on the machine.
+Likewise the machine names the definition a loop started at where the floor names the deepest call: `def f($n): def g($m): def h($k): if $k >= 16777217 then $k else g($k + 1) end; h($m); g($n); f(0)` is `g/1 exceeded maximum recursion depth` on the shipped routes and `f/1 exceeded maximum recursion depth` on the machine.
+A zero-argument `def`'s tail loop keeps the shipped bound on its outputs too, starting after 64 tail rounds counted one each, however much each costs against the round cap: `[def f: ., (. + 1 | f); 0 | f]` is refused with `f/0: maximum outputs exceeded` after 2^20 outputs, where jq grows until memory runs out.
+Every output of a round is charged, the round's own and those of a helper or closure it calls in tail position (`(g | select(true)), (. + 1 | f)` included), with two differences from the shipped loop.
+The outputs of the round an ordinary call enters (`[0 | f]`) are not charged, so `def f: if . < 70 then range(15000), (. + 1 | f) else empty end; [0 | f] | length` answers `1050000` on the machine, as jq does, where the shipped evaluators refuse it.
+And the machine checks the bound before each output, where the shipped loop checks it after each item of the comma in front of the call, so a loop refused on both routes prints a different number of outputs before the refusal when a round outputs more than one.
+
+**A different bound can be met first.**
+Where the machine loops and the shipped evaluators nest, or the reverse, the two refuse the same program at different bounds, with different messages; both refuse it.
+`def h($m): if $m < 16132 then $m, h($m + 1) else empty end; def f: if . < 65 then h(0), (. + 1 | f) else empty end; [0 | f] | length` is `h/1 exceeded maximum recursion depth` on the shipped routes, whose floor `h`'s nested calls meet, and `f/0: maximum outputs exceeded` on the machine, where `h` is a loop whose outputs count against `f`'s.
+A `while` or `until` whose update forks is counted per path on the machine and over its whole tree on the shipped routes: `[0 | until(. >= 20000000; . + 1, . + 2)] | length` is `until: maximum iterations exceeded` there and the byte budget's unnamed `exceeded maximum recursion depth` on the machine, which explores one path at a time; a forked loop that ends within its rounds on every path can answer on the machine where the shipped routes refuse it.
+One shape goes the other way: a `while` or `until` whose update leaves a finished `try` or `label` behind (`try (. + 1) catch 0`, `label $x | . + 1`, `first(. + 1, 0)`) keeps a fork point a round on the machine, which drops only the finished branches of `,` and `//`, so it meets the byte budget's `exceeded maximum recursion depth` at between 1,000,000 and 2,000,000 rounds (`0 | until(. >= 2000000; try (. + 1) catch 0)`).
+The shipped routes run it in constant memory, and jq answers it in memory that grows with the rounds (1.25 GB at 4,000,000 rounds of the `try` form, 3.2 GB of the `label` form).
+
+**A closure chain.**
+A recursion that composes a closure argument at every level and reads it (`def f(g): g | f(g + 1); 0 | f(.)`) runs `d` nested calls to read it at depth `d`, so it is quadratic in time.
+The shipped evaluators refuse it at their native-stack floor, after about 12 s in a release build on an Apple M4 Pro; the machine, as jq, has no bound on it but the byte budget, and runs far longer before it refuses.
+A finite chain answers on the machine as in jq.
+
+**Where the machine tells a `repeat` apart differently.**
+It tells an eager `repeat` from one a consumer can stop by the nearest consumer it runs inside: a `[...]` or a `reduce` makes it eager, a label of the prelude's (`first`, `limit`, `nth`) or the run's own output does not, and a label whose body has already output, or a label of the user's own, is no consumer.
+The shipped evaluators tell the two apart by the route that evaluates the `repeat`, so the two disagree on some shapes: `[repeat(1) as $x | $x]` and `[def h: repeat(1); h]` are refused on the machine as eager and never end on the shipped routes, and the reverse also occurs (a `repeat` the machine runs unbounded under a consumer that stops it answers where the shipped routes refuse it as eager).
+
 ## An input read whole with no room for it (#7576)
 
 An input `succinctly jq` reads whole that there is no room for ends the run as jq's failed allocation does: `jq: error: cannot allocate memory` and `abort()`, exit 134 to a shell, with nothing on stdout.

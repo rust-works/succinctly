@@ -54,6 +54,19 @@ pub(super) enum ArgSpec {
     Ref { level: u16, idx: u16 },
 }
 
+/// Whether a [`Insn::Call`] is followed by `RET`, and what becomes of the caller's frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Tail {
+    /// An ordinary call: its `RET` returns to the instruction after it.
+    No,
+    /// `TAIL_CALL_JQ`: nothing the callee holds refers to the caller's frame, which goes first.
+    Pop,
+    /// A call followed by `RET` whose callee closes over the caller's frame (a `def` declared in
+    /// it, or a closure argument made here): the frame stays while the callee runs, and the
+    /// callee's `RET` returns where the caller's would have.
+    Keep,
+}
+
 /// One instruction. Stack effects are written `[in] -> [out]`, top last.
 #[derive(Debug)]
 pub(super) enum Insn {
@@ -87,8 +100,9 @@ pub(super) enum Insn {
     TryBegin(Option<usize>),
     /// `TRY_END`.
     TryEnd,
-    /// `GENLABEL` into the slot, then a label's `TRY_BEGIN`.
-    Label(u16),
+    /// `GENLABEL` into the slot, then a label's `TRY_BEGIN`; `true` for a label of the prelude's
+    /// (`first`, `limit`, `nth`), a consumer that can stop a `repeat`.
+    Label(u16, bool),
     /// `break $label`: raise the label held at `(level, index)`.
     Break(u16, u16),
     /// `STOREV` into a local slot: `[v] -> []`.
@@ -132,7 +146,7 @@ pub(super) enum Insn {
     Call {
         callee: Callee,
         args: Box<[ArgSpec]>,
-        tail: bool,
+        tail: Tail,
     },
     /// `RET`.
     Ret,
@@ -159,7 +173,7 @@ pub(super) fn insn_name(insn: &Insn) -> &'static str {
         Insn::Backtrack => "Backtrack",
         Insn::TryBegin(_) => "TryBegin",
         Insn::TryEnd => "TryEnd",
-        Insn::Label(_) => "Label",
+        Insn::Label(..) => "Label",
         Insn::Break(..) => "Break",
         Insn::Store(_) => "Store",
         Insn::Load(..) => "Load",
@@ -196,6 +210,36 @@ pub(super) struct Func<'e> {
     depth: u16,
     /// Per parameter: whether the caller passes it as a value.
     value_params: Vec<bool>,
+    /// Whether it is a prelude definition, or defined or passed inside one.
+    pub prelude: bool,
+    /// The loop the prelude's `until`, `while`, `repeat` or `range/3` runs as this function
+    /// (`_until`, `_while`, `_repeat`): what a refusal past the loop cap names
+    /// (`until: maximum iterations exceeded`, as the shipped loops say).
+    pub loop_name: Option<&'static str>,
+    /// For a prelude body: the loop name its nested definitions take ([`prelude_loop`]).
+    nested_loop: Option<&'static str>,
+    /// Whether its body declares definitions of its own: a loop round into it is charged
+    /// `BOUND_ROUND_WEIGHT`, as the shipped tail loop charges a round that binds a body.
+    pub binds: bool,
+}
+
+impl Func<'_> {
+    /// Whether its tail loop's outputs are bounded (`MAX_LOOP_OUTPUTS`): a user's `def` with
+    /// no parameters, the loops the shipped tail loop bounds (#5379).
+    pub fn bounds_outputs(&self) -> bool {
+        self.arity == 0 && !self.prelude && !self.name.is_empty()
+    }
+}
+
+/// The loop a definition nested in the prelude's `name` runs: the shipped loops' own names. The
+/// `while` that `range/3` runs is compiled apart and named `range` (#7977).
+fn prelude_loop(name: &str) -> Option<&'static str> {
+    match name {
+        "_sp_until" => Some("until"),
+        "_sp_while" => Some("while"),
+        "_sp_repeat" => Some("repeat"),
+        _ => None,
+    }
 }
 
 /// A leaf: a call-free subtree `Interp::eval` runs, and where its free variables live.
@@ -216,6 +260,10 @@ pub(super) struct Code<'e> {
     /// The functions compiled from prelude bodies, for tests that look at the program's own code.
     #[cfg(test)]
     pub prelude_funcs: Vec<u32>,
+    /// The resume addresses of the fork points of `[...]` and `reduce`, in ascending order: the
+    /// consumers that take every output of what they run, as the shipped evaluators' eager
+    /// `repeat` does (`Vm::repeat_is_eager`).
+    pub collects: Vec<usize>,
 }
 
 /// A name in scope at compile time, with the function that owns its slot.
@@ -247,8 +295,9 @@ struct Compiler<'c, 'e> {
     code: Code<'e>,
     /// Functions still to compile, with the scope each sees.
     pending: Vec<(u32, Body<'e>, Vec<Entry<'e>>)>,
-    /// The prelude definitions compiled so far, by name and arity.
-    prelude: BTreeMap<(&'e str, usize), u32>,
+    /// The prelude definitions compiled so far, by name, arity and the loop name their nested
+    /// definitions take when it is not their own (`range/3`'s `while`).
+    prelude: BTreeMap<(&'e str, usize, Option<&'static str>), u32>,
     /// The function being compiled.
     cur: u32,
     scope: Vec<Entry<'e>>,
@@ -293,6 +342,7 @@ fn compile_moving<'e>(it: &Interp<'e>, program: &'e Expr, moves: bool) -> Result
             main: 0,
             #[cfg(test)]
             prelude_funcs: Vec::new(),
+            collects: Vec::new(),
         },
         pending: Vec::new(),
         prelude: BTreeMap::new(),
@@ -307,6 +357,14 @@ fn compile_moving<'e>(it: &Interp<'e>, program: &'e Expr, moves: bool) -> Result
     c.pending.push((main, Body::Main(program), Vec::new()));
     while let Some((f, body, scope)) = c.pending.pop() {
         c.func(f, body, scope)?;
+    }
+    if c.code.funcs.len() >= 1 << super::ENTRY_BITS {
+        // A frame names its loop's entry in that many bits.
+        return Err(String::from("too many functions"));
+    }
+    if c.code.insns.len() >= u32::MAX as usize {
+        // A frame holds its return address in a `u32`.
+        return Err(String::from("too many instructions"));
     }
     c.mark_tails();
     c.code.main = main;
@@ -449,6 +507,10 @@ impl<'e> Compiler<'_, 'e> {
         depth: u16,
         value_params: Vec<bool>,
     ) -> u32 {
+        // A function made while a prelude body compiles belongs to the prelude.
+        let outer = self.code.funcs.get(self.cur as usize);
+        let prelude = outer.is_some_and(|f| f.prelude);
+        let loop_name = outer.filter(|f| f.prelude).and_then(|f| f.nested_loop);
         self.code.funcs.push(Func {
             name,
             arity,
@@ -456,6 +518,10 @@ impl<'e> Compiler<'_, 'e> {
             nslots: 0,
             depth,
             value_params,
+            prelude,
+            loop_name: loop_name.filter(|_| arity == 0 && !name.is_empty()),
+            nested_loop: None,
+            binds: false,
         });
         (self.code.funcs.len() - 1) as u32
     }
@@ -518,6 +584,8 @@ impl<'e> Compiler<'_, 'e> {
                 if any_subexpr(body, &mut declined_anywhere) {
                     return Err(String::from("a prelude body holding a declined form"));
                 }
+                self.code.funcs[f as usize].binds =
+                    any_subexpr(body, &mut |e| matches!(e, Expr::FuncDef { .. }));
                 self.nslots = u16::try_from(params.len()).map_err(|_| "too many parameters")?;
                 let value = self.code.funcs[f as usize].value_params.clone();
                 let mut binds = Vec::new();
@@ -549,7 +617,7 @@ impl<'e> Compiler<'_, 'e> {
                     self.emit(Insn::Call {
                         callee: Callee::Param { level: 0, idx: i },
                         args: Box::new([]),
-                        tail: false,
+                        tail: Tail::No,
                     });
                     self.emit(Insn::Store(s));
                     self.scope.push(Entry::Var(n, f, s));
@@ -649,7 +717,7 @@ impl<'e> Compiler<'_, 'e> {
         self.emit(Insn::Call {
             callee,
             args: specs.into_boxed_slice(),
-            tail: false,
+            tail: Tail::No,
         });
         Ok(())
     }
@@ -676,12 +744,18 @@ impl<'e> Compiler<'_, 'e> {
     }
 
     /// The function of the prelude definition `name/arity`, queued for compiling on first use.
-    fn prelude_func(&mut self, name: &str, arity: usize) -> Result<u32, String> {
+    /// `tag` names the loop its nested definitions run, when it is not the definition's own.
+    fn prelude_func(
+        &mut self,
+        name: &str,
+        arity: usize,
+        tag: Option<&'static str>,
+    ) -> Result<u32, String> {
         let prelude: &'e Prelude = self.it.prelude;
         let def = prelude
             .find(name, arity)
             .ok_or_else(|| format!("no definition of {name}/{arity}"))?;
-        if let Some(&f) = self.prelude.get(&(def.name, arity)) {
+        if let Some(&f) = self.prelude.get(&(def.name, arity, tag)) {
             return Ok(f);
         }
         let Expr::FuncDef {
@@ -691,7 +765,11 @@ impl<'e> Compiler<'_, 'e> {
             return Err(String::from("a prelude definition that is not a def"));
         };
         let f = self.new_func(name, arity, 0, Self::value_modes(params, body));
-        self.prelude.insert((def.name, arity), f);
+        let func = &mut self.code.funcs[f as usize];
+        func.prelude = true;
+        func.loop_name = None;
+        func.nested_loop = tag.or_else(|| prelude_loop(def.name));
+        self.prelude.insert((def.name, arity, tag), f);
         #[cfg(test)]
         self.code.prelude_funcs.push(f);
         self.pending.push((f, Body::Def(params, body), Vec::new()));
@@ -699,7 +777,17 @@ impl<'e> Compiler<'_, 'e> {
     }
 
     fn prelude_call(&mut self, name: &str, args: &[&'e Expr]) -> C {
-        let f = self.prelude_func(name, args.len())?;
+        self.prelude_call_tagged(name, args, None)
+    }
+
+    /// [`Compiler::prelude_call`] of an instance whose nested loop is named `tag`.
+    fn prelude_call_tagged(
+        &mut self,
+        name: &str,
+        args: &[&'e Expr],
+        tag: Option<&'static str>,
+    ) -> C {
+        let f = self.prelude_func(name, args.len(), tag)?;
         self.call_func(
             Callee::Def {
                 func: f,
@@ -951,6 +1039,7 @@ impl<'e> Compiler<'_, 'e> {
                 self.expr(update)?;
                 self.emit(Insn::Store(acc));
                 self.emit(Insn::Backtrack);
+                self.code.collects.push(self.here());
                 self.patch(f);
                 self.emit(Insn::LoadMove(0, acc));
                 self.scope.truncate(mark);
@@ -993,13 +1082,15 @@ impl<'e> Compiler<'_, 'e> {
                 self.expr(inner)?;
                 self.emit(Insn::Append(acc));
                 self.emit(Insn::Backtrack);
+                self.code.collects.push(self.here());
                 self.patch(f);
                 self.emit(Insn::LoadAcc(acc));
             }
             // `gen_label`: a `try` whose handler stops this label's break.
             Expr::Label { name, body } => {
                 let s = self.slot()?;
-                self.emit(Insn::Label(s));
+                let stops = self.code.funcs[self.cur as usize].prelude;
+                self.emit(Insn::Label(s, stops));
                 self.scope.push(Entry::Label(name, self.cur, s));
                 self.expr(body)?;
                 self.scope.pop();
@@ -1042,7 +1133,7 @@ impl<'e> Compiler<'_, 'e> {
                     self.emit(Insn::Call {
                         callee: Callee::Param { level, idx },
                         args: Box::new([]),
-                        tail: false,
+                        tail: Tail::No,
                     });
                 }
                 _ => match builtin_fallback {
@@ -1103,7 +1194,12 @@ impl<'e> Compiler<'_, 'e> {
             Expr::FirstExpr(g) => self.prelude_call("_sp_first", &[g])?,
             Expr::NthExpr { n, expr: g } => self.prelude_call("_sp_nth", &[n, g])?,
             Expr::Until { cond, update } => self.prelude_call("_sp_until", &[cond, update])?,
-            Expr::While { cond, update } => self.prelude_call("_sp_while", &[cond, update])?,
+            Expr::While { cond, update } => {
+                // `range/3` runs a `while` of its own, whose cap is `range`'s (#7977).
+                let cur = &self.code.funcs[self.cur as usize];
+                let tag = (cur.prelude && cur.name == "_sp_range").then_some("range");
+                self.prelude_call_tagged("_sp_while", &[cond, update], tag)?;
+            }
             Expr::Repeat(g) => self.prelude_call("_sp_repeat", &[g])?,
             Expr::RecursiveDescent => self.prelude_call("_sp_recurse", &[])?,
             // `def range($x): range(0; $x)` and the bytecoded `range/2`.
@@ -1209,9 +1305,6 @@ impl<'e> Compiler<'_, 'e> {
             };
             let closes_here = matches!(callee, Callee::Def { level: 0, .. })
                 || args.iter().any(|a| matches!(a, ArgSpec::Lambda(_)));
-            if closes_here {
-                continue;
-            }
             let mut next = pc + 1;
             // Jumps nest one per enclosing `if` or `,`; the bound only keeps a jump chain from
             // being followed forever, and a call past it stays an ordinary call.
@@ -1230,7 +1323,7 @@ impl<'e> Compiler<'_, 'e> {
             };
             if ret {
                 if let Insn::Call { tail, .. } = &mut self.code.insns[pc] {
-                    *tail = true;
+                    *tail = if closes_here { Tail::Keep } else { Tail::Pop };
                 }
             }
         }

@@ -1315,7 +1315,7 @@ pub(crate) const OUTPUT_BUDGET_AFTER_ROUNDS: usize = 64;
 
 /// What a round that binds a body of its own is charged against [`MAX_LOOP_ROUNDS`], in
 /// rounds that bind none (#5379).
-const BOUND_ROUND_WEIGHT: usize = 16;
+pub(crate) const BOUND_ROUND_WEIGHT: usize = 16;
 
 /// What a tail loop may still spend (#5379).
 ///
@@ -1363,14 +1363,19 @@ impl TailRounds {
     pub(crate) fn charge_outputs(&mut self, emitted: usize) -> Result<(), EvalError> {
         self.emitted = self.emitted.saturating_add(emitted);
         if self.emitted > MAX_LOOP_OUTPUTS && self.taken >= OUTPUT_BUDGET_AFTER_ROUNDS {
-            return Err(EvalError::resource_limit(format!(
-                "{}/{}: maximum outputs exceeded",
-                ModuleRun::display_name(&self.def.name),
-                self.def.params.len()
-            )));
+            return Err(outputs_refusal(&self.def.name, self.def.params.len()));
         }
         Ok(())
     }
+}
+
+/// The refusal of the tail loop of `name/arity` past [`MAX_LOOP_OUTPUTS`]
+/// (`f/0: maximum outputs exceeded`), the one wording every route gives.
+pub(crate) fn outputs_refusal(name: &str, arity: usize) -> EvalError {
+    EvalError::resource_limit(format!(
+        "{}/{arity}: maximum outputs exceeded",
+        ModuleRun::display_name(name),
+    ))
 }
 
 #[cfg(test)]

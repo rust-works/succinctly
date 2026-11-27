@@ -115,6 +115,10 @@ HEAVY_TESTS=(
   # unoptimised build's, which every `deep-recursion` leg is, and an `opt-level=1` build clears them
   # by so much that a frame could grow there unseen.
   per_issue::i3260_depth_capacity::recursion_depth_capacity_stays_above_its_floor
+  # #7977 step 2: the call machine's loop caps, each a 2^24-round loop run with the switch on and
+  # off (seconds, M5 Max, unoptimised, one at a time).
+  per_issue::i7977_budget::a_loop_that_never_deepens_is_refused_as_the_shipped_evaluators_refuse_it_7977 # 148
+  per_issue::i7977_budget::the_machine_answers_what_the_shipped_evaluators_answer_7977 # 141
 )
 
 # What the `deep-recursion` leg runs, and every other leg skips.
