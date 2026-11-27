@@ -527,4 +527,56 @@ mod tests {
         p.match_stack_limit(1000);
         p.retry_limit(1000);
     }
+
+    /// The vendored patch keeps a search's match stack in the match parameter for the next search
+    /// (`vendor/oniguruma/patches/`). A reused `Scratch` must answer every search as a fresh one
+    /// does: after a search that grew the stack, after one with no match, after a test-mode search
+    /// with no region, and when one `Scratch` serves patterns whose stacks are laid out for
+    /// different numbers of groups (the patch only takes a stack of the same layout).
+    #[test]
+    fn a_reused_scratch_answers_as_a_fresh_search_does() {
+        let patterns = [
+            "(a|b)*c",
+            "((((((a))))))+",
+            "x",
+            "(?<n>\\w+)\\s+\\k<n>",
+            "(?:a*)*b",
+            "",
+            "(?=(a))a",
+        ];
+        let subjects = [
+            "",
+            "abc",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+            "hello hello",
+            "bbbb",
+            "zzz",
+        ];
+        let compiled: Vec<OnigRegex> = patterns.iter().map(|p| compile(p)).collect();
+        let mut shared = Scratch::new();
+        for round in 0..3 {
+            for (re, p) in compiled.iter().zip(patterns) {
+                let mut own = Scratch::new();
+                for subject in subjects {
+                    let bytes = subject.as_bytes();
+                    for start in 0..=bytes.len() {
+                        let fresh = re.search(bytes, start).unwrap();
+                        for scratch in [&mut own, &mut shared] {
+                            let found = re.search_in(scratch, bytes, start).unwrap();
+                            let spans = found
+                                .then(|| (0..scratch.len()).map(|i| scratch.span(i)).collect());
+                            assert_eq!(
+                                spans, fresh,
+                                "{p:?} on {subject:?} from {start}, round {round}"
+                            );
+                            assert_eq!(
+                                re.matches_in(scratch, bytes, start).unwrap(),
+                                fresh.is_some()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

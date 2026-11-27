@@ -85,6 +85,10 @@ struct OnigMatchParamStruct {
 #endif
 
   void*           callout_user_data; /* used in callback each match */
+  /* succinctly (#7965): the match stack of the last search, kept for the next one */
+  void*           kept_stack_p;
+  int             kept_stack_n;
+  int             kept_ptr_num;
 #ifdef USE_CALLOUT
   OnigCalloutFunc progress_callout_of_contents;
   OnigCalloutFunc retraction_callout_of_contents;
@@ -1272,6 +1276,11 @@ struct OnigCalloutArgsStruct {
   (msa).mp = mpv;\
   (msa).best_len = ONIG_MISMATCH;\
   (msa).ptr_num  = PTR_NUM_SIZE(reg);\
+  if (IS_NOT_NULL((mpv)->kept_stack_p) && (mpv)->kept_ptr_num == (msa).ptr_num) {\
+    (msa).stack_p = (mpv)->kept_stack_p;\
+    (msa).stack_n = (mpv)->kept_stack_n;\
+    (mpv)->kept_stack_p = 0;\
+  }\
 } while(0)
 #else
 #define MATCH_ARG_INIT(msa, reg, arg_option, arg_region, arg_start, mpv) do { \
@@ -1284,10 +1293,24 @@ struct OnigCalloutArgsStruct {
   SUBEXP_CALL_IN_MATCH_ARG_INIT(msa,mpv)\
   (msa).mp = mpv;\
   (msa).ptr_num  = PTR_NUM_SIZE(reg);\
+  if (IS_NOT_NULL((mpv)->kept_stack_p) && (mpv)->kept_ptr_num == (msa).ptr_num) {\
+    (msa).stack_p = (mpv)->kept_stack_p;\
+    (msa).stack_n = (mpv)->kept_stack_n;\
+    (mpv)->kept_stack_p = 0;\
+  }\
 } while(0)
 #endif
 
-#define MATCH_ARG_FREE(msa)  if ((msa).stack_p) xfree((msa).stack_p)
+#define MATCH_ARG_FREE(msa)  do {\
+  if ((msa).stack_p) {\
+    if (IS_NOT_NULL((msa).mp) && IS_NULL((msa).mp->kept_stack_p)) {\
+      (msa).mp->kept_stack_p = (msa).stack_p;\
+      (msa).mp->kept_stack_n = (msa).stack_n;\
+      (msa).mp->kept_ptr_num = (msa).ptr_num;\
+    }\
+    else xfree((msa).stack_p);\
+  }\
+} while(0)
 
 
 #define ALLOCA_PTR_NUM_LIMIT   50
@@ -1452,6 +1475,10 @@ onig_new_match_param(void)
 extern void
 onig_free_match_param_content(OnigMatchParam* p)
 {
+  if (IS_NOT_NULL(p->kept_stack_p)) {
+    xfree(p->kept_stack_p);
+    p->kept_stack_p = 0;
+  }
 #ifdef USE_CALLOUT
   if (IS_NOT_NULL(p->callout_data)) {
     xfree(p->callout_data);
@@ -1479,6 +1506,9 @@ onig_initialize_match_param(OnigMatchParam* mp)
 #endif
 
   mp->callout_user_data = 0;
+  mp->kept_stack_p = 0;
+  mp->kept_stack_n = 0;
+  mp->kept_ptr_num = 0;
 
 #ifdef USE_CALLOUT
   mp->progress_callout_of_contents   = DefaultProgressCallout;
