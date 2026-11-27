@@ -6139,6 +6139,8 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   An integer of a *document* written `0x1f`, `0o17`, `01`, `+5` or `007` keeps its spelling since the integer slice of #2802, so `==`, `tostring`, `join`, `sort`, `unique` and `split` by such a separator (#4263) read its text as yq does (`.a == 31` on `a: 0x1f` is `false`).
   A decimal filter literal with leading zeros (`01`, `007`, `-01`) keeps its spelling since #7999, as a document's does: `1 == 01` is `false` and `01 | tostring` is `"01"`, as in yq.
   A float literal does not: `01.5 | tostring` is `"1.5"` here and `"01.5"` in yq.
+  A mapping key spelled `08` or `09`, which YAML 1.1 cannot read as an octal integer, prints bare here (`{09: 1}` is `09: 1`), where yq tags it (`!!int 09: 1`).
+  A value spelled so is tagged as in yq (`[09]` is `- !!int 09`).
   A hexadecimal filter literal (`0x1f`, `0X1F`) keeps its spelling since #7615, as a document's does: `0x10 == 16` is `false` and `[0x1f, 31] | unique` is `[31,31]`, as in yq.
   A hex literal past `i64` is refused with yq's `strconv.ParseInt: parsing "FFFFFFFFFFFFFFFF": value out of range`, behind the `parse error at position N:` prefix every parse error has here.
   A spelled integer is still an index by value for `has` on a sequence, from a document or a literal: `[1,2] | has(0x1)` is `true` here, and in yq the error `strconv.ParseInt: parsing "0x1": invalid syntax`.

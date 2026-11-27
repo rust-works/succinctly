@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 #[cfg(not(test))]
 use alloc::rc::{Rc, Weak};
 #[cfg(not(test))]
-use alloc::string::String;
+use alloc::string::{String, ToString};
 #[cfg(not(test))]
 use alloc::vec;
 #[cfg(not(test))]
@@ -4726,6 +4726,35 @@ impl Expr {
         }
         match key {
             Self::Literal(Literal::String(name)) => Some((target.as_ref(), name.as_str())),
+            _ => None,
+        }
+    }
+
+    /// For a bracket on an integer literal whose text is not its decimal value (`E[0x1]`, `E[01]`,
+    /// `E[(-0)]`), the indexed target `E`, the value and the text (#7999). Only the yq parser
+    /// keeps such a key unfolded: yq names a mapping's key by the text and a sequence's slot by
+    /// the value, so this is static navigation whose step the node's kind decides. Every analysis
+    /// that treats `Field` and `Index` as plain navigation must treat this the same way.
+    #[must_use]
+    pub fn spelled_int_bracket(&self) -> Option<(&Self, i64, &str)> {
+        let Self::IndexExpr { target, key } = self else {
+            return None;
+        };
+        let (idx, text) = Self::spelled_int_key(key)?;
+        Some((target.as_ref(), idx, text))
+    }
+
+    /// The value and text of an integer literal written other than as its decimal value (`0x1`,
+    /// `01`, `-0`), seen through parentheses: the key [`Self::spelled_int_bracket`] names.
+    #[must_use]
+    pub fn spelled_int_key(key: &Self) -> Option<(i64, &str)> {
+        match key {
+            Self::Paren(inner) => Self::spelled_int_key(inner),
+            Self::Literal(Literal::NumberLiteral(NumberRepr::Int(i), text))
+                if text.as_str() != i.to_string() =>
+            {
+                Some((*i, text.as_str()))
+            }
             _ => None,
         }
     }

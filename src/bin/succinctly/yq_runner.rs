@@ -3645,6 +3645,11 @@ enum PathStep {
     /// [`collect_write_targets`] makes one, for `=` and `|=` with a closed literal, alone or beside
     /// other writes of the pipe.
     Each,
+    /// A spelled integer key (`.m[0x1]`, `.s[01]`, #7999) as the AST names it: the key of that
+    /// text in a mapping, the slot of that value anywhere else. [`collect_write_targets`]
+    /// resolves it against the document into a [`PathStep::Key`] or [`PathStep::Index`] before
+    /// anything else reads the path, or declines the write.
+    Spelled(i64, String),
 }
 
 /// What a write did at the path it resolved to (#870).
@@ -3754,15 +3759,18 @@ fn static_path_steps_each(expr: &Expr, each: bool, out: &mut Vec<PathStep>) -> b
             true
         }
         // #2126: `del(.["a"][0])` keeps the bracket form; it is `del(.a[0])` to the reconcile.
-        Expr::IndexExpr { target, .. } => match expr.literal_bracket_key() {
-            Some((_, name)) => {
-                static_path_steps_each(target, each, out) && {
-                    out.push(PathStep::Key(name.into()));
-                    true
-                }
+        // #7999: a spelled integer key is a field or an index, which the document decides.
+        Expr::IndexExpr { target, .. } => {
+            let step = match (expr.literal_bracket_key(), expr.spelled_int_bracket()) {
+                (Some((_, name)), _) => PathStep::Key(name.into()),
+                (None, Some((_, idx, text))) => PathStep::Spelled(idx, text.into()),
+                (None, None) => return false,
+            };
+            static_path_steps_each(target, each, out) && {
+                out.push(step);
+                true
             }
-            None => false,
-        },
+        }
         // #3551: bare `first` is yq's path step to a sequence's element 0
         // (`del(first)` on `[1,2]` is `[2]`), so a delete through it shifts
         // the same positions `del(.[0])` does. Without this arm the
@@ -3859,7 +3867,7 @@ fn is_closed_literal(expr: &Expr) -> bool {
 /// A path that *would* depend on the document (`.arr[(.i)] = 1`) is
 /// rejected by [`static_path_steps`] instead of being resolved against a
 /// document that may already be stale.
-fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
+fn collect_write_targets(expr: &Expr, doc: Option<&OwnedValue>) -> Option<Vec<WriteTarget>> {
     /// The stage of the next write: one past the last target pushed (a comma `del` pushes
     /// several targets under one stage).
     fn next_stage(out: &[WriteTarget]) -> usize {
@@ -4076,7 +4084,58 @@ fn collect_write_targets(expr: &Expr) -> Option<Vec<WriteTarget>> {
     if !walk(expr, &mut DefScope::default(), &mut out) {
         return None;
     }
+    if !resolve_spelled_steps(&mut out, doc) {
+        return None;
+    }
     resolve_stage_order(out)
+}
+
+/// Turn every [`PathStep::Spelled`] of `targets` into the step it names in `doc`, the document the
+/// first write reads (#7999): the key of its text where the node it indexes is a mapping, the slot
+/// of its value anywhere else (a sequence, or a `null` or absent node, which the write makes a
+/// sequence, as in yq). `false`, declining the write, when there is no document, the step follows
+/// a `.[]` (whose members may differ in kind), or an earlier stage wrote at or above the node it
+/// indexes, or removed a slot of a sequence above it: that node may no longer be the one `doc`
+/// holds there.
+fn resolve_spelled_steps(targets: &mut [WriteTarget], doc: Option<&OwnedValue>) -> bool {
+    for i in 0..targets.len() {
+        for p in 0..targets[i].path.len() {
+            let PathStep::Spelled(idx, text) = &targets[i].path[p] else {
+                continue;
+            };
+            let (idx, text) = (*idx, text.clone());
+            let Some(doc) = doc else {
+                return false;
+            };
+            let container = &targets[i].path[..p];
+            if container.contains(&PathStep::Each) {
+                return false;
+            }
+            let leads = |steps: &[PathStep]| {
+                steps.len() <= container.len()
+                    && steps
+                        .iter()
+                        .zip(container)
+                        .all(|(a, b)| a == b || *a == PathStep::Each)
+            };
+            let stage = targets[i].stage;
+            let moved = targets[..i].iter().filter(|u| u.stage < stage).any(|u| {
+                leads(&u.path)
+                    || (renumbers_array(u)
+                        && u.path.len() <= container.len()
+                        && leads(&u.path[..u.path.len() - 1]))
+            });
+            if moved {
+                return false;
+            }
+            let step = match read_owned_at(doc, container) {
+                Some(OwnedValue::Object(_)) => PathStep::Key(text),
+                _ => PathStep::Index(idx),
+            };
+            targets[i].path[p] = step;
+        }
+    }
+    true
 }
 
 /// Whether `target` removes an array slot, renumbering the ones after it.
@@ -4636,9 +4695,13 @@ fn chained_write_stages<'e>(
     flatten_pipe_stages(expr, &mut flat);
     let mut stages = Vec::new();
     for stage in flat {
+        // A spelled key (#7999) needs the document each stage reads, which this plan does not
+        // hold, so a chain through one is reconciled whole.
         let static_path = |path: &Expr| {
             let mut steps = Vec::new();
-            static_path_steps(path, &mut steps).then_some(steps)
+            (static_path_steps(path, &mut steps)
+                && !steps.iter().any(|s| matches!(s, PathStep::Spelled(..))))
+            .then_some(steps)
         };
         let literal = |value: &Expr| evaluate_input_quiet(&OwnedValue::Null, value);
         match strip_parens(stage) {
@@ -4724,17 +4787,17 @@ fn reconcile_presentation_by_stage(
             ChainStage::Identity => continue,
             ChainStage::Set(path, literal, expr) => {
                 set_owned_at(&mut next, path, literal.clone())?;
-                (collect_write_targets(expr)?, None)
+                (collect_write_targets(expr, Some(&value))?, None)
             }
             ChainStage::Copy(path, source, expr) => {
                 let read = read_owned_at(&value, source)?.clone();
                 set_owned_at(&mut next, path, read)?;
-                (collect_write_targets(expr)?, Some(*expr))
+                (collect_write_targets(expr, Some(&value))?, Some(*expr))
             }
             ChainStage::Add(path, literal, expr) => {
                 let sum = added(read_owned_at(&value, path)?, literal)?;
                 set_owned_at(&mut next, path, sum)?;
-                (collect_write_targets(expr)?, None)
+                (collect_write_targets(expr, Some(&value))?, None)
             }
             ChainStage::Del(path) => {
                 del_owned_at(&mut next, path)?;
@@ -4927,8 +4990,9 @@ fn set_owned_at(node: &mut OwnedValue, path: &[PathStep], new: OwnedValue) -> Op
             }
             set_owned_at(&mut items[at], rest, new)
         }
-        // A chain stage's path is static (`static_path_steps`), so it holds no `Each`.
-        PathStep::Each => None,
+        // A chain stage's path is static (`static_path_steps`), so it holds no `Each`, and
+        // `chained_write_stages` declines a spelled key.
+        PathStep::Each | PathStep::Spelled(..) => None,
     }
 }
 
@@ -6127,7 +6191,7 @@ fn propagate_assign_alias_marks(
     let resolve = stages.len() == 1 && is_plain_assign_chain(expr);
     for (stage, (path_expr, value_expr)) in stages.into_iter().enumerate() {
         let resolved = resolve
-            .then(|| resolve_negative_indices(path_expr, value))
+            .then(|| resolve_static_steps(path_expr, value))
             .flatten();
         let path_expr = resolved.as_ref().unwrap_or(path_expr);
         let Some(targets) = static_nav_targets(path_expr) else {
@@ -6290,9 +6354,13 @@ fn is_static_read(expr: &Expr) -> bool {
     match expr {
         Expr::Paren(inner) => is_static_read(inner),
         Expr::Comma(items) => items.iter().all(is_static_read),
-        // `nav_node` also reads a negative index, which `static_nav_steps` declines.
+        // `nav_node` also reads a negative index, which `static_nav_steps` declines, and a spelled
+        // integer key, which only the node can name (#7999).
         Expr::Index { .. } => true,
-        _ => static_nav_steps(expr).is_some(),
+        _ => match expr.spelled_int_bracket() {
+            Some((target, ..)) => matches!(target, Expr::Identity) || is_static_read(target),
+            None => static_nav_steps(expr).is_some(),
+        },
     }
 }
 
@@ -6318,14 +6386,23 @@ fn nav_node<'t>(node: &'t CommentTree, expr: &Expr) -> Option<&'t CommentTree> {
             _ => None,
         },
         Expr::IndexExpr { .. } => {
-            let (target, name) = expr.literal_bracket_key()?;
+            // #7999: a spelled integer key is the field of its text on a mapping and the index of
+            // its value on a sequence.
+            let (target, name, idx) = match expr.literal_bracket_key() {
+                Some((target, name)) => (target, name, None),
+                None => {
+                    let (target, idx, text) = expr.spelled_int_bracket()?;
+                    (target, text, Some(idx))
+                }
+            };
             let base = if matches!(target, Expr::Identity) {
                 node
             } else {
                 nav_node(node, target)?
             };
-            match base {
-                CommentTree::Object(_, fields, _) => fields.get(name),
+            match (base, idx) {
+                (CommentTree::Object(_, fields, _), _) => fields.get(name),
+                (CommentTree::Array(..), Some(idx)) => nav_node(base, &Expr::index(idx)),
                 _ => None,
             }
         }
@@ -6617,10 +6694,10 @@ fn propagate_assign_copied_presentation(
         // as the write found it, which only the first stage's pristine document says; a later
         // stage may have changed the length (#5407).
         let resolved_path = (stage == 0)
-            .then(|| resolve_negative_indices(path_expr, pristine_value))
+            .then(|| resolve_static_steps(path_expr, pristine_value))
             .flatten();
         let resolved_value = (stage == 0)
-            .then(|| resolve_negative_indices(value_expr, pristine_value))
+            .then(|| resolve_static_steps(value_expr, pristine_value))
             .flatten();
         let path_expr = resolved_path.as_ref().unwrap_or(path_expr);
         let value_expr = resolved_value.as_ref().unwrap_or(value_expr);
@@ -6679,6 +6756,80 @@ fn propagate_assign_copied_presentation(
                 *target = copy;
             } // patchcov: coverage tolerate-line reason="unreachable: the value at the target exists (checked above), and the tree stops short of it only at a leaf, which the lookup grows (#5249)"
         }
+    }
+}
+
+/// `expr` with the steps of its static navigation that only `root` can name resolved: each spelled
+/// integer key ([`resolve_spelled_brackets`], #7999) and then each negative array index
+/// ([`resolve_negative_indices`], #5407). `None` when it names neither.
+fn resolve_static_steps(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
+    let spelled = resolve_spelled_brackets(expr, root);
+    let named = spelled.as_ref().unwrap_or(expr);
+    resolve_negative_indices(named, root).or(spelled)
+}
+
+/// `expr` with each spelled integer key of its static navigation (`.m[0x1]`, `.s[01]`, #7999)
+/// replaced by the step it names in `root`, as the evaluator reads it: the field of its text on a
+/// mapping, the index of its value anywhere else. `None` when it holds none, or one is reached
+/// through a step this walk does not follow (only fields, indexes and pipes, parentheses and a
+/// comma of them are), which [`static_nav_steps`] then declines.
+fn resolve_spelled_brackets(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
+    /// `expr` rewritten, and the node it lands on (`None` past the document).
+    fn walk<'v>(
+        expr: &Expr,
+        node: Option<&'v OwnedValue>,
+    ) -> Option<(Expr, Option<&'v OwnedValue>)> {
+        let child = |step: &Expr, node: Option<&'v OwnedValue>| match (step, node) {
+            (Expr::Field(name), Some(OwnedValue::Object(fields))) => fields.get(name.as_str()),
+            (Expr::Index { idx, .. }, Some(OwnedValue::Array(items))) => {
+                items.get(resolved_index(*idx, items.len())?)
+            }
+            _ => None,
+        };
+        match expr {
+            Expr::Identity => Some((Expr::Identity, node)),
+            Expr::Field(_) | Expr::Index { .. } => Some((expr.clone(), child(expr, node))),
+            Expr::Paren(inner) => walk(inner, node).map(|(e, at)| (Expr::paren(e), at)),
+            Expr::Pipe(stages) => {
+                let mut out = Vec::with_capacity(stages.len());
+                let mut at = node;
+                for stage in stages.iter() {
+                    let (e, next) = walk(stage, at)?;
+                    out.push(e);
+                    at = next;
+                }
+                Some((Expr::pipe(out), at))
+            }
+            Expr::IndexExpr { .. } => {
+                let (target, idx, text) = expr.spelled_int_bracket()?;
+                let (target, at) = walk(target, node)?;
+                let step = match at {
+                    Some(OwnedValue::Object(_)) => Expr::Field(text.to_string()),
+                    _ => Expr::index(idx),
+                };
+                let next = child(&step, at);
+                let resolved = if matches!(target, Expr::Identity) {
+                    step
+                } else {
+                    Expr::pipe(vec![target, step])
+                };
+                Some((resolved, next))
+            }
+            _ => None,
+        }
+    }
+    if !jq::walk::any_subexpr(expr, &mut |e| e.spelled_int_bracket().is_some()) {
+        return None;
+    }
+    match expr {
+        Expr::Comma(items) => {
+            let resolved = items
+                .iter()
+                .map(|item| walk(item, Some(root)).map(|(e, _)| e))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Expr::Comma(resolved))
+        }
+        _ => walk(expr, Some(root)).map(|(e, _)| e),
     }
 }
 
@@ -7321,6 +7472,8 @@ fn is_navigation_stage(stage: &Expr) -> bool {
         | Expr::Slice { .. }
         | Expr::Iterate
         | Expr::RecursiveDescent => true,
+        // A spelled integer key (`.[0x1]`, #7999) is a field or an index.
+        Expr::IndexExpr { .. } => stage.spelled_int_bracket().is_some(),
         // `Paren`, `Optional` and `Pipe` never reach here: `flatten_pipe_stages` has already
         // looked through them.
         _ => false,
@@ -9760,7 +9913,7 @@ fn evaluate_yaml_cursor_core<W: AsRef<[u64]> + Clone>(
     // path) reconciles exactly as it did before #870.
     let write_targets = presentation_sync_ctx
         .as_ref()
-        .and_then(|_| collect_write_targets(expr))
+        .and_then(|(pristine, _)| collect_write_targets(expr, Some(pristine)))
         .unwrap_or_default();
 
     // #1351: for the duration of the write, let the evaluator's write entry
@@ -18613,7 +18766,8 @@ mod tests {
     }
 
     fn targets_of(expr: &Expr) -> Option<Vec<(Vec<PathStep>, WriteKind)>> {
-        collect_write_targets(expr).map(|ts| ts.into_iter().map(|t| (t.path, t.kind)).collect())
+        collect_write_targets(expr, None)
+            .map(|ts| ts.into_iter().map(|t| (t.path, t.kind)).collect())
     }
 
     /// A leading `.` contributes no step: `.` is the node you are already
@@ -19080,7 +19234,7 @@ mod tests {
     #[test]
     fn collect_write_targets_marks_closed_literal_writes_fresh_870() {
         let lit = || Expr::Literal(succinctly::jq::Literal::Int(1));
-        let fresh_of = |e: &Expr| collect_write_targets(e).map(|ts| ts[0].fresh);
+        let fresh_of = |e: &Expr| collect_write_targets(e, None).map(|ts| ts[0].fresh);
 
         assert_eq!(
             fresh_of(&Expr::Assign {
@@ -19282,7 +19436,7 @@ mod tests {
             WriteKind::Del,
         )]);
         let of = |e: &Expr| {
-            collect_write_targets(e)
+            collect_write_targets(e, None)
                 .map(|ts| ts.into_iter().map(|t| (t.path, t.kind)).collect::<Vec<_>>())
         };
         let bound_call = |body: Expr, args: Vec<Expr>| Expr::DefCall {

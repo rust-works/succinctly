@@ -5478,13 +5478,7 @@ impl<'a> Parser<'a> {
     /// fold to [`Expr::Index`], which keeps only the value. A canonical `1` still folds: the text
     /// and the value name the same key. Only the yq parser keeps such a spelling.
     fn is_spelled_int_key(key: &Expr) -> bool {
-        match key {
-            Expr::Paren(inner) => Self::is_spelled_int_key(inner),
-            Expr::Literal(Literal::NumberLiteral(NumberRepr::Int(i), text)) => {
-                text.as_str() != i.to_string()
-            }
-            _ => false,
-        }
+        Expr::spelled_int_key(key).is_some()
     }
 
     /// Fold a slice bound to the `i64` every navigation step uses, seeing

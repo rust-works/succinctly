@@ -124,6 +124,111 @@ fn test_spelled_bracket_key_writes_the_mapping_key_it_names_7999() -> Result<()>
     Ok(())
 }
 
+/// The YAML a write prints keeps the document's presentation as the static `.s[1]` and `.m["0x1"]`
+/// do: comments, quoting, flow style and anchors, by `eval` and by `eval-all` (whose plain-route
+/// reroute takes a spelled key as navigation), on a file and on stdin. The positional fallback this
+/// replaced moved `del(.s[01])`'s comments onto the wrong item and printed a quoted `"01"` key bare,
+/// which reads back as an integer.
+#[test]
+fn test_spelled_bracket_key_keeps_presentation_7999() -> Result<()> {
+    const FLOW: &str = "s: [a, b]\n\"01\": &k x # c1\n";
+    const BLOCK: &str = "s:\n  - a # c0\n  - 'b' # c1\n  - \"c\" # c2\n";
+    const ANCHORS: &str = "s: [&x {k: v}, &w {k: v}, *x]\n";
+    const MAP: &str = "m:\n  \"0x1\": 'five' # h\n  \"1\": six # o\n  \"01\": &a seven # z\n  \"-0\": nz # n\nr: *a\n";
+    const MAP_FLOW: &str = "m: {\"0x1\": 5, \"1\": 6} # fm\nq: \"x\" # tail\n";
+    let rows: &[(&str, &str, &str)] = &[
+        (".s[01] = 9", FLOW, "s: [a, 9]\n\"01\": &k x # c1\n"),
+        (".s[0x1] |= \"z\"", FLOW, "s: [a, z]\n\"01\": &k x # c1\n"),
+        ("del(.s[01])", FLOW, "s: [a]\n\"01\": &k x # c1\n"),
+        ("del(.s[01])", BLOCK, "s:\n  - a # c0\n  - \"c\" # c2\n"),
+        ("del(.s[0x0])", BLOCK, "s:\n  - 'b' # c1\n  - \"c\" # c2\n"),
+        ("del(.s[-0])", BLOCK, "s:\n  - 'b' # c1\n  - \"c\" # c2\n"),
+        ("del(.s[-01])", BLOCK, "s:\n  - a # c0\n  - 'b' # c1\n"),
+        (".s[01] = \"q\"", BLOCK, "s:\n  - a # c0\n  - 'q' # c1\n  - \"c\" # c2\n"),
+        (".s[0x2] |= \"q\"", BLOCK, "s:\n  - a # c0\n  - 'b' # c1\n  - \"q\" # c2\n"),
+        ("del(.s[01])", ANCHORS, "s: [&x {k: v}, *x]\n"),
+        (".s[0x1].k = \"z\"", ANCHORS, "s: [&x {k: v}, &w {k: z}, *x]\n"),
+        (".s[0x0].k = \"z\"", ANCHORS, "s: [&x {k: z}, &w {k: v}, *x]\n"),
+        (
+            ".m[0x1] = 9",
+            MAP,
+            "m:\n  \"0x1\": 9 # h\n  \"1\": six # o\n  \"01\": &a seven # z\n  \"-0\": nz # n\nr: *a\n",
+        ),
+        (
+            ".m[01] |= \"q\"",
+            MAP,
+            "m:\n  \"0x1\": 'five' # h\n  \"1\": six # o\n  \"01\": &a q # z\n  \"-0\": nz # n\nr: *a\n",
+        ),
+        (
+            "del(.m[0x1])",
+            MAP,
+            "m:\n  \"1\": six # o\n  \"01\": &a seven # z\n  \"-0\": nz # n\nr: *a\n",
+        ),
+        (
+            "del(.m[-0])",
+            MAP,
+            "m:\n  \"0x1\": 'five' # h\n  \"1\": six # o\n  \"01\": &a seven # z\nr: *a\n",
+        ),
+        (
+            ".m[0x2] = 9",
+            MAP,
+            "m:\n  \"0x1\": 'five' # h\n  \"1\": six # o\n  \"01\": &a seven # z\n  \"-0\": nz # n\n  0x2: 9\nr: *a\n",
+        ),
+        (".m[0x1] = 9", MAP_FLOW, "m: {\"0x1\": 9, \"1\": 6} # fm\nq: \"x\" # tail\n"),
+        ("del(.m[0x1])", MAP_FLOW, "m: {\"1\": 6} # fm\nq: \"x\" # tail\n"),
+    ];
+    for (filter, input, want) in rows {
+        let mut file = NamedTempFile::new()?;
+        file.write_all(input.as_bytes())?;
+        let path = file.path().to_str().expect("utf-8 temp path");
+        for mode in [&[][..], &["ea"][..]] {
+            let (out, code) = run_yq_file(filter, path, mode)?;
+            assert_eq!(
+                (out.as_str(), code),
+                (*want, 0),
+                "{mode:?} {filter} over {input:?}"
+            );
+            let (out, code) = run_yq_stdin(filter, input, mode)?;
+            assert_eq!(
+                (out.as_str(), code),
+                (*want, 0),
+                "{mode:?} {filter} over stdin {input:?}"
+            );
+        }
+    }
+    // A copy takes the source's comment, as the static `.m["0x1"] = .m["01"]` does.
+    let (out, code) = run_yq_stdin(".m[0x1] = .m[01]", MAP, &[])?;
+    assert_eq!(
+        (out.as_str(), code),
+        (
+            "m:\n  \"0x1\": 'seven' # z\n  \"1\": six # o\n  \"01\": &a seven # z\n  \"-0\": nz # n\nr: *a\n",
+            0
+        )
+    );
+    Ok(())
+}
+
+/// A key spelled `-0` is the mapping key `-0` and the sequence slot 0, as in yq.
+#[test]
+fn test_minus_zero_bracket_key_7999() -> Result<()> {
+    let input = "m: {\"-0\": 1, \"0\": 2}\ns: [a, b]\n";
+    for (filter, want) in [
+        (".m[-0]", "1"),
+        (".m[0]", "2"),
+        (".m[-0] = 9 | .m", r#"{"-0":9,"0":2}"#),
+        ("del(.m[-0]) | .m", r#"{"0":2}"#),
+        (".s[-0]", r#""a""#),
+        ("del(.s[-0]) | .s", r#"["b"]"#),
+    ] {
+        assert_eq!(
+            yq_json(filter, input, &[])?,
+            (want.to_string(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// A sequence is still indexed by the key's value, and a slice bound is unchanged.
 #[test]
 fn test_spelled_bracket_key_indexes_a_sequence_by_value_7999() -> Result<()> {
