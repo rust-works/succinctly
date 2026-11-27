@@ -20,6 +20,7 @@ Practical how-to documentation for using and developing succinctly.
 | [Release Guide](release.md)                                       | Release process (for maintainers)                                                                            |
 | [Reproducing the jq comparison](reproducing-the-jq-comparison.md) | Valid `dev compare jq` runs on any machine or a scripted EC2 instance, and merging the platforms             |
 | [Differential bug hunting](bug-hunting.md)                        | Running a hunt for unknown jq/yq divergences: strategies, coverage map, harness rules, finding to merged fix |
+| [The jq regex corpus](jq-regex-corpus.md)                         | The differential corpus that gates jq-mode regex changes (ADR-0031): running it, reading it, the baseline    |
 
 ## Quick Links
 
