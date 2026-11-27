@@ -7407,12 +7407,13 @@ jq mode keeps its generator model for all three (no key, no output).
 Still diverging: over a `null` or absent operand yq's empty index creates the container
 (`.n[$typo] = 1` over `n: null` is `n: []`, as plain `.n[] = 1` is, which `succinctly yq` already
 does), where this tool leaves the document unchanged; a slice bound with no output is an error in yq (`.[$nope:]` is `expected to find 1
-number, got 0 instead`) and nothing here (#4197); `1 as $y | select(false) as $y | $y` is `1` in yq
-and nothing here, because the outer `$y` is not substituted into a body that rebinds the name;
-and a `--arg __loc__` is not honoured in yq mode.
+number, got 0 instead`) and nothing here (#4197); and `1 as $y | select(false) as $y | $y` is `1` in yq
+and nothing here, because the outer `$y` is not substituted into a body that rebinds the name.
 
 `$ENV` and `$ARGS` are not variables of yq's, so here too they are unbound names unless the program binds them: `$ENV.x` prints nothing and `[$ENV, $ARGS] | length` is `0` (#7616).
 Under `--jq-extensions` they are jq's environment object and `{named, positional}` object.
+`$__loc__` is the same (#7997): without the flag a program can bind it (`1 as $__loc__ | $__loc__` is `1`, as in yq) and `--arg __loc__ X` sets it.
+Under `--jq-extensions` it is jq's `{file, line}` object, which, as in jq, no binding or `--arg` replaces (`1 as $__loc__` is a syntax error there).
 
 ### `..` stops at an alias node — resolved for reads ([#4214](https://github.com/rust-works/succinctly/issues/4214)); the write path, owned routes and merge keys are residual ([#4223](https://github.com/rust-works/succinctly/issues/4223))
 

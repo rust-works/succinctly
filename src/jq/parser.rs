@@ -1846,17 +1846,18 @@ fn meta_from_owned(value: &OwnedValue) -> MetaValue {
 /// predicates diverge silently" shape #2728 found for identifier-start
 /// rules, per CLAUDE.md's #106 note.
 ///
-/// `env_pseudo` is false in `succinctly yq` without `--jq-extensions` (#7616): yq has no `$ENV`, so
-/// there it is an ordinary variable, unbound unless the program binds it, and reads as nothing, as
-/// `$foo` does (`yq -n '[$ENV] | length'` is `0`). See [`Parser::env_is_pseudo_var`].
-fn dollar_var_expr(name: String, line: usize, env_pseudo: bool) -> Expr {
-    if name == "__loc__" {
+/// `jq_pseudo` is false in `succinctly yq` without `--jq-extensions` (#7616, #7997): yq has neither
+/// `$ENV` nor `$__loc__`, so there each is an ordinary variable, unbound unless the program binds it,
+/// and reads as nothing, as `$foo` does (`yq -n '[$ENV] | length'` is `0`, and `1 as $__loc__ |
+/// $__loc__` is `1`). See [`Parser::jq_pseudo_vars`].
+fn dollar_var_expr(name: String, line: usize, jq_pseudo: bool) -> Expr {
+    if name == "__loc__" && jq_pseudo {
         // #2774: the parser has no notion of which file it is reading (a
         // module's text arrives here identically to the main filter's), so
         // `file` always starts `None` -- `ModuleLoader` stamps it in after
         // the fact for a def sourced from an `include`d module or `~/.jq`.
         Expr::Loc { line, file: None }
-    } else if name == "ENV" && env_pseudo {
+    } else if name == "ENV" && jq_pseudo {
         Expr::Env
     } else {
         Expr::Var(name)
@@ -2316,8 +2317,8 @@ struct Parser<'a> {
     /// parse has built, with the byte offset of its `$` sigil. `$__loc__`/
     /// `$ENV` are never recorded in jq mode — they lower to `Expr::Loc`/`Expr::Env`,
     /// never `Expr::Var`, so they can never be the subject of an unbound-
-    /// variable diagnostic in the first place. (Plain yq mode reads `$ENV` as
-    /// an ordinary name, #7616, and records it like any other.)
+    /// variable diagnostic in the first place. (Plain yq mode reads both as
+    /// ordinary names, #7616 and #7997, and records them like any other.)
     var_sites: Vec<VarSite>,
     /// jq's `check_object_key` errors (#5510), by position: jq's parser records one and keeps
     /// going, so they are reported together at the end (see [`Self::finish`]). Keyed by the
@@ -4092,9 +4093,10 @@ impl<'a> Parser<'a> {
                 .is_some_and(is_ident_continue_char)
     }
 
-    /// Whether `$ENV` is jq's environment object (#7616): always in jq mode and under
-    /// `--jq-extensions`; in plain yq mode it is an ordinary variable name, as in yq.
-    fn env_is_pseudo_var(&self) -> bool {
+    /// Whether `$ENV` and `$__loc__` are jq's pseudo-variables, the environment object and the
+    /// `{file, line}` location (#7616, #7997): always in jq mode and under `--jq-extensions`; in
+    /// plain yq mode each is an ordinary variable name, as in yq, which a program can bind.
+    fn jq_pseudo_vars(&self) -> bool {
         self.mode == ParserMode::Jq || self.jq_extensions
     }
 
@@ -5565,7 +5567,10 @@ impl<'a> Parser<'a> {
     /// `{$__loc__}`/`{$__loc__: Pattern}` shorthand forms report a bare
     /// `unexpected $__loc__` with no expecting list -- all exit 3). Real yq
     /// v4.53.3 instead accepts it as an ordinary binding (`1 as $__loc__ |
-    /// 2` → `2`, confirmed live), so the reject is gated to jq mode.
+    /// 2` → `2`, confirmed live), so the reject follows the same test as
+    /// `dollar_var_expr` ([`Self::jq_pseudo_vars`]): jq mode, and yq mode
+    /// under `--jq-extensions`, where a reference is the location and a
+    /// binding of the name could never be read (#7997).
     ///
     /// One definition for every binding site (a `def` `$`-param, the primary
     /// `$var` pattern, and the object-pattern shorthand) is deliberate: the
@@ -5587,7 +5592,7 @@ impl<'a> Parser<'a> {
         expecting: Option<&str>,
         sigil_offset: usize,
     ) -> Result<(), ParseError> {
-        if self.mode == ParserMode::Jq && name == "__loc__" {
+        if self.jq_pseudo_vars() && name == "__loc__" {
             let message = match expecting {
                 Some(expecting) => {
                     format!("syntax error, unexpected $__loc__, expecting {expecting}")
@@ -5799,7 +5804,7 @@ impl<'a> Parser<'a> {
                                     self.pos,
                                 ));
                             }
-                            let key_value = dollar_var_expr(name, line, self.env_is_pseudo_var());
+                            let key_value = dollar_var_expr(name, line, self.jq_pseudo_vars());
                             if let Expr::Var(name) = &key_value {
                                 self.var_sites.push(VarSite {
                                     name: name.clone(),
@@ -5808,8 +5813,7 @@ impl<'a> Parser<'a> {
                             }
                             (ObjectKey::Expr(Box::new(key_value)), None)
                         } else {
-                            let value =
-                                dollar_var_expr(name.clone(), line, self.env_is_pseudo_var());
+                            let value = dollar_var_expr(name.clone(), line, self.jq_pseudo_vars());
                             if let Expr::Var(name) = &value {
                                 self.var_sites.push(VarSite {
                                     name: name.clone(),
@@ -7009,7 +7013,7 @@ impl<'a> Parser<'a> {
                 let line = self.current_line();
                 self.next();
                 let name = self.parse_variable_name()?;
-                let expr = dollar_var_expr(name, line, self.env_is_pseudo_var());
+                let expr = dollar_var_expr(name, line, self.jq_pseudo_vars());
                 if let Expr::Var(name) = &expr {
                     self.var_sites.push(VarSite {
                         name: name.clone(),

@@ -5096,9 +5096,9 @@ fn eval_single<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // against. `deferred_bind_is_sound` keeps a deferred binding out of
         // every body that can reach here, so this is the loud backstop.
         Expr::DeferredVar(_) => QueryResult::Error(EvalError::new(DEFERRED_BIND_UNRESOLVED)),
-        // #2776: `$__loc__` is no builtin in yq; the lexer reads it as an ordinary `GET_VARIABLE`
-        // nothing binds, so it is as unbound as `$nope` (`UNBOUND_VARIABLE_YIELDS_NOTHING`).
-        Expr::Loc { .. } if S::UNBOUND_VARIABLE_YIELDS_NOTHING => QueryResult::None,
+        // #2776, #7997: `$__loc__` is no builtin in yq, whose lexer reads it as an ordinary
+        // `GET_VARIABLE`, so plain yq mode parses it as `Expr::Var` (`dollar_var_expr`) and only
+        // jq mode or `--jq-extensions` reaches this arm, where it is jq's location object.
         Expr::Loc { line, file } => {
             // #2688: `$__loc__` names the *program text*, not the input --
             // jq's own `locfile` uses the literal string `<top-level>` for
