@@ -102741,6 +102741,9 @@ fn bind_yq_update<'e>(
 /// `. as $i ireduce (0; (. + $i, . * 10))` over `[1, 2]` is `3 2 10 0`, a `select(false)` UPDATE
 /// prints nothing, and INIT `(0, 100)` folds both over the same source (`3 103`; jq's later forks read
 /// a `null` source, #3895).
+/// An empty list is folded too (#8035): UPDATE runs over it for every later node, where a collect, a
+/// literal, a loop variable or an `error` still answers once, so `.[] as $x ireduce (select(false);
+/// [.])` over `[1, 2]` is `[[]]` and `... (select(false); $x)` is `2`.
 ///
 /// Reading the source first is visible only through errors (#8022), so the source is still streamed
 /// here, INIT first, and the order is recovered by precedence: an error anywhere in the source
@@ -102786,10 +102789,14 @@ fn reduce_list_yq<S: EvalSemantics>(
     // doubles the list every step is refused at 100,000 accumulators where yq grows it until the
     // process dies (`ireduce (0; (. + 1, . + 2))` over 30 elements is 2^30).
     let mut extra_budget = REDUCE_FOREACH_MAX_STEPS;
+    // #8035: an empty list is still folded, as yq runs UPDATE over it (`[.]` over no accumulator
+    // is `[]`), unless an UPDATE that reads no loop variable already answered nothing over it:
+    // that answer is the same for every later element.
+    let mut settled_empty = false;
     let source_flow = drive_source(SourceInput::Real, &mut |element| {
-        // Nothing left to fold (INIT yielded nothing, or UPDATE dropped every accumulator) or an
-        // error held: the element is read only for the error a later one may raise.
-        if failure.is_some() || accumulators.is_empty() {
+        // An error held, or an empty list nothing can refill: the element is read only for the
+        // error a later one may raise.
+        if failure.is_some() || settled_empty {
             return Demand::Continue;
         }
         let mut step_failure: Option<Control> = None;
@@ -102812,9 +102819,20 @@ fn reduce_list_yq<S: EvalSemantics>(
                     _ => Ok(outputs),
                 }
             } else {
+                // Several accumulators, or none (#8035): yq evaluates UPDATE over the whole list,
+                // so over an empty one a collect, a literal or an `error` still answers once
+                // (the #6943 rule, which the context-list walk carries).
+                let was_empty = current.is_empty();
                 let substituted =
                     bind_yq_update(update.hoisted, update.inert, bindings, &all_var_names);
-                super::eval_generic::eval_yq_over_owned_list::<S>(&substituted, current, optional)
+                let stepped = super::eval_generic::eval_yq_over_owned_list::<S>(
+                    &substituted,
+                    current,
+                    optional,
+                );
+                settled_empty =
+                    was_empty && update.inert && matches!(&stepped, Ok(next) if next.is_empty());
+                stepped
             };
             match stepped {
                 Ok(next) => {
@@ -102827,8 +102845,7 @@ fn reduce_list_yq<S: EvalSemantics>(
                     }
                     extra_budget -= extra;
                     accumulators = next;
-                    // An empty list stays empty: the rest of the source is only read.
-                    if accumulators.is_empty() {
+                    if settled_empty {
                         Demand::Stop
                     } else {
                         Demand::Continue
