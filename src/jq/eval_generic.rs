@@ -12450,7 +12450,7 @@ mod path_base {
 pub(crate) struct UpdateAncestry {
     pub(crate) pre: OwnedValue,
     pub(crate) base_len: usize,
-    pub(crate) outer: Option<Rc<UpdateAncestry>>,
+    pub(crate) outer: Option<Rc<Self>>,
 }
 
 /// Run `f` with no ambient prefix and no [`UpdateAncestry`] (#8039): the filter of an update that

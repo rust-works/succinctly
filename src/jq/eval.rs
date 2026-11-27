@@ -55746,7 +55746,7 @@ struct UpdatePos<'a> {
     pre: Option<&'a OwnedValue>,
 }
 
-impl<'a> UpdatePos<'a> {
+impl UpdatePos<'_> {
     /// The position of `component` inside the value this one describes.
     fn child(&self, component: OwnedValue) -> Self {
         let mut path = vec_with_capacity(self.path.len() + 1);
@@ -55810,7 +55810,7 @@ impl<'a> UpdatePos<'a> {
 /// at or above it (#8039): [`UpdatePos::ancestor`] above its own input.
 fn ambient_update_ancestor(path: &[OwnedValue], len: usize) -> Option<OwnedValue> {
     let mut ancestry = super::eval_generic::ambient_update_ancestry();
-    while let Some(entry) = ancestry {
+    while let Some(entry) = ancestry.take() {
         if entry.base_len <= len {
             let mut cur = &entry.pre;
             for component in path.get(entry.base_len..len)? {
@@ -55818,7 +55818,7 @@ fn ambient_update_ancestor(path: &[OwnedValue], len: usize) -> Option<OwnedValue
             }
             return Some(cur.clone());
         }
-        ancestry = entry.outer.clone();
+        ancestry.clone_from(&entry.outer);
     }
     None
 }
