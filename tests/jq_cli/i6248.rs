@@ -84,18 +84,23 @@ fn a_malformed_octal_brace_escape_is_refused_as_jq_does_6248() -> Result<()> {
 }
 
 /// A surrogate or a value past U+10FFFF as an end of a range in a class: jq clamps the range
-/// (`[a-\o{154000}]` runs to U+D7FF), which is not reproduced. It stays refused, not read as an empty
-/// set that would answer `[]` where jq answers.
+/// (`[a-\o{154000}]` runs to U+D7FF), and a range that starts past its end is refused. The earlier
+/// engine refused all four, a recorded divergence; they now match jq 1.7.1 (#7965).
 #[test]
-fn a_range_ending_in_a_non_character_octal_escape_stays_refused_6248() -> Result<()> {
-    for pattern in [
-        r"[a-\o{154000}]",
-        r"[\o{154000}-z]",
-        r"[\o{101}-\o{154000}]",
-        r"[a-\o{4200000}]",
+fn a_range_ending_in_a_non_character_octal_escape_is_clamped_6248() -> Result<()> {
+    for (pattern, expected) in [
+        (r"[a-\o{154000}]", "[\"a\",\"é\",\"Ā\",\"ÿ\"]"),
+        (
+            r"[\o{101}-\o{154000}]",
+            "[\"a\",\"A\",\"B\",\"é\",\"Ā\",\"ÿ\"]",
+        ),
+        (r"[a-\o{4200000}]", "[\"a\",\"é\",\"Ā\",\"ÿ\"]"),
     ] {
         let (stdout, _, status) = matches(pattern)?;
-        assert_eq!((stdout.as_str(), status), ("", 5), "{pattern}");
+        assert_eq!((stdout.as_str(), status), (expected, 0), "{pattern}");
     }
+    let (stdout, stderr, status) = matches(r"[\o{154000}-z]")?;
+    assert_eq!((stdout.as_str(), status), ("", 5));
+    assert!(stderr.contains("empty range in char class"), "{stderr}");
     Ok(())
 }

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::succinctly_bin;
+use crate::{run_jq_full, succinctly_bin};
 
 /// Runs `succinctly jq -nc <program>`, killing it past `LIMIT` so a search that no longer ends
 /// fails the test instead of growing without bound.
@@ -60,10 +60,6 @@ fn test_a_k_ending_a_look_behind_match_ends_the_global_search_6169() -> Result<(
             r#""cab" | [match("(?<=a\\Kb)";"gl") | .string]"#,
             r#"["b"]"#,
         ),
-        (
-            r#""cab" | [match("(?<=a\\Kb)";"gn") | .string]"#,
-            r#"["b"]"#,
-        ),
         (r#""cab" | [scan("(?<=a\\Kb)")]"#, r#"["b"]"#),
         (r#""cab" | gsub("(?<=a\\Kb)"; "X")"#, r#""caX""#),
         (r#""cab" | [splits("(?<=a\\Kb)")]"#, r#"["ca",""]"#),
@@ -71,14 +67,27 @@ fn test_a_k_ending_a_look_behind_match_ends_the_global_search_6169() -> Result<(
         (r#""éabéab" | [match("(?<=a\\Kb)";"g") | .offset]"#, "[2,5]"),
         (r#""éab" | [match("(?<=é\\Ka)";"g") | .string]"#, r#"["a"]"#),
         (r#""éabéab" | gsub("(?<=a\\Kb)"; "é")"#, r#""éaééaé""#),
-        // The refused-in-jq look-behinds (`.?`, `.*` after the `\K`) end too.
-        (
-            r#""cab" | [match("(?<=a\\K.?)b?";"g") | .string]"#,
-            r#"["b"]"#,
-        ),
-        (r#""cab" | [match("(?<=\\K.?)";"g") | .string]"#, r#"[""]"#),
     ] {
         assert_eq!(answer(program)?, expected, "{program}");
+    }
+    Ok(())
+}
+
+/// A look-behind whose body ends in `.?` after the `\K` is refused by Oniguruma, so it never
+/// reaches the search. The earlier engine read it and the skip ended its global search, a recorded
+/// divergence; it is now refused in jq 1.7.1's words (#7965).
+#[test]
+fn test_a_k_before_a_varying_look_behind_tail_is_refused_6169() -> Result<()> {
+    for program in [
+        r#""cab" | [match("(?<=a\\K.?)b?";"g") | .string]"#,
+        r#""cab" | [match("(?<=\\K.?)";"g") | .string]"#,
+    ] {
+        let (stdout, stderr, code) = run_jq_full(&["-nc", program], None)?;
+        assert_eq!((stdout.as_str(), code), ("", 5), "{program}: {stderr}");
+        assert!(
+            stderr.contains("Regex failure: invalid pattern in look-behind"),
+            "{program}: {stderr}"
+        );
     }
     Ok(())
 }
@@ -106,6 +115,9 @@ fn test_a_global_search_that_jq_ends_is_unchanged_6169() -> Result<()> {
         ),
         (r#""cab" | [match("(?=a\\K)";"g") | .string]"#, r#"[""]"#),
         (r#""cab" | [match("(?<=a\\Kb)") | .string]"#, r#"["b"]"#),
+        // jq 1.7.1 ends this search, with no match, under `n`; the earlier engine answered `["b"]`,
+        // a recorded divergence that matches jq 1.7.1 since #7965.
+        (r#""cab" | [match("(?<=a\\Kb)";"gn") | .string]"#, "[]"),
     ] {
         assert_eq!(answer(program)?, expected, "{program}");
     }

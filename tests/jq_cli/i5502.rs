@@ -156,27 +156,18 @@ fn test_empty_match_reports_every_group_empty_5502() -> Result<()> {
     ])
 }
 
-/// Escapes and constructs `fancy-regex` reads differently from Oniguruma, or that were not checked
-/// against it, keep the `regex` crate's refusal rather than answering differently from jq
-/// (jq 1.7.1: `true`, `true`, an error). A `(?P...)` group never gets this
+/// Escapes and constructs `fancy-regex` read differently from Oniguruma, or that were not checked
+/// against it, kept the `regex` crate's refusal on the earlier engine, a recorded divergence. On
+/// Oniguruma they answer as jq 1.7.1 does (#7965): a call `\g<n>` and a range cutter `(?~|b)`
+/// match, and `a{3,2}` is refused in Oniguruma's words (#6423). A `(?P...)` group never gets this
 /// far: #5529 refuses it before either engine, with jq's own message (`tests/jq_cli/i5529.rs`).
-/// `\h` and `\g1` were two of them until #6080: `\h` is the letter `h` in jq, and `\g1` the letter `g`
-/// and a `1`, as is every escaped letter jq does not define (`tests/jq_cli/i6080.rs`).
+/// `\h` is the letter `h` in jq, and `\g1` the letter `g` and a `1` (`tests/jq_cli/i6080.rs`).
 #[test]
-fn test_constructs_read_differently_stay_refused_5502() -> Result<()> {
-    for filter in [
-        r#""abab" | test("(?<n>ab)\\g<n>")"#,
-        // `(?~b)` is read since #6252 (`tests/jq_cli/i6252.rs`); a range cutter is not.
-        r#""abc" | test("(?~|b)")"#,
-    ] {
-        let (stdout, stderr, code) = run(filter)?;
-        assert_eq!((stdout.as_str(), code), ("", 5), "{filter}");
-        assert!(
-            stderr.contains("Regex failure: regex parse error"),
-            "{filter}: {stderr}"
-        );
-    }
-    // jq errors on this one, in Oniguruma's words (#6423); `fancy-regex` would answer it.
+fn test_constructs_read_differently_answer_as_jq_does_5502() -> Result<()> {
+    assert_rows(&[
+        (r#""abab" | test("(?<n>ab)\\g<n>")"#, "true"),
+        (r#""abc" | test("(?~|b)")"#, "true"),
+    ])?;
     let (stdout, stderr, code) = run(r#""aaa" | test("a{3,2}")"#)?;
     assert_eq!((stdout.as_str(), code), ("", 5));
     assert!(
@@ -186,31 +177,22 @@ fn test_constructs_read_differently_stay_refused_5502() -> Result<()> {
     Ok(())
 }
 
-/// A search that exhausts the backtracking budget, or the backtracking stack, is an error worded
-/// as Oniguruma's for its own limits, which `?` and `try` catch like any other. jq itself answers
-/// both rows `false`: its optimizer settles them without backtracking, a recorded divergence
-/// (`docs/compliance/jq/limitations.md`). Spending the whole budget takes about a second in a
-/// debug build, so that row runs once.
+/// Two searches that exhausted the earlier engine's backtracking budget, or its backtracking stack,
+/// which raised an error `?` and `try` catch. jq 1.7.1 answers both `false`, as Oniguruma settles
+/// them without backtracking; that was a recorded divergence of the earlier engine and now matches
+/// jq 1.7.1 (#7965).
 #[test]
-fn test_backtrack_limit_is_a_catchable_error_5502() -> Result<()> {
+fn test_a_long_backtracking_search_answers_as_jq_does_5502() -> Result<()> {
     let input = format!("\"{}!\"", "a".repeat(40));
     let (stdout, _, code) = run(&format!(r#"{input} | try test("((?=a)a|aa)*b") catch ."#))?;
-    assert_eq!(
-        (stdout.as_str(), code),
-        ("\"Regex failure: retry-limit-in-match over\"\n", 0)
-    );
+    assert_eq!((stdout.as_str(), code), ("false\n", 0));
 
-    // One saved state per character: a million of them fill the stack long before the budget.
     let input = format!("\"{}\"", "a".repeat(1_000_000));
     let filter = r#"test("(?:a(?=a)|a)*b")"#;
     let (stdout, stderr, code) = run_jq_full(&["-c", filter], Some(&input))?;
-    assert_eq!((stdout.as_str(), code), ("", 5));
-    assert!(
-        stderr.contains("Regex failure: match-stack limit over"),
-        "{stderr}"
-    );
+    assert_eq!((stdout.as_str(), code), ("false\n", 0), "{stderr}");
     let (stdout, _, code) = run_jq_full(&["-c", &format!("[{filter}?]")], Some(&input))?;
-    assert_eq!((stdout.as_str(), code), ("[]\n", 0));
+    assert_eq!((stdout.as_str(), code), ("[false]\n", 0));
     Ok(())
 }
 

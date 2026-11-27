@@ -55,11 +55,12 @@ fn a_lazy_repeat_that_keeps_its_text_leaves_the_others_written_6469() -> Result<
     Ok(())
 }
 
-/// Nine repeats that keep their text take ten readings, under `MOST_READS` (16), and answer as jq
-/// does. Seventeen take more than it allows, so the pattern moves on as a whole past it and the last
-/// group is `""` where jq's is `null`: the limitation `docs/compliance/jq/limitations.md` records.
+/// Nine repeats that keep their text took ten readings on the earlier engine, under `MOST_READS`
+/// (16), and answered as jq does. Seventeen took more than it allowed, so the pattern moved on as a
+/// whole and the last group was `""` where jq's is `null`, a recorded divergence. On Oniguruma both
+/// match jq 1.7.1 (#7965).
 #[test]
-fn past_the_most_readings_the_pattern_moves_on_as_a_whole_6469() -> Result<()> {
+fn past_the_most_readings_the_pattern_answers_as_jq_does_6469() -> Result<()> {
     let kept = r"(?:^x*|(?:(y*)|x)+(?:(y)|x?){0,2})*?";
     let pattern = |copies: usize| format!("{}(?:(?:(b*)|a){{0,2}}?)*?c", kept.repeat(copies));
     let nulls = |count: usize| ["null"].repeat(count).join(",");
@@ -69,7 +70,7 @@ fn past_the_most_readings_the_pattern_moves_on_as_a_whole_6469() -> Result<()> {
     );
     assert_eq!(
         captures(&pattern(17), "aac")?,
-        format!("[[{},\"\"]]\n", nulls(34))
+        format!("[[{}]]\n", nulls(35))
     );
     Ok(())
 }

@@ -126,29 +126,18 @@ fn a_count_at_the_limit_or_a_brace_that_is_no_repeat_is_answered_6423() -> Resul
     Ok(())
 }
 
-/// A name the pattern defines is a reference or a call jq answers, which the crate cannot: it is not
-/// worded as an undefined name.
+/// A name the pattern defines is a call jq answers. The earlier engine could not, and refused it in
+/// the `regex` crate's words, a recorded divergence; it now matches jq 1.7.1 (`false`, #7965).
 #[test]
-fn a_call_to_a_defined_group_keeps_the_crate_s_refusal_6423() -> Result<()> {
-    let (stdout, code) = caught(r"(?<a>.)\g<a>", None)?;
-    assert_eq!(code, 0);
-    assert!(
-        stdout.starts_with(r#""Regex failure: regex parse error:"#),
-        "{stdout}"
-    );
-    assert!(!stdout.contains("undefined name"), "{stdout}");
+fn a_call_to_a_defined_group_is_answered_6423() -> Result<()> {
+    assert_eq!(caught(r"(?<a>.)\g<a>", None)?, ("false".to_owned(), 0));
     Ok(())
 }
 
-/// A refusal for the crate's size limit has no Oniguruma counterpart and keeps the crate's words.
-/// jq answers this pattern (`false`): #6439.
+/// A pattern past the `regex` crate's size limit was refused in the crate's words on the earlier
+/// engine, a recorded divergence (#6439); it now matches jq 1.7.1 (`false`, #7965).
 #[test]
-fn a_pattern_past_the_crate_s_size_limit_keeps_its_words_6423() -> Result<()> {
-    let (stdout, code) = caught(r"\w{100000}", None)?;
-    assert_eq!(code, 0);
-    assert!(
-        stdout.starts_with(r#""Regex failure: Compiled regex exceeds size limit"#),
-        "{stdout}"
-    );
+fn a_pattern_past_the_crate_s_size_limit_is_answered_6423() -> Result<()> {
+    assert_eq!(caught(r"\w{100000}", None)?, ("false".to_owned(), 0));
     Ok(())
 }

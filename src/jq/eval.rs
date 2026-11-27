@@ -33562,12 +33562,45 @@ enum RegexEngine {
     Onig(OnigEngine),
 }
 
-/// Whether jq-mode patterns compile with [`OnigEngine`]: `SUCCINCTLY_REGEX_ONIG=1`, read once.
-/// Off by default, and with `=0`, until the engine becomes the default (ADR-0031 step 4, #7961).
+/// Whether jq-mode patterns compile with [`OnigEngine`], read once: yes unless
+/// `SUCCINCTLY_REGEX_ONIG=0` asks for the earlier engine (ADR-0031 step 4b, #7965). The switch and
+/// the earlier engine go in step 6.
 #[cfg(feature = "regex")]
 fn onig_engine_selected() -> bool {
+    #[cfg(test)]
+    if EARLIER_ENGINE_IN_TEST.with(core::cell::Cell::get) {
+        return false;
+    }
     static SELECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SELECTED.get_or_init(|| std::env::var_os("SUCCINCTLY_REGEX_ONIG").is_some_and(|v| v == "1"))
+    *SELECTED.get_or_init(|| std::env::var_os("SUCCINCTLY_REGEX_ONIG").map_or(true, |v| v != "0"))
+}
+
+#[cfg(all(test, feature = "regex"))]
+thread_local! {
+    /// Set by [`EarlierRegexEngine::pin`] for the unit tests of the earlier engine's passes.
+    static EARLIER_ENGINE_IN_TEST: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// While alive, jq-mode patterns compile with the earlier engine, as `SUCCINCTLY_REGEX_ONIG=0`
+/// makes them, on this test's thread only: for the unit tests of that engine's passes, which ship
+/// until step 6 of ADR-0031 deletes them. The regex cache is per thread, so nothing compiled here
+/// is seen by another test.
+#[cfg(all(test, feature = "regex"))]
+pub(super) struct EarlierRegexEngine;
+
+#[cfg(all(test, feature = "regex"))]
+impl EarlierRegexEngine {
+    pub(super) fn pin() -> Self {
+        EARLIER_ENGINE_IN_TEST.with(|on| on.set(true));
+        Self
+    }
+}
+
+#[cfg(all(test, feature = "regex"))]
+impl Drop for EarlierRegexEngine {
+    fn drop(&mut self) {
+        EARLIER_ENGINE_IN_TEST.with(|on| on.set(false));
+    }
 }
 
 /// A jq-mode pattern compiled by Oniguruma as jq 1.7.1's `f_match` (`src/builtin.c`) compiles it:
@@ -33687,6 +33720,20 @@ impl OnigEngine {
         if beg == end {
             let at = ceil(beg);
             return RegexMatch::at(&input[at..at], at);
+        }
+        if beg > end {
+            // A group repeated in a loop can report its last iteration's start after an earlier
+            // iteration's end (`(\B|a|\A){2}`, #6424, #6473). In an empty overall match jq reads
+            // only that the group took part. Otherwise `f_match` never reaches `beg` before `end`,
+            // so the group is at offset 0 with every character before `end` counted, and its string
+            // is `jv_string_sized` with a negative length, for which jq has no defined answer: it
+            // is empty here.
+            let end = ceil(end);
+            return RegexMatch {
+                text: Cow::Borrowed(""),
+                start: 0,
+                end,
+            };
         }
         if input.is_char_boundary(beg) && input.is_char_boundary(end) {
             return RegexMatch::at(&input[beg..end], beg);
@@ -156570,6 +156617,8 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn a_caret_at_the_end_is_checked_on_the_loop_engine_too_6456() {
+        // The earlier engine's passes, which `SUCCINCTLY_REGEX_ONIG=0` still selects (#7965).
+        let _earlier = super::EarlierRegexEngine::pin();
         // A loop over a group that can match empty is read through the rewritten engine; its match
         // that ends at the end of the text is asked of the exact engine as the plain one's is.
         let candidates = [
@@ -156604,6 +156653,8 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn a_rewritten_loop_takes_the_exact_engine_s_captures_at_a_final_newline_6456() {
+        // The earlier engine's passes, which `SUCCINCTLY_REGEX_ONIG=0` still selects (#7965).
+        let _earlier = super::EarlierRegexEngine::pin();
         for pattern in ["(a|\\s*)+$", "(\\n|a*)+$"] {
             let re = build_regex_uncached::<JqSemantics>(pattern, Some("g")).unwrap();
             assert!(
@@ -156773,6 +156824,8 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn build_regex_falls_back_to_the_pattern_as_written_6106() {
+        // The earlier engine's passes, which `SUCCINCTLY_REGEX_ONIG=0` still selects (#7965).
+        let _earlier = super::EarlierRegexEngine::pin();
         let compiled = |pattern: &str| match build_regex_uncached::<JqSemantics>(pattern, None) {
             Ok(JqRegex {
                 engine: RegexEngine::Std(re),
@@ -156805,6 +156858,8 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn build_regex_lists_the_copies_of_a_loop_with_groups_6332() {
+        // The earlier engine's passes, which `SUCCINCTLY_REGEX_ONIG=0` still selects (#7965).
+        let _earlier = super::EarlierRegexEngine::pin();
         // What each group's copies are, its name, and the pattern, of the engine a pattern builds.
         let rewritten = |pattern: &str, flags: Option<&str>| {
             let engine = build_regex_uncached::<JqSemantics>(pattern, flags)
@@ -157785,6 +157840,8 @@ mod tests {
     #[cfg(feature = "regex")]
     #[test]
     fn test_regex_l_and_n_keep_their_old_search_where_fancy_regex_disagrees_5530() {
+        // The earlier engine's passes, which `SUCCINCTLY_REGEX_ONIG=0` still selects (#7965).
+        let _earlier = super::EarlierRegexEngine::pin();
         // `fancy-regex`'s longest-match mode returns the lazy match, where Oniguruma's
         // `ONIG_OPTION_FIND_LONGEST` returns the longest of all the ways to match
         // (`"aa" | match("a*?"; "l")` is `"aa"` in jq 1.7.1). A pattern with a lazy quantifier

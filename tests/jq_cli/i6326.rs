@@ -1,9 +1,8 @@
 //! #6326: jq 1.7.1 searches again one *byte* after an empty match, so a multibyte character gives
 //! an empty match at each of its continuation bytes, reported where the next character starts
-//! (`"ß" | [match("";"g") | .offset]` is `[0,1,1]`). It holds for a pattern whose empty match does
-//! not depend on where it stands (no assertion); one with `\b`, `^`, `$` or a look-around is
-//! recorded in `docs/compliance/jq/limitations.md`. Every row was captured from jq 1.7.1
-//! (`/usr/bin/jq -nc`).
+//! (`"ß" | [match("";"g") | .offset]` is `[0,1,1]`). It holds for a pattern with an assertion
+//! (`\b`, `^`, `$`, a look-around) too, where the earlier engine kept the character step (#7965).
+//! Every row was captured from jq 1.7.1 (`/usr/bin/jq -nc`).
 //! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
 //! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
@@ -73,16 +72,19 @@ fn test_text_without_a_multibyte_empty_match_is_untouched_6326() -> Result<()> {
     ])
 }
 
-/// Recorded in `docs/compliance/jq/limitations.md`: a pattern with an assertion, or one the `regex`
-/// crate's parser refuses, keeps the character step, so these answer one match fewer per
-/// continuation byte than jq 1.7.1 (`[0,1,2]`, `[0,1,1]`, `[0,1,1,2,3]` and `[0,1,1]`).
+/// A pattern with an assertion, or one the `regex` crate's parser refused, kept the character step
+/// on the earlier engine and answered one match fewer per continuation byte than jq 1.7.1, a
+/// recorded divergence; on Oniguruma it steps by byte as jq 1.7.1 does (#7965).
 #[test]
-fn test_a_pattern_with_an_assertion_keeps_the_character_step_6326() -> Result<()> {
+fn test_a_pattern_with_an_assertion_steps_by_byte_too_6326() -> Result<()> {
     assert_rows(&[
-        (r#""ßa" | [match("\\b";"g") | .offset]"#, "[0,2]"),
-        (r#""é" | [match("(?=)";"g") | .offset]"#, "[0,1]"),
-        (r#""éab" | [match("(?~[^a])";"g") | .offset]"#, "[0,1,2,3]"),
-        (r#""é" | [match("\\G";"g") | .offset]"#, "[0,1]"),
+        (r#""ßa" | [match("\\b";"g") | .offset]"#, "[0,1,2]"),
+        (r#""é" | [match("(?=)";"g") | .offset]"#, "[0,1,1]"),
+        (
+            r#""éab" | [match("(?~[^a])";"g") | .offset]"#,
+            "[0,1,1,2,3]",
+        ),
+        (r#""é" | [match("\\G";"g") | .offset]"#, "[0,1,1]"),
         (r#""é" | [match("^";"g") | .offset]"#, "[0]"),
         (r#""é" | [match("$";"g") | .offset]"#, "[1]"),
     ])

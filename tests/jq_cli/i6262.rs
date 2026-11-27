@@ -1,10 +1,11 @@
-//! #6262: a backreference inside the group it refers to, with that group under a repeat that can run
-//! twice (`(\\1|\\w)+`). Oniguruma reads it as the group's last completed value; `fancy-regex` (the
-//! second engine, taken for a backreference) reads from the group's new start to its old end, which
-//! is empty for contiguous passes, so `"ab" | match("(\\1|\\w)+")` split into `a` and `b` where jq has
-//! one match and the group at `[1,"b"]`. The shape is refused on that engine (`Regex failure`), as
-//! #6096's is. A reference to a group that is open under no such repeat, or to one that has closed,
-//! keeps its route and answers as `/usr/bin/jq` 1.7.1 does for `match($p; $f)`.
+//! #6262: a backreference inside the group it refers to, with that group under a repeat that can
+//! run twice (`(\\1|\\w)+`). Oniguruma reads it as the group's last completed value; `fancy-regex`
+//! (the second engine, taken for a backreference) reads from the group's new start to its old end,
+//! which is empty for contiguous passes, so `"ab" | match("(\\1|\\w)+")` split into `a` and `b`
+//! where jq has one match and the group at `[1,"b"]`. The shape was refused on that engine (`Regex
+//! failure`), as #6096's was, a recorded divergence; on Oniguruma it answers as jq 1.7.1 does
+//! (#7965). A reference to a group that is open under no such repeat, or to one that has closed,
+//! answers as `/usr/bin/jq` 1.7.1 does for `match($p; $f)`.
 //! Pin moved (#7520): a row whose empty overall match leaves a capture group unset is jq 1.8.2's answer
 //! (`null`, offset -1), where jq 1.7.1 reported an empty string.
 
@@ -24,47 +25,374 @@ fn match_on(text: &str, pattern: &str, flags: &str) -> Result<String> {
     Ok(stdout.trim().to_string())
 }
 
-/// The group is under a repeat that can run twice, so the reference may read a previous pass.
-/// Refused whatever the text: the engine answers some texts as jq does and others not, and a
-/// pattern cannot tell which.
+/// The group is under a repeat that can run twice, so the reference may read a previous pass: the
+/// earlier engine refused it whatever the text, and each row is now jq's answer (#7965). Rows whose
+/// empty overall match leaves the group unset are jq 1.8.2's (#7520).
 #[test]
-fn a_reference_to_an_open_group_of_a_repeat_is_refused() -> Result<()> {
-    const SHAPES: &[&str] = &[
-        r"(\1|\w)+",
-        r"(a|\1)+",
-        r"(\w|\1)*",
-        r"(a|\1){2}",
-        r"(a|\1){1,2}",
-        r"(a|\1){2,}",
-        r"(a|\1)+?",
-        r"(a|\1)*?",
-        r"((?!\1)){2}",
-        r"((?!\1)){2,}",
-        r"(a(?=\1)|b)+",
-        r"(a(?!\1))+",
-        r"(a\1)+",
-        // the group sits in an outer repeat, or the reference in a lookaround or an atomic group
-        r"(?:(a|\1)b)+",
-        r"(?:(?:(a|\1))|x)+",
-        r"(?:(a(?>\1)?))+",
-        // a named reference is the same reference
-        r"(?<n>a|\k<n>)+",
-        // the open group is not the first: only its own number counts
-        r"(x)(a|\2)+",
-        // a plain group beside a named one still counts (jq captures both)
-        r"(x)(?<n>a|\k<n>)+",
-        r"((b)|a(?:\1|c))+",
+fn a_reference_to_an_open_group_of_a_repeat_answers_as_jq_does() -> Result<()> {
+    const ROWS: &[(&str, &str, &str, &str)] = &[
+        (r"", r"(\1|\w)+", r"", r"[]"),
+        (r"a", r"(\1|\w)+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(\1|\w)+", r"", r#"[[0,"ab",[1,"b"]]]"#),
+        (r"aab", r"(\1|\w)+", r"", r#"[[0,"aab",[2,"b"]]]"#),
+        (r"abab", r"(\1|\w)+", r"", r#"[[0,"abab",[3,"b"]]]"#),
+        (r"", r"(\1|\w)+", r"g", r"[]"),
+        (r"a", r"(\1|\w)+", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(\1|\w)+", r"g", r#"[[0,"ab",[1,"b"]]]"#),
+        (r"aab", r"(\1|\w)+", r"g", r#"[[0,"aab",[2,"b"]]]"#),
+        (r"abab", r"(\1|\w)+", r"g", r#"[[0,"abab",[3,"b"]]]"#),
+        (r"", r"(a|\1)+", r"", r"[]"),
+        (r"a", r"(a|\1)+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(a|\1)+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(a|\1)+", r"", r#"[[0,"aa",[1,"a"]]]"#),
+        (r"abab", r"(a|\1)+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"", r"(a|\1)+", r"g", r"[]"),
+        (r"a", r"(a|\1)+", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(a|\1)+", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(a|\1)+", r"g", r#"[[0,"aa",[1,"a"]]]"#),
+        (
+            r"abab",
+            r"(a|\1)+",
+            r"g",
+            r#"[[0,"a",[0,"a"]],[2,"a",[2,"a"]]]"#,
+        ),
+        (r"", r"(\w|\1)*", r"", r#"[[0,"",[-1,null]]]"#),
+        (r"a", r"(\w|\1)*", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(\w|\1)*", r"", r#"[[0,"ab",[1,"b"]]]"#),
+        (r"aab", r"(\w|\1)*", r"", r#"[[0,"aab",[2,"b"]]]"#),
+        (r"abab", r"(\w|\1)*", r"", r#"[[0,"abab",[3,"b"]]]"#),
+        (r"", r"(\w|\1)*", r"g", r#"[[0,"",[-1,null]]]"#),
+        (
+            r"a",
+            r"(\w|\1)*",
+            r"g",
+            r#"[[0,"a",[0,"a"]],[1,"",[-1,null]]]"#,
+        ),
+        (
+            r"ab",
+            r"(\w|\1)*",
+            r"g",
+            r#"[[0,"ab",[1,"b"]],[2,"",[-1,null]]]"#,
+        ),
+        (
+            r"aab",
+            r"(\w|\1)*",
+            r"g",
+            r#"[[0,"aab",[2,"b"]],[3,"",[-1,null]]]"#,
+        ),
+        (
+            r"abab",
+            r"(\w|\1)*",
+            r"g",
+            r#"[[0,"abab",[3,"b"]],[4,"",[-1,null]]]"#,
+        ),
+        (r"", r"(a|\1){2}", r"", r"[]"),
+        (r"a", r"(a|\1){2}", r"", r"[]"),
+        (r"ab", r"(a|\1){2}", r"", r"[]"),
+        (r"aab", r"(a|\1){2}", r"", r#"[[0,"aa",[1,"a"]]]"#),
+        (r"abab", r"(a|\1){2}", r"", r"[]"),
+        (r"", r"(a|\1){2}", r"g", r"[]"),
+        (r"a", r"(a|\1){2}", r"g", r"[]"),
+        (r"ab", r"(a|\1){2}", r"g", r"[]"),
+        (r"aab", r"(a|\1){2}", r"g", r#"[[0,"aa",[1,"a"]]]"#),
+        (r"abab", r"(a|\1){2}", r"g", r"[]"),
+        (r"", r"(a|\1){1,2}", r"", r"[]"),
+        (r"a", r"(a|\1){1,2}", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(a|\1){1,2}", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(a|\1){1,2}", r"", r#"[[0,"aa",[1,"a"]]]"#),
+        (r"abab", r"(a|\1){1,2}", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"", r"(a|\1){1,2}", r"g", r"[]"),
+        (r"a", r"(a|\1){1,2}", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(a|\1){1,2}", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(a|\1){1,2}", r"g", r#"[[0,"aa",[1,"a"]]]"#),
+        (
+            r"abab",
+            r"(a|\1){1,2}",
+            r"g",
+            r#"[[0,"a",[0,"a"]],[2,"a",[2,"a"]]]"#,
+        ),
+        (r"", r"(a|\1){2,}", r"", r"[]"),
+        (r"a", r"(a|\1){2,}", r"", r"[]"),
+        (r"ab", r"(a|\1){2,}", r"", r"[]"),
+        (r"aab", r"(a|\1){2,}", r"", r#"[[0,"aa",[1,"a"]]]"#),
+        (r"abab", r"(a|\1){2,}", r"", r"[]"),
+        (r"", r"(a|\1){2,}", r"g", r"[]"),
+        (r"a", r"(a|\1){2,}", r"g", r"[]"),
+        (r"ab", r"(a|\1){2,}", r"g", r"[]"),
+        (r"aab", r"(a|\1){2,}", r"g", r#"[[0,"aa",[1,"a"]]]"#),
+        (r"abab", r"(a|\1){2,}", r"g", r"[]"),
+        (r"", r"(a|\1)+?", r"", r"[]"),
+        (r"a", r"(a|\1)+?", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(a|\1)+?", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(a|\1)+?", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"abab", r"(a|\1)+?", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"", r"(a|\1)+?", r"g", r"[]"),
+        (r"a", r"(a|\1)+?", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(a|\1)+?", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (
+            r"aab",
+            r"(a|\1)+?",
+            r"g",
+            r#"[[0,"a",[0,"a"]],[1,"a",[1,"a"]]]"#,
+        ),
+        (
+            r"abab",
+            r"(a|\1)+?",
+            r"g",
+            r#"[[0,"a",[0,"a"]],[2,"a",[2,"a"]]]"#,
+        ),
+        (r"", r"(a|\1)*?", r"", r#"[[0,"",[-1,null]]]"#),
+        (r"a", r"(a|\1)*?", r"", r#"[[0,"",[-1,null]]]"#),
+        (r"ab", r"(a|\1)*?", r"", r#"[[0,"",[-1,null]]]"#),
+        (r"aab", r"(a|\1)*?", r"", r#"[[0,"",[-1,null]]]"#),
+        (r"abab", r"(a|\1)*?", r"", r#"[[0,"",[-1,null]]]"#),
+        (r"", r"(a|\1)*?", r"g", r#"[[0,"",[-1,null]]]"#),
+        (
+            r"a",
+            r"(a|\1)*?",
+            r"g",
+            r#"[[0,"",[-1,null]],[1,"",[-1,null]]]"#,
+        ),
+        (
+            r"ab",
+            r"(a|\1)*?",
+            r"g",
+            r#"[[0,"",[-1,null]],[1,"",[-1,null]],[2,"",[-1,null]]]"#,
+        ),
+        (
+            r"aab",
+            r"(a|\1)*?",
+            r"g",
+            r#"[[0,"",[-1,null]],[1,"",[-1,null]],[2,"",[-1,null]],[3,"",[-1,null]]]"#,
+        ),
+        (
+            r"abab",
+            r"(a|\1)*?",
+            r"g",
+            r#"[[0,"",[-1,null]],[1,"",[-1,null]],[2,"",[-1,null]],[3,"",[-1,null]],[4,"",[-1,null]]]"#,
+        ),
+        (r"", r"((?!\1)){2}", r"", r#"[[0,"",[0,""]]]"#),
+        (r"a", r"((?!\1)){2}", r"", r#"[[0,"",[0,""]]]"#),
+        (r"ab", r"((?!\1)){2}", r"", r#"[[0,"",[0,""]]]"#),
+        (r"aab", r"((?!\1)){2}", r"", r#"[[0,"",[0,""]]]"#),
+        (r"abab", r"((?!\1)){2}", r"", r#"[[0,"",[0,""]]]"#),
+        (r"", r"((?!\1)){2}", r"g", r#"[[0,"",[0,""]]]"#),
+        (
+            r"a",
+            r"((?!\1)){2}",
+            r"g",
+            r#"[[0,"",[0,""]],[1,"",[1,""]]]"#,
+        ),
+        (
+            r"ab",
+            r"((?!\1)){2}",
+            r"g",
+            r#"[[0,"",[0,""]],[1,"",[1,""]],[2,"",[2,""]]]"#,
+        ),
+        (
+            r"aab",
+            r"((?!\1)){2}",
+            r"g",
+            r#"[[0,"",[0,""]],[1,"",[1,""]],[2,"",[2,""]],[3,"",[3,""]]]"#,
+        ),
+        (
+            r"abab",
+            r"((?!\1)){2}",
+            r"g",
+            r#"[[0,"",[0,""]],[1,"",[1,""]],[2,"",[2,""]],[3,"",[3,""]],[4,"",[4,""]]]"#,
+        ),
+        (r"", r"((?!\1)){2,}", r"", r#"[[0,"",[0,""]]]"#),
+        (r"a", r"((?!\1)){2,}", r"", r#"[[0,"",[0,""]]]"#),
+        (r"ab", r"((?!\1)){2,}", r"", r#"[[0,"",[0,""]]]"#),
+        (r"aab", r"((?!\1)){2,}", r"", r#"[[0,"",[0,""]]]"#),
+        (r"abab", r"((?!\1)){2,}", r"", r#"[[0,"",[0,""]]]"#),
+        (r"", r"((?!\1)){2,}", r"g", r#"[[0,"",[0,""]]]"#),
+        (
+            r"a",
+            r"((?!\1)){2,}",
+            r"g",
+            r#"[[0,"",[0,""]],[1,"",[1,""]]]"#,
+        ),
+        (
+            r"ab",
+            r"((?!\1)){2,}",
+            r"g",
+            r#"[[0,"",[0,""]],[1,"",[1,""]],[2,"",[2,""]]]"#,
+        ),
+        (
+            r"aab",
+            r"((?!\1)){2,}",
+            r"g",
+            r#"[[0,"",[0,""]],[1,"",[1,""]],[2,"",[2,""]],[3,"",[3,""]]]"#,
+        ),
+        (
+            r"abab",
+            r"((?!\1)){2,}",
+            r"g",
+            r#"[[0,"",[0,""]],[1,"",[1,""]],[2,"",[2,""]],[3,"",[3,""]],[4,"",[4,""]]]"#,
+        ),
+        (r"", r"(a(?=\1)|b)+", r"", r"[]"),
+        (r"a", r"(a(?=\1)|b)+", r"", r"[]"),
+        (r"ab", r"(a(?=\1)|b)+", r"", r#"[[1,"b",[1,"b"]]]"#),
+        (r"aab", r"(a(?=\1)|b)+", r"", r#"[[2,"b",[2,"b"]]]"#),
+        (r"abab", r"(a(?=\1)|b)+", r"", r#"[[1,"b",[1,"b"]]]"#),
+        (r"", r"(a(?=\1)|b)+", r"g", r"[]"),
+        (r"a", r"(a(?=\1)|b)+", r"g", r"[]"),
+        (r"ab", r"(a(?=\1)|b)+", r"g", r#"[[1,"b",[1,"b"]]]"#),
+        (r"aab", r"(a(?=\1)|b)+", r"g", r#"[[2,"b",[2,"b"]]]"#),
+        (
+            r"abab",
+            r"(a(?=\1)|b)+",
+            r"g",
+            r#"[[1,"b",[1,"b"]],[3,"b",[3,"b"]]]"#,
+        ),
+        (r"", r"(a(?!\1))+", r"", r"[]"),
+        (r"a", r"(a(?!\1))+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(a(?!\1))+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(a(?!\1))+", r"", r#"[[0,"aa",[1,"a"]]]"#),
+        (r"abab", r"(a(?!\1))+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"", r"(a(?!\1))+", r"g", r"[]"),
+        (r"a", r"(a(?!\1))+", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(a(?!\1))+", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(a(?!\1))+", r"g", r#"[[0,"aa",[1,"a"]]]"#),
+        (
+            r"abab",
+            r"(a(?!\1))+",
+            r"g",
+            r#"[[0,"a",[0,"a"]],[2,"a",[2,"a"]]]"#,
+        ),
+        (r"", r"(a\1)+", r"", r"[]"),
+        (r"a", r"(a\1)+", r"", r"[]"),
+        (r"ab", r"(a\1)+", r"", r"[]"),
+        (r"aab", r"(a\1)+", r"", r"[]"),
+        (r"abab", r"(a\1)+", r"", r"[]"),
+        (r"", r"(a\1)+", r"g", r"[]"),
+        (r"a", r"(a\1)+", r"g", r"[]"),
+        (r"ab", r"(a\1)+", r"g", r"[]"),
+        (r"aab", r"(a\1)+", r"g", r"[]"),
+        (r"abab", r"(a\1)+", r"g", r"[]"),
+        (r"", r"(?:(a|\1)b)+", r"", r"[]"),
+        (r"a", r"(?:(a|\1)b)+", r"", r"[]"),
+        (r"ab", r"(?:(a|\1)b)+", r"", r#"[[0,"ab",[0,"a"]]]"#),
+        (r"aab", r"(?:(a|\1)b)+", r"", r#"[[1,"ab",[1,"a"]]]"#),
+        (r"abab", r"(?:(a|\1)b)+", r"", r#"[[0,"abab",[2,"a"]]]"#),
+        (r"", r"(?:(a|\1)b)+", r"g", r"[]"),
+        (r"a", r"(?:(a|\1)b)+", r"g", r"[]"),
+        (r"ab", r"(?:(a|\1)b)+", r"g", r#"[[0,"ab",[0,"a"]]]"#),
+        (r"aab", r"(?:(a|\1)b)+", r"g", r#"[[1,"ab",[1,"a"]]]"#),
+        (r"abab", r"(?:(a|\1)b)+", r"g", r#"[[0,"abab",[2,"a"]]]"#),
+        (r"", r"(?:(?:(a|\1))|x)+", r"", r"[]"),
+        (r"a", r"(?:(?:(a|\1))|x)+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(?:(?:(a|\1))|x)+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(?:(?:(a|\1))|x)+", r"", r#"[[0,"aa",[1,"a"]]]"#),
+        (r"abab", r"(?:(?:(a|\1))|x)+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"", r"(?:(?:(a|\1))|x)+", r"g", r"[]"),
+        (r"a", r"(?:(?:(a|\1))|x)+", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(?:(?:(a|\1))|x)+", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(?:(?:(a|\1))|x)+", r"g", r#"[[0,"aa",[1,"a"]]]"#),
+        (
+            r"abab",
+            r"(?:(?:(a|\1))|x)+",
+            r"g",
+            r#"[[0,"a",[0,"a"]],[2,"a",[2,"a"]]]"#,
+        ),
+        (r"", r"(?:(a(?>\1)?))+", r"", r"[]"),
+        (r"a", r"(?:(a(?>\1)?))+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(?:(a(?>\1)?))+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(?:(a(?>\1)?))+", r"", r#"[[0,"aa",[1,"a"]]]"#),
+        (r"abab", r"(?:(a(?>\1)?))+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"", r"(?:(a(?>\1)?))+", r"g", r"[]"),
+        (r"a", r"(?:(a(?>\1)?))+", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(?:(a(?>\1)?))+", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(?:(a(?>\1)?))+", r"g", r#"[[0,"aa",[1,"a"]]]"#),
+        (
+            r"abab",
+            r"(?:(a(?>\1)?))+",
+            r"g",
+            r#"[[0,"a",[0,"a"]],[2,"a",[2,"a"]]]"#,
+        ),
+        (r"", r"(?<n>a|\k<n>)+", r"", r"[]"),
+        (r"a", r"(?<n>a|\k<n>)+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(?<n>a|\k<n>)+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(?<n>a|\k<n>)+", r"", r#"[[0,"aa",[1,"a"]]]"#),
+        (r"abab", r"(?<n>a|\k<n>)+", r"", r#"[[0,"a",[0,"a"]]]"#),
+        (r"", r"(?<n>a|\k<n>)+", r"g", r"[]"),
+        (r"a", r"(?<n>a|\k<n>)+", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"ab", r"(?<n>a|\k<n>)+", r"g", r#"[[0,"a",[0,"a"]]]"#),
+        (r"aab", r"(?<n>a|\k<n>)+", r"g", r#"[[0,"aa",[1,"a"]]]"#),
+        (
+            r"abab",
+            r"(?<n>a|\k<n>)+",
+            r"g",
+            r#"[[0,"a",[0,"a"]],[2,"a",[2,"a"]]]"#,
+        ),
+        (r"", r"(x)(a|\2)+", r"", r"[]"),
+        (r"a", r"(x)(a|\2)+", r"", r"[]"),
+        (r"ab", r"(x)(a|\2)+", r"", r"[]"),
+        (r"aab", r"(x)(a|\2)+", r"", r"[]"),
+        (r"abab", r"(x)(a|\2)+", r"", r"[]"),
+        (r"", r"(x)(a|\2)+", r"g", r"[]"),
+        (r"a", r"(x)(a|\2)+", r"g", r"[]"),
+        (r"ab", r"(x)(a|\2)+", r"g", r"[]"),
+        (r"aab", r"(x)(a|\2)+", r"g", r"[]"),
+        (r"abab", r"(x)(a|\2)+", r"g", r"[]"),
+        (r"", r"(x)(?<n>a|\k<n>)+", r"", r"[]"),
+        (r"a", r"(x)(?<n>a|\k<n>)+", r"", r"[]"),
+        (r"ab", r"(x)(?<n>a|\k<n>)+", r"", r"[]"),
+        (r"aab", r"(x)(?<n>a|\k<n>)+", r"", r"[]"),
+        (r"abab", r"(x)(?<n>a|\k<n>)+", r"", r"[]"),
+        (r"", r"(x)(?<n>a|\k<n>)+", r"g", r"[]"),
+        (r"a", r"(x)(?<n>a|\k<n>)+", r"g", r"[]"),
+        (r"ab", r"(x)(?<n>a|\k<n>)+", r"g", r"[]"),
+        (r"aab", r"(x)(?<n>a|\k<n>)+", r"g", r"[]"),
+        (r"abab", r"(x)(?<n>a|\k<n>)+", r"g", r"[]"),
+        (r"", r"((b)|a(?:\1|c))+", r"", r"[]"),
+        (r"a", r"((b)|a(?:\1|c))+", r"", r"[]"),
+        (
+            r"ab",
+            r"((b)|a(?:\1|c))+",
+            r"",
+            r#"[[1,"b",[1,"b"],[1,"b"]]]"#,
+        ),
+        (
+            r"aab",
+            r"((b)|a(?:\1|c))+",
+            r"",
+            r#"[[2,"b",[2,"b"],[2,"b"]]]"#,
+        ),
+        (
+            r"abab",
+            r"((b)|a(?:\1|c))+",
+            r"",
+            r#"[[1,"b",[1,"b"],[1,"b"]]]"#,
+        ),
+        (r"", r"((b)|a(?:\1|c))+", r"g", r"[]"),
+        (r"a", r"((b)|a(?:\1|c))+", r"g", r"[]"),
+        (
+            r"ab",
+            r"((b)|a(?:\1|c))+",
+            r"g",
+            r#"[[1,"b",[1,"b"],[1,"b"]]]"#,
+        ),
+        (
+            r"aab",
+            r"((b)|a(?:\1|c))+",
+            r"g",
+            r#"[[2,"b",[2,"b"],[2,"b"]]]"#,
+        ),
+        (
+            r"abab",
+            r"((b)|a(?:\1|c))+",
+            r"g",
+            r#"[[1,"b",[1,"b"],[1,"b"]],[3,"b",[3,"b"],[3,"b"]]]"#,
+        ),
     ];
-    for pattern in SHAPES {
-        for flags in ["", "g"] {
-            for text in ["", "a", "ab", "aab", "abab"] {
-                assert_eq!(
-                    match_on(text, pattern, flags)?,
-                    r#""ERR""#,
-                    "{text:?} ~ {pattern:?} [{flags}]"
-                );
-            }
-        }
+    for &(text, pattern, flags, expected) in ROWS {
+        assert_eq!(
+            match_on(text, pattern, flags)?,
+            expected,
+            "{text:?} ~ {pattern:?} [{flags}]"
+        );
     }
     Ok(())
 }
@@ -117,25 +445,24 @@ fn a_repeated_group_without_a_reference_is_unaffected() -> Result<()> {
     Ok(())
 }
 
-/// Every regex builtin builds its pattern the same way, so the refusal reaches all of them. jq
-/// 1.7.1 answers each of these on `"xab"` (`true`, `[["b"]]`, `"X"`, `"xXb"`, `["x","b"]`,
-/// `{"n":"a"}`).
+/// Every regex builtin builds its pattern the same way. The earlier engine refused the shape in
+/// each of them; they now answer as jq 1.7.1 does on `"xab"` (#7965).
 #[test]
-fn every_regex_builtin_refuses_the_shape() -> Result<()> {
-    const PROGRAMS: &[&str] = &[
-        r#"test("(\\1|\\w)+")"#,
-        r#"test("(\\1|\\w)+"; "i")"#,
-        r#"[scan("(\\1|\\w)+")]"#,
-        r#"sub("(\\1|\\w)+"; "X")"#,
-        r#"gsub("(a|\\1)+"; "X")"#,
-        r#"[splits("(a|\\1)+")]"#,
-        r#"capture("(?<n>a|\\k<n>)+")"#,
+fn every_regex_builtin_answers_the_shape_as_jq_does() -> Result<()> {
+    const PROGRAMS: &[(&str, &str)] = &[
+        (r#"test("(\\1|\\w)+")"#, "true"),
+        (r#"test("(\\1|\\w)+"; "i")"#, "true"),
+        (r#"[scan("(\\1|\\w)+")]"#, r#"[["b"]]"#),
+        (r#"sub("(\\1|\\w)+"; "X")"#, r#""X""#),
+        (r#"gsub("(a|\\1)+"; "X")"#, r#""xXb""#),
+        (r#"[splits("(a|\\1)+")]"#, r#"["x","b"]"#),
+        (r#"capture("(?<n>a|\\k<n>)+")"#, r#"{"n":"a"}"#),
     ];
-    for program in PROGRAMS {
+    for &(program, expected) in PROGRAMS {
         let filter = format!(r#""xab" | try ({program}) catch "ERR""#);
         let (stdout, stderr, code) = run_jq_full(&["-nc", &filter], None)?;
         assert_eq!(code, 0, "{program}: {stderr}");
-        assert_eq!(stdout.trim(), r#""ERR""#, "{program}");
+        assert_eq!(stdout.trim(), expected, "{program}");
     }
     Ok(())
 }

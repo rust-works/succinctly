@@ -75,9 +75,11 @@ fn test_the_absence_operator_stops_where_its_body_would_match_6252() -> Result<(
     Ok(())
 }
 
-/// What is not the operator is not rewritten: `(?~` in a class or after a backslash is text, a
-/// comment is copied, and the forms the rewrite does not read stay refused, as before: a range
-/// cutter `(?~|…)`, an operator inside another one, and one under a quoted run.
+/// What is not the operator is not rewritten: `(?~` in a class or after a backslash is text and a
+/// comment is copied. The forms the earlier engine's rewrite did not read, a range cutter `(?~|…)`,
+/// an operator inside another one, one under a quoted run and one in a look-behind, it refused, a
+/// recorded divergence; they now match jq 1.7.1 (#7965), and an unclosed `(?~` is refused as jq
+/// does.
 #[test]
 fn test_what_is_not_the_absence_operator_is_left_alone_6252() -> Result<()> {
     let (stdout, code, stderr) = matches("a(?~b", r"[(?~]", "g")?;
@@ -97,17 +99,25 @@ fn test_what_is_not_the_absence_operator_is_left_alone_6252() -> Result<()> {
     // A `#` in a class or after a backslash is no comment under the `x` flag.
     let (stdout, code, stderr) = matches("xa#b", r"(?~a)[#]", "gx")?;
     assert_eq!((stdout.as_str(), code), (r##"[[2,"#"]]"##, 0), "{stderr}");
-    for pattern in [
-        "(?~|ab)",
-        "(?~a(?~b))",
-        r"\Q(?~ab)\E(?~c)",
-        "(?~ab",
-        "(?<=(?~a))b",
-        "(?<!(?~a))b",
+    for (pattern, expected) in [
+        ("(?~|ab)", r#"[[0,""],[1,""],[2,""],[3,""],[4,""]]"#),
+        ("(?~a(?~b))", r#"[[0,"abab"],[4,""]]"#),
+        (r"\Q(?~ab)\E(?~c)", "[]"),
+        ("(?<=(?~a))b", r#"[[1,"b"],[3,"b"]]"#),
+        ("(?<!(?~a))b", "[]"),
     ] {
         let (stdout, code, stderr) = matches("abab", pattern, "g")?;
-        assert_ne!(code, 0, "{pattern}: {stdout}");
-        assert!(stderr.contains("Regex failure"), "{pattern}: {stderr}");
+        assert_eq!(
+            (stdout.as_str(), code),
+            (expected, 0),
+            "{pattern}: {stderr}"
+        );
     }
+    let (stdout, code, stderr) = matches("abab", "(?~ab", "g")?;
+    assert_eq!((stdout.as_str(), code), ("", 5), "{stderr}");
+    assert!(
+        stderr.contains("Regex failure: end pattern with unmatched parenthesis"),
+        "{stderr}"
+    );
     Ok(())
 }

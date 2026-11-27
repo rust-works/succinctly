@@ -1,12 +1,12 @@
 //! #6302: a lazy unbounded `X{n,}?` over a body with a consuming way before its empty one
-//! (`(?:b*||\w)`) is a counted loop in Oniguruma when the body's compiled length times `n` is
-//! more than ten, and leaves at the body's empty way even before its minimum. The rewrite that
-//! writes that out doubles with every count, because each level holds the next one twice with the
-//! empty way between the two, so it is given up when one text passes 32 KiB and the repeat keeps
-//! the `regex` crate's reading. The count at which that happens depends on the body, because a
-//! class is written out in full in each copy. The first column is what `/usr/bin/jq` 1.7.1
-//! printed; the second is this tool's answer, pinned so `docs/compliance/jq/limitations.md` stays
-//! true. `AGREE` is the counts below the boundary.
+//! (`(?:b*||\w)`) is a counted loop in Oniguruma when the body's compiled length times `n` is more
+//! than ten, and leaves at the body's empty way even before its minimum. The rewrite that writes
+//! that out doubles with every count, because each level holds the next one twice with the empty
+//! way between the two, so the earlier engine gave it up when one text passed 32 KiB and the repeat
+//! kept the `regex` crate's reading, a recorded divergence. The count at which that happened
+//! depends on the body, because a class is written out in full in each copy. On Oniguruma the
+//! counts past that boundary answer as jq 1.7.1 does (#7965). Every expectation is what
+//! `/usr/bin/jq` 1.7.1 printed. `AGREE` is the counts below the boundary.
 
 use anyhow::Result;
 
@@ -24,37 +24,21 @@ fn match_on(text: &str, pattern: &str, flags: &str) -> Result<String> {
     Ok(stdout.trim().to_string())
 }
 
-/// (text, pattern, flags, jq 1.7.1, this tool).
-const GAPS: &[(&str, &str, &str, &str, &str)] = &[
-    ("ab", r"(?:b*||\w){8,}?", "gn", r#"["ab"]"#, r#"["a","b"]"#),
-    ("ab", r"(?:b*||\w){12,}?", "gn", r#"["ab"]"#, r#"["a","b"]"#),
-    (
-        "ab",
-        r"(?:b*||\p{L}){10,}?",
-        "gn",
-        r#"["ab"]"#,
-        r#"["a","b"]"#,
-    ),
-    (
-        "ab",
-        r"(?:b*||[a-z]){11,}?",
-        "gn",
-        r#"["ab"]"#,
-        r#"["a","b"]"#,
-    ),
+/// (text, pattern, flags, jq 1.7.1): the counts past the earlier engine's size cap.
+const PAST_THE_CAP: &[(&str, &str, &str, &str)] = &[
+    ("ab", r"(?:b*||\w){8,}?", "gn", r#"["ab"]"#),
+    ("ab", r"(?:b*||\w){12,}?", "gn", r#"["ab"]"#),
+    ("ab", r"(?:b*||\p{L}){10,}?", "gn", r#"["ab"]"#),
+    ("ab", r"(?:b*||[a-z]){11,}?", "gn", r#"["ab"]"#),
 ];
 
 #[test]
-fn test_a_lazy_counted_repeat_past_the_size_cap_keeps_the_crates_reading_6302() -> Result<()> {
-    for &(text, pattern, flags, jq, ours) in GAPS {
+fn test_a_lazy_counted_repeat_past_the_size_cap_answers_as_jq_does_6302() -> Result<()> {
+    for &(text, pattern, flags, expected) in PAST_THE_CAP {
         assert_eq!(
             match_on(text, pattern, flags)?,
-            ours,
+            expected,
             "{text:?} ~ {pattern:?} [{flags}]"
-        );
-        assert_ne!(
-            jq, ours,
-            "{text:?} ~ {pattern:?}: the gap is closed, update the limitations page"
         );
     }
     Ok(())

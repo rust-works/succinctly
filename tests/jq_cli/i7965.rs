@@ -122,13 +122,16 @@ fn flags_refusals_and_adoptions_are_jqs_7965() -> Result<()> {
     Ok(())
 }
 
+/// Since step 4b the engine is the default: with no variable, jq's answer (captured from
+/// `/usr/bin/jq` 1.7.1); `SUCCINCTLY_REGEX_ONIG=0` still selects the earlier engine until step 6.
 #[test]
-fn the_switch_off_or_absent_keeps_the_default_engine_7965() -> Result<()> {
+fn the_engine_is_the_default_and_the_switch_off_selects_the_earlier_one_7965() -> Result<()> {
     let (input, filter) = (r#""éſ""#, r#"[scan("(?<=(?:é|ſ))"; "g")]"#);
+    let jq = r#"["","�",""]"#;
     let (absent, code) = spawn_jq(&["-c", filter], Some(input.as_bytes()))?;
     assert_eq!(code, 0);
-    let absent = String::from_utf8(absent.stdout)?.trim_end().to_string();
-    assert_eq!(run("0", filter, input)?, (absent.clone(), 0));
-    assert_ne!(run("1", filter, input)?.0, absent);
+    assert_eq!(String::from_utf8(absent.stdout)?.trim_end(), jq);
+    assert_eq!(run("1", filter, input)?, (jq.to_string(), 0));
+    assert_ne!(run("0", filter, input)?.0, jq);
     Ok(())
 }

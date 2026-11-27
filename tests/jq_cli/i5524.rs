@@ -83,18 +83,18 @@ fn test_a_possessive_quantifier_followed_by_more_pattern_is_atomic_6172() -> Res
     Ok(())
 }
 
-/// What the scan cannot place an atom for keeps the refusal: a quantifier on a quoted run, on a
-/// group of flags, and after a control-character escape.
-/// An inline `(?x)` was refused here too until #7464 modelled the flag, and a lazy quantifier
-/// followed by `+` (`c?+a+?+`) until #7682 wrote such a run as Oniguruma reads it; their rows are now
-/// among the atomic rewrites above.
+/// What the earlier engine's scan could not place an atom for, a quantifier on a quoted run and
+/// one after a control-character escape, it refused, a recorded divergence. On Oniguruma both
+/// answer as jq 1.7.1 does (#7965). An inline `(?x)` was refused too until #7464 modelled the flag,
+/// and a lazy quantifier followed by `+` (`c?+a+?+`) until #7682; their rows are among the atomic
+/// rewrites above.
 #[test]
-fn test_a_possessive_quantifier_without_a_known_atom_is_refused_5524() -> Result<()> {
+fn test_a_possessive_quantifier_without_a_known_atom_answers_as_jq_does_5524() -> Result<()> {
     for program in [r#"test("\\Qab\\E*+b")"#, r#"test("\\C-a*+b")"#] {
         let (stdout, stderr, code) = run_jq_full(&["-c", program], Some(r#""aab""#))?;
-        assert_eq!((stdout.as_str(), code), ("", 5), "{program}: {stderr}");
-        assert!(
-            stderr.contains("possessive quantifier"),
+        assert_eq!(
+            (stdout.as_str(), code),
+            ("false\n", 0),
             "{program}: {stderr}"
         );
     }

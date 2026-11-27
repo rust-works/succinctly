@@ -280,41 +280,43 @@ fn a_possessive_interval_after_a_comment_matches_7689() -> Result<()> {
     Ok(())
 }
 
-/// Under `l` a repeated group whose body is a `*` repeat keeps `fancy-regex`'s merged loop: its
-/// longest-match search over the unmerged loop tries every split of the run, and ran out of budget
-/// on 31 characters. jq 1.7.1 and 1.8.2 print `false`. The group then keeps its last non-empty
-/// iteration, as recorded in docs/compliance/jq/limitations.md: jq has `[3,0]` here.
+/// Under `l`, a repeated group whose body is a `*` repeat answers on 31 characters, where the
+/// earlier engine's longest-match search over the unmerged loop ran out of budget; jq 1.7.1 and
+/// 1.8.2 print `false`. The group ends at its last, empty iteration (`[3,0]` in jq 1.7.1 and
+/// 1.8.2), where the earlier engine kept its merged loop's last non-empty one (`[0,3]`), a recorded
+/// divergence that now matches jq 1.7.1 (#7965).
 #[test]
-fn a_star_body_under_l_keeps_the_merged_loop_7689() -> Result<()> {
+fn a_star_body_under_l_ends_at_the_empty_iteration_7689() -> Result<()> {
     let out = jq_n(r#"("a" * 31 + "!") | test("(a*)*b"; "l")"#)?;
     assert_eq!(out, ("false\n".to_string(), String::new(), 0));
     let out = jq_n(r#""aaa" | match("(a*)*"; "l").captures[0] | [.offset,.length]"#)?;
-    assert_eq!(out, ("[0,3]\n".to_string(), String::new(), 0));
+    assert_eq!(out, ("[3,0]\n".to_string(), String::new(), 0));
     Ok(())
 }
 
-/// Recorded in docs/compliance/jq/limitations.md: a possessive repeat is an atomic group, which
-/// sends the pattern to `fancy-regex`. Without `l` or `n` its group keeps the last non-empty
-/// iteration (jq 1.7.1 and 1.8.2: `[2,0]`); a loop inside it does not end at its empty iteration
-/// (jq: `[2,0]`); and `l` reads past the atomic group's first way (jq: `[0,1]`).
+/// A possessive repeat is an atomic group, which sent the pattern to `fancy-regex` on the earlier
+/// engine. There its group kept the last non-empty iteration, a loop inside it did not end at its
+/// empty iteration, and `l` read past the atomic group's first way; and under `x`, `(?:a b){1}*`
+/// did not repeat the group's last character as Oniguruma does. These were recorded divergences
+/// and now match jq 1.7.1 and 1.8.2 (#7965).
 #[test]
-fn possessive_repeats_on_the_second_engine_keep_their_recorded_answers_7689() -> Result<()> {
+fn possessive_repeats_answer_as_jq_does_7689() -> Result<()> {
     for (program, here) in [
         (
             r#""aa" | match("(a*)*+$").captures[0] | [.offset,.length]"#,
-            "[0,2]\n",
+            "[2,0]\n",
         ),
         (
             r#""ba" | match("(?:b|)(b*|a)++$") | [.offset,.length]"#,
-            "[0,2]\n",
+            "[2,0]\n",
         ),
         (
             r#""aaab" | match("a(|a){1,2}+"; "l") | [.offset,.length]"#,
-            "[0,3]\n",
+            "[0,1]\n",
         ),
         (
             r#""abbbab" | [match("(?:a b){1}*"; "gx") | .string]"#,
-            "[\"ab\",\"\",\"\",\"ab\",\"\"]\n",
+            "[\"abbb\",\"ab\"]\n",
         ),
     ] {
         assert_eq!(
