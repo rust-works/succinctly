@@ -12338,7 +12338,7 @@ pub(crate) fn with_file_origin<R>(table: &[usize], f: impl FnOnce() -> R) -> R {
 /// old behaviour for a mid-pipe assignment rather than a wrong one.
 #[cfg(feature = "std")]
 mod path_base {
-    use super::OwnedValue;
+    use super::{OwnedValue, UpdateAncestry};
     use alloc::rc::Rc;
     use alloc::vec::Vec;
     use std::cell::RefCell;
@@ -12363,11 +12363,36 @@ mod path_base {
         let _restore = Restore(CURRENT.with(|c| c.borrow_mut().replace(base)));
         f()
     }
+
+    thread_local! {
+        static ANCESTRY: RefCell<Option<Rc<UpdateAncestry>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn ancestry() -> Option<Rc<UpdateAncestry>> {
+        ANCESTRY.with(|c| c.borrow().clone())
+    }
+
+    /// Installs `ancestry` for `f`'s dynamic extent, restoring the previous value on the way
+    /// out, as [`with`] does for the prefix.
+    pub(crate) fn with_ancestry<R>(
+        ancestry: Option<Rc<UpdateAncestry>>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore(Option<Rc<UpdateAncestry>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ANCESTRY.with(|c| *c.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore =
+            Restore(ANCESTRY.with(|c| core::mem::replace(&mut *c.borrow_mut(), ancestry)));
+        f()
+    }
 }
 
 #[cfg(not(feature = "std"))]
 mod path_base {
-    use super::OwnedValue;
+    use super::{OwnedValue, UpdateAncestry};
     use alloc::rc::Rc;
     use alloc::vec::Vec;
 
@@ -12378,6 +12403,34 @@ mod path_base {
     pub(crate) fn with<R>(_base: Rc<Vec<OwnedValue>>, f: impl FnOnce() -> R) -> R {
         f()
     }
+
+    pub(crate) fn ancestry() -> Option<Rc<UpdateAncestry>> {
+        None
+    }
+
+    pub(crate) fn with_ancestry<R>(
+        _ancestry: Option<Rc<UpdateAncestry>>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        f()
+    }
+}
+
+/// What `parent` climbs above the input of an update (#8039): the input of an enclosing update
+/// whose target that input is, with every target of the enclosing update vivified and none written
+/// (its `pre`), and the length of the absolute path where it sits. `with(.b; . |= parent)` is
+/// `.b |= (. |= parent)`, whose inner update stands at its own input, so the parent is above
+/// anything that update was handed; the enclosing one holds it. `outer` is the ancestry that was
+/// ambient when this one was installed, for a climb above the enclosing update's own input.
+pub(crate) struct UpdateAncestry {
+    pub(crate) pre: OwnedValue,
+    pub(crate) base_len: usize,
+    pub(crate) outer: Option<Rc<UpdateAncestry>>,
+}
+
+/// The ambient [`UpdateAncestry`], if an enclosing update installed one (#8039).
+pub(crate) fn ambient_update_ancestry() -> Option<Rc<UpdateAncestry>> {
+    path_base::ancestry()
 }
 
 /// The ambient assignment position prefix, or `[]` where none is installed
@@ -12402,6 +12455,31 @@ pub(crate) fn with_path_base<R>(base: &[OwnedValue], f: impl FnOnce() -> R) -> R
 /// installs is already absolute, having been built from the prefix it read.
 pub(crate) fn with_absolute_path_base<R>(base: Vec<OwnedValue>, f: impl FnOnce() -> R) -> R {
     path_base::with(Rc::new(base), f)
+}
+
+/// [`with_absolute_path_base`] for an update filter whose target sits at `base`, and whose
+/// update's input (the value at `base[..base_len]`, every target vivified) is `pre` where the
+/// filter reads `parent` (#8039): an update nested in the filter at the target itself (`. |=
+/// parent`) climbs out of it ([`ambient_update_ancestry`]). Without a `pre` the ancestry that is
+/// ambient stays, since every path below it still names the nodes it holds.
+pub(crate) fn with_absolute_update_base<R>(
+    base: Vec<OwnedValue>,
+    pre: Option<(&OwnedValue, usize)>,
+    f: impl FnOnce() -> R,
+) -> R {
+    match pre {
+        Some((pre, base_len)) => {
+            let ancestry = UpdateAncestry {
+                pre: pre.clone(),
+                base_len,
+                outer: path_base::ancestry(),
+            };
+            path_base::with(Rc::new(base), || {
+                path_base::with_ancestry(Some(Rc::new(ancestry)), f)
+            })
+        }
+        None => with_absolute_path_base(base, f),
+    }
 }
 
 /// Whether every path-context read in `expr` can be rewritten to the constant

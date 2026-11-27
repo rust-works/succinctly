@@ -55772,30 +55772,55 @@ impl<'a> UpdatePos<'a> {
         }
     }
 
-    /// `key`: the last component taken. `None` only at the update input's own
-    /// position (`. |= key`), where the component that named it belongs to
-    /// whatever produced that input and this walk never saw it.
+    /// `key`: the last component of the absolute path, the one `path` answers. At the update
+    /// input's own position (`. |= key`) that is the last component of the prefix a route above
+    /// installed, naming the input itself (#8039): `with(.b; . |= key)` is `.b |= (. |= key)`, and
+    /// yq writes `"b"` there as it does for `.b |= key`. `None` only where there is no prefix
+    /// either, at the document root, whose `key` answers nothing in yq.
     fn key(&self) -> Option<&OwnedValue> {
-        (self.path.len() > self.base_len).then(|| self.path.last().expect("len checked"))
+        self.path.last()
     }
 
     /// `parent(n)`: `n` levels up, read out of [`pre`](Self::pre).
     ///
-    /// `None` above the update's input -- that node is outside the value
-    /// `update_path` was handed, and no route hands it one. `None` too for a
+    /// Above the update's input that node is outside the value `update_path`
+    /// was handed, and only an enclosing update whose target the input is
+    /// holds it (#8039: `with(.b; . |= parent)` is `.b |= (. |= parent)`):
+    /// the ambient [`UpdateAncestry`](super::eval_generic::UpdateAncestry)
+    /// it installed, or `None` where there is none. `None` too for a
     /// component that does not exist in `pre`: an ancestor reached only by
     /// autovivification did not exist when the filter's position was named,
     /// the same "nothing there" answer `parent` gives above the document root
     /// (real yq vivifies instead, the pre-existing divergence #2435 records).
-    fn ancestor(&self, n: usize) -> Option<&'a OwnedValue> {
+    fn ancestor(&self, n: usize) -> Option<OwnedValue> {
         let depth = self.path.len() - self.base_len;
-        let keep = depth.checked_sub(n)?;
+        let Some(keep) = depth.checked_sub(n) else {
+            return ambient_update_ancestor(&self.path, self.path.len().checked_sub(n)?);
+        };
         let mut cur = self.pre?;
         for component in &self.path[self.base_len..self.base_len + keep] {
             cur = owned_component(cur, component)?;
         }
-        Some(cur)
+        Some(cur.clone())
     }
+}
+
+/// The node `path[..len]` names, read out of the nearest ambient
+/// [`UpdateAncestry`](super::eval_generic::UpdateAncestry) whose input sits
+/// at or above it (#8039): [`UpdatePos::ancestor`] above its own input.
+fn ambient_update_ancestor(path: &[OwnedValue], len: usize) -> Option<OwnedValue> {
+    let mut ancestry = super::eval_generic::ambient_update_ancestry();
+    while let Some(entry) = ancestry {
+        if entry.base_len <= len {
+            let mut cur = &entry.pre;
+            for component in path.get(entry.base_len..len)? {
+                cur = owned_component(cur, component)?;
+            }
+            return Some(cur.clone());
+        }
+        ancestry = entry.outer.clone();
+    }
+    None
 }
 
 /// One step into an owned container by a path component, or `None` where
@@ -55877,8 +55902,7 @@ fn position_update_filter<S: EvalSemantics>(
     if !needs_path_context(filter_expr) {
         return Ok(None);
     }
-    let parent_of =
-        |n: usize| -> Result<Option<OwnedValue>, EvalError> { Ok(pos.ancestor(n).cloned()) };
+    let parent_of = |n: usize| -> Result<Option<OwnedValue>, EvalError> { Ok(pos.ancestor(n)) };
     super::eval_generic::resolve_path_context_at::<S>(filter_expr, pos.key(), &pos.path, &parent_of)
         .map(Some)
 }
@@ -55990,7 +56014,11 @@ fn update_root_with_filter<S: EvalSemantics>(
     let filter_expr = positioned.as_ref().unwrap_or(filter_expr);
     let run = || eval_owned_multi_first_as::<S>(filter_expr, as_written, root, reentry);
     let output = match pos {
-        Some(pos) => super::eval_generic::with_absolute_path_base(pos.path.clone(), run)?,
+        Some(pos) => super::eval_generic::with_absolute_update_base(
+            pos.path.clone(),
+            pos.pre.map(|pre| (pre, pos.base_len)),
+            run,
+        )?,
         None => run()?,
     };
     let wrote = output.is_some();
