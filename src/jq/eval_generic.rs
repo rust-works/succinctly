@@ -12448,7 +12448,7 @@ mod path_base {
 /// anything that update was handed; the enclosing one holds it. `outer` is the ancestry that was
 /// ambient when this one was installed, for a climb above the enclosing update's own input.
 pub(crate) struct UpdateAncestry {
-    pub(crate) pre: OwnedValue,
+    pub(crate) pre: Rc<OwnedValue>,
     pub(crate) base_len: usize,
     pub(crate) outer: Option<Rc<Self>>,
 }
@@ -12498,19 +12498,19 @@ pub(crate) fn with_absolute_path_base<R>(base: Vec<OwnedValue>, f: impl FnOnce()
 }
 
 /// [`with_absolute_path_base`] for an update filter whose target sits at `base`, and whose
-/// update's input (the value at `base[..base_len]`, every target vivified) is `pre` where the
-/// filter reads `parent` (#8039): an update nested in the filter at the target itself (`. |=
-/// parent`) climbs out of it ([`ambient_update_ancestry`]). Without a `pre` the ancestry that is
-/// ambient stays, since every path below it still names the nodes it holds.
+/// update's input (the value at `base[..base_len]`, every target vivified) is `pre`, shared
+/// rather than copied, where an update nested in the filter reads `parent` (#8039): one at the
+/// target itself (`. |= parent`) climbs out of it ([`ambient_update_ancestry`]). Without a `pre`
+/// the ancestry that is ambient stays, since every path below it still names the nodes it holds.
 pub(crate) fn with_absolute_update_base<R>(
     base: Vec<OwnedValue>,
-    pre: Option<(&OwnedValue, usize)>,
+    pre: Option<(Rc<OwnedValue>, usize)>,
     f: impl FnOnce() -> R,
 ) -> R {
     match pre {
         Some((pre, base_len)) => {
             let ancestry = UpdateAncestry {
-                pre: pre.clone(),
+                pre,
                 base_len,
                 outer: path_base::ancestry(),
             };
