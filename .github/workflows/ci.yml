@@ -1517,8 +1517,11 @@ jobs:
         run: cargo test --locked --lib --features onig-engine jq::onig_ffi
 
       # Step 3: jq's `f_match` ported onto the library, run with `SUCCINCTLY_REGEX_ONIG=1`
-      # (`tests/jq_cli/i7965.rs`). The corpus gate itself is scripts/jq-regex-corpus.py's.
+      # (`tests/jq_cli/i7965.rs`). The corpus gate itself is scripts/jq-regex-corpus.py's. Not on
+      # Windows: `jq_cli_tests` does not compile there (its FIFO helpers are Unix-only), and the C
+      # build above is what only Windows checks.
       - name: Run the jq adapter's CLI tests
+        if: runner.os != 'Windows'
         run: cargo test --locked --features cli,onig-engine --test jq_cli_tests per_issue::i7965
 
   # Pull-request coverage: the sticky patch-coverage comment, diffed against the
