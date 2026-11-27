@@ -634,9 +634,10 @@ pub fn e2_consistent(
 }
 
 /// E2's ground that succinctly does not implement yet (#7966): the NUL is the first fault (no
-/// release faults before it), succinctly reports no fault before it, keeps the values before it
-/// (reading past it as a release may), prints no value neither release prints, and exits zero
-/// exactly when one release does.
+/// release faults before it), succinctly reports no fault before it (one `at EOF` on the byte
+/// before the NUL is its end of input), keeps the values before it (reading past it as a release
+/// may), prints no value neither release prints, and exits as a release does or, reporting a
+/// fault, as E2 says.
 fn e2_pending(
     stream: &[u8],
     s: &Transcript,
@@ -651,11 +652,14 @@ fn e2_pending(
     if [r171, r182].iter().any(|r| fault_before_nul(r, npos)) {
         return false;
     }
-    if fault_msg(s, shape)
-        .and_then(position)
-        .is_some_and(|p| p < npos)
-    {
-        return false;
+    // A fault `at EOF` on the byte before the NUL is succinctly reading the NUL as the end of the
+    // input (jq 1.7.1's cut), not a fault before it.
+    if let Some(msg) = fault_msg(s, shape) {
+        let eof_at_nul =
+            |p: (u64, u64)| contains(msg, b" at EOF") && p.0 == npos.0 && p.1 + 1 == npos.1;
+        if position(msg).is_some_and(|p| p < npos && !eof_at_nul(p)) {
+            return false;
+        }
     }
     // Not reporting the NUL, succinctly exits as a release does; reporting it somewhere (without
     // its position, say), it exits as E2 says.
@@ -1405,6 +1409,41 @@ mod tests {
         assert_eq!(
             classify(stream, &tb(b"\"\"\n", err, 0), &r, &r, d, &facts),
             Class::BugAgree
+        );
+    }
+
+    #[test]
+    fn a_nul_read_as_the_end_of_input_is_e2_pending() {
+        let seq = Shape {
+            seq: true,
+            ..Shape::default()
+        };
+        // Captured from jq 1.7.1 and 1.8.2: 1.7.1 cuts the read at the NUL (line 2, column 4);
+        // 1.8.2 reads through it and reports the number there.
+        let stream = b"\x1e0\n\x1e12\x00";
+        let at = |col: u8| {
+            let e = format!(
+                "jq: ignoring parse error: Potentially truncated top-level numeric value at EOF at line 2, column {}\n",
+                char::from(col)
+            );
+            tb(b"\x1e0\n", e.as_bytes(), 0)
+        };
+        let r171 = tb(b"\x1e0\n", b"", 0);
+        let r182 = at(b'4');
+        let facts = Facts {
+            before_fault: [None, Some(1)],
+            before_nul: values_before_nul(stream, true).expect("the 1.7.1 reader"),
+            ..Facts::default()
+        };
+        // Succinctly cuts there too, and reports the cut number at EOF on the byte before the NUL.
+        assert_eq!(
+            classify(stream, &at(b'3'), &r171, &r182, seq, &facts),
+            Class::E2Pending
+        );
+        // Two bytes before the NUL is a fault before it.
+        assert_eq!(
+            classify(stream, &at(b'2'), &r171, &r182, seq, &facts),
+            Class::BugSplit
         );
     }
 }
