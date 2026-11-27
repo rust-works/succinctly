@@ -7,6 +7,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then . + 1 | . * 2 else w($k - 1) end; 3 | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "8\n",
   "stderr": "",
   "exit": 0
@@ -19,6 +20,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then 1, 2, (3, 4) else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n2\n3\n4\n",
   "stderr": "",
   "exit": 0
@@ -31,6 +33,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then 1, empty, 2 else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n2\n",
   "stderr": "",
   "exit": 0
@@ -43,6 +46,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [1 + 2, 7 - 3, 2 * 5, 9 / 3, 7 % 3, \"a\" + \"b\", [1] + [2], {a:1} + {b:2}] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[3,4,10,3,1,\"ab\",[1,2],{\"a\":1,\"b\":2}]\n",
   "stderr": "",
   "exit": 0
@@ -55,6 +59,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [1 < 2, 2 <= 1, 1 == 1.0, \"a\" != \"b\", [1] > [0], null < false] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[true,false,true,true,true,true]\n",
   "stderr": "",
   "exit": 0
@@ -67,6 +72,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [true and false, false or true, (1,null) and true, (false, 2) or false] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[false,true,true,false,false,true]\n",
   "stderr": "",
   "exit": 0
@@ -79,6 +85,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [null // 1, (false, 2) // 3, (null, false) // 4, empty // 5] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,2,4,5]\n",
   "stderr": "",
   "exit": 0
@@ -91,6 +98,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [range(5) | if . < 2 then \"lo\" elif . < 4 then \"mid\" else \"hi\" end] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[\"lo\",\"lo\",\"mid\",\"mid\",\"hi\"]\n",
   "stderr": "",
   "exit": 0
@@ -103,6 +111,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [if (true, false) then 1 else 2 end] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,2]\n",
   "stderr": "",
   "exit": 0
@@ -115,6 +124,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then 5 as $x | $x + 1 else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "6\n",
   "stderr": "",
   "exit": 0
@@ -127,6 +137,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [(1, 2) as $x | (10, 20) as $y | $x + $y] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[11,21,12,22]\n",
   "stderr": "",
   "exit": 0
@@ -139,6 +150,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [1, [2, 3]] as [$a, [$b, $c]] | $a + $b + $c else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "6\n",
   "stderr": "",
   "exit": 0
@@ -151,6 +163,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then {a: 1, b: {c: 2}} as {a: $a, b: {c: $c}} | [$a, $c] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,2]\n",
   "stderr": "",
   "exit": 0
@@ -163,6 +176,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [range(3), (4, 5)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[0,1,2,4,5]\n",
   "stderr": "",
   "exit": 0
@@ -175,6 +189,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [empty] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[]\n",
   "stderr": "",
   "exit": 0
@@ -187,6 +202,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then reduce range(10) as $i (0; . + $i) else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "45\n",
   "stderr": "",
   "exit": 0
@@ -199,6 +215,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then reduce (1, 2) as $i (0; ., 10) else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "10\n",
   "stderr": "",
   "exit": 0
@@ -211,6 +228,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then reduce (1, 2) as $i (0; empty) else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "null\n",
   "stderr": "",
   "exit": 0
@@ -223,6 +241,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [foreach range(5) as $i (0; . + $i)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[0,1,3,6,10]\n",
   "stderr": "",
   "exit": 0
@@ -235,6 +254,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [foreach range(5) as $i (0; . + $i; [$i, .])] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[[0,0],[1,1],[2,3],[3,6],[4,10]]\n",
   "stderr": "",
   "exit": 0
@@ -247,6 +267,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [foreach (1, 2) as $i (0; . + $i, . * 10)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,0,2,0]\n",
   "stderr": "",
   "exit": 0
@@ -259,6 +280,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [[1, 2, 3] | .[] | . * 2] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[2,4,6]\n",
   "stderr": "",
   "exit": 0
@@ -271,6 +293,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [{a: 1, b: 2} | .[]] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,2]\n",
   "stderr": "",
   "exit": 0
@@ -283,6 +306,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [1 | .[]?] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[]\n",
   "stderr": "",
   "exit": 0
@@ -295,6 +319,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [1] | try (2 | .[]) catch . else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "\"Cannot iterate over number (2)\"\n",
   "stderr": "",
   "exit": 0
@@ -307,6 +332,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then {a: {b: [10, 20, 30]}} | [.a.b[1], .a.b[-1], .a[\"b\"][0], .x] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[20,30,10,null]\n",
   "stderr": "",
   "exit": 0
@@ -319,6 +345,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [[1, 2, 3, 4] | .[1:3], .[:-1], .[2:]] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[[2,3],[1,2,3],[3,4]]\n",
   "stderr": "",
   "exit": 0
@@ -331,6 +358,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [range(4)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[0,1,2,3]\n",
   "stderr": "",
   "exit": 0
@@ -343,6 +371,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [range(2; 6)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[2,3,4,5]\n",
   "stderr": "",
   "exit": 0
@@ -355,6 +384,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [range(0; 10; 3)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[0,3,6,9]\n",
   "stderr": "",
   "exit": 0
@@ -367,6 +397,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [range(0; 1; 0.25)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[0,0.25,0.5,0.75]\n",
   "stderr": "",
   "exit": 0
@@ -379,6 +410,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [range(1, 2; 4)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,2,3,2,3]\n",
   "stderr": "",
   "exit": 0
@@ -391,6 +423,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then try error(\"x\") catch . else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "\"x\"\n",
   "stderr": "",
   "exit": 0
@@ -403,6 +436,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then try error({a: 1}) catch .a else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n",
   "stderr": "",
   "exit": 0
@@ -415,6 +449,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then try error(null) catch . else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "null\n",
   "stderr": "",
   "exit": 0
@@ -427,6 +462,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [try error(\"x\")] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[]\n",
   "stderr": "",
   "exit": 0
@@ -439,6 +475,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [try (1, error(\"x\"), 3) catch .] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,\"x\"]\n",
   "stderr": "",
   "exit": 0
@@ -451,6 +488,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then try ((try (1, 2) catch \"inner\") | if . == 2 then error(\"late\") else . end) catch \"outer: \" + . else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n\"outer: \"\n",
   "stderr": "",
   "exit": 0
@@ -463,6 +501,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [(try (1, 2) catch 9) as $x | try (if $x == 2 then error(\"e\") else $x end) catch \"c\"] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,\"c\"]\n",
   "stderr": "",
   "exit": 0
@@ -475,6 +514,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [(1, error(\"x\"), 3)?] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1]\n",
   "stderr": "",
   "exit": 0
@@ -487,6 +527,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [1, {a: 2}] | [.[] | .a?] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[2]\n",
   "stderr": "",
   "exit": 0
@@ -499,6 +540,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then 1, error(\"boom\"), 3 else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n",
   "stderr": "jq: error (at <unknown>): boom\n",
   "exit": 5
@@ -511,6 +553,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then error({a: 1}) else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "",
   "stderr": "jq: error (at <unknown>) (not a string): {\"a\":1}\n",
   "exit": 5
@@ -523,6 +566,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then {} - 1 else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "",
   "stderr": "jq: error (at <unknown>): object ({}) and number (1) cannot be subtracted\n",
   "exit": 5
@@ -535,6 +579,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [label $f | range(10) | ., (select(. == 3) | break $f)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[0,1,2,3]\n",
   "stderr": "",
   "exit": 0
@@ -547,6 +592,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [label $a | label $b | 1, break $b, 2] , [label $a | (label $b | 1, break $a), 3] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1]\n[1]\n",
   "stderr": "",
   "exit": 0
@@ -559,6 +605,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then first(range(10; 0; -1)) else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "10\n",
   "stderr": "",
   "exit": 0
@@ -571,6 +618,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then first(1, error(\"never\")) else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n",
   "stderr": "",
   "exit": 0
@@ -583,6 +631,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [1, 2, 3] | first(.[] | if . == 2 then error(\"never\") else . end) else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n",
   "stderr": "",
   "exit": 0
@@ -595,6 +644,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [limit(3; range(100))] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[0,1,2]\n",
   "stderr": "",
   "exit": 0
@@ -607,6 +657,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [limit(0; 1, error(\"never\"))] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[]\n",
   "stderr": "",
   "exit": 0
@@ -619,6 +670,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [limit(-1; 1, 2)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,2]\n",
   "stderr": "",
   "exit": 0
@@ -631,6 +683,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then 0 | until(. >= 5; . + 2) else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "6\n",
   "stderr": "",
   "exit": 0
@@ -643,6 +696,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [1 | while(. < 50; . * 3)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,3,9,27]\n",
   "stderr": "",
   "exit": 0
@@ -655,6 +709,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [limit(5; 1 | repeat(. * 2))] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[2,2,2,2,2]\n",
   "stderr": "",
   "exit": 0
@@ -667,6 +722,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [range(10) | select(. % 3 == 0)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[0,3,6,9]\n",
   "stderr": "",
   "exit": 0
@@ -679,6 +735,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [{a: [1, {b: 2}]} | recurse | numbers] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,2]\n",
   "stderr": "",
   "exit": 0
@@ -691,6 +748,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [2 | recurse(if . < 50 then . * . else empty end)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[2,4,16,256]\n",
   "stderr": "",
   "exit": 0
@@ -703,6 +761,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [1, 2, 3] | map(. + 1) else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[2,3,4]\n",
   "stderr": "",
   "exit": 0
@@ -715,6 +774,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [1, 2, 3] | add else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "6\n",
   "stderr": "",
   "exit": 0
@@ -727,6 +787,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then {b: 1, a: [1, 2]} | [length, keys, (.a | length)] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[2,[\"a\",\"b\"],2]\n",
   "stderr": "",
   "exit": 0
@@ -739,6 +800,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [1, \"a\", [1]] | map(tostring), tojson else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[\"1\",\"a\",\"[1]\"]\n\"[1,\\\"a\\\",[1]]\"\n",
   "stderr": "",
   "exit": 0
@@ -751,6 +813,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then \"v=\\(1 + 2)\" else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "\"v=3\"\n",
   "stderr": "",
   "exit": 0
@@ -763,6 +826,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then {a: 1, b: (2, 3)} else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "{\"a\":1,\"b\":2}\n{\"a\":1,\"b\":3}\n",
   "stderr": "",
   "exit": 0
@@ -775,6 +839,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then 1 | debug | . + 1 else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "2\n",
   "stderr": "[\"DEBUG:\",1]\n",
   "exit": 0
@@ -787,6 +852,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then \"x\" | stderr | 1 else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n",
   "stderr": "x",
   "exit": 0
@@ -799,6 +865,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then [true, false, null, 0] | map(not) else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[false,true,true,false]\n",
   "stderr": "",
   "exit": 0
@@ -811,6 +878,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then 1 as $a | (2 as $a | $a), $a else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "2\n1\n",
   "stderr": "",
   "exit": 0
@@ -823,6 +891,7 @@
   ],
   "filter": "def w($k): if $k <= 0 then def g: 1; def h: g; def g: 2; [g, h] else w($k - 1) end; null | w(2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[2,1]\n",
   "stderr": "",
   "exit": 0
@@ -835,6 +904,7 @@
   ],
   "filter": "def f(g; $n): if $n <= 0 then g else f(g + 1; $n - 1) end; f(10; 5)",
   "route": "take",
+  "stdin": null,
   "stdout": "15\n",
   "stderr": "",
   "exit": 0
@@ -847,6 +917,7 @@
   ],
   "filter": "def f(g; $n): if $n <= 0 then [g] else 100 as $x | f(g; $n - 1) end; 1 as $x | f($x; 3)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1]\n",
   "stderr": "",
   "exit": 0
@@ -859,6 +930,7 @@
   ],
   "filter": "def f(g; $n): if $n <= 0 then g else f(g | . * 2; $n - 1) end; 3 | f(.; 4)",
   "route": "take",
+  "stdin": null,
   "stdout": "48\n",
   "stderr": "",
   "exit": 0
@@ -871,6 +943,7 @@
   ],
   "filter": "def f(g; $n): if $n <= 0 then [g] else f(g, 9; $n - 1) end; f(1, 2; 2)",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,2,9,9]\n",
   "stderr": "",
   "exit": 0
@@ -883,6 +956,7 @@
   ],
   "filter": "def s(n): if n == 0 then 0 else n + s(n - 1) end; s(10)",
   "route": "take",
+  "stdin": null,
   "stdout": "55\n",
   "stderr": "",
   "exit": 0
@@ -895,6 +969,7 @@
   ],
   "filter": "def f($x; $n): if $n == 0 then $x else f($x * 2; $n - 1) end; [f(1, 3; 3)]",
   "route": "take",
+  "stdin": null,
   "stdout": "[8,24]\n",
   "stderr": "",
   "exit": 0
@@ -907,6 +982,7 @@
   ],
   "filter": "def f($a): if $a > 0 then [$a, a] , f($a - 1) else empty end; [f(2)]",
   "route": "take",
+  "stdin": null,
   "stdout": "[[2,2],[1,1]]\n",
   "stderr": "",
   "exit": 0
@@ -919,6 +995,7 @@
   ],
   "filter": "def outer($n): def inner($m): if $m == 0 then $n else inner($m - 1) end; inner($n); [outer(3), outer(5)]",
   "route": "take",
+  "stdin": null,
   "stdout": "[3,5]\n",
   "stderr": "",
   "exit": 0
@@ -931,6 +1008,7 @@
   ],
   "filter": "def f(g): def h($n): if $n == 0 then g else h($n - 1) end; h(3); 7 | f(. + 1)",
   "route": "take",
+  "stdin": null,
   "stdout": "8\n",
   "stderr": "",
   "exit": 0
@@ -943,6 +1021,7 @@
   ],
   "filter": "def ev($n): def od($m): if $m == 0 then false else ev($m - 1) end; if $n == 0 then true else od($n - 1) end; [ev(10), ev(7)]",
   "route": "take",
+  "stdin": null,
   "stdout": "[true,false]\n",
   "stderr": "",
   "exit": 0
@@ -955,6 +1034,7 @@
   ],
   "filter": "def f($n): if $n == 0 then 0 else f($n - 1) + 1 end; f(1000)",
   "route": "take",
+  "stdin": null,
   "stdout": "1000\n",
   "stderr": "",
   "exit": 0
@@ -967,6 +1047,7 @@
   ],
   "filter": "def r($p1; $p2): if $p1 == 0 then $p2 else r($p1 - 1; $p2) end; r(5000; 7)",
   "route": "take",
+  "stdin": null,
   "stdout": "7\n",
   "stderr": "",
   "exit": 0
@@ -979,6 +1060,7 @@
   ],
   "filter": "def f: if . < 3000 then . + 1 | f else . end; 0 | f",
   "route": "take",
+  "stdin": null,
   "stdout": "3000\n",
   "stderr": "",
   "exit": 0
@@ -991,6 +1073,7 @@
   ],
   "filter": "def f($n): if $n == 0 then . + 1 else f($n - 1) | f($n - 1) end; 0 | f(10)",
   "route": "take",
+  "stdin": null,
   "stdout": "1024\n",
   "stderr": "",
   "exit": 0
@@ -1003,6 +1086,7 @@
   ],
   "filter": "def t($n): if $n <= 0 then 1 else t($n - 1) + t($n - 1) end; t(10)",
   "route": "take",
+  "stdin": null,
   "stdout": "1024\n",
   "stderr": "",
   "exit": 0
@@ -1015,6 +1099,7 @@
   ],
   "filter": "def f: if . > 0 then (. - 1 | f), . else . end; [5 | f]",
   "route": "take",
+  "stdin": null,
   "stdout": "[0,1,2,3,4,5]\n",
   "stderr": "",
   "exit": 0
@@ -1027,6 +1112,7 @@
   ],
   "filter": "def fib: if . < 2 then . else (. - 1 | fib) + (. - 2 | fib) end; 15 | fib",
   "route": "take",
+  "stdin": null,
   "stdout": "610\n",
   "stderr": "",
   "exit": 0
@@ -1039,6 +1125,7 @@
   ],
   "filter": "def t($n): if $n <= 0 then (1, 2) | select(. == 1) else t($n - 1) + t($n - 1) end; [0 | t(8)] | length",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n",
   "stderr": "",
   "exit": 0
@@ -1051,6 +1138,7 @@
   ],
   "filter": "def t($n): if $n <= 0 then [1] | .[] as $v | $v else t($n - 1) + t($n - 1) end; [t(8)] | length",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n",
   "stderr": "",
   "exit": 0
@@ -1063,6 +1151,7 @@
   ],
   "filter": "def t($n): if $n <= 0 then (foreach (1, 2) as $x (0; . + $x)) | select(. == 1) else t($n - 1) + t($n - 1) end; [t(6)] | length",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n",
   "stderr": "",
   "exit": 0
@@ -1075,6 +1164,7 @@
   ],
   "filter": "def f(g; $n): if $n <= 0 then g else f(g + (1, 3); $n - 1) end; first(f((1, 3); 12)) | type",
   "route": "take",
+  "stdin": null,
   "stdout": "\"number\"\n",
   "stderr": "",
   "exit": 0
@@ -1087,6 +1177,7 @@
   ],
   "filter": "def f(g; $n): if $n <= 0 then g else f(g + (1, 3); $n - 1) end; [f((1, 3); 6)] | length",
   "route": "take",
+  "stdin": null,
   "stdout": "128\n",
   "stderr": "",
   "exit": 0
@@ -1099,6 +1190,7 @@
   ],
   "filter": "def f($n): if $n==0 then .+1 else f($n-1)|f($n-1) end; 0|f(8)",
   "route": "take",
+  "stdin": null,
   "stdout": "256\n",
   "stderr": "",
   "exit": 0
@@ -1111,6 +1203,7 @@
   ],
   "filter": "def Q: def Q(n): n as $n | (if . == null then [1, 1, 1] else . end) as $q | if $q[$n] != null then $q else $q | Q($n - 1) as $q1 | $q1 | Q($n - 2) as $q2 | $q2 | Q($n - $q2[$n - 1]) as $q3 | $q3 | Q($n - $q3[$n - 2]) as $q4 | ($q4[$n - $q4[$n - 1]] + $q4[$n - $q4[$n - 2]]) as $ans | $q4 | setpath([$n]; $ans) end; . as $n | null | Q($n) | .[$n]; 100 | Q",
   "route": "take",
+  "stdin": null,
   "stdout": "56\n",
   "stderr": "",
   "exit": 0
@@ -1123,6 +1216,7 @@
   ],
   "filter": "def f: if . > 0 then (. - 1 | f), . else . end; [300 | f] | length",
   "route": "take",
+  "stdin": null,
   "stdout": "301\n",
   "stderr": "",
   "exit": 0
@@ -1135,6 +1229,7 @@
   ],
   "filter": "def f(g; $n): if $n > 0 then f(try (g + (1, error(\"x\"))) catch 0; $n - 1) + f(g; $n - 1) else g end; first(f(null; 4) | select(. > 30))",
   "route": "take",
+  "stdin": null,
   "stdout": "32\n",
   "stderr": "",
   "exit": 0
@@ -1147,6 +1242,7 @@
   ],
   "filter": "def g($n): if $n == 0 then [range(50)] else g($n - 1) | setpath([$n]; 1) end; g(40) | add",
   "route": "take",
+  "stdin": null,
   "stdout": "445\n",
   "stderr": "",
   "exit": 0
@@ -1159,6 +1255,7 @@
   ],
   "filter": "def f($n): if $n == 0 then 1, error(\"late\") else f($n - 1) end; [try f(3) catch .]",
   "route": "take",
+  "stdin": null,
   "stdout": "[1,\"late\"]\n",
   "stderr": "",
   "exit": 0
@@ -1171,6 +1268,7 @@
   ],
   "filter": "def nat: ., (. + 1 | nat); first(0 | nat | select(. > 5))",
   "route": "take",
+  "stdin": null,
   "stdout": "6\n",
   "stderr": "",
   "exit": 0
@@ -1183,6 +1281,7 @@
   ],
   "filter": "def nat: ., (. + 1 | nat); [limit(5; 0 | nat)]",
   "route": "take",
+  "stdin": null,
   "stdout": "[0,1,2,3,4]\n",
   "stderr": "",
   "exit": 0
@@ -1195,6 +1294,7 @@
   ],
   "filter": "def f($n): if $n == 0 then 1, 2, 3 else f($n - 1) end; [label $out | f(3) | if . == 2 then break $out else . end]",
   "route": "take",
+  "stdin": null,
   "stdout": "[1]\n",
   "stderr": "",
   "exit": 0
@@ -1207,6 +1307,7 @@
   ],
   "filter": "def nat: ., (. + 1 | nat); [label $q | 0 | nat | if . > 3 then break $q else . end]",
   "route": "take",
+  "stdin": null,
   "stdout": "[0,1,2,3]\n",
   "stderr": "",
   "exit": 0
@@ -1219,6 +1320,7 @@
   ],
   "filter": "def nat($m): if . < $m then ., (. + 1 | nat($m)) else empty end; reduce (0 | nat(100)) as $x (0; . + $x)",
   "route": "take",
+  "stdin": null,
   "stdout": "4950\n",
   "stderr": "",
   "exit": 0
@@ -1231,6 +1333,7 @@
   ],
   "filter": "def f($n): if $n == 0 then (1 | debug), (2 | debug) else f($n - 1) end; first(f(2))",
   "route": "take",
+  "stdin": null,
   "stdout": "1\n",
   "stderr": "[\"DEBUG:\",1]\n",
   "exit": 0
@@ -1243,6 +1346,7 @@
   ],
   "filter": "def f($n): if $n == 0 then 0 else f($n - 1) + 1 end; f(10000)",
   "route": "take",
+  "stdin": null,
   "stdout": "10000\n",
   "stderr": "",
   "exit": 0
@@ -1255,6 +1359,7 @@
   ],
   "filter": "def k(f): f * 2; [1, 2] | map(k(.))",
   "route": "decline",
+  "stdin": null,
   "stdout": "[2,4]\n",
   "stderr": "",
   "exit": 0
@@ -1267,6 +1372,7 @@
   ],
   "filter": "def f($n): if $n == 0 then [1] as [$x] ?// $x | $x else f($n - 1) end; f(2)",
   "route": "decline",
+  "stdin": null,
   "stdout": "1\n",
   "stderr": "",
   "exit": 0
@@ -1279,6 +1385,7 @@
   ],
   "filter": "def f($n): if $n == 0 then input else f($n - 1) end; f(2)",
   "route": "decline",
+  "stdin": null,
   "stdout": "",
   "stderr": "jq: error (at <stdin>:0): break\n",
   "exit": 5
@@ -1291,6 +1398,7 @@
   ],
   "filter": "def d($n): if $n == 0 then .a else d($n - 1) end; {a: 1} | path(d(3))",
   "route": "decline",
+  "stdin": null,
   "stdout": "[\"a\"]\n",
   "stderr": "",
   "exit": 0
@@ -1303,7 +1411,293 @@
   ],
   "filter": "def f($n): if $n == 0 then 1, 2 else f($n - 1) end; last(f(3))",
   "route": "decline",
+  "stdin": null,
   "stdout": "2\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "ndjson_caught_break",
+  "args": [
+   "-c"
+  ],
+  "filter": "def f($n): if $n == 0 then (label $out | try (break $out) catch .) else f($n - 1) end; f(2)",
+  "route": "take",
+  "stdin": "1\n2\n",
+  "stdout": "{\"__jq\":0}\n{\"__jq\":1}\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "stdin_error_location",
+  "args": [
+   "-c"
+  ],
+  "filter": "def f($n): if $n == 0 then . + 1 else f($n - 1) end; f(2)",
+  "route": "take",
+  "stdin": "1\n\"x\"\n",
+  "stdout": "2\n",
+  "stderr": "jq: error (at <stdin>:2): string (\"x\") and number (1) cannot be added\n",
+  "exit": 5
+ },
+ {
+  "id": "halt_error",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def f($n): if $n == 0 then \"bye\\n\" | halt_error else f($n - 1) end; f(2)",
+  "route": "take",
+  "stdin": null,
+  "stdout": "",
+  "stderr": "bye\n",
+  "exit": 5
+ },
+ {
+  "id": "exit_status_e",
+  "args": [
+   "-c",
+   "-e",
+   "-n"
+  ],
+  "filter": "def f($n): if $n == 0 then false else f($n - 1) end; f(2)",
+  "route": "take",
+  "stdin": null,
+  "stdout": "false\n",
+  "stderr": "",
+  "exit": 1
+ },
+ {
+  "id": "slurp",
+  "args": [
+   "-c",
+   "-s"
+  ],
+  "filter": "def f($n): if $n == 0 then add else f($n - 1) end; f(2)",
+  "route": "take",
+  "stdin": "1 2 3",
+  "stdout": "6\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_debug_first",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def f($n): if $n == 0 then {a: ((1,2) | debug)} else f($n - 1) end; first(f(2))",
+  "route": "decline",
+  "stdin": null,
+  "stdout": "{\"a\":1}\n",
+  "stderr": "[\"DEBUG:\",1]\n",
+  "exit": 0
+ },
+ {
+  "id": "leaf_debug_first_object",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; first({a: (1, (2|debug))})",
+  "route": "decline",
+  "stdin": null,
+  "stdout": "{\"a\":1}\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_stderr_interp",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; first(\"\\((1,2)|stderr)\")",
+  "route": "decline",
+  "stdin": null,
+  "stdout": "\"1\"\n",
+  "stderr": "1",
+  "exit": 0
+ },
+ {
+  "id": "leaf_debug_index",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [5,6] | first(.[((0,1)|debug)])",
+  "route": "decline",
+  "stdin": null,
+  "stdout": "5\n",
+  "stderr": "[\"DEBUG:\",0]\n",
+  "exit": 0
+ },
+ {
+  "id": "leaf_debug_order",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def f($n): if $n == 0 then {a: ((1,2) | debug)} else f($n - 1) end; f(0) | debug | empty",
+  "route": "decline",
+  "stdin": null,
+  "stdout": "",
+  "stderr": "[\"DEBUG:\",1]\n[\"DEBUG:\",{\"a\":1}]\n[\"DEBUG:\",2]\n[\"DEBUG:\",{\"a\":2}]\n",
+  "exit": 0
+ },
+ {
+  "id": "native_debug_optional",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; first(((1,2)|debug)?)",
+  "route": "take",
+  "stdin": null,
+  "stdout": "1\n",
+  "stderr": "[\"DEBUG:\",1]\n",
+  "exit": 0
+ },
+ {
+  "id": "native_debug_negate",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; first(-((1,2)|debug))",
+  "route": "take",
+  "stdin": null,
+  "stdout": "-1\n",
+  "stderr": "[\"DEBUG:\",1]\n",
+  "exit": 0
+ },
+ {
+  "id": "dup_array",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [1,2] as [$a, $a] | $a",
+  "route": "take",
+  "stdin": null,
+  "stdout": "2\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "dup_object",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; {\"a\":1,\"b\":2} as {a: $x, b: $x} | $x",
+  "route": "take",
+  "stdin": null,
+  "stdout": "1\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "dup_nested_array",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [[1,2],3] as [[$a, $a], $a] | $a",
+  "route": "take",
+  "stdin": null,
+  "stdout": "3\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "dup_object_array",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; {\"a\":1,\"b\":[2]} as {a: $x, b: [$x]} | $x",
+  "route": "take",
+  "stdin": null,
+  "stdout": "1\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "dup_array_object",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [{\"a\":1},2] as [{a: $x}, $x] | $x",
+  "route": "take",
+  "stdin": null,
+  "stdout": "2\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "dup_reduce",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; reduce ([1,2],[3,4]) as [$a, $a] (0; . + $a)",
+  "route": "take",
+  "stdin": null,
+  "stdout": "6\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "dup_foreach",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [foreach ([1,2],[3,4]) as [$a, $a] (0; . + $a)]",
+  "route": "take",
+  "stdin": null,
+  "stdout": "[2,6]\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "range2_negate",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; range(0;1) | -.",
+  "route": "take",
+  "stdin": null,
+  "stdout": "-0\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "range3_negate",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [range(0;3;1) | -.]",
+  "route": "take",
+  "stdin": null,
+  "stdout": "[-0,-1,-2]\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "range2_pairs",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [range(0;2) | [., -.]]",
+  "route": "take",
+  "stdin": null,
+  "stdout": "[[0,-0],[1,-1]]\n",
   "stderr": "",
   "exit": 0
  }

@@ -135,6 +135,51 @@ pub(super) enum Insn {
     Ret,
 }
 
+/// Every instruction's name, by an exhaustive match: a new variant does not compile until it is
+/// named here, and the instruction test then fails until a row runs it.
+#[cfg(test)]
+pub(super) fn insn_name(insn: &Insn) -> &'static str {
+    match insn {
+        Insn::Dup => "Dup",
+        Insn::DupN => "DupN",
+        Insn::Pop => "Pop",
+        Insn::Swap => "Swap",
+        Insn::Const(_) => "Const",
+        Insn::Leaf(_) => "Leaf",
+        Insn::Each(_) => "Each",
+        Insn::Range => "Range",
+        Insn::Fork(_) => "Fork",
+        Insn::Jump(_) => "Jump",
+        Insn::JumpF(_) => "JumpF",
+        Insn::JumpIfSet(..) => "JumpIfSet",
+        Insn::SetSlot(..) => "SetSlot",
+        Insn::Backtrack => "Backtrack",
+        Insn::TryBegin(_) => "TryBegin",
+        Insn::TryEnd => "TryEnd",
+        Insn::Label(_) => "Label",
+        Insn::Break(..) => "Break",
+        Insn::Store(_) => "Store",
+        Insn::Load(..) => "Load",
+        Insn::LoadMove(..) => "LoadMove",
+        Insn::LoadLast(..) => "LoadLast",
+        Insn::Kill(_) => "Kill",
+        Insn::NewAcc(_) => "NewAcc",
+        Insn::Append(_) => "Append",
+        Insn::LoadAcc(_) => "LoadAcc",
+        Insn::Bin(_) => "Bin",
+        Insn::Cmp(_) => "Cmp",
+        Insn::ToBool => "ToBool",
+        Insn::Not => "Not",
+        Insn::Negate => "Negate",
+        Insn::Index => "Index",
+        Insn::IndexK(_) => "IndexK",
+        Insn::Raise => "Raise",
+        Insn::SetPath => "SetPath",
+        Insn::Call { .. } => "Call",
+        Insn::Ret => "Ret",
+    }
+}
+
 /// A compiled function: the main program, a `def` body, a closure argument or a prelude body.
 pub(super) struct Func<'e> {
     /// The definition's name (empty for the main program and for closure arguments).
@@ -165,6 +210,9 @@ pub(super) struct Code<'e> {
     pub leaves: Vec<LeafCode<'e>>,
     /// The main program's function.
     pub main: u32,
+    /// The functions compiled from prelude bodies, for tests that look at the program's own code.
+    #[cfg(test)]
+    pub prelude_funcs: Vec<u32>,
 }
 
 /// A name in scope at compile time, with the function that owns its slot.
@@ -207,10 +255,28 @@ struct Compiler<'c, 'e> {
     last: BTreeSet<usize>,
     /// Nodes, by address, after which these local slots are dead.
     kills: BTreeMap<usize, Vec<u16>>,
+    /// Whether last reads move ([`LastUse`]); off only in a test.
+    moves: bool,
+    /// The `from` operands of `range/3`, by address ([`range_by_start`]).
+    range_starts: BTreeSet<usize>,
 }
 
 /// Compile `program`, or say why the machine declines it.
 pub(super) fn compile<'e>(it: &Interp<'e>, program: &'e Expr) -> Result<Code<'e>, String> {
+    compile_moving(it, program, true)
+}
+
+/// [`compile`] with no last-use moves (`moves: false`): every read a `Load`, no `Kill`, for the
+/// differential test that the moves change no answer.
+#[cfg(test)]
+pub(super) fn compile_without_moves<'e>(
+    it: &Interp<'e>,
+    program: &'e Expr,
+) -> Result<Code<'e>, String> {
+    compile_moving(it, program, false)
+}
+
+fn compile_moving<'e>(it: &Interp<'e>, program: &'e Expr, moves: bool) -> Result<Code<'e>, String> {
     if any_subexpr(program, &mut declined_anywhere) {
         return Err(String::from(
             "a path form, `last`, `?//` or an input builtin",
@@ -224,6 +290,8 @@ pub(super) fn compile<'e>(it: &Interp<'e>, program: &'e Expr) -> Result<Code<'e>
             consts: Vec::new(),
             leaves: Vec::new(),
             main: 0,
+            #[cfg(test)]
+            prelude_funcs: Vec::new(),
         },
         pending: Vec::new(),
         prelude: BTreeMap::new(),
@@ -232,6 +300,8 @@ pub(super) fn compile<'e>(it: &Interp<'e>, program: &'e Expr) -> Result<Code<'e>
         nslots: 0,
         last: BTreeSet::new(),
         kills: BTreeMap::new(),
+        moves,
+        range_starts: BTreeSet::new(),
     };
     let main = c.new_func("", 0, 0, Vec::new());
     c.pending.push((main, Body::Main(program), Vec::new()));
@@ -243,47 +313,42 @@ pub(super) fn compile<'e>(it: &Interp<'e>, program: &'e Expr) -> Result<Code<'e>
     Ok(c.code)
 }
 
-/// What the machine declines anywhere in a program, prelude bodies included: the path forms
-/// (they need the path register in every fork point, #7977 step 8), `last`, `?//` and the input
-/// builtins (step 7), the shipped evaluator's own rewrites, and what the path-mode interpreter
-/// refuses.
+/// What the machine declines anywhere in a program, prelude bodies included: everything the
+/// path-mode interpreter declines (`declined_construct`: the shipped evaluator's own rewrites,
+/// the extensions it does not run), and on top of that the forms the machine does not run yet:
+/// the path forms (they need the path register in every fork point, #7977 step 8), and `last`,
+/// `?//` and the input builtins (step 7).
 fn declined_anywhere(e: &Expr) -> bool {
+    declined_construct(e).is_some() || not_yet_the_machines(e)
+}
+
+/// The forms the path-mode interpreter runs and the machine does not, yet.
+fn not_yet_the_machines(e: &Expr) -> bool {
     use Builtin as B;
     match e {
         Expr::Assign { .. }
         | Expr::Update { .. }
         | Expr::CompoundAssign { .. }
         | Expr::AlternativeAssign { .. }
-        | Expr::MetaAssign { .. }
-        | Expr::LastExpr(_)
-        | Expr::DefCall { .. }
-        | Expr::Shared(_)
-        | Expr::DeferredVar(_)
-        | Expr::NamespacedCall { .. }
-        | Expr::RecursiveDescentWithKeys
-        | Expr::ArrayKey(_) => true,
-        Expr::AsPattern { patterns, .. } => patterns.len() != 1,
-        Expr::Reduce { patterns, .. } | Expr::Foreach { patterns, .. } => patterns.len() != 1,
-        Expr::Builtin(b) => {
-            matches!(
-                b,
-                B::Path(_)
-                    | B::Paths
-                    | B::PathsFilter(_)
-                    | B::LeafPaths
-                    | B::Del(_)
-                    | B::Pick(_)
-                    | B::ToStream
-                    | B::LastStream(_)
-                    | B::Input
-                    | B::Inputs
-                    | B::InputLineNumber
-                    | B::GetPath(_)
-            ) || unsupported_builtin(b).is_some()
-                || path_context_name(b).is_some()
-                || cursor_metadata_name(b).is_some()
-        }
-        Expr::Object(entries) => entries.iter().any(|e| matches!(e.key, ObjectKey::Bare)),
+        | Expr::LastExpr(_) => true,
+        Expr::AsPattern { patterns, .. }
+        | Expr::Reduce { patterns, .. }
+        | Expr::Foreach { patterns, .. } => patterns.len() != 1,
+        Expr::Builtin(b) => matches!(
+            b,
+            B::Path(_)
+                | B::Paths
+                | B::PathsFilter(_)
+                | B::LeafPaths
+                | B::Del(_)
+                | B::Pick(_)
+                | B::ToStream
+                | B::LastStream(_)
+                | B::GetPath(_)
+                | B::Input
+                | B::Inputs
+                | B::InputLineNumber
+        ),
         _ => false,
     }
 }
@@ -312,8 +377,34 @@ fn blocks_leaf(e: &Expr) -> bool {
     }
 }
 
+/// A constant `from` of `range/3` as the shipped route's `range` emits it first: an integer
+/// literal's spelling is dropped, unless it is `-0` or an integer a double cannot hold, which jq
+/// prints as written. So `range(0; 3; 1) | -.` starts at `-0`, as in jq. A `from` that is not a
+/// constant reaches the prelude body as it is.
+fn range_by_start(value: OwnedValue) -> OwnedValue {
+    match value {
+        OwnedValue::NumberLiteral(NumberRepr::Int(i), text)
+            if !(i == 0 && text.starts_with('-'))
+                && super::super::super::eval::jq_int_within_exact_f64_range(i) =>
+        {
+            OwnedValue::Int(i)
+        }
+        other => other,
+    }
+}
+
+/// Whether `e` runs as one [`Insn::Leaf`]. A leaf runs to its end before its first output is
+/// used, so it may not hold a side effect (`debug`, `stderr`) unless it is that builtin alone,
+/// which answers once: in a leaf that can answer more than once, the effect of a later output
+/// would fire before the consumer had seen the earlier one, and past a consumer that stops.
 fn is_leaf(e: &Expr) -> bool {
-    !any_subexpr(e, &mut blocks_leaf)
+    !any_subexpr(e, &mut blocks_leaf) && (is_effect(e) || !any_subexpr(e, &mut is_effect))
+}
+
+/// A C builtin with a side effect at the moment it runs. (`halt` and `halt_error` raise, and a
+/// leaf's raise waits for its earlier outputs; `input` and its kin are declined.)
+fn is_effect(e: &Expr) -> bool {
+    matches!(e, Expr::Builtin(Builtin::Debug | Builtin::Stderr))
 }
 
 /// Names a leaf binds inside itself, and the names it reads.
@@ -510,16 +601,23 @@ impl<'e> Compiler<'_, 'e> {
     }
 
     /// A closure argument: a function over the current frame, compiled later.
-    fn lambda(&mut self, arg: &'e Expr) -> u32 {
-        let depth = self.depth(self.cur) + 1;
+    fn lambda(&mut self, arg: &'e Expr) -> Result<u32, String> {
+        let depth = self.inner_depth()?;
         let f = self.new_func("", 0, depth, Vec::new());
         self.pending
             .push((f, Body::Lambda(arg), self.scope.clone()));
-        f
+        Ok(f)
     }
 
-    /// A call: value arguments evaluated here (the last outermost, as jq's `CALL_BUILTIN`
-    /// orders them), closure arguments passed as lambdas or references.
+    /// The lexical depth of a function nested in the current one.
+    fn inner_depth(&self) -> Result<u16, String> {
+        self.depth(self.cur)
+            .checked_add(1)
+            .ok_or_else(|| String::from("definitions nested too deep"))
+    }
+
+    /// A call: value arguments evaluated here, the first outermost (`def f($a; $b)` binds as
+    /// `a as $a | b as $b | ...`), closure arguments passed as lambdas or references.
     fn call_func(&mut self, callee: Callee, func: u32, args: &[&'e Expr]) -> C {
         let modes = self.code.funcs[func as usize].value_params.clone();
         if modes.len() != args.len() {
@@ -535,7 +633,7 @@ impl<'e> Compiler<'_, 'e> {
             } else if let Some((level, idx)) = self.param_ref(arg) {
                 specs.push(ArgSpec::Ref { level, idx });
             } else {
-                let l = self.lambda(arg);
+                let l = self.lambda(arg)?;
                 specs.push(ArgSpec::Lambda(l));
             }
         }
@@ -585,6 +683,8 @@ impl<'e> Compiler<'_, 'e> {
         };
         let f = self.new_func(name, arity, 0, Self::value_modes(params, body));
         self.prelude.insert((def.name, arity), f);
+        #[cfg(test)]
+        self.code.prelude_funcs.push(f);
         self.pending.push((f, Body::Def(params, body), Vec::new()));
         Ok(f)
     }
@@ -604,7 +704,10 @@ impl<'e> Compiler<'_, 'e> {
     /// `e` as a [`Insn::Leaf`], its free variables resolved to slots.
     fn leaf(&mut self, e: &'e Expr) -> C {
         if !is_leaf(e) {
-            return Err(format!("a call inside {}", variant_name(e)));
+            return Err(format!(
+                "a call, a generator the machine runs, or a side effect inside {}",
+                variant_name(e)
+            ));
         }
         let (inside, read) = leaf_names(e);
         let mut vars = Vec::new();
@@ -622,13 +725,13 @@ impl<'e> Compiler<'_, 'e> {
     }
 
     /// A destructuring pattern (`gen_array_matcher`, `gen_object_matcher`): `[v] -> []`,
-    /// binding its variables in new slots.
-    fn pattern(&mut self, p: &'e Pattern) -> C {
+    /// binding its variables in new slots. `mark` is the scope's height before the pattern.
+    fn pattern(&mut self, p: &'e Pattern, mark: usize) -> C {
         match p {
             Pattern::Var(name) => {
                 let s = self.slot()?;
                 self.emit(Insn::Store(s));
-                self.scope.push(Entry::Var(name, self.cur, s));
+                self.bind_pattern_var(name, s, mark);
             }
             Pattern::Array(elems) => {
                 // `gen_array_matcher`: the last element first.
@@ -636,7 +739,7 @@ impl<'e> Compiler<'_, 'e> {
                     self.emit(Insn::Dup);
                     let k = self.konst(OwnedValue::Int(i as i64));
                     self.emit(Insn::IndexK(k));
-                    self.pattern(sub)?;
+                    self.pattern(sub, mark)?;
                 }
                 self.emit(Insn::Pop);
             }
@@ -659,14 +762,28 @@ impl<'e> Compiler<'_, 'e> {
                         let s = self.slot()?;
                         self.emit(Insn::Dup);
                         self.emit(Insn::Store(s));
-                        self.scope.push(Entry::Var(name, self.cur, s));
+                        self.bind_pattern_var(name, s, mark);
                     }
-                    self.pattern(&entry.pattern)?;
+                    self.pattern(&entry.pattern, mark)?;
                 }
                 self.emit(Insn::Pop);
             }
         }
         Ok(())
+    }
+
+    /// Bring `$name`, stored in slot `s`, into scope, unless the pattern begun at scope height
+    /// `mark` has bound it already. A name bound twice in one pattern is the first store that
+    /// runs, as in jq: the last element of an array pattern runs first, an object pattern's
+    /// entries in order (`[1,2] as [$a, $a] | $a` is `2`, `{"a":1,"b":2} as {a: $x, b: $x} | $x`
+    /// is `1`). The later stores still run, for their errors.
+    fn bind_pattern_var(&mut self, name: &'e str, s: u16, mark: usize) {
+        let bound = self.scope[mark..]
+            .iter()
+            .any(|e| matches!(e, Entry::Var(n, ..) if *n == name));
+        if !bound {
+            self.scope.push(Entry::Var(name, self.cur, s));
+        }
     }
 
     /// A binary operator: the right operand runs first, as in jq (`gen_binop`).
@@ -681,7 +798,10 @@ impl<'e> Compiler<'_, 'e> {
 
     /// Compile `e`: `[in] -> [out]`, or a backtrack.
     fn expr(&mut self, e: &'e Expr) -> C {
-        if let Some(value) = self.it.constant(e) {
+        if let Some(mut value) = self.it.constant(e) {
+            if self.range_starts.contains(&(e as *const Expr as usize)) {
+                value = range_by_start(value);
+            }
             let k = self.konst(value);
             self.emit(Insn::Const(k));
             return Ok(());
@@ -811,7 +931,7 @@ impl<'e> Compiler<'_, 'e> {
                 let f = self.emit(Insn::Fork(0));
                 self.emit(Insn::DupN);
                 self.expr(source)?;
-                self.pattern(&patterns[0])?;
+                self.pattern(&patterns[0], mark)?;
                 self.emit(Insn::LoadMove(0, acc));
                 self.expr(update)?;
                 self.emit(Insn::Store(acc));
@@ -836,7 +956,7 @@ impl<'e> Compiler<'_, 'e> {
                 let f = self.emit(Insn::Fork(0));
                 self.emit(Insn::DupN);
                 self.expr(source)?;
-                self.pattern(&patterns[0])?;
+                self.pattern(&patterns[0], mark)?;
                 self.emit(Insn::LoadMove(0, state));
                 self.expr(update)?;
                 self.emit(Insn::Dup);
@@ -883,7 +1003,7 @@ impl<'e> Compiler<'_, 'e> {
                 then,
                 ..
             } => {
-                let depth = self.depth(self.cur) + 1;
+                let depth = self.inner_depth()?;
                 let f = self.new_func(name, params.len(), depth, Self::value_modes(params, body));
                 self.scope
                     .push(Entry::Def(name, params.len(), f, Some(self.cur)));
@@ -950,7 +1070,7 @@ impl<'e> Compiler<'_, 'e> {
                 let mark = self.scope.len();
                 self.emit(Insn::Dup);
                 self.expr(source)?;
-                self.pattern(&patterns[0])?;
+                self.pattern(&patterns[0], mark)?;
                 let bound: Vec<(&str, u16)> = self.scope[mark..]
                     .iter()
                     .filter_map(|entry| match entry {
@@ -987,7 +1107,11 @@ impl<'e> Compiler<'_, 'e> {
                 from,
                 to: Some(to),
                 step: Some(step),
-            } => self.prelude_call("_sp_range", &[from, to, step])?,
+            } => {
+                let start: &Expr = from;
+                self.range_starts.insert(start as *const Expr as usize);
+                self.prelude_call("_sp_range", &[from, to, step])?;
+            }
             // `CALL_BUILTIN`: the last argument is the outermost loop.
             Expr::Builtin(Builtin::SetPath(path, value)) => {
                 self.emit(Insn::Dup);
@@ -1001,10 +1125,10 @@ impl<'e> Compiler<'_, 'e> {
             Expr::Builtin(Builtin::Empty) => {
                 self.emit(Insn::Backtrack);
             }
-            Expr::Builtin(b) if prelude_call(b).is_some() => {
-                let (name, args) = prelude_call(b).unwrap_or(("", Vec::new()));
-                self.prelude_call(name, &args)?;
-            }
+            Expr::Builtin(b) => match prelude_call(b) {
+                Some((name, args)) => self.prelude_call(name, &args)?,
+                None => self.leaf(e)?,
+            },
             _ => self.leaf(e)?,
         }
         if let Some(slots) = self.kills.get(&(e as *const Expr as usize)) {
@@ -1017,6 +1141,9 @@ impl<'e> Compiler<'_, 'e> {
 
     /// Mark the last reads of `$name` (bound to local slot `slot`) in `body`, its scope.
     fn last_uses(&mut self, name: &str, slot: u16, body: &Expr) {
+        if !self.moves {
+            return;
+        }
         let mut live = LastUse {
             name,
             last: Vec::new(),

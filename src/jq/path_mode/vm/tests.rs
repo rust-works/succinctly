@@ -1,5 +1,6 @@
-//! The call machine's unit tests (#7977). Every expected answer was captured from `/usr/bin/jq`
-//! 1.7.1 (macOS arm64) with `jq -nc`.
+//! The call machine's unit tests (#7977). Every expected output and jq error was captured from
+//! `/usr/bin/jq` 1.7.1 (macOS arm64) with `jq -nc`; the budget's refusal wording is succinctly's
+//! own (ADR-0025), which jq, having no such bound, never prints.
 
 // STYLE-0004: jq object literals, not format strings.
 #![allow(clippy::literal_string_with_formatting_args)]
@@ -8,7 +9,7 @@ use super::*;
 use alloc::collections::BTreeSet;
 use proptest::prelude::*;
 
-/// Every instruction, by its `Debug` name.
+/// Every instruction, by [`compile::insn_name`].
 const INSTRUCTIONS: [&str; 37] = [
     "Dup",
     "DupN",
@@ -238,13 +239,23 @@ fn program(filter: &str) -> Expr {
 
 /// Run `filter` on `null` on the machine, as `run_program` does with the switch on.
 fn machine(filter: &str) -> Answer {
+    machine_compiled(filter, true).unwrap_or_else(|e| panic!("{filter}: {e}"))
+}
+
+/// [`machine`], with last-use moves (`moves`) or without them; `Err` when the machine declines.
+fn machine_compiled(filter: &str, moves: bool) -> Result<Answer, String> {
     let program = program(filter);
     with_prelude(|prelude| {
         let it = Interp::new(prelude);
+        let code = if moves {
+            compile::compile(&it, &program)?
+        } else {
+            compile::compile_without_moves(&it, &program)?
+        };
         let mut input = OwnedValue::Null;
         it.prepare(&program, &mut input);
         let mut outputs = Vec::new();
-        let result = run(&it, &program, input, &mut |v| {
+        let result = run_code(&it, &code, input, &mut |v| {
             outputs.push(v.to_json_jq_preserve());
             true
         });
@@ -259,27 +270,39 @@ fn machine(filter: &str) -> Answer {
                 other => panic!("{filter}: {other:?}"),
             },
         };
-        Answer { outputs, error }
+        Ok(Answer { outputs, error })
     })
 }
 
-/// The instructions `filter` compiles to, by name.
-fn instructions(filter: &str) -> BTreeSet<String> {
+/// The instructions `filter`'s own functions compile to, by name: the main program, its `def`s
+/// and closure arguments, not the prelude bodies it calls.
+fn own_instructions(filter: &str) -> BTreeSet<&'static str> {
     let program = program(filter);
     with_prelude(|prelude| {
         let it = Interp::new(prelude);
         let code = compile::compile(&it, &program).unwrap_or_else(|e| panic!("{filter}: {e}"));
-        code.insns
-            .iter()
-            .map(|insn| {
-                let name = format!("{insn:?}");
-                let end = name
-                    .find(|c: char| !c.is_alphanumeric())
-                    .unwrap_or(name.len());
-                name[..end].to_string()
-            })
-            .collect()
+        let mut entries: Vec<usize> = code.funcs.iter().map(|f| f.entry).collect();
+        entries.sort_unstable();
+        let mut own = BTreeSet::new();
+        for (i, func) in code.funcs.iter().enumerate() {
+            if code.prelude_funcs.contains(&(i as u32)) {
+                continue;
+            }
+            let end = entries
+                .iter()
+                .copied()
+                .find(|&e| e > func.entry)
+                .unwrap_or(code.insns.len());
+            own.extend(code.insns[func.entry..end].iter().map(compile::insn_name));
+        }
+        own
     })
+}
+
+/// Whether the machine declines `filter`.
+fn declines(filter: &str) -> bool {
+    let program = program(filter);
+    with_prelude(|prelude| compile::compile(&Interp::new(prelude), &program).is_err())
 }
 
 fn ok(outputs: &[&str]) -> Answer {
@@ -291,15 +314,16 @@ fn ok(outputs: &[&str]) -> Answer {
 
 #[test]
 fn every_instruction_runs_as_jq_7977() {
-    let mut seen = BTreeSet::new();
+    EXECUTED.with(|seen| seen.borrow_mut().clear());
     for (filter, want) in INSTRUCTION_ROWS {
         assert_eq!(machine(filter), ok(want), "{filter}");
-        seen.extend(instructions(filter));
     }
-    let all: BTreeSet<String> = INSTRUCTIONS.iter().map(|s| String::from(*s)).collect();
+    let ran = EXECUTED.with(|seen| seen.borrow().clone());
+    let all: BTreeSet<&str> = INSTRUCTIONS.iter().copied().collect();
+    assert_eq!(all.len(), INSTRUCTIONS.len(), "a name listed twice");
     assert_eq!(
-        seen, all,
-        "the rows compile to every instruction, and to nothing else"
+        ran, all,
+        "the rows run every instruction (`Vm::step` counts what it runs)"
     );
 }
 
@@ -336,7 +360,7 @@ fn last_reads_move_only_where_no_fork_point_can_read_again_7977() {
     let mut moves = 0;
     for (filter, want) in LAST_USE_ROWS {
         assert_eq!(machine(filter), ok(want), "{filter}");
-        let insns = instructions(filter);
+        let insns = own_instructions(filter);
         if insns.contains("LoadLast") || insns.contains("Kill") {
             moves += 1;
         }
@@ -346,8 +370,76 @@ fn last_reads_move_only_where_no_fork_point_can_read_again_7977() {
     assert_eq!(
         moves,
         LAST_USE_ROWS.len() - 2,
-        "rows that compile to a LoadLast or a Kill"
+        "rows whose own code compiles to a LoadLast or a Kill"
     );
+}
+
+/// A name bound twice in one pattern is the first store that runs (#7977 review): the last
+/// element of an array pattern, the first entry of an object pattern, as in jq and on the shipped
+/// route.
+#[test]
+fn a_name_bound_twice_in_a_pattern_is_its_first_store_7977() {
+    const R: &str = "def r: if false then r else . end; ";
+    for (filter, want) in [
+        ("[1,2] as [$a, $a] | $a", "2"),
+        ("[1,2,3] as [$a, $a, $a] | $a", "3"),
+        (r#"{"a":1,"b":2} as {a: $x, b: $x} | $x"#, "1"),
+        ("[[1,2],3] as [[$a, $a], $a] | $a", "3"),
+        ("[1,[2,3]] as [$a, [$a, $a]] | $a", "3"),
+        (r#"{"a":1,"b":[2]} as {a: $x, b: [$x]} | $x"#, "1"),
+        (r#"[{"a":1},2] as [{a: $x}, $x] | $x"#, "2"),
+        (r#"{"a":1,"b":2} as {$a, b: $a} | $a"#, "1"),
+        ("reduce ([1,2],[3,4]) as [$a, $a] (0; . + $a)", "6"),
+        ("[foreach ([1,2],[3,4]) as [$a, $a] (0; . + $a)]", "[2,6]"),
+        (
+            r#"[foreach ({"a":1,"b":2}) as {a: $x, b: $x} (0; . + $x)]"#,
+            "[1]",
+        ),
+    ] {
+        assert_eq!(machine(&format!("{R}{filter}")), ok(&[want]), "{filter}");
+    }
+}
+
+/// `range`'s first output has the shipped route's representation, so `range(0; 1) | -.` is `-0`
+/// as in jq (#7977 review).
+#[test]
+fn ranges_first_output_negates_as_jqs_7977() {
+    const R: &str = "def r: if false then r else . end; ";
+    for (filter, want) in [
+        ("range(0;1) | -.", &["-0"][..]),
+        ("[range(0;3;1) | -.]", &["[-0,-1,-2]"]),
+        ("[range(0;2) | [., -.]]", &["[[0,-0],[1,-1]]"]),
+        ("range(0.0;2)", &["0.0", "1"]),
+        ("[range(1.0;3)]", &["[1.0,2]"]),
+    ] {
+        assert_eq!(machine(&format!("{R}{filter}")), ok(want), "{filter}");
+    }
+}
+
+/// A leaf runs to its end before its first output is used, so one that can answer more than once
+/// may not hold `debug` or `stderr` (#7977 review): the effect of a later output would fire past
+/// a consumer that stops, and before the consumer saw the earlier one. The machine declines
+/// such a program; `debug` alone, which answers once, is still a leaf.
+#[test]
+fn a_side_effect_never_runs_inside_a_leaf_that_answers_twice_7977() {
+    for filter in [
+        "def f($n): if $n == 0 then {a: ((1,2) | debug)} else f($n - 1) end; first(f(2))",
+        "def r: if false then r else . end; first({a: (1, (2|debug))})",
+        r#"def r: if false then r else . end; "\((1,2)|stderr)""#,
+        "def r: if false then r else . end; [5,6] | .[((0,1)|debug)]",
+    ] {
+        assert!(declines(filter), "declines {filter}");
+    }
+    // `?` and unary `-` over such a subtree compile natively instead, outputs one at a time.
+    for filter in [
+        "def r: if false then r else . end; [((1,2)|debug)?]",
+        "def r: if false then r else . end; -((1,2)|debug)",
+        "def r: if false then r else . end; 1 | debug | . + 1",
+        "def r: if false then r else . end; (1 | debug), (2 | stderr)",
+        "def r: if false then r else . end; {a: (1, 2)}",
+    ] {
+        assert!(!declines(filter), "takes {filter}");
+    }
 }
 
 /// #7803's memo: `$q4 | setpath([$n]; $ans)` writes the array `$q4` holds, which is its last read,
@@ -398,15 +490,11 @@ fn the_router_takes_recursive_programs_and_declines_the_rest_7977() {
     }
 }
 
-#[cfg(feature = "std")]
 #[test]
-fn the_switch_is_on_only_for_a_value_but_0_7977() {
-    use std::ffi::OsStr;
-    assert!(!switch_value_on(None));
-    assert!(!switch_value_on(Some(OsStr::new(""))));
-    assert!(!switch_value_on(Some(OsStr::new("0"))));
-    assert!(switch_value_on(Some(OsStr::new("1"))));
-    assert!(switch_value_on(Some(OsStr::new("yes"))));
+fn the_machine_is_off_until_a_caller_turns_it_on_7977() {
+    // The process-wide flag, read without changing it: no test turns it on, so another test
+    // running at the same time cannot see it move.
+    assert!(!switched_on());
 }
 
 #[test]
@@ -511,4 +599,91 @@ fn pop_n_moves_even_a_protected_value_and_leaves_null_7977() {
     assert!(stack.top_free());
     assert_eq!(stack.pop_n(), OwnedValue::Int(2));
     assert!(stack.data.is_empty());
+}
+
+/// Programs that bind an array to `$a`, write it with `setpath` and read it again, under the
+/// control a move must survive: `,`, `//`, `try`, `label`/`break`, `first`, `reduce` and
+/// `foreach` (which reach `pop_n` and the slots watermark), `if`, rebinding and destructuring.
+fn moving_program() -> impl Strategy<Value = String> {
+    let leaf = prop_oneof![
+        Just("$a".to_string()),
+        Just("($a | setpath([0]; 9))".to_string()),
+        Just("($a | setpath([1]; length))".to_string()),
+        Just("1".to_string()),
+        Just(".".to_string()),
+        Just("empty".to_string()),
+        Just(r#"error("e")"#.to_string()),
+    ];
+    let body = leaf.prop_recursive(4, 32, 3, |inner| {
+        prop_oneof![
+            (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("({x}, {y})")),
+            (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("({x} // {y})")),
+            (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("(try {x} catch {y})")),
+            inner.clone().prop_map(|x| format!("first({x})")),
+            (inner.clone(), inner.clone())
+                .prop_map(|(x, y)| format!("(label $l | {x}, break $l, {y})")),
+            (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("({x} | {y})")),
+            inner.clone().prop_map(|x| format!("[{x}]")),
+            (inner.clone(), inner.clone())
+                .prop_map(|(x, y)| format!("(reduce (0, 1) as $i ({x}; {y}))")),
+            (inner.clone(), inner.clone())
+                .prop_map(|(x, y)| format!("(foreach (0, 1) as $i ({x}; {y}))")),
+            (inner.clone(), inner.clone()).prop_map(|(x, y)| format!("({x} as $a | {y})")),
+            (inner.clone(), inner.clone())
+                .prop_map(|(x, y)| format!("([{x}, 0] as [$a, $b] | {y})")),
+            (inner.clone(), inner.clone(), inner)
+                .prop_map(|(c, x, y)| format!("(if {c} then {x} else {y} end)")),
+        ]
+    });
+    (body, any::<bool>()).prop_map(|(e, in_def)| {
+        if in_def {
+            format!(
+                "def f($a; $n): if $n == 0 then [{e}] else f($a | setpath([0]; $n); $n - 1), [$a] end; \
+                 [f([1,2]; 2)]"
+            )
+        } else {
+            format!("def r: if false then r else . end; [1,2] as $a | [{e}]")
+        }
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// The last-use moves change no answer (#7977 review): every program answers the same with
+    /// `LoadLast` and `Kill` as with plain `Load`s, which never move.
+    #[test]
+    fn the_last_use_moves_change_no_answer_7977(filter in moving_program()) {
+        let moved = machine_compiled(&filter, true);
+        let copied = machine_compiled(&filter, false);
+        prop_assert_eq!(moved.is_ok(), copied.is_ok(), "{}", filter);
+        if let (Ok(moved), Ok(copied)) = (moved, copied) {
+            prop_assert_eq!(moved, copied, "{}", filter);
+        }
+    }
+}
+
+/// The generator above reaches moves at all: a sample of its programs compiles to them.
+#[test]
+fn the_move_programs_reach_loadlast_and_kill_7977() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let (mut last, mut kill) = (0, 0);
+    for _ in 0..200 {
+        let filter = moving_program()
+            .new_tree(&mut runner)
+            .expect("a program")
+            .current();
+        if declines(&filter) {
+            continue;
+        }
+        let own = own_instructions(&filter);
+        last += usize::from(own.contains("LoadLast"));
+        kill += usize::from(own.contains("Kill"));
+    }
+    assert!(
+        last > 20 && kill > 20,
+        "LoadLast in {last}, Kill in {kill} of 200"
+    );
 }

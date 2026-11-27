@@ -1,7 +1,8 @@
 //! #7977: the call machine, behind `SUCCINCTLY_CALL_MACHINE`, off by default.
 //!
-//! The corpus is `scripts/call_machine/cases.py`, 109 programs from the #7957 spikes, with
-//! jq 1.7.1's stdout, stderr and exit status captured into
+//! The corpus is `scripts/call_machine/cases.py`: 109 programs from the #7957 spikes and 22 from
+//! the review of #7984 (standard input, several documents, exit statuses, flags, side effects in
+//! leaves, duplicate pattern names, `range`'s first value), with jq 1.7.1's stdout, stderr and exit status captured into
 //! `tests/data/call-machine-corpus-7977.json` by `scripts/call_machine/check.py capture`
 //! (`/usr/bin/jq` 1.7.1, macOS arm64). With the switch on, every answer is jq's and every "take"
 //! program reaches the machine; with it unset, the machine is never asked, so a program runs as on
@@ -32,6 +33,16 @@ struct Answer {
 /// Run `succinctly jq <args>` with the switch set to `switch` (`None`: removed from the
 /// environment) and the decision log in `dir`.
 fn run(args: &[&str], switch: Option<&str>, dir: &Path) -> Result<Answer> {
+    run_with_stdin(args, switch, dir, None)
+}
+
+/// [`run`], feeding `stdin` to the run (`None`: no standard input).
+fn run_with_stdin(
+    args: &[&str],
+    switch: Option<&str>,
+    dir: &Path,
+    stdin: Option<&str>,
+) -> Result<Answer> {
     let log = dir.join("decisions.log");
     // A retry after a signal death must not read the decisions of the attempt before.
     let (output, exit) = spawn_with_signal_retry(
@@ -45,7 +56,7 @@ fn run(args: &[&str], switch: Option<&str>, dir: &Path) -> Result<Answer> {
             };
             command
         },
-        None,
+        stdin.map(str::as_bytes),
     )?;
     Ok(Answer {
         stdout: String::from_utf8(output.stdout)?,
@@ -63,7 +74,7 @@ fn the_corpus_matches_jq_on_the_call_machine_7977() -> Result<()> {
     let rows: Vec<serde_json::Value> = serde_json::from_str(&text)?;
     assert_eq!(
         rows.len(),
-        109,
+        131,
         "the corpus of scripts/call_machine/cases.py"
     );
     let dir = tempfile::tempdir()?;
@@ -77,7 +88,8 @@ fn the_corpus_matches_jq_on_the_call_machine_7977() -> Result<()> {
             .map(|a| a.as_str().unwrap_or_default())
             .collect();
         args.push(row["filter"].as_str().context("filter")?);
-        let got = run(&args, Some("1"), dir.path())?;
+        let stdin = row["stdin"].as_str();
+        let got = run_with_stdin(&args, Some("1"), dir.path(), stdin)?;
         let want = (
             row["stdout"].as_str().context("stdout")?,
             row["stderr"].as_str().context("stderr")?,
@@ -94,8 +106,14 @@ fn the_corpus_matches_jq_on_the_call_machine_7977() -> Result<()> {
                 (&got.stdout, &got.stderr, got.exit)
             ));
         }
-        if row["route"] == "take" && !got.decisions.lines().any(|l| l == "taken") {
-            wrong.push(format!("{id}: not taken ({:?})", got.decisions));
+        // Every decision for the program is the route the corpus says, and there is one.
+        let route = if row["route"] == "take" {
+            "taken"
+        } else {
+            "declined"
+        };
+        if got.decisions.is_empty() || got.decisions.lines().any(|l| l != route) {
+            wrong.push(format!("{id}: want {route}, decided {:?}", got.decisions));
         }
     }
     assert!(
@@ -118,12 +136,9 @@ fn with_the_switch_off_the_machine_is_never_asked_7977() -> Result<()> {
         "{}",
         on.stderr
     );
-    // Decided as the route is pinned, then once more on the first document (#7977 step 5).
-    assert!(
-        !on.decisions.is_empty() && on.decisions.lines().all(|l| l == "taken"),
-        "{:?}",
-        on.decisions
-    );
+    // Decided as the route is pinned, then once more on the first document: two today, one
+    // once the compiled program is kept for the run (#7977 step 5).
+    assert_eq!(on.decisions, "taken\ntaken\n");
     for switch in [None, Some("0"), Some("")] {
         let off = run(&["-n", DEEP], switch, dir.path())?;
         assert_eq!(off.stdout, "", "{switch:?}");

@@ -37,14 +37,16 @@
 //! `Reg::top()`; its outputs past the first become a fork point that yields them one per
 //! backtrack.
 //!
-//! The machine runs only behind the `SUCCINCTLY_CALL_MACHINE` switch ([`switched_on`], #7961),
-//! off by default: with it off, [`takes`] is never asked and nothing here runs.
+//! The machine runs only once a caller turns it on ([`super::set_call_machine`]; the CLI does so
+//! for `SUCCINCTLY_CALL_MACHINE`, #7961). Off, the default, [`takes`] is never asked and nothing
+//! here runs.
 
 use super::*;
 
 mod compile;
 
 use compile::{ArgSpec, Callee, Code, Insn, NO_LEVEL};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// The byte budget of the control state: the stacks' blocks, slots and fork points. Past it a
 /// call or a fork point refuses with the shipped evaluators' recursion wording ([`refusal`]).
@@ -252,6 +254,28 @@ fn refusal(name: &str, arity: usize) -> Raise {
     )))
 }
 
+/// `RANGE`'s first output, as the shipped evaluator's `range` emits it (#3103, #6064): over
+/// integer bounds an integer literal's spelling is dropped except `-0`'s, and over a float bound
+/// the literals `range_from_literal_override` names keep theirs. So `range(0; 1) | -.` is `-0`, as
+/// in jq and on the shipped route.
+fn range_start(start: OwnedValue, end: &OwnedValue) -> OwnedValue {
+    let is_float = |v: &OwnedValue| {
+        matches!(
+            v,
+            OwnedValue::Float(_) | OwnedValue::NumberLiteral(NumberRepr::Float(_), _)
+        )
+    };
+    let keep = if is_float(&start) || is_float(end) {
+        super::super::eval::range_from_literal_override(&start).is_some()
+    } else {
+        matches!(&start, OwnedValue::NumberLiteral(NumberRepr::Int(0), text) if text.starts_with('-'))
+    };
+    match start {
+        OwnedValue::NumberLiteral(NumberRepr::Int(i), _) if !keep => OwnedValue::Int(i),
+        other => other,
+    }
+}
+
 /// The number of elements `EACH` visits in `container`.
 fn length(container: &OwnedValue) -> usize {
     match container {
@@ -285,9 +309,19 @@ pub(super) fn run<'e>(
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
 ) -> R {
     let code = compile::compile(it, program).map_err(unsupported)?;
+    run_code(it, &code, input, on_value)
+}
+
+/// [`run`] of a compiled program.
+fn run_code(
+    it: &Interp<'_>,
+    code: &Code<'_>,
+    input: OwnedValue,
+    on_value: &mut dyn FnMut(OwnedValue) -> bool,
+) -> R {
     let mut vm = Vm {
         it,
-        code: &code,
+        code,
         data: Stack::new(),
         frames: Stack::new(),
         slots: Vec::new(),
@@ -440,6 +474,11 @@ impl Vm<'_, '_> {
     ) -> Result<Flow, Raise> {
         let code = self.code;
         let next = Flow::Next(pc + 1);
+        #[cfg(test)]
+        EXECUTED.with(|seen| {
+            seen.borrow_mut()
+                .insert(compile::insn_name(&code.insns[pc]))
+        });
         match &code.insns[pc] {
             Insn::Dup => {
                 let v = self.data.pop();
@@ -508,7 +547,7 @@ impl Vm<'_, '_> {
                         resume: pc + 1,
                     })?;
                 }
-                self.data.push(start);
+                self.data.push(range_start(start, &max));
             }
             Insn::Fork(t) => self.fork(Kind::Branch(*t))?,
             Insn::Jump(t) => return Ok(Flow::Next(*t)),
@@ -912,40 +951,33 @@ fn self_recursive(program: &Expr) -> bool {
     })
 }
 
-/// The environment variable that turns the call machine on (#7977): `1` routes the programs
-/// it [`takes`] to it, `0` or unset keeps every program on the shipped routes. It is a runtime
-/// switch, not a feature, so one binary can be measured both ways (#7961); it defaults to off
-/// until the machine is the default.
-#[cfg(feature = "std")]
-pub(crate) const SWITCH_ENV: &str = "SUCCINCTLY_CALL_MACHINE";
+/// Whether the machine is on for this process ([`set_switched_on`]); off until a caller turns it
+/// on. The library reads no environment: the CLI turns it on from `SUCCINCTLY_CALL_MACHINE`
+/// (`jq_runner/call_machine.rs`, #7961).
+static ON: AtomicBool = AtomicBool::new(false);
 
-/// The environment variable naming a file each [`takes`] decision appends `taken` or `declined`
-/// to, one line each, while [`SWITCH_ENV`] is on. The corpus harness
-/// (`scripts/call_machine/check.py`) and `tests/jq_cli/i7977.rs` read it to tell a program the
-/// machine answered from one it declined, which the outputs alone cannot.
-#[cfg(feature = "std")]
-pub(crate) const DECISION_LOG_ENV: &str = "SUCCINCTLY_DEBUG_CALL_MACHINE_LOG";
-
-/// Whether `value`, the content of [`SWITCH_ENV`], turns the machine on: any non-empty value but
-/// `0`, as the other `SUCCINCTLY_DEBUG_JQ_*` switches read theirs.
-#[cfg(feature = "std")]
-fn switch_value_on(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_some_and(|value| !value.is_empty() && value != "0")
-}
-
-/// Whether [`SWITCH_ENV`] is on, read once per process. Everything that could hand a program to
-/// the machine asks this first, so with the switch off the machine costs one load per question.
-/// `no_std` has no environment, so there the machine is off.
+/// Whether the machine is on. Everything that could hand a program to the machine asks this
+/// first, so with it off the machine costs one load per question and nothing else.
 #[inline]
 pub(super) fn switched_on() -> bool {
-    #[cfg(feature = "std")]
-    {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| switch_value_on(std::env::var_os(SWITCH_ENV).as_deref()))
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        false
+    ON.load(Ordering::Relaxed)
+}
+
+/// Turn the machine on or off ([`super::set_call_machine`]).
+pub(super) fn set_switched_on(on: bool) {
+    ON.store(on, Ordering::Relaxed);
+}
+
+/// The function told of each routing decision while the machine is on
+/// ([`super::observe_call_machine`]).
+#[cfg(feature = "std")]
+static OBSERVER: std::sync::Mutex<Option<fn(bool)>> = std::sync::Mutex::new(None);
+
+/// Install `observer` ([`super::observe_call_machine`]).
+#[cfg(feature = "std")]
+pub(super) fn set_observer(observer: Option<fn(bool)>) {
+    if let Ok(mut slot) = OBSERVER.lock() {
+        *slot = observer;
     }
 }
 
@@ -981,14 +1013,13 @@ pub(super) fn takes(program: &Expr) -> bool {
     }
 }
 
-/// The routing rule: a program with a self-recursive `def`, no input builtin, and every node one
-/// [`compile`] accepts. The compiler is the decliner, so there is one definition of what the
-/// machine runs.
+/// The routing rule: a program with a self-recursive `def` whose every node [`compile`] accepts
+/// (it declines the input builtins among the rest). The compiler is the decliner, so there is one
+/// definition of what the machine runs.
 #[cold]
 #[inline(never)]
 fn decide(program: &Expr) -> bool {
     let answer = self_recursive(program)
-        && !crate::jq::walk::uses_input_builtins(program)
         && with_prelude(|prelude| {
             let it = Interp::new(prelude);
             compile::compile(&it, program).is_ok()
@@ -997,21 +1028,21 @@ fn decide(program: &Expr) -> bool {
     answer
 }
 
-/// Append the decision to [`DECISION_LOG_ENV`]'s file, if it names one.
+/// Tell the observer, if one is installed, of a decision.
 fn note_decision(taken: bool) {
     #[cfg(feature = "std")]
-    if let Some(path) = std::env::var_os(DECISION_LOG_ENV) {
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(path)
-        {
-            let _ = writeln!(file, "{}", if taken { "taken" } else { "declined" });
-        }
+    if let Some(observer) = OBSERVER.lock().ok().and_then(|slot| *slot) {
+        observer(taken);
     }
     #[cfg(not(feature = "std"))]
     let _ = taken;
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The instructions [`Vm::step`] ran on this thread, by name, for the instruction test.
+    static EXECUTED: core::cell::RefCell<alloc::collections::BTreeSet<&'static str>> =
+        const { core::cell::RefCell::new(alloc::collections::BTreeSet::new()) };
 }
 
 #[cfg(test)]
