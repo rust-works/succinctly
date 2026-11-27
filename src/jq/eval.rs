@@ -188673,7 +188673,26 @@ mod tests {
     /// instrumentation for reasons that have nothing to do with the gate.
     /// 40 levels is ~10^12 expansions unmemoized — this test does not need a
     /// timing assertion to fail, it simply would not finish.
+    /// The memo the test below depends on, over a chain short enough for any stack: `f1`'s body
+    /// walks `f0` twice and the second walk is answered from the memo. The deep test is ignored
+    /// under `cfg(coverage)`, and this one keeps the memo's hit covered there.
     #[test]
+    fn write_shape_gate_answers_a_repeated_body_from_its_memo_2091() {
+        let filter = "def f0: .a = 1; def f1: f0|f0; def f2: f1|f1; f2";
+        assert!(is_alias_sensitive_assign(&parse(filter).expect("parses")));
+        let reshaping = filter.replacen("def f0: .a = 1;", "def f0: map(.);", 1);
+        assert!(!is_alias_sensitive_assign(
+            &parse(&reshaping).expect("parses")
+        ));
+    }
+
+    #[test]
+    #[cfg_attr(
+        coverage,
+        ignore = "ARM64 Linux coverage frames put its 40-deep def chain past the 2 MiB test stack \
+                  (it needs ~1985 KiB in a coverage-instrumented aarch64 macOS build); it still runs \
+                  in the plain Test legs; see the stack-headroom follow-up linked from #7617"
+    )]
     fn write_shape_gate_is_not_exponential_in_def_nesting_2091() {
         let mut filter = String::from("def f0: .a = 1;");
         let mut prev = String::from("f0");
