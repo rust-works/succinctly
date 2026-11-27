@@ -307,6 +307,51 @@ fn a_write_right_side_re_emits_only_after_an_empty_stage_8002() -> Result<()> {
     Ok(())
 }
 
+/// The rule asks the stages before a candidate only when the body answered nothing, and leaves the
+/// target alone when they matched and a later stage emptied the node (`. | 3 | select(false)`).
+#[test]
+fn a_body_whose_prefix_matched_is_left_as_it_answered_8002() -> Result<()> {
+    const XY: &str = "{\"x\":1,\"y\":2}";
+    for (input, filter, expected) in [
+        (XY, "map_values(select(true) | 3)", "{\"x\":3,\"y\":3}\n"),
+        (
+            XY,
+            "map_values(. | 3 | select(false))",
+            "{\"x\":1,\"y\":2}\n",
+        ),
+        (XY, ".x |= (. | 3 | select(false))", "{\"x\":1,\"y\":2}\n"),
+        (
+            XY,
+            "with_entries(. | {\"key\":\"z\",\"value\":1} | select(false))",
+            "{}\n",
+        ),
+        (
+            XY,
+            "map_values(select(key == \"x\") | 3 | select(false))",
+            "{\"x\":1,\"y\":2}\n",
+        ),
+        (
+            "{\"x\":[1]}",
+            ".x |= [.[] | 3 | select(false)]",
+            "{\"x\":[]}\n",
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, input, &["-p=json", "-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+    // A body that reads path context is positioned at each member, and its `error` raises there.
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(
+        "map_values(select(key == \"zz\") | error(\"x\"))",
+        XY,
+        &["-p=json", "-o=json", "-I0"],
+    )?;
+    assert_ne!(code, 0);
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, "Error: x\n");
+    Ok(())
+}
+
 /// `--eval-all` and `-i` take routes of their own and answer the same.
 #[test]
 fn the_rule_holds_under_eval_all_and_inplace_8002() -> Result<()> {
