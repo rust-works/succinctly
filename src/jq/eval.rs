@@ -5465,9 +5465,11 @@ pub(crate) fn yq_stage_can_reemit_in(expr: &Expr, arrays: bool) -> bool {
 /// candidate yields anything over the context, or `None` to give up (it raised; the run that
 /// answered nothing did not, so the generic route gives up the same way).
 ///
-/// A candidate, and every stage after it, must read no path context (`key`, `path`, `parent`) as
-/// written: the node a candidate emits is a new one with no position of its own, and a `key`
-/// after it would otherwise read the target's (`select(false) | 3 | key` writes nothing in yq).
+/// Every stage after a candidate must read no path context (`key`, `path`, `parent`) as written:
+/// the node a candidate emits is a new one with no position of its own, and a `key` after it
+/// would otherwise read the target's (`select(false) | 3 | key` writes nothing in yq). The
+/// candidate's own reads are of the empty context and drop out of what it emits
+/// (`select(false) | [key]` is `[]`, #8034); one that the rewrite keeps declines it too.
 ///
 /// `None` for a body with no such stage, the common case, which costs one walk of its stages.
 pub(crate) fn yq_reemit_after_empty_stage(
@@ -5506,12 +5508,18 @@ fn yq_reemit_after_empty_stage_as(
         if !yq_stage_can_reemit(&written_flat[at]) {
             continue;
         }
-        if written_flat[at..].iter().any(needs_path_context) {
+        if written_flat[at + 1..].iter().any(needs_path_context) {
             return None;
         }
         let Some(head) = yq_empty_context_reemit(&written_flat[at]) else {
             continue; // patchcov: coverage tolerate-line reason="an object with a computed key (`{(\"a\" + \"b\"): 1}`) may re-emit and then declines; the plain pipe declines it the same way (#6943), so no row of yq's answer can pin it"
         };
+        // The candidate's own reads are of the empty context, which the rewrite drops (#8034):
+        // `select(false) | [key]` is `[]` and `select(false) | (1, key)` is `1` in yq. Only a
+        // read the rewrite keeps would stand at the target's position.
+        if needs_path_context(&head) {
+            return None;
+        }
         if prefix_matched(&Expr::pipe(flat[..at].to_vec()))? {
             continue;
         }
