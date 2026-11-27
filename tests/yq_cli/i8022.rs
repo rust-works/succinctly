@@ -155,7 +155,8 @@ fn a_fold_without_errors_is_unchanged_8022() -> Result<()> {
 
 /// jq's `reduce` evaluates INIT first and never reads the source of an empty INIT, and is
 /// unchanged (jq 1.7.1: `i`, nothing, `s`). yq-mode `reduce` (behind `--jq-extensions`) takes
-/// yq's order, as it takes yq's accumulator list (#6802).
+/// yq's order, as it takes yq's accumulator list (#6802): a recorded divergence from jq, where
+/// `reduce error("s") as $x (error("i"); .)` is `i` (`docs/compliance/yq/limitations.md`).
 #[test]
 fn jq_reduce_keeps_init_first_8022() -> Result<()> {
     for (filter, expected_stderr, expected_code) in [
