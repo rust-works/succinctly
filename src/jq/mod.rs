@@ -113,6 +113,8 @@ mod math;
 mod onig_capture_loop;
 #[cfg(feature = "regex")]
 mod onig_end_search;
+#[cfg(feature = "onig-engine")]
+mod onig_ffi;
 #[cfg(feature = "regex")]
 mod onig_fold;
 #[cfg(feature = "regex")]
