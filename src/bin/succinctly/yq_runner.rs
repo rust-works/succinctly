@@ -7882,7 +7882,14 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
                 let detached = jq::walk::contains_builtin(cond, |b| {
                     matches!(b, Builtin::EvalExpr(..) | Builtin::Load(..))
                 });
-                inexact |= detached;
+                // The cursor reads a scalar's value and through an alias as the owned value does,
+                // so a condition that yq answers from the text or the alias node itself
+                // (`. == true` on `True`, `has("p")` on `*x`) is not resolved there either.
+                inexact |= detached
+                    || jq::yq_condition_reads_differently_on_owned(
+                        cond,
+                        cursor.index().has_aliases(),
+                    );
                 detached
                     || jq::walk::any_subexpr(cond, &mut |e| {
                         matches!(e, Expr::FuncCall { .. } | Expr::DefCall { .. })

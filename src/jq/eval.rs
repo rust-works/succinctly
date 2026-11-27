@@ -83769,12 +83769,119 @@ fn yq_slot_rewrite_is_sound(navigation: &[Expr], tail: &[Expr]) -> bool {
     !(reads_metadata || key_after_key || walks_through_aliases)
 }
 
+/// Whether a yq `select` condition reads values alone, so the owned value answers it exactly as the
+/// document does (#8020): navigation, literals, comparisons, arithmetic, `and`/`or`/`not`, `//`,
+/// and a short list of builtins over values (`length`, `has`, `contains`, `test`, ...). An
+/// allowlist: every metadata read (`style`, `line_comment`, `tag`, `type`, `kind`, `anchor`, ...),
+/// `eval`, a call of a `def`, a variable and any builtin not listed answers `false`.
+fn yq_condition_is_value_only(cond: &Expr) -> bool {
+    use Builtin as B;
+    let within = yq_condition_is_value_only;
+    match cond {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate
+        | Expr::Literal(_)
+        | Expr::Not => true,
+        Expr::Optional(inner) | Expr::Paren(inner) | Expr::Negate(inner) => within(inner),
+        Expr::Pipe(stages) => stages.iter().all(within),
+        Expr::Comma(items) => items.iter().all(within),
+        Expr::Compare { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
+            within(left) && within(right)
+        }
+        Expr::And(left, right) | Expr::Or(left, right) | Expr::Alternative(left, right) => {
+            within(left) && within(right)
+        }
+        Expr::Builtin(builtin) => match builtin {
+            B::Length
+            | B::Keys
+            | B::KeysUnsorted
+            | B::ToString
+            | B::ToNumber
+            | B::AsciiDowncase
+            | B::AsciiUpcase
+            | B::Downcase
+            | B::Upcase => true,
+            B::Select(arg)
+            | B::Has(arg)
+            | B::Contains(arg)
+            | B::Startswith(arg)
+            | B::Endswith(arg)
+            | B::Test(arg) => within(arg),
+            B::TestFlags(re, flags) => within(re) && within(flags),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether a values-only `select` condition can still answer differently on the owned value than on
+/// yq's document (#8020), which keeps a node yq leaves:
+///
+/// - The owned value lost scalar spellings: yq compares a scalar's text, so `True == true` and
+///   `True != "True"` are both false there, and `~ | tostring` is `"~"`. So `tostring`, and a `!=`
+///   or an `==` against `true`, `false` or `null` over a node's own value, count.
+/// - With `aliased`, the owned value expanded aliases and merge keys: yq's `has`, `length`, `keys`,
+///   `tostring`, `contains`, `test` and the string predicates see an alias node itself
+///   (`*x | has("p")` is false in yq). Those count too.
+#[doc(hidden)]
+pub fn yq_condition_reads_differently_on_owned(cond: &Expr, aliased: bool) -> bool {
+    use Builtin as B;
+    let nullish = |e: &Expr| {
+        matches!(
+            unwrap_paren(e),
+            Expr::Literal(Literal::Null | Literal::Bool(_))
+        )
+    };
+    // An operand that reads a node's own value, which is what yq compares by its text; a
+    // metadata reader's answer (`style != ""`) is a fresh string, the same in both.
+    fn node_value(e: &Expr) -> bool {
+        match unwrap_paren(e) {
+            Expr::Identity
+            | Expr::Field(_)
+            | Expr::Index { .. }
+            | Expr::Slice { .. }
+            | Expr::ArrayKey(_)
+            | Expr::Iterate => true,
+            Expr::Optional(inner) => node_value(inner),
+            Expr::Pipe(stages) => stages.iter().all(node_value),
+            _ => false,
+        }
+    }
+    any_subexpr(cond, &mut |e| match e {
+        Expr::Builtin(B::ToString) => true,
+        Expr::Compare { op, left, right } => {
+            (node_value(left) || node_value(right))
+                && (matches!(op, CompareOp::Ne)
+                    || (matches!(op, CompareOp::Eq) && (nullish(left) || nullish(right))))
+        }
+        Expr::Builtin(
+            B::Has(_)
+            | B::Length
+            | B::Keys
+            | B::KeysUnsorted
+            | B::Contains(_)
+            | B::Test(_)
+            | B::TestFlags(..)
+            | B::Startswith(_)
+            | B::Endswith(_)
+            | B::AsciiDowncase
+            | B::AsciiUpcase
+            | B::Downcase
+            | B::Upcase,
+        ) => aliased,
+        _ => false,
+    })
+}
+
 /// Whether a `del()` navigation stage reaches on the owned value exactly the nodes yq reaches on the
-/// document (#8020): pure navigation only -- keys, indexes, slices, `.[]` and `..` (the caller
-/// guards `..` on a document with aliases). An allowlist, and deliberately one without `select`:
-/// the owned value expands aliases and merge keys and loses scalar spellings (`True`, `~`), so even
-/// a condition over values alone (`has("p")`, `. == true`) can keep nodes yq leaves. A `select` is
-/// resolved on the document's cursor before it gets here, or the tail stays parentless.
+/// document (#8020): an allowlist. Keys, indexes, slices, `.[]` and `..` pass (the caller guards
+/// `..` on a document with aliases), and so does a `select` over a condition of values alone
+/// ([`yq_condition_is_value_only`]) unless it reads one of the values the owned value holds
+/// differently ([`yq_condition_reads_differently_on_owned`]).
 fn yq_owned_navigation_is_exact(stage: &Expr) -> bool {
     match stage {
         Expr::Identity
@@ -83785,6 +83892,10 @@ fn yq_owned_navigation_is_exact(stage: &Expr) -> bool {
         | Expr::Iterate
         | Expr::RecursiveDescent
         | Expr::RecursiveDescentWithKeys => true,
+        Expr::Builtin(Builtin::Select(cond)) => {
+            yq_condition_is_value_only(cond)
+                && !yq_condition_reads_differently_on_owned(cond, alias_identity::active())
+        }
         Expr::Optional(inner) | Expr::Paren(inner) => yq_owned_navigation_is_exact(inner),
         Expr::Pipe(stages) => stages.iter().all(yq_owned_navigation_is_exact),
         Expr::Comma(items) => items.iter().all(yq_owned_navigation_is_exact),
