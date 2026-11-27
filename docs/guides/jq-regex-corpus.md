@@ -38,6 +38,7 @@ python3 scripts/jq-regex-corpus.py validate res main
 - `--standalone K` runs every K-th row as its own process, with the pattern as a literal in the program and no `try`.
   `validate` then checks that the batched answer equals that run's stdout, stderr and exit status.
 - `--env K=V` passes a variable to the binary, for a build that chooses its engine at run time.
+  A build with `--features cli,onig-engine` runs jq mode on the vendored Oniguruma under `--env SUCCINCTLY_REGEX_ONIG=1`, and on the default engine otherwise.
 
 On an M4 Pro with four workers, a release `succinctly` build took 11 seconds for the batched run and 10 seconds for `--standalone 40` (2026-11-27).
 
@@ -59,7 +60,7 @@ There are three causes:
 
 ## Baseline
 
-Measured on macOS arm64 with release `--features cli` builds, on 2026-11-24 (main and the C prototypes) and 2026-11-27 (ferroni):
+Measured on macOS arm64 with release `--features cli` builds, on 2026-11-24 (main and the C prototypes) and 2026-11-27 (ferroni, and the vendored pin with `onig-engine` and `SUCCINCTLY_REGEX_ONIG=1`):
 
 | Build                                                           | equal to jq 1.7.1 | follow jq 1.8.2 | differ from both |
 |-----------------------------------------------------------------|-------------------|-----------------|------------------|
@@ -67,6 +68,8 @@ Measured on macOS arm64 with release `--features cli` builds, on 2026-11-24 (mai
 | C Oniguruma 6.9.9 (prototype through the `onig` crate)          | 458,156           | 1,411           | 111              |
 | C Oniguruma 6.9.10                                              | 453,292           | 6,273           | 113              |
 | ferroni 2.9.0, the two post-pin syntax flags of Perl_NG cleared | 451,449           | 1,394           | 6,835            |
+| C Oniguruma at the pin `d2f1a14ced`, with the `f_match` port    | 458,259           | 1,419           | 0                |
 
 The standalone control agrees with the batch on all 11,492 sampled rows for both jq builds and each candidate.
+The pin's 1,419 rows that follow jq 1.8.2 are all the adopted empty-match captures (#7520); the prototype's 111 were jq's byte step after an empty match, which the port reproduces (#7965).
 On main it agrees on 11,487: four are error texts longer than the driver keeps, and one batch was stopped by the RSS cap.
