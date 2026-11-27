@@ -38,7 +38,7 @@ python3 scripts/jq-regex-corpus.py validate res main
 - `--standalone K` runs every K-th row as its own process, with the pattern as a literal in the program and no `try`.
   `validate` then checks that the batched answer equals that run's stdout, stderr and exit status.
 - `--env K=V` passes a variable to the binary, for a build that chooses its engine at run time.
-  A `cli` build runs jq mode on the vendored Oniguruma under `--env SUCCINCTLY_REGEX_ONIG=1`, and on the default engine under `=0` or without it.
+  A `cli` build runs jq mode on the vendored Oniguruma; `--env SUCCINCTLY_REGEX_ONIG=0` selects the earlier engine, for a run against it, until it is removed.
 
 On an M4 Pro with four workers, a release `succinctly` build took 11 seconds for the batched run and 10 seconds for `--standalone 40` (2026-11-27).
 

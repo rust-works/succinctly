@@ -124,20 +124,16 @@ fn test_n_flag_backtracks_to_a_non_empty_match_5530() -> Result<()> {
     ])
 }
 
-/// A pattern with a lazy quantifier keeps `l` as a no-op: `fancy-regex`'s longest-match mode
-/// returns the lazy match, where Oniguruma returns the longest of all the ways to match
-/// (`"aa" | match("a*?"; "l")` is `"aa"` in jq 1.7.1). Pinned as the divergence it is
-/// (docs/compliance/jq/limitations.md), so closing it is a visible change.
+/// `l` over a lazy quantifier returns the longest of all the ways to match, as Oniguruma does:
+/// `"aa" | match("a*?"; "l")` is `"aa"` in jq 1.7.1, with `n` too. The earlier engine returned the
+/// lazy match (`""`, and no match under `ln`), a recorded divergence; it now matches jq 1.7.1
+/// (#7965).
 #[test]
-fn test_l_flag_on_a_lazy_quantifier_is_still_a_no_op_5530() -> Result<()> {
-    let (stdout, stderr, code) = run(r#""aa" | [match("a*?"; "l") | .string]"#)?;
-    assert_eq!((stdout.trim_end(), code), (r#"[""]"#, 0), "stderr {stderr}");
-    // The same pattern with `n` is not affected by `l` being a no-op: `ln` keeps its old route
-    // whole, so it also keeps the skip-forward `n`, which finds no match for a lazy empty-first
-    // pattern that matches nothing else at its start.
-    let (stdout, _, code) = run(r#""aa" | [match("a*?"; "ln") | .string]"#)?;
-    assert_eq!((stdout.trim_end(), code), ("[]", 0));
-    Ok(())
+fn test_l_flag_on_a_lazy_quantifier_takes_the_longest_match_5530() -> Result<()> {
+    assert_rows(&[
+        (r#""aa" | [match("a*?"; "l") | .string]"#, r#"["aa"]"#),
+        (r#""aa" | [match("a*?"; "ln") | .string]"#, r#"["aa"]"#),
+    ])
 }
 
 /// The compiled-regex cache (#5531) is keyed by pattern and flags. `l` and `n` change the engine

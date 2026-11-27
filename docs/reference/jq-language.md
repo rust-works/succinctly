@@ -695,15 +695,12 @@ divergences (`inputs | f` does not interleave) are recorded in
 
 1. **Variable scoping** - May not perfectly match jq edge cases
 2. **Error messages** - byte-identical to jq-1.7.1 across the probe corpus in `tests/data/jq-error-probes.tsv`, bar the probes on which succinctly raises no error at all; those and the reverse case (succinctly errors where jq answers) are enumerated in [jq Known Limitations](../compliance/jq/limitations.md)
-3. **Regex `l`/`n` flags** - `l` (POSIX leftmost-longest matching) is accepted
-   as valid flag syntax but has no effect (`match("a|aa|aaa";"l")` returns
-   `"a"`, not real jq's `"aaa"`); `n` (suppress empty matches) has a narrower
-   gap for lazy quantifiers and empty-first alternations, where a non-empty
-   match exists but is only reachable via backtracking a Thompson-NFA-based
-   engine doesn't do. Both are permanent, documented limitations, not pending
-   work — [ADR-0019](../adrs/adr-0019.md) rejected swapping the regex engine
-   to close them (#920, #922); [ADR-0031](../adrs/adr-0031.md) supersedes it,
-   and both close when jq mode moves to Oniguruma (#7965)
+3. **Regex** - jq-mode patterns compile and match with the Oniguruma that jq 1.7.1
+   bundles, through a port of jq's `f_match` ([ADR-0031](../adrs/adr-0031.md), #7965),
+   so the `l` and `n` flags, look-around, back-references and Oniguruma's error messages
+   behave as in jq; the few differences left (jq 1.8.2's empty-match captures, the
+   511-group nesting limit, a search jq never ends) are in
+   [jq Known Limitations](../compliance/jq/limitations.md#regular-expressions-run-on-jq-171s-oniguruma-7965)
 
 ---
 

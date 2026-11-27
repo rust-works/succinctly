@@ -87,18 +87,21 @@ fn a_malformed_hex_brace_escape_is_refused_as_jq_does_6251() -> Result<()> {
     Ok(())
 }
 
-/// A surrogate or a value past U+10FFFF as an end of a range in a class: jq clamps the range, which is
-/// not reproduced. It stays refused, not read as an empty set that would answer `[]` where jq answers.
+/// A surrogate or a value past U+10FFFF as an end of a range in a class: jq clamps the range, and a
+/// range that starts past its end is refused. The earlier engine refused all four, a recorded
+/// divergence; they now match jq 1.7.1 (#7965).
 #[test]
-fn a_range_ending_in_a_non_character_hex_escape_stays_refused_6251() -> Result<()> {
-    for pattern in [
-        r"[a-\x{D800}]",
-        r"[\x{D800}-z]",
-        r"[\x{D800}-\x{DFFF}]",
-        r"[a-\x{110000}]",
+fn a_range_ending_in_a_non_character_hex_escape_is_clamped_6251() -> Result<()> {
+    for (pattern, expected) in [
+        (r"[a-\x{D800}]", "[\"a\",\"é\",\"Ā\",\"ÿ\"]"),
+        (r"[\x{D800}-\x{DFFF}]", "[]"),
+        (r"[a-\x{110000}]", "[\"a\",\"é\",\"Ā\",\"ÿ\"]"),
     ] {
         let (stdout, _, status) = matches(pattern)?;
-        assert_eq!((stdout.as_str(), status), ("", 5), "{pattern}");
+        assert_eq!((stdout.as_str(), status), (expected, 0), "{pattern}");
     }
+    let (stdout, stderr, status) = matches(r"[\x{D800}-z]")?;
+    assert_eq!((stdout.as_str(), status), ("", 5));
+    assert!(stderr.contains("empty range in char class"), "{stderr}");
     Ok(())
 }

@@ -1,8 +1,8 @@
 //! #6096: `fancy-regex` 0.20.0 (the second engine, taken for lookaround, a backreference, `\\K`, ...)
 //! answers wrongly for two greedy `X+` repeats of one expression with a single repeat that can match
 //! nothing between them: `"a" | test("(?=a)a+a*a+")` is `true`, and jq and the `regex` crate say
-//! `false`. The shape is refused on that engine (`Regex failure`), as other unverified constructs are,
-//! and keeps its normal route when nothing else needs the second engine, `l` and `n` included.
+//! `false`. The shape was refused on that engine (`Regex failure`), as other unverified constructs
+//! were, a recorded divergence; on Oniguruma it answers as jq 1.7.1 does (#7965).
 //! Every other expectation is what `/usr/bin/jq` 1.7.1 printed for `test($p; $f)`.
 
 use anyhow::Result;
@@ -21,38 +21,87 @@ fn test_on(text: &str, pattern: &str, flags: &str) -> Result<String> {
     Ok(stdout.trim().to_string())
 }
 
-/// A lookahead that is always true puts the pattern on the second engine; these are the shapes
-/// the engine gets wrong, refused whatever the text (it answered some texts right, `aa`, and not
-/// others, `a`, and a pattern cannot tell which).
+/// A lookahead that is always true put the pattern on the second engine; these are the shapes
+/// that engine got wrong, so it refused them whatever the text, a recorded divergence. Each row is
+/// now jq 1.7.1's answer (#7965).
 #[test]
-fn a_squeezed_plus_run_on_the_second_engine_is_refused() -> Result<()> {
-    const SHAPES: &[&str] = &[
-        r"(?=[\s\S])a+a*a+",
-        r"(?=[\s\S])a+a?a+",
-        r"(?=[\s\S])a+a{0,3}a+",
-        r"(?=[\s\S])a{1,}a*a{1,}",
-        r"(?=[\s\S])a*a+a*a+",
-        r"(?=[\s\S])a+a*a+a*a+",
-        r"(?=[\s\S])a+b*a+",
-        r"(?=[\s\S])a+.*a+",
-        r"(?=[\s\S])a+.?a+",
-        r"(?=[\s\S])a+(?:b)*a+",
-        r"(?=[\s\S])a+b{0,2}a+",
-        r"(?=[\s\S])a+b*a+c",
-        r"(?=[\s\S])a+\d*a+",
-        r"(?=[\s\S])a+\s*a+",
-        r"(?=[\s\S])[a]+b*[a]+",
-        r"(?=[\s\S])(?:ab)+c*(?:ab)+",
-        r"(?=[\s\S])a+b*a+b*a+",
+fn a_squeezed_plus_run_on_the_second_engine_answers_as_jq_does() -> Result<()> {
+    const ROWS: &[(&str, &str, &str, &str)] = &[
+        (r"a", r"(?=[\s\S])a+a*a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+a*a+", "", r"true"),
+        (r"aba", r"(?=[\s\S])a+a*a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+a*a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+a?a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+a?a+", "", r"true"),
+        (r"aba", r"(?=[\s\S])a+a?a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+a?a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+a{0,3}a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+a{0,3}a+", "", r"true"),
+        (r"aba", r"(?=[\s\S])a+a{0,3}a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+a{0,3}a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a{1,}a*a{1,}", "", r"false"),
+        (r"aa", r"(?=[\s\S])a{1,}a*a{1,}", "", r"true"),
+        (r"aba", r"(?=[\s\S])a{1,}a*a{1,}", "", r"false"),
+        (r"ba", r"(?=[\s\S])a{1,}a*a{1,}", "", r"false"),
+        (r"a", r"(?=[\s\S])a*a+a*a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a*a+a*a+", "", r"true"),
+        (r"aba", r"(?=[\s\S])a*a+a*a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a*a+a*a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+a*a+a*a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+a*a+a*a+", "", r"false"),
+        (r"aba", r"(?=[\s\S])a+a*a+a*a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+a*a+a*a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+b*a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+b*a+", "", r"true"),
+        (r"aba", r"(?=[\s\S])a+b*a+", "", r"true"),
+        (r"ba", r"(?=[\s\S])a+b*a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+.*a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+.*a+", "", r"true"),
+        (r"aba", r"(?=[\s\S])a+.*a+", "", r"true"),
+        (r"ba", r"(?=[\s\S])a+.*a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+.?a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+.?a+", "", r"true"),
+        (r"aba", r"(?=[\s\S])a+.?a+", "", r"true"),
+        (r"ba", r"(?=[\s\S])a+.?a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+(?:b)*a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+(?:b)*a+", "", r"true"),
+        (r"aba", r"(?=[\s\S])a+(?:b)*a+", "", r"true"),
+        (r"ba", r"(?=[\s\S])a+(?:b)*a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+b{0,2}a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+b{0,2}a+", "", r"true"),
+        (r"aba", r"(?=[\s\S])a+b{0,2}a+", "", r"true"),
+        (r"ba", r"(?=[\s\S])a+b{0,2}a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+b*a+c", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+b*a+c", "", r"false"),
+        (r"aba", r"(?=[\s\S])a+b*a+c", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+b*a+c", "", r"false"),
+        (r"a", r"(?=[\s\S])a+\d*a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+\d*a+", "", r"true"),
+        (r"aba", r"(?=[\s\S])a+\d*a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+\d*a+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+\s*a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+\s*a+", "", r"true"),
+        (r"aba", r"(?=[\s\S])a+\s*a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+\s*a+", "", r"false"),
+        (r"a", r"(?=[\s\S])[a]+b*[a]+", "", r"false"),
+        (r"aa", r"(?=[\s\S])[a]+b*[a]+", "", r"true"),
+        (r"aba", r"(?=[\s\S])[a]+b*[a]+", "", r"true"),
+        (r"ba", r"(?=[\s\S])[a]+b*[a]+", "", r"false"),
+        (r"a", r"(?=[\s\S])(?:ab)+c*(?:ab)+", "", r"false"),
+        (r"aa", r"(?=[\s\S])(?:ab)+c*(?:ab)+", "", r"false"),
+        (r"aba", r"(?=[\s\S])(?:ab)+c*(?:ab)+", "", r"false"),
+        (r"ba", r"(?=[\s\S])(?:ab)+c*(?:ab)+", "", r"false"),
+        (r"a", r"(?=[\s\S])a+b*a+b*a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])a+b*a+b*a+", "", r"false"),
+        (r"aba", r"(?=[\s\S])a+b*a+b*a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])a+b*a+b*a+", "", r"false"),
     ];
-    for pattern in SHAPES {
-        for text in ["a", "aa", "aba", "ba"] {
-            assert_eq!(
-                test_on(text, pattern, "")?,
-                r#""ERR""#,
-                "{text:?} ~ {pattern:?}"
-            );
-        }
+    for (text, pattern, flags, want) in ROWS {
+        assert_eq!(
+            test_on(text, pattern, flags)?,
+            *want,
+            "{text:?} ~ {pattern:?} [{flags}]"
+        );
     }
     Ok(())
 }
@@ -578,26 +627,43 @@ fn nearby_shapes_on_the_second_engine_still_agree_with_jq() -> Result<()> {
     Ok(())
 }
 
-/// The run is found wherever it sits: in a group, an alternation, an atomic group, a repeated group, a
-/// look-ahead and a look-behind.
+/// The run wherever it sits: in a group, an alternation, an atomic group, a repeated group, a
+/// look-ahead and a look-behind. The earlier engine refused each, a recorded divergence; each row
+/// is now jq 1.7.1's answer (#7965).
 #[test]
-fn a_squeezed_plus_run_nested_in_another_construct_is_refused() -> Result<()> {
-    const SHAPES: &[&str] = &[
-        r"(?=[\s\S])(a+a*a+)",
-        r"(?=[\s\S])(?:x|a+a*a+)",
-        r"(?=[\s\S])(?>a+a*a+)",
-        r"(?=[\s\S])(?:a+a*a+)+",
-        r"(?=[\s\S])b(?=a+a*a+)",
-        r"(?=[\s\S])(?<=x)a+a*a+",
+fn a_squeezed_plus_run_nested_in_another_construct_answers_as_jq_does() -> Result<()> {
+    const ROWS: &[(&str, &str, &str, &str)] = &[
+        (r"a", r"(?=[\s\S])(a+a*a+)", "", r"false"),
+        (r"xa", r"(?=[\s\S])(a+a*a+)", "", r"false"),
+        (r"ba", r"(?=[\s\S])(a+a*a+)", "", r"false"),
+        (r"aa", r"(?=[\s\S])(a+a*a+)", "", r"true"),
+        (r"a", r"(?=[\s\S])(?:x|a+a*a+)", "", r"false"),
+        (r"xa", r"(?=[\s\S])(?:x|a+a*a+)", "", r"true"),
+        (r"ba", r"(?=[\s\S])(?:x|a+a*a+)", "", r"false"),
+        (r"aa", r"(?=[\s\S])(?:x|a+a*a+)", "", r"true"),
+        (r"a", r"(?=[\s\S])(?>a+a*a+)", "", r"false"),
+        (r"xa", r"(?=[\s\S])(?>a+a*a+)", "", r"false"),
+        (r"ba", r"(?=[\s\S])(?>a+a*a+)", "", r"false"),
+        (r"aa", r"(?=[\s\S])(?>a+a*a+)", "", r"true"),
+        (r"a", r"(?=[\s\S])(?:a+a*a+)+", "", r"false"),
+        (r"xa", r"(?=[\s\S])(?:a+a*a+)+", "", r"false"),
+        (r"ba", r"(?=[\s\S])(?:a+a*a+)+", "", r"false"),
+        (r"aa", r"(?=[\s\S])(?:a+a*a+)+", "", r"true"),
+        (r"a", r"(?=[\s\S])b(?=a+a*a+)", "", r"false"),
+        (r"xa", r"(?=[\s\S])b(?=a+a*a+)", "", r"false"),
+        (r"ba", r"(?=[\s\S])b(?=a+a*a+)", "", r"false"),
+        (r"aa", r"(?=[\s\S])b(?=a+a*a+)", "", r"false"),
+        (r"a", r"(?=[\s\S])(?<=x)a+a*a+", "", r"false"),
+        (r"xa", r"(?=[\s\S])(?<=x)a+a*a+", "", r"false"),
+        (r"ba", r"(?=[\s\S])(?<=x)a+a*a+", "", r"false"),
+        (r"aa", r"(?=[\s\S])(?<=x)a+a*a+", "", r"false"),
     ];
-    for pattern in SHAPES {
-        for text in ["a", "xa", "ba", "aa"] {
-            assert_eq!(
-                test_on(text, pattern, "")?,
-                r#""ERR""#,
-                "{text:?} ~ {pattern:?}"
-            );
-        }
+    for (text, pattern, flags, want) in ROWS {
+        assert_eq!(
+            test_on(text, pattern, flags)?,
+            *want,
+            "{text:?} ~ {pattern:?} [{flags}]"
+        );
     }
     Ok(())
 }

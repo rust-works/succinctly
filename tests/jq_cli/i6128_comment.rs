@@ -118,14 +118,14 @@ fn test_a_repeat_after_a_comment_repeats_the_item_before_it_6128() -> Result<()>
     Ok(())
 }
 
-/// A comment after a quantifier followed by an interval or a lazy repeat is kept: `b*(?#){2}` is a
-/// repeat of a repeat in jq and `b*(?#)*?` a lazy repeat of `b*`, which the engines read another
-/// way inside a loop (`"bab"` whole, where jq answers `b`, `""`, `b`, `""`). An unfixed gap,
-/// recorded in `docs/compliance/jq/limitations.md`; the greedy `*`, `+` and `?` after a comment
-/// are merged since #6303 (`tests/jq_cli/i6303.rs`).
+/// A comment after a quantifier followed by an interval or a lazy repeat: `b*(?#){2}` is a repeat
+/// of a repeat in jq and `b*(?#)*?` a lazy repeat of `b*`. The earlier engine kept the comment and
+/// read them another way inside a loop (`"bab"` whole), a recorded divergence; on Oniguruma they
+/// match jq 1.7.1 (#7965). The greedy `*`, `+` and `?` after a comment were merged since #6303
+/// (`tests/jq_cli/i6303.rs`).
 #[test]
-fn test_a_comment_after_a_quantifier_is_kept_6128() -> Result<()> {
-    for (pattern, input, flags, jq_answer) in [
+fn test_a_comment_between_two_quantifiers_answers_as_jq_does_6128() -> Result<()> {
+    for (pattern, input, flags, expected) in [
         (
             r"(?:b*(?#){2}|a)+",
             "bab",
@@ -139,10 +139,10 @@ fn test_a_comment_after_a_quantifier_is_kept_6128() -> Result<()> {
             r#"[[0,0,""],[1,1,"a"],[2,0,""],[3,0,""]]"#,
         ),
     ] {
-        let ours = answer(pattern, input, flags)?;
-        assert_ne!(
-            ours, jq_answer,
-            "{pattern} on {input}: the gap closed, move the row up"
+        assert_eq!(
+            answer(pattern, input, flags)?,
+            expected,
+            "{pattern} on {input}"
         );
     }
     Ok(())

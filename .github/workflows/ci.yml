@@ -1521,7 +1521,7 @@ jobs:
       - name: Build the vendored Oniguruma and run its FFI tests
         run: cargo test --locked --lib --features regex jq::onig_ffi
 
-      # Step 3: jq's `f_match` ported onto the library, run with `SUCCINCTLY_REGEX_ONIG=1`
+      # jq's `f_match` ported onto the library, the default engine since step 4b
       # (`tests/jq_cli/i7965.rs`). The corpus gate itself is scripts/jq-regex-corpus.py's. Not on
       # Windows: `jq_cli_tests` does not compile there (its FIFO helpers are Unix-only), and the C
       # build above is what only Windows checks.

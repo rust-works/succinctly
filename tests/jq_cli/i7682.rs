@@ -238,15 +238,16 @@ fn a_possessive_plus_after_a_lazy_optional_and_a_plus_never_matches_under_n_7682
     Ok(())
 }
 
-/// The issue's second row is the `l` flag's limit, not the run's reading: `a{2,}?{2}` is
-/// `(?:a{2,}?){2}` here as in jq, and `l` stays a no-op on a pattern with a lazy quantifier
-/// (docs/compliance/jq/limitations.md, "Regex flags `l` and `n`"). jq 1.7.1 and 1.8.2 print `[6]`.
+/// The issue's second row is the `l` flag's reach, not the run's reading: `a{2,}?{2}` is
+/// `(?:a{2,}?){2}` here as in jq, and `l` takes the longest way through the lazy quantifier. The
+/// earlier engine left `l` a no-op on a pattern with a lazy quantifier (`[4]`), a recorded
+/// divergence; it now matches jq 1.7.1, which prints `[6]` (#7965).
 #[test]
-fn the_l_flag_over_a_repeated_lazy_interval_is_still_a_no_op_7682() -> Result<()> {
+fn the_l_flag_over_a_repeated_lazy_interval_takes_the_longest_match_7682() -> Result<()> {
     let out = run_jq_full(
         &["-nc", r#""aaaaaa" | [match("b|a{2,}?{2}"; "l") | .length]"#],
         None,
     )?;
-    assert_eq!(out, ("[4]\n".to_string(), String::new(), 0));
+    assert_eq!(out, ("[6]\n".to_string(), String::new(), 0));
     Ok(())
 }
