@@ -1520,13 +1520,30 @@ impl<'c, 'e> Vm<'c, 'e> {
         Ok(Flow::Next(f.entry))
     }
 
-    /// Drop the fork points at the top that can only answer nothing, so a loop whose round left
-    /// one (an update `. + 1, empty`, or `x // d` once `x` gave a truthy output) does not keep a
-    /// frame per round. A `FORK` resuming at a `BACKTRACK`, or at `//`'s check of a `found` slot
-    /// that is set, would backtrack at once with no effect, so dropping it, and lowering the
-    /// watermarks to what it saved, is the state its resumption would reach. The shipped
-    /// evaluators run these loops in constant memory too, stepping in place a round whose update
-    /// answers once.
+    /// Drop the fork points at the top that are dead: ones a backtrack would pass without
+    /// resuming any code and without changing what it carries. So a loop whose round left them
+    /// does not keep a frame per round: an update `. + 1, empty`, `x // d` once `x` gave a truthy
+    /// output, a finished `try` or label (`try (. + 1) catch 0`, `label $x | . + 1`), or
+    /// `first(. + 1, 0)`, whose `break` ends its label. The shipped evaluators run these loops in
+    /// constant memory too, stepping in place a round whose update answers once.
+    ///
+    /// A backtrack reaches the fork points at the top either with no error, when a later output
+    /// is asked for, or with an error the code above them raises later. Read by
+    /// [`Vm::backtrack`]'s arms, a run of fork points is dead when both come out of it as they
+    /// went in, with no code resumed:
+    /// - With no error, a `FORK` resuming at a `BACKTRACK`, at `//`'s check of a `found` slot
+    ///   that is set, or at a `break` passes, the last raising the break through the fork points
+    ///   below; `TRY_END` and a `try` pass.
+    /// - An error, the break included, passes a `FORK`, `EACH`, `RANGE` or a leaf's outputs;
+    ///   `TRY_END` wraps it and a `try` unwraps it again. A `try` it reaches unwrapped catches
+    ///   it, or swallows it (no `catch`), or stops it (a label's own break).
+    ///
+    /// For an error raised later that last is a change, so a `try` is passed only with its
+    /// `TRY_END` above it in the run: a `try` or label whose body has finished. For the break,
+    /// its own label's `try` ending it, or a `try` without `catch` swallowing it, is the end the
+    /// backtrack would reach. The longest run after which both readings are clean (no break in
+    /// flight, every `TRY_END` unwrapped) is dropped, and the watermarks are lowered to what its
+    /// lowest fork point saved: the state a backtrack through it would reach.
     #[cold]
     #[inline(never)]
     fn drop_dead_forks(&mut self) {
@@ -1534,28 +1551,67 @@ impl<'c, 'e> Vm<'c, 'e> {
         if !self.drops {
             return;
         }
-        while let Some(fork) = self.forks.last() {
-            let Kind::Branch(at) = fork.kind else {
-                break;
-            };
-            let dead = match self.code.insns[at] {
-                Insn::Backtrack => true,
-                Insn::JumpIfSet(s, t) => {
-                    matches!(self.code.insns[t], Insn::Backtrack) && fork.frames.0 >= 0 && {
-                        let base = self.frames.data[fork.frames.0 as usize].value.base as usize;
-                        matches!(&self.slots[base + s as usize], Slot::Val(v) if truthy(v))
+        // The `TRY_END`s an error raised later has passed and no `try` has unwrapped.
+        let mut wraps = 0u32;
+        // The break a backtrack with no error raises on its way down: its label's id, and the
+        // `TRY_END`s it has passed and no `try` has unwrapped.
+        let mut raised: Option<(u64, u32)> = None;
+        let mut cut = self.forks.len();
+        for i in (0..self.forks.len()).rev() {
+            let fork = &self.forks[i];
+            match fork.kind {
+                Kind::TryEnd => wraps += 1,
+                Kind::Try(_) if wraps > 0 => wraps -= 1,
+                Kind::Try(_) => break,
+                _ => {}
+            }
+            match (&fork.kind, raised) {
+                (Kind::Branch(at), None) => match self.code.insns[*at] {
+                    Insn::Backtrack => {}
+                    Insn::JumpIfSet(s, t)
+                        if matches!(self.code.insns[t], Insn::Backtrack)
+                            && matches!(self.slot_of(fork, 0, s), Some(Slot::Val(v)) if truthy(v)) =>
+                        {}
+                    Insn::Break(level, idx) => match self.slot_of(fork, level, idx) {
+                        Some(Slot::Val(OwnedValue::Int(id))) => raised = Some((*id as u64, 0)),
+                        _ => break,
+                    },
+                    _ => break,
+                },
+                (Kind::Each { .. } | Kind::Range { .. } | Kind::Values { .. }, None) => break,
+                (_, None) => {}
+                (Kind::TryEnd, Some((id, n))) => raised = Some((id, n + 1)),
+                (Kind::Try(_), Some((id, n))) if n > 0 => raised = Some((id, n - 1)),
+                (Kind::Try(Handler::None), Some(_)) => raised = None,
+                (Kind::Try(Handler::Label { id: own, .. }), Some((id, _))) => {
+                    if *own == id {
+                        raised = None;
                     }
                 }
-                _ => false,
-            };
-            if !dead {
-                break;
+                (Kind::Try(Handler::Code(_)), Some(_)) => break,
+                (_, Some(_)) => {}
             }
+            if wraps == 0 && raised.is_none() {
+                cut = i;
+            }
+        }
+        if let Some(fork) = self.forks.get(cut) {
             let (data, frames) = (fork.data.1, fork.frames.1);
-            self.forks.pop();
+            self.forks.truncate(cut);
             self.data.limit = data;
             self.frames.limit = frames;
         }
+    }
+
+    /// The slot `idx` of the frame `level` static links out from the one `fork` resumes in, as
+    /// the instruction it resumes at would read it ([`Vm::slot`]), if there is one.
+    fn slot_of(&self, fork: &Fork, level: u16, idx: u16) -> Option<&Slot> {
+        let mut f = fork.frames.0;
+        for _ in 0..level {
+            f = self.frames.data.get(usize::try_from(f).ok()?)?.value.env as isize;
+        }
+        let base = self.frames.data.get(usize::try_from(f).ok()?)?.value.base as usize;
+        self.slots.get(base + idx as usize)
     }
 
     /// The refusal of a call to `func` whose frame does not fit: named for it, or for the

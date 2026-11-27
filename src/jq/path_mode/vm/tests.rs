@@ -1840,3 +1840,159 @@ fn a_tail_jump_meets_each_bound_where_the_call_does_7977() {
         "the rows reach every bound"
     );
 }
+
+/// A loop whose update leaves a finished `try` or label behind (its `TRY_END` above it, nothing
+/// between), or `first`'s label with the `break` that ends it, runs in constant control state:
+/// the dead fork points are dropped at the next round. Within a 1 MiB budget, where a frame a
+/// round is refused long before (as it was until these were dropped); the shipped evaluators
+/// and jq answer these too.
+#[test]
+fn a_finished_try_or_label_is_dropped_at_the_next_round_7977() {
+    let limits = small(1 << 20, 1 << 24, 1 << 20);
+    for update in [
+        "try (. + 1) catch 0",
+        "try (. + 1)",
+        "label $x | . + 1",
+        "first(. + 1, 0)",
+        "label $x | (. + 1, break $x)",
+        "label $a | label $b | (. + 1, break $a)",
+        "try (label $x | (. + 1, break $x)) catch 99",
+        "try (try (. + 1) catch 0) catch 1",
+    ] {
+        for filter in [
+            format!("0 | until(. >= 100000; {update})"),
+            format!("[0 | while(. < 100000; {update})] | length"),
+            format!("def f: if . < 100000 then ({update}) | f else . end; 0 | f"),
+        ] {
+            assert_eq!(machine_within(limits, &filter), ok(&["100000"]), "{filter}");
+            let kept = machine_built(
+                limits,
+                &filter,
+                Build {
+                    drops: false,
+                    ..Build::SHIPPED
+                },
+            );
+            let refusal = kept.ok().and_then(|answer| answer.error);
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|e| e.ends_with("exceeded maximum recursion depth")),
+                "{filter}: kept, the fork points meet the budget: {refusal:?}"
+            );
+        }
+    }
+}
+
+/// A `try` or label that can still answer is kept: one whose body can still output, whose
+/// `catch` can still fire, or whose label a `break` still pending can reach, and a `try` an
+/// error raised later passes through. Every answer is jq 1.7.1's.
+#[test]
+fn a_try_or_label_that_can_still_answer_is_kept_7977() {
+    for (filter, want) in [
+        (
+            "[0 | until(. >= 3; try (. + 1, . + 10) catch 0)]",
+            "[3,12,11,10]",
+        ),
+        (
+            r#"[0 | until(. >= 3; try (. + 1, error("x")) catch 100)]"#,
+            "[3,100,100,100]",
+        ),
+        (r#"[0 | until(. >= 3; try (. + 1, error("x")))]"#, "[3]"),
+        (
+            "[label $out | 0 | until(. >= 3; (. + 1, break $out))]",
+            "[3]",
+        ),
+        (
+            "[label $out | 0 | until(. >= 3; label $x | . + 1) | ., break $out]",
+            "[3]",
+        ),
+        (
+            "[0 | until(. >= 3; label $x | try (. + 1, break $x) catch 99)]",
+            "[3,99,99,99]",
+        ),
+        (
+            r#"try (0 | until(. >= 3; try (. + 1) catch 0) | error("later")) catch "outer""#,
+            r#""outer""#,
+        ),
+        (
+            r#"try ([0 | until(. >= 3; label $x | (. + 1, error("e")))]) catch ."#,
+            r#""e""#,
+        ),
+        ("[0 | until(. >= 3; first(. + 1, 0))]", "[3]"),
+        (
+            "[0 | until(. >= 3; label $a | label $b | (. + 1, break $a))]",
+            "[3]",
+        ),
+    ] {
+        assert_eq!(machine(filter), ok(&[want]), "{filter}");
+    }
+}
+
+/// Zero-argument tail loops and `$` argument loops, plain and nested, whose rounds pass through
+/// an update that leaves fork points of every kind behind: `,`, `//`, `try`, label, `first`,
+/// and a pending `break` or error.
+fn tail_loop_program() -> impl Strategy<Value = String> {
+    let once = prop_oneof![
+        Just(". + 1"),
+        Just("(. + 1, empty)"),
+        Just("((. + 1) // 0)"),
+        Just("(null // . + 1)"),
+        Just("(try (. + 1) catch 0)"),
+        Just("(. + 1)?"),
+        Just("(label $x | . + 1)"),
+        Just("(label $x | (. + 1, break $x))"),
+        Just("first(. + 1, 0)"),
+        Just("(label $a | label $b | (. + 1, break $a))"),
+        Just("(try (label $x | (. + 1, break $x)) catch 99)"),
+        Just("(if . == 2 then error(\"two\") else . + 1 end)"),
+    ];
+    let many = prop_oneof![
+        Just("(. + 1, . + 2)"),
+        Just("(try (. + 1, error(\"x\")) catch 100)"),
+        Just("(try (. + 1, . + 10) catch 0)"),
+        Just("(label $x | try (. + 1, break $x) catch 99)"),
+        Just("(label $x | (. + 1, error(\"e\")))"),
+        Just("((. + 1) as $v | $v, $v + 5)"),
+    ];
+    let update = prop_oneof![
+        (
+            once,
+            prop_oneof![Just(0u32), Just(1), Just(3), Just(40), Just(150)]
+        ),
+        (many, prop_oneof![Just(0u32), Just(1), Just(3)]),
+    ];
+    let shape = prop_oneof![
+        Just("def f: if . < N then U | f else . end; [0 | f]"),
+        Just("def f: if . >= N then . else U | f end; [0 | f]"),
+        Just("def f: f; [0 | until(. >= N; U)]"),
+        Just("def f: f; [0 | while(. < N; U)]"),
+        Just("def g: def f: if . < N then U | f else . end; f; [0 | g]"),
+        Just("def f($n): if $n < N then U | f($n + 1) else . end; [0 | f(0)]"),
+        Just("def f: if . < N then U, (. + 3 | f) else . end; [0 | f]"),
+        Just("def f: try (if . < N then U | f else . end) catch -1; [0 | f]"),
+        Just("[label $out | 0 | def f: if . < N then U | f else ., break $out end; f]"),
+        Just("try (0 | def f: if . < N then U | f else . end; f | error(\"later\")) catch ."),
+    ];
+    (shape, update).prop_map(|(shape, (u, n))| shape.replace('U', u).replace('N', &n.to_string()))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// The tail jumps and the dead fork points' drops change no answer and no bound (#7977 step
+    /// 4): every tail loop answers the same with neither, with either and with both, its loop
+    /// cap a hundred rounds, so the longest loops meet it.
+    #[test]
+    fn tail_jumps_and_dropped_forks_change_no_answer_7977(filter in tail_loop_program()) {
+        let limits = small(BUDGET, 100, 1 << 20);
+        let plain = machine_built(limits, &filter, Build { jumps: false, drops: false, ..Build::SHIPPED });
+        for build in [
+            Build::SHIPPED,
+            Build { jumps: false, ..Build::SHIPPED },
+            Build { drops: false, ..Build::SHIPPED },
+        ] {
+            prop_assert_eq!(&machine_built(limits, &filter, build), &plain, "{} {:?}", filter, build);
+        }
+    }
+}
