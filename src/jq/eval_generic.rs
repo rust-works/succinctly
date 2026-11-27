@@ -24865,7 +24865,7 @@ fn yq_pipe_has_list_stage(stages: &[Expr], seen: bool) -> bool {
 /// associative), but this is only ever called from the yq-mode union route:
 /// its point is to put a union that sits at the head of a *nested* pipe --
 /// `(.a, .b) | ((.c, .d) | .)` -- at a stage index the union walk can see.
-fn yq_flatten_pipe_stages(stages: &[Expr], out: &mut Vec<Expr>) {
+pub(crate) fn yq_flatten_pipe_stages(stages: &[Expr], out: &mut Vec<Expr>) {
     for stage in stages {
         match unwrap_paren(stage) {
             Expr::Pipe(inner) => yq_flatten_pipe_stages(inner, out),

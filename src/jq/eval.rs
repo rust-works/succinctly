@@ -5455,6 +5455,67 @@ pub(crate) fn yq_stage_can_reemit_in(expr: &Expr, arrays: bool) -> bool {
     }
 }
 
+/// What yq emits for `body` over a context that holds nodes and over which `body` answered
+/// nothing (#8002): the pipe's rule (#6943, the generic pipe entry's `eval_yq_empty_context_pipe`)
+/// for a body a write or a builtin evaluates itself, like the right side of `|=`.
+///
+/// The first stage after the head that builds a node of its own and whose input was empty emits
+/// it once, and the stages after it run on that node: the answer is that node and those stages, an
+/// expression that reads no input. `prefix_matched` says whether a pipe of the stages before a
+/// candidate yields anything over the context, or `None` to give up (it raised; the run that
+/// answered nothing did not, so the generic route gives up the same way).
+///
+/// `None` for a body with no such stage, the common case, which costs one walk of its stages.
+pub(crate) fn yq_reemit_after_empty_stage(
+    body: &Expr,
+    prefix_matched: &mut dyn FnMut(&Expr) -> Option<bool>,
+) -> Option<Expr> {
+    let Expr::Pipe(stages) = unwrap_paren(body) else {
+        return None;
+    };
+    if !stages.iter().skip(1).any(yq_stage_can_reemit) {
+        return None;
+    }
+    // A pipe nested as a stage is the same evaluation as the flat one in yq.
+    let mut flat: Vec<Expr> = Vec::new();
+    super::eval_generic::yq_flatten_pipe_stages(stages, &mut flat);
+    for at in 1..flat.len() {
+        if !yq_stage_can_reemit(&flat[at]) {
+            continue;
+        }
+        let Some(head) = yq_empty_context_reemit(&flat[at]) else {
+            continue;
+        };
+        if prefix_matched(&Expr::pipe(flat[..at].to_vec()))? {
+            continue;
+        }
+        let mut rest = vec_with_capacity(flat.len() - at);
+        rest.push(head);
+        rest.extend(flat[at + 1..].iter().cloned());
+        return Some(Expr::pipe(rest));
+    }
+    None
+}
+
+/// [`yq_reemit_after_empty_stage`] over the one owned node a body was evaluated on.
+fn yq_owned_reemit_after_empty_stage<S: EvalSemantics>(
+    body: &Expr,
+    input: &OwnedValue,
+    reentry: Reentry,
+) -> Option<Expr> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    yq_reemit_after_empty_stage(body, &mut |prefix| {
+        let mut seen = false;
+        let flow = eval_each_owned::<S>(prefix, input, false, reentry, &mut |_| {
+            seen = true;
+            Demand::Stop
+        });
+        (!matches!(flow, Flow::Escaped(_))).then_some(seen)
+    })
+}
+
 /// The operands of a binary operator under [`yq_empty_context_reemit`]: both
 /// must re-emit. An operand that reads its input is empty against an empty
 /// context, but what yq then does is not one rule -- `1 == .b` is `false`
@@ -59190,6 +59251,17 @@ fn eval_owned_multi_first<S: EvalSemantics>(
         });
         return match flow {
             Flow::Escaped(control) => Err(control.into()),
+            // #8002: the filter is a pipe over the one target node, and a literal or `error` after
+            // a stage that matched nothing still runs, as in a plain pipe (#6943):
+            // `.[0] |= (select(false) | 3)` writes `3`.
+            Flow::Exhausted if first.is_none() => {
+                match yq_owned_reemit_after_empty_stage::<S>(expr, input, reentry) {
+                    Some(reemitted) => {
+                        eval_owned_multi_first::<S>(&reemitted, &OwnedValue::Null, Reentry::REBUILT)
+                    }
+                    None => Ok(None),
+                }
+            }
             _ => Ok(first),
         };
     }
