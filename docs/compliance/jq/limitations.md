@@ -314,12 +314,12 @@ substitution into the more sensible WHATWG-consistent shape. See
 substitution-mechanism history and
 [#1717](https://github.com/rust-works/succinctly/issues/1717) for the algorithm fix itself.
 
-**After a caught input fault, a later string does not follow the rule ([#7947](https://github.com/rust-works/succinctly/issues/7947)).**
-A string read from the rest of the stream after a caught fault decodes an overlong, surrogate or out-of-range sequence as one U+FFFD per byte, the WHATWG count, where jq 1.7.1 and 1.8.2 give one U+FFFD for the sequence.
-With a file of `1 a"` and spaces to 4,095 bytes, then a quote, the bytes `E0 80 80`, a quote and a newline, the third value of `[limit(3; repeat(try input catch .))]` under `-n` is three U+FFFD here and one in both jq releases, after `1` and the fault `Invalid numeric literal at line 1, column 4`.
-A surrogate (`ED A0 80`) gives three here and one in jq, a sequence above U+10FFFF (`F4 90 80 80`) four here and one in jq, and `1 }"` in place of `1 a"` gives the same counts.
-The same string as a document of its own decodes as jq decodes it.
-Open as #7947; no test pins it.
+**After a caught input fault, a later string follows the rule, since [#7947](https://github.com/rust-works/succinctly/issues/7947).**
+A string read from the rest of the stream after a caught fault used to decode an overlong, surrogate or out-of-range sequence as one U+FFFD per byte, the WHATWG count, where jq 1.7.1 and 1.8.2 give one U+FFFD for the sequence.
+With a file of `1 a"` and spaces to 4,095 bytes, then a quote, the bytes `E0 80 80`, a quote and a newline, the third value of `[limit(3; repeat(try input catch .))]` under `-n` was three U+FFFD here and one in both jq releases, after `1` and the fault `Invalid numeric literal at line 1, column 4`.
+The text was substituted once, whole, deciding in or out of a string by its quotes, and past a fault jq drops the rest of its read, so the quote of `a"` it never reads put the strings after it out of step.
+A value read past a fault that holds a substituted byte is now substituted again from the bytes jq read, from its own first byte, where jq's lexer is outside a string, and gives one U+FFFD for each of these sequences, as both releases do.
+Pinned by `tests/jq_cli/i7947.rs`.
 
 ## Under `-R -s`, a truncated lead byte just before a line break keeps the line break (#7866)
 
@@ -378,6 +378,55 @@ $ sjq -R '.[4090:]' t.txt
 In jq 1.7.1 the character is replaced when it starts at or before byte 4094 of its line and ends at or after byte 4095: a 4-byte character at 4092, 4093 or 4094, a 3-byte one at 4093 or 4094, and a 2-byte one at 4094.
 One that starts at 4095 or later, or ends by 4094, is read intact.
 Pinned by `tests/jq_cli/i5476.rs`, which asserts succinctly's side and, for the routes above, the output jq 1.8.2 (`/opt/homebrew/bin/jq`) prints; jq 1.7.1's side was captured from `/usr/bin/jq`.
+
+## What the input reader promises at a fault and at a NUL (#7963)
+
+[ADR-0018](../../adrs/adr-0018.md)'s #7963 amendment, accepted by the owner on 2026-11-27, narrows what `succinctly jq` owes jq at the edges of its input reader.
+Its implementation is tracked in [#7966](https://github.com/rust-works/succinctly/issues/7966) (the NUL) and [#7967](https://github.com/rust-works/succinctly/issues/7967) (after the first fault).
+Neither has landed, so `succinctly jq` still reads its input as the sections below this one record.
+This section says which of those behaviours are owed to jq and which are not.
+
+**Up to and including the first fault, everything is owed (E1).**
+The first fault of a stream is the first byte at which jq's parser reports a parse error.
+`succinctly jq` owes jq the values before it and their positions, the fault's message, line and column, and the exit status when the fault ends the run.
+
+**After the first fault, output is best effort above a floor (E1).**
+The floor has four parts:
+
+- reading resumes at the start of the next line, or under `--seq` at the next record separator;
+- every value printed after the fault is a complete JSON text that lies wholly after it;
+- a value that neither jq release prints is a bug;
+- the run's exit status is zero exactly when jq 1.7.1's is.
+
+Above the floor, later faults and their positions, `input_line_number` and `input_filename` after the first fault, the number of U+FFFD in a string read after it, and how many values the fault loses are best effort.
+A difference there, such as #7947's U+FFFD count after a caught fault or #7948's line count past invalid UTF-8 after one, is therefore not owed.
+Today the reader models jq's own resume point, jq's next read: the next newline, or the next 4,095-byte piece of a longer line.
+`1 } 2`, 6,000 spaces and `3` on one line, then `4` on the next, read with `[limit(5; repeat(try input catch .))]` under `-n`, is `[1,"Unmatched '}' at line 1, column 3",3,4,"break"]` in jq 1.7.1, jq 1.8.2 and `succinctly jq` at `0dac2e2d7`.
+When #7967 makes the reader resume at the next line, `succinctly jq` may give `4` where jq gives `3` and `4`.
+
+**A NUL byte outside a string is to be a parse error at its own position (E2).**
+The accepted rule does not reproduce jq 1.7.1's truncation of a newline-less read at the NUL (CVE-2026-33948), or jq 1.8.2's reading through the NUL, which ends the number before it.
+jq master (unreleased; commit fbee8f4, jqlang/jq#3606) reports such a NUL as `Invalid character`.
+#7966 will capture the exact wording from a build of jq master before a test pins it.
+Until #7966 lands, `succinctly jq` keeps the readings the next section records:
+
+- a NUL in a chunk with no newline is an error (#5654);
+- a NUL glued to a number ends the number as both releases end it (#7437, #7749);
+- `--seq` cuts a chunk with no newline at its first NUL, as jq 1.7.1 does (#7340).
+
+A NUL inside a string, a NUL under `-R`, and the NUL rules for a `-f` program (#7434), a module path (#7450) and `tonumber` (#7521) are unchanged by the amendment.
+
+**Every other reader fact follows jq 1.7.1, the pinned reference.**
+These facts are the read size, the position after the last read (#7607), the closing refill and the document depth limit.
+Three adoptions of jq 1.8.2 stay as listed exceptions:
+
+- `--seq` reads every record (#7718);
+- `--stream --slurp` keeps its order and its fault (#7523, #7807);
+- a character that straddles the 4,095-byte `-R` read is kept (#5476).
+
+No further reader fact moves to jq 1.8.2 case by case; moving the reader to a newer jq is revisited when jq 1.9 ships.
+A reader answer that follows jq 1.8.2 outside these exceptions is a bug against the pin ([#7971](https://github.com/rust-works/succinctly/issues/7971)).
+Not adopted: free wording for a malformed byte-order mark, so `Malformed BOM` and #5804's numeric-literal wording stay owed.
 
 ## A NUL byte truncates jq's input in a chunk with no newline; succinctly reports it (#5654)
 
@@ -440,7 +489,7 @@ With 4,088 spaces, `123`, a NUL, six spaces and a newline in a file, `[., input_
 The number is read as both releases read it, and only the line count differs.
 Both releases count the newline their read reaches when the `123` starts at byte 4,087 to 4,090, and all three say `1` from byte 4,091 on.
 With the `123` at byte 4,085 or 4,086 jq 1.7.1 says `1`, and jq 1.8.2 says `0`, as `succinctly jq` does.
-#7948's second shape, a line counted past invalid UTF-8 after a fault, is recorded further down, beside #7938; no test pins either.
+#7948's second shape, a line counted past invalid UTF-8 after a fault, is fixed and recorded further down, beside #7938; no test pins this first shape.
 
 ## A `-f` program file with a NUL byte is refused, as jq 1.8.2 refuses it; jq 1.7.1 ends the program at the NUL (#7434)
 
@@ -554,7 +603,8 @@ Both changes come from upstream commit 4e3088f ([jqlang/jq#3279](https://github.
 Its message, its PR text and its test name only the `--slurp --stream` fix, which `succinctly jq` follows (#7523, above); neither effect described here is called a bug or a fix upstream, so `succinctly jq` keeps jq 1.7.1's answers, the reference ADR-0018 pins, and the rules modelled on 1.7.1's reader (#2947, #3003, #6146, the directory-last family #6472, #6604, #6625, #6661, #6775, #6789) stand.
 One more such answer is the fault after a number or literal directly before the text's last byte, a `"`, `[` or `{` (`2"`, `true"`, `1 2[`; #6004, #7810): that byte completes the value, so the read that reached the end returned it and the next call meets the fault with the file closed, and jq 1.7.1's `input` names `(at <unknown>)` where jq 1.8.2 names `(at <stdin>:0)`.
 It holds only when that read is a short one: a last line that fills its 4095-byte reads exactly leaves an empty last read, and then both releases name the file.
-Whether to follow jq 1.8.2 here is a question for the owners (#7607); #7461's true line number and #7472's 64-bit count are unaffected either way.
+ADR-0018's #7963 amendment settles the question this paragraph left to the owners (#7607): the position after the last read stays jq 1.7.1's until the reader is moved to a newer jq as one release.
+#7461's true line number and #7472's 64-bit count are unaffected either way.
 `succinctly yq` is not affected: these are jq's reader rules.
 Pinned by `tests/jq_cli/i7607.rs` and `tests/jq_cli/i7810.rs`, whose rows were captured from jq 1.7.1 (`/usr/bin/jq`), with jq 1.8.2's (`/opt/homebrew/bin/jq`) answers in its comments.
 
@@ -11468,11 +11518,13 @@ A value within a few bytes of the boundary was placed one line short, in `(at �
 A program that read on past a caught fault met the moved resumption point as a fault jq does not raise ([#7921](https://github.com/rust-works/succinctly/issues/7921)): with `0`, a newline, 4,092 spaces, `}`, the byte `0x80`, a quote, a newline, `5` and a newline, `[limit(6; repeat(try input catch .))]` under `-n` gave a second fault, `Invalid numeric literal at line 2, column 4095`, before the `5`, where jq 1.7.1 and 1.8.2 give `0`, the `}` fault and `5`.
 And behind a byte-order mark, whose three bytes #7569 counts in the first read, the resumption point could fall inside a number and read part of it as a value jq never reads, which ran the program again and made the run exit 0 where jq exits 5 ([#7934](https://github.com/rust-works/succinctly/issues/7934); [#7931](https://github.com/rust-works/succinctly/issues/7931) has the `(at f:0)` and double-fault shapes).
 A file that starts inside a replacement, with a character's bytes cut across two files, has its reads counted from its own first byte, inside that replacement, where they were counted from the replacement's end.
-The windowed document loop still counts a value's line over the window's text, since a window does not keep the substitution's edits: on a regular file of 4 MiB or more, a runtime error's `(at …)` line for a value just past a read boundary after invalid UTF-8 on a long line can be one short ([#7938](https://github.com/rust-works/succinctly/issues/7938)).
-`input_line_number` past a fault on a first line that holds invalid UTF-8 can be one short too, on a file of any size ([#7948](https://github.com/rust-works/succinctly/issues/7948)).
-Over a 4,083-byte line of spaces that holds five strings with six invalid bytes in them, a `1`, a bare `0xC3` byte at offset 4,079 and a newline at offset 4,082, `select(type == "number") | input_line_number` prints `0` here, where jq 1.7.1 and 1.8.2 print `1`; all three report the parse error at column 4081 and exit 5.
-With every byte above `0x7F` written as `z`, `succinctly jq` gives `1` too, so on this route the line is counted over the text with U+FFFD in it, as #7938's is.
-Open as #7948, whose other shape, after a NUL, is in the section on NUL bytes near the top of this page; no test pins either.
+The windowed document loop, which reads a regular file of 4 MiB or more a window at a time, counted a value's line over the window's text until [#7938](https://github.com/rust-works/succinctly/issues/7938), since a window kept the substitution's edits only when its tail was handed to a later file: a runtime error's `(at …)` line for a value just past a read boundary after invalid UTF-8 on a long line could be one short.
+The windows now keep every edit the substitution makes and hand them to the loop relative to the window, so it counts the reads in the bytes jq read as the whole-file route does, on a file, on standard input and through a pipe; pinned by `tests/jq_cli/i7938.rs`.
+`input_line_number` past a fault on a first line that holds invalid UTF-8 could be one short too, on a file of any size, until [#7948](https://github.com/rust-works/succinctly/issues/7948).
+Over a 4,083-byte line of spaces that holds five strings with six invalid bytes in them, a `1`, a bare `0xC3` byte at offset 4,079 and a newline at offset 4,082, `select(type == "number") | input_line_number` printed `0` here, where jq 1.7.1 and 1.8.2 print `1`; all three report the parse error at column 4081 and exit 5.
+When the fault falls past a quarter of the file, the documents before it are handed to the program as a lazy prefix, and that hand-off did not count its lines in the bytes jq read as #7934's other hand-offs do, so the line was counted over the text with U+FFFD in it.
+It now counts them as the others do: over a 4,090-byte line with three strings holding invalid bytes, a `1`, a bare `0xC3` at byte 4,086 and a newline, it prints the fault at column 4088 and then `1`, as both releases do; pinned by `tests/jq_cli/i7948.rs`.
+#7948's other shape, after a NUL, is in the section on NUL bytes near the top of this page.
 A sibling with the same symptom as #7934 on input that is ASCII but for the mark and a NUL has another cause and is not fixed by this ([#7937](https://github.com/rust-works/succinctly/issues/7937)): the NUL pass rewrites a number that a fault's dropped read splits, and the resume reads part of it.
 Since the reads are counted where jq's are, a shape with invalid UTF-8 before such a number reaches it as its ASCII twin does (a mark, a surrogate's three bytes before `]123`, a NUL and a newline one byte past the end of the second read print `[]` and exit 0, where before #7934 the run exited 5 with the fault named a line late).
 The column a parse error names is counted over the bytes jq read, an invalid byte one column, since [#5964](https://github.com/rust-works/succinctly/issues/5964) (`\xff }` is column 2).

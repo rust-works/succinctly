@@ -22,6 +22,8 @@ Before releasing, ensure you have:
 - [ ] Write access to the repository
 - [ ] `CARGO_REGISTRY_TOKEN` secret configured in GitHub (for crates.io publishing)
 - [ ] All CI checks passing on `main`
+- [ ] No open issue labelled `binary-size`: the release workflow fails on a Linux binary over its size budget
+      (see [Release Artifacts](#release-artifacts))
 
 ## Release Process
 
@@ -73,8 +75,9 @@ python3 scripts/link-order/generate.py macos target/release/succinctly linux.txt
 - [ ] Rebuild on both platforms and read `target/release/deps/succinctly-*.link-order.log`
       (`N listed, M found, K symbols ordered`): the names not found should be the other platform's only.
 - [ ] `python3 scripts/link-order/generate.py stale target/release` passes.
-      CI's perf-guard job runs the same check on every PR and fails once more than 5% of the listed names no
-      longer resolve; a PR that trips it regenerates the list the same way.
+      CI's perf-guard job runs the same check on every PR, and fails a release branch's PR (`release/*`) once more
+      than 5% of the listed names no longer resolve; any other PR gets a warning, and release.yml fails on it.
+      scheduled.yml's `link-order` job opens a "regenerate the link-order list" issue once main passes 4%.
 - [ ] Only then re-run the jq comparison whose figures the release quotes
       ([reproducing-the-jq-comparison.md](reproducing-the-jq-comparison.md)), and the memory figures of
       [docs/benchmarks/jq.md](../benchmarks/jq.md#memory) with the shipped feature list passed as `--subject`.
@@ -209,10 +212,18 @@ The release workflow produces:
 All Unix binaries are stripped for smaller size.
 
 The stripped Linux x64 and ARM64 binaries have a size budget, `tests/data/binary-size-budget.json` (#7390). CI's
-`Perf Regression Guard` legs build this workflow's command, strip a copy and fail when it is more than 5% over its
-budget (`scripts/binary_size.py`); an intended increase sets the target's `bytes` to the size the failing run printed,
-in the same PR. Take the number from CI's log, not a local build: another toolchain, linker or `strip` moves it by a
-percent or two. macOS has no budget, since macOS runners are not spent on the perf guard.
+`Perf Regression Guard` legs build this workflow's command and strip a copy (`scripts/binary_size.py`). A pull request
+fails when its stripped binary is more than `max_pr_growth` (1%) larger than its base's, the binary the perf guard
+compares with; a line `[size-growth: ok #N]` in a commit message or the PR body waives that for intended growth
+(#7959). The budget is only a report on a pull request and on a push to main, because the drift of many small merges
+is what uses it up, and failing every push to main would leave main red with no owner. Two places catch that drift:
+`Scheduled`'s daily `binary-size` job measures the release binary main's newest push run uploaded and, while it is
+more than 5% over the budget, keeps one open issue labelled `binary-size` per target; and this workflow's
+`build-release` job runs the same check on the Linux binaries it built and fails, before their archives are uploaded
+or the crate is published. The GitHub release exists by then, so look for an open `binary-size` issue before tagging.
+Close one by shrinking the binary, or by setting the target's `bytes` to the size CI printed, in a PR of its own.
+Take the number from CI's log, not a local build: another toolchain, linker or `strip` moves it by a percent or two.
+macOS has no budget, since macOS runners are not spent on the perf guard.
 
 The macOS ARM64 archive is built for macOS 12.0 or newer, not for rustc's default of 11.0 on arm64 (#7321). The
 setting is `MACOSX_DEPLOYMENT_TARGET` in `.cargo/config.toml`'s `[env]`, so the archive, a local `cargo build

@@ -37,7 +37,10 @@ functions the list misses, or when BINARY was not linked in its order.
 newest one under `target/release`) and fails when more than PERCENT of the listed names no longer
 resolve (default 5, see STALE_PERCENT). `check` alone missed #7894: over 222 merges the share
 went from 3.4% to 8.0% and every small run held 1.3 MB more of the binary resident on Linux, while
-the two startup runs `check` traces stayed inside its 64 KB.
+the two startup runs `check` traces stayed inside its 64 KB. `stale TARGET_DIR_OR_LOG [PERCENT]
+--warn` prints a warning annotation and passes instead: ci.yml gives it to every pull request but a
+release branch's, so a PR that only meets a stale list is not failed for it, and `watch.py`
+(scheduled.yml) files the regeneration as an issue.
 """
 import bisect
 import collections
@@ -310,8 +313,10 @@ def newest_log(path):
     return max(logs, key=os.path.getmtime) if logs else None
 
 
-def stale(path, limit):
-    """Fail when more than `limit` percent of the listed names did not resolve in the newest link."""
+def stale(path, limit, warn=False):
+    """Fail when more than `limit` percent of the listed names did not resolve in the newest link.
+    With `warn`, say so in a warning annotation and pass: the list is stale whichever change meets it
+    (pull requests)."""
     log = newest_log(path)
     if log is None:
         print(f"no link-order log under {path}: the linker wrapper did not run for a release binary")
@@ -331,6 +336,11 @@ def stale(path, limit):
               "(64 KB or a large folio on Linux) in every run that calls it (#7894).\nRegenerate it: "
               "`generate.py linux` on x86_64 Linux, then `generate.py macos` on Apple silicon "
               "(docs/guides/release.md).")
+        if warn:
+            print(f"::warning title=link-order list is stale ({share:.1f}% > {limit:g}%)::"
+                  "Not this change's to fix: the scheduled `link-order` job files the regeneration "
+                  "(docs/guides/release.md). It fails release branches and release builds.")
+            return True
         return False
     return True
 
@@ -345,8 +355,8 @@ def main(argv):
         print("\n".join(macos(argv[1], argv[-1])))
     elif len(argv) >= 3 and argv[0] == "check":
         sys.exit(0 if check(argv[1], argv[2], int(argv[3]) if len(argv) > 3 else 65536) else 1)
-    elif len(argv) >= 2 and argv[0] == "stale":
-        sys.exit(0 if stale(argv[1], float(argv[2]) if len(argv) > 2 else STALE_PERCENT) else 1)
+    elif argv[:1] == ["stale"] and (rest := [a for a in argv[1:] if a != "--warn"]):
+        sys.exit(0 if stale(rest[0], float(rest[1]) if len(rest) > 1 else STALE_PERCENT, "--warn" in argv) else 1)
     else:
         sys.exit(__doc__)
 

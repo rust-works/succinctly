@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 70da920be7de37c8d885803a844b3fe9bb35042e8c67be16ce65ec6c1c1dc823 # shrinks to filter = "def r: if false then r else . end; [1,2] as $a | [([first($a), 0] as [$a, $b] | ($a, $a))]"

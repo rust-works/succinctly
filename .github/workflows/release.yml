@@ -114,15 +114,28 @@ jobs:
         [ -n "$log" ] || log="no link-order log"
         echo "$log"
         case "$log" in *ordered*) ;; *) echo "::warning::release binary linked without the function order: $log" ;; esac
-        # #7894: a warning, not a failure, at release time: ci.yml's perf-guard job is the gate. The
-        # bound is of the x86_64 Linux link (the macOS one never resolves the x86-only names).
+        # #7894: a failure at release time. ci.yml's perf-guard job only warns on an ordinary PR, so
+        # this and the release branch's own PR are where a stale list stops the line: regenerate it
+        # as the last code change before the tag (docs/guides/release.md). The bound is of the
+        # x86_64 Linux link (the macOS one never resolves the x86-only names).
         if [ "${{ matrix.build }}" = linux-x64 ]; then
-          python3 scripts/link-order/generate.py stale "target/${{ matrix.target }}/release" || echo "::warning::scripts/link-order/symbols.txt is stale: regenerate it before a release (docs/guides/release.md)"
+          python3 scripts/link-order/generate.py stale "target/${{ matrix.target }}/release"
         fi
 
     - name: Strip release binary (linux and macos)
       if: matrix.build != 'windows'
       run: strip "target/${{ matrix.target }}/release/succinctly"
+
+    # #7959: the binary-size budget (tests/data/binary-size-budget.json), enforced. CI holds each PR to
+    # its growth against its base and only reports the budget, and scheduled.yml's `binary-size` job
+    # files a tracking issue while main is over it; a release over it stops here,
+    # before its Linux archives are uploaded or the crate is published (the GitHub release already
+    # exists by then: docs/guides/release.md). The budget is CI's perf-guard measurement, which this
+    # build's own image and `+popcnt` barely move: v0.8.0's x86_64 binary was 0.04% smaller than CI's
+    # build of the same commit, and its aarch64 one the same size to the byte.
+    - name: Check the stripped binary against its size budget
+      if: matrix.build == 'linux-x64' || matrix.build == 'linux-arm64'
+      run: python3 scripts/binary_size.py check --binary "target/${{ matrix.target }}/release/succinctly" --target "${{ matrix.target }}"
 
     - name: Build archive
       shell: bash

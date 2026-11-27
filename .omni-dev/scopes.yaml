@@ -46,7 +46,7 @@ scopes:
   - name: "test"
     description: "Test suite and property tests"
     examples: ["test: add bp edge case coverage", "test: fix flaky property test"]
-    file_patterns: ["tests/**", "fuzz/**", "examples/**"]
+    file_patterns: ["tests/**", "fuzz/**", "examples/**", "jq-reader-oracle/**"]
   - name: "docs"
     description: "Documentation and optimization notes"
     examples: ["docs: update AVX-512 results", "docs: add PFSM integration guide"]

@@ -933,10 +933,17 @@ jobs:
       - name: cancel-stale-merge-group-runs self-tests
         run: python3 scripts/test_cancel_stale_merge_group_runs.py -v
 
-      # #7390: the stripped-size budget check run after the release build below: a fake strip,
-      # no build. It also pins that this job's release build is the one release.yml ships.
+      # #7390, #7959: the stripped-size check run after the release build below (a PR's growth against
+      # its base, and the budget as a report), and scheduled.yml's tracking-issue job: a fake strip and a
+      # fake `gh`, no build. It also pins that this job's release build is the one release.yml ships.
       - name: binary_size.py self-tests
         run: python3 scripts/test_binary_size.py -v
+
+      # #7977: the call machine's corpus harness (scripts/call_machine/): the golden file the
+      # jq_cli test runs holds exactly cases.py's programs, and a ladder binary gets its own
+      # environment. No build, no jq.
+      - name: call-machine harness self-tests
+        run: python3 scripts/test_call_machine.py -v
 
       # #7260: the release binary's function-order linker wrapper (scripts/link-order/link.py):
       # which links it orders, and the name normalization one list needs for GNU and LLVM
@@ -1140,12 +1147,22 @@ jobs:
       # resolve (`STALE_PERCENT` in generate.py says why 5). The startup check alone let the list
       # drift for 222 merges: the functions that went missing were on the paths of ordinary rows,
       # not of the two startup runs it traces, and each kept a page of text resident per run.
+      # #7958: it fails only a release branch's PR (`release/*`). Every other run (a PR, a merge
+      # group, a main push) that meets a stale list gets a warning annotation (`--warn`) and passes:
+      # the list goes stale from the sum of unrelated merges, and regenerating it is no ordinary PR's
+      # job (two that do conflict). On a main push a failure would also skip the binary upload and
+      # the perf guard below. scheduled.yml's `link-order` job reads the share daily from main's
+      # runs and files the regeneration as an issue past 4%; release.yml fails on a stale list.
       - name: Link order covers the startup path
         if: matrix.name == 'x86_64'
+        env:
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           cat "$RUNNER_TEMP/link-order-trace.txt" || echo "the linker wrapper ran for no link"
           ls -t target/release/deps/succinctly*.link-order.log target/release/build/succinctly/*/out/succinctly*.link-order.log 2>/dev/null | head -1 | xargs -r cat
-          python3 scripts/link-order/generate.py stale target/release
+          WARN=--warn
+          [ "${HEAD_REF#release/}" = "$HEAD_REF" ] || WARN=
+          python3 scripts/link-order/generate.py stale target/release $WARN
           python3 scripts/link-order/generate.py check target/release/succinctly scripts/link-order/symbols.txt 65536
 
       # #5704: what the lookup step above finds. Named by arch, SHA and a hash of
@@ -1175,26 +1192,56 @@ jobs:
             target/
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-      - name: Run perf guard
+      # The one place that says which binary is this run's base, for the perf guard and the size check
+      # below: main's push-run artifact when "Verify baseline binary" kept it, else the merge-base build
+      # on a pull request, else the previous-commit build on a push that made one. Empty when none exists.
+      - name: Resolve base binary
         run: |
           if [ -n "$PERF_GUARD_BASELINE_BIN" ]; then
-            EXTRA_ARGS="--baseline-binary $PERF_GUARD_BASELINE_BIN"
+            BASE_BIN="$PERF_GUARD_BASELINE_BIN"
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            EXTRA_ARGS="--baseline-binary /tmp/perf-guard-merge-base/target/release/succinctly"
+            BASE_BIN=/tmp/perf-guard-merge-base/target/release/succinctly
           elif [ "${{ github.event_name }}" = "push" ] && [ "$PERF_GUARD_PREV_BUILT" = "1" ]; then
-            EXTRA_ARGS="--baseline-binary /tmp/perf-guard-prev-commit/target/release/succinctly"
+            BASE_BIN=/tmp/perf-guard-prev-commit/target/release/succinctly
           else
-            EXTRA_ARGS=""
+            BASE_BIN=""
+          fi
+          echo "PERF_GUARD_BASE_BIN=$BASE_BIN" >> "$GITHUB_ENV"
+
+      - name: Run perf guard
+        run: |
+          EXTRA_ARGS=""
+          if [ -n "$PERF_GUARD_BASE_BIN" ]; then
+            EXTRA_ARGS="--baseline-binary $PERF_GUARD_BASE_BIN"
           fi
           python3 scripts/perf-guard.py --binary target/release/succinctly --arch "${{ matrix.name }}" --check $EXTRA_ARGS
 
       # #7390: the stripped size of the binary built above (release.yml's own command, so the shipped
-      # shape) against tests/data/binary-size-budget.json, failing past 5% growth. An intended increase
-      # bumps the committed number in the same PR: the failure prints the measured size and the edit.
-      # Runs whether or not the perf guard passed, so each reports on its own.
+      # shape). Runs whether or not the perf guard passed, so each reports on its own.
+      #
+      # #7959: a pull request is gated on its own growth against its base, the binary the perf guard
+      # compares with (main's push-run artifact, else the merge-base build above), stripped the same way:
+      # more than `max_pr_growth` in tests/data/binary-size-budget.json fails, unless a commit message or
+      # the PR body carries a line `[size-growth: ok #N]`. If a PR's base binary is missing, the budget is
+      # enforced instead (the check fails towards checking).
+      #
+      # The committed budget is only a report here, on a PR and on a push to main (`--budget-mode
+      # report`): a PR cannot bump a number that every other PR also edits and that the drift of every
+      # earlier PR has already used up, and failing every push to main would leave main red with no
+      # owner. The slow drift is caught instead by scheduled.yml's `binary-size` job, which opens a
+      # tracking issue per target that is over, and by release.yml, which fails on it.
       - name: Check stripped binary size
         if: ${{ !cancelled() && steps.release-build.outcome == 'success' }}
-        run: python3 scripts/binary_size.py check --binary target/release/succinctly
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            python3 scripts/binary_size.py check --binary target/release/succinctly \
+              --baseline-binary "$PERF_GUARD_BASE_BIN" --budget-mode report --commit-range origin/main..HEAD
+          else
+            python3 scripts/binary_size.py check --binary target/release/succinctly --budget-mode report
+          fi
 
   clippy:
     name: Clippy
@@ -1654,12 +1701,15 @@ jobs:
       # fuzz/ and bench-compare/ each keep their own Cargo.lock and depend on the main crate by
       # path, so a dependency added to the root Cargo.toml leaves both lockfiles behind, and the
       # advisory checks in security.yml then read a lockfile that no build uses (#7467).
+      # jq-reader-oracle/ (#7970) keeps its own too; it does not depend on the main crate, and
+      # only its metadata is checked here, because building it compiles jq's C sources.
       # `--locked` fails when resolving would have to change the lockfile.
       - name: Nested lockfiles match their manifests
         if: needs.gate.outputs.code == 'true'
         run: |
           cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
           cargo metadata --locked --format-version 1 --manifest-path bench-compare/Cargo.toml > /dev/null
+          cargo metadata --locked --format-version 1 --manifest-path jq-reader-oracle/Cargo.toml > /dev/null
 
       - name: Compile-check the fuzz targets
         if: needs.gate.outputs.code == 'true'

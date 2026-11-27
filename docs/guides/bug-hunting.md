@@ -112,6 +112,12 @@ work:
   `--slurp --stream` fix (jqlang/jq#3279). Only the first is a fix of the behaviour it changes; for the other two,
   what they do to other routes is a separate decision.
 
+The latest-jq rule above does not reach the reader's facts any more: ADR-0018's #7963 amendment pins them to jq 1.7.1
+(the read size, the position after the last read, the closing refill, the depth limit), keeps the 1.8.2 adoptions
+already recorded (#7718, #7523, #7807, #5476) as listed exceptions, and revisits the pin when jq 1.9 ships. The same
+amendment owes jq only the first fault exactly, with a floor after it, and makes a NUL outside a string a parse error
+(#7966, #7967), so a difference after a stream's first fault that keeps the floor is not a bug to file.
+
 `succinctly yq` follows yq v4.53.3 the same way; see [For a yq hunt](#for-a-yq-hunt).
 
 ### Capture, never recall

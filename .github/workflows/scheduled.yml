@@ -157,6 +157,88 @@ jobs:
           name: benchmark-results-${{ matrix.platform.arch }}-${{ matrix.variant.name }}
           path: bench-${{ matrix.variant.name }}.txt
 
+  # #7959: the binary-size budget (tests/data/binary-size-budget.json) is not a pull-request gate: a PR
+  # is held to `max_pr_growth` against its base binary, and ci.yml only reports the budget, so the slow
+  # drift of many merges is caught here. Each leg measures the release binary main's newest push run of
+  # ci.yml uploaded for its arch (`perf-guard-bin-<arch>-<sha>-<rustc key>`, found the way ci.yml's #5704
+  # lookup finds it, so no fat-LTO build), stripped on the image its perf-guard leg strips on, and opens
+  # one tracking issue per target that is over (label `binary-size`), or rewrites the body of the open
+  # one. release.yml fails on the same budget. scripts/binary_size.py's `track` has the rules.
+  binary-size:
+    name: Binary size budget (${{ matrix.name }})
+    # Reads this repository's own Actions artifacts; a fork has none, and would query ours.
+    if: github.repository == 'rust-works/succinctly'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            runner: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
+          - name: ARM64-Linux
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    # As for `ci-times`: an unreadable API must not turn the whole Scheduled run red. The script's
+    # tests run on pull requests (ci.yml's perf-guard job runs scripts/test_binary_size.py).
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read                 # lists main's push runs and downloads their binary
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # Main's head first; a push run that built no binary (a docs-only push, one still building, an
+      # expired artifact) is passed over for the newest one that did. Only a `push` run of ci.yml on
+      # `main` is a source, as in ci.yml's lookup. Any `rustc -V` key will do: this measures main's
+      # binary as CI built it, not a baseline that must match this run's toolchain.
+      - name: Find main's newest release binary
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ARCH: ${{ matrix.name }}
+        run: |
+          HEAD_SHA=$(gh api "repos/$REPO/commits/main" --jq .sha)
+          RUNS=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?event=push&branch=main&per_page=30" \
+            --jq '.workflow_runs[] | select(.head_branch == "main") | "\(.id) \(.head_sha)"')
+          while read -r id sha; do
+            case "$sha" in *[!0-9a-f]*|"") continue ;; esac
+            name=$(gh api "repos/$REPO/actions/runs/$id/artifacts?per_page=100" \
+              --jq "[.artifacts[] | select((.expired | not) and (.name | startswith(\"perf-guard-bin-$ARCH-$sha-\")))][0].name // empty" || true)
+            if [ -n "$name" ]; then
+              {
+                echo "artifact=$name"
+                echo "run-id=$id"
+                echo "sha=$sha"
+                echo "head-sha=$HEAD_SHA"
+              } >> "$GITHUB_OUTPUT"
+              echo "Measuring $name from push run $id (main's head is $HEAD_SHA)"
+              exit 0
+            fi
+          done <<< "$RUNS"
+          echo "::error::no perf-guard-bin-$ARCH artifact in main's last 30 push runs of ci.yml"
+          exit 1
+
+      - name: Download main's release binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ steps.find.outputs.artifact }}
+          path: ${{ runner.temp }}/main-bin
+          run-id: ${{ steps.find.outputs.run-id }}
+          github-token: ${{ github.token }}
+
+      - name: Track the budget
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+          MEASURED_AT: >-
+            main at ${{ steps.find.outputs.sha }} (main's head: ${{ steps.find.outputs.head-sha }}),
+            artifact ${{ steps.find.outputs.artifact }} of
+            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ steps.find.outputs.run-id }}
+        run: python3 scripts/binary_size.py track --binary "$RUNNER_TEMP/main-bin/succinctly" --target "$TARGET" --measured-at "$MEASURED_AT" --issue
+
   # #5867: a CI job can get several times slower and stay green. Compares the median time of each job in
   # the newest `merge_group` runs of ci.yml with its median over the two weeks before and, if one is
   # both 1.5x and two minutes slower, opens (or adds a comment to) the one open `ci-slowdown` issue.
@@ -181,3 +263,24 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci_leg_times.py report --issue
+
+  # #7894 follow-up: ci.yml's perf-guard job only warns on a stale link-order list (it fails
+  # release branches), so this reads the share from main's newest push run and opens, or rewrites
+  # the body of, one "regenerate the link-order list" issue once it passes 4% (the limit is 5%).
+  # No build: it reads the job log the perf guard already wrote.
+  link-order:
+    name: Link-order list share
+    if: github.repository == 'rust-works/succinctly'
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: File the regeneration once the list is nearly stale
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/link-order/watch.py --issue

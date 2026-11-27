@@ -38,6 +38,7 @@ use crate::cli::output::{
     DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, StreamFault, Terminator,
 };
 
+mod call_machine;
 mod eof_location;
 mod window;
 
@@ -5359,6 +5360,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
     FIRST_OPEN_FAILURE_AT.with(|first| first.set(None));
     // Nor may one carry a standard input that failed (#7126).
     INPUT_READ_FAILED.with(|failed| failed.set(false));
+    // #7977: the call machine's switch, before anything decides a route.
+    call_machine::configure();
     super::stdin_offset::start_run();
     silence_depth_guard_panic_line();
     args.resolve_positional_args();
@@ -6313,32 +6316,50 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // The next file's text, or for a windowed file its next window with the documents the
             // window holds (#6920): the splitter already ran over it, and `lines_before` line
             // breaks and `window_substituted` come with it.
-            let (idx, raw, window_split, lines_before, window_substituted, window_place, notes) =
-                match windowed.as_mut() {
-                    Some(reader) => match reader.next_window_noting(&mut |at, failure| {
-                        noted.push((at, failure));
-                    }) {
-                        Ok(Some((idx, next))) => (
-                            idx,
-                            next.raw,
-                            Some((next.values, next.split_error)),
-                            next.lines_before,
-                            next.substituted,
-                            Some((next.seam, next.origin)),
-                            next.notes,
-                        ),
-                        Ok(None) => break,
-                        // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
-                        Err(error) => {
-                            report_input_read_failure(&error);
-                            break;
-                        } // patchcov: coverage end
-                    },
-                    None => match whole_files.next() {
-                        Some((idx, raw)) => (idx, raw.as_slice(), None, 0, false, None, Vec::new()),
-                        None => break,
-                    },
-                };
+            let (
+                idx,
+                raw,
+                window_split,
+                lines_before,
+                window_substituted,
+                window_place,
+                notes,
+                window_edits,
+            ) = match windowed.as_mut() {
+                Some(reader) => match reader.next_window_noting(&mut |at, failure| {
+                    noted.push((at, failure));
+                }) {
+                    Ok(Some((idx, next))) => (
+                        idx,
+                        next.raw,
+                        Some((next.values, next.split_error)),
+                        next.lines_before,
+                        next.substituted,
+                        Some((next.seam, next.origin)),
+                        next.notes,
+                        next.edits,
+                    ),
+                    Ok(None) => break,
+                    // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+                    Err(error) => {
+                        report_input_read_failure(&error);
+                        break;
+                    } // patchcov: coverage end
+                },
+                None => match whole_files.next() {
+                    Some((idx, raw)) => (
+                        idx,
+                        raw.as_slice(),
+                        None,
+                        0,
+                        false,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    None => break,
+                },
+            };
             // #7332: the next window is here, so the last index of the one before it is given back,
             // and its last document (#7697).
             held_index = None;
@@ -6462,11 +6483,16 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             } else {
                 seams.get(idx).cloned().unwrap_or_default()
             };
-            // #7934: a file the substitution changed has its reads counted in the bytes jq read. A
-            // window's text is counted as it is (its edits are not kept).
+            // #7934: a file the substitution changed has its reads counted in the bytes jq read; a
+            // window's text through the edits the window kept (#7938).
             let lossy = (slurped.is_none() && window_place.is_none())
                 .then(|| originals.get(idx).and_then(Option::as_ref))
                 .flatten();
+            let edits: &[SubstitutionEdit] = match (lossy, slurped.is_none()) {
+                (Some(lossy), _) => &lossy.edits,
+                (None, true) => &window_edits,
+                (None, false) => &[],
+            };
             let locator = ValueLocator::new(
                 raw,
                 filename.as_deref(),
@@ -6479,7 +6505,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }),
                 seam.clone(),
             )
-            .reading(lossy)
+            .reading_edits(edits)
             .with_lines_before(lines_before);
             let tail_locator = ValueLocator::new(b"", value_tail.as_deref(), Some(0), Seam::NONE);
             // #7322: what jq's `--seq` reader warns of in a stretch of the window that was not plain
@@ -9896,6 +9922,11 @@ fn read_inputs(
                     if let Some(spans) = lazy_prefix {
                         offset = spans.last().map_or(0, |&(_, end)| end);
                         defer_lazy_start(std::rc::Rc::clone(&raw), spans, src, seam.clone(), None);
+                        // #7948: its documents' lines count jq's reads in the bytes jq read, as
+                        // the moved stream's do above (#7934).
+                        if let Some(lossy) = lossy {
+                            mark_lazy_read_as(lossy.clone());
+                        }
                         lazy_inputs = true;
                     }
                     let tail_cx = TailContext {
@@ -11141,6 +11172,16 @@ impl LossySource {
     /// The original's bytes for `range` of the text.
     fn bytes(&self, range: core::ops::Range<usize>) -> &[u8] {
         &self.original[self.original_offset(range.start)..self.original_offset(range.end)]
+    }
+
+    /// Whether the substitution changed any byte of `range` of the text (#7947).
+    fn changes(&self, range: core::ops::Range<usize>) -> bool {
+        let first = self
+            .edits
+            .partition_point(|edit| edit.text.end <= range.start);
+        self.edits
+            .get(first)
+            .is_some_and(|edit| edit.text.start < range.end)
     }
 }
 
@@ -14753,9 +14794,12 @@ impl<'a> ValueLocator<'a> {
 
     /// This locator over a text the invalid-UTF-8 substitution made of the bytes jq read, whose
     /// reads are counted in those bytes ([`LineCounter::reading`], #7934).
-    fn reading(self, lossy: Option<&'a LossySource>) -> Self {
+    /// The edits are a file's ([`LossySource`]) or a window's (#7938).
+    fn reading_edits(self, edits: &'a [SubstitutionEdit]) -> Self {
+        let mut counter = self.counter.into_inner();
+        counter.edits = edits;
         Self {
-            counter: RefCell::new(self.counter.into_inner().reading(lossy)),
+            counter: RefCell::new(counter),
             ..self
         }
     }
@@ -15702,6 +15746,28 @@ fn read_json_tail(
             if bare_token_lost_to_fault(raw.as_bytes(), (offset + s, offset + e), start, cx.stream)
             {
                 parsed.pop();
+            }
+        }
+        // #7947: past a fault jq's lexer starts the next read outside any string, which the
+        // substitution of the whole text could not know: a quote the fault's read dropped puts the
+        // text's strings out of step from there. A value read past a fault is substituted again
+        // from the bytes jq read, from its own first byte, where jq's lexer is outside a string.
+        if let (Some(_), Some(lossy)) = (parser_at, cx.lossy) {
+            for (value, &(s, e)) in parsed.iter_mut().zip(&spans) {
+                let (vs, ve) = (offset + s, offset + e);
+                if !lossy.changes(vs..ve) {
+                    continue;
+                }
+                let fresh = succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(
+                    lossy.bytes(vs..ve),
+                );
+                if fresh.as_bytes() != &raw.as_bytes()[vs..ve] {
+                    if let (mut again, None) = parse_json_stream_prefix(&fresh, None) {
+                        if again.len() == 1 {
+                            *value = again.pop().expect("one value");
+                        }
+                    }
+                }
             }
         }
         let read = parsed.len();

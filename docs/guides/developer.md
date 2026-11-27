@@ -222,6 +222,17 @@ test, and `tests/jq_cli/i7688.rs` pins both over every source the script reads.
 A new windowed route needs its gate to ask `window::whole_file_forced()` and its start to call
 `window::note_route`, or the fuzz reports that no case took it.
 
+The call machine (#7977, `src/jq/path_mode/vm.rs`) is experimental: it runs a jq-mode program that holds a
+recursive `def` only when `SUCCINCTLY_CALL_MACHINE` is set to a non-empty value but `0`. The library reads no
+environment for it; `succinctly jq` reads the variable once (`jq_runner/call_machine.rs`) and turns the machine on
+with `path_mode::set_call_machine`. Unset, nothing asks the machine, so a run behaves as a build without it.
+It is a runtime switch, not a feature, so one binary is measured both ways with the variable set in both arms
+(`=1` against `=0`, #7961). `SUCCINCTLY_DEBUG_CALL_MACHINE_LOG=<file>`
+has each routing decision append `taken` or `declined` while the switch is on.
+`scripts/call_machine/check.py check <binary>` runs its 142-program corpus against the jq 1.7.1 answers in
+`tests/data/call-machine-corpus-7977.json` (`tests/jq_cli/i7977.rs` runs the same file in CI), and
+`scripts/call_machine/ladders.py` holds its timing ladders, for the bench boxes only.
+
 ### Differential sweeps against jq
 
 A change to the jq evaluator, the path register above all, is judged against `/usr/bin/jq` (1.7.1) over a
@@ -279,6 +290,12 @@ change whose message regression a pinned test then caught (#5197). The register-
 progress line (rows done, rows/s, ETA) to stderr, so read the first one after a few thousand rows instead of
 waiting for the end. A sweep cannot find a shape it does not generate: a new class of divergence gets its generator committed
 here, not left in an issue comment.
+
+The input layer (jq's 4,095- and 4,091-byte reads, NUL bytes, BOMs, invalid UTF-8, file seams) has its own oracle:
+[`jq-reader-oracle/`](../../jq-reader-oracle/README.md) links jq 1.7.1's and jq 1.8.2's own readers in-process and
+runs a differential harness against a `succinctly` binary, classifying each difference as a release split, as covered
+by E1 or E2 (#7963), as a recorded divergence, or as a bug (#7970). It is a separate package with its own lockfile,
+not part of the crate, and needs a C compiler; it is not yet folded into `dev compare jq`.
 
 ### Coverage
 

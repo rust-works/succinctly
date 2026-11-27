@@ -1,0 +1,27 @@
+# jq's own input reader, in-process, as a test oracle for `succinctly jq` (#7970).
+#
+# A separate package with its own lockfile, like fuzz/ and bench-compare/, so nothing of it
+# reaches the succinctly crate: no feature, no build script, no C, no change to the shipped
+# binary, the published crate or any `--all-features` build. It needs a C compiler and builds on
+# Linux and macOS only (jq's C sources need POSIX and GNU C; build.rs refuses a non-unix or
+# big-endian target). It does not depend on succinctly: the differential harness runs a
+# `succinctly` binary given by path.
+[package]
+name = "jq-reader-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# jq is MIT; its decNumber copy carries the ICU licence. Both are in vendor/jq-*/COPYING.
+license = "MIT"
+rust-version = "1.89.0"
+
+# Its own workspace root, as fuzz/ has: never a member of an enclosing workspace.
+[workspace]
+
+[dependencies]
+libc = "0.2"
+regex = "1.13.2"
+serde_json = { version = "1.0", features = ["preserve_order", "arbitrary_precision"] }
+
+[build-dependencies]
+cc = "1.2"

@@ -1,0 +1,5 @@
+# This package's own clippy configuration, so clippy does not read the succinctly crate's
+# (../clippy.toml): its disallowed-methods list guards the library against allocations sized by
+# untrusted input (#1670), and this is a development tool over generated cases. The MSRV is the
+# one Cargo.toml declares.
+msrv = "1.89.0"

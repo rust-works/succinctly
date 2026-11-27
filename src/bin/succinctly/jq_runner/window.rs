@@ -302,6 +302,10 @@ pub(super) struct Window<'a> {
     pub last: bool,
     /// An invalid byte was substituted in this window or an earlier one.
     pub substituted: bool,
+    /// #7938: where the substitution changed `raw`, relative to it (its text and the bytes it was
+    /// read as, both from `raw`'s first byte), so the document loop counts jq's reads in the bytes
+    /// jq read; empty where nothing was substituted.
+    pub edits: Vec<SubstitutionEdit>,
     /// What the files stitched into one stream (#4305) did to this window's text: the bytes moved onto
     /// the front of the file while they are still in `raw`, and the ones moved off its end for the
     /// last window ([`Seam`], #7024). [`Seam::NONE`] for a file that is the stream's only one.
@@ -503,6 +507,11 @@ pub(super) struct WindowedFile {
     /// Where the substitution changed the text, kept for a file that hands a tail on.
     raw_map: RawMap,
     track_raw: bool,
+    /// #7938: every edit the substitution made in the text still in `buf`, absolute in the file's
+    /// stream (text and bytes as read), whether or not [`Self::raw_map`] is kept, and `raw - text`
+    /// before the first of them: what a window hands the document loop ([`Window::edits`]).
+    edits: Vec<SubstitutionEdit>,
+    edits_delta_dropped: i64,
     /// Where `buf` starts in jq's input.
     origin: (usize, usize),
     /// Where the end of the text handed out is, once the last window is.
@@ -607,6 +616,8 @@ impl WindowedFile {
             file_read: 0,
             raw_map: RawMap::default(),
             track_raw,
+            edits: Vec::new(),
+            edits_delta_dropped: 0,
             origin: place.origin,
             end_origin: place.origin,
             certifier: None,
@@ -845,6 +856,7 @@ impl WindowedFile {
                     #[cfg(test)]
                     last,
                     substituted: self.substituted,
+                    edits: self.window_edits(),
                     seam,
                     origin: self.origin,
                     notes,
@@ -1038,6 +1050,14 @@ impl WindowedFile {
             // The text starts on a later line now, whose reads start at its front (#7569).
             self.seam.lead = 0;
             self.raw_map.drop_before(self.offset);
+            let keep = self
+                .edits
+                .partition_point(|edit| edit.text.end <= self.offset);
+            if keep > 0 {
+                let last = &self.edits[keep - 1];
+                self.edits_delta_dropped = last.raw.end as i64 - last.text.end as i64;
+                self.edits.drain(..keep);
+            }
         }
     }
 
@@ -1338,16 +1358,11 @@ impl WindowedFile {
         let raw_len = region.len();
         // #7341: a `--seq` gate's positions and the warnings of its stretches are offsets into the text,
         // which the substitution moves (only a stretch's values can hold invalid UTF-8 there).
-        let (text, edits) = if self.track_raw || self.seq_gate.is_some() {
+        // #7938: mapped on every route, so the document loop counts reads in the bytes as read.
+        let (text, edits) = {
             let (text, edits) =
                 succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(region);
             (text.into_bytes(), edits)
-        } else {
-            (
-                succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(region)
-                    .into_bytes(),
-                Vec::new(),
-            )
         };
         if let Some(gate) = self.seq_gate.as_mut() {
             let (from, delta) = (self.validated, text.len() as isize - raw_len as isize);
@@ -1367,6 +1382,15 @@ impl WindowedFile {
             }
         }
         let text_start = self.offset + self.validated;
+        // The region's bytes start where its text does, moved by every edit before it.
+        let delta = self.edits.last().map_or(self.edits_delta_dropped, |edit| {
+            edit.raw.end as i64 - edit.text.end as i64
+        });
+        let raw_start = usize::try_from(text_start as i64 + delta).unwrap_or(0);
+        self.edits.extend(edits.iter().map(|edit| SubstitutionEdit {
+            raw: raw_start + edit.raw.start..raw_start + edit.raw.end,
+            text: text_start + edit.text.start..text_start + edit.text.end,
+        }));
         if self.track_raw {
             // The first region is the front of the file, where the carry is: its seam is moved by
             // the substitution as the whole-file route's is (`utf8_lossy_document`).
@@ -1402,6 +1426,22 @@ impl WindowedFile {
         self.buf.splice(self.validated..end, text);
         self.validated = new_end;
         self.substituted = true;
+    }
+
+    /// [`Self::edits`] relative to the window's text, which starts at `offset` (a line start, never
+    /// inside an edit) and in the bytes as read where the edits before it put it.
+    fn window_edits(&self) -> Vec<SubstitutionEdit> {
+        if self.edits.is_empty() {
+            return Vec::new();
+        }
+        let raw_front = usize::try_from(self.offset as i64 + self.edits_delta_dropped).unwrap_or(0);
+        self.edits
+            .iter()
+            .map(|edit| SubstitutionEdit {
+                raw: edit.raw.start - raw_front..edit.raw.end - raw_front,
+                text: edit.text.start - self.offset..edit.text.end - self.offset,
+            })
+            .collect()
     }
 }
 

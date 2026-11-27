@@ -51,9 +51,10 @@ LEDGER_PATHS = (
 )
 RUST_PATHS = ("*.rs", "Cargo.toml", "Cargo.lock", "rust-toolchain*", "clippy.toml", ".cargo/*")
 
-# What can leave `fuzz/Cargo.lock` or `bench-compare/Cargo.lock` behind its manifest (#7467): both
-# crates depend on the main crate by path, so its manifest counts as theirs.
-NESTED_LOCK_PATHS = ("Cargo.toml", "fuzz/Cargo.*", "bench-compare/Cargo.*")
+# What can leave `fuzz/Cargo.lock`, `bench-compare/Cargo.lock` or `jq-reader-oracle/Cargo.lock`
+# behind its manifest (#7467): the first two crates depend on the main crate by path, so its
+# manifest counts as theirs; jq-reader-oracle (#7970) does not.
+NESTED_LOCK_PATHS = ("Cargo.toml", "fuzz/Cargo.*", "bench-compare/Cargo.*", "jq-reader-oracle/Cargo.*")
 
 RELEASE_FEATURES = "cli,simd,regex,serde,bench-runner"  # comparison/jq/manifest.toml
 
@@ -107,7 +108,8 @@ GATES = (
             'for t in scripts/test_*.py; do out=$(python3 "$t" 2>&1) || {{ echo "$t:"; echo "$out"; exit 1; }}; done',
         ),
         (r"^python3 scripts/test_\w+\.py",),
-        paths=("scripts/*.py", ".github/workflows/*"),
+        # The call machine's golden corpus, which `test_call_machine.py` checks against its cases.
+        paths=("scripts/*.py", ".github/workflows/*", "tests/data/call-machine-corpus-7977.json"),
         cost=0,
     ),
     Gate(
@@ -163,8 +165,9 @@ GATES = (
         (
             "cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null",
             "cargo metadata --locked --format-version 1 --manifest-path bench-compare/Cargo.toml > /dev/null",
+            "cargo metadata --locked --format-version 1 --manifest-path jq-reader-oracle/Cargo.toml > /dev/null",
         ),
-        (r"^cargo metadata --locked --format-version 1 --manifest-path (fuzz|bench-compare)/Cargo\.toml > /dev/null$",),
+        (r"^cargo metadata --locked --format-version 1 --manifest-path (fuzz|bench-compare|jq-reader-oracle)/Cargo\.toml > /dev/null$",),
         paths=NESTED_LOCK_PATHS,
         cost=1,
     ),
@@ -292,8 +295,10 @@ NOT_MIRRORED = (
     (r"^\./scripts/sync-[\w-]+\.sh", "golden and corpus drift checks need the pinned yq/jq/corpus tooling CI installs"),
     (r"^\./scripts/gh-release-download\.sh", "fetches a pinned tool onto the CI runner (#6652); scripts/test_ci_release_downloads.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/perf-guard\.py", "needs valgrind and a release binary on Linux"),
-    (r"^python3 scripts/binary_size\.py check", "needs the fat-LTO release binary (minutes), and its budget is CI's own measurement (#7390); scripts/test_binary_size.py, run by the script-tests gate, is the local check"),
+    (r"^python3 scripts/binary_size\.py check", "needs the fat-LTO release binary (minutes), a base binary to compare with, and a budget that is CI's own measurement (#7390); scripts/test_binary_size.py, run by the script-tests gate, is the local check"),
+    (r"^python3 scripts/binary_size\.py track", "measures main's binary from a CI artifact and opens an issue with a token (scheduled.yml, #7959); scripts/test_binary_size.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/link-order/generate\.py check", "needs valgrind and a release binary on Linux (#7260); scripts/test_link_order.py, run by the script-tests gate, is the local check"),
+    (r"^python3 scripts/link-order/watch\.py", "reads main's perf-guard job log with a token and opens an issue (scheduled.yml); scripts/test_link_order.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/link-order/generate\.py stale", "reads the link log of the fat-LTO release build on x86_64 Linux (minutes; #7894); scripts/test_link_order.py, run by the script-tests gate, is the local check"),
     (r"^python3 scripts/ci_leg_times\.py", "reads the Actions API with a token and opens an issue (scheduled.yml); scripts/test_ci_leg_times.py is the local check"),
     (r"^python3 scripts/cancel_stale_merge_group_runs\.py$", "not a gate: cancels runs of destroyed merge groups with a token (cancel-stale-merge-groups.yml, #7552); `--dry-run` lists them, and scripts/test_cancel_stale_merge_group_runs.py, run by the script-tests gate, is the local check"),
