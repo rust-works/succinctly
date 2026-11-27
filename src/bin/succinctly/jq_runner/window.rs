@@ -1296,7 +1296,7 @@ impl WindowedFile {
             return;
         }
         let from = self.validated;
-        if succinctly::text::utf8::validate_utf8(&self.buf[from..end]).is_ok() {
+        if succinctly::text::utf8::is_utf8(&self.buf[from..end]) {
             self.validated = end;
         } else {
             // The first region after a carry that was not validated again: the substitution moves the

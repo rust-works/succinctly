@@ -11082,17 +11082,16 @@ impl ErrorAt<'_> {
 /// counts those, so a message that names where it stopped has to as well, and the edits that map
 /// the text onto them, over which jq's reads are counted (#7934).
 fn utf8_lossy_document(raw: Vec<u8>, seam: Option<&mut Seam>) -> (Vec<u8>, Option<LossySource>) {
-    match succinctly::text::utf8::validate_utf8(&raw) {
-        Ok(()) => (raw, None),
-        Err(_) => {
-            let (substituted, edits) =
-                succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(&raw);
-            if let Some(seam) = seam {
-                *seam = std::mem::take(seam).after_substitution(raw.len(), &edits);
-            }
-            (substituted.into_bytes(), Some(LossySource::new(raw, edits)))
-        }
+    // `is_utf8`, not `validate_utf8`: its ASCII skip is the whole-file route's (#7966).
+    if succinctly::text::utf8::is_utf8(&raw) {
+        return (raw, None);
     }
+    let (substituted, edits) =
+        succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document_mapped(&raw);
+    if let Some(seam) = seam {
+        *seam = std::mem::take(seam).after_substitution(raw.len(), &edits);
+    }
+    (substituted.into_bytes(), Some(LossySource::new(raw, edits)))
 }
 
 /// What jq's parser read of each file: the bytes as they were where the invalid-UTF-8
@@ -16348,7 +16347,7 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
         if crate::cli::front_matter::StreamBomMatch::default().breaks_in(&bytes) {
             BROKEN_MARK_STREAM.with(|flag| flag.set(true));
         }
-        let utf8 = succinctly::text::utf8::validate_utf8(&bytes[bom..]).is_ok();
+        let utf8 = succinctly::text::utf8::is_utf8(&bytes[bom..]);
         // Up to the last whole character: the front may end inside one.
         let valid_end = if utf8 {
             bytes.len()
