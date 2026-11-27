@@ -33630,6 +33630,13 @@ impl OnigEngine {
         EvalError::new(format!("Regex failure: {}", e.text()))
     }
 
+    /// jq's test mode: whether a search of the whole of `input` finds a match, asking for no spans.
+    fn is_match(&self, input: &str) -> Result<bool, EvalError> {
+        self.re
+            .matches_in(&mut self.scratch.borrow_mut(), input.as_bytes(), 0)
+            .map_err(Self::failure)
+    }
+
     /// The match `onig_search` finds from byte `start` to the end of `input`, its groups as jq
     /// reads them.
     fn captures_at<'h>(
@@ -33646,6 +33653,13 @@ impl OnigEngine {
             return Ok(None);
         }
         let raw = scratch.span(0).expect("group 0 holds the whole match");
+        if self.names.len() == 1 {
+            // No group but the whole match: no list to allocate per match.
+            return Ok(Some(RegexCaptures::OnigWhole {
+                whole: Self::group(input, raw.0, raw.1),
+                raw,
+            }));
+        }
         let groups = (0..self.names.len())
             .map(|i| scratch.span(i).map(|(b, e)| Self::group(input, b, e)))
             .collect();
@@ -33697,6 +33711,11 @@ enum RegexCaptures<'h> {
     /// whole match's byte span as the library reported it, where jq's next search starts from.
     Onig {
         groups: Vec<Option<RegexMatch<'h>>>,
+        raw: (usize, usize),
+    },
+    /// [`Onig`](Self::Onig) for a pattern with no capture group: the whole match alone.
+    OnigWhole {
+        whole: RegexMatch<'h>,
         raw: (usize, usize),
     },
 }
@@ -33802,6 +33821,7 @@ impl<'h> RegexCaptures<'h> {
             }
             RegexCaptures::Mapped(groups) => groups.get(i).cloned().flatten(),
             RegexCaptures::Onig { groups, .. } => groups.get(i).cloned().flatten(),
+            RegexCaptures::OnigWhole { whole, .. } => (i == 0).then(|| whole.clone()),
         }
     }
 
@@ -33922,7 +33942,7 @@ impl JqRegex {
         }
         match &self.engine {
             // jq's test mode: the first search's answer.
-            RegexEngine::Onig(engine) => Ok(engine.captures_at(input, 0)?.is_some()),
+            RegexEngine::Onig(engine) => engine.is_match(input),
             RegexEngine::Std(re) | RegexEngine::Rewritten { re, .. } => {
                 let found = dv_is_match(re, input, self.needs_trailing_nl_check);
                 if found && self.caret_end.is_some() && ends_with_trailing_newline(input) {
@@ -43445,7 +43465,7 @@ fn next_match_step<'h>(
     // Oniguruma's match: jq's own step from the span the library reported (`f_match`): the next
     // search starts where a match ended, or one *byte* after an empty one, inside a multibyte
     // character if one follows (#7965). The #6169 guard below still applies.
-    if let RegexCaptures::Onig { raw, .. } = &caps {
+    if let RegexCaptures::Onig { raw, .. } | RegexCaptures::OnigWhole { raw, .. } = &caps {
         let (raw_start, raw_end) = *raw;
         let backward_repeat = raw_start < start && raw_end <= start;
         let next_start = if raw_end > raw_start && !backward_repeat {

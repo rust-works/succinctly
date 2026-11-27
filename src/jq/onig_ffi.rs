@@ -281,13 +281,35 @@ impl OnigRegex {
         subject: &[u8],
         start: usize,
     ) -> Result<bool, OnigError> {
+        let region = scratch.region.0;
+        self.search_raw(scratch, region, subject, start)
+    }
+
+    /// Whether a search from byte `start` finds a match, with no region: jq's test mode, which
+    /// asks the library for no spans (its `f_match` stops at the first match).
+    pub(crate) fn matches_in(
+        &self,
+        scratch: &mut Scratch,
+        subject: &[u8],
+        start: usize,
+    ) -> Result<bool, OnigError> {
+        self.search_raw(scratch, core::ptr::null_mut(), subject, start)
+    }
+
+    fn search_raw(
+        &self,
+        scratch: &mut Scratch,
+        region: *mut OnigRegion,
+        subject: &[u8],
+        start: usize,
+    ) -> Result<bool, OnigError> {
         if start > subject.len() {
             return Ok(false);
         }
         let base = subject.as_ptr();
-        // SAFETY: every pointer is within `subject` (`start <= len`); the region and the match
-        // parameter are live allocations of the library's own types, and the library resizes the
-        // region to this pattern's groups.
+        // SAFETY: every pointer is within `subject` (`start <= len`); the region (when not null)
+        // and the match parameter are live allocations of the library's own types, and the
+        // library resizes the region to this pattern's groups.
         let r = unsafe {
             let end = base.add(subject.len());
             onig_search_with_param(
@@ -296,7 +318,7 @@ impl OnigRegex {
                 end,
                 base.add(start),
                 end,
-                scratch.region.0,
+                region,
                 ONIG_OPTION_NONE,
                 scratch.param.0,
             )
