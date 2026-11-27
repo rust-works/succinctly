@@ -281,13 +281,35 @@ impl OnigRegex {
         subject: &[u8],
         start: usize,
     ) -> Result<bool, OnigError> {
+        let region = scratch.region.0;
+        self.search_raw(scratch, region, subject, start)
+    }
+
+    /// Whether a search from byte `start` finds a match, with no region: jq's test mode, which
+    /// asks the library for no spans (its `f_match` stops at the first match).
+    pub(crate) fn matches_in(
+        &self,
+        scratch: &mut Scratch,
+        subject: &[u8],
+        start: usize,
+    ) -> Result<bool, OnigError> {
+        self.search_raw(scratch, core::ptr::null_mut(), subject, start)
+    }
+
+    fn search_raw(
+        &self,
+        scratch: &mut Scratch,
+        region: *mut OnigRegion,
+        subject: &[u8],
+        start: usize,
+    ) -> Result<bool, OnigError> {
         if start > subject.len() {
             return Ok(false);
         }
         let base = subject.as_ptr();
-        // SAFETY: every pointer is within `subject` (`start <= len`); the region and the match
-        // parameter are live allocations of the library's own types, and the library resizes the
-        // region to this pattern's groups.
+        // SAFETY: every pointer is within `subject` (`start <= len`); the region (when not null)
+        // and the match parameter are live allocations of the library's own types, and the
+        // library resizes the region to this pattern's groups.
         let r = unsafe {
             let end = base.add(subject.len());
             onig_search_with_param(
@@ -296,7 +318,7 @@ impl OnigRegex {
                 end,
                 base.add(start),
                 end,
-                scratch.region.0,
+                region,
                 ONIG_OPTION_NONE,
                 scratch.param.0,
             )
@@ -504,5 +526,57 @@ mod tests {
         let p = MatchParam::new();
         p.match_stack_limit(1000);
         p.retry_limit(1000);
+    }
+
+    /// The vendored patch keeps a search's match stack in the match parameter for the next search
+    /// (`vendor/oniguruma/patches/`). A reused `Scratch` must answer every search as a fresh one
+    /// does: after a search that grew the stack, after one with no match, after a test-mode search
+    /// with no region, and when one `Scratch` serves patterns whose stacks are laid out for
+    /// different numbers of groups (the patch only takes a stack of the same layout).
+    #[test]
+    fn a_reused_scratch_answers_as_a_fresh_search_does() {
+        let patterns = [
+            "(a|b)*c",
+            "((((((a))))))+",
+            "x",
+            "(?<n>\\w+)\\s+\\k<n>",
+            "(?:a*)*b",
+            "",
+            "(?=(a))a",
+        ];
+        let subjects = [
+            "",
+            "abc",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+            "hello hello",
+            "bbbb",
+            "zzz",
+        ];
+        let compiled: Vec<OnigRegex> = patterns.iter().map(|p| compile(p)).collect();
+        let mut shared = Scratch::new();
+        for round in 0..3 {
+            for (re, p) in compiled.iter().zip(patterns) {
+                let mut own = Scratch::new();
+                for subject in subjects {
+                    let bytes = subject.as_bytes();
+                    for start in 0..=bytes.len() {
+                        let fresh = re.search(bytes, start).unwrap();
+                        for scratch in [&mut own, &mut shared] {
+                            let found = re.search_in(scratch, bytes, start).unwrap();
+                            let spans = found
+                                .then(|| (0..scratch.len()).map(|i| scratch.span(i)).collect());
+                            assert_eq!(
+                                spans, fresh,
+                                "{p:?} on {subject:?} from {start}, round {round}"
+                            );
+                            assert_eq!(
+                                re.matches_in(scratch, bytes, start).unwrap(),
+                                fresh.is_some()
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
