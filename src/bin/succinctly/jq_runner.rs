@@ -43,7 +43,9 @@ use reader_model::JQ_LINE_READS;
 mod call_machine;
 mod eof_location;
 // ADR-0033's reader model (#7987): the routes' read arithmetic is its `Fgets` and `LineReads`
-// (step 4), and no route enters its `ReaderState` until step 5.
+// (step 4), and the materializing route of `read_inputs` enters its `ReaderState` on a trigger
+// (step 5, `model_read`).
+mod model_read;
 pub(crate) mod reader_model;
 mod window;
 
@@ -8684,6 +8686,52 @@ fn read_inputs(
     // the events, and the first fault is the error jq raises.
     let stream_by_reader =
         json_input_mode && args.stream && !args.stream_errors && (track_eof || args.slurp);
+    // ADR-0033 step 5 (#7987): a plain JSON stream this route reads enters jq's reader model on a
+    // trigger ([`model_read`]). Not under `--slurp`, `--stream` or `--stream-errors`, whose readers
+    // are later steps', nor with a file that did not open, whose report the reads place.
+    let model_route = reader_model::enabled()
+        && json_input_mode
+        && reads_plain_json(args)
+        && !args.stream
+        && !args.stream_errors
+        && !args.slurp
+        && track_eof
+        && !any_open_failure
+        && !unopened_tail
+        && handed.is_none();
+    // The triggers known before anything is read as JSON: a mark that is not whole, and several
+    // sources not all UTF-8 (never read lazily). The model reads the whole input, as it was read.
+    let sources_utf8 = (model_route && raw_bytes.len() > 1)
+        .then(|| raw_bytes.iter().all(|(_, raw)| std::str::from_utf8(raw).is_ok()));
+    if model_route
+        && (sources_utf8 == Some(false)
+            || model_read::mark_not_whole(raw_bytes.iter().map(|(_, raw)| raw.as_slice())))
+    {
+        let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
+        let tags: Vec<usize> = raw_bytes.iter().map(|(tag, _)| tag.unwrap_or(0)).collect();
+        let mut locations =
+            InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
+        let (mut values, mut errors) = (Vec::new(), Vec::new());
+        model_read::read_whole(
+            &sources,
+            &tags,
+            model_read::Sink {
+                values: &mut values,
+                locations: &mut locations,
+                errors: &mut errors,
+            },
+        );
+        return Ok(Ok((values, locations, None, errors)));
+    }
+    // What the model needs of the sources as read, should the loop below meet a trigger.
+    let (model_lens, model_tags): (Vec<usize>, Vec<usize>) = if model_route {
+        raw_bytes
+            .iter()
+            .map(|(tag, raw)| (raw.len(), tag.unwrap_or(0)))
+            .unzip()
+    } else {
+        (Vec::new(), Vec::new())
+    };
     // `--seq` keeps the mark: its reader removes it as jq's does, and reacts to one that breaks off.
     let bom_cuts = if json_input_mode {
         // #5291: jq skips a BOM at the start of its input.
@@ -8714,11 +8762,15 @@ fn read_inputs(
     // per file) is off. #6455: their stitch waits for the route to turn the stream down or hand its
     // rest to the eager reader, so a program that stops early does not scan every file but the last
     // whole: the files before the one a scan reaches are clean, with nothing open for the next.
+    // The model's route asked it above, before the mark was cut, which changes no answer there: a
+    // mark it reads is whole in one source, valid UTF-8 cut whole.
     let several_lazy = lazy_read_flags(args, track_eof)
         && raw_bytes.len() > 1
-        && raw_bytes
-            .iter()
-            .all(|(_, raw)| std::str::from_utf8(raw).is_ok());
+        && sources_utf8.unwrap_or_else(|| {
+            raw_bytes
+                .iter()
+                .all(|(_, raw)| std::str::from_utf8(raw).is_ok())
+        });
     let mut seams = if several_lazy {
         vec![Seam::NONE; raw_bytes.len()]
     } else if json_input_mode && !args.validate && !args.stream_errors && !stream_by_reader {
@@ -9664,6 +9716,9 @@ fn read_inputs(
         LAZY_RAW_INPUTS.with(|slot| *slot.borrow_mut() = None);
         LAZY_STREAM_INPUTS.with(|slot| *slot.borrow_mut() = None);
         let mut lazy_inputs = false;
+        // ADR-0033 step 5: what the loop read of each source, for the model to be entered after it
+        // should it meet a trigger.
+        let mut model_files: Vec<model_read::EagerFile> = Vec::new();
         let counts_files = !args.stream && args.input_dsv.is_none();
         let mut next_file = StreamOrigin::ALONE.file;
         // #5857: a clean stream of several files converts each document when the program reads
@@ -9892,7 +9947,12 @@ fn read_inputs(
                     let documents_before = values.len();
                     let mut ends = Vec::new();
                     let mut offset = 0;
+                    // The ends of the values this source's reads hand out, for the model.
+                    let mut model_ends: Vec<usize> = Vec::new();
                     if let Some(spans) = lazy_prefix {
+                        if model_route {
+                            model_ends.extend(spans.iter().map(|&(_, end)| end));
+                        }
                         offset = spans.last().map_or(0, |&(_, end)| end);
                         defer_lazy_start(std::rc::Rc::clone(&raw), spans, src, seam.clone(), None);
                         // #7948: its documents' lines count jq's reads in the bytes jq read, as
@@ -9911,6 +9971,7 @@ fn read_inputs(
                         ends_stream: pos == last && !unopened_tail,
                         lines_before: 0,
                     };
+                    let mut first_fault = None;
                     if let Err(error) = read_json_tail(
                         &raw,
                         offset,
@@ -9918,6 +9979,7 @@ fn read_inputs(
                         &mut values,
                         &mut ends,
                         &mut resumed_errors,
+                        &mut first_fault,
                     ) {
                         return Ok(Err(error));
                     }
@@ -9929,6 +9991,25 @@ fn read_inputs(
                         &ends,
                         values.len() - documents_before,
                     );
+                    if model_route {
+                        let lazy = model_ends.len();
+                        model_ends.extend_from_slice(&ends);
+                        // A lone source that is not UTF-8 is read as the substitution of it from its
+                        // first changed byte, which is a trigger of its own.
+                        let changed = lossy.and_then(|lossy| lossy.edits.first()).map(|edit| edit.text.start);
+                        let trigger = match (first_fault, changed) {
+                            (Some(fault), Some(changed)) => Some(fault.min(changed)),
+                            (fault, changed) => fault.or(changed),
+                        };
+                        model_files.push(model_read::EagerFile {
+                            text: std::rc::Rc::clone(&raw),
+                            base: seam.base,
+                            ends: model_ends,
+                            lazy,
+                            values_before: documents_before,
+                            trigger,
+                        });
+                    }
                     continue;
                 }
                 // Parse as JSON stream: the clean prefix, and the parse error
@@ -10031,6 +10112,38 @@ fn read_inputs(
             // `debug_assert_eq!(inputs.len(), locations.per_value().len())`.
             if !args.slurp && !lazy_inputs {
                 debug_assert_eq!(locations.len(), values.len(), "one location per value");
+            }
+        }
+        // ADR-0033 step 5 (#7987): the loop met a trigger (a fault, or a lone source's first byte
+        // that is not UTF-8). Its values before the last sync point ahead of it stand, and jq's
+        // reader model reads the rest of the input from there, over the sources as they were read.
+        if model_files.iter().any(|file| file.trigger.is_some()) {
+            let stream =
+                model_read::original_stream(&model_files, &lossy_sources, &bom_cuts, &model_lens);
+            debug_assert!(stream.is_some(), "the texts read are the sources read");
+            if let Some(stream) = stream {
+                let mut sources: Vec<&[u8]> = Vec::with_capacity(model_lens.len());
+                let mut at = 0;
+                for &len in &model_lens {
+                    sources.push(&stream[at..at + len]);
+                    at += len;
+                }
+                if let Some(entry) = model_read::entry_before(&model_files, &sources, &bom_cuts) {
+                    values.truncate(entry.keep);
+                    locations.truncate_values(entry.keep);
+                    resumed_errors.clear();
+                    model_read::read_rest(
+                        &sources,
+                        &model_tags,
+                        entry.state,
+                        entry.drop_through,
+                        model_read::Sink {
+                            values: &mut values,
+                            locations: &mut locations,
+                            errors: &mut resumed_errors,
+                        },
+                    );
+                }
             }
         }
     }
@@ -10811,6 +10924,14 @@ impl InputLocations {
 
     fn len(&self) -> usize {
         self.per_value.len()
+    }
+
+    /// Keeps the locations of the first `len` values only (ADR-0033 step 5: the reader model reads
+    /// the rest of the input again).
+    fn truncate_values(&mut self, len: usize) {
+        if len < self.per_value.len() {
+            self.per_value = self.per_value.iter().take(len).collect();
+        }
     }
 
     /// Record one location per value from the values' end offsets in `raw`.
@@ -15506,6 +15627,9 @@ struct TailContext<'a> {
 /// order. Their positions are best effort: a segment past a fault starts at its real place in the
 /// text, where jq's parser does not count the bytes it dropped (#5923 kept that count, and carried it
 /// into the next file).
+///
+/// `first_fault` is set to where the value the first fault is met in starts, unless it is set
+/// already: the earliest byte the reader model has to read again (ADR-0033 step 5, `model_read`).
 fn read_json_tail(
     raw: &str,
     mut offset: usize,
@@ -15513,6 +15637,7 @@ fn read_json_tail(
     values: &mut Vec<OwnedValue>,
     ends: &mut Vec<usize>,
     resumed_errors: &mut Vec<(usize, TrailingParseError)>,
+    first_fault: &mut Option<usize>,
 ) -> Result<()> {
     // #7931, #7934: jq's reads are counted over the bytes it read, not over the substitution.
     let mut faults = LineCounter::at_seam(raw.as_bytes(), cx.seam.clone()).reading(cx.lossy);
@@ -15609,6 +15734,7 @@ fn read_json_tail(
         let (Some(error), Some(start)) = (parse_error, start) else {
             break;
         };
+        first_fault.get_or_insert(start);
         let (detected, mut line, resume) =
             meet_fault(&mut faults, raw.as_bytes(), start, cx.stream);
         // #6004, #7810: a bare token straight before the last byte, an opener or a quote, completes
@@ -17470,7 +17596,15 @@ fn fault_tail(
         lines_before: lazy.dropped.newlines,
     };
     let (mut values, mut ends, mut errors) = (Vec::new(), Vec::new(), Vec::new());
-    match read_json_tail(text, end_of_last, &cx, &mut values, &mut ends, &mut errors) {
+    match read_json_tail(
+        text,
+        end_of_last,
+        &cx,
+        &mut values,
+        &mut ends,
+        &mut errors,
+        &mut None,
+    ) {
         Ok(()) => {
             // A stream scanned a chunk at a time has nothing queued behind its lazy
             // documents: it is the only source, or the last of several whose earlier ones
@@ -17697,7 +17831,15 @@ fn hand_off_later_sources(
         let before = values.len();
         let mut ends = Vec::new();
         let offset = if pos == 0 { from } else { 0 };
-        match read_json_tail(text, offset, &cx, &mut values, &mut ends, &mut errors) {
+        match read_json_tail(
+            text,
+            offset,
+            &cx,
+            &mut values,
+            &mut ends,
+            &mut errors,
+            &mut None,
+        ) {
             Ok(()) => {}
             // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two parsers and the prefix parse materializes from its spans, so it cannot find fewer values (the guard `read_json_tail` keeps per segment, #4311)"
             Err(error) => {

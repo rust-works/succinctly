@@ -30,8 +30,13 @@
 //!
 //! The read arithmetic both are built on is the one the routes call (step 4): [`Fgets`], one
 //! `fgets` read, and [`LineReads`], where a line's reads fall as a closed form of the offset into
-//! it. No route enters [`ReaderState`] itself until step 5, so the items only the model and its
-//! tests read are marked as such.
+//! it.
+//!
+//! Since step 5 the materializing route of `read_inputs` enters the model on its triggers
+//! (`jq_runner/model_read.rs`): it carries a [`ReaderState`] from the stream's start over the plain
+//! stretch before the trigger with [`ReaderState::skip_plain`], then reads the rest of the input
+//! with [`ReaderState::read_to_end`]. [`enabled`] is the switch that keeps the deciders the model
+//! replaces selectable until step 10.
 
 use crate::cli::jq_reader_profile::{ReaderProfile, JQ_READER};
 use crate::cli::jq_seq_reader::find_byte;
@@ -143,7 +148,6 @@ impl LineReads {
 
 /// How a run reads its input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ReadMode {
     /// `--seq` (`JV_PARSE_SEQ`).
     pub seq: bool,
@@ -151,7 +155,6 @@ pub(crate) struct ReadMode {
 
 /// `current_input`: the file being read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct OpenFile {
     /// How many of its bytes `fgets` has read.
     pub offset: usize,
@@ -163,7 +166,6 @@ pub(crate) struct OpenFile {
 /// jq's reader at a sync point: its parser between top-level values at the start of one of its
 /// reads (ADR-0033, "Sync points and state").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ReaderState {
     /// `curr_file`: how many files `next_file` has handed out. The open file, when there is one,
     /// is the last of them.
@@ -179,7 +181,6 @@ pub(crate) struct ReaderState {
 
 /// What `input_filename` and `input_line_number` answer (`jq_util_input_get_position`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Position {
     /// The file, by its index among the inputs; `None` is `<unknown>` (`null`).
     pub file: Option<usize>,
@@ -189,7 +190,6 @@ pub(crate) struct Position {
 
 /// What one `jq_util_input_next_input` call returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Item {
     /// A value, as its span in the inputs read as one stream.
     Value(Span),
@@ -201,7 +201,6 @@ pub(crate) enum Item {
 
 /// One call's answer and the position right after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Read {
     pub item: Item,
     pub at: Position,
@@ -209,7 +208,6 @@ pub(crate) struct Read {
 
 /// Where [`ReaderState::step`] stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Stop {
     /// At the next sync point.
     Synced,
@@ -220,7 +218,6 @@ pub(crate) enum Stop {
 
 /// What a route knows about one file's share of a plain stretch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PlainRun {
     /// The file, by its index among the inputs.
     pub file: usize,
@@ -246,7 +243,6 @@ pub(crate) struct PlainRun {
 /// (after white space, `]`, `}` or `"`, or at the end of the input) and at the end of a read: after
 /// a newline, a whole number of reads after the last one, or at the end of its file.
 #[derive(Clone, Copy, Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PlainStretch<'r> {
     pub runs: &'r [PlainRun],
     /// How many input files the run has.
@@ -259,7 +255,6 @@ pub(crate) struct PlainStretch<'r> {
 }
 
 /// The offset in the inputs read as one stream at which `file` starts.
-#[cfg_attr(not(test), allow(dead_code))]
 fn file_start(sources: &[&[u8]], file: usize) -> usize {
     sources[..file.min(sources.len())]
         .iter()
@@ -268,7 +263,6 @@ fn file_start(sources: &[&[u8]], file: usize) -> usize {
 }
 
 /// `jq_util_input_state` and its parser, between two sync points.
-#[cfg_attr(not(test), allow(dead_code))]
 struct Reader<'s, 'b> {
     profile: &'s ReaderProfile,
     mode: ReadMode,
@@ -279,7 +273,6 @@ struct Reader<'s, 'b> {
     parser: JvParser<'b>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<'s, 'b> Reader<'s, 'b> {
     fn resume(
         state: ReaderState,
@@ -433,8 +426,26 @@ impl<'s, 'b> Reader<'s, 'b> {
     }
 }
 
-// `position` is read by no test either: the routes read it once they enter the model (step 5).
-#[allow(dead_code)]
+/// Whether the routes enter the model on their triggers. `SUCCINCTLY_READER_MODEL=0` turns it off,
+/// so a run reads with the deciders the model replaces: ADR-0033's two readers coexist until step
+/// 10, and the switch is how the old one is selected for an A/B or a bisection. On by default.
+pub(crate) fn enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = MODEL_ON.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("SUCCINCTLY_READER_MODEL").map_or(true, |value| value != "0")
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: [`enabled`]'s answer on this thread, in place of the environment's.
+    pub(crate) static MODEL_ON: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 impl ReaderState {
     /// The reader before its first read.
     pub(crate) const fn start(mode: ReadMode) -> Self {
@@ -446,7 +457,9 @@ impl ReaderState {
         }
     }
 
-    /// What `input_filename` and `input_line_number` answer here.
+    /// What `input_filename` and `input_line_number` answer here. Read by no route yet: the
+    /// materializing route takes each answer's position from the answer (step 5).
+    #[allow(dead_code)]
     pub(crate) fn position(&self) -> Position {
         Position {
             file: self.input.map(|_| self.next_file - 1),
@@ -469,6 +482,34 @@ impl ReaderState {
         let stop = reader.run(out);
         *self = reader.state();
         stop
+    }
+
+    /// [`step`](Self::step) from this sync point on until the input is over: each answer goes to
+    /// `on_read` as it is read, the first [`Item::End`] last. Outside `--seq` a `Malformed BOM`
+    /// ends it instead, as the last answer, and it returns `true`: every `input` after it is that
+    /// fault again ([`Stop::Stuck`]). Each step's answers are handed on and dropped before the next
+    /// step, so what it holds is one read's worth, not the input's.
+    pub(crate) fn read_to_end(
+        mut self,
+        sources: &[&[u8]],
+        profile: &ReaderProfile,
+        mode: ReadMode,
+        mut on_read: impl FnMut(Read),
+    ) -> bool {
+        let mut reads = Vec::new();
+        loop {
+            let stop = self.step(sources, profile, mode, &mut reads);
+            for read in reads.drain(..) {
+                let end = read.item == Item::End;
+                on_read(read);
+                if end {
+                    return false;
+                }
+            }
+            if stop == Stop::Stuck {
+                return true;
+            }
+        }
     }
 
     /// The state [`step`](Self::step) reaches over `stretch`, from its facts alone: the sync point
