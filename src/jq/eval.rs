@@ -83687,12 +83687,16 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
 /// `map`, arithmetic) is left to the general rule. `None` when nothing in `expr` has that shape.
 fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
     let deriving_stage = |stage: &Expr| {
-        matches!(
-            unwrap_paren(stage),
-            Expr::Builtin(Builtin::ToString | Builtin::Length | Builtin::ToJson | Builtin::Type)
-                | Expr::Not
-                | Expr::Format(FormatType::Json | FormatType::YqJson(_) | FormatType::YqYaml(_))
-        )
+        is_yq_metadata_reader(stage)
+            || matches!(
+                unwrap_paren(stage),
+                Expr::Builtin(
+                    Builtin::ToString | Builtin::Length | Builtin::ToJson | Builtin::Type
+                ) | Expr::Not
+                    | Expr::Format(
+                        FormatType::Json | FormatType::YqJson(_) | FormatType::YqYaml(_)
+                    )
+            )
     };
     match expr {
         Expr::Paren(inner) => yq_slot_keeping_del_target(inner).map(|r| Expr::Paren(Box::new(r))),
@@ -83724,10 +83728,82 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
             // instead of going, and the rewrite would delete the document.
             let steps_down = stages[..split].iter().any(del_target_steps_down);
             if !steps_down {
-                return None;
+                return yq_reader_del_target_from_root(stages, split);
             }
             Some(Expr::pipe(stages[..split].to_vec()))
         }
+        _ => None,
+    }
+}
+
+/// Whether `stage` is one of yq's node metadata readers (#8020): `line`, `column`, `kind`, `style`,
+/// `tag`, `anchor`, `alias`, the three comment readers, `path`, `document_index`, `file_index` and
+/// `filename`. Each answers a fresh scalar built with `CreateReplacement`, which keeps its input's
+/// parent and key, so as a `del()` target it is its input's slot, and at the root (which has no
+/// parent) it is a node of its own: not the document, which only `del(.)` deletes.
+fn is_yq_metadata_reader(stage: &Expr) -> bool {
+    matches!(
+        unwrap_paren(stage),
+        Expr::Builtin(
+            Builtin::Line
+                | Builtin::Column
+                | Builtin::Kind
+                | Builtin::Style
+                | Builtin::Tag
+                | Builtin::Anchor
+                | Builtin::Alias
+                | Builtin::HeadComment
+                | Builtin::LineComment
+                | Builtin::FootComment
+                | Builtin::PathNoArg
+                | Builtin::DocumentIndex
+                | Builtin::FileIndex
+                | Builtin::Filename
+        )
+    )
+}
+
+/// [`yq_slot_keeping_del_target`] for a pipe of navigation that ends in metadata readers
+/// ([`is_yq_metadata_reader`]) and may yield the root (#8020): `stages[..split]` is the navigation,
+/// none of it stepping down. A reader's answer at the root is a parentless node of its own, which
+/// stops yq's back-to-front loop, and a bare reader resolves to such a parentless target here. So
+/// the navigation is split where it can still reach a node below the root: `(A, B) | R` is
+/// `(A | R), (B | R)`, and `.. | R` is `R, (.[]? | ..)`, the root's answer first, as `..` emits it
+/// (`del(.. | line)` leaves `{}`, `del((.b, .) | line)` deletes nothing and `del((., .b) | line)`
+/// deletes `.b`, all as in yq v4.53.3). `None` for any other shape, which the general rule takes:
+/// a reader there is parentless, so it can only stop the loop early, never delete the document.
+fn yq_reader_del_target_from_root(stages: &[Expr], split: usize) -> Option<Expr> {
+    if !stages[split..].iter().all(is_yq_metadata_reader) {
+        return None;
+    }
+    let rest = &stages[1..];
+    match unwrap_paren(&stages[0]) {
+        Expr::RecursiveDescent => {
+            let below = [
+                Expr::Optional(Box::new(Expr::Iterate)),
+                Expr::RecursiveDescent,
+            ]
+            .into_iter()
+            .chain(stages[1..split].iter().cloned())
+            .collect();
+            Some(Expr::Comma(vec![
+                Expr::pipe(rest.to_vec()),
+                Expr::pipe(below),
+            ]))
+        }
+        Expr::Comma(items) => Some(Expr::Comma(
+            items
+                .iter()
+                .map(|item| {
+                    let member = Expr::pipe(
+                        core::iter::once(item.clone())
+                            .chain(rest.iter().cloned())
+                            .collect(),
+                    );
+                    yq_slot_keeping_del_target(&member).unwrap_or(member)
+                })
+                .collect(),
+        )),
         _ => None,
     }
 }
@@ -83801,6 +83877,10 @@ fn del_target_shape(expr: &Expr) -> DelTargetShape {
             }
             shape
         }
+        // A metadata reader at the root answers a node of its own with no parent (#8020):
+        // `del(.a, line)` deletes nothing and `del(line, .a)` deletes `.a`. After a step down it
+        // is its input's slot, which `yq_slot_keeping_del_target` rewrote it to.
+        stage if is_yq_metadata_reader(stage) => Parentless,
         _ => Other,
     }
 }

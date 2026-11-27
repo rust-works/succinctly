@@ -7749,34 +7749,35 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
         other => (other, None),
     };
     let rewritten = retarget_write(write, &mut |target| {
-        let by_tag = || selects_by_tag(target) && cursor.index().has_explicit_tags();
-        if !(selects_by_node_metadata(target) || by_tag()) {
-            return None;
+        // #8020: a metadata reader's answer is a fresh node, whose `path` is the path of the node
+        // it read: `line | path` is `[]`. Rewritten to that path, `del(.a, line)` became
+        // `del(.a, .)` and deleted the document, and `(.a, line) = 7` replaced it, where yq
+        // deletes and writes nothing through such a node. A target that can answer one is not
+        // rewritten, except member by member for a comma, whose other members still select by
+        // metadata on the cursor; the evaluator applies yq's rule to what is left as written.
+        if metadata_reader_reaches_output(target) {
+            let Expr::Comma(members) = strip_parens(target) else {
+                return None;
+            };
+            let mut changed = false;
+            let members = members
+                .iter()
+                .map(|member| {
+                    if metadata_reader_reaches_output(member) {
+                        return member.clone();
+                    }
+                    match cursor_write_target(cursor, member) {
+                        Some(paths) => {
+                            changed = true;
+                            paths
+                        }
+                        None => member.clone(),
+                    }
+                })
+                .collect();
+            return changed.then(|| Expr::Paren(Box::new(Expr::Comma(members))));
         }
-        let query = Expr::Pipe(vec![target.clone(), Expr::Builtin(Builtin::PathNoArg)].into());
-        let mut scratch = ErrorSink::default();
-        let results = evaluate_yaml_cursor_core(
-            cursor,
-            &query,
-            &mut scratch,
-            false,
-            false,
-            false,
-            CoreRoute::inner(None),
-        )
-        .ok()?;
-        if scratch.hit() {
-            return None;
-        }
-        let mut matched = results
-            .iter()
-            .map(|(path, _)| navigation_for(path))
-            .collect::<Option<Vec<_>>>()?;
-        Some(match matched.len() {
-            0 => Expr::Builtin(Builtin::Empty),
-            1 => matched.remove(0),
-            _ => Expr::Paren(Box::new(Expr::Comma(matched))),
-        })
+        cursor_write_target(cursor, target)
     })?;
     Some(match pipe {
         None => rewritten,
@@ -7786,6 +7787,72 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
             Expr::Pipe(stages.into())
         }
     })
+}
+
+/// The navigation to each node one write target selects by node metadata, resolved on the cursor
+/// ([`resolve_metadata_write_targets`]), or `None` when it selects by none or its paths cannot be
+/// resolved.
+fn cursor_write_target<W: AsRef<[u64]> + Clone>(
+    cursor: YamlCursor<'_, W>,
+    target: &Expr,
+) -> Option<Expr> {
+    let by_tag = || selects_by_tag(target) && cursor.index().has_explicit_tags();
+    if !(selects_by_node_metadata(target) || by_tag()) {
+        return None;
+    }
+    let query = Expr::Pipe(vec![target.clone(), Expr::Builtin(Builtin::PathNoArg)].into());
+    let mut scratch = ErrorSink::default();
+    let results = evaluate_yaml_cursor_core(
+        cursor,
+        &query,
+        &mut scratch,
+        false,
+        false,
+        false,
+        CoreRoute::inner(None),
+    )
+    .ok()?;
+    if scratch.hit() {
+        return None;
+    }
+    let mut matched = results
+        .iter()
+        .map(|(path, _)| navigation_for(path))
+        .collect::<Option<Vec<_>>>()?;
+    Some(match matched.len() {
+        0 => Expr::Builtin(Builtin::Empty),
+        1 => matched.remove(0),
+        _ => Expr::Paren(Box::new(Expr::Comma(matched))),
+    })
+}
+
+/// Whether an output of a write target can be the answer of a node metadata reader (`line`,
+/// `kind`, `tag`, `path`, `document_index`, ...), a fresh node in yq rather than one of the
+/// document's (#8020). A reader inside a `select` condition, a comparison or an `if` condition only
+/// chooses nodes; any other place a reader appears counts, so a shape this does not know answers
+/// `true` and keeps its target as written.
+fn metadata_reader_reaches_output(target: &Expr) -> bool {
+    let is_reader =
+        |b: &Builtin| is_node_metadata_slot(b) || matches!(b, Builtin::Tag | Builtin::PathNoArg);
+    match strip_parens(target) {
+        Expr::Builtin(Builtin::Select(_)) => false,
+        Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) | Expr::Not => false,
+        Expr::Optional(inner) => metadata_reader_reaches_output(inner),
+        Expr::Pipe(stages) => stages.iter().any(metadata_reader_reaches_output),
+        Expr::Comma(items) => items.iter().any(metadata_reader_reaches_output),
+        Expr::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            metadata_reader_reaches_output(then_branch)
+                || metadata_reader_reaches_output(else_branch)
+        }
+        Expr::Alternative(left, right) => {
+            metadata_reader_reaches_output(left) || metadata_reader_reaches_output(right)
+        }
+        other => jq::walk::contains_builtin(other, is_reader),
+    }
 }
 
 /// Whether `expr` contains a `tag` metadata write anywhere (#2796): the one slot that changes
