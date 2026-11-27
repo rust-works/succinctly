@@ -7521,17 +7521,17 @@ fn test_duplicate_mapping_key_survives_first_last_stream() -> Result<()> {
 /// #631: computed indexing (`.[(expr)]`, `Expr::IndexExpr`) is the same bug
 /// class via a different AST node than `first`/`last` above. `.[0]`
 /// (`Expr::Index`, a literal the parser folds at parse time) already
-/// preserved duplicate keys, but `.[(1-1)]` — forced past that folding —
+/// preserved duplicate keys, but `.[(1 - 1)]` — forced past that folding —
 /// did not, until `Expr::IndexExpr` was added to `can_use_m2_streaming` too.
 #[test]
 fn test_duplicate_mapping_key_survives_computed_index() -> Result<()> {
     let yaml = "- a: 1\n  a: 2\n- b: 3\n  b: 4\n";
 
-    let (pretty, code) = run_yq_stdin(".[(1-1)]", yaml, &[])?;
+    let (pretty, code) = run_yq_stdin(".[(1 - 1)]", yaml, &[])?;
     assert_eq!(code, 0);
     assert_eq!(pretty, "a: 1\na: 2\n");
 
-    let (compact, code) = run_yq_stdin(".[(1-1)]", yaml, &["-I0"])?;
+    let (compact, code) = run_yq_stdin(".[(1 - 1)]", yaml, &["-I0"])?;
     assert_eq!(code, 0);
     assert_eq!(compact, "a: 1\na: 2\n");
 
@@ -30318,21 +30318,21 @@ fn test_slice_string_and_array_unaffected_1065() -> Result<()> {
 /// boundary -- `5 | .[($a):1]` still doesn't qualify, since piping through
 /// `.` re-enters via `eval_owned_pipe`'s serialize/reparse round-trip
 /// (`eval_owned_input`), handing `eval_slice_expr` a fresh *borrowed*
-/// `StandardJson` cursor instead. `(5)[(1-1):(1+0)]` -- a bare literal in
+/// `StandardJson` cursor instead. `(5)[(1 - 1):(1+0)]` -- a bare literal in
 /// postfix-slice position, with arithmetic (non-folding) bounds -- is
 /// confirmed live (via a temporary trace) to be the one shape that reaches
 /// `slice_owned_value_read`/`is_yq_slice_empty_container_scalar` directly.
 #[test]
 fn test_slice_owned_target_scalar_is_empty_array_1065() -> Result<()> {
-    let (out, code) = run_yq_stdin("(5)[(1-1):(1+0)]", "", &["-n", "-o", "json"])?;
+    let (out, code) = run_yq_stdin("(5)[(1 - 1):(1+0)]", "", &["-n", "-o", "json"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[]");
 
-    let (out, code) = run_yq_stdin("(true)[(1-1):(1+0)]", "", &["-n", "-o", "json"])?;
+    let (out, code) = run_yq_stdin("(true)[(1 - 1):(1+0)]", "", &["-n", "-o", "json"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[]");
 
-    let (out, code) = run_yq_stdin("(null)[(1-1):(1+0)]", "", &["-n", "-o", "json"])?;
+    let (out, code) = run_yq_stdin("(null)[(1 - 1):(1+0)]", "", &["-n", "-o", "json"])?;
     assert_eq!(code, 0, "out: {out:?}");
     assert_eq!(out.trim(), "[]");
     Ok(())
@@ -30428,7 +30428,7 @@ fn test_object_slice_empty_object_and_nested_value_1102() -> Result<()> {
 #[test]
 fn test_object_slice_owned_target_1102() -> Result<()> {
     let (out, code) = run_yq_stdin(
-        r#"({"a":1,"b":2})[(1-1):(2+0)]"#,
+        r#"({"a":1,"b":2})[(1 - 1):(2+0)]"#,
         "",
         &["-n", "-o", "json", "-I0"],
     )?;
@@ -30589,7 +30589,7 @@ fn test_object_slice_getpath_path_round_trip_1102() -> Result<()> {
 
     // Same round trip via a computed-bound descriptor, not just a literal.
     let (out, code) = run_yq_stdin(
-        "getpath(path(.[(1-1):(1+1)]))",
+        "getpath(path(.[(1 - 1):(1+1)]))",
         r#"{"a":1,"b":2,"c":3}"#,
         &["-o", "json", "-I0", "--jq-extensions"],
     )?;
@@ -56761,7 +56761,7 @@ fn test_yq_index_scalar_with_key_is_empty_2482() -> Result<()> {
 /// $ yq -n '1.5 + "x"'        "1.5x"      $ yq -n '"x" + 1.5'        "x1.5"
 /// $ yq -n '1.0 + "x"'        "1.0x"      $ yq -n '"x" + 1.0'        "x1.0"
 /// $ yq -n '1e100 + "x"'      "1e100x"    $ yq -n '"x" + 1e100'      "x1e100"
-/// $ yq -n '(0-5) + "x"'      "-5x"       $ yq -n '"x" + (0-5)'      "x-5"
+/// $ yq -n '(0 - 5) + "x"'    "-5x"       $ yq -n '"x" + (0 - 5)'    "x-5"
 /// $ yq -n 'true + "x"'       "truex"     $ yq -n '"x" + true'       "xtrue"
 /// $ yq -n 'false + "x"'      "falsex"    $ yq -n '"x" + false'      "xfalse"
 /// $ succinctly yq -n '0 + "x"'   Error: number (0) and string ("x") cannot be added  (was, exit 1)
@@ -56791,8 +56791,8 @@ fn test_yq_scalar_string_concat_matrix_2507() -> Result<()> {
         (r#""x" + 1.0"#, r#""x1.0""#),
         (r#"1e100 + "x""#, r#""1e100x""#),
         (r#""x" + 1e100"#, r#""x1e100""#),
-        (r#"(0-5) + "x""#, r#""-5x""#),
-        (r#""x" + (0-5)"#, r#""x-5""#),
+        (r#"(0 - 5) + "x""#, r#""-5x""#),
+        (r#""x" + (0 - 5)"#, r#""x-5""#),
         (r#"true + "x""#, r#""truex""#),
         (r#""x" + true"#, r#""xtrue""#),
         (r#"false + "x""#, r#""falsex""#),

@@ -702,6 +702,14 @@ fn yq_string_interpolation() -> bool {
 /// recurses ([`Parser::parse_yq_forty_group_operand`]).
 const YQ_FORTY_GROUP_WEIGHT: usize = 16;
 
+/// yq's refusal of a value followed by a negative number (`1 -16`, `.a -1`; #7998): its tree
+/// builder is left two nodes, its words for which are these. `position` is the `-`'s.
+#[cold]
+#[inline(never)]
+fn yq_adjacent_negative_number(position: usize) -> ParseError {
+    ParseError::new("bad expression, please check expression syntax", position)
+}
+
 /// One link of yq's right-folding arithmetic level ([`Parser::parse_yq_arithmetic`]).
 enum YqArithLink {
     Arith(ArithOp),
@@ -12797,35 +12805,46 @@ impl<'a> Parser<'a> {
 
     /// Consume the next link of yq's arithmetic level, if one follows: `+ - * / % //` (and `*`'s
     /// merge flags). Not the compound assignments (`+=`, `*=`, `//=` ...), which end the level.
+    ///
+    /// A `-` directly followed by a digit is no link (#7998): yq's lexer tries its number tokens
+    /// (`-?\d+`, `-?\d+(\.\d+)`, `-?[1-9](\.\d+)?[Ee][-+]?\d+`) before `Subtract`, so it reads
+    /// `1 -16`, `1-16` and `.a -1` as a value and a negative number side by side, which its tree
+    /// builder refuses. A `-` before a space, `(`, `.` or another `-` is still a subtraction.
     #[inline(never)]
-    fn take_yq_arithmetic_op(&mut self) -> Option<YqArithLink> {
+    fn take_yq_arithmetic_op(&mut self) -> Result<Option<YqArithLink>, ParseError> {
         self.skip_ws();
         let peek2 = self.peek_str(2);
         if matches!(peek2, "+=" | "-=" | "*=" | "%=" | "/=") || self.peek_str(3) == "//=" {
-            return None;
+            return Ok(None);
         }
-        let link = match self.peek()? {
+        let Some(c) = self.peek() else {
+            return Ok(None);
+        };
+        let link = match c {
             '+' => YqArithLink::Arith(ArithOp::Add),
+            '-' if peek2.as_bytes().get(1).is_some_and(u8::is_ascii_digit) => {
+                return Err(yq_adjacent_negative_number(self.pos));
+            }
             '-' => YqArithLink::Arith(ArithOp::Sub),
             '%' => YqArithLink::Arith(ArithOp::Mod),
             '*' => {
                 self.next();
                 let flags = self.scan_merge_flags();
                 self.skip_ws();
-                return Some(YqArithLink::Arith(ArithOp::Mul(flags)));
+                return Ok(Some(YqArithLink::Arith(ArithOp::Mul(flags))));
             }
             '/' if peek2 == "//" => {
                 self.next();
                 self.next();
                 self.skip_ws();
-                return Some(YqArithLink::Alternative);
+                return Ok(Some(YqArithLink::Alternative));
             }
             '/' => YqArithLink::Arith(ArithOp::Div),
-            _ => return None,
+            _ => return Ok(None),
         };
         self.next();
         self.skip_ws();
-        Some(link)
+        Ok(Some(link))
     }
 
     /// yq mode: `+ - * / % //` are one precedence (42, `operation.go` v4.53.3) and a stack that
@@ -12837,7 +12856,7 @@ impl<'a> Parser<'a> {
     fn parse_yq_arithmetic(&mut self) -> Result<Expr, ParseError> {
         let mut operands = vec![self.parse_operand()?];
         let mut links = Vec::new();
-        while let Some(link) = self.take_yq_arithmetic_op() {
+        while let Some(link) = self.take_yq_arithmetic_op()? {
             links.push(link);
             self.check_expr_nesting(links.len())?;
             operands.push(self.parse_operand()?);
@@ -18236,10 +18255,20 @@ mod tests {
                 "{filter:?}"
             );
         }
-        // Spaced, trailing and jq-mode `-` is still subtraction / a boundary.
-        for filter in ["length - 1", "length -1", ".a | length -1"] {
+        // Spaced and jq-mode `-` is still subtraction / a boundary.
+        for filter in ["length - 1", ".a | length - 1"] {
             assert!(
                 parse_program_with_mode(filter, ParserMode::Yq).is_ok(),
+                "{filter:?}"
+            );
+        }
+        // A `-` straight before a digit is a negative number in yq's lexer, so after `length` it
+        // is a second value, which yq refuses as `bad expression` (#7998).
+        for filter in ["length -1", ".a | length -1"] {
+            let err = parse_program_with_mode(filter, ParserMode::Yq).err();
+            assert_eq!(
+                err.map(|e| e.message).as_deref(),
+                Some("bad expression, please check expression syntax"),
                 "{filter:?}"
             );
         }
