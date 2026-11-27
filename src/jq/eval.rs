@@ -83830,12 +83830,6 @@ fn yq_condition_is_value_only(cond: &Expr) -> bool {
 #[doc(hidden)]
 pub fn yq_condition_reads_differently_on_owned(cond: &Expr, aliased: bool) -> bool {
     use Builtin as B;
-    let nullish = |e: &Expr| {
-        matches!(
-            unwrap_paren(e),
-            Expr::Literal(Literal::Null | Literal::Bool(_))
-        )
-    };
     // An operand that reads a node's own value, which is what yq compares by its text; a
     // metadata reader's answer (`style != ""`) is a fresh string, the same in both.
     fn node_value(e: &Expr) -> bool {
@@ -83851,6 +83845,12 @@ pub fn yq_condition_reads_differently_on_owned(cond: &Expr, aliased: bool) -> bo
             _ => false,
         }
     }
+    let nullish = |e: &Expr| {
+        matches!(
+            unwrap_paren(e),
+            Expr::Literal(Literal::Null | Literal::Bool(_))
+        )
+    };
     any_subexpr(cond, &mut |e| match e {
         Expr::Builtin(B::ToString) => true,
         Expr::Compare { op, left, right } => {
