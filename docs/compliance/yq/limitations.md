@@ -4346,9 +4346,12 @@ from no position at all).
 
 An update whose target is its own input (`. |= f`, which `with(PATH; . |= f)` is) reads `key` and `parent` at that input since [#8039](https://github.com/rust-works/succinctly/issues/8039): `with(.b; . |= key)` writes `"b"`, and `with(.a.b; . |= (parent | keys))` writes the keys of `.a`, as in yq (pinned in `tests/yq_cli/i8039.rs`).
 Before it `key` answered nothing there and the target was left as it was.
-Two shapes still read no such position.
+An update whose own reads cannot all be resolved at its target still names the target for the updates nested in its filter, so `with(.x; . |= (.d = 1 | .b |= path))` and `.x |= (.b |= (.c | . |= path))` write `["x","b"]` and `["x","b","c"]`.
+A nested update that follows a value yq builds with no position (a scalar literal, an object constructor, a string interpolation, `keys` or `with_entries`) gets none: `.x |= (.b |= (5 | . |= path))` writes `[]`, as in yq.
+Three shapes still differ.
+A read of the update's own filter after a write in it is not positioned, because the write is taken to move the position: `.b |= (.x = 1 | key)` leaves `5` where yq writes `"b"`.
 A nested update reached through a pipe stage rather than an update's body climbs no `parent` above its own input: `.a.b | . |= (parent | keys)` leaves `.a.b` as it was, where yq writes `["b","d"]`.
-A read after a write in the same update body is not positioned, because the write is taken to move the position the reads after it are resolved at: `with(.a; .c = 1 | .d |= path)` writes `["d"]` where yq writes `["a","d"]`, and `with(.b; (. |= key) | (. |= path))` writes `[]` where yq writes `["b"]`.
+A `parent` above a node the filter navigated into but that does not exist lacks that node's key, the #2435 divergence above: `.x |= (.b |= (.b | . |= (parent | keys)))` writes `["c"]` where yq, which creates `.b.b` on the way, writes `["c","b"]`.
 
 `line`/`column` inside an update filter are **not** covered: they are answered from a
 cursor, not from a path, and no cursor reaches the filter. `.a | .b |= line` is `2` in real

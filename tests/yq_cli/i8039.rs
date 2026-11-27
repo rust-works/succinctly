@@ -3,11 +3,12 @@
 //! does for `.b |= key`, but the nested update answered no `key` (nor `parent`) at its own input,
 //! so the value was left unchanged. `path` already read the position the enclosing update
 //! installed; `key` is now its last component, and `parent` climbs the enclosing update's input.
-//! An update that names no position for its filter (`5 | . |= key` reads a node yq builds, which
-//! has none) gives its nested updates none either, rather than the enclosing update's.
+//! An update whose own reads cannot be resolved at its target still names that target for the
+//! updates nested in its filter, unless a value yq builds with no position comes first
+//! (`5 | . |= key`, whose `5` has no key).
 //!
 //! Every row was captured from yq v4.53.3. `with` is not a jq builtin, and `succinctly jq` still
-//! refuses it as jq 1.7.1 does.
+//! refuses it as jq 1.7.1 does; a nested update there climbs no `parent` either.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
