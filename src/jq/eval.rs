@@ -5393,10 +5393,25 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
         // side is never reached), and `null // .b` is `null` -- a falsy left
         // output stays itself when the right side yields nothing -- which is
         // what the `empty` stands in for.
-        Expr::Alternative(left, right) => Some(Expr::Alternative(
-            Box::new(yq_empty_context_reemit(left)?),
-            Box::new(yq_empty_context_reemit(right).unwrap_or(Expr::Builtin(Builtin::Empty))),
-        )),
+        // #8035: and the left side has to answer something. yq picks the right side only for a
+        // left output that is falsy, so a left side that empties on its own leaves nothing:
+        // `.a[] | ((1 | select(false)) // 5)` over `a: []` is nothing, where `null // 5` is `5`.
+        // A left rewrite that may answer nothing is asked first, as the condition of an `if` whose
+        // two branches are the operator: no answer is no branch. Not as a pipe stage before the
+        // operator, which the pipe's own rule would re-emit after that stage emptied, forever.
+        Expr::Alternative(left, right) => {
+            let left = yq_empty_context_reemit(left)?;
+            let right = yq_empty_context_reemit(right).unwrap_or(Expr::Builtin(Builtin::Empty));
+            if reemit_always_answers(&left) {
+                return Some(Expr::Alternative(Box::new(left), Box::new(right)));
+            }
+            let operator = Expr::Alternative(Box::new(left.clone()), Box::new(right));
+            Some(Expr::If {
+                cond: Box::new(Expr::FirstExpr(Box::new(left))),
+                then_branch: Box::new(operator.clone()),
+                else_branch: Box::new(operator),
+            })
+        }
         Expr::Pipe(stages) => {
             let (at, head) = stages
                 .iter()
@@ -5628,6 +5643,29 @@ pub(crate) fn eval_each_owned_reemitting<S: EvalSemantics>(
             sink,
         ),
         None => flow,
+    }
+}
+
+/// Whether a rewrite [`yq_empty_context_reemit`] made answers at least once (or raises) whatever it
+/// runs on: a literal, a collect, and constructors and operators over such operands. A pipe may
+/// empty in a later stage (`1 | select(false)`), so it and anything holding one answers `false`.
+fn reemit_always_answers(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Array(_) => true,
+        Expr::Error(message) => message.as_deref().map_or(true, reemit_always_answers),
+        Expr::Object(entries) => entries
+            .iter()
+            .all(|entry| reemit_always_answers(&entry.value)),
+        Expr::Comma(branches) => branches.iter().any(reemit_always_answers),
+        Expr::Negate(operand) => reemit_always_answers(operand),
+        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            reemit_always_answers(left) && reemit_always_answers(right)
+        }
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            reemit_always_answers(left) && reemit_always_answers(right)
+        }
+        Expr::Alternative(left, _) => reemit_always_answers(left),
+        _ => false,
     }
 }
 
@@ -102741,6 +102779,9 @@ fn bind_yq_update<'e>(
 /// `. as $i ireduce (0; (. + $i, . * 10))` over `[1, 2]` is `3 2 10 0`, a `select(false)` UPDATE
 /// prints nothing, and INIT `(0, 100)` folds both over the same source (`3 103`; jq's later forks read
 /// a `null` source, #3895).
+/// An empty list is folded too (#8035): UPDATE runs over it for every later node, where a collect, a
+/// literal, a loop variable or an `error` still answers once, so `.[] as $x ireduce (select(false);
+/// [.])` over `[1, 2]` is `[[]]` and `... (select(false); $x)` is `2`.
 ///
 /// Reading the source first is visible only through errors (#8022), so the source is still streamed
 /// here, INIT first, and the order is recovered by precedence: an error anywhere in the source
@@ -102786,10 +102827,14 @@ fn reduce_list_yq<S: EvalSemantics>(
     // doubles the list every step is refused at 100,000 accumulators where yq grows it until the
     // process dies (`ireduce (0; (. + 1, . + 2))` over 30 elements is 2^30).
     let mut extra_budget = REDUCE_FOREACH_MAX_STEPS;
+    // #8035: an empty list is still folded, as yq runs UPDATE over it (`[.]` over no accumulator
+    // is `[]`), unless an UPDATE that reads no loop variable already answered nothing over it:
+    // that answer is the same for every later element.
+    let mut settled_empty = false;
     let source_flow = drive_source(SourceInput::Real, &mut |element| {
-        // Nothing left to fold (INIT yielded nothing, or UPDATE dropped every accumulator) or an
-        // error held: the element is read only for the error a later one may raise.
-        if failure.is_some() || accumulators.is_empty() {
+        // An error held, or an empty list nothing can refill: the element is read only for the
+        // error a later one may raise.
+        if failure.is_some() || settled_empty {
             return Demand::Continue;
         }
         let mut step_failure: Option<Control> = None;
@@ -102812,9 +102857,20 @@ fn reduce_list_yq<S: EvalSemantics>(
                     _ => Ok(outputs),
                 }
             } else {
+                // Several accumulators, or none (#8035): yq evaluates UPDATE over the whole list,
+                // so over an empty one a collect, a literal or an `error` still answers once
+                // (the #6943 rule, which the context-list walk carries).
+                let was_empty = current.is_empty();
                 let substituted =
                     bind_yq_update(update.hoisted, update.inert, bindings, &all_var_names);
-                super::eval_generic::eval_yq_over_owned_list::<S>(&substituted, current, optional)
+                let stepped = super::eval_generic::eval_yq_over_owned_list::<S>(
+                    &substituted,
+                    current,
+                    optional,
+                );
+                settled_empty =
+                    was_empty && update.inert && matches!(&stepped, Ok(next) if next.is_empty());
+                stepped
             };
             match stepped {
                 Ok(next) => {
@@ -102827,8 +102883,7 @@ fn reduce_list_yq<S: EvalSemantics>(
                     }
                     extra_budget -= extra;
                     accumulators = next;
-                    // An empty list stays empty: the rest of the source is only read.
-                    if accumulators.is_empty() {
+                    if settled_empty {
                         Demand::Stop
                     } else {
                         Demand::Continue
@@ -137096,6 +137151,45 @@ mod tests {
         // Anything that reads its input propagates the emptiness.
         for src in [".", ".b", "length", "select(true)", "tostring", "keys"] {
             assert_eq!(reemit(src), None, "`{src}`");
+        }
+    }
+
+    /// #8035: which re-emit rewrites answer whatever they run on, so a `//` over them needs no
+    /// guard; a pipe may empty, and so may every shape that holds one.
+    #[test]
+    fn test_reemit_always_answers_8035() {
+        let answers = |src: &str| {
+            let expr = parse_with_mode_and_extensions(src, ParserMode::Yq, true).unwrap();
+            reemit_always_answers(&yq_empty_context_reemit(&expr).expect(src))
+        };
+        for src in [
+            "1",
+            "[1 | select(false)]",
+            "error(\"x\")",
+            "{\"a\": 1}",
+            "(1 | select(false)), 2",
+            "-(1)",
+            "1 + 2",
+            "1 == 2",
+            "true and false",
+            "true or false",
+            "null // (1 | select(false))",
+        ] {
+            assert!(answers(src), "`{src}`");
+        }
+        for src in [
+            "1 | select(false)",
+            "error(1 | select(false))",
+            "{\"a\": (1 | select(false))}",
+            "(1 | select(false)), (2 | select(false))",
+            "-(1 | select(false))",
+            "1 + (1 | select(false))",
+            "(1 | select(false)) == 2",
+            "true and (1 | select(false))",
+            "(1 | select(false)) or true",
+            "(1 | select(false)) // 2",
+        ] {
+            assert!(!answers(src), "`{src}`");
         }
     }
 
