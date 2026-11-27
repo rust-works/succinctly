@@ -50,8 +50,9 @@
 #   deep-recursion-tests.sh heavy-args  prints `--exact <name> ...` for HEAVY_TESTS (not the
 #                                       stack tests, which are `#[ignore]`d under coverage):
 #                                       the `jq-cli-heavy` coverage shard runs exactly these
-#                                       and the `jq-cli` shard `skip-args` them, so the two
-#                                       together run every `jq_cli_tests` test once (#5711)
+#                                       and the `jq-cli-issues`/`jq-cli-main` shards skip
+#                                       `skip-args`' names, so the three together run every
+#                                       `jq_cli_tests` test once (#5711, #7978)
 #
 # Why `run` checks more than `cargo test -- --exact <names>` does: libtest runs
 # zero tests and exits 0 when a filter matches nothing (`running 0 tests`,
