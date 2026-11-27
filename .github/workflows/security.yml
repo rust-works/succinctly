@@ -40,6 +40,11 @@ jobs:
       - name: Run cargo-audit (bench-compare workspace)
         run: cargo audit -f bench-compare/Cargo.lock
 
+      # jq-reader-oracle/ (#7970) is a third, with its own Cargo.lock; CI builds and tests it in
+      # ci.yml's `jq-reader-oracle` job (#7986).
+      - name: Run cargo-audit (jq-reader-oracle workspace)
+        run: cargo audit -f jq-reader-oracle/Cargo.lock
+
   deny:
     name: Dependency Policy
     runs-on: ubuntu-24.04
@@ -76,6 +81,9 @@ jobs:
 
       - name: Dependency Policy (bench-compare workspace)
         run: cargo deny --manifest-path bench-compare/Cargo.toml --config bench-compare/deny.toml check all
+
+      - name: Dependency Policy (jq-reader-oracle workspace)
+        run: cargo deny --manifest-path jq-reader-oracle/Cargo.toml --config jq-reader-oracle/deny.toml check all
 
   secrets:
     name: Secret Scanning
