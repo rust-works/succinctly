@@ -24,6 +24,8 @@ const NOTHING_ROWS: &[&str] = &[
     ".[] as $x ireduce (0; . + $x; 1, error(\"w\"))",
     ".[] as $x ireduce (0; . + $x; $nope)",
     ".[] as $x ireduce (0; $nope; 1)",
+    ".[] as $x ireduce (0; . + $x; $__loc__)",
+    ".[] as $x ireduce (0; $__loc__; 1)",
     // Four and five parts, and unions and pipes in the parts after the first `;`.
     ".[] as $x ireduce (0; . + $x; 1; 2)",
     ".[] as $x ireduce (0; . + $x; 1; 2; 3)",
@@ -62,6 +64,8 @@ const VALUE_ROWS: &[(&str, &str)] = &[
     (".[] as $x ireduce (0; . + $x, . + 1; 9)", "3\n"),
     (".[] as $x ireduce (0; . + $x, error(\"u\"); 9)", "3\n"),
     (".[] as $x ireduce (0; . + $x, .; 9)", "3\n"),
+    (".[] as $x ireduce (0; . + $x, $nope; 9)", "3\n"),
+    (".[] as $x ireduce (0; . + $x, $__loc__; 9)", "3\n"),
     (
         ".[] as $x ireduce (0; . + $x, . + 10, . + 100; 9)",
         "3\n12\n11\n20\n",
@@ -112,15 +116,14 @@ fn a_union_before_the_block_is_the_update_8001() -> Result<()> {
     Ok(())
 }
 
-/// No output with no input read (`-n`), on an empty input, per document, under `--eval-all` and
-/// with `--jq-extensions` (`ireduce` is yq's syntax there too).
+/// No output with no input read (`-n`), per document, under `--eval-all` and with
+/// `--jq-extensions` (`ireduce` is yq's syntax there too).
 #[test]
 fn a_block_update_on_every_route_8001() -> Result<()> {
     let docs = "a: 1\n---\nb: 2\n";
     for (filter, input, args) in [
         ("[1,2] | .[] as $x ireduce (0; . + $x; .)", "", &["-n"][..]),
         (". as $x ireduce (3; . + $x; .)", INPUT, &["-n"][..]),
-        (". as $x ireduce (3; . + $x; .)", "", &[][..]),
         (". as $x ireduce (3; .; .)", docs, &[][..]),
         (". as $x ireduce (3; .; .)", docs, &["--eval-all"][..]),
         (
@@ -179,6 +182,27 @@ fn src_and_init_still_raise_8001() -> Result<()> {
         assert_eq!(
             (stdout.as_str(), stderr.trim_end(), code),
             ("", error, 1),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// An undefined function in a part that is never evaluated still fails the run in both: yq's lexer
+/// rejects the name (`Error: 1:31: lexer: invalid input text "nope)"`), and the resolver here.
+#[test]
+fn an_undefined_function_in_the_block_still_raises_8001() -> Result<()> {
+    for (filter, name) in [
+        (".[] as $x ireduce (0; . + $x; nope)", "nope/0"),
+        (".[] as $x ireduce (0; nope; 9)", "nope/0"),
+        (".[] as $x ireduce (0; . + $x, nope; 9)", "nope/0"),
+        (".[] as $x ireduce (0; . + $x, nope(1); 9)", "nope/1"),
+        (".[] as $x ireduce (0; . + $x; 1; nope)", "nope/0"),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, INPUT, JSON)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.trim_end(), code),
+            ("", format!("Error: {name} is not defined").as_str(), 1),
             "{filter}"
         );
     }

@@ -13838,9 +13838,11 @@ impl<'a> Parser<'a> {
     /// yields nothing and evaluates neither side, so UPDATE is its unions up to the operand before
     /// the first `;`: `(0; A, B; V)` is `0; (A, (B; V))`, whose UPDATE is `A` alone, and
     /// `(0; U; V)` drops every accumulator at the first source node (the fold then prints nothing,
-    /// and prints INIT over an empty source). The operands after the first `;` are parsed as yq's
-    /// would be and discarded, so an `error` there never fires. That union is a fresh list next to
-    /// the block, so identity operands do not collapse (`(0; ., .; 9)` keeps both, [`yq_union`]).
+    /// and prints INIT over an empty source). The block's sides stay in the tree behind `empty`,
+    /// `empty | (B, V)`, which never runs them, so an `error` or a `$name` there never fires, while
+    /// the resolver still rejects an undefined function in them, as yq's lexer rejects one. That
+    /// union is a fresh list next to the block, so identity operands do not collapse
+    /// (`(0; ., .; 9)` keeps both, [`yq_union`]).
     #[inline(never)] // out of line, so its operand list stays off `parse_ireduce`'s frame
     fn parse_ireduce_update(&mut self) -> Result<Expr, ParseError> {
         let expd = core::mem::replace(&mut self.expd_operand, false);
@@ -13850,18 +13852,18 @@ impl<'a> Parser<'a> {
         if self.peek() != Some(';') {
             return Ok(yq_union(operands));
         }
-        operands.pop();
+        let mut block = vec![operands.pop().expect("at least one operand")];
         while self.peek() == Some(';') {
             self.next();
             self.skip_ws();
-            self.parse_expr()?;
+            block.push(self.parse_expr()?);
             self.skip_ws();
         }
-        Ok(if operands.is_empty() {
-            Expr::Builtin(Builtin::Empty)
-        } else {
-            Expr::comma(operands)
-        })
+        operands.push(Expr::pipe(vec![
+            Expr::Builtin(Builtin::Empty),
+            Expr::comma(block),
+        ]));
+        Ok(Expr::comma(operands))
     }
 
     /// The operands of a yq-mode `,` list, each a whole pipe chain (see
