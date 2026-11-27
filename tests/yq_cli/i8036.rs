@@ -105,6 +105,40 @@ fn a_fold_as_a_path_without_errors_is_unchanged_8036() -> Result<()> {
     Ok(())
 }
 
+/// An INIT that yields nothing as a path here only because it reads its position (`parent`,
+/// `key`, `path`) is not taken for an empty one: yq's INIT yields a node there, so UPDATE never
+/// runs over an empty list (`[.] | .[0] | keys` over it would raise that `null` has no keys).
+/// Such a fold answers as before: on `{"a": {"b": 1}}` yq v4.53.3 leaves the first two unchanged,
+/// exit 0. `$__loc__` is no builtin in yq, so an INIT of it is empty in both tools and UPDATE runs
+/// over the empty list (`Error: u` in yq).
+#[test]
+fn an_init_that_reads_its_position_is_not_taken_for_empty_8036() -> Result<()> {
+    let input = "{\"a\": {\"b\": 1}}\n";
+    for filter in [
+        "del(.a as $x ireduce ((.a.b | parent); [.] | .[0] | keys))",
+        "(.a as $x ireduce ((.a.b | parent); [.] | .[0] | keys)) = 9",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, input, JSON)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            ("{\"a\":{\"b\":1}}\n", "", 0),
+            "{filter}"
+        );
+    }
+    for filter in [
+        "del(.a as $x ireduce ($__loc__; error(\"u\")))",
+        "(.a as $x ireduce ($__loc__; error(\"u\"))) = 9",
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, input, JSON)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.trim_end(), code),
+            ("", "Error: u", 1),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// Only an ordinary error waits for the rest of the source, as on the value route (#8022): a
 /// `break` and a `halt` (behind `--jq-extensions`; yq has neither) end the fold at once, so the
 /// source's later error never outranks them.

@@ -85566,8 +85566,12 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         return outcome;
     }
     if reads_source_first {
-        if fork_index == 0 {
-            // #8036: no fork read the source.
+        // #8036: no fork read the source. Unless INIT reads its position (`parent`, `key`, `path`,
+        // ...: [`needs_path_context`]), which in path position here can yield nothing where yq's
+        // INIT yields a node (`del(.a.b | parent)` is `{}` in yq and a no-op here), so its list is
+        // not known to be empty and UPDATE must not run over an empty one: such a fold keeps
+        // answering as it did.
+        if fork_index == 0 && !needs_path_context(init) {
             // `fold_pattern_admitted` admits a yq fold here only with one `$var` pattern.
             return resolve_yq_fold_without_accumulators::<S>(
                 &patterns[0],
