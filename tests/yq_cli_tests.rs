@@ -2209,7 +2209,10 @@ fn test_yq_loc_and_hyphen_digit_variables_are_unbound_2776_2767() -> Result<()> 
 /// into yq mode: real yq's `and`/`or` are ordinary operators, not a lexer
 /// rejection like `empty`/`leaf_paths`, so a live divergence here is not an
 /// ADR-0018 extension exemption. Confirmed live against yq v4.53.3: each of
-/// these silently no-ops (exit 0, document unchanged) -- caught in code
+/// these silently no-ops (exit 0, document unchanged). yq has no unary minus,
+/// so `del(1 | -(.a) | select(false))` exits 1 there (`'|' expects 2 args but
+/// there is 1`) and is refused here too since #8048; the negation row is
+/// spelled `.a * -1`, as in yq. The `and`/`or` leak was caught in code
 /// review as a regression from an earlier draft of the #2760 fix that was
 /// missing the `S::TAG == EvalTag::Jq` guard `array_resolves_live` already
 /// has for the sibling `[E]` arm, and raised

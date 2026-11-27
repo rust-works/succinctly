@@ -12644,8 +12644,8 @@ impl<'a> Parser<'a> {
                     // Check for bracket after dot
                     if self.peek() == Some('[') {
                         let bracket_start = self.pos;
-                        let bracket =
-                            self.parse_index_bracket_with_optional(if dotted { "." } else { "" })?;
+                        // #8048: the `.` before the bracket is yq's `.` operator itself.
+                        let bracket = self.parse_index_bracket_with_optional(".")?;
                         // jq's grammar has `Term '.' '[' Exp ']'` and `Term '.' '[' ']'` but no
                         // slice after a dot (#5454): `[1,2,3].[1:]` is a syntax error there.
                         if self.mode == ParserMode::Jq && Self::bracket_is_slice(&bracket) {
@@ -12667,6 +12667,7 @@ impl<'a> Parser<'a> {
                                     self.next();
                                 }
                                 push_bracket(&mut chain, Bracket::Dynamic { key, optional });
+                                dotted = true;
                                 continue;
                             }
                             None => self.parse_field_ident()?,
