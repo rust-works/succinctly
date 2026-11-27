@@ -4344,6 +4344,12 @@ succinctly until spine 2416's identity pass ran map-family bodies at each member
 position (before it, a `parent` inside such a body was refused by every route and answered
 from no position at all).
 
+An update whose target is its own input (`. |= f`, which `with(PATH; . |= f)` is) reads `key` and `parent` at that input since [#8039](https://github.com/rust-works/succinctly/issues/8039): `with(.b; . |= key)` writes `"b"`, and `with(.a.b; . |= (parent | keys))` writes the keys of `.a`, as in yq (pinned in `tests/yq_cli/i8039.rs`).
+Before it `key` answered nothing there and the target was left as it was.
+Two shapes still read no such position.
+A nested update reached through a pipe stage rather than an update's body climbs no `parent` above its own input: `.a.b | . |= (parent | keys)` leaves `.a.b` as it was, where yq writes `["b","d"]`.
+A read after a write in the same update body is not positioned, because the write is taken to move the position the reads after it are resolved at: `with(.a; .c = 1 | .d |= path)` writes `["d"]` where yq writes `["a","d"]`, and `with(.b; (. |= key) | (. |= path))` writes `[]` where yq writes `["b"]`.
+
 `line`/`column` inside an update filter are **not** covered: they are answered from a
 cursor, not from a path, and no cursor reaches the filter. `.a | .b |= line` is `2` in real
 yq and `0` in succinctly — a separate, pre-existing gap, not one #2522 touches.
