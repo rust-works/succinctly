@@ -83793,29 +83793,9 @@ fn yq_owned_navigation_is_exact(stage: &Expr) -> bool {
 /// and a short list of builtins over values (`length`, `has`, `contains`, `test`, ...). An
 /// allowlist: every metadata read (`style`, `line_comment`, `tag`, `type`, `kind`, `anchor`, ...),
 /// `eval`, a call of a `def`, a variable and any builtin not listed answers `false`.
-#[doc(hidden)]
-pub fn yq_condition_is_value_only(cond: &Expr) -> bool {
-    yq_condition_within(cond, &|_| false)
-}
-
-/// [`yq_condition_is_value_only`], with the node readers yq's document answers (`style`, the
-/// comment readers, `anchor`, `alias`, `tag`, `type`, `kind`, `line`, `column`, `path`, `key`,
-/// `document_index`, `file_index`, `filename`) allowed too: a condition the document's cursor
-/// answers exactly as yq does, so the paths it selects there are yq's (#8020). `eval(..)` is not
-/// one: it evaluates its program on a value detached from the document.
-#[doc(hidden)]
-pub fn yq_condition_is_cursor_exact(cond: &Expr) -> bool {
-    yq_condition_within(cond, &|b| {
-        is_yq_metadata_reader_builtin(b) || matches!(b, Builtin::Type | Builtin::Key)
-    })
-}
-
-/// The allowlist behind [`yq_condition_is_value_only`] and [`yq_condition_is_cursor_exact`]:
-/// `reader` admits the builtins beyond the values-only ones.
-#[doc(hidden)]
-pub fn yq_condition_within(cond: &Expr, reader: &dyn Fn(&Builtin) -> bool) -> bool {
+fn yq_condition_is_value_only(cond: &Expr) -> bool {
     use Builtin as B;
-    let within = |e: &Expr| yq_condition_within(e, reader);
+    let within = yq_condition_is_value_only;
     match cond {
         Expr::Identity
         | Expr::Field(_)
@@ -83851,7 +83831,7 @@ pub fn yq_condition_within(cond: &Expr, reader: &dyn Fn(&Builtin) -> bool) -> bo
             | B::Endswith(arg)
             | B::Test(arg) => within(arg),
             B::TestFlags(re, flags) => within(re) && within(flags),
-            other => reader(other),
+            _ => false,
         },
         _ => false,
     }

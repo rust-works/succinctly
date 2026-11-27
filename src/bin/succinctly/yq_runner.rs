@@ -7837,17 +7837,15 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         return None;
     }
     // A selection the owned value cannot run exactly: one that reads node metadata
-    // (`select(style == "")`), or a `select`/`if` condition outside the values-only allowlist
-    // (`type`, which is yq's tag, `eval(..)`, a `def` call; `jq::yq_condition_is_value_only`). A
-    // reader that only answers a node -- a stage of its own, or a member of a comma or a
+    // (`select(style == "")`, `tag`/`type` by `selects_by_tag`'s rule), or one that can read it
+    // through `eval(..)` or a `def` call. A reader that only answers a node -- a stage of its own, or a member of a comma or a
     // `first(..)` of navigation and readers (`first(.a, line)`, `.b | (style, .)`) -- selects
     // nothing, and the evaluator takes its fresh node as yq does. A condition with an effect of its
     // own (`input`, `debug`, `halt`) is not run twice: the target runs as written.
     let explicit_tags = cursor.index().has_explicit_tags();
     let mut effectful = false;
-    // A condition that reads node metadata is resolved on the cursor only when the cursor answers
-    // all of it as yq does ([`jq::yq_condition_is_cursor_exact`]); `eval(..)` runs its program
-    // detached from the document, so `eval("style")` answers `""` there. Such a target refuses.
+    // `eval(..)` runs its program detached from the document, so even the cursor answers
+    // `eval("style")` with `""`: a target whose selection holds one refuses.
     let mut inexact = false;
     let filters = navigation.iter().any(|stage| {
         if answers_without_selecting(stage, &is_reader) {
@@ -7866,38 +7864,18 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
                                 | Builtin::System(..)
                         )
                     });
-                // `tag`/`type` keep their own rule (`selects_by_tag`: the owned value answers a
-                // document's core tags, and `!!map`/`!!seq` tests must stay there, #6895), and
-                // `key`/`parent` are answered on the owned value from the path (#6089).
-                let beyond = !jq::yq_condition_within(cond, &|b| {
-                    matches!(
-                        b,
-                        Builtin::Tag
-                            | Builtin::Type
-                            | Builtin::Key
-                            | Builtin::Parent
-                            | Builtin::ParentN(_)
-                    )
+                // Beyond the direct metadata reads (`selects_by_node_metadata`, and `tag`/`type`
+                // by `selects_by_tag`'s rule, #6895), a condition can read metadata the owned value
+                // does not hold through `eval(..)` or a call of a `def`; `eval` runs detached from
+                // the document even on the cursor, so a target with one refuses.
+                let detached = jq::walk::contains_builtin(cond, |b| {
+                    matches!(b, Builtin::EvalExpr(..) | Builtin::Load(..))
                 });
-                inexact |= beyond
-                    && (!jq::yq_condition_is_cursor_exact(cond)
-                        && (jq::walk::uses_cursor_metadata_builtins(cond)
-                            || jq::walk::contains_builtin(cond, |b| {
-                                matches!(
-                                    b,
-                                    Builtin::Tag
-                                        | Builtin::Type
-                                        | Builtin::Kind
-                                        | Builtin::Key
-                                        | Builtin::PathNoArg
-                                        | Builtin::FileIndex
-                                        | Builtin::Filename
-                                )
-                            }))
-                        || jq::walk::contains_builtin(cond, |b| {
-                            matches!(b, Builtin::EvalExpr(..) | Builtin::Load(..))
-                        }));
-                beyond
+                inexact |= detached;
+                detached
+                    || jq::walk::any_subexpr(cond, &mut |e| {
+                        matches!(e, Expr::FuncCall { .. } | Expr::DefCall { .. })
+                    })
             }
             _ => false,
         });
