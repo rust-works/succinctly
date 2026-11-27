@@ -95005,13 +95005,17 @@ pub(crate) const REPEAT_WIDTH_BUDGET: usize = 10_000;
 /// charge their rounds, forks and emissions through [`LoopBudget`] instead.)
 pub(crate) fn charge_budget(budget: &mut usize, what: &str) -> Option<Control> {
     if *budget == 0 {
-        // #2132: uncatchable -- see `EvalError::resource_limit`.
-        return Some(Control::Error(EvalError::resource_limit(format!(
-            "{what}: maximum iterations exceeded"
-        ))));
+        return Some(Control::Error(iterations_refusal(what)));
     }
     *budget -= 1;
     None
+}
+
+/// The refusal of a loop past its step or round budget, `what` naming it
+/// (`until: maximum iterations exceeded`).
+pub(crate) fn iterations_refusal(what: &str) -> EvalError {
+    // #2132: uncatchable -- see `EvalError::resource_limit`.
+    EvalError::resource_limit(format!("{what}: maximum iterations exceeded"))
 }
 
 /// What an INIT fork of a `reduce`/`foreach` is charged against the fold's
@@ -95103,9 +95107,7 @@ pub(crate) struct LoopBudget<'b> {
 impl LoopBudget<'_> {
     /// The uncatchable refusal: `what` names the loop (#2132).
     fn refusal(what: &str) -> Control {
-        Control::Error(EvalError::resource_limit(format!(
-            "{what}: maximum iterations exceeded"
-        )))
+        Control::Error(iterations_refusal(what))
     }
 
     /// One round.
@@ -123249,13 +123251,20 @@ pub(crate) fn value_depth_floor_armed() -> bool {
 /// The refusal of a call to `def` that recursed too deep: by
 /// [`MAX_EVAL_FRAMES`], or by the native-stack floor (ADR-0025).
 pub(crate) fn def_call_depth_refusal(def: &FuncDefData) -> EvalError {
+    named_depth_refusal(&def.name, def.params.len())
+}
+
+/// The refusal of a call to the definition `name/arity` past a depth or round
+/// bound (`f/1 exceeded maximum recursion depth`), the one wording every
+/// evaluator gives for it, the call machine's included (#7977).
+/// [`shared_arg_depth_refusal`] is the unnamed one.
+pub(crate) fn named_depth_refusal(name: &str, arity: usize) -> EvalError {
     // #2132: uncatchable -- `def f: f; try f catch "caught"` answered
     // `"caught"` at exit 0 with a plain `new`. See
     // `EvalError::resource_limit`.
     EvalError::resource_limit(format!(
-        "{}/{} exceeded maximum recursion depth",
-        super::resolve::ModuleRun::display_name(&def.name),
-        def.params.len()
+        "{}/{arity} exceeded maximum recursion depth",
+        super::resolve::ModuleRun::display_name(name),
     ))
 }
 

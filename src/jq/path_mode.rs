@@ -63,10 +63,11 @@ use super::c_builtin_identity::{array_index, binop_keeps, format_keeps_input, ke
 use super::error::{dump_truncated_with, Control, EvalError};
 use super::eval::{
     apply_compare_op, arith_combine, arith_negate, compare_values, definition_zero_for,
-    is_tree_descending_f, native_stack_exhausted, owned_to_string, range_max_exceeded_error,
-    recurse_max_items, recurse_node_cost, recurse_value_size, with_native_stack_floor_lifted,
-    EvalTag, JqSemantics, LoopCounters, QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES,
-    MAX_LOOP_ROUNDS, MAX_RANGE, MAX_RANGE_TOTAL, REPEAT_WIDTH_BUDGET,
+    is_tree_descending_f, named_depth_refusal, native_stack_exhausted, owned_to_string,
+    range_max_exceeded_error, recurse_max_items, recurse_node_cost, recurse_value_size,
+    shared_arg_depth_refusal, with_native_stack_floor_lifted, EvalTag, JqSemantics, LoopCounters,
+    QueryResult, MAX_EMPTY_REPEAT_ROUNDS, MAX_EVAL_FRAMES, MAX_LOOP_ROUNDS, MAX_RANGE,
+    MAX_RANGE_TOTAL, REPEAT_WIDTH_BUDGET,
 };
 use super::expr::{
     ArithOp, Builtin, CompareOp, Expr, Literal, MergeFlags, NumberKey, ObjectKey, Param, Pattern,
@@ -75,7 +76,8 @@ use super::expr::{
 use super::parser::parse;
 use super::resolve::ModuleRun;
 use super::tail_call::{
-    declared_tail_call, stage_settles, MAX_LOOP_OUTPUTS, OUTPUT_BUDGET_AFTER_ROUNDS,
+    declared_tail_call, outputs_refusal, stage_settles, MAX_LOOP_OUTPUTS,
+    OUTPUT_BUDGET_AFTER_ROUNDS,
 };
 use super::value::FieldMap;
 use super::value::{
@@ -4584,12 +4586,10 @@ impl<'e> Interp<'e> {
                             })?;
                             outputs = outputs.saturating_add(emitted);
                             if outputs > MAX_LOOP_OUTPUTS && taken >= OUTPUT_BUDGET_AFTER_ROUNDS {
-                                return Err(Raise::Fatal(EvalError::resource_limit(format!(
-                                    "{}/0: maximum outputs exceeded",
-                                    ModuleRun::display_name(
-                                        entry.strip_prefix("_sp_").unwrap_or(entry)
-                                    )
-                                ))));
+                                return Err(Raise::Fatal(outputs_refusal(
+                                    entry.strip_prefix("_sp_").unwrap_or(entry),
+                                    0,
+                                )));
                             }
                         }
                         expr = last;
@@ -4598,10 +4598,10 @@ impl<'e> Interp<'e> {
                 }
             };
             rounds = rounds.checked_sub(1).ok_or_else(|| {
-                Raise::Fatal(EvalError::resource_limit(format!(
-                    "{}/0 exceeded maximum recursion depth",
-                    ModuleRun::display_name(entry.strip_prefix("_sp_").unwrap_or(entry))
-                )))
+                Raise::Fatal(named_depth_refusal(
+                    entry.strip_prefix("_sp_").unwrap_or(entry),
+                    0,
+                ))
             })?;
             callee = next;
             taken += 1;
@@ -4674,15 +4674,12 @@ impl<'e> Interp<'e> {
     fn enter_call(&self, callee: &Callee<'e>) -> Result<DepthGuard<'_>, Raise> {
         let depth = self.depth.get() + 1;
         if depth > MAX_EVAL_FRAMES || native_stack_exhausted() {
-            let message = match callee {
-                Callee::Def { name, params, .. } => format!(
-                    "{}/{} exceeded maximum recursion depth",
-                    ModuleRun::display_name(name.strip_prefix("_sp_").unwrap_or(name)),
-                    params.len()
-                ),
-                Callee::Arg { .. } => String::from("exceeded maximum recursion depth"),
-            };
-            return Err(Raise::Fatal(EvalError::resource_limit(message)));
+            return Err(Raise::Fatal(match callee {
+                Callee::Def { name, params, .. } => {
+                    named_depth_refusal(name.strip_prefix("_sp_").unwrap_or(name), params.len())
+                }
+                Callee::Arg { .. } => shared_arg_depth_refusal(),
+            }));
         }
         self.depth.set(depth);
         Ok(DepthGuard(&self.depth))
