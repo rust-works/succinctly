@@ -153,8 +153,9 @@ fn fresh_regardless(stage: &Expr, cx: Cx<'_>) -> bool {
         Expr::Literal(_) | Expr::StringInterpolation(_) => true,
         Expr::Object(entries) => entries.is_empty(),
         Expr::Builtin(Builtin::Keys | Builtin::KeysUnsorted | Builtin::WithEntries(_)) => true,
-        // `env(NAME)` and `strenv(NAME)` read no node: `envOperator` returns one new node (#7996).
-        Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_)) => true,
+        // `env(NAME)` and `strenv(NAME)` read no node: `envOperator` returns one new node (#7996),
+        // and so does `nowOp` (#8007).
+        Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now) => true,
         Expr::Paren(inner) => fresh_regardless(inner, cx),
         Expr::Comma(items) => items.iter().all(|item| fresh_regardless(item, cx)),
         Expr::Alternative(left, _) => {
@@ -297,8 +298,9 @@ fn builtin_node(builtin: &Builtin, input: Node) -> Option<Node> {
         // `keys` (which yq mode parses as `KeysUnsorted`, document order) and `with_entries` build
         // a new collection whatever their input.
         Builtin::Keys | Builtin::KeysUnsorted | Builtin::WithEntries(_) => Some(FRESH),
-        // A node `envOperator` builds from the variable alone (#7996).
-        Builtin::EnvObject(_) | Builtin::StrEnv(_) => Some(FRESH),
+        // A node `envOperator` builds from the variable alone (#7996), or `nowOp` from the clock
+        // (#8007).
+        Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now => Some(FRESH),
         Builtin::Length
         | Builtin::Has(_)
         | Builtin::Contains(_)
@@ -391,6 +393,9 @@ mod tests {
             ".a | env(X)",
             "env(X) | .b",
             "select(true) | strenv(X)",
+            "now",
+            ".a | now",
+            "now | tostring",
         ] {
             assert!(fresh(filter), "{filter}");
         }
@@ -429,6 +434,8 @@ mod tests {
             ".a, env(X)",
             "env(X) as $e | .",
             ".a = env(X)",
+            ".a, now",
+            ".a = now",
         ] {
             assert!(!fresh(filter), "{filter}");
         }

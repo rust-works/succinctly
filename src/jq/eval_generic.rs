@@ -24826,10 +24826,11 @@ pub(super) fn is_empty_object_literal(stage: &Expr) -> bool {
 }
 
 /// The one definition of a stage yq builds **once** over its whole context list, however many
-/// nodes reach it and even when none does: an empty `{}` (#6801), and `env(NAME)` and
+/// nodes reach it and even when none does: an empty `{}` (#6801), `env(NAME)` and
 /// `strenv(NAME)` (#7996), whose handler (`envOperator`, `operator_env.go`, v4.53.3) reads the
 /// variable and returns `context.SingleChildContext(node)`, one new node with no document, without
-/// looking at the nodes it was given. `.[] | env(X)` over three members is one `hi`, and so is
+/// looking at the nodes it was given, and `now` (#8007), whose `nowOp` (`operator_datetime.go`)
+/// does the same with the clock. `.[] | env(X)` over three members is one `hi`, and so is
 /// `select(false) | env(X)`. [`yq_pipe_has_list_stage`] (the entry check), [`yq_list_stage`] (the
 /// split) and the parser's `map` rewrite all ask it: they must agree on which pipes the walk owns,
 /// or a pipe is sent in that the split then declines.
@@ -24837,7 +24838,7 @@ pub(super) fn yq_stage_built_once(stage: &Expr) -> bool {
     is_empty_object_literal(stage)
         || matches!(
             unwrap_paren(stage),
-            Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_))
+            Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now)
         )
 }
 
@@ -25345,10 +25346,10 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
 
 /// The node a [`YqListStage::BuiltOnce`] stage builds, once for the whole context list: a node real
 /// yq builds from scratch, so it carries no flag and no origin (`yq ea 'env(X)' f1 f2` prints one
-/// `hi`, and yq writes no `---` before it, #7996). `{}` is the empty mapping; `env(NAME)` and
-/// `strenv(NAME)` read no node, so they run once over a stand-in, and an error of theirs (an unset
-/// variable in `env(..)`, `--security-disable-env-ops`) ends the walk however many nodes reached
-/// them, none included, as in yq.
+/// `hi`, and yq writes no `---` before it, #7996). `{}` is the empty mapping; `env(NAME)`,
+/// `strenv(NAME)` and `now` (#8007) read no node, so they run once over a stand-in, and an error of
+/// theirs (an unset variable in `env(..)`, `--security-disable-env-ops`) ends the walk however many
+/// nodes reached them, none included, as in yq.
 fn built_once<S: EvalSemantics, V: DocumentValue>(
     stage: &Expr,
     optional: bool,
