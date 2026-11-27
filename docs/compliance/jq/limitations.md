@@ -8367,8 +8367,8 @@ Pinned by `tests/jq_cli/i7449.rs`.
 jq mode's `test`, `match`, `capture`, `scan`, `split`/`splits`, `sub` and `gsub` compile and match with Oniguruma itself, at commit `d2f1a14ced`, the commit jq 1.7.1 bundles ([ADR-0031](../../adrs/adr-0031.md), vendored in `vendor/oniguruma`).
 The adapter is a port of jq 1.7.1's `f_match`: the modifier letters and their error, `Regex failure: ` and the library's message for a refused pattern, a global search that resumes one byte after an empty match, and offsets, lengths and strings read from the library's byte spans as jq reads them, a match that begins inside a multibyte character included.
 On the corpus of `scripts/jq-regex-corpus.py` ([guide](../../guides/jq-regex-corpus.md)), 459,678 generated pattern, flags and subject rows, every answer equals jq 1.7.1's but the adoption of jq 1.8.2's empty-match captures (#7520, above); the earlier engine, an imitation of Oniguruma over the `regex` and `fancy-regex` crates, differed from both releases on 49,641.
+That engine, and `fancy-regex` with it, was deleted in ADR-0031's step 6.
 The sections this one replaced recorded that imitation's differences: POSIX classes and their Unicode version, possessive and stacked quantifiers, look-around and back-references on a second engine, the `l` and `n` flags, the captures of a repeated group, `$` before a final newline and the compile errors among them; they are in this page's history before #7965.
-`SUCCINCTLY_REGEX_ONIG=0` selects that earlier engine until ADR-0031's step 6 deletes it.
 The vendored copy carries one local patch, which keeps a search's match stack for the next search and changes no answer (`vendor/oniguruma/patches/`).
 yq mode is unchanged: its patterns are Go's `regexp` dialect, translated for the `regex` crate.
 
