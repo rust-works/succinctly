@@ -3870,9 +3870,9 @@ fn test_1398_dup_key_format_parity_across_filters() -> Result<()> {
 /// $ printf 'a: 1\n---\nb: 2\n' | yq -o=json -I=0 'di + 0'              # 0 then 1
 /// ```
 ///
-/// Real yq has no unary minus, so `-length` has no oracle of its own; its
-/// yq-spelled twin `length * -1` is the oracle row, and `(-length)` is
-/// asserted alongside it as internal consistency.
+/// Real yq has no unary minus, so its spelling of `-length` is `length * -1`;
+/// since #8048 `succinctly yq` refuses `-length` as yq does
+/// (`tests/yq_cli/i8048.rs`).
 ///
 /// `column` was absent from the rows below until #2712: succinctly's bare
 /// `.b | column` answered 9 where yq v4.53.3 answers 4 (yq reports the
@@ -3888,14 +3888,9 @@ fn test_arithmetic_reads_the_real_document_2626() -> Result<()> {
         ("(keys|length) + 0", "3"),
         ("(to_entries|length) + 0", "3"),
         ("length * -1", "-3"),
-        // Parenthesized so the leading `-` is not read as a CLI flag; the
-        // parse is the same `Expr::Negate`.
-        ("(-length)", "-3"),
         // Under a lazy consumer these take `eval_each_generic`'s own arms.
-        // Its `Expr::Negate` arm bridged too, so `limit(1; -length)` was the
-        // last spelling still answering `-2` once the arms above were fixed.
         ("limit(1; length + 0)", "3"),
-        ("limit(1; -length)", "-3"),
+        ("limit(1; length * -1)", "-3"),
     ] {
         let (out, code) = run_yq_stdin(filter, dup, &["--jq-extensions", "-o=json", "-I=0"])?;
         assert_eq!(code, 0, "filter {filter}");
