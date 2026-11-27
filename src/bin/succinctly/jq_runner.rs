@@ -17460,7 +17460,7 @@ fn fault_tail(
     };
     let (mut values, mut ends, mut errors) = (Vec::new(), Vec::new(), Vec::new());
     match read_json_tail(text, end_of_last, &cx, &mut values, &mut ends, &mut errors) {
-        Ok(_) => {
+        Ok(()) => {
             // A stream scanned a chunk at a time has nothing queued behind its lazy
             // documents: it is the only source, or the last of several whose earlier ones
             // have all been read (#6450), and it was clean when it was deferred.
