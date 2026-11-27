@@ -137154,6 +137154,45 @@ mod tests {
         }
     }
 
+    /// #8035: which re-emit rewrites answer whatever they run on, so a `//` over them needs no
+    /// guard; a pipe may empty, and so may every shape that holds one.
+    #[test]
+    fn test_reemit_always_answers_8035() {
+        let answers = |src: &str| {
+            let expr = parse_with_mode_and_extensions(src, ParserMode::Yq, true).unwrap();
+            reemit_always_answers(&yq_empty_context_reemit(&expr).expect(src))
+        };
+        for src in [
+            "1",
+            "[1 | select(false)]",
+            "error(\"x\")",
+            "{\"a\": 1}",
+            "(1 | select(false)), 2",
+            "-(1)",
+            "1 + 2",
+            "1 == 2",
+            "true and false",
+            "true or false",
+            "null // (1 | select(false))",
+        ] {
+            assert!(answers(src), "`{src}`");
+        }
+        for src in [
+            "1 | select(false)",
+            "error(1 | select(false))",
+            "{\"a\": (1 | select(false))}",
+            "(1 | select(false)), (2 | select(false))",
+            "-(1 | select(false))",
+            "1 + (1 | select(false))",
+            "(1 | select(false)) == 2",
+            "true and (1 | select(false))",
+            "(1 | select(false)) or true",
+            "(1 | select(false)) // 2",
+        ] {
+            assert!(!answers(src), "`{src}`");
+        }
+    }
+
     /// #6943: the allocation-free test the pipe entry asks never says `false` where the rewrite
     /// exists (a `true` for a shape the rewrite then declines is fine: it costs one count), and the
     /// no-array form leaves out only a collection.
