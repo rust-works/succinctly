@@ -7748,36 +7748,18 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
         Expr::Pipe(pipe) => (pipe.first()?, Some(pipe)),
         other => (other, None),
     };
-    // A `del()` (and only a `del()`: a write through a reader's answer writes that fresh node, not
-    // the document) whose target ends in readers deletes the slots of the nodes they read.
-    let deleting = matches!(strip_parens(write), Expr::Builtin(Builtin::Del(_)));
     let rewritten = retarget_write(write, &mut |target| {
-        // #8020: a metadata reader's answer is a fresh node, whose `path` is the path of the node
-        // it read: `line | path` is `[]`. Rewritten to that path, `del(.a, line)` became
-        // `del(.a, .)` and deleted the document, and `(.a, line) = 7` replaced it, where yq
-        // deletes and writes nothing through such a node. A target that can answer one is kept as
-        // written, and a comma is resolved member by member, so a member that selects by metadata
-        // is still resolved on the cursor while a reader or a literal beside it is left to the
-        // evaluator, which applies yq's rule to it.
-        let resolve = |member: &Expr| {
-            if deleting {
-                if let Some(tail) = cursor_reader_tail_del_target(cursor, member) {
-                    return tail;
-                }
-            }
-            if metadata_reader_reaches_output(member) {
-                return None;
-            }
-            cursor_write_target(cursor, member)
-        };
+        // A comma is resolved member by member (#8020), so a member that selects by metadata is
+        // resolved on the cursor while a reader or a literal beside it is left to the evaluator,
+        // which applies yq's rule to it: `del(1, (.. | select(style == "x")))` keeps the document.
         let Expr::Comma(members) = strip_parens(target) else {
-            return resolve(target);
+            return cursor_metadata_target(cursor, target);
         };
         let mut changed = false;
         let members = members
             .iter()
             .map(|member| {
-                let resolved = resolve(member);
+                let resolved = cursor_metadata_target(cursor, member);
                 changed |= resolved.is_some();
                 resolved.unwrap_or_else(|| member.clone())
             })
@@ -7794,37 +7776,81 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
     })
 }
 
-/// The navigation to each node one write target selects by node metadata, resolved on the cursor
-/// ([`resolve_metadata_write_targets`]), or `None` when it selects by none or its paths cannot be
-/// resolved.
-fn cursor_write_target<W: AsRef<[u64]> + Clone>(
+/// One write target that selects nodes by node metadata, resolved on the cursor (#5479, #8020,
+/// #8037): `None` when it selects by none, which runs as written.
+///
+/// The target is split into its navigation and a tail of node readers (`line`, `kind`, `tag`,
+/// `path`, the comment readers, ..., and `key`). The navigation is resolved to the path of each
+/// node it selects, and each becomes that path with the tail after it (`.b | line`, or the tail
+/// alone at the root), which the evaluator then takes as yq does: a reader's answer keeps the slot
+/// of the node it read for a `del()` and is a fresh node for a write, and `key` renames.
+///
+/// A `path` names a document node only for an output that is one: a fresh node has a path too --
+/// `[]` for a literal or a reader's answer at the root, the path of the node it was copied from for
+/// a constructor (`{"a": 1} | .a` answers `["a"]`) -- and rewriting that into navigation wrote or
+/// deleted a document node yq never touches (`del(.a, line)` deleted the document, `(.b |
+/// select(kind == "map") | {"a": 1} | .a) = 9` set the top-level `a`). So only a navigation that
+/// navigates and filters is resolved. Any other one refuses rather than running as written: the
+/// owned value answers every metadata reader's default, so its `select` would keep nodes yq
+/// leaves. So does a `..` below a step down on a document with aliases, as yq's `..` stops at an
+/// alias and the owned walk would reach the anchor through it.
+///
+/// A target whose paths cannot be resolved (an error, or a key that is not a string or an
+/// integer) runs as written, as it always did.
+fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     target: &Expr,
 ) -> Option<Expr> {
-    let by_tag = || selects_by_tag(target) && cursor.index().has_explicit_tags();
-    if !(selects_by_node_metadata(target) || by_tag()) {
+    fn flatten<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match strip_parens(expr) {
+            Expr::Pipe(stages) => stages.iter().for_each(|stage| flatten(stage, out)),
+            other => out.push(other),
+        }
+    }
+    let mut stages = Vec::new();
+    flatten(target, &mut stages);
+    let is_reader = |stage: &Expr| match strip_parens(stage) {
+        Expr::Builtin(b) => {
+            is_node_metadata_slot(b)
+                || matches!(b, Builtin::Tag | Builtin::PathNoArg | Builtin::Key)
+        }
+        _ => false,
+    };
+    let split = stages
+        .iter()
+        .rposition(|stage| !is_reader(stage))
+        .map_or(0, |at| at + 1);
+    let (navigation, tail) = stages.split_at(split);
+    if navigation.is_empty() {
         return None;
     }
-    // #8020, #8037: a `path` names a document node only for an output that is one. A fresh node
-    // has a path too -- `[]` for a literal or a reader's answer at the root, the path of the node
-    // it was copied from for a constructor (`{"a": 1} | .a` answers `["a"]`) -- and rewriting
-    // that into navigation wrote or deleted a document node yq never touches
-    // (`del(1, (.. | select(style == "x")))` printed nothing, `(.b | select(kind == "map") |
-    // {"a": 1} | .a) = 9` set the top-level `a`). Only a target that navigates and filters is
-    // resolved; any other one runs as written.
-    if !navigates_and_filters_only(target) {
+    let navigation_expr = Expr::pipe(navigation.iter().map(|stage| (*stage).clone()).collect());
+    let by_tag = || selects_by_tag(&navigation_expr) && cursor.index().has_explicit_tags();
+    if !(selects_by_node_metadata(&navigation_expr) || by_tag()) {
         return None;
     }
-    cursor_navigation_to(cursor, target)
-}
-
-/// The navigation to each node `target` answers on the cursor, in order, or `None` when its paths
-/// cannot be resolved (an error, or a key that is not a string or an integer).
-fn cursor_navigation_to<W: AsRef<[u64]> + Clone>(
-    cursor: YamlCursor<'_, W>,
-    target: &Expr,
-) -> Option<Expr> {
-    let query = Expr::Pipe(vec![target.clone(), Expr::Builtin(Builtin::PathNoArg)].into());
+    let descent = |e: &Expr| matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys);
+    let mut stepped = false;
+    let descends_below_a_step = navigation.iter().any(|stage| {
+        if descent(stage) {
+            return stepped;
+        }
+        if jq::walk::any_subexpr(stage, &mut |e| descent(e)) {
+            return true;
+        }
+        stepped |= !matches!(stage, Expr::Identity | Expr::Builtin(Builtin::Select(_)));
+        false
+    });
+    if !navigates_and_filters_only(&navigation_expr)
+        || (descends_below_a_step && cursor.index().has_aliases())
+    {
+        return Some(Expr::Error(Some(Box::new(Expr::Literal(Literal::String(
+            "Invalid path expression: a target that selects by node metadata must only navigate \
+             and filter here"
+                .into(),
+        ))))));
+    }
+    let query = Expr::Pipe(vec![navigation_expr, Expr::Builtin(Builtin::PathNoArg)].into());
     let mut scratch = ErrorSink::default();
     let results = evaluate_yaml_cursor_core(
         cursor,
@@ -7839,116 +7865,22 @@ fn cursor_navigation_to<W: AsRef<[u64]> + Clone>(
     if scratch.hit() {
         return None;
     }
-    let mut matched = results
-        .iter()
-        .map(|(path, _)| navigation_for(path))
-        .collect::<Option<Vec<_>>>()?;
+    let mut matched = Vec::with_capacity(results.len());
+    for (path, _) in &results {
+        let at = navigation_for(path)?;
+        let at_root = matches!(at, Expr::Identity);
+        let mut member: Vec<Expr> = Vec::with_capacity(tail.len() + 1);
+        if !(at_root && !tail.is_empty()) {
+            member.push(at);
+        }
+        member.extend(tail.iter().map(|stage| (*stage).clone()));
+        matched.push(Expr::pipe(member));
+    }
     Some(match matched.len() {
         0 => Expr::Builtin(Builtin::Empty),
         1 => matched.remove(0),
         _ => Expr::Paren(Box::new(Expr::Comma(matched))),
     })
-}
-
-/// A `del()` target that selects by node metadata and ends in readers (`.[] | select(style ==
-/// "") | line`), resolved on the cursor to the slots yq deletes (#8020): yq's readers (and `key`)
-/// keep the parent and key of the node they read, so each answer is deleted from that node's slot,
-/// and the owned value cannot run the selection (every metadata reader answers its default there,
-/// so the `select` would keep every node). A node at the root keeps the readers as written, a
-/// parentless target the evaluator stops at. `None` for any other shape, a tail with `key` straight
-/// after `key` (a key node has no key: yq deletes nothing), a `..` below a step down on a document with
-/// aliases (yq's `..` stops at an alias), and a root node under a tail with `key`; the evaluator
-/// then refuses or deletes less than yq. `Some(None)` declines the rewrite as well, and keeps the
-/// caller from resolving the target another way.
-fn cursor_reader_tail_del_target<W: AsRef<[u64]> + Clone>(
-    cursor: YamlCursor<'_, W>,
-    target: &Expr,
-) -> Option<Option<Expr>> {
-    fn flatten<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
-        match strip_parens(expr) {
-            Expr::Pipe(stages) => stages.iter().for_each(|stage| flatten(stage, out)),
-            other => out.push(other),
-        }
-    }
-    let mut stages = Vec::new();
-    flatten(target, &mut stages);
-    let is_tail = |stage: &&Expr| match strip_parens(stage) {
-        Expr::Builtin(b) => {
-            is_node_metadata_slot(b)
-                || matches!(b, Builtin::Tag | Builtin::PathNoArg | Builtin::Key)
-        }
-        _ => false,
-    };
-    let split = stages.iter().position(|stage| is_tail(&stage))?;
-    let (navigation, tail) = stages.split_at(split);
-    if split == 0 || !tail.iter().all(|stage| is_tail(&stage)) {
-        return None;
-    }
-    let navigation = Expr::pipe(navigation.iter().map(|stage| (*stage).clone()).collect());
-    if !selects_by_node_metadata(&navigation) {
-        return None;
-    }
-    let is_key = |stage: &&Expr| matches!(strip_parens(stage), Expr::Builtin(Builtin::Key));
-    let key_after_key = tail
-        .windows(2)
-        .any(|pair| is_key(&pair[0]) && is_key(&pair[1]));
-    // yq's `..` stops at an alias; a `..` below a step down on a document with aliases could reach
-    // an anchor outside the walk through one, and the alias redirect would delete from it.
-    let descent = |e: &Expr| matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys);
-    let mut stepped = false;
-    let walks = stages[..split].iter().any(|stage| {
-        if descent(stage) {
-            return stepped;
-        }
-        if jq::walk::any_subexpr(stage, &mut |e| descent(e)) {
-            return true;
-        }
-        stepped |= !matches!(stage, Expr::Identity | Expr::Builtin(Builtin::Select(_)));
-        false
-    });
-    if key_after_key
-        || !navigates_and_filters_only(&navigation)
-        || (walks && cursor.index().has_aliases())
-    {
-        return Some(None);
-    }
-    let query = Expr::Pipe(vec![navigation, Expr::Builtin(Builtin::PathNoArg)].into());
-    let mut scratch = ErrorSink::default();
-    let Ok(results) = evaluate_yaml_cursor_core(
-        cursor,
-        &query,
-        &mut scratch,
-        false,
-        false,
-        false,
-        CoreRoute::inner(None),
-    ) else {
-        return Some(None);
-    };
-    if scratch.hit() {
-        return Some(None);
-    }
-    let at_root = |path: &OwnedValue| matches!(path, OwnedValue::Array(steps) if steps.is_empty());
-    if tail.iter().any(|s| is_key(s)) && results.iter().any(|(path, _)| at_root(path)) {
-        return Some(None);
-    }
-    let readers = Expr::pipe(tail.iter().map(|stage| (*stage).clone()).collect());
-    let mut matched = Vec::with_capacity(results.len());
-    for (path, _) in &results {
-        matched.push(if at_root(path) {
-            readers.clone()
-        } else {
-            let Some(navigation) = navigation_for(path) else {
-                return Some(None);
-            };
-            navigation
-        });
-    }
-    Some(Some(match matched.len() {
-        0 => Expr::Builtin(Builtin::Empty),
-        1 => matched.remove(0),
-        _ => Expr::Paren(Box::new(Expr::Comma(matched))),
-    }))
 }
 
 /// Whether every output of a write target is a node of the document it navigated to: `.`, `..`,
@@ -7966,39 +7898,6 @@ fn navigates_and_filters_only(target: &Expr) -> bool {
         Expr::Pipe(stages) => stages.iter().all(navigates_and_filters_only),
         Expr::Comma(items) => items.iter().all(navigates_and_filters_only),
         _ => false,
-    }
-}
-
-/// Whether an output of a write target can be the answer of a node metadata reader (`line`,
-/// `kind`, `tag`, `path`, `document_index`, ...), a fresh node in yq rather than one of the
-/// document's (#8020). A reader inside a `select` condition, a comparison or an `if` condition only
-/// chooses nodes; any other place a reader appears counts, so the target is kept as written.
-fn metadata_reader_reaches_output(target: &Expr) -> bool {
-    match strip_parens(target) {
-        Expr::Builtin(b)
-            if is_node_metadata_slot(b) || matches!(b, Builtin::Tag | Builtin::PathNoArg) =>
-        {
-            true
-        }
-        Expr::Builtin(Builtin::Select(_)) => false,
-        Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) | Expr::Not => false,
-        Expr::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            metadata_reader_reaches_output(then_branch)
-                || metadata_reader_reaches_output(else_branch)
-        }
-        // Any other shape: whether a child can, `select` conditions and comparisons still pruned.
-        other => {
-            let mut reaches = false;
-            jq::walk::map_subexprs(other, &mut |child| {
-                reaches = reaches || metadata_reader_reaches_output(child);
-                child.clone()
-            });
-            reaches
-        }
     }
 }
 
