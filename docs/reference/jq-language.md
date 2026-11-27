@@ -702,7 +702,8 @@ divergences (`inputs | f` does not interleave) are recorded in
    match exists but is only reachable via backtracking a Thompson-NFA-based
    engine doesn't do. Both are permanent, documented limitations, not pending
    work — [ADR-0019](../adrs/adr-0019.md) rejected swapping the regex engine
-   to close them (#920, #922)
+   to close them (#920, #922); [ADR-0031](../adrs/adr-0031.md) supersedes it,
+   and both close when jq mode moves to Oniguruma (#7965)
 
 ---
 

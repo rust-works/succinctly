@@ -24,40 +24,41 @@ by Michael Nygard.
 
 ## Inventory
 
-| ADR                     | Status     | Date       | Title                                                         |
-|-------------------------|------------|------------|---------------------------------------------------------------|
-| [ADR-0000](adr-0000.md) | ✅ Accepted | 2026-07-12 | Use Architecture Decision Records                             |
-| [ADR-0001](adr-0001.md) | ✅ Accepted | 2026-07-12 | Semi-Indexing over DOM Parsing                                |
-| [ADR-0002](adr-0002.md) | ✅ Accepted | 2026-07-12 | Table-Driven PFSM as the Portable JSON Parser                 |
-| [ADR-0003](adr-0003.md) | ✅ Accepted | 2026-07-12 | Oracle Parser for YAML                                        |
-| [ADR-0004](adr-0004.md) | ✅ Accepted | 2026-07-12 | Reject Software Prefetching for Large YAML Files (P2.6)       |
-| [ADR-0005](adr-0005.md) | ✅ Accepted | 2026-07-12 | Reject SIMD Threshold Tuning (P2.8)                           |
-| [ADR-0006](adr-0006.md) | ✅ Accepted | 2026-07-12 | Reject Branchless Character Classification (P3)               |
-| [ADR-0007](adr-0007.md) | ✅ Accepted | 2026-07-12 | Reject the Flow-Collection SIMD Fast Path (P5)                |
-| [ADR-0008](adr-0008.md) | ✅ Accepted | 2026-07-12 | Reject BMI2 Quote-Indexing for YAML (P6)                      |
-| [ADR-0009](adr-0009.md) | ✅ Accepted | 2026-07-12 | Reject a Parse-Time Newline Index (P7)                        |
-| [ADR-0010](adr-0010.md) | ✅ Accepted | 2026-07-12 | Reject AVX-512 SIMD Variants (P8)                             |
-| [ADR-0011](adr-0011.md) | ✅ Accepted | 2026-07-15 | Custom Succinct Structures over Existing Rust Crates          |
-| [ADR-0012](adr-0012.md) | ✅ Accepted | 2026-07-25 | Elias-Fano Line Index over a Dense Bitmap                     |
-| [ADR-0013](adr-0013.md) | ✅ Accepted | 2026-07-25 | Reject the SIMD Chunk-Scanner JSON Validator (#130)           |
-| [ADR-0014](adr-0014.md) | ✅ Accepted | 2026-08-03 | Reject Consolidating This Crate's Rank Implementations        |
-| [ADR-0015](adr-0015.md) | ✅ Accepted | 2026-08-05 | Keep BitVec, RankDirectory, and SelectIndex As-Is             |
-| [ADR-0016](adr-0016.md) | ✅ Accepted | 2026-08-08 | Reject SIMD Escape Scanning for jq Format Functions           |
-| [ADR-0017](adr-0017.md) | ✅ Accepted | 2026-08-11 | Presentation-Metadata Side-Trees over a Mutable YAML Document |
-| [ADR-0018](adr-0018.md) | ✅ Accepted | 2026-08-22 | Reference-Tool Fidelity, Decided by Mode Rather than Format   |
-| [ADR-0019](adr-0019.md) | ✅ Accepted | 2026-08-22 | Reject Regex-Engine Swap for jq's l/n Flag Gaps (#920, #922)  |
-| [ADR-0020](adr-0020.md) | ✅ Accepted | 2026-09-01 | Evaluate User-Defined `def`s as Runtime Calls (#1371)         |
-| [ADR-0021](adr-0021.md) | ✅ Accepted | 2026-09-05 | Path Context as a Cursor Property, Not Walk State (#2416)     |
-| [ADR-0022](adr-0022.md) | ✅ Accepted | 2026-09-12 | Demand Budgets Ride the Sink (#2666)                          |
-| [ADR-0023](adr-0023.md) | ✅ Accepted | 2026-09-16 | Module Scope Boundary as a Resolver Floor (#2951)             |
-| [ADR-0024](adr-0024.md) | ✅ Accepted | 2026-09-17 | Structural Sharing in `OwnedValue` (#2999)                    |
-| [ADR-0025](adr-0025.md) | ✅ Accepted | 2026-09-26 | Guard Recursion by the Native Stack It Spends (#3262)         |
-| [ADR-0026](adr-0026.md) | ✅ Accepted | 2026-10-25 | Carry jq's Path Register, Not Infer It (#5223)                |
-| [ADR-0027](adr-0027.md) | ✅ Accepted | 2026-10-28 | Keep a Repeated Key's Earlier Entries Beside the Map (#1344)  |
-| [ADR-0028](adr-0028.md) | 🟡 Proposed | 2026-11-10 | Carry Null and Bool Spellings in OwnedValue (#2802)           |
-| [ADR-0029](adr-0029.md) | ✅ Accepted | 2026-11-12 | An Owned Array Is a Window on Shared Storage (#6659)          |
-| [ADR-0030](adr-0030.md) | 🟡 Proposed | 2026-11-15 | Owned Values Carry a Handle to Their Source Node (#7243)      |
-| [ADR-0032](adr-0032.md) | ✅ Accepted | 2026-11-27 | A Call Machine for jq Programs with a Recursive `def` (#7977) |
+| ADR                     | Status       | Date       | Title                                                         |
+|-------------------------|--------------|------------|---------------------------------------------------------------|
+| [ADR-0000](adr-0000.md) | ✅ Accepted   | 2026-07-12 | Use Architecture Decision Records                             |
+| [ADR-0001](adr-0001.md) | ✅ Accepted   | 2026-07-12 | Semi-Indexing over DOM Parsing                                |
+| [ADR-0002](adr-0002.md) | ✅ Accepted   | 2026-07-12 | Table-Driven PFSM as the Portable JSON Parser                 |
+| [ADR-0003](adr-0003.md) | ✅ Accepted   | 2026-07-12 | Oracle Parser for YAML                                        |
+| [ADR-0004](adr-0004.md) | ✅ Accepted   | 2026-07-12 | Reject Software Prefetching for Large YAML Files (P2.6)       |
+| [ADR-0005](adr-0005.md) | ✅ Accepted   | 2026-07-12 | Reject SIMD Threshold Tuning (P2.8)                           |
+| [ADR-0006](adr-0006.md) | ✅ Accepted   | 2026-07-12 | Reject Branchless Character Classification (P3)               |
+| [ADR-0007](adr-0007.md) | ✅ Accepted   | 2026-07-12 | Reject the Flow-Collection SIMD Fast Path (P5)                |
+| [ADR-0008](adr-0008.md) | ✅ Accepted   | 2026-07-12 | Reject BMI2 Quote-Indexing for YAML (P6)                      |
+| [ADR-0009](adr-0009.md) | ✅ Accepted   | 2026-07-12 | Reject a Parse-Time Newline Index (P7)                        |
+| [ADR-0010](adr-0010.md) | ✅ Accepted   | 2026-07-12 | Reject AVX-512 SIMD Variants (P8)                             |
+| [ADR-0011](adr-0011.md) | ✅ Accepted   | 2026-07-15 | Custom Succinct Structures over Existing Rust Crates          |
+| [ADR-0012](adr-0012.md) | ✅ Accepted   | 2026-07-25 | Elias-Fano Line Index over a Dense Bitmap                     |
+| [ADR-0013](adr-0013.md) | ✅ Accepted   | 2026-07-25 | Reject the SIMD Chunk-Scanner JSON Validator (#130)           |
+| [ADR-0014](adr-0014.md) | ✅ Accepted   | 2026-08-03 | Reject Consolidating This Crate's Rank Implementations        |
+| [ADR-0015](adr-0015.md) | ✅ Accepted   | 2026-08-05 | Keep BitVec, RankDirectory, and SelectIndex As-Is             |
+| [ADR-0016](adr-0016.md) | ✅ Accepted   | 2026-08-08 | Reject SIMD Escape Scanning for jq Format Functions           |
+| [ADR-0017](adr-0017.md) | ✅ Accepted   | 2026-08-11 | Presentation-Metadata Side-Trees over a Mutable YAML Document |
+| [ADR-0018](adr-0018.md) | ✅ Accepted   | 2026-08-22 | Reference-Tool Fidelity, Decided by Mode Rather than Format   |
+| [ADR-0019](adr-0019.md) | 🔄 Superseded | 2026-08-22 | Reject Regex-Engine Swap for jq's l/n Flag Gaps (#920, #922)  |
+| [ADR-0020](adr-0020.md) | ✅ Accepted   | 2026-09-01 | Evaluate User-Defined `def`s as Runtime Calls (#1371)         |
+| [ADR-0021](adr-0021.md) | ✅ Accepted   | 2026-09-05 | Path Context as a Cursor Property, Not Walk State (#2416)     |
+| [ADR-0022](adr-0022.md) | ✅ Accepted   | 2026-09-12 | Demand Budgets Ride the Sink (#2666)                          |
+| [ADR-0023](adr-0023.md) | ✅ Accepted   | 2026-09-16 | Module Scope Boundary as a Resolver Floor (#2951)             |
+| [ADR-0024](adr-0024.md) | ✅ Accepted   | 2026-09-17 | Structural Sharing in `OwnedValue` (#2999)                    |
+| [ADR-0025](adr-0025.md) | ✅ Accepted   | 2026-09-26 | Guard Recursion by the Native Stack It Spends (#3262)         |
+| [ADR-0026](adr-0026.md) | ✅ Accepted   | 2026-10-25 | Carry jq's Path Register, Not Infer It (#5223)                |
+| [ADR-0027](adr-0027.md) | ✅ Accepted   | 2026-10-28 | Keep a Repeated Key's Earlier Entries Beside the Map (#1344)  |
+| [ADR-0028](adr-0028.md) | 🟡 Proposed   | 2026-11-10 | Carry Null and Bool Spellings in OwnedValue (#2802)           |
+| [ADR-0029](adr-0029.md) | ✅ Accepted   | 2026-11-12 | An Owned Array Is a Window on Shared Storage (#6659)          |
+| [ADR-0030](adr-0030.md) | 🟡 Proposed   | 2026-11-15 | Owned Values Carry a Handle to Their Source Node (#7243)      |
+| [ADR-0031](adr-0031.md) | ✅ Accepted   | 2026-11-27 | jq-Mode Regex Runs on Oniguruma at jq 1.7.1's Pin (#7965)     |
+| [ADR-0032](adr-0032.md) | ✅ Accepted   | 2026-11-27 | A Call Machine for jq Programs with a Recursive `def` (#7977) |
 
 The inventory is maintained by the [`update-adr-inventory`](../../.claude/skills/update-adr-inventory/SKILL.md)
 skill, which scans `adr-*.md` for the title and status and derives the date from git history.

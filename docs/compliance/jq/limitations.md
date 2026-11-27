@@ -8901,6 +8901,7 @@ The `l` and `n` flags use the second engine too, and are described in the next s
 ## Regex flags `l` and `n`
 
 [ADR-0019](../../adrs/adr-0019.md) accepted two regex-flag gaps as permanent, under rule 4(d) of [ADR-0018](../../adrs/adr-0018.md): no dependency in the `regex` stack expresses Oniguruma's search policies, and the alternatives that do were C FFI.
+[ADR-0031](../../adrs/adr-0031.md) supersedes that decision: jq-mode regex will run on Oniguruma at the commit jq 1.7.1 bundles, which closes both gaps when step 4 of [#7965](https://github.com/rust-works/succinctly/issues/7965) lands; until then this section describes the shipped behaviour.
 [#5530](https://github.com/rust-works/succinctly/issues/5530) closed most of both gaps once `fancy-regex` 0.20 (pure Rust, already the second engine for lookaround) gained a longest-match mode and a not-empty mode.
 A pattern whose flags include `l`, or whose flags include `n` and which can match the empty string, is compiled by `fancy-regex` with the matching mode.
 Every other pattern keeps the `regex` crate, its speed and its output, and yq mode never takes the route.
