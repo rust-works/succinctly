@@ -89,11 +89,12 @@ use super::eval::{
     yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
     yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
     yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
-    yq_read_only_context, yq_scalar_text, yq_sort_by, yq_stage_can_reemit, yq_stage_can_reemit_in,
-    yq_together_rhs, BinaryFanoutRules, ComputedSliceBound, Control, Demand, EmptyOperandOp,
-    EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd,
-    RangeNum, Reentry, RestPipe, RestTail, RootWitness, SliceTargetKind, StashedEscape,
-    StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
+    yq_pipe_may_reemit, yq_read_only_context, yq_scalar_text, yq_sort_by, yq_stage_can_reemit,
+    yq_stage_can_reemit_in, yq_together_rhs, BinaryFanoutRules, ComputedSliceBound, Control,
+    Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN,
+    PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RestTail, RootWitness,
+    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED,
+    MAX_RANGE_TOTAL,
 };
 use super::eval::{
     collect_tostream_events, share_path_component, yq_yaml_unwrapped_text, LoopAbort,
@@ -42410,15 +42411,41 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                 GenericResult::Owned(entries) => entries,
                 other => return other,
             };
-            let mapped = Expr::Builtin(Builtin::Map(f.clone()));
             let mut outputs: Vec<OwnedValue> = Vec::new();
-            if let Flow::Escaped(control) =
-                eval_each_owned::<S>(&mapped, &entries, optional, Reentry::REBUILT, &mut |v| {
-                    outputs.push(v);
-                    Demand::Continue
-                })
-            {
-                return partial_generic(Vec::new(), control);
+            // #8002: yq runs `f` on each entry as a context of its own (`withEntriesOperator`), so
+            // a literal or `error` after a stage that matched nothing still runs once per entry:
+            // `with_entries(select(false) | error("x"))` raises `x`. `map(f)` would run it once
+            // over the whole list.
+            if S::TAG == EvalTag::Yq && yq_pipe_may_reemit(f) {
+                let OwnedValue::Array(listed) = &entries else {
+                    return GenericResult::None; // patchcov: coverage tolerate-line reason="unreachable: `to_entries` of an object is an array"
+                };
+                let mut mapped: Vec<OwnedValue> = Vec::new();
+                for entry in listed.iter() {
+                    if let Flow::Escaped(control) = super::eval::eval_each_owned_reemitting::<S>(
+                        f,
+                        entry,
+                        optional,
+                        Reentry::REBUILT,
+                        &mut |v| {
+                            mapped.push(v);
+                            Demand::Continue
+                        },
+                    ) {
+                        return partial_generic(Vec::new(), control);
+                    }
+                }
+                outputs.push(OwnedValue::array_from(mapped));
+            } else {
+                let mapped = Expr::Builtin(Builtin::Map(f.clone()));
+                if let Flow::Escaped(control) =
+                    eval_each_owned::<S>(&mapped, &entries, optional, Reentry::REBUILT, &mut |v| {
+                        outputs.push(v);
+                        Demand::Continue
+                    })
+                {
+                    return partial_generic(Vec::new(), control);
+                }
             }
             // `map` on an array emits exactly one array. `optional` is never
             // `true` here (same reasoning as `ToEntries`'s own arm below:

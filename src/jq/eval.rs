@@ -5470,12 +5470,12 @@ pub(crate) fn yq_reemit_after_empty_stage(
     body: &Expr,
     prefix_matched: &mut dyn FnMut(&Expr) -> Option<bool>,
 ) -> Option<Expr> {
+    if !yq_pipe_may_reemit(body) {
+        return None;
+    }
     let Expr::Pipe(stages) = unwrap_paren(body) else {
         return None;
     };
-    if !stages.iter().skip(1).any(yq_stage_can_reemit) {
-        return None;
-    }
     // A pipe nested as a stage is the same evaluation as the flat one in yq.
     let mut flat: Vec<Expr> = Vec::new();
     super::eval_generic::yq_flatten_pipe_stages(stages, &mut flat);
@@ -5497,6 +5497,49 @@ pub(crate) fn yq_reemit_after_empty_stage(
     None
 }
 
+/// Whether `body` is a pipe [`yq_reemit_after_empty_stage`] may answer for: a stage of it (a nested
+/// pipe at its head included) may re-emit. Allocation-free.
+pub(crate) fn yq_pipe_may_reemit(body: &Expr) -> bool {
+    matches!(unwrap_paren(body), Expr::Pipe(stages) if stages.iter().any(yq_stage_can_reemit))
+}
+
+/// Whether `result` holds no output and no control: what [`yq_reemit_over_values`]'s callers ask
+/// before they look for a stage that re-emits.
+fn query_result_is_empty<W>(result: &QueryResult<'_, W>) -> bool {
+    match result {
+        QueryResult::None => true,
+        QueryResult::Many(vs) => vs.is_empty(),
+        QueryResult::ManyOwned(vs) => vs.is_empty(),
+        _ => false,
+    }
+}
+
+/// [`yq_reemit_after_empty_stage`] over the values `body` was evaluated on, one context list: a
+/// stage's input was empty when the stages before it yield nothing over any of them. `None` in jq
+/// mode and over an empty list.
+fn yq_reemit_over_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    body: &Expr,
+    context: &[StandardJson<'a, W>],
+    optional: bool,
+) -> Option<Expr> {
+    if S::TAG != EvalTag::Yq || context.is_empty() {
+        return None;
+    }
+    yq_reemit_after_empty_stage(body, &mut |prefix| {
+        for value in context {
+            match eval_single::<W, S>(prefix, value.clone(), optional) {
+                result if query_result_is_empty(&result) => {}
+                QueryResult::Error(_)
+                | QueryResult::Break(_)
+                | QueryResult::Halt(_)
+                | QueryResult::Partial(..) => return None,
+                _ => return Some(true),
+            }
+        }
+        Some(false)
+    })
+}
+
 /// [`yq_reemit_after_empty_stage`] over the one owned node a body was evaluated on.
 fn yq_owned_reemit_after_empty_stage<S: EvalSemantics>(
     body: &Expr,
@@ -5514,6 +5557,36 @@ fn yq_owned_reemit_after_empty_stage<S: EvalSemantics>(
         });
         (!matches!(flow, Flow::Escaped(_))).then_some(seen)
     })
+}
+
+/// [`eval_each_owned`] of a body a builtin runs on one owned node as a context of its own (yq's
+/// `with_entries(f)` runs `f` on each entry), under yq's empty-stage rule (#8002): a body that
+/// answered nothing and whose literal or `error` stage had an empty input still emits it.
+pub(crate) fn eval_each_owned_reemitting<S: EvalSemantics>(
+    body: &Expr,
+    input: &OwnedValue,
+    optional: bool,
+    reentry: Reentry,
+    sink: &mut dyn FnMut(OwnedValue) -> Demand,
+) -> Flow {
+    let mut produced = false;
+    let flow = eval_each_owned::<S>(body, input, optional, reentry, &mut |value| {
+        produced = true;
+        sink(value)
+    });
+    if produced || !matches!(flow, Flow::Exhausted) || !yq_pipe_may_reemit(body) {
+        return flow;
+    }
+    match yq_owned_reemit_after_empty_stage::<S>(body, input, reentry) {
+        Some(reemitted) => eval_each_owned::<S>(
+            &reemitted,
+            &OwnedValue::Null,
+            optional,
+            Reentry::REBUILT,
+            sink,
+        ),
+        None => flow,
+    }
 }
 
 /// The operands of a binary operator under [`yq_empty_context_reemit`]: both
@@ -5653,7 +5726,21 @@ fn eval_array_construction<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     value: StandardJson<'a, W>,
     optional: bool,
 ) -> QueryResult<'a, W> {
+    // #8002: in yq a collect's body is a pipe over its input like any other, so a literal or
+    // `error` after a stage that matched nothing still runs once: `[.[] | select(false) | 3]` is
+    // `[3]` over a computed array as over the document (#6943).
+    let context = (S::TAG == EvalTag::Yq && yq_pipe_may_reemit(inner)).then(|| [value.clone()]);
     match collect_array_items::<W, S>(inner, value, optional) {
+        Ok(items) if items.is_empty() => {
+            match context
+                .and_then(|context| yq_reemit_over_values::<W, S>(inner, &context, optional))
+            {
+                Some(reemitted) => {
+                    eval_array_construction::<W, S>(&reemitted, StandardJson::Null, optional)
+                }
+                None => QueryResult::Owned(OwnedValue::array_from(items)),
+            }
+        }
         Ok(items) => QueryResult::Owned(OwnedValue::array_from(items)),
         Err(escape) => escape,
     }
@@ -23249,45 +23336,77 @@ fn map_over<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     optional: bool,
 ) -> QueryResult<'a, W> {
     let mut results = Vec::new();
+    // #8002: yq's `map(f)` runs `f` over its members as one context list, so a literal or `error`
+    // after a stage that matched none of them still runs once (`map(select(false) | 3)` is `[3]`,
+    // #6943); the members are kept only for a body that may answer that way.
+    let mut kept: Option<Vec<StandardJson<'a, W>>> =
+        (S::TAG == EvalTag::Yq && yq_pipe_may_reemit(f)).then(Vec::new);
     for elem in elements {
+        if let Some(kept) = kept.as_mut() {
+            kept.push(elem.clone());
+        }
         // STYLE-0012: `map(f)` is `[.[] | f]` -- array construction, atomic in
         // jq for the same reason `eval_array_construction` is (this function's
         // own `Partial` arm below already says so). `optional` is forwarded
         // into `f`'s evaluation and never consulted here; the inner filter's
         // own `QueryResult::Error` arm returns bare too.
-        match eval_single::<W, S>(f, elem, optional).materialize_cursor() {
-            // STYLE-0012: atomic array construction -- see the `map(f)` comment
-            // at the top of this loop.
-            QueryResult::One(v) => match to_owned::<S, _>(&v) {
-                Ok(owned) => results.push(owned),
-                Err(e) => return QueryResult::Error(e),
-            },
-            QueryResult::OneCursor(_) => unreachable!(),
-            QueryResult::Owned(v) => results.push(v),
-            QueryResult::Many(vs) => {
-                for v in &vs {
-                    // STYLE-0012: same array-construction atomicity as the
-                    // `One` arm above.
-                    match to_owned::<S, _>(v) {
-                        Ok(owned) => results.push(owned),
-                        Err(e) => return QueryResult::Error(e),
-                    }
-                }
+        let outputs = eval_single::<W, S>(f, elem, optional);
+        if let Err(escape) = push_map_outputs::<W, S>(outputs, &mut results) {
+            return escape;
+        }
+    }
+    if results.is_empty() {
+        if let Some(reemitted) = kept
+            .as_deref()
+            .and_then(|kept| yq_reemit_over_values::<W, S>(f, kept, optional))
+        {
+            let outputs = eval_single::<W, S>(&reemitted, StandardJson::Null, optional);
+            if let Err(escape) = push_map_outputs::<W, S>(outputs, &mut results) {
+                return escape;
             }
-            QueryResult::ManyOwned(vs) => results.extend(vs),
-            QueryResult::None => {}
-            QueryResult::Error(e) => return QueryResult::Error(e),
-            QueryResult::Break(label) => return QueryResult::Break(label),
-            QueryResult::Halt(code) => return QueryResult::Halt(code),
-            // `map(f)` is `[.[] | f]` — array construction, atomic in jq
-            // (see `eval_array_construction`) — so a `Partial` just
-            // surfaces its control, same as a bare one.
-            QueryResult::Partial(_, Control::Error(e)) => return QueryResult::Error(e),
-            QueryResult::Partial(_, Control::Break(label)) => return QueryResult::Break(label),
-            QueryResult::Partial(_, Control::Halt(code)) => return QueryResult::Halt(code),
         }
     }
     QueryResult::Owned(OwnedValue::array_from(results))
+}
+
+/// One member's outputs of `map(f)`'s body, appended to `results` ([`map_over`]), or the result
+/// that ends the map.
+fn push_map_outputs<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+    outputs: QueryResult<'a, W>,
+    results: &mut Vec<OwnedValue>,
+) -> Result<(), QueryResult<'a, W>> {
+    match outputs.materialize_cursor() {
+        // STYLE-0012: atomic array construction -- see the `map(f)` comment
+        // in `map_over`'s loop.
+        QueryResult::One(v) => match to_owned::<S, _>(&v) {
+            Ok(owned) => results.push(owned),
+            Err(e) => return Err(QueryResult::Error(e)),
+        },
+        QueryResult::OneCursor(_) => unreachable!(),
+        QueryResult::Owned(v) => results.push(v),
+        QueryResult::Many(vs) => {
+            for v in &vs {
+                // STYLE-0012: same array-construction atomicity as the
+                // `One` arm above.
+                match to_owned::<S, _>(v) {
+                    Ok(owned) => results.push(owned),
+                    Err(e) => return Err(QueryResult::Error(e)),
+                }
+            }
+        }
+        QueryResult::ManyOwned(vs) => results.extend(vs),
+        QueryResult::None => {}
+        QueryResult::Error(e) => return Err(QueryResult::Error(e)),
+        QueryResult::Break(label) => return Err(QueryResult::Break(label)),
+        QueryResult::Halt(code) => return Err(QueryResult::Halt(code)),
+        // `map(f)` is `[.[] | f]` — array construction, atomic in jq
+        // (see `eval_array_construction`) — so a `Partial` just
+        // surfaces its control, same as a bare one.
+        QueryResult::Partial(_, Control::Error(e)) => return Err(QueryResult::Error(e)),
+        QueryResult::Partial(_, Control::Break(label)) => return Err(QueryResult::Break(label)),
+        QueryResult::Partial(_, Control::Halt(code)) => return Err(QueryResult::Halt(code)),
+    }
+    Ok(())
 }
 
 fn builtin_map<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
@@ -23374,6 +23493,20 @@ fn map_values_member<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
 ) -> QueryResult<'a, W> {
     if take_first {
         return eval_first_expr::<W, S>(f, member, optional).materialize_cursor();
+    }
+    // #8002: yq's `map_values(f)` is `.[] |= f`, whose right side keeps the pipe's empty-stage
+    // rule: `map_values(select(false) | 3)` writes `3` to every member.
+    if S::TAG == EvalTag::Yq && yq_pipe_may_reemit(f) {
+        let result = eval_single::<W, S>(f, member.clone(), optional).materialize_cursor();
+        if !query_result_is_empty(&result) {
+            return result;
+        }
+        return match yq_reemit_over_values::<W, S>(f, core::slice::from_ref(&member), optional) {
+            Some(reemitted) => {
+                eval_single::<W, S>(&reemitted, StandardJson::Null, optional).materialize_cursor()
+            }
+            None => result,
+        };
     }
     eval_single::<W, S>(f, member, optional).materialize_cursor()
 }
@@ -27045,7 +27178,17 @@ fn builtin_with_entries<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
         // against, so `v` can never carry an undecodable string here --
         // fixed anyway for the same structural-consistency reason as
         // `collect_rhs_outputs`'s masked fix (#1778).
-        match eval_single::<Vec<u64>, S>(f, cursor.value(), optional).materialize_cursor() {
+        let mut outputs = eval_single::<Vec<u64>, S>(f, cursor.value(), optional);
+        // #8002: yq runs `f` on each entry as a context of its own, so a literal or `error` after
+        // a stage that matched nothing still runs (`with_entries(select(false) | error("x"))`
+        // raises `x`), as in a pipe (#6943).
+        if S::TAG == EvalTag::Yq && query_result_is_empty(&outputs) {
+            let entry = [cursor.value()];
+            if let Some(reemitted) = yq_reemit_over_values::<Vec<u64>, S>(f, &entry, optional) {
+                outputs = eval_single::<Vec<u64>, S>(&reemitted, StandardJson::Null, optional);
+            }
+        }
+        match outputs.materialize_cursor() {
             QueryResult::One(v) => match to_owned::<S, _>(&v) {
                 Ok(v) => transformed.push(v),
                 Err(e) => return suppress_or_raise(e, optional),
