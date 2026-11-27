@@ -31300,22 +31300,7 @@ fn parse_complete_json(s: &str, yq_mode: bool) -> Result<OwnedValue, String> {
     for _ in 0..marks {
         s = s.strip_prefix('\u{feff}').unwrap_or(s);
     }
-    let parsed = parse_complete_json_after_bom(s, yq_mode);
-    // #7437: jq's number parser reads a token as a C string, so a NUL glued to a number ends it
-    // (`"[1\u0000x,2]" | fromjson` is `[1,2]` in jq 1.7.1 and 1.8.2). Only a text that fails
-    // pays for the search; the error stays the original text's, which jq's parser words.
-    if parsed.is_err() && !yq_mode && s.as_bytes().contains(&0) {
-        let mut blanked = s.as_bytes().to_vec();
-        // Spaces over whole characters: the text stays UTF-8.
-        if super::parse_message::blank_nul_number_tails(&mut blanked, None, 0, &mut []) {
-            if let Ok(Ok(value)) = core::str::from_utf8(&blanked)
-                .map(|text| parse_complete_json_after_bom(text, false))
-            {
-                return Ok(value);
-            }
-        }
-    }
-    parsed
+    parse_complete_json_after_bom(s, yq_mode)
 }
 
 /// [`parse_complete_json`] for text whose leading BOM, if jq's parser would skip one, is

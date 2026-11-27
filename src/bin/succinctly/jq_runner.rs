@@ -6172,12 +6172,6 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             None => input_names(&files),
         };
         jq::cli_context::set_input_names(names);
-        // #7437: each source validated and searched for a NUL in the one read of it, which the
-        // substitution below takes the verdict of.
-        let scans = reads_plain_json(&args).then(|| scan_sources(&raw_inputs));
-        if let Some(scans) = &scans {
-            blank_nul_number_tails_in(raw_inputs.iter_mut(), Some(scans), false, false);
-        }
         // #5291: jq skips a BOM at the start of its input, `--validate` included.
         let bom_cuts = strip_leading_json_bom(raw_inputs.iter_mut());
         // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
@@ -6200,20 +6194,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         let (raw_inputs, originals): (Vec<Vec<u8>>, Vec<Option<LossySource>>) = if args.validate {
             (raw_inputs, Vec::new())
         } else {
-            let unmoved = seams_moved_nothing(&seams);
             raw_inputs
                 .into_iter()
                 .enumerate()
-                .map(|(index, raw)| {
-                    let scan = scans.as_ref().map(|scans| scans[index]);
-                    utf8_lossy_scanned(raw, seams.get_mut(index), scan, unmoved)
-                })
+                .map(|(index, raw)| utf8_lossy_document(raw, seams.get_mut(index)))
                 .unzip()
         };
-        // Given back before the documents are read: an allocation the run holds through them moves
-        // where glibc's allocator puts theirs (+0.7% instructions on NDJSON `-c .id` at 1 MB, in
-        // `_int_malloc` and `_int_free`).
-        drop(scans);
 
         // #2847: `--slurp` replaces the per-file documents with the single
         // synthesized array, evaluated once below. Everything the per-file
@@ -8695,18 +8681,6 @@ fn read_inputs(
         json_input_mode && args.stream && !args.stream_errors && (track_eof || args.slurp);
     // `--seq` keeps the mark: its reader removes it as jq's does, and reacts to one that breaks off.
     let bom_cuts = if json_input_mode {
-        // #7897: not for the bytes jq's streaming parser reads here (`--stream-errors`, and
-        // `--stream` by the reader): it ends a number token at a NUL itself, a refill at a time
-        // (`jq_stream_errors::Parser::check_literal`), and the rewrite moves digits between the
-        // refills it reads, which differ once a fault has dropped the rest of one.
-        if reads_plain_json(args) && !args.stream_errors && !stream_by_reader {
-            blank_nul_number_tails_in(
-                raw_bytes.iter_mut().map(|(_, raw)| raw),
-                None,
-                track_eof,
-                args.stream,
-            );
-        }
         // #5291: jq skips a BOM at the start of its input.
         strip_leading_json_bom(raw_bytes.iter_mut().map(|(_, raw)| raw))
     } else {
@@ -8791,8 +8765,6 @@ fn read_inputs(
     // finds no value but records the `Unfinished abandoned text` fault `input` raises
     // (#5636, #5640).
     let mut seq_values: Vec<(usize, usize)> = Vec::new();
-    // The bytes inside those ranges that are not part of the values (`SeqStreamWalk::cuts`, #7340).
-    let mut seq_cuts: Vec<(usize, usize)> = Vec::new();
     // And each value's `(source index, line)` from the same walk (#3250).
     let mut seq_value_locations: Vec<(usize, usize)> = Vec::new();
     // The walk's diagnostics, kept only where `input`/`inputs` raise them ([`seq_faults_queued`]):
@@ -8903,7 +8875,6 @@ fn read_inputs(
                     )
                 };
                 seq_values = walk.values;
-                seq_cuts = walk.cuts;
                 seq_value_locations = walk.locations;
                 seq_fault_errors = seq_fault_errors_of(walk.faults, &raw_bytes, args.slurp);
                 walk.slurp_position_lost
@@ -8923,7 +8894,6 @@ fn read_inputs(
             &mut |_| {},
         );
         seq_values = walk.values;
-        seq_cuts = walk.cuts;
         seq_value_locations = walk.locations;
         // `input`/`inputs` raise what a plain run only warns about (#5640).
         seq_fault_errors = seq_fault_errors_of(walk.faults, &raw_bytes, args.slurp);
@@ -9627,7 +9597,6 @@ fn read_inputs(
             *slot.borrow_mut() = Some(LazySeqInputs::new(
                 seq_raw,
                 std::mem::take(&mut seq_values),
-                std::mem::take(&mut seq_cuts),
                 &seq_value_locations,
                 std::mem::take(&mut resumed_errors),
             ));
@@ -9636,7 +9605,6 @@ fn read_inputs(
         values = build_seq_values(
             &seq_raw,
             &seq_values,
-            &seq_cuts,
             &seq_value_locations,
             &mut locations,
             args.slurp,
@@ -12527,148 +12495,7 @@ pub(super) fn abort_if_out_of_memory(error: &std::io::Error) {
     }
 }
 
-/// Blanks what jq's number parser never reads of a number token with a NUL byte in it, in each
-/// source as read (#7437, [`succinctly::jq::blank_nul_number_tails`]): `[1`, a NUL, `x,2]` and a
-/// newline is `[1,2]` to jq. Only a NUL in an `fgets` read that holds a newline: one that does not is
-/// where jq's reader stops reading (#5654). The BOM jq skips at the stream's front is not part of
-/// the first token, though its first read holds it. Only for the plain JSON reader: `--seq` cuts
-/// these bytes itself (#7340), and `--validate` is strict RFC 8259, which no NUL passes. Costs one
-/// search for a NUL per source with none.
-///
-/// jq reads the files as one stream, so a line a file ends in without a newline goes on in the
-/// next: a string or token open there is handed on, and only for a file whose first line holds a
-/// NUL is that line's start looked for in the files before it.
-///
-/// What is handed on is what jq's parser still holds of the earlier files when it reaches this
-/// one, not all of their last line (#7897, [`open_tail_len_before`]): a fault drops the rest of the
-/// read it is met in, so `l 12` and then a file of a NUL and a newline are a fault and a second
-/// fault to an `input` that reads on, where rewriting `12` and the NUL as one number moved its last
-/// digit into the second file and gave out `2`. `resumes` and `stream` are what
-/// [`stitch_json_file_seams`] is called with for the same files.
-///
-/// `scans` are the sources' [`scan_sources`], when they were made: a source they say holds no NUL
-/// is not searched again.
-fn blank_nul_number_tails_in<'a>(
-    raws: impl Iterator<Item = &'a mut Vec<u8>>,
-    scans: Option<&[succinctly::jq::TextScan]>,
-    resumes: bool,
-    stream: bool,
-) {
-    let mut raws: Vec<&mut Vec<u8>> = raws.collect();
-    // #7921: the mark jq's parser skips at the stream's front, which may be cut across the first
-    // files with bytes (#7566), as [`strip_leading_json_bom`] cuts it after this; looked for only
-    // once a file holds a NUL.
-    let mut bom_cuts: Option<Vec<usize>> = None;
-    for at in 0..raws.len() {
-        if scans.is_some_and(|scans| !scans[at].nul) {
-            continue;
-        }
-        let Some(nul) = succinctly::jq::find_nul(raws[at]) else {
-            continue;
-        };
-        let cuts = bom_cuts.get_or_insert_with(|| {
-            crate::cli::front_matter::stream_bom_cuts(raws.iter().map(|raw| raw.as_slice()))
-        });
-        let cut_of = |index: usize| crate::cli::front_matter::bom_cut_at(cuts, index);
-        let (before, rest) = raws.split_at_mut(at);
-        let raw = &mut *rest[0];
-        let bom = cut_of(at);
-        // The part of the first line the earlier files hold, when the NUL is on that line, behind
-        // the BOM jq skips at the stream's front: where in each file it starts, last file first.
-        let mut head: Vec<u8> = Vec::new();
-        let mut parts: Vec<(usize, usize)> = Vec::new();
-        if !raw[..nul].contains(&b'\n') {
-            for (index, earlier) in before.iter().enumerate().rev() {
-                let line_break = earlier.iter().rposition(|&b| b == b'\n');
-                let from = match line_break {
-                    Some(last) => last + 1,
-                    None => cut_of(index),
-                };
-                head.splice(0..0, earlier[from..].iter().copied());
-                parts.push((index, from));
-                if line_break.is_some() {
-                    break;
-                }
-            }
-            if !head.is_empty() {
-                // #7897: only the end of it that jq's parser still holds.
-                let mut held = open_tail_len_before(before, resumes, stream).min(head.len());
-                head.drain(..head.len() - held);
-                parts.retain_mut(|(index, from)| {
-                    let len = before[*index].len() - *from;
-                    let take = len.min(held);
-                    *from += len - take;
-                    held -= take;
-                    take > 0
-                });
-            }
-        }
-        let rewrote = succinctly::jq::blank_nul_number_tails(
-            &mut raw[bom..],
-            Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
-            bom,
-            &mut head,
-        );
-        // #7749: a number that started in the earlier files is rewritten over them too.
-        if rewrote && !head.is_empty() {
-            let mut end = head.len();
-            for &(index, from) in &parts {
-                let earlier = &mut *before[index];
-                let len = earlier.len() - from;
-                earlier[from..].copy_from_slice(&head[end - len..end]);
-                end -= len;
-            }
-        }
-    }
-}
-
-/// How many bytes at the end of the files `before` jq's parser still holds when it reaches the
-/// file after them (#7897): the token, string or container open there, which is what
-/// [`stitch_json_file_seams`] moves onto that file, so the answer is the stitch's own, over a copy.
-/// Nothing when the last file ends between values, and nothing when a fault dropped the rest of
-/// the read the open token is in (with `resumes`; without, the run ends at the fault).
-///
-/// Only for a file whose first line holds a NUL and goes on from the file before it
-/// ([`blank_nul_number_tails_in`]), where it costs a copy and a scan of the files before.
-fn open_tail_len_before(before: &[&mut Vec<u8>], resumes: bool, stream: bool) -> usize {
-    let mut copies: Vec<Vec<u8>> = before.iter().map(|raw| (**raw).clone()).collect();
-    copies.push(Vec::new());
-    let leads = strip_leading_json_bom(copies.iter_mut());
-    let seams = stitch_json_file_seams(copies.iter_mut(), resumes, stream, &leads);
-    seams.last().map_or(0, |seam| seam.base)
-}
-
-/// Each source validated as UTF-8 and searched for a NUL in one read of it (#7437,
-/// [`succinctly::jq::scan_utf8_and_nul`]), for [`blank_nul_number_tails_in`] and then
-/// [`utf8_lossy_scanned`], which would otherwise each read every byte from memory again.
-fn scan_sources(raws: &[Vec<u8>]) -> Vec<succinctly::jq::TextScan> {
-    raws.iter()
-        .map(|raw| succinctly::jq::scan_utf8_and_nul(raw))
-        .collect()
-}
-
-/// [`utf8_lossy_document`], taking the verdict of `scan` for a source it holds when nothing has
-/// changed the source since but the BOM taken off its front, which is UTF-8 itself: no NUL tail was
-/// blanked (the source holds no NUL) and no seam moved bytes off or onto any source (`unmoved`).
-fn utf8_lossy_scanned(
-    raw: Vec<u8>,
-    seam: Option<&mut Seam>,
-    scan: Option<succinctly::jq::TextScan>,
-    unmoved: bool,
-) -> (Vec<u8>, Option<LossySource>) {
-    match scan {
-        Some(scan) if unmoved && scan.utf8 && !scan.nul => (raw, None),
-        _ => utf8_lossy_document(raw, seam),
-    }
-}
-
-/// Whether [`stitch_json_file_seams`] moved no bytes between the sources: every move puts the bytes
-/// on the front of a later source, whose seam counts them.
-fn seams_moved_nothing(seams: &[Seam]) -> bool {
-    seams.iter().all(|seam| seam.base == 0)
-}
-
-/// Whether the plain JSON reader reads the input, the one [`blank_nul_number_tails_in`] is for.
+/// Whether the plain JSON reader reads the input: not `--seq`, `--validate`, `-R` or DSV.
 fn reads_plain_json(args: &JqCommand) -> bool {
     !args.seq && !args.validate && !args.raw_input && args.input_dsv.is_none()
 }
@@ -15181,13 +15008,14 @@ fn fault_past_invalid_utf8(
 /// Where jq's lexer completes the token at `at`: a string's closing quote, the
 /// delimiter after a run of literal or number bytes (every byte up to a boundary,
 /// whatever it is: `\` is part of the run, #4376), or `at` itself for a structural byte
-/// (#4308).
+/// (#4308). A NUL ends the run too, and is met where it stands: the parser checks the token
+/// before it there and then refuses the NUL (#7966, [`jq::INVALID_CHARACTER`]).
 fn token_end(bytes: &[u8], at: usize) -> usize {
     match bytes.get(at) {
         Some(b'"') => string_close_from(bytes, at + 1),
-        Some(&b) if !is_jq_token_boundary(b) => bytes[at..]
+        Some(&b) if b != 0 && !is_jq_token_boundary(b) => bytes[at..]
             .iter()
-            .position(|&b| is_jq_token_boundary(b))
+            .position(|&b| b == 0 || is_jq_token_boundary(b))
             .map_or(bytes.len(), |offset| at + offset),
         _ => at,
     }
@@ -16520,25 +16348,9 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
         if crate::cli::front_matter::StreamBomMatch::default().breaks_in(&bytes) {
             BROKEN_MARK_STREAM.with(|flag| flag.set(true));
         }
-        // The front validated and searched for a NUL in one read of it (#7437).
-        let scan = succinctly::jq::scan_utf8_and_nul(&bytes[bom..]);
-        // #7748: the number tokens' NUL tails of the front, as the route that reads the source whole
-        // rewrites them ([`blank_nul_number_tails_in`]) and as each window after it is
-        // ([`blank_lazy_window_nul_tails`]), before the scan reads it: the text handed to the lazy
-        // route is the front, and only the windows read after it were rewritten. A NUL whose read
-        // has no newline yet is left to the next read, or to the window that brings the newline.
-        // The rewrite writes ASCII over whole tokens, so a UTF-8 front stays UTF-8; one that was not
-        // is validated again below, as the rewrite may have taken its stray byte out of a tail.
-        if scan.nul {
-            succinctly::jq::blank_nul_number_tails(
-                &mut bytes[bom..],
-                Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
-                bom,
-                &mut [],
-            );
-        }
+        let utf8 = succinctly::text::utf8::validate_utf8(&bytes[bom..]).is_ok();
         // Up to the last whole character: the front may end inside one.
-        let valid_end = if scan.utf8 {
+        let valid_end = if utf8 {
             bytes.len()
         } else {
             match std::str::from_utf8(&bytes[bom..]) {
@@ -16550,7 +16362,7 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
         // #7738: a front a stream cannot start on (a byte that is not UTF-8) is not read to the end of
         // the stream: the front up to its last line break is jq's substitution of it, and the route reads
         // the stream on a window at a time from there.
-        if !scan.utf8 && streamed {
+        if !utf8 && streamed {
             if let Some((text, lossy, pending)) = lossy_stream_front(&bytes, bom, kind) {
                 return Ok(LoneStart::Lazy {
                     text,
@@ -16822,8 +16634,7 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
             .windows
             .next_window_after(Some(want), text, report_input_read_failure)
         {
-            Ok(mut all) => {
-                blank_lazy_window_nul_tails(&mut all, kept);
+            Ok(all) => {
                 match String::from_utf8(all) {
                     Ok(all) => {
                         *std::rc::Rc::make_mut(&mut lazy.text) = all;
@@ -16865,10 +16676,8 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
         }
         // Not UTF-8: the rest of the source, and all of it from here, is bytes as read.
         let mut original = std::mem::take(std::rc::Rc::make_mut(&mut lazy.text)).into_bytes();
-        let kept = original.len();
         original.extend_from_slice(&fresh);
         original.extend(rest.windows.take_rest(report_input_read_failure));
-        blank_lazy_window_nul_tails(&mut original, kept);
         // The strict scan reads the stream from the first document not read: the text before is
         // blanked, as it may begin inside the last document a window dropped the front of.
         more.recorded_tail = Some(lazy.dropped.count_in(EofTail::of(
@@ -16982,26 +16791,6 @@ fn blank_consumed(bytes: &[u8], dropped: DroppedText, upto: usize) -> Vec<u8> {
         }
     }
     blanked
-}
-
-/// #7437: the number tokens' NUL tails of what a window added to a lazy source's text after `kept`
-/// bytes, as the eager reader blanks them ([`blank_nul_number_tails_in`]). A window starts where the
-/// last one ended, which may be inside a line, so the scan starts at that line's start: what is before
-/// the window there is what jq read of the line before, and blanks nothing that a scanned document
-/// holds, as a NUL in one would have been its fault.
-fn blank_lazy_window_nul_tails(text: &mut [u8], kept: usize) {
-    let line_start = text[..kept]
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |at| at + 1);
-    if succinctly::jq::find_nul(&text[line_start..]).is_some() {
-        succinctly::jq::blank_nul_number_tails(
-            &mut text[line_start..],
-            Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
-            0,
-            &mut [],
-        );
-    }
 }
 
 /// Reads what is left of the source, for a fault: the eager reader that takes the stream from the end
@@ -18455,8 +18244,6 @@ struct LazySeqInputs {
     first_invalid: usize,
     /// Each record's `(start, end)` in `combined`.
     ranges: Vec<(usize, usize)>,
-    /// The bytes of `combined` that are not part of any record (`SeqStreamWalk::cuts`, #7340).
-    cuts: Vec<(usize, usize)>,
     /// `(source tag, line)` of every record, as jq's reader stood when it yielded it, at 8 bytes a
     /// record below 2^32 lines (#7472).
     places: jq::LineTable,
@@ -18472,7 +18259,6 @@ impl LazySeqInputs {
     fn new(
         mut sources: Vec<(Option<usize>, Vec<u8>)>,
         ranges: Vec<(usize, usize)>,
-        cuts: Vec<(usize, usize)>,
         value_locations: &[(usize, usize)],
         errors: Vec<(usize, TrailingParseError)>,
     ) -> Self {
@@ -18501,7 +18287,6 @@ impl LazySeqInputs {
             first_invalid: first_invalid_utf8(&combined),
             combined,
             ranges,
-            cuts,
             places,
             errors: errors.into_iter().peekable(),
             next: 0,
@@ -18529,9 +18314,7 @@ impl LazySeqInputs {
             let (source, line) = self.places.get(self.next)?;
             self.next += 1;
             // A record the checked materializer refuses is dropped, with its place.
-            if let Some(value) =
-                seq_record_value(&self.combined, self.first_invalid, start, end, &self.cuts)
-            {
+            if let Some(value) = seq_record_value(&self.combined, self.first_invalid, start, end) {
                 return Some(jq::ProducedInput::Document(value, source, line));
             }
         }
@@ -18820,12 +18603,10 @@ impl WalkedSeqInputs {
             }
             if let Some(((start, end), (source, line))) = self.walk.pop_value() {
                 let tag = self.tag_of(source);
-                let cuts = self.walk.cuts_for(start, end);
                 let (data, base) = self.walk.window();
                 let first_invalid = self.walk.utf8_up_to().saturating_sub(base);
                 // A record the checked materializer refuses is dropped, with its place.
-                if let Some(value) =
-                    seq_record_value(data, first_invalid, start - base, end - base, &cuts)
+                if let Some(value) = seq_record_value(data, first_invalid, start - base, end - base)
                 {
                     return Some(jq::ProducedInput::Document(value, tag, line as u64));
                 }
@@ -19292,8 +19073,7 @@ fn seq_stream_walked_as_plain_json_with(
             return Err(($raw, kept.then(|| Box::new($walk))))
         };
     }
-    // #7340: a stream with bytes inside its values that are not part of them is never plain.
-    if warned || position_lost || values.is_empty() || !walk.cuts.is_empty() {
+    if warned || position_lost || values.is_empty() {
         not_plain!(raw, walk);
     }
     // `-s` wraps the values in one array, which is a level more than the deepest value has: a
@@ -20256,32 +20036,22 @@ fn trim_json_whitespace(s: &str) -> &str {
 /// reads every value (a fault of succinctly's own, such as a nesting depth the materializer
 /// refuses past jq's), the refusal keeps its own words.
 ///
-/// jq's number parser reads a token as a C string, so a NUL glued to a number ends it (`1.5`, a
-/// NUL, `x` is `[1.5]`), as for `fromjson` (#7437): `jv_load_file` hands its parser each read by
-/// its length, so there is no `fgets` read for the NUL to end. Only a file that is refused pays for
-/// the search, and the rewrite keeps every offset, so a fault after it is placed as jq places it.
+/// A NUL outside a string is the model's `Invalid character` at the NUL (#7966), as on the main
+/// input.
 fn parse_json_file(bytes: &[u8]) -> Result<Vec<OwnedValue>> {
-    let parse = |bytes: &[u8]| match core::str::from_utf8(bytes) {
+    let parsed = match core::str::from_utf8(bytes) {
         Ok(text) => parse_json_stream(text),
         Err(_) => parse_json_stream(
             &succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(bytes),
         ),
     };
-    let error = match parse(bytes) {
+    let error = match parsed {
         Ok(values) => return Ok(values),
         Err(error) => error,
     };
     let read = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     if let Some(message) = jq::jq_stream_fault([read], 1, 0) {
         return Err(anyhow::anyhow!(message));
-    }
-    if succinctly::jq::find_nul(read).is_some() {
-        let mut blanked = read.to_vec();
-        if succinctly::jq::blank_nul_number_tails(&mut blanked, None, 0, &mut []) {
-            if let Ok(values) = parse(&blanked) {
-                return Ok(values);
-            }
-        }
     }
     Err(error)
 }
@@ -20549,8 +20319,6 @@ fn build_seq_values(
     // `jq_seq_reader::SeqStreamWalk::values` for these same sources: raw
     // offsets into their concatenation.
     ranges: &[(usize, usize)],
-    // `jq_seq_reader::SeqStreamWalk::cuts` for these ranges (#7340).
-    cuts: &[(usize, usize)],
     // `jq_seq_reader::SeqStreamWalk::locations`, parallel to `ranges`: each
     // value's `(source index, line)` as jq reports it (#3250).
     value_locations: &[(usize, usize)],
@@ -20570,7 +20338,7 @@ fn build_seq_values(
             std::borrow::Cow::Owned(all)
         }
     };
-    let parsed = seq_values_with_indices(&combined, ranges, cuts);
+    let parsed = seq_values_with_indices(&combined, ranges);
 
     if !slurp {
         debug_assert_eq!(
@@ -20746,17 +20514,13 @@ fn remap_ends_to_locations<S: AsRef<[u8]>>(
 /// reader decides on.
 ///
 /// [`jq_seq_reader::walk_stream`]: crate::cli::jq_seq_reader::walk_stream
-fn seq_values_with_indices(
-    combined: &[u8],
-    ranges: &[(usize, usize)],
-    cuts: &[(usize, usize)],
-) -> Vec<(OwnedValue, usize)> {
+fn seq_values_with_indices(combined: &[u8], ranges: &[(usize, usize)]) -> Vec<(OwnedValue, usize)> {
     let first_invalid = first_invalid_utf8(combined);
     ranges
         .iter()
         .enumerate()
         .filter_map(|(index, &(start, end))| {
-            seq_record_value(combined, first_invalid, start, end, cuts).map(|value| (value, index))
+            seq_record_value(combined, first_invalid, start, end).map(|value| (value, index))
         })
         .collect()
 }
@@ -20772,26 +20536,17 @@ fn first_invalid_utf8(combined: &[u8]) -> usize {
 
 /// The value of the record at `start..end` of the `--seq` stream `combined`, for
 /// [`seq_values_with_indices`] and [`LazySeqInputs`] (#6500), which must agree on every record.
-/// `first_invalid` is [`first_invalid_utf8`] of the stream, and `cuts` the bytes of it that are
-/// not part of any value (`SeqStreamWalk::cuts`, #7340), taken out of the record first. `None` for
-/// a record the checked materializer refuses, which both routes drop.
+/// `first_invalid` is [`first_invalid_utf8`] of the stream. `None` for a record the checked
+/// materializer refuses, which both routes drop.
 fn seq_record_value(
     combined: &[u8],
     first_invalid: usize,
     start: usize,
     end: usize,
-    cuts: &[(usize, usize)],
 ) -> Option<OwnedValue> {
-    let spliced = crate::cli::jq_seq_reader::splice_cuts(combined, start, end, cuts);
-    // Taking bytes out of a range of valid UTF-8 leaves it valid UTF-8 only when the cuts fall on
-    // character boundaries, which a NUL and the end of an `fgets` chunk need not, so a spliced
-    // record is always checked.
-    let unspliced = matches!(spliced, std::borrow::Cow::Borrowed(_));
-    let raw: &[u8] = &spliced;
+    let raw = &combined[start..end];
     let substituted;
-    let bytes = if (unspliced && end <= first_invalid)
-        || succinctly::text::utf8::validate_utf8(raw).is_ok()
-    {
+    let bytes = if end <= first_invalid || succinctly::text::utf8::validate_utf8(raw).is_ok() {
         raw
     } else {
         substituted = succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(raw);
@@ -20847,10 +20602,10 @@ fn seq_record_general_value(bytes: &[u8]) -> Option<OwnedValue> {
 /// the BOM in the second file, since real jq treats every source as one
 /// continuous stream).
 ///
-/// The bytes jq's parser never sees are neither counted nor searched for an RS
-/// (`jq_seq_reader::nul_cuts`, #7340): `jq_util_input_read_more` measures an
-/// `fgets` chunk with no newline by `strlen`, so `ab\0cd` reports column 2, not
-/// 5, and an RS after such a NUL is no RS to jq. jq's BOM detection consumes a
+/// Every byte is counted and searched for an RS, a NUL and what follows it in an
+/// `fgets` chunk with no newline included: jq 1.7.1 measured such a chunk by
+/// `strlen`, so `ab\0cd` reported column 2, which the reader does not reproduce
+/// (#7966), and reports column 5 as jq 1.8.2 does. jq's BOM detection consumes a
 /// *partial*, never-completed `EF`/`EF BB` prefix too, not just a full 3-byte
 /// match (`jq_seq_reader::bom_prefix`).
 fn seq_no_rs_byte_warning(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<String> {
@@ -20877,9 +20632,8 @@ fn seq_no_rs_byte_position(raw_bytes: &[(Option<usize>, Vec<u8>)]) -> Option<(us
     // A *malformed* BOM is the one case where "no RS byte anywhere" does not imply #1525's
     // template: it costs jq a `parser_reset` that leaves the parser reading rather than waiting
     // for an RS, so the reader owns that case (#1723); the scan says so as it says it met an RS.
-    // #7340: what jq's parser never sees, a stream's NULs and what follows them in a read with no
-    // newline, is neither counted nor searched for an RS. Each source is fed whole: jq starts a
-    // read at each file's start. #7260: one definition with the windowed route's scan.
+    // Each source is fed whole: jq starts a read at each file's start. #7260: one definition with
+    // the windowed route's scan.
     let mut scan = crate::cli::jq_seq_reader::NoRsScan::default();
     for (_, raw) in raw_bytes {
         scan.feed(raw, true)?;
@@ -29712,19 +29466,20 @@ mod tests {
             assert_eq!(position(&[b"\xEF\xB71\n"]), None);
         }
 
-        /// #7340: a chunk with no newline is jq's only up to its first NUL, so the column stops
-        /// there and an RS after it is no RS; a chunk that ends in a newline is counted whole.
-        /// Each source's chunks are its own, and a BOM before the NUL is still not counted.
+        /// #7966: every byte before the first RS is counted, a NUL and what follows it in a chunk
+        /// with no newline included, and an RS after such a NUL is an RS. jq 1.7.1 counted such a
+        /// chunk only up to its NUL (`ab`, NUL, `cd` was column 2, #7340), which the reader no longer
+        /// reproduces; jq 1.8.2 and jq master count it whole, and these are 1.8.2's answers. A NUL
+        /// before the first RS is never scanned, so it is no `Invalid character`.
         #[test]
-        fn position_skips_what_jq_never_sees_past_a_nul_7340() {
-            assert_eq!(position(&[b"ab\x00cd"]), Some((1, 2)));
-            assert_eq!(position(&[b"ab\x00\x1ecd"]), Some((1, 2)));
+        fn position_counts_every_byte_before_an_rs_7966() {
+            assert_eq!(position(&[b"ab\x00cd"]), Some((1, 5)));
+            assert_eq!(position(&[b"ab\x00\x1ecd"]), None);
             assert_eq!(position(&[b"ab\x00cd\n"]), Some((2, 0)));
-            assert_eq!(position(&[b"x\nab\x00cd"]), Some((2, 2)));
-            assert_eq!(position(&[b"ab\x00cd", b"ef"]), Some((1, 4)));
-            assert_eq!(position(&[b"ab", b"c\x00d"]), Some((1, 3)));
-            assert_eq!(position(&[b"\xEF\xBB\xBFab\x00cd"]), Some((1, 2)));
-            // ... but a chunk that ends in a newline keeps an RS after its NUL.
+            assert_eq!(position(&[b"x\nab\x00cd"]), Some((2, 5)));
+            assert_eq!(position(&[b"ab\x00cd", b"ef"]), Some((1, 7)));
+            assert_eq!(position(&[b"ab", b"c\x00d"]), Some((1, 5)));
+            assert_eq!(position(&[b"\xEF\xBB\xBFab\x00cd"]), Some((1, 5)));
             assert_eq!(position(&[b"x\nab\x00cd\x1e1\nzz"]), None);
         }
 
@@ -31170,6 +30925,10 @@ mod tests {
         assert_eq!(token_end(b"\\ x", 0), 1);
         assert_eq!(token_end(b"a@b,c", 0), 3);
         assert_eq!(token_end(b"{x", 0), 0);
+        // #7966: a NUL ends the run, and a NUL at `at` is met there.
+        assert_eq!(token_end(b"12\0x ", 0), 2);
+        assert_eq!(token_end(b"\0x ", 0), 0);
+        assert_eq!(token_end(b"\"a\0\" ", 0), 3);
     }
 
     /// `seam` once `raw` has gone through the substitution, and the edits that made it.
@@ -31737,14 +31496,7 @@ mod tests {
             .map(|(idx, s)| (*idx, s.as_bytes().to_vec()))
             .collect();
         let walk = crate::cli::jq_seq_reader::walk_stream(&raw, false, &mut |_| {});
-        build_seq_values(
-            &raw,
-            &walk.values,
-            &walk.cuts,
-            &walk.locations,
-            locations,
-            false,
-        )
+        build_seq_values(&raw, &walk.values, &walk.locations, locations, false)
     }
 
     /// One `--seq` stream's values, the way `get_inputs` builds them.
@@ -31872,7 +31624,7 @@ mod tests {
                 }
                 None => {
                     // The record's value is whatever the general route says, as before.
-                    let direct = seq_record_value(bytes, usize::MAX, 0, bytes.len(), &[]);
+                    let direct = seq_record_value(bytes, usize::MAX, 0, bytes.len());
                     assert_eq!(
                         direct.as_ref().map(|v| seq_record_prints(record, v)),
                         general.as_ref().map(|v| seq_record_prints(record, v)),
@@ -31882,7 +31634,7 @@ mod tests {
             }
             // Through the one function both routes call, a record is its general value either way.
             assert_eq!(
-                seq_record_value(bytes, usize::MAX, 0, bytes.len(), &[])
+                seq_record_value(bytes, usize::MAX, 0, bytes.len())
                     .as_ref()
                     .map(|v| seq_record_prints(record, v)),
                 general.as_ref().map(|v| seq_record_prints(record, v)),
@@ -31896,7 +31648,7 @@ mod tests {
         // Invalid UTF-8 never reaches the reader: it is substituted first, as before.
         let raw = b"\"a\xffb\"";
         assert_eq!(
-            seq_record_value(raw, 0, 0, raw.len(), &[]).map(|v| v.to_json()),
+            seq_record_value(raw, 0, 0, raw.len()).map(|v| v.to_json()),
             Some("\"a\u{fffd}b\"".to_string())
         );
     }

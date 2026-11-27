@@ -1,13 +1,15 @@
 //! #7934: since jq's reads past invalid UTF-8 are counted in the bytes jq read, a NUL that starts
-//! the read after a fault's dropped read is met as it is on ASCII input: #5654's recorded
-//! divergence, not a new one.
+//! the read after a fault's dropped read is met as it is on ASCII input. Re-pinned by #7966: that
+//! NUL is the second fault, `Invalid character` at its own column (ADR-0018's E2, worded as jq
+//! master, commit fbee8f4, words it), where it was `Invalid numeric literal at EOF` before.
 //!
 //! The shape: `[1,2]` and a newline, spaces, `xa`, an invalid sequence, `]` or `}`, and a NUL that
 //! is the file's last byte, at line offset 8,190. jq meets the fault at `x` in its second
 //! 4,095-byte read, drops the rest of that read, and resumes at the third, which is the NUL alone
-//! with no newline: jq 1.7.1's `strlen` drops it and the stream ends, exit 0. `succinctly jq`
-//! reports such a NUL (`Invalid numeric literal at EOF`, exit 5), as it does for `[1]` and a NUL
-//! (`docs/compliance/jq/limitations.md`, #5654). Before #7934 the read was counted over the text
+//! with no newline: jq 1.7.1's `strlen` drops it and the stream ends, exit 0, and jq 1.8.2 reads it
+//! as an empty token there and says nothing either. `succinctly jq` reports such a NUL (`Invalid
+//! character at line 2, column 8191`, exit 5), as it does for `[1]` and a NUL
+//! (`docs/compliance/jq/limitations.md`, #7966). Before #7934 the read was counted over the text
 //! after the invalid sequence became U+FFFD, two bytes early, so the run resumed inside the
 //! replacement, never met the NUL, and matched jq by accident. Its ASCII twin (`z` for each invalid
 //! byte, the same bytes and the same reads) gave the divergence then too.
@@ -64,7 +66,7 @@ fn a_nul_read_after_a_dropped_read_past_invalid_utf8_is_reported_as_on_ascii_793
         run(PROGRAMS[0], &text)?,
         (
             String::new(),
-            "jq: error (at f:1): Invalid numeric literal at line 2, column 8190\njq: parse error: Invalid numeric literal at EOF at line 2, column 8191\n".to_string(),
+            "jq: error (at f:1): Invalid numeric literal at line 2, column 8190\njq: parse error: Invalid character at line 2, column 8191\n".to_string(),
             5
         ),
     );
@@ -72,14 +74,14 @@ fn a_nul_read_after_a_dropped_read_past_invalid_utf8_is_reported_as_on_ascii_793
         run(PROGRAMS[1], &text)?,
         (
             "[[1,2],\"E\"]\n".to_string(),
-            "jq: parse error: Invalid numeric literal at EOF at line 2, column 8191\n".to_string(),
+            "jq: parse error: Invalid character at line 2, column 8191\n".to_string(),
             5
         ),
     );
     assert_eq!(
         run(PROGRAMS[2], &text)?,
         (
-            "[[1,2],\"Invalid numeric literal at line 2, column 8190\",\"Invalid numeric literal at EOF at line 2, column 8191\",\"break\",\"break\",\"break\",\"break\",\"break\"]\n".to_string(),
+            "[[1,2],\"Invalid numeric literal at line 2, column 8190\",\"Invalid character at line 2, column 8191\",\"break\",\"break\",\"break\",\"break\",\"break\"]\n".to_string(),
             String::new(),
             0
         ),

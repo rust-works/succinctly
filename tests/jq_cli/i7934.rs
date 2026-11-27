@@ -174,8 +174,12 @@ fn a_file_that_starts_inside_a_replacement_reads_from_its_first_byte_7934() -> R
 /// 0x80. jq's read hides the token's tail, so both releases print `0`, `1`, `2` and `3`. The window
 /// looked for such a token after its invalid bytes had become U+FFFD, two bytes more each, so the
 /// read ended before the NUL and the run stopped at `Invalid JSON text`, exit 5 (#7934).
+///
+/// Re-pinned by #7966: the NUL is the fault (ADR-0018's E2), `Invalid character` at its own
+/// column, which is counted in the bytes as read: 4,092, where the U+FFFD text would put it at
+/// 4,094. The run stops there with `0` printed, as jq master (fbee8f4) reads it.
 #[test]
-fn a_window_reads_a_number_with_a_nul_past_a_replaced_byte_7934() -> Result<()> {
+fn a_window_reads_a_nul_past_a_replaced_byte_as_a_fault_in_the_bytes_read_7966() -> Result<()> {
     let mut bytes = Vec::new();
     while bytes.len() < small_window::MIN_BYTES {
         bytes.push(b'"');
@@ -200,7 +204,11 @@ fn a_window_reads_a_number_with_a_nul_past_a_replaced_byte_7934() -> Result<()> 
             String::from_utf8_lossy(&output.stderr).into_owned(),
             output.status.code(),
         ),
-        ("0\n1\n2\n3\n".to_string(), String::new(), Some(0)),
+        (
+            "0\n".to_string(),
+            "jq: parse error: Invalid character at line 7, column 4092\n".to_string(),
+            Some(5)
+        ),
     );
     Ok(())
 }

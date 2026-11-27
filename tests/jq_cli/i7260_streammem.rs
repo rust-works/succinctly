@@ -75,13 +75,16 @@ fn a_seq_file_of_lines_after_a_bom_warns_on_the_line_after_them_7260() -> Result
     Ok(())
 }
 
-/// A NUL in a 4095-byte read of jq's that holds no line break hides the rest of that read: the
-/// second read of one long line ends at the NUL at byte 5000, so 3190 bytes are not counted.
+/// A NUL in a 4095-byte read of jq's that holds no line break is counted with the rest of that
+/// read (#7966): jq 1.7.1 ended the second read of one long line at the NUL at byte 5000 and did not
+/// count the 3190 bytes after it (column 278954 here); jq 1.8.2 counts them (column 282144), and
+/// so does `succinctly jq`, which does not reproduce 1.7.1's cut. A NUL before the first RS is never
+/// scanned, so it is no fault.
 #[test]
-fn a_nul_in_a_long_line_hides_the_rest_of_its_read_7260() -> Result<()> {
+fn a_nul_in_a_long_line_is_counted_with_the_rest_of_its_read_7966() -> Result<()> {
     let mut bytes = vec![b'a'; small_window::MIN_BYTES + 20_000];
     bytes[5_000] = 0;
-    let want = (String::new(), abandoned(1, bytes.len() - 3_190), 0);
+    let want = (String::new(), abandoned(1, bytes.len()), 0);
     for got in run_both(&["--seq", "-c", "."], &bytes)? {
         assert_eq!(got, want);
     }

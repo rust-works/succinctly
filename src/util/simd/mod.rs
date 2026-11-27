@@ -16,14 +16,6 @@ pub mod x86;
 /// Shared SIMD escape scanning (portable; SIMD kernels are gated internally).
 pub(crate) mod escape;
 
-/// The first NUL byte of a buffer, the search every JSON reading route makes per source (#7437).
-///
-/// The file is `nul_byte.rs` because `NUL` is a reserved device name on Windows, where git cannot
-/// check out a file named `nul.rs` (#7953). The module keeps its name, so its symbols, and with
-/// them `scripts/link-order/symbols.txt`, are unchanged.
-#[path = "nul_byte.rs"]
-pub(crate) mod nul;
-
 /// 64-byte block classification of a JSON string's specials, for the
 /// canonical-echo gate's string scan (#3340).
 pub(crate) mod specials;

@@ -1,10 +1,13 @@
-//! #7749: a NUL glued to a number token ends the number for jq's number parser, but not the token:
-//! jq's tokenizer reads the NUL and what follows it into the token up to the next byte that ends a
-//! token, and acts on the token there. So an error jq raises when the token ends (`Expected
-//! separator between values`, an unmatched closer) is at that byte's column, and `1`, NUL, `}` is
-//! that error alone, with no `1` printed first. #7437 blanked the tail to spaces, which ended the
-//! token at the NUL. Every row was captured from jq 1.7.1 (`/usr/bin/jq`), and jq 1.8.2
-//! (`/opt/homebrew/bin/jq`) gives the same answer for each.
+//! #7749, re-pinned by #7966: jq 1.7.1 and 1.8.2 read a NUL glued to a number token into the
+//! token, up to the next byte that ends one, and their number parser stops at the NUL: an error jq
+//! raises when the token ends was at that byte's column (`[[1]1`, NUL, `]` was `Expected separator
+//! between values` at column 7), `1`, NUL, `}` was `Unmatched '}'` at column 3, and `[1`, NUL, `,2]`
+//! was `[1,2]`. Under ADR-0018's #7963 amendment E2 the NUL ends the token and is itself the fault,
+//! as jq master (unreleased; commit fbee8f4, jqlang/jq#3606) reads it: the token before it is
+//! checked there (`[[1]1` is `Expected separator between values` at column 6, the NUL's), and
+//! otherwise the NUL is `Invalid character` at its own column. Every first fault below was checked
+//! against a driver over master's `jv_parse.c`, with and without `JV_PARSE_STREAMING`; no row here
+//! matches either release.
 
 use anyhow::Result;
 
@@ -19,15 +22,15 @@ const ROWS: &[Row] = &[
         [
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 7\n",
+                "jq: parse error: Expected separator between values at line 1, column 6\n",
             ),
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 7\n",
+                "jq: parse error: Expected separator between values at line 1, column 6\n",
             ),
             (
                 "[[0,0],1]\n[[0,0]]\n",
-                "jq: parse error: Expected separator between values at line 1, column 7\n",
+                "jq: parse error: Expected separator between values at line 1, column 6\n",
             ),
         ],
     ),
@@ -36,37 +39,49 @@ const ROWS: &[Row] = &[
         [
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 20\n",
+                "jq: parse error: Expected separator between values at line 1, column 19\n",
             ),
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 20\n",
+                "jq: parse error: Expected separator between values at line 1, column 19\n",
             ),
             (
                 "[[\"a\",0],true]\n[[\"a\",1],null]\n[[\"a\",1]]\n",
-                "jq: parse error: Expected separator between values at line 1, column 20\n",
+                "jq: parse error: Expected separator between values at line 1, column 19\n",
             ),
         ],
     ),
     (
         "1\0}\n",
         [
-            ("", "jq: parse error: Unmatched '}' at line 1, column 3\n"),
-            ("", "jq: parse error: Unmatched '}' at line 1, column 3\n"),
             (
                 "",
-                "jq: parse error: Unmatched '}' at the top-level at line 1, column 3\n",
+                "jq: parse error: Invalid character at line 1, column 2\n",
+            ),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 2\n",
+            ),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 2\n",
             ),
         ],
     ),
     (
         "1\0]\n",
         [
-            ("", "jq: parse error: Unmatched ']' at line 1, column 3\n"),
-            ("", "jq: parse error: Unmatched ']' at line 1, column 3\n"),
             (
                 "",
-                "jq: parse error: Unmatched ']' at the top-level at line 1, column 3\n",
+                "jq: parse error: Invalid character at line 1, column 2\n",
+            ),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 2\n",
+            ),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 2\n",
             ),
         ],
     ),
@@ -75,26 +90,32 @@ const ROWS: &[Row] = &[
         [
             (
                 "",
-                "jq: parse error: Objects must consist of key:value pairs at line 1, column 4\n",
+                "jq: parse error: Invalid character at line 1, column 3\n",
             ),
             (
                 "",
-                "jq: parse error: Objects must consist of key:value pairs at line 1, column 4\n",
+                "jq: parse error: Invalid character at line 1, column 3\n",
             ),
             (
                 "",
-                "jq: parse error: Unmatched '}' in the middle of an array at line 1, column 4\n",
+                "jq: parse error: Invalid character at line 1, column 3\n",
             ),
         ],
     ),
     (
         "{\"a\":1\0]\n",
         [
-            ("", "jq: parse error: Unmatched ']' at line 1, column 8\n"),
-            ("", "jq: parse error: Unmatched ']' at line 1, column 8\n"),
             (
                 "",
-                "jq: parse error: Unmatched ']' in the middle of an object at line 1, column 8\n",
+                "jq: parse error: Invalid character at line 1, column 7\n",
+            ),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 7\n",
+            ),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 7\n",
             ),
         ],
     ),
@@ -103,15 +124,15 @@ const ROWS: &[Row] = &[
         [
             (
                 "",
-                "jq: parse error: Expected string key before ':' at line 1, column 5\n",
+                "jq: parse error: Invalid character at line 1, column 3\n",
             ),
             (
                 "",
-                "jq: parse error: Expected string key before ':' at line 1, column 5\n",
+                "jq: parse error: Invalid character at line 1, column 3\n",
             ),
             (
                 "",
-                "jq: parse error: ':' not as part of an object at line 1, column 5\n",
+                "jq: parse error: Invalid character at line 1, column 3\n",
             ),
         ],
     ),
@@ -120,12 +141,15 @@ const ROWS: &[Row] = &[
         [
             (
                 "\"s\"\n",
-                "jq: parse error: Unmatched '}' at line 1, column 7\n",
+                "jq: parse error: Invalid character at line 1, column 5\n",
             ),
-            ("", "jq: parse error: Unmatched '}' at line 1, column 7\n"),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 5\n",
+            ),
             (
                 "[[],\"s\"]\n",
-                "jq: parse error: Unmatched '}' at the top-level at line 1, column 7\n",
+                "jq: parse error: Invalid character at line 1, column 5\n",
             ),
         ],
     ),
@@ -134,15 +158,15 @@ const ROWS: &[Row] = &[
         [
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 11\n",
+                "jq: parse error: Invalid character at line 1, column 5\n",
             ),
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 11\n",
+                "jq: parse error: Invalid character at line 1, column 5\n",
             ),
             (
                 "[[0],1]\n",
-                "jq: parse error: Expected separator between values at line 1, column 11\n",
+                "jq: parse error: Invalid character at line 1, column 5\n",
             ),
         ],
     ),
@@ -151,26 +175,32 @@ const ROWS: &[Row] = &[
         [
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 6\n",
+                "jq: parse error: Invalid character at line 1, column 3\n",
             ),
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 6\n",
+                "jq: parse error: Invalid character at line 1, column 3\n",
             ),
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 6\n",
+                "jq: parse error: Invalid character at line 1, column 3\n",
             ),
         ],
     ),
     (
         "1\0x]\n2\n",
         [
-            ("", "jq: parse error: Unmatched ']' at line 1, column 4\n"),
-            ("", "jq: parse error: Unmatched ']' at line 1, column 4\n"),
             (
                 "",
-                "jq: parse error: Unmatched ']' at the top-level at line 1, column 4\n",
+                "jq: parse error: Invalid character at line 1, column 2\n",
+            ),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 2\n",
+            ),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 2\n",
             ),
         ],
     ),
@@ -178,13 +208,16 @@ const ROWS: &[Row] = &[
         "[1\0,2]\n1.5\0e}\n",
         [
             (
-                "[1,2]\n",
-                "jq: parse error: Unmatched '}' at line 2, column 6\n",
+                "",
+                "jq: parse error: Invalid character at line 1, column 3\n",
             ),
-            ("", "jq: parse error: Unmatched '}' at line 2, column 6\n"),
             (
-                "[[0],1]\n[[1],2]\n[[1]]\n",
-                "jq: parse error: Unmatched '}' at the top-level at line 2, column 6\n",
+                "",
+                "jq: parse error: Invalid character at line 1, column 3\n",
+            ),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 3\n",
             ),
         ],
     ),
@@ -193,26 +226,32 @@ const ROWS: &[Row] = &[
         [
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 12\n",
+                "jq: parse error: Invalid character at line 1, column 8\n",
             ),
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 12\n",
+                "jq: parse error: Invalid character at line 1, column 8\n",
             ),
             (
                 "",
-                "jq: parse error: Expected separator between values at line 1, column 12\n",
+                "jq: parse error: Invalid character at line 1, column 8\n",
             ),
         ],
     ),
     (
         "nan\0}\n",
         [
-            ("", "jq: parse error: Unmatched '}' at line 1, column 5\n"),
-            ("", "jq: parse error: Unmatched '}' at line 1, column 5\n"),
             (
                 "",
-                "jq: parse error: Unmatched '}' at the top-level at line 1, column 5\n",
+                "jq: parse error: Invalid character at line 1, column 4\n",
+            ),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 4\n",
+            ),
+            (
+                "",
+                "jq: parse error: Invalid character at line 1, column 4\n",
             ),
         ],
     ),
@@ -221,28 +260,30 @@ const ROWS: &[Row] = &[
         [
             (
                 "",
-                "jq: parse error: Expected separator between values at line 2, column 0\n",
+                "jq: parse error: Expected separator between values at line 1, column 6\n",
             ),
             (
                 "",
-                "jq: parse error: Expected separator between values at line 2, column 0\n",
+                "jq: parse error: Expected separator between values at line 1, column 6\n",
             ),
             (
                 "[[0,0],1]\n[[0,0]]\n",
-                "jq: parse error: Expected separator between values at line 2, column 0\n",
+                "jq: parse error: Expected separator between values at line 1, column 6\n",
             ),
         ],
     ),
 ];
 
 #[test]
-fn a_nul_tail_ends_its_token_where_jq_ends_it_7749() -> Result<()> {
+fn a_nul_ends_its_token_and_is_the_fault_7966() -> Result<()> {
     let routes: [&[&str]; 3] = [&["-c", "."], &["-c", "-s", "."], &["-c", "--stream", "."]];
     for (input, answers) in ROWS {
         for (args, (stdout, stderr)) in routes.iter().zip(answers) {
-            // #7762: `-s` over standard input words a missing separator in a container as
-            // `Invalid JSON text`, NUL or not; the file route below reads those rows.
-            let slurp_gap = args.contains(&"-s") && stderr.contains("Expected separator");
+            // `-s` over standard input words a fault inside a container in the splitter's words
+            // (`Invalid JSON text: expected ',' or ']', found ...`), a NUL or any other byte (#7762
+            // covered the missing separator; `[1 }]` still reads so); the file route below reads
+            // those rows.
+            let slurp_gap = args.contains(&"-s") && input.starts_with(['[', '{']);
             let (out, err, code) = run_jq_full(args, Some(input))?;
             if !slurp_gap {
                 assert_eq!(
@@ -263,36 +304,56 @@ fn a_nul_tail_ends_its_token_where_jq_ends_it_7749() -> Result<()> {
 }
 
 /// A number token that starts in one file and has its NUL in the next (jq reads the files as one
-/// stream): `(first file, second file, -c . stdout, stderr, exit)`.
+/// stream): `(first file, second file, -c . stdout, stderr, exit)`. Both releases read `[12]`,
+/// `[123]` and `[1,2,3]` for the second, fourth and sixth rows; the NUL is the fault there now, at
+/// its column in the stream, the first file's bytes counted.
 const ACROSS_FILES: &[(&str, &str, &str, &str, i32)] = &[
     (
         "[[1]1",
         "\0]\n",
         "",
-        "jq: parse error: Expected separator between values at line 1, column 7\n",
+        "jq: parse error: Expected separator between values at line 1, column 6\n",
         5,
     ),
-    ("[1", "2\0x]\n", "[12]\n", "", 0),
+    (
+        "[1",
+        "2\0x]\n",
+        "",
+        "jq: parse error: Invalid character at line 1, column 4\n",
+        5,
+    ),
     (
         "1",
         "\0}\n",
         "",
-        "jq: parse error: Unmatched '}' at line 1, column 3\n",
+        "jq: parse error: Invalid character at line 1, column 2\n",
         5,
     ),
-    ("[123", "\0]\n", "[123]\n", "", 0),
+    (
+        "[123",
+        "\0]\n",
+        "",
+        "jq: parse error: Invalid character at line 1, column 5\n",
+        5,
+    ),
     (
         "{\"a\":[true,null]1",
         "2\0}\n",
         "",
-        "jq: parse error: Expected separator between values at line 1, column 20\n",
+        "jq: parse error: Expected separator between values at line 1, column 19\n",
         5,
     ),
-    ("[1,2", "\0x,3]\n", "[1,2,3]\n", "", 0),
+    (
+        "[1,2",
+        "\0x,3]\n",
+        "",
+        "jq: parse error: Invalid character at line 1, column 5\n",
+        5,
+    ),
 ];
 
 #[test]
-fn a_number_from_an_earlier_file_is_rewritten_over_both_files_7749() -> Result<()> {
+fn a_nul_after_a_number_from_an_earlier_file_is_the_fault_7966() -> Result<()> {
     for (first, second, stdout, stderr, exit) in ACROSS_FILES {
         for args in [&["-c", "."][..], &["-n", "-c", "inputs"]] {
             let (out, err, code, paths) =
