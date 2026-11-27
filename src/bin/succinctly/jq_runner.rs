@@ -33,6 +33,7 @@ use succinctly::json::JsonIndex;
 
 use super::m2_gate::can_use_m2_streaming;
 use super::{JqCommand, OnError};
+use crate::cli::jq_reader_profile::JQ_READER;
 use crate::cli::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
     DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, StreamFault, Terminator,
@@ -10486,7 +10487,7 @@ pub struct InputLocations {
 /// read that hit the end of input is the one that completed the stream's last
 /// value; then it says `<unknown>`. jq reads each file with `fgets` into a
 /// 4096-byte buffer, so a read ends after a newline or after
-/// [`JQ_READ_CHUNK`] bytes, and the read that reaches the end is the one left
+/// [`JQ_READER.read_len`](JQ_READER) bytes, and the read that reaches the end is the one left
 /// short of both (or an empty one). A string or container completes on its
 /// closing byte; a number or `true`/`false`/`null` on the byte after it, or at
 /// the end of input. Under `-R` every line is a value, completed by its
@@ -10507,10 +10508,6 @@ struct EofTail {
     /// Whether the read that reached the end of input completed a value.
     unknown: bool,
 }
-
-/// The most `fgets` puts in jq's 4096-byte input buffer per read: a line
-/// longer than this is read in pieces of this size (#4303).
-const JQ_READ_CHUNK: usize = 4095;
 
 #[cfg(test)]
 std::thread_local! {
@@ -10630,14 +10627,15 @@ impl EofTail {
     }
 
     /// Where the read that reaches the end of `last` starts. Reads restart after each newline
-    /// and take at most [`JQ_READ_CHUNK`] bytes, so a last line that fills its reads exactly
-    /// leaves an empty final read. The first `base` bytes are not this source's (#4316).
+    /// and take at most [`JQ_READER.read_len`](JQ_READER) bytes, so a last line that fills its
+    /// reads exactly leaves an empty final read. The first `base` bytes are not this source's
+    /// (#4316).
     fn final_read_start(last: &[u8], base: usize) -> usize {
         let line_start = last[base..]
             .iter()
             .rposition(|&b| b == b'\n')
             .map_or(base, |at| base + at + 1);
-        let partial = (last.len() - line_start) % JQ_READ_CHUNK;
+        let partial = (last.len() - line_start) % JQ_READER.read_len;
         last.len() - partial
     }
 
@@ -11588,8 +11586,7 @@ fn closer_lags_in_joined_text(raws: &[Vec<u8>]) -> bool {
 /// file that returns nothing follows it (#6760). One definition for [`closing_event_lags`] and the
 /// joined-text test of [`held_back_closer_before`] (#6732), which must agree on it.
 fn last_read_fills_buffer(raw: &[u8]) -> bool {
-    crate::cli::jq_seq_reader::fgets_chunk_lens(raw).last()
-        == Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK)
+    crate::cli::jq_seq_reader::fgets_chunk_lens(raw).last() == Some(JQ_READER.read_len)
 }
 
 /// Whether the last record of the `--seq` text `raw` leaves jq's stream parser holding its closing
@@ -14305,9 +14302,10 @@ impl<'a> LineCounter<'a> {
         end.max(at + 1)
     }
 
-    /// The end of the [`JQ_READ_CHUNK`]-byte read holding `at`, in the bytes jq read.
+    /// The end of the [`JQ_READER.read_len`](JQ_READER)-byte read holding `at`, in the bytes jq
+    /// read.
     fn raw_chunk_end(&self, at: usize) -> usize {
-        self.raw_line_start() + (self.read_of(at) + 1) * JQ_READ_CHUNK - self.lead
+        self.raw_line_start() + (self.read_of(at) + 1) * JQ_READER.read_len - self.lead
     }
 
     /// Where the line holding the counter's position starts in the bytes jq read. On the text's first
@@ -14369,7 +14367,7 @@ impl<'a> LineCounter<'a> {
     /// completes it.
     ///
     /// jq reads its input with `fgets` into a 4096-byte buffer, so a read runs
-    /// through the next newline or [`JQ_READ_CHUNK`] bytes, counted from the
+    /// through the next newline or [`JQ_READER.read_len`](JQ_READER) bytes, counted from the
     /// start of the line. A string or container completes on its closing
     /// byte; a number or literal on the byte after it, or at the end. So
     /// `1 2\n` puts both values on line 1, where the newline-after-`end` rule
@@ -14394,9 +14392,9 @@ impl<'a> LineCounter<'a> {
     /// The read holding `at`, a byte inside the bytes moved onto this file from the previous
     /// ones (#4376), which only a value or fault after a resumed fault can be in: the line jq has
     /// counted through the end of that read, and where it ends. Those bytes are the earlier
-    /// files', so the read ends at the next newline, [`JQ_READ_CHUNK`] bytes from the start of
-    /// its line, or the end of the file `at` is in, which is the seam when it is the last (#5936);
-    /// jq has counted that file's lines. `None` outside the moved bytes.
+    /// files', so the read ends at the next newline, [`JQ_READER.read_len`](JQ_READER) bytes from
+    /// the start of its line, or the end of the file `at` is in, which is the seam when it is the
+    /// last (#5936); jq has counted that file's lines. `None` outside the moved bytes.
     fn moved_read(&self, at: usize) -> Option<(usize, usize)> {
         let base = self.seam.base.min(self.bytes.len());
         if at >= base {
@@ -14404,20 +14402,21 @@ impl<'a> LineCounter<'a> {
         }
         let (start, part) = self.seam.part_at(at);
         let end = part.end.min(base);
-        // A read is [`JQ_READ_CHUNK`] bytes at most, counted from the start of the line, as
-        // [`read_end`](Self::read_end) counts it for this file's own bytes (#7573): a fault in the
-        // first 4095 bytes of a long first line is met before that line's break is read.
+        // A read is [`JQ_READER.read_len`](JQ_READER) bytes at most, counted from the start of the
+        // line, as [`read_end`](Self::read_end) counts it for this file's own bytes (#7573): a
+        // fault in the first 4095 bytes of a long first line is met before that line's break is
+        // read.
         let line_start = self.bytes[start..at]
             .iter()
             .rposition(|&b| b == b'\n')
             .map_or(start, |newline| start + newline + 1);
         let chunk_end = if self.edits.is_empty() {
-            line_start + ((at - line_start) / JQ_READ_CHUNK + 1) * JQ_READ_CHUNK
+            line_start + ((at - line_start) / JQ_READER.read_len + 1) * JQ_READER.read_len
         } else {
             // #7934: in the bytes jq read, where the moved bytes hold a replacement.
             let raw_line = self.read_offset(line_start);
-            let reads = (self.read_offset(at) - raw_line) / JQ_READ_CHUNK + 1;
-            self.text_read_end(raw_line + reads * JQ_READ_CHUNK, at)
+            let reads = (self.read_offset(at) - raw_line) / JQ_READER.read_len + 1;
+            self.text_read_end(raw_line + reads * JQ_READER.read_len, at)
         };
         let read_end = match self.bytes[at..end].iter().position(|&b| b == b'\n') {
             Some(newline) if at + newline < chunk_end => at + newline + 1,
@@ -14437,13 +14436,13 @@ impl<'a> LineCounter<'a> {
 
     /// Where the read holding `at` ends, given that the last call was
     /// [`line_at_read_of`](Self::line_at_read_of) of `at`: one past the next
-    /// newline, or the end of its [`JQ_READ_CHUNK`] bytes, whichever is first
+    /// newline, or the end of its [`JQ_READER.read_len`](JQ_READER) bytes, whichever is first
     /// (#4311). Uses the line start and next newline that call left behind, so
     /// it costs nothing more.
     fn read_end(&self, at: usize) -> usize {
         let at = at.max(self.line_start);
         let chunk_end = if self.edits.is_empty() {
-            self.line_start + (self.read_of(at) + 1) * JQ_READ_CHUNK - self.lead
+            self.line_start + (self.read_of(at) + 1) * JQ_READER.read_len - self.lead
         } else {
             self.text_read_end(self.raw_chunk_end(at), at)
         };
@@ -14487,7 +14486,7 @@ impl<'a> LineCounter<'a> {
     /// Which of the reads of the line holding `at` (from `line_start`) holds it, counted from 0: the
     /// first read of the text's first line holds the [`lead`](Self::lead) bytes too (#7569).
     fn read_of(&self, at: usize) -> usize {
-        (self.read_offset(at) - self.raw_line_start() + self.lead) / JQ_READ_CHUNK
+        (self.read_offset(at) - self.raw_line_start() + self.lead) / JQ_READER.read_len
     }
 
     /// Same result [`line_at`] would return for this `end`, given every
@@ -14736,7 +14735,7 @@ fn parse_error_line_after(
 /// (#4311): the byte it detects it at ([`parse_error_detection`]), its line,
 /// and where jq resumes reading -- the start of the read after the one holding
 /// that byte, which runs through the next newline or to the end of its
-/// [`JQ_READ_CHUNK`] bytes; the end of input when the fault is there. jq
+/// [`JQ_READER.read_len`](JQ_READER) bytes; the end of input when the fault is there. jq
 /// discards what is left of that read, so `1 } 2\n3\n` reads `1`, the error,
 /// then `3`.
 ///
@@ -14841,8 +14840,8 @@ fn bare_token_before_final_opener(bytes: &[u8], span: (usize, usize), malformed:
 }
 
 /// Whether jq's read that reaches the end of a source holds the source's last byte, which it
-/// does unless the last line fills its [`JQ_READ_CHUNK`]-byte reads exactly and leaves an empty
-/// final read ([`EofTail::final_read_start`]). Then the token
+/// does unless the last line fills its [`JQ_READER.read_len`](JQ_READER)-byte reads exactly and
+/// leaves an empty final read ([`EofTail::final_read_start`]). Then the token
 /// [`bare_token_before_final_opener`] finds was completed by a read before the one that reached
 /// the end, and the fault keeps the file's name: 4,093 spaces then `2[` (4,095 bytes, one full
 /// read) is named `<stdin>:0`, where 4,092 or 4,094 spaces are named `<unknown>` (#7810). jq's
@@ -17890,6 +17889,10 @@ fn lazy_raw_producer_windowed(
 /// end-of-buffer fixup (#1717) is relative to each line's end. Splitting on `\n` first is safe amid
 /// invalid UTF-8, as 0x0A is never part of a multi-byte sequence, and joining restores the layout.
 fn substitute_raw_lines(bytes: Vec<u8>) -> String {
+    // #5476: a line is decoded whole, never a 4,095-byte read at a time, so a character that
+    // straddles the end of a read is kept, as jq 1.8.2 keeps it. There is no code for jq 1.7.1's
+    // reading, so the profile may not ask for it.
+    const _: () = assert!(JQ_READER.raw_keeps_straddling_character);
     bytes
         .split(|&b| b == b'\n')
         .map(succinctly::text::utf8::substitute_invalid_utf8_jq_style)
@@ -18637,7 +18640,7 @@ impl WalkedSeqInputs {
         let (newlines, line_start) = self.walk.last_source_lines();
         // [`EofTail::final_read_start`] of the last source, from where its last line starts.
         let total = self.walk.total();
-        let final_read_start = total - (total - line_start) % JQ_READ_CHUNK;
+        let final_read_start = total - (total - line_start) % JQ_READER.read_len;
         let unknown = self
             .walk
             .last_value()
@@ -31095,8 +31098,8 @@ mod tests {
         let value = b"1 ";
         let far = Seam {
             base: 0,
-            moved_len: JQ_READ_CHUNK + 4,
-            moved_newline: Some(JQ_READ_CHUNK + 2),
+            moved_len: JQ_READER.read_len + 4,
+            moved_newline: Some(JQ_READER.read_len + 2),
             ..Seam::NONE
         };
         assert_eq!(LineCounter::at_seam(value, far).read_end_line(1), 0);

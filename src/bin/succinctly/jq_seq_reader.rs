@@ -73,13 +73,13 @@
 //! [`SeqStreamWalk::slurp_position_lost`] for the full derivation.
 
 use crate::cli::front_matter::UTF8_BOM;
+use crate::cli::jq_reader_profile::JQ_READER;
+
+// #7718: the reader reads every record, as jq 1.8.2 does (the module's comment above). There is no
+// code for jq 1.7.1's end at an empty record, so the profile may not ask for it.
+const _: () = assert!(JQ_READER.seq_reads_every_record);
 
 const ASCII_RS: u8 = 0x1e;
-
-/// The most bytes one of jq's `fgets` refills can hold: `jq_util_input_read_more`
-/// (`src/util.c`) calls `fgets(state->buf, sizeof(state->buf), f)` on a
-/// `char buf[4096]`, and `fgets` reserves one byte for the terminating NUL.
-pub(crate) const JQ_FGETS_CHUNK: usize = 4095;
 
 /// jq 1.7.1's `main` line for a `--seq` parse error it skips
 /// (`fprintf(stderr, "jq: ignoring parse error: %s\n", ...)`), for the
@@ -90,7 +90,7 @@ pub(crate) fn ignored_parse_error(body: &str) -> String {
 }
 
 /// jq's `fgets` chunks over one source, as their lengths in order: each
-/// ends just after a newline or after [`JQ_FGETS_CHUNK`] bytes, whichever
+/// ends just after a newline or after [`JQ_READER.read_len`](JQ_READER) bytes, whichever
 /// comes first. The one definition of that rule, shared by
 /// [`final_buffer_start`] and [`refill_boundaries`] (#3200).
 pub(crate) fn fgets_chunk_lens(raw: &[u8]) -> impl Iterator<Item = usize> + '_ {
@@ -105,7 +105,7 @@ pub(crate) fn fgets_chunk_lens(raw: &[u8]) -> impl Iterator<Item = usize> + '_ {
 /// The length of the `fgets` chunk that starts at `pos` in `raw`, or `None` at its end: one step
 /// of [`fgets_chunk_lens`], for a reader that finds the chunks as it goes (#5498).
 pub(crate) fn fgets_chunk_len_at(raw: &[u8], pos: usize) -> Option<usize> {
-    fgets_chunk_len_in(raw, pos, JQ_FGETS_CHUNK)
+    fgets_chunk_len_in(raw, pos, JQ_READER.read_len)
 }
 
 /// [`fgets_chunk_len_at`] for a chunk with room for `room` bytes of `raw`: the first chunk of a
@@ -128,7 +128,7 @@ pub(crate) fn c_string(bytes: &[u8]) -> &[u8] {
 /// The absolute offsets, ascending, at which jq starts a `jv_parser_next`
 /// that the reader's own byte loop does not already reset at: each source
 /// after the first, since jq refills one file at a time (#3002), and, with
-/// `size_limit`, each refill after a full [`JQ_FGETS_CHUNK`]-byte chunk that
+/// `size_limit`, each refill after a full [`JQ_READER.read_len`](JQ_READER)-byte chunk that
 /// did not end on a newline (#3200). A chunk ending on a newline needs no
 /// entry, since the reader resets as it scans the newline. A chunk ending at
 /// its source's own end needs none either: the next source's start is
@@ -146,7 +146,8 @@ fn refill_boundaries(raw_bytes: &[(Option<usize>, Vec<u8>)], size_limit: bool) -
             let mut chunk_end = 0usize;
             for len in fgets_chunk_lens(raw) {
                 chunk_end += len;
-                if len == JQ_FGETS_CHUNK && raw[chunk_end - 1] != b'\n' && chunk_end < raw.len() {
+                if len == JQ_READER.read_len && raw[chunk_end - 1] != b'\n' && chunk_end < raw.len()
+                {
                     boundaries.push(source_start + chunk_end);
                 }
             }
@@ -221,8 +222,8 @@ fn value_locations(
 /// into the whole concatenated raw stream (all sources, in order).
 ///
 /// `read_more` (`jq_util_input_read_more`, `src/util.c`) calls `fgets` on a
-/// [`JQ_FGETS_CHUNK`]+1-byte buffer, so a chunk ends at a newline or after
-/// [`JQ_FGETS_CHUNK`] bytes, whichever comes first -- and `feof` is set
+/// [`JQ_READER.read_len`](JQ_READER)+1-byte buffer, so a chunk ends at a newline or after
+/// [`JQ_READER.read_len`](JQ_READER) bytes, whichever comes first -- and `feof` is set
 /// only by an `fgets` that actually ran out of input, so a chunk ending on
 /// a newline or filling the buffer exactly is followed by one more
 /// (possibly empty) buffer. jq refills one *file* at a time, so chunking
@@ -267,7 +268,7 @@ fn final_buffer_start_after(final_chunk: Option<(usize, usize, bool)>, total: us
         // *empty* buffer follows and that one is final; otherwise this
         // chunk is.
         Some((start, len, newline)) => {
-            if len == JQ_FGETS_CHUNK || newline {
+            if len == JQ_READER.read_len || newline {
                 total
             } else {
                 start
@@ -376,10 +377,11 @@ const SEARCH_BLOCK: usize = 64;
 /// block, which keeps a stream of short lines (one `fgets` chunk each) as cheap as it was.
 const SEARCH_HEAD: usize = 16;
 
-/// The window [`SeqStreamWalker`] probes for a newline (#7775): a run of [`JQ_FGETS_CHUNK`] bytes
-/// with no newline holds a whole window of this size wherever it starts, so a stretch whose every
-/// window holds a newline has none, and its `fgets` chunks are its lines.
-const LINE_PROBE: usize = JQ_FGETS_CHUNK.div_ceil(2);
+/// The window [`SeqStreamWalker`] probes for a newline (#7775): a run of
+/// [`JQ_READER.read_len`](JQ_READER) bytes with no newline holds a whole window of this size
+/// wherever it starts, so a stretch whose every window holds a newline has none, and its `fgets`
+/// chunks are its lines.
+const LINE_PROBE: usize = JQ_READER.read_len.div_ceil(2);
 
 /// The offset of the first `needle` in `hay` (#7263): the first [`SEARCH_HEAD`] bytes one at a
 /// time, then a [`SEARCH_BLOCK`] at a time, where only the block that holds it is searched a byte
@@ -410,11 +412,12 @@ pub(crate) fn find_byte(needle: u8, hay: &[u8]) -> Option<usize> {
 /// no RS need not be held to be answered.
 ///
 /// The bytes are fed a source at a time, each in pieces that start where one of jq's `fgets` reads
-/// starts ([`JQ_FGETS_CHUNK`]); [`NoRsScan::feed`] says how far it read, which is always such a
-/// start, so the caller keeps the rest in front of the next piece. Every byte of a read is counted,
-/// the bytes after a NUL in a read with no newline included (#7966); a BOM, whole or a prefix of
-/// one, is consumed at the stream's front and not counted ([`bom_prefix`]). The one definition of the position: [`super::jq_runner`]'s whole-stream answer
-/// feeds every source whole, and the windowed `--seq` route feeds a file it does not hold.
+/// starts ([`JQ_READER.read_len`](JQ_READER)); [`NoRsScan::feed`] says how far it read, which is
+/// always such a start, so the caller keeps the rest in front of the next piece. Every byte of a
+/// read is counted, the bytes after a NUL in a read with no newline included (#7966); a BOM, whole
+/// or a prefix of one, is consumed at the stream's front and not counted ([`bom_prefix`]). The one
+/// definition of the position: [`super::jq_runner`]'s whole-stream answer feeds every source whole,
+/// and the windowed `--seq` route feeds a file it does not hold.
 pub(crate) struct NoRsScan {
     line: usize,
     column: usize,
@@ -444,10 +447,10 @@ impl NoRsScan {
         let upto = if end {
             bytes.len()
         } else {
-            // Reads start after a newline and then every JQ_FGETS_CHUNK bytes along a line; `bytes`
-            // starts at one, so the line in it after its last newline starts at one too.
+            // Reads start after a newline and then every JQ_READER.read_len bytes along a line;
+            // `bytes` starts at one, so the line in it after its last newline starts at one too.
             let line_start = rfind_byte(b'\n', bytes).map_or(0, |at| at + 1);
-            line_start + (bytes.len() - line_start) / JQ_FGETS_CHUNK * JQ_FGETS_CHUNK
+            line_start + (bytes.len() - line_start) / JQ_READER.read_len * JQ_READER.read_len
         };
         self.visible(&bytes[..upto])?;
         Some(upto)
@@ -1193,10 +1196,11 @@ fn walk_stream_placing(
 /// The bytes are read a source at a time ([`SeqStreamWalker::start_source`],
 /// [`SeqStreamWalker::read_from`], [`SeqStreamWalker::end_source`], then [`SeqStreamWalker::end`]), and
 /// [`SeqStreamWalker::advance`] walks every byte of the `fgets` chunks that are whole by then: a chunk
-/// ends at a newline or after [`JQ_FGETS_CHUNK`] bytes, or at its source's end. Each value, each fault and each place is the
-/// one the whole walk gives, in the same order, so a run that reads to the end reads what it did: a
-/// test holds the two to each other. Not for `-s`, a stream with a file that did not open, or a
-/// resumed stream (`seed_*`): their walks need the whole stream first.
+/// ends at a newline or after [`JQ_READER.read_len`](JQ_READER) bytes, or at its source's end. Each
+/// value, each fault and each place is the one the whole walk gives, in the same order, so a run
+/// that reads to the end reads what it did: a test holds the two to each other. Not for `-s`, a
+/// stream with a file that did not open, or a resumed stream (`seed_*`): their walks need the whole
+/// stream first.
 ///
 /// The walk holds what jq's reader holds and no more: the values are taken out as they are handed
 /// on ([`SeqStreamWalker::pop_value`], [`SeqStreamWalker::pop_fault`]), and the bytes before the first
@@ -1557,9 +1561,10 @@ impl SeqStreamWalker {
     }
 
     /// Takes the chunks from `chunk_at` to `end` (just past a newline) at once, when every
-    /// [`LINE_PROBE`] bytes there hold a newline: no run of [`JQ_FGETS_CHUNK`] bytes is then free of
-    /// one, so every chunk ends at a newline, and a chunk that ends at a newline is not a full chunk. Otherwise takes the lines before the first window that holds none, and says
-    /// so with `false`.
+    /// [`LINE_PROBE`] bytes there hold a newline: no run of [`JQ_READER.read_len`](JQ_READER) bytes
+    /// is then free of one, so every chunk ends at a newline, and a chunk that ends at a newline is
+    /// not a full chunk. Otherwise takes the lines before the first window that holds none, and
+    /// says so with `false`.
     fn take_lines(&mut self, end: usize) -> bool {
         let from = self.chunk_at;
         let span = &self.data[from - self.base..end - self.base];
@@ -1588,15 +1593,15 @@ impl SeqStreamWalker {
         if rest.is_empty() {
             return false;
         }
-        let room = &rest[..rest.len().min(JQ_FGETS_CHUNK)];
+        let room = &rest[..rest.len().min(JQ_READER.read_len)];
         let len = match find_byte(b'\n', room) {
             Some(at) => at + 1,
-            None if room.len() == JQ_FGETS_CHUNK || self.source_ended => room.len(),
+            None if room.len() == JQ_READER.read_len || self.source_ended => room.len(),
             None => return false,
         };
         let chunk_start = self.chunk_at;
         let newline = room[len - 1] == b'\n';
-        let full = len == JQ_FGETS_CHUNK && !newline;
+        let full = len == JQ_READER.read_len && !newline;
         let after_full = std::mem::replace(&mut self.after_full_chunk, full);
         if let Some(reader) = self.reader.as_mut() {
             if after_full && reader.resets_per_call {
@@ -2678,7 +2683,7 @@ impl<'a> Reader<'a> {
     fn token_structure(&mut self, ch: u8) -> Result<(), &'static str> {
         match ch {
             b'[' | b'{' => {
-                if self.stack.len() >= succinctly::jq::JQ_MAX_PARSING_DEPTH {
+                if self.stack.len() >= JQ_READER.max_depth {
                     return Err("Exceeds depth limit for parsing");
                 }
                 if self.next.is_some() {
@@ -4630,23 +4635,23 @@ mod tests {
     }
 
     /// #7263: `fgets_chunk_len_at` keeps the byte-at-a-time rule it replaced: a chunk ends just
-    /// after a newline or after `JQ_FGETS_CHUNK` bytes.
+    /// after a newline or after `JQ_READER.read_len` bytes.
     #[test]
     fn fgets_chunk_len_at_keeps_the_bytewise_rule_7263() {
         let bytewise = |raw: &[u8], pos: usize| {
             let rest = raw.get(pos..).filter(|rest| !rest.is_empty())?;
             Some(
                 rest.iter()
-                    .take(JQ_FGETS_CHUNK)
+                    .take(JQ_READER.read_len)
                     .position(|&byte| byte == b'\n')
-                    .map_or_else(|| rest.len().min(JQ_FGETS_CHUNK), |index| index + 1),
+                    .map_or_else(|| rest.len().min(JQ_READER.read_len), |index| index + 1),
             )
         };
         let mut rng = Lcg(4095);
         for round in 0..300 {
             // Long runs without a newline, so that chunks fill to the limit as well as end early.
             let alphabet: &[u8] = if round % 2 == 0 { b"xxxxxxxx\n" } else { b"x" };
-            let len = rng.below(3 * JQ_FGETS_CHUNK);
+            let len = rng.below(3 * JQ_READER.read_len);
             let raw = rng.bytes(alphabet, len);
             let mut pos = 0;
             loop {
@@ -4703,9 +4708,9 @@ mod tests {
         for prefix in prefixes {
             for round in 0..300 {
                 let mut stream = prefix.to_vec();
-                // Long lines past a read of JQ_FGETS_CHUNK bytes, and an RS or NUL now and then.
+                // Lines longer than one read (JQ_READER.read_len), and an RS or NUL now and then.
                 let len = rng.below(if round % 3 == 0 {
-                    3 * JQ_FGETS_CHUNK
+                    3 * JQ_READER.read_len
                 } else {
                     40
                 });
@@ -4726,7 +4731,7 @@ mod tests {
                 }
                 if round % 7 == 0 {
                     // A long line with a NUL in its second read and an RS after it, unseen.
-                    stream.extend(std::iter::repeat_n(b'a', JQ_FGETS_CHUNK + 7));
+                    stream.extend(std::iter::repeat_n(b'a', JQ_READER.read_len + 7));
                     stream.extend(b"\0x\x1ey");
                 }
                 let mut sources = Vec::new();
@@ -4757,7 +4762,7 @@ mod tests {
                             return Some(());
                         }
                         // What is left is less than one of jq's reads, which never holds a newline.
-                        assert!(held.len() - read < JQ_FGETS_CHUNK);
+                        assert!(held.len() - read < JQ_READER.read_len);
                         assert!(!held[read..].contains(&b'\n'));
                         held.drain(..read);
                     }
@@ -4886,9 +4891,9 @@ mod tests {
     /// first RS, answers as the byte-at-a-time walk does.
     #[test]
     fn a_long_discarded_run_answers_as_bytewise_7263() {
-        let mut stream = vec![b'x'; 3 * JQ_FGETS_CHUNK + 7];
+        let mut stream = vec![b'x'; 3 * JQ_READER.read_len + 7];
         stream[100] = b'\n';
-        stream[JQ_FGETS_CHUNK + 3] = b'\n';
+        stream[JQ_READER.read_len + 3] = b'\n';
         // No newline after the run, so the column of the fault at the end counts every byte of it.
         stream.extend_from_slice(b"\x1e{\"a\":1} \x1e[1,");
         let halves = vec![
