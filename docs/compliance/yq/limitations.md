@@ -1426,7 +1426,7 @@ On every route a yq `ireduce` folds a list of accumulators, as yq's does ([#6802
 `. as $i ireduce (0; (. + $i, . * 10))` over `[1, 2]` is `3 2 10 0`, and `ireduce (0; select(false))` prints nothing.
 Several INIT outputs come from a parenthesised union (`ireduce ((0, 100); . + $i)`).
 An unparenthesised comma at the top of INIT is not one: yq's `,` and `;` share a precedence and associate to the right, so `ireduce (0, 100; . + $i)` is `0, (100; . + $i)`, and both tools fail with `reduce must be given a block, got UNION instead` where the fold runs in a pipe, even over an empty source or a `select(false)` context ([#7617](https://github.com/rust-works/succinctly/issues/7617)).
-Under `|=` and `with_entries` a right side whose context empties before the fold does not run it here, where yq still raises: `.[] |= (select(. == 5) | . as $x ireduce (0, 1; .))` over `[1, 2]` is `[1,2]` here ([#8002](https://github.com/rust-works/succinctly/issues/8002)).
+So do the right side of `|=` and the body of `with_entries` whose context empties before the fold: `.[] |= (select(. == 5) | . as $x ireduce (0, 1; .))` over `[1, 2]` raises it in both ([#8002](https://github.com/rust-works/succinctly/issues/8002)).
 A second `;` makes UPDATE a block, for the same reason: `ireduce (0; U; V)` is `0; (U; V)`, and a block evaluated as a value yields nothing and evaluates neither side, so in both tools the fold prints nothing (INIT over an empty source) and an `error` in `U` or `V` never fires ([#8001](https://github.com/rust-works/succinctly/issues/8001)).
 An undefined function in a part that is never evaluated still fails the run in both, at yq's lexer and at the resolver here (`ireduce (0; . + $x; nope)`).
 A union in front of the block keeps the operands before the one the `;` follows: `ireduce (0; A, B; V)` is `0; (A, (B; V))`, whose UPDATE is `A` (`.[] as $x ireduce (0; . + $x, . + 1; 9)` over `[1, 2]` is `3`).
@@ -4079,7 +4079,12 @@ It is answered where the pipe is evaluated: the sink route counts what the pipe 
 A pipe with outputs pays a counter and nothing else, and the lazy and cursor routes keep their results.
 Pinned by `tests/yq_cli/i6943.rs`, whose rows were captured from yq v4.53.3.
 
-Not matched: the right side of a write (`.x = (.a[] | 1)` is `x: 1` in yq and `x: null` here), the body of `map_values` and of `|=` (`.d[] |= (select(false) | 1)`), and a source that is a computed list (`.d | to_entries | map(select(false) | 1)` is `[1]` in yq and `[]` here).
+Since [#8002](https://github.com/rust-works/succinctly/issues/8002) the rule also holds where a write or a builtin evaluates the body itself.
+The right side of `|=` (and of `with(...)` and `map_values`, which is `.[] |= f`) is a pipe over its one target, so `.d[] |= (select(false) | 1)` writes `1` to every member, and an `error` after the empty stage raises.
+The body of `with_entries` is one over each entry (`with_entries(select(false) | {"key": "z", "value": 9})` over two entries is two `z` entries in both).
+A collect over a computed value is one over its source (`.d | to_entries | map(select(false) | 1)` is `[1]`), and the right side of a plain write re-emits after an empty fan-out (`.x = (.a[] | 1)` is `x: 1`).
+Not matched on an update's right side: a union branch (`.a |= ((select(false) | 7), 8)` is `a: 7` in yq and `a: 8` here) and a stage behind a binding (`.a[] |= (. as $x | select(false) | 3)` writes `3` in yq and leaves the members here).
+A `map(f)` whose body reads path context, in a pipe too: `.b | map(select(key == 5) | 3)` over `b: [1, 2]` is `[3]` in yq and `[]` here.
 A collection `[...]` after a stage whose input list is empty is `[]` in yq and is answered here only when the whole pipe was empty.
 A pipe nested in an object or a call (`{"k": (select(false) | [1])}`) is asked once per node, as before.
 A literal bound to a variable (`.a[] | 1 as $x | $x` is `1` in yq and nothing here) is not a re-emitting stage.

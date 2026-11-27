@@ -7,9 +7,9 @@
 //! `succinctly jq` never does: jq's pipe loops zero times.
 //!
 //! Every row was captured from yq v4.53.3 (`-o=json -I0`) over `a: []` / `b: {}` / `c: 1` /
-//! `d: [{x: 1}]` and kept only when both tools agree. Left out because they still differ: the
-//! wording of `.a.b | 1` (an error in both), a re-emission in a write's right side
-//! (`.x = (.a[] | 1)`), in `map_values` and in `|=` bodies, and after `to_entries`.
+//! `d: [{x: 1}]` and kept only when both tools agree. Left out because it still differs: the
+//! wording of `.a.b | 1` (an error in both). The rule on a write's right side, in `map_values`,
+//! `with_entries` and `|=` bodies, and after `to_entries` is #8002's (`i8002.rs`).
 
 use anyhow::Result;
 

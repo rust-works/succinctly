@@ -155,6 +155,14 @@ fn the_rule_holds_over_json_input_and_a_computed_value_8002() -> Result<()> {
         // Unchanged: the plain pipe already agreed, and a stage that reads its input is empty.
         ("[1,2]", "[select(false) | 3]", "[3]\n"),
         ("[1,2]", ".[0] = (select(false) | 3)", "[3,2]\n"),
+        // A plain write's right side whose fan-out was empty (`.a[]` over `[]`) re-emits too.
+        ("{\"a\":[]}", ".x = (.a[] | 1)", "{\"a\":[],\"x\":1}\n"),
+        (
+            "{\"a\":[1]}",
+            ".x = (.a[] | select(false) | 1)",
+            "{\"a\":[1],\"x\":1}\n",
+        ),
+        ("{\"a\":[]}", ".x += (.a[] | 1)", "{\"a\":[],\"x\":1}\n"),
         ("[1,2]", ".[0] |= (select(false) | .)", "[1,2]\n"),
     ] {
         let (stdout, code) = run_yq_stdin(filter, input, &["-p=json", "-o=json", "-I0"])?;
@@ -200,6 +208,16 @@ fn an_error_after_an_empty_stage_raises_in_an_update_8002() -> Result<()> {
         ),
         ("{\"a\":1}", "map_values(select(false) | error(\"x\"))", "x"),
         ("{\"a\":[1]}", ".a | map(select(false) | error(\"x\"))", "x"),
+        (
+            "{\"a\":{\"p\":1}}",
+            ".a | with_entries(select(false) | . as $x ireduce (0, 1; .))",
+            "reduce must be given a block, got UNION instead",
+        ),
+        (
+            "[1,2]",
+            ".[] |= (select(. == 5) | . as $x ireduce (0, 1; .))",
+            "reduce must be given a block, got UNION instead",
+        ),
     ] {
         let (stdout, stderr, code) =
             run_yq_stdin_with_stderr(filter, input, &["-p=json", "-o=json", "-I0"])?;
