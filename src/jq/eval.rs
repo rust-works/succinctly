@@ -5393,10 +5393,25 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
         // side is never reached), and `null // .b` is `null` -- a falsy left
         // output stays itself when the right side yields nothing -- which is
         // what the `empty` stands in for.
-        Expr::Alternative(left, right) => Some(Expr::Alternative(
-            Box::new(yq_empty_context_reemit(left)?),
-            Box::new(yq_empty_context_reemit(right).unwrap_or(Expr::Builtin(Builtin::Empty))),
-        )),
+        // #8035: and the left side has to answer something. yq picks the right side only for a
+        // left output that is falsy, so a left side that empties on its own leaves nothing:
+        // `.a[] | ((1 | select(false)) // 5)` over `a: []` is nothing, where `null // 5` is `5`.
+        // A left rewrite that may answer nothing is asked first, as the condition of an `if` whose
+        // two branches are the operator: no answer is no branch. Not as a pipe stage before the
+        // operator, which the pipe's own rule would re-emit after that stage emptied, forever.
+        Expr::Alternative(left, right) => {
+            let left = yq_empty_context_reemit(left)?;
+            let right = yq_empty_context_reemit(right).unwrap_or(Expr::Builtin(Builtin::Empty));
+            if reemit_always_answers(&left) {
+                return Some(Expr::Alternative(Box::new(left), Box::new(right)));
+            }
+            let operator = Expr::Alternative(Box::new(left.clone()), Box::new(right));
+            Some(Expr::If {
+                cond: Box::new(Expr::FirstExpr(Box::new(left))),
+                then_branch: Box::new(operator.clone()),
+                else_branch: Box::new(operator),
+            })
+        }
         Expr::Pipe(stages) => {
             let (at, head) = stages
                 .iter()
@@ -5628,6 +5643,29 @@ pub(crate) fn eval_each_owned_reemitting<S: EvalSemantics>(
             sink,
         ),
         None => flow,
+    }
+}
+
+/// Whether a rewrite [`yq_empty_context_reemit`] made answers at least once (or raises) whatever it
+/// runs on: a literal, a collect, and constructors and operators over such operands. A pipe may
+/// empty in a later stage (`1 | select(false)`), so it and anything holding one answers `false`.
+fn reemit_always_answers(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) | Expr::Array(_) => true,
+        Expr::Error(message) => message.as_deref().map_or(true, reemit_always_answers),
+        Expr::Object(entries) => entries
+            .iter()
+            .all(|entry| reemit_always_answers(&entry.value)),
+        Expr::Comma(branches) => branches.iter().any(reemit_always_answers),
+        Expr::Negate(operand) => reemit_always_answers(operand),
+        Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
+            reemit_always_answers(left) && reemit_always_answers(right)
+        }
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            reemit_always_answers(left) && reemit_always_answers(right)
+        }
+        Expr::Alternative(left, _) => reemit_always_answers(left),
+        _ => false,
     }
 }
 
