@@ -1695,12 +1695,15 @@ jobs:
       # fuzz/ and bench-compare/ each keep their own Cargo.lock and depend on the main crate by
       # path, so a dependency added to the root Cargo.toml leaves both lockfiles behind, and the
       # advisory checks in security.yml then read a lockfile that no build uses (#7467).
+      # jq-reader-oracle/ (#7970) keeps its own too; it does not depend on the main crate, and
+      # only its metadata is checked here, because building it compiles jq's C sources.
       # `--locked` fails when resolving would have to change the lockfile.
       - name: Nested lockfiles match their manifests
         if: needs.gate.outputs.code == 'true'
         run: |
           cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
           cargo metadata --locked --format-version 1 --manifest-path bench-compare/Cargo.toml > /dev/null
+          cargo metadata --locked --format-version 1 --manifest-path jq-reader-oracle/Cargo.toml > /dev/null
 
       - name: Compile-check the fuzz targets
         if: needs.gate.outputs.code == 'true'

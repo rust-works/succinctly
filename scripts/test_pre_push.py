@@ -225,7 +225,14 @@ class PlanTests(unittest.TestCase):
 
     def test_a_manifest_change_checks_the_nested_lockfiles_7467(self):
         # fuzz/ and bench-compare/ depend on the main crate by path: its manifest can stale their locks.
-        for path in ("Cargo.toml", "fuzz/Cargo.toml", "fuzz/Cargo.lock", "bench-compare/Cargo.lock"):
+        for path in (
+            "Cargo.toml",
+            "fuzz/Cargo.toml",
+            "fuzz/Cargo.lock",
+            "bench-compare/Cargo.lock",
+            "jq-reader-oracle/Cargo.toml",
+            "jq-reader-oracle/Cargo.lock",
+        ):
             self.assertIsNone(self.plan([path])["nested-locks"], path)
         self.assertIsNotNone(self.plan(["src/jq/eval.rs"])["nested-locks"])
         self.assertIsNotNone(self.plan(["Cargo.lock"])["nested-locks"])
