@@ -253,6 +253,33 @@ const REVIEW_ROWS: &[(&str, &str, &str)] = &[
         "{}\n",
     ),
     (STYLED, "(.[] | select(style == \"\") | line) = 9", STYLED),
+    // `key` renames the selected node's key; the root has none.
+    (
+        STYLED,
+        "(.[] | select(style == \"double\") | key) = 9",
+        "9: \"x\"\nb: 1\nc: 2 # hi\n",
+    ),
+    (
+        STYLED,
+        "(.[] | select(style == \"double\") | line | key) = 9",
+        "9: \"x\"\nb: 1\nc: 2 # hi\n",
+    ),
+    (
+        STYLED,
+        "(.[] | select(line_comment == \"# hi\") | key) = 9",
+        STYLED,
+    ),
+    (
+        STYLED,
+        "((.a, .) | select(style == \"\") | key) = 9",
+        STYLED,
+    ),
+    (STYLED, "del((.a, .) | select(style == \"\") | key)", STYLED),
+    (
+        STYLED,
+        "del(.. | select(style == \"\") | key)",
+        "a: \"x\"\n",
+    ),
     (NESTED, "del(.b | key | key)", NESTED),
     (NESTED, "del(.[] | key | key)", NESTED),
     (NESTED, "del(.. | key | key)", NESTED),
@@ -462,6 +489,12 @@ fn inplace_review_rows_keep_the_file_8020() -> Result<()> {
             0,
         ),
         (NESTED, "del(.b | key | key)", NESTED, 0),
+        (
+            STYLED,
+            "(.[] | select(style == \"double\") | key) = 9",
+            "9: \"x\"\nb: 1\nc: 2 # hi\n",
+            0,
+        ),
         (ALIASED, "del(.e | .. | line)", ALIASED, 0),
         (
             CONTAINERS,
