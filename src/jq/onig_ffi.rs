@@ -266,14 +266,28 @@ impl OnigRegex {
     /// `onig_search_with_param` forward from byte `start` to the end of `subject`, with the
     /// library's default limits (jq sets none). `Ok(None)` is no match.
     pub(crate) fn search(&self, subject: &[u8], start: usize) -> Result<Option<Spans>, OnigError> {
-        if start > subject.len() {
+        let mut scratch = Scratch::new();
+        if !self.search_in(&mut scratch, subject, start)? {
             return Ok(None);
         }
-        let region = Region::new();
-        let param = MatchParam::new();
+        Ok(Some((0..scratch.len()).map(|i| scratch.span(i)).collect()))
+    }
+
+    /// [`search`](Self::search) into `scratch`, which a loop of searches reuses as jq's `f_match`
+    /// reuses its region: `true` when it matched, and the spans are then `scratch`'s.
+    pub(crate) fn search_in(
+        &self,
+        scratch: &mut Scratch,
+        subject: &[u8],
+        start: usize,
+    ) -> Result<bool, OnigError> {
+        if start > subject.len() {
+            return Ok(false);
+        }
         let base = subject.as_ptr();
-        // SAFETY: every pointer is within `subject` (`start <= len`); `region` and `param` are live
-        // allocations of the library's own types.
+        // SAFETY: every pointer is within `subject` (`start <= len`); the region and the match
+        // parameter are live allocations of the library's own types, and the library resizes the
+        // region to this pattern's groups.
         let r = unsafe {
             let end = base.add(subject.len());
             onig_search_with_param(
@@ -282,29 +296,54 @@ impl OnigRegex {
                 end,
                 base.add(start),
                 end,
-                region.0,
+                scratch.region.0,
                 ONIG_OPTION_NONE,
-                param.0,
+                scratch.param.0,
             )
         };
         if r == ONIG_MISMATCH {
-            return Ok(None);
+            return Ok(false);
         }
         if r < 0 {
             return Err(OnigError::from_code(r, None));
         }
-        // SAFETY: after a match the region holds `num_regs` begin and end offsets.
-        let spans = unsafe {
-            let reg = &*region.0;
-            let n = usize::try_from(reg.num_regs).unwrap_or(0);
-            let beg = core::slice::from_raw_parts(reg.beg, n);
-            let end = core::slice::from_raw_parts(reg.end, n);
-            beg.iter()
-                .zip(end)
-                .map(|(&b, &e)| Some((usize::try_from(b).ok()?, usize::try_from(e).ok()?)))
-                .collect()
+        Ok(true)
+    }
+}
+
+/// The region and match parameter of a search, kept for the next one ([`OnigRegex::search_in`]).
+pub(crate) struct Scratch {
+    region: Region,
+    param: MatchParam,
+}
+
+impl Scratch {
+    pub(crate) fn new() -> Self {
+        Self {
+            region: Region::new(),
+            param: MatchParam::new(),
+        }
+    }
+
+    /// The number of spans the last match holds: the whole match and each group.
+    pub(crate) fn len(&self) -> usize {
+        // SAFETY: the region is live; `num_regs` is its own count.
+        usize::try_from(unsafe { (*self.region.0).num_regs }).unwrap_or(0)
+    }
+
+    /// Span `i` of the last match as byte offsets: entry 0 is the whole match, and a group that
+    /// took no part (or a number past the last) is `None`.
+    pub(crate) fn span(&self, i: usize) -> Option<(usize, usize)> {
+        if i >= self.len() {
+            return None;
+        }
+        // SAFETY: after a match the region holds `num_regs` begin and end offsets, and `i` is
+        // below that count.
+        let (b, e) = unsafe {
+            let reg = &*self.region.0;
+            (*reg.beg.add(i), *reg.end.add(i))
         };
-        Ok(Some(spans))
+        Some((usize::try_from(b).ok()?, usize::try_from(e).ok()?))
     }
 }
 

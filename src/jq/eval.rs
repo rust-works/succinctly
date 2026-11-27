@@ -33593,6 +33593,8 @@ struct OnigEngine {
     /// Entry `i` is group `i`'s name, entry 0 the whole match's (none). Where several groups share
     /// a name, each carries it, as `f_match_name_iter` sets it on every one.
     names: Vec<Option<Box<str>>>,
+    /// The region every search of this pattern writes, as jq's `f_match` loop reuses one.
+    scratch: core::cell::RefCell<super::onig_ffi::Scratch>,
 }
 
 #[cfg(feature = "regex")]
@@ -33630,7 +33632,11 @@ impl OnigEngine {
                 }
             }
         }
-        Ok(Self { re, names })
+        Ok(Self {
+            re,
+            names,
+            scratch: core::cell::RefCell::new(super::onig_ffi::Scratch::new()),
+        })
     }
 
     /// jq's error for a failed compile or search: `Regex failure: ` and the library's message,
@@ -33646,26 +33652,17 @@ impl OnigEngine {
         input: &'h str,
         start: usize,
     ) -> Result<Option<RegexCaptures<'h>>, EvalError> {
-        let Some(spans) = self
+        let mut scratch = self.scratch.borrow_mut();
+        if !self
             .re
-            .search(input.as_bytes(), start)
+            .search_in(&mut scratch, input.as_bytes(), start)
             .map_err(Self::failure)?
-        else {
+        {
             return Ok(None);
-        };
-        let raw = spans
-            .first()
-            .copied()
-            .flatten()
-            .expect("group 0 holds the whole match");
+        }
+        let raw = scratch.span(0).expect("group 0 holds the whole match");
         let groups = (0..self.names.len())
-            .map(|i| {
-                spans
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .map(|(b, e)| Self::group(input, b, e))
-            })
+            .map(|i| scratch.span(i).map(|(b, e)| Self::group(input, b, e)))
             .collect();
         Ok(Some(RegexCaptures::Onig { groups, raw }))
     }
@@ -33691,6 +33688,9 @@ impl OnigEngine {
         if beg == end {
             let at = ceil(beg);
             return RegexMatch::at(&input[at..at], at);
+        }
+        if input.is_char_boundary(beg) && input.is_char_boundary(end) {
+            return RegexMatch::at(&input[beg..end], beg);
         }
         RegexMatch {
             text: String::from_utf8_lossy(&input.as_bytes()[beg..end]),
