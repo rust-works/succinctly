@@ -320,8 +320,6 @@ const REVIEW_ROWS: &[(&str, &str, &str)] = &[
 /// container after one (#8037), whose `path` is not the node yq writes, and a metadata `select`
 /// the cursor cannot resolve soundly. (document, filter.)
 const REFUSED_ROWS: &[(&str, &str)] = &[
-    (STYLED, "del(.[] | select(style == \"\") | tostring)"),
-    (ALIASED, "del(.e | .. | tostring)"),
     // `eval(..)` runs its program detached from the document, so even the cursor answers
     // `eval("style")` with `""`: yq keeps `a: "x"` in both.
     (STYLED, "del(.[] | select(eval(\"style\") == \"\") | line)"),
@@ -347,11 +345,6 @@ const REFUSED_ROWS: &[(&str, &str)] = &[
         "del(.b | select(kind == \"map\") | with_entries(.) | .c)",
     ),
 ];
-
-/// A `..` below a step down on a document with aliases: yq's `..` stops at the alias and deletes
-/// `e`, where the owned walk would go through it into the anchor, so `succinctly yq` deletes
-/// nothing (the safe direction, recorded). (filter, `succinctly yq`'s stdout over [`ALIASED`].)
-const LESS_ROWS: &[(&str, &str)] = &[("del(.e | .. | line)", ALIASED)];
 
 /// A key rename through a reader's answer (`.a | line | key`): yq renames `.a`'s key (`9: "x"`),
 /// and `succinctly yq` writes nothing, as it did before (the safe direction, recorded).
@@ -400,11 +393,76 @@ const ALLOWLIST_ROWS: &[(&str, &str, &str)] = &[
         "del(.e | .. | select(style == \"\") | line)",
         "d: &x {p: 1, q: 2}\nf: 3\n",
     ),
+    (ALIASED, "del(.e | .. | line)", "d: &x {p: 1, q: 2}\nf: 3\n"),
+    (
+        ALIASED,
+        "del(.e | .. | tostring)",
+        "d: &x {p: 1, q: 2}\nf: 3\n",
+    ),
+    (
+        STYLED,
+        "del(.[] | select(style == \"\") | tostring)",
+        "a: \"x\"\n",
+    ),
     (INNER, "del(.x | first(style == \"\"))", "x: {a: \"q\"}\n"),
     (
         INNER,
         "del(.x | first(style == \"double\") | line)",
         "x: {b: 2}\n",
+    ),
+];
+
+/// An anchor, an alias to it and a mapping like it.
+const ALIAS_LIKE: &str = "d: &x {p: 1}\ne: *x\nf: {p: 2}\n";
+/// A merge key and an alias.
+const MERGED: &str = "base: &b {x: 1, y: 2}\nm: {<<: *b, z: 3}\nal: *b\n";
+/// Scalars whose spelling yq compares (`True`, `~`).
+const SPELLED: &str = "a: True\nb: true\nc: ~\nd: null\n";
+
+/// A values-only `select` the owned value answers differently than yq's document (#8020 third
+/// review): yq's `has`, `length`, `tostring` and the string tests see an alias node itself, and yq
+/// compares a scalar's text (`True == true` is false). Neither the owned value, which expanded the
+/// alias and lost the spelling, nor the cursor, which reads the same values, can pick yq's nodes,
+/// so the reader stays parentless and nothing is deleted, where yq deletes some (the safe
+/// direction, recorded). (document, filter, `succinctly yq`'s stdout.)
+const LESS_ROWS: &[(&str, &str, &str)] = &[
+    (
+        ALIAS_LIKE,
+        "del(.[] | select(has(\"p\")) | line)",
+        ALIAS_LIKE,
+    ),
+    (
+        ALIAS_LIKE,
+        "del(.[] | select(length == 1) | style)",
+        ALIAS_LIKE,
+    ),
+    (
+        ALIAS_LIKE,
+        "del(.[] | select(tostring | test(\"p\")) | key)",
+        ALIAS_LIKE,
+    ),
+    (
+        ALIAS_LIKE,
+        "del(.. | select(has(\"p\")) | line)",
+        ALIAS_LIKE,
+    ),
+    // The merge key is printed expanded, as it was before this change for a `del()` that deletes
+    // nothing.
+    (
+        MERGED,
+        "del(.[] | select(has(\"x\")) | key)",
+        "base: &b {x: 1, y: 2}\nm: {x: 1, y: 2, z: 3}\nal: *b\n",
+    ),
+    (
+        MERGED,
+        "del(.. | select(has(\"x\")) | line)",
+        "base: &b {x: 1, y: 2}\nm: {x: 1, y: 2, z: 3}\nal: *b\n",
+    ),
+    (SPELLED, "del(.[] | select(. == true) | line)", SPELLED),
+    (
+        SPELLED,
+        "del(.[] | select(tostring == \"null\") | line)",
+        SPELLED,
     ),
 ];
 
@@ -537,9 +595,9 @@ fn a_target_whose_path_is_not_yqs_node_is_refused_8020() -> Result<()> {
 }
 
 #[test]
-fn a_descent_below_an_alias_deletes_less_than_yq_8020() -> Result<()> {
-    for (filter, want) in LESS_ROWS {
-        assert_row(&[filter], ALIASED, want)?;
+fn a_select_the_owned_value_reads_differently_deletes_less_than_yq_8020() -> Result<()> {
+    for (doc, filter, want) in LESS_ROWS {
+        assert_row(&[filter], doc, want)?;
     }
     Ok(())
 }
@@ -588,6 +646,13 @@ fn inplace_review_rows_keep_the_file_8020() -> Result<()> {
         ),
         (NESTED, "del(.b | key | key)", NESTED, 0),
         (
+            ALIAS_LIKE,
+            "del(.[] | select(has(\"p\")) | line)",
+            ALIAS_LIKE,
+            0,
+        ),
+        (SPELLED, "del(.[] | select(. == true) | line)", SPELLED, 0),
+        (
             TAGGED,
             "del(.[] | select(type == \"!!str\") | line)",
             "a: !Foo x\nc: 1\n",
@@ -605,7 +670,12 @@ fn inplace_review_rows_keep_the_file_8020() -> Result<()> {
             "9: \"x\"\nb: 1\nc: 2 # hi\n",
             0,
         ),
-        (ALIASED, "del(.e | .. | line)", ALIASED, 0),
+        (
+            ALIASED,
+            "del(.e | .. | line)",
+            "d: &x {p: 1, q: 2}\nf: 3\n",
+            0,
+        ),
         (
             CONTAINERS,
             "del(.arr | select(kind == \"seq\") | [.[]] | .[0])",
