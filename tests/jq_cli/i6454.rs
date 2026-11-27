@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 
+use super::i7967::masked;
 use crate::run_jq_full;
 
 const FILTER: &str = "[limit(8; repeat(try input catch .))]";
@@ -24,7 +25,7 @@ fn a_fault_after_a_depth_refusal_in_an_object_is_placed_from_the_refusal_6454() 
     ] {
         let input = format!("{deep}{tail}");
         let (stdout, _, code) = run_jq_full(&["-nc", FILTER], Some(&input))?;
-        assert_eq!((stdout.as_str(), code), (want, 0), "{tail:?}");
+        assert_eq!((masked(&stdout), code), (masked(want), 0), "{tail:?}");
     }
     Ok(())
 }
@@ -38,9 +39,9 @@ fn the_issue_repro_names_the_stale_position_6454() -> Result<()> {
     );
     let (stdout, _, code) = run_jq_full(&["-c", "try ([inputs]|length) catch ."], Some(&input))?;
     assert_eq!(
-        (stdout.as_str(), code),
+        (masked(&stdout), code),
         (
-            "\"Exceeds depth limit for parsing at line 2, column 257\"\n\"Expected string key before ':' at line 2, column 261\"\n0\n",
+            masked("\"Exceeds depth limit for parsing at line 2, column 257\"\n\"Expected string key before ':' at line 2, column 261\"\n0\n"),
             0
         )
     );

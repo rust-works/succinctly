@@ -383,7 +383,8 @@ Pinned by `tests/jq_cli/i5476.rs`, which asserts succinctly's side and, for the 
 
 [ADR-0018](../../adrs/adr-0018.md)'s #7963 amendment, accepted by the owner on 2026-11-27, narrows what `succinctly jq` owes jq at the edges of its input reader.
 Its implementation is tracked in [#7966](https://github.com/rust-works/succinctly/issues/7966) (the NUL) and [#7967](https://github.com/rust-works/succinctly/issues/7967) (after the first fault).
-#7966 has landed (the next section); #7967 has not, so after the first fault `succinctly jq` still reads its input as the sections below record.
+Both have landed: #7966 is the next section, and #7967 is the last paragraph of the E1 rule below.
+Where a section below records a position after the first fault, it records what `succinctly jq` did before #7967, which is jq's; since #7967 that position is best effort.
 This section says which of those behaviours are owed to jq and which are not.
 
 **Up to and including the first fault, everything is owed (E1).**
@@ -400,9 +401,17 @@ The floor has four parts:
 
 Above the floor, later faults and their positions, `input_line_number` and `input_filename` after the first fault, the number of U+FFFD in a string read after it, and how many values the fault loses are best effort.
 A difference there, such as #7947's U+FFFD count after a caught fault or #7948's line count past invalid UTF-8 after one, is therefore not owed.
-Today the reader models jq's own resume point, jq's next read: the next newline, or the next 4,095-byte piece of a longer line.
-`1 } 2`, 6,000 spaces and `3` on one line, then `4` on the next, read with `[limit(5; repeat(try input catch .))]` under `-n`, is `[1,"Unmatched '}' at line 1, column 3",3,4,"break"]` in jq 1.7.1, jq 1.8.2 and `succinctly jq` at `0dac2e2d7`.
-When #7967 makes the reader resume at the next line, `succinctly jq` may give `4` where jq gives `3` and `4`.
+
+**How `succinctly jq` meets the floor, since [#7967](https://github.com/rust-works/succinctly/issues/7967).**
+The reader resumes where jq's next read starts: the next newline, or the next 4,095-byte piece of a longer line.
+That is never later than the start of the next line, so it meets the floor's first part, and it reads every value jq reads after a fault, in jq's order, with the faults between them.
+Resuming at the start of the next line instead would be simpler, but on a line longer than a read it can start a value jq never starts, where jq's own resume read runs on into that line inside a token or a container, and that would break the floor's third part.
+`1 } 2`, 6,000 spaces and `3` on one line, then `4` on the next, read with `[limit(5; repeat(try input catch .))]` under `-n`, is `[1,"Unmatched '}' at line 1, column 3",3,4,"break"]` in jq 1.7.1, jq 1.8.2 and `succinctly jq` (`tests/jq_cli/i7967.rs`).
+What #7967 stopped modelling is jq's state after a fault where it decides no value, only a position:
+- a fault after the first is placed where it is in the text, where jq does not count the bytes the earlier fault made it drop and carries that count into the next file (#5923), so `}`, a newline, `}` and a newline give the second fault at line 2, column 1 where jq 1.7.1 and 1.8.2 say line 1, column 2;
+- a `--seq` stream handed on from its windows at an RS jq's reader met with a value pending no longer has that RS read as a fault (#7260, #7404), which only moved the positions after it.
+Where it decides a value it is kept, because a value neither release prints is a bug: the read jq resumes at, a read that starts inside a character or a replaced run (#5975, #5990, #7934), the stitch of a token cut by a file's end after a fault, and the substitution of a string read past a fault from the bytes jq read (#7947), which the count of U+FFFD it gives and the bytes jq's replacement swallows (`\xe1A` is one U+FFFD in jq) both depend on.
+The tests that pinned those positions (`i5923`, `i5936`, `i5964`, `i5975`, `i5990`, `i6019`, `i6454`, `i6465`, `i6663`, `i6678`, `i7470`, `i7611`, `i7897`, `i7921`, `i7966`) keep jq's captured output and check it through the first fault exactly, and after it with the line and column of every later fault masked (`masked` in `tests/jq_cli/i7967.rs`), so a value lost, added or moved still fails them.
 
 **A NUL byte outside a string is a parse error at its own position (E2).**
 The accepted rule does not reproduce jq 1.7.1's truncation of a newline-less read at the NUL (CVE-2026-33948), or jq 1.8.2's reading through the NUL, which ends the number before it.
@@ -7711,8 +7720,9 @@ Since [#7260](https://github.com/rust-works/succinctly/issues/7260) a lone `--se
 So a bad first record, or one every 1000 records, costs a window at 100 MiB and not the file (145.9 to 10.1 MiB on the 7950X and 152.3 to 6.6 on the M4 Pro for the first, with the run 25-28% shorter).
 Since [#7341](https://github.com/rust-works/succinctly/issues/7341) they also carry on past a stretch whose values jq reads and RFC 8259 does not (`nan`, `012`, nesting past 128 levels, invalid UTF-8 in a string), which the windows' parser reads as jq's parser does.
 A stretch of any length is read in pieces of 64 KiB, each cut at an RS that starts a line, where jq's reader stands as it stands between plain records, and a stretch that runs to the stream's end is read to its last such RS and the rest handed on from there.
-Since #7260 the route the rest is handed to reads that RS as jq's reader met it when the stretch ended there with a value pending (`{"\` cut by it): as the end of a truncated value, and not as an RS with nothing pending, which in jq's last read ends the stream, so a bare number after it is read on to the end and draws jq's `Potentially truncated top-level numeric value at EOF` (the warning was lost from a file of 4 MiB or more, and from a pipe).
-The same holds for a file of a `--seq` list whose own gate hands the rest of it on at such an RS ([#7404](https://github.com/rust-works/succinctly/issues/7404)): the RS is placed in the stream of the files handed on, which jq's reader reads as one.
+When the stretch ends at that RS with a value pending (`{"\` cut by it), jq's reader meets the RS as the end of a truncated value, so a bare number after it is read on to the end and draws jq's `Potentially truncated top-level numeric value at EOF`; the warning was lost from a file of 4 MiB or more, and from a pipe, while an RS with nothing pending ended the stream in jq's last read.
+#7260, and [#7404](https://github.com/rust-works/succinctly/issues/7404) for a file of a `--seq` list whose own gate hands the rest of it on at such an RS, made the route the rest is handed to read that RS as a fault.
+Since #7718 an RS with nothing pending ends nothing (jq 1.8.2's reading), so the tail reads on to the end without that, and #7967 removed it: what it still moved was the position rules after the fault (ADR-0018's #7963 amendment E1); `tests/jq_cli/i7260_streams.rs` pins the warnings.
 The warnings of the stretches wait for their window, which ends at the next plain record once 65536 wait (a 5 MB stream that warns once a byte held 171-200 MiB, and holds 21-23).
 So at 100 MiB a stream of `nan` records costs a window and not the file (257.0 to 14.4 MiB on the 7950X and 290.8 to 10.4 on the M4 Pro, the run 46-55% shorter), and so does one whose first record is `nan` (233.5 to 11.8 and 259.2 to 7.1) or draws 3000 warnings (234.5 to 12.4 and 259.6 to 8.1), each 10-14% shorter.
 A 10 MB stream with 5 MB of lines that only warn in its middle held 1059-1101 MiB, and holds 34-36.

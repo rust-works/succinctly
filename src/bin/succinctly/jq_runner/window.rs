@@ -1703,10 +1703,6 @@ pub(super) struct SeqTail {
     /// The byte the records before it left at index 1 of jq's token buffer
     /// ([`crate::cli::jq_seq_reader::token_byte_after`]).
     pub token_byte: Option<u8>,
-    /// Where in `stream` the RS the tail opens with is, when jq's reader met it with a value pending:
-    /// a stretch read before it warned there, which the windows have printed
-    /// ([`crate::cli::jq_seq_reader::seed_faulted_rs`], #7260).
-    pub faulted_rs: Option<usize>,
     /// #7260: the line breaks before the tail that `stream`'s front does not hold
     /// ([`crate::cli::jq_seq_reader::resumed_front_counted`]), which the walks of it are seeded with.
     pub line_base: usize,
@@ -1754,16 +1750,11 @@ pub(super) struct SeqFront {
     pub stream: Vec<u8>,
     /// The failure of a read of the file, which ended it there.
     pub error: Option<io::Error>,
-    /// Where in `stream` the RS it opens with is, when jq's reader met it with a value pending
-    /// ([`SeqTail::faulted_rs`], #7404).
-    pub faulted_rs: Option<usize>,
 }
 
 impl PartialEq for SeqFront {
     fn eq(&self, other: &Self) -> bool {
-        self.stream == other.stream
-            && self.error.is_some() == other.error.is_some()
-            && self.faulted_rs == other.faulted_rs
+        self.stream == other.stream && self.error.is_some() == other.error.is_some()
     }
 }
 
@@ -2187,7 +2178,6 @@ impl WindowedFile {
                 stream: Vec::new(),
                 error: None,
                 token_byte: gate.token_byte,
-                faulted_rs: None,
                 line_base: 0,
                 no_rs_end: Some(end),
             });
@@ -2217,10 +2207,6 @@ impl WindowedFile {
         };
         #[cfg(test)]
         let (reserved_at, reserved_room) = (bytes.as_ptr() as usize, bytes.capacity());
-        // #7260: a warning met at the RS the tail opens with is a stretch's, which ended there.
-        let faulted_rs = (self.buf.get(at) == Some(&RS)
-            && self.notes.iter().any(|&(met, _)| met == at))
-        .then_some(bytes.len());
         bytes.extend_from_slice(&self.buf[at..]);
         // #7260: the blocks of a pipe's probe not read yet come before the rest of the pipe.
         for block in self.pre_read.drain(..) {
@@ -2253,7 +2239,6 @@ impl WindowedFile {
             stream: bytes,
             error,
             token_byte: gate.token_byte,
-            faulted_rs,
             line_base,
             no_rs_end: None,
         });
@@ -3045,7 +3030,6 @@ impl WindowedFiles {
                                     front: Some(SeqFront {
                                         stream: tail.stream,
                                         error: tail.error,
-                                        faulted_rs: tail.faulted_rs,
                                     }),
                                 });
                                 self.pending = Vec::new().into_iter();
@@ -6507,7 +6491,6 @@ mod stream_tests {
                     front: Some(SeqFront {
                         stream: crate::cli::jq_seq_reader::resumed_stream(1, rest),
                         error: None,
-                        faulted_rs: None,
                     }),
                 }),
                 "{name}"

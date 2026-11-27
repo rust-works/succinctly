@@ -9911,7 +9911,7 @@ fn read_inputs(
                         ends_stream: pos == last && !unopened_tail,
                         lines_before: 0,
                     };
-                    let file_end = match read_json_tail(
+                    if let Err(error) = read_json_tail(
                         &raw,
                         offset,
                         &tail_cx,
@@ -9919,11 +9919,7 @@ fn read_inputs(
                         &mut ends,
                         &mut resumed_errors,
                     ) {
-                        Ok(file_end) => file_end,
-                        Err(error) => return Ok(Err(error)),
-                    };
-                    if let (true, Some(end)) = (counts_files && pos < last, file_end) {
-                        next_file = end;
+                        return Ok(Err(error));
                     }
                     locations.extend_from_ends(
                         src,
@@ -13817,9 +13813,6 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
         return false;
     };
     crate::cli::jq_seq_reader::seed_token_byte(tail.token_byte);
-    // #7404: an RS the file's gate handed its rest on at, met with a value pending, is placed in the
-    // stream of every source handed on, which jq's reader reads as one.
-    crate::cli::jq_seq_reader::seed_faulted_rs(None);
     let named = get_input_files(args);
     let (mut files, mut raws) = (Vec::new(), Vec::new());
     if tail.lines > 0 {
@@ -13843,8 +13836,6 @@ fn hand_on_seq_files_tail(args: &JqCommand, past_open_failure: bool) -> bool {
                 failures.push((front + 1, InputFileOpenError::from_io(path, error, last)));
             }
             // patchcov: coverage end
-            let before: usize = raws.iter().map(Vec::len).sum();
-            crate::cli::jq_seq_reader::seed_faulted_rs(rest.faulted_rs.map(|at| before + at));
             files.push(path.clone());
             raws.push(rest.stream);
             tail.index + 1
@@ -13884,7 +13875,6 @@ fn hand_on_seq_pipe_tail(args: &JqCommand) -> bool {
         return false;
     };
     crate::cli::jq_seq_reader::seed_token_byte(tail.token_byte);
-    crate::cli::jq_seq_reader::seed_faulted_rs(tail.faulted_rs);
     crate::cli::jq_seq_reader::seed_line_base(tail.line_base);
     // #7260: a file read to its end that held no RS is handed on as no bytes and where it ended.
     HANDED_ON_NO_RS_END.with(|end| end.set(tail.no_rs_end));
@@ -15509,8 +15499,13 @@ struct TailContext<'a> {
 /// The eager reader of a JSON text from byte `offset` on (#4311): the documents it holds, each ending
 /// at `ends` in `raw`, and the parse errors jq meets on the way, which it resumes after. They are
 /// appended to `values`, `ends` and `resumed_errors`, each error counting the documents in `values`
-/// before it. Returns where jq's parser stands at the end of the text once a fault has moved it off
-/// the real position (#5923).
+/// before it.
+///
+/// #7967 (ADR-0018's #7963 amendment E1): everything through the first fault is jq's, and past it
+/// the reader resumes where jq's next read starts, so the documents and faults after it come in jq's
+/// order. Their positions are best effort: a segment past a fault starts at its real place in the
+/// text, where jq's parser does not count the bytes it dropped (#5923 kept that count, and carried it
+/// into the next file).
 fn read_json_tail(
     raw: &str,
     mut offset: usize,
@@ -15518,30 +15513,27 @@ fn read_json_tail(
     values: &mut Vec<OwnedValue>,
     ends: &mut Vec<usize>,
     resumed_errors: &mut Vec<(usize, TrailingParseError)>,
-) -> Result<Option<(usize, usize)>> {
+) -> Result<()> {
     // #7931, #7934: jq's reads are counted over the bytes it read, not over the substitution.
     let mut faults = LineCounter::at_seam(raw.as_bytes(), cx.seam.clone()).reading(cx.lossy);
     faults.set_lines_before(cx.lines_before);
-    // #5923: where jq's parser stands at the start of each segment. The first is
-    // where the file starts; after a fault it is where the fault left the parser,
-    // since jq drops the rest of the read and never counts it.
-    let mut parser_at: Option<(usize, usize)> = None;
-    // ... and where it stands at the end of the file once a fault has moved it off
-    // the real position: the next file starts there, since jq carries its counters
-    // from one file to the next.
-    let mut file_end: Option<(usize, usize)> = None;
+    // Where the last segment started and its place in jq's input, counted on from there.
+    let mut place = (0, cx.file_start);
+    let mut past_fault = false;
     loop {
         let mut segment = &raw[offset..];
         // #7470, #7611: past a fault, only through the next fault. The parse below names the
         // fault with jq's parser model over these same bytes, which a `lossy` text does not hold
         // (the model reads the bytes jq read), so that one is read whole.
-        if parser_at.is_some() && cx.lossy.is_none() {
+        if past_fault && cx.lossy.is_none() {
             segment = &segment[..fault_cut(segment.as_bytes(), cx.stream)];
         }
         let seg_pos = (!cx.stream).then(|| {
-            parser_at.unwrap_or_else(|| {
-                advance_source(cx.file_start, raw.as_bytes(), cx.lossy, 0..offset)
-            })
+            place = (
+                offset,
+                advance_source(place.1, raw.as_bytes(), cx.lossy, place.0..offset),
+            );
+            place.1
         });
         // The bytes jq read of this segment, where they are known.
         let read = cx.lossy.map(|lossy| {
@@ -15556,7 +15548,7 @@ fn read_json_tail(
             before: &[],
             read,
         });
-        let (parsed, parse_error, fault_end) = parse_json_stream_prefix_ending(segment, seg_origin);
+        let (parsed, parse_error) = parse_json_stream_prefix(segment, seg_origin);
         let (spans, split_error) = split_json_values(segment.as_bytes());
         if spans.len() < parsed.len() {
             // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two and the prefix parse materializes from its spans, so it cannot find fewer values -- the same internal-error guard as the non-resuming branch below (#1064), kept per segment (#4311)"
@@ -15592,7 +15584,8 @@ fn read_json_tail(
         // substitution of the whole text could not know: a quote the fault's read dropped puts the
         // text's strings out of step from there. A value read past a fault is substituted again
         // from the bytes jq read, from its own first byte, where jq's lexer is outside a string.
-        if let (Some(_), Some(lossy)) = (parser_at, cx.lossy) {
+        // #7967 keeps this past the first fault: it decides the value, which the floor owes jq.
+        if let (true, Some(lossy)) = (past_fault, cx.lossy) {
             for (value, &(s, e)) in parsed.iter_mut().zip(&spans) {
                 let (vs, ve) = (offset + s, offset + e);
                 if !lossy.changes(vs..ve) {
@@ -15614,10 +15607,6 @@ fn read_json_tail(
         ends.extend(spans.iter().take(read).map(|&(_, end)| offset + end));
         values.extend(parsed);
         let (Some(error), Some(start)) = (parse_error, start) else {
-            if parser_at.is_some() {
-                file_end = seg_pos
-                    .map(|at| advance_source(at, raw.as_bytes(), cx.lossy, offset..raw.len()));
-            }
             break;
         };
         let (detected, mut line, resume) =
@@ -15649,15 +15638,7 @@ fn read_json_tail(
                 as_parse_error: false,
             },
         ));
-        // The next segment starts where the parser stopped, unless the fault's
-        // wording was not the parser's own: then it is the dropped bytes counted
-        // from where this segment started.
-        parser_at = fault_end.or_else(|| {
-            seg_pos.map(|at| {
-                let end = resume.min(raw.len());
-                advance_source(at, raw.as_bytes(), cx.lossy, offset..end)
-            })
-        });
+        past_fault = true;
         let mut next = resume;
         // #5990: the read this one's end leaves starts inside a replacement when
         // the share of moved bytes it ends is cut through the run the
@@ -15675,27 +15656,22 @@ fn read_json_tail(
         // no JSON token begins with: jq raises there too and
         // discards that read as well (`}` padded so the read ends
         // inside `é`, then ` 7\n8\n`, reads the error twice, then
-        // `8`).
+        // `8`). The fault is the parser's own, read from the byte the read starts on (#5975), at
+        // that byte's real place (#7967: best effort past the first fault).
         while next < raw.len() && (inside_edit.is_some() || !raw.is_char_boundary(next)) {
             let line = faults.line_at_read_of(next);
             let fault_source = faults.moved_source(next).unwrap_or(cx.src);
-            let raw_start = inside_edit.take();
-            // #5975: the fault is the parser's own, read from the byte the read
-            // starts on, from where the parser stood at the last fault.
-            let fault = parser_at.and_then(|(line, column)| {
-                let read = match (raw_start, cx.lossy) {
-                    (Some(raw_start), Some(lossy)) => &lossy.original[raw_start..],
-                    (None, Some(lossy)) => lossy.bytes(next..raw.len()),
-                    (_, None) => &raw.as_bytes()[next..],
-                };
-                jq::jq_stream_fault_end([read], line, column)
-            });
-            let (error, fault_end) = match fault {
-                Some((message, end)) => (EvalError::new(message), Some(end)),
-                // patchcov: coverage tolerate reason="unreachable: the read starts on a UTF-8 continuation byte, which no JSON token begins with, so the parser always names a fault in it; kept so a read it could not name is still an error and not silently dropped (#5975)"
-                None => (EvalError::new("Invalid JSON text"), None),
-                // patchcov: coverage end
+            let read = match (inside_edit.take(), cx.lossy) {
+                (Some(raw_start), Some(lossy)) => &lossy.original[raw_start..],
+                (None, Some(lossy)) => lossy.bytes(next..raw.len()),
+                (_, None) => &raw.as_bytes()[next..],
             };
+            let error = seg_pos
+                .and_then(|at| {
+                    let (line, column) = advance_source(at, raw.as_bytes(), cx.lossy, offset..next);
+                    jq::jq_stream_fault([read], line, column)
+                })
+                .map_or_else(|| EvalError::new("Invalid JSON text"), EvalError::new);
             resumed_errors.push((
                 values.len(),
                 TrailingParseError {
@@ -15706,22 +15682,14 @@ fn read_json_tail(
                     as_parse_error: false,
                 },
             ));
-            let read_end = faults.read_end(next);
-            // Without the parser's own end, the bytes it dropped are counted on.
-            parser_at = fault_end.or_else(|| {
-                // patchcov: coverage tolerate reason="unreachable with the arm above: the parser always names the fault, so the dropped bytes are never counted by hand (#5975)"
-                parser_at.map(|at| advance_source(at, raw.as_bytes(), cx.lossy, next..read_end))
-                // patchcov: coverage end
-            });
-            next = read_end;
+            next = faults.read_end(next);
         }
         if next >= raw.len() {
-            file_end = parser_at;
             break;
         }
         offset = next;
     }
-    Ok(file_end)
+    Ok(())
 }
 
 /// Documents of one source of a clean JSON stream that a program reading `input`/`inputs` converts
@@ -17503,7 +17471,7 @@ fn fault_tail(
     };
     let (mut values, mut ends, mut errors) = (Vec::new(), Vec::new(), Vec::new());
     match read_json_tail(text, end_of_last, &cx, &mut values, &mut ends, &mut errors) {
-        Ok(_) => {
+        Ok(()) => {
             // A stream scanned a chunk at a time has nothing queued behind its lazy
             // documents: it is the only source, or the last of several whose earlier ones
             // have all been read (#6450), and it was clean when it was deferred.
@@ -17730,11 +17698,7 @@ fn hand_off_later_sources(
         let mut ends = Vec::new();
         let offset = if pos == 0 { from } else { 0 };
         match read_json_tail(text, offset, &cx, &mut values, &mut ends, &mut errors) {
-            Ok(file_end) => {
-                if let (true, Some(end)) = (pos < last, file_end) {
-                    next_file = end;
-                }
-            }
+            Ok(()) => {}
             // patchcov: coverage tolerate reason="unreachable: the splitter is the more lenient of the two parsers and the prefix parse materializes from its spans, so it cannot find fewer values (the guard `read_json_tail` keeps per segment, #4311)"
             Err(error) => {
                 let failed = jq::ProducedInput::Error(
@@ -20133,17 +20097,6 @@ fn parse_json_stream_prefix(
     s: &str,
     origin: Option<StreamOrigin<'_>>,
 ) -> (Vec<OwnedValue>, Option<EvalError>) {
-    let (values, error, _) = parse_json_stream_prefix_ending(s, origin);
-    (values, error)
-}
-
-/// [`parse_json_stream_prefix`], and where jq's parser stands when it meets the fault, as
-/// `(line, column)`, when the message is its own (#5923). jq keeps those counters across a fault
-/// and never counts what it drops after it, so the text read on from the fault starts there.
-fn parse_json_stream_prefix_ending(
-    s: &str,
-    origin: Option<StreamOrigin<'_>>,
-) -> (Vec<OwnedValue>, Option<EvalError>, Option<(usize, usize)>) {
     // The same trim as [`parse_json_stream`]'s (#5654), so the two accept the same text.
     let (text, lead) = (
         s.as_bytes(),
@@ -20151,10 +20104,10 @@ fn parse_json_stream_prefix_ending(
     );
     let s = trim_json_whitespace(s);
     if s.is_empty() {
-        return (vec![], None, None);
+        return (vec![], None);
     }
     if let Ok(values) = parse_json_stream_strict(s, origin, text, lead) {
-        return (values, None, None);
+        return (values, None);
     }
     // #7758: the first escape jq's parser refuses. The strict pass refuses a text with one, and the
     // walk below stops at the document that holds it: a key that does not decode becomes its source
@@ -20166,7 +20119,7 @@ fn parse_json_stream_prefix_ending(
     let jq_fault = || {
         origin.and_then(|origin| {
             let (line, column) = origin.position(text, 0);
-            jq::jq_stream_fault_end([origin.read.unwrap_or(text)], line, column)
+            jq::jq_stream_fault([origin.read.unwrap_or(text)], line, column)
         })
     };
     let bytes = s.as_bytes();
@@ -20176,16 +20129,16 @@ fn parse_json_stream_prefix_ending(
         // #7758: jq stops at the document that holds the escape, whether or not it converts.
         if escape_fault.is_some_and(|at| end > at) {
             return match jq_fault() {
-                Some((message, end)) => (values, Some(EvalError::new(message)), Some(end)),
-                None => (values, Some(EvalError::new("Invalid JSON text")), None),
+                Some(message) => (values, Some(EvalError::new(message))),
+                None => (values, Some(EvalError::new("Invalid JSON text"))),
             };
         }
         match stream_document_checked(&bytes[start..end], origin, text, lead + start) {
             Ok(value) => values.push(value),
             Err(error) if error.is_decode_failure() => {
                 return match jq_fault() {
-                    Some((message, end)) => (values, Some(EvalError::new(message)), Some(end)),
-                    None => (values, Some(error), None),
+                    Some(message) => (values, Some(EvalError::new(message))),
+                    None => (values, Some(error)),
                 };
             }
             // #6454: a fault the walk names in jq's own words (the depth limit) leaves jq's
@@ -20194,12 +20147,12 @@ fn parse_json_stream_prefix_ending(
             // the bytes it read, so where the two disagree on a depth refusal the model's is jq's.
             Err(error) => {
                 let walked = error.to_string();
-                return match jq_fault().filter(|(message, _)| {
+                return match jq_fault().filter(|message| {
                     *message == walked
                         || (jq::is_jq_depth_fault(message) && jq::is_jq_depth_fault(&walked))
                 }) {
-                    Some((message, end)) => (values, Some(EvalError::new(message)), Some(end)),
-                    None => (values, Some(error), None),
+                    Some(message) => (values, Some(EvalError::new(message))),
+                    None => (values, Some(error)),
                 };
             }
         }
@@ -20207,9 +20160,9 @@ fn parse_json_stream_prefix_ending(
     // #5497: jq meets its depth limit first when the refused bracket comes before the fault
     // the splitter stopped at.
     match split_error.map(|_| jq_fault()) {
-        None => (values, None, None),
-        Some(Some((message, end))) => (values, Some(EvalError::new(message)), Some(end)),
-        Some(None) => (values, Some(EvalError::new("Invalid JSON text")), None),
+        None => (values, None),
+        Some(Some(message)) => (values, Some(EvalError::new(message))),
+        Some(None) => (values, Some(EvalError::new("Invalid JSON text"))),
     }
 }
 

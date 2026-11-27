@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
+use super::i7967::masked;
 use crate::run_jq_full;
 
 /// The programs of the rows, by index: the routes that read on after a fault, one that reads every
@@ -123,8 +124,8 @@ fn test_deep_document_refusal_matches_jq_on_every_input_route_7470() -> Result<(
         let text = shape(name, n);
         let got = run_jq_full(PROGRAMS[program], Some(&text))?;
         assert_eq!(
-            (got.0.as_str(), got.1.as_str(), got.2),
-            (stdout, stderr, code),
+            (masked(&got.0), masked(&got.1), got.2),
+            (masked(stdout), masked(stderr), code),
             "{name} x {n}, {:?}",
             PROGRAMS[program]
         );
