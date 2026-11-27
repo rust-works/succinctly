@@ -11137,6 +11137,16 @@ impl LossySource {
     fn bytes(&self, range: core::ops::Range<usize>) -> &[u8] {
         &self.original[self.original_offset(range.start)..self.original_offset(range.end)]
     }
+
+    /// Whether the substitution changed any byte of `range` of the text (#7947).
+    fn changes(&self, range: core::ops::Range<usize>) -> bool {
+        let first = self
+            .edits
+            .partition_point(|edit| edit.text.end <= range.start);
+        self.edits
+            .get(first)
+            .is_some_and(|edit| edit.text.start < range.end)
+    }
 }
 
 /// `at` moved past `range` of `text`, counted over the bytes jq read where the text is a
@@ -15559,9 +15569,29 @@ fn read_json_tail(
                 parsed.pop();
             }
         }
-        // #7967: a string read past a fault is the whole text's substitution, so its count of
-        // U+FFFD is best effort (E1): jq's lexer starts the read after a fault outside any string,
-        // which a quote in the bytes it dropped can put out of step with the text's (#7947).
+        // #7947: past a fault jq's lexer starts the next read outside any string, which the
+        // substitution of the whole text could not know: a quote the fault's read dropped puts the
+        // text's strings out of step from there. A value read past a fault is substituted again
+        // from the bytes jq read, from its own first byte, where jq's lexer is outside a string.
+        // #7967 keeps this past the first fault: it decides the value, which the floor owes jq.
+        if let (true, Some(lossy)) = (past_fault, cx.lossy) {
+            for (value, &(s, e)) in parsed.iter_mut().zip(&spans) {
+                let (vs, ve) = (offset + s, offset + e);
+                if !lossy.changes(vs..ve) {
+                    continue;
+                }
+                let fresh = succinctly::jq::utf8_document::substitute_invalid_utf8_jq_document(
+                    lossy.bytes(vs..ve),
+                );
+                if fresh.as_bytes() != &raw.as_bytes()[vs..ve] {
+                    if let (mut again, None) = parse_json_stream_prefix(&fresh, None) {
+                        if again.len() == 1 {
+                            *value = again.pop().expect("one value");
+                        }
+                    }
+                }
+            }
+        }
         let read = parsed.len();
         ends.extend(spans.iter().take(read).map(|&(_, end)| offset + end));
         values.extend(parsed);

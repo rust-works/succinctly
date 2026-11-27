@@ -1754,8 +1754,7 @@ pub(super) struct SeqFront {
 
 impl PartialEq for SeqFront {
     fn eq(&self, other: &Self) -> bool {
-        self.stream == other.stream
-            && self.error.is_some() == other.error.is_some()
+        self.stream == other.stream && self.error.is_some() == other.error.is_some()
     }
 }
 
