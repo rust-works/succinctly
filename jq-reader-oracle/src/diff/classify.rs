@@ -630,13 +630,7 @@ pub fn e2_consistent(
             .all(|(r, k)| e1_clean(s, r, k, r171, shape.lenient_e1));
     }
     let at_nul = fault_msg(s, shape).and_then(position) == Some(npos);
-    let ends_run = !shape.trace && !shape.seq;
-    let status = if ends_run {
-        s.status != 0
-    } else {
-        (s.status == 0) == (r171.status == 0)
-    };
-    at_nul && status && kept_before_nul(s, shape, facts, false)
+    at_nul && e2_status(s, r171, shape) && kept_before_nul(s, shape, facts, false)
 }
 
 /// E2's ground that succinctly does not implement yet (#7966): the NUL is the first fault (no
@@ -663,11 +657,26 @@ fn e2_pending(
     {
         return false;
     }
-    !wrong_value(s, r171, r182, shape)
-        && kept_before_nul(s, shape, facts, true)
-        && [r171, r182]
+    // Not reporting the NUL, succinctly exits as a release does; reporting it somewhere (without
+    // its position, say), it exits as E2 says.
+    let status = if fault_msg(s, shape).is_some() {
+        e2_status(s, r171, shape)
+    } else {
+        [r171, r182]
             .iter()
             .any(|r| (s.status == 0) == (r.status == 0))
+    };
+    !wrong_value(s, r171, r182, shape) && kept_before_nul(s, shape, facts, true) && status
+}
+
+/// E2's exit status: non-zero when the NUL's fault ends the run (`jq -c .` without `--seq`),
+/// else zero exactly when jq 1.7.1's is.
+fn e2_status(s: &Transcript, r171: &Transcript, shape: Shape) -> bool {
+    if !shape.trace && !shape.seq {
+        s.status != 0
+    } else {
+        (s.status == 0) == (r171.status == 0)
+    }
 }
 
 /// The full verdict: equal to a release first, then E2, then E1 (against 1.7.1, then 1.8.2),
@@ -791,14 +800,42 @@ pub fn escapes_made_valid(stream: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Standard output without the lines that forward a string jq's parser rejects.
+/// Standard output without the lines that forward a string jq's parser rejects. A string echoed
+/// with a backslash before a raw newline spans two lines, and both go.
 fn without_echoes(stdout: &[u8]) -> Vec<u8> {
-    stdout
-        .split_inclusive(|&c| c == b'\n')
-        .filter(|l| !bad_escape(l))
-        .flatten()
-        .copied()
-        .collect()
+    let bad = bad_escapes(stdout);
+    // The strings of the output, as (first byte, last byte), and which of them hold a bad escape.
+    let mut spans = Vec::new();
+    let (mut start, mut i) = (None, 0);
+    while i < stdout.len() {
+        match (start, stdout[i]) {
+            (None, b'"') => start = Some(i),
+            (Some(a), b'"') => {
+                spans.push((a, i));
+                start = None;
+            }
+            (Some(_), b'\\') => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    if let Some(a) = start {
+        spans.push((a, stdout.len().saturating_sub(1)));
+    }
+    let echoed: Vec<(usize, usize)> = spans
+        .into_iter()
+        .filter(|&(a, b)| bad.iter().any(|&(j, _)| a < j && j <= b))
+        .collect();
+    let mut out = Vec::new();
+    let mut at = 0;
+    for line in stdout.split_inclusive(|&c| c == b'\n') {
+        let (a, b) = (at, at + line.len());
+        at = b;
+        if !echoed.iter().any(|&(x, y)| x < b && a <= y) {
+            out.extend_from_slice(line);
+        }
+    }
+    out
 }
 
 fn escape_fault(msg: &[u8]) -> bool {
@@ -833,7 +870,11 @@ fn escape_echo(
         stderr: s.stderr.clone(),
         status: s.status,
     };
-    if wrong_value(&s2, valid.0, valid.1, shape) || (s.status == 0) != (valid.0.status == 0) {
+    // The status of the valid stream, or, where succinctly reports jq's own escape fault after
+    // the echo, jq's status for it.
+    let reports_it = head(&s.stderr).is_some() && head(&s.stderr) == head(&r.stderr);
+    let status = (s.status == 0) == (valid.0.status == 0) || (reports_it && s.status == r.status);
+    if wrong_value(&s2, valid.0, valid.1, shape) || !status {
         return false;
     }
     let (sl, rl) = (lines(&s2.stdout), lines(&r.stdout));
@@ -1302,5 +1343,68 @@ mod tests {
             &r,
             Shape::default()
         ));
+    }
+
+    // Found by the rerun of the scale triage: shapes of the #5308 echo and of E2's pending ground.
+    #[test]
+    fn the_escape_echo_spans_lines_and_may_end_in_jq_s_fault() {
+        let d = Shape::default();
+        let valid = |o: &[u8]| {
+            let v = tb(o, b"", 0);
+            Facts {
+                escapes_valid: Some((v.clone(), v)),
+                ..k(0)
+            }
+        };
+        // A backslash before a raw newline: the echoed string takes two lines.
+        let stream = b"\"\\\n\"";
+        assert_eq!(escapes_made_valid(stream), b"\"\\\\\"");
+        let r = tb(
+            b"",
+            b"jq: parse error: Invalid escape at line 2, column 1\n",
+            5,
+        );
+        let s = tb(b"\"\\\n\"\n", b"", 0);
+        assert_eq!(
+            classify(stream, &s, &r, &r, d, &valid(b"\"\\\\\"\n")),
+            Class::Recorded
+        );
+        // The echo, then jq's own escape fault with jq's status.
+        let stream = b"\"\\x\"\x00";
+        let fault = b"jq: parse error: Invalid escape at line 1, column 4\n";
+        let r = tb(b"", fault, 5);
+        let s = tb(b"\"\\x\"\n", fault, 5);
+        assert_eq!(
+            classify(stream, &s, &r, &r, d, &valid(b"\"\\\\\"\n")),
+            Class::Recorded
+        );
+        let s = tb(b"\"\\x\"\n", fault, 2);
+        assert_eq!(
+            classify(stream, &s, &r, &r, d, &valid(b"\"\\\\\"\n")),
+            Class::BugAgree
+        );
+    }
+
+    #[test]
+    fn a_nul_reported_without_its_position_is_e2_pending_when_the_values_before_it_stay() {
+        let d = Shape::default();
+        let stream = b"\"\"1\x00";
+        let r = tb(b"\"\"\n1\n", b"", 0);
+        let facts = Facts {
+            before_nul: values_before_nul(stream, false).expect("the 1.7.1 reader"),
+            ..Facts::default()
+        };
+        let err = b"jq: error (at a.json:0): Invalid JSON text\n";
+        let s = tb(b"\"\"\n", err, 5);
+        assert_eq!(classify(stream, &s, &r, &r, d, &facts), Class::E2Pending);
+        // Losing the `""` before the NUL is a bug, and so is exiting 0 at a fault that ends the run.
+        assert_eq!(
+            classify(stream, &tb(b"", err, 5), &r, &r, d, &facts),
+            Class::BugAgree
+        );
+        assert_eq!(
+            classify(stream, &tb(b"\"\"\n", err, 0), &r, &r, d, &facts),
+            Class::BugAgree
+        );
     }
 }
