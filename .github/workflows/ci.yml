@@ -871,6 +871,12 @@ jobs:
       - name: ab-cli.py self-tests
         run: python3 scripts/test_ab_cli.py -v
 
+      # #7960: the same for `scripts/layout-ab.py`, the layout-seeded A/B: fake binaries, no cargo.
+      # It pins the label and pair parsing, the output and exit gate, the per-group environment and
+      # the paired interval's arithmetic.
+      - name: layout-ab.py self-tests
+        run: python3 scripts/test_layout_ab.py -v
+
       # #7092: the committed NFKD table behind `-o=shell` keys against Python's own Unicode data.
       - name: shell NFKD table self-test
         run: python3 scripts/test_gen_shell_nfkd.py -v

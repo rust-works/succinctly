@@ -4,8 +4,10 @@
 No linker, no build: the decisions `link.py` makes from rustc's arguments, the name normalization
 that lets one list serve GNU and LLVM demanglers, the resolution against an object's symbols, and
 `generate.py`'s staleness check of the wrapper's log (and its `--warn`) and its macOS pass (#7894,
-#7826), and `watch.py`'s reading of the perf-guard log.
+#7826), `watch.py`'s reading of the perf-guard log, and the measurement builds' layout seed, saved
+link and `relink.py` (#7960).
 """
+import json
 import os
 import sys
 import tempfile
@@ -14,6 +16,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "link-order"))
 import generate  # noqa: E402
 import link  # noqa: E402
+import relink  # noqa: E402
 import watch  # noqa: E402
 
 
@@ -339,6 +342,102 @@ class MacosPass(unittest.TestCase):
         self.assertEqual(out, ["# header", "main", "a::aarch64::z", "b::neon::k", generate.MARK, "x::listed_neon", "hot::f"])
         self.assertIn("added 2 platform-named functions", err.getvalue())
         self.assertIn("does not sample", err.getvalue())
+
+
+class LayoutSeed(unittest.TestCase):
+    """#7960: the measurement-only layout perturbation."""
+
+    def test_no_seed_is_none_and_a_seed_is_an_integer(self):
+        self.assertIsNone(link.layout_seed({}))
+        self.assertIsNone(link.layout_seed({"SUCCINCTLY_LINK_LAYOUT_SEED": " "}))
+        self.assertEqual(link.layout_seed({"SUCCINCTLY_LINK_LAYOUT_SEED": "7"}), 7)
+        for bad in ("x", "-1", "1.5"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                link.layout_seed({"SUCCINCTLY_LINK_LAYOUT_SEED": bad})
+
+    def test_modes_default_by_platform_and_combine(self):
+        self.assertEqual(link.layout_modes("linux", {}), {"pad"})
+        self.assertEqual(link.layout_modes("darwin", {}), {"shuffle"})
+        for spelled in ("pad,shuffle", "pad+shuffle", "shuffle,pad"):
+            with self.subTest(spelled=spelled):
+                self.assertEqual(link.layout_modes("linux", {"SUCCINCTLY_LINK_LAYOUT_MODE": spelled}),
+                                 {"pad", "shuffle"})
+
+    def test_a_mode_that_cannot_apply_is_refused_not_ignored(self):
+        # ld64 has no padding option: asking for it must not quietly link unperturbed.
+        with self.assertRaises(ValueError):
+            link.layout_modes("darwin", {"SUCCINCTLY_LINK_LAYOUT_MODE": "pad"})
+        for bad in ("bogus", "", "pad,bogus"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                link.layout_modes("linux", {"SUCCINCTLY_LINK_LAYOUT_MODE": bad})
+
+    def test_shuffle_permutes_the_block_and_keeps_the_c_runtime_first(self):
+        order = list(link.CRT_STARTUP) + [f"f{i}" for i in range(50)]
+        a = link.shuffled(order, 1, "linux")
+        self.assertEqual(a[: len(link.CRT_STARTUP)], link.CRT_STARTUP)
+        self.assertEqual(sorted(a), sorted(order))
+        self.assertNotEqual(a, order)
+        self.assertEqual(a, link.shuffled(order, 1, "linux"), "a seed is one layout")
+        self.assertNotEqual(a, link.shuffled(order, 2, "linux"))
+        mac = [f"f{i}" for i in range(50)]
+        self.assertEqual(sorted(link.shuffled(mac, 1, "darwin")), sorted(mac))
+
+
+class SaveLink(unittest.TestCase):
+    def test_deleted_inputs_are_copied_and_the_arguments_rewritten(self):
+        with tempfile.TemporaryDirectory() as scratch, tempfile.TemporaryDirectory() as save:
+            obj = os.path.join(scratch, "succinctly.rcgu.o")
+            tmpfile = os.path.join(tempfile.gettempdir(), f"layout-test-{os.getpid()}.list")
+            for path in (obj, tmpfile):
+                with open(path, "w") as f:
+                    f.write(path)
+            try:
+                args = ["-m64", obj, f"-Wl,-exported_symbols_list,{tmpfile}", "-lc", "-o", "/t/succinctly"]
+                link.save_link(args, save)
+            finally:
+                os.unlink(tmpfile)
+            with open(os.path.join(save, "link.json")) as f:
+                saved = json.load(f)
+            out = saved["args"]
+            self.assertEqual(out[0], "-m64")
+            self.assertEqual(out[3:], ["-lc", "-o", "/t/succinctly"])
+            self.assertTrue(out[1].startswith(save) and os.path.isfile(out[1]))
+            flag, path = out[2].rsplit(",", 1)
+            self.assertEqual(flag, "-Wl,-exported_symbols_list")
+            self.assertTrue(path.startswith(save))
+            with open(path) as f:
+                self.assertEqual(f.read(), tmpfile, "the copy holds the deleted file's content")
+            self.assertEqual(saved["list"], link.LIST)
+            self.assertEqual(saved["cwd"], os.getcwd())
+
+
+class Relink(unittest.TestCase):
+    def test_only_the_output_changes_in_the_arguments(self):
+        saved = ["-m64", "a.o", "-o", "/t/old/succinctly", "-lc"]
+        self.assertEqual(relink.relink_args(saved, "/n/succinctly"), ["-m64", "a.o", "-o", "/n/succinctly", "-lc"])
+        self.assertEqual(saved[3], "/t/old/succinctly", "the saved list is not modified")
+
+    def test_the_environment_carries_only_what_the_relink_asks_for(self):
+        base = {"PATH": "/bin", "SUCCINCTLY_LINK_SAVE_DIR": "/s", "SUCCINCTLY_LINK_LAYOUT_SEED": "9",
+                "SUCCINCTLY_LINK_LAYOUT_MODE": "shuffle", "SUCCINCTLY_LINK_ORDER_LIST": "/other.txt"}
+        self.assertEqual(relink.relink_env(base, "/l.txt"), {"PATH": "/bin", "SUCCINCTLY_LINK_ORDER_LIST": "/l.txt"})
+        env = relink.relink_env(base, "/l.txt", 3, "pad")
+        self.assertEqual((env["SUCCINCTLY_LINK_LAYOUT_SEED"], env["SUCCINCTLY_LINK_LAYOUT_MODE"]), ("3", "pad"))
+        self.assertNotIn("SUCCINCTLY_LINK_SAVE_DIR", env)
+
+    def test_a_log_without_the_order_or_the_seed_is_a_failure(self):
+        ordered = "1536 listed, 1468 found, 1541 symbols ordered (rustc links with lld)\n"
+        seeded = ordered + "layout seed 3, modes ['pad']\n"
+        self.assertIsNone(relink.log_problem(ordered))
+        self.assertIsNone(relink.log_problem(seeded, 3))
+        self.assertIn("without the function order", relink.log_problem("plain link: no lld\n"))
+        self.assertIn("layout seed 3", relink.log_problem(ordered, 3))
+        self.assertIn("layout seed 13", relink.log_problem(seeded, 13), "seed 3 is not seed 13")
+
+    def test_the_log_line_is_the_one_link_py_writes(self):
+        # log_problem matches the line link.py's main appends for a seeded link.
+        with open(os.path.join(os.path.dirname(os.path.abspath(link.__file__)), "link.py")) as f:
+            self.assertIn('msg += f"layout seed {seed}, modes {sorted(modes)}\\n"', f.read())
 
 
 if __name__ == "__main__":

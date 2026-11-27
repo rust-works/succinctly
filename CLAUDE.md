@@ -532,6 +532,7 @@ behind each, is [docs/optimizations/lessons.md](docs/optimizations/lessons.md#ke
 - **Process-spawn A/B needs inputs ≥ 1 MB.** Startup is ~4-6 ms, the entire runtime at 1kb/10kb/100kb — which are in `dev bench yq`'s defaults.
 - **Report the scaling curve over 2-3 sizes**, not one ratio. Growth with input size is the signature of an algorithmic fix and corroborates the claimed mechanism.
 - **Gate on output identity before believing any timing**, and confirm both still match `jq`/`yq`.
+- **A wall-clock difference at equal instruction counts is placement until a layout-seeded A/B says otherwise** (#7960). Pair the two builds over 8 seeded re-links with `scripts/layout-ab.py` ([rule 12](docs/guides/benchmarking.md#12-pair-a-and-b-over-seeded-layouts-before-calling-a-difference-at-equal-ir-7960)). On #7933's pair a plain interleaved A/B read +5%, with its A/A' passing, where the paired one read 0 ± 2%.
 - **Memory-bound effects do not port across architectures** — measure ARM *and* x86_64, and name the chip in every table. #106 was 6.1x on M4 Pro, 16.4x on Zen 4.
 - **Verify the box is idle; macOS load average lies** (read 1.4 on a machine using 2.4% CPU — it counts uninterruptible-wait threads). Never benchmark a laptop on battery.
 - **A benchmark cannot measure a shape it does not generate** — "all neutral" is not evidence. Add the generator pattern first.

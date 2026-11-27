@@ -1401,6 +1401,74 @@ when you read a result:
   `PreviewSink::new`). Agreement between two coprime periods is the evidence; one period agreeing
   with itself is not.
 
+### 12. Pair A and B over seeded layouts before calling a difference at equal `Ir` (#7960)
+
+Rule 9's padding holdout tests one placement. #7933 needed the distribution instead. Its release
+candidate read +10-12% slower on the 7950X's `strings_upcase`, with instruction counts flat and an
+interleaved A/A' control that passed, and one A/B could not say how much of that was the change.
+
+The fix is to link each side again under N seeded layouts and pair them seed by seed. The
+link-order wrapper takes the seed (`scripts/link-order/link.py`, "Measurement builds only"):
+
+- `SUCCINCTLY_LINK_SAVE_DIR=<dir>` on the release build keeps the link, so
+  `scripts/link-order/relink.py <dir> <out>/succinctly --seed N` links the same objects again in
+  seconds. With no seed, the re-link is cargo's binary again: byte for byte on Linux, and on macOS
+  identical code with a larger `__LINKEDIT`.
+- A seed perturbs the layout. `--mode pad` is lld's `--randomize-section-padding=N`, which keeps the
+  order and is the Linux default. `--mode shuffle` is a seeded permutation of the ordered block,
+  which stays first; it is the only mode on macOS, where ld64 has no padding option.
+- `SUCCINCTLY_LINK_ORDER_LIST=<tree>/scripts/link-order/symbols.txt` links an older commit's
+  objects with that commit's own list. Set it, and point `CARGO_TARGET_<TRIPLE>_LINKER` at this
+  branch's `scripts/link-order/cc`, when the trees being compared predate these variables.
+- `scripts/layout-ab.py` runs every binary once per repetition, in a shuffled order, behind the
+  output and exit gate. It reports the plain A/B of the unseeded links, each side's spread over
+  its seeds, and the paired `B.sK / A.sK - 1` with a 95% t interval.
+
+```bash
+# each side: one release build that keeps its link
+SUCCINCTLY_LINK_SAVE_DIR=$PWD/save-A cargo build --release --features cli,simd,regex,serde
+for s in 1 2 3 4 5 6 7 8; do
+  scripts/link-order/relink.py save-A bins/A.s$s/succinctly --seed $s   # and the same for B
+done
+scripts/layout-ab.py --row strings_upcase --input strings-10mb.json --reps 15 \
+  --bin A=bins/A/succinctly --bin B=bins/B/succinctly \
+  $(for s in 1 2 3 4 5 6 7 8; do printf -- '--bin A.s%s=bins/A.s%s/succinctly --bin B.s%s=bins/B.s%s/succinctly ' $s $s $s $s; done)
+```
+
+On #7933's pair, A = `e43c3f9c4` and B = `6362c4bc4`, with C = A plus a planted extra pass in
+`ascii_upcase` (+2.80% `Ir`), measured on the 7950X, `strings_upcase`, 8 padding seeds:
+
+| Size   | A/A'   | Plain B/A | Paired B/A     | Paired C/A     | A over its seeds (range) |
+|--------|--------|-----------|----------------|----------------|--------------------------|
+| 1 MB   | +1.29% | +4.70%    | +0.20% ± 2.19% | +2.94% ± 0.85% | 4.66%                    |
+| 10 MB  | +1.02% | +5.83%    | +0.88% ± 2.41% | +3.94% ± 0.88% | 5.00%                    |
+| 100 MB | -0.47% | +5.14%    | +1.24% ± 2.27% | +4.08% ± 0.85% | 4.51%                    |
+
+- The plain A/B, with its control passing, calls B a 5-6% regression. Paired over the layouts, B's
+  interval includes 0 on every row, and its value per seed runs from -3.9% to +4.4%. That is
+  placement.
+- The planted cost's interval excludes 0 on every row, while the plain A/B under-reads it.
+- Shuffle seeds tell the same story on this row. On an Apple M4, with shuffle seeds only, the
+  planted cost read zero on the `-s` rows it never runs on and was detected on both
+  `strings_upcase` rows.
+
+**How many seeds.** Every subset of the 8 seeds was re-analysed. With 4 padding seeds or 6 shuffle
+seeds, every subset already found the planted cost. At 8, the interval is ±0.85-1.4% on these rows
+and no subset flagged B. Use 8. Rows under about 5 ms stay unreadable either way, as rule 2
+already says.
+
+**A runtime switch is the one-binary A/B (#7961).** When the change ships behind a switch, time one
+binary against itself: `--bin P=... --bin P0=... --env P:SWITCH=1 --env P0:SWITCH=0`, plus the
+seeded copies of each. Set the switch in both arms at equal length, never present against absent:
+the environment's size moves the initial stack. On the reader prototype, that difference alone read
+-2.00% on one row of one binary, and `=1` against `=0` brought it to +0.61%. The harness warns when
+two compared arms differ that way.
+
+**What it does not cover.** Padding and shuffling are two ways of moving code, not every way a
+change moves it: a change that moves the hot block itself, or its alignment against large pages,
+may fall outside both. The result is the change's effect averaged over layouts, not its effect in
+the one layout that ships.
+
 ### Building both halves on a remote box
 
 A source-only tarball plus a reverse patch of the commit under test is enough, with no pushing:
