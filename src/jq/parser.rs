@@ -13841,31 +13841,69 @@ impl<'a> Parser<'a> {
         Ok(patterns)
     }
 
+    /// The `ireduce (INIT; UPDATE)` after yq's `SRC as $v` (#5456): `reduce SRC as $v (INIT; UPDATE)`.
+    ///
+    /// Out of line, so its locals stay off the frame of [`Self::parse_as_pattern`], which every `as`
+    /// binding pays for (#7617).
+    #[inline(never)]
+    fn parse_ireduce(&mut self, expr: Expr, patterns: Vec<Pattern>) -> Result<Expr, ParseError> {
+        self.consume_keyword("ireduce");
+        self.skip_ws();
+        self.expect('(')?;
+        self.skip_ws();
+        let init = self.parse_expr()?;
+        self.skip_ws();
+        if matches!(init, Expr::Comma(_)) {
+            return self.finish_ireduce_union_init();
+        }
+        self.expect(';')?;
+        self.skip_ws();
+        let update = self.parse_expr()?;
+        self.skip_ws();
+        self.expect(')')?;
+        let (expr, patterns, update) = bind_ireduce_node_reads(expr, patterns, update);
+        Ok(Expr::Reduce {
+            input: Box::new(expr),
+            patterns,
+            init: Box::new(init),
+            update: Box::new(update),
+        })
+    }
+
+    /// The rest of a yq `ireduce (INIT, ...` whose INIT is an unparenthesised union (#7617), from
+    /// just after that union to the closing `)`, and the error yq raises for it.
+    ///
+    /// yq's `,` and `;` share one precedence and associate to the right (`expression_postfix.go`
+    /// pops an operator only on a strictly greater precedence), so `(0, 1; U)` is `0, (1; U)`: the
+    /// block `reduceOperator` requires is not the argument's top, and it fails with `reduce must be
+    /// given a block, got UNION instead` before it evaluates SRC, INIT or UPDATE. The check is at
+    /// evaluation, so the expression is yq's `error` with that message, which fires where yq's fold
+    /// runs in a pipe: over an empty source or a `select(false)` context too, and not behind a
+    /// short-circuited `false and`. Under `|=` or `with_entries`, a right side whose context empties
+    /// before the fold does not run it, where yq still raises (#8002). Whatever follows the union
+    /// parses as an expression list, as yq's would (`(0, 1)`, `(0, 1; .; .)`).
+    #[cold]
+    #[inline(never)] // one rare call site: out of line, so it does not grow the parser's frame
+    fn finish_ireduce_union_init(&mut self) -> Result<Expr, ParseError> {
+        while self.peek() == Some(';') {
+            self.next();
+            self.skip_ws();
+            self.parse_expr()?;
+            self.skip_ws();
+        }
+        self.expect(')')?;
+        Ok(Expr::Error(Some(Box::new(Expr::Literal(Literal::String(
+            "reduce must be given a block, got UNION instead".into(),
+        ))))))
+    }
+
     /// Parse the pattern part of an `as` binding, including any
     /// `?//`-separated alternatives (`. as [$a] ?// {$a} | ...`).
     /// Called after "as" has been consumed.
     fn parse_as_pattern(&mut self, expr: Expr) -> Result<Expr, ParseError> {
         let mut patterns = self.parse_pattern_alternatives()?;
-        // #5456: yq's `SRC as $v ireduce (INIT; UPDATE)` is `reduce SRC as $v (INIT; UPDATE)`.
         if self.mode == ParserMode::Yq && self.matches_keyword("ireduce") {
-            self.consume_keyword("ireduce");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let init = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(';')?;
-            self.skip_ws();
-            let update = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            let (expr, patterns, update) = bind_ireduce_node_reads(expr, patterns, update);
-            return Ok(Expr::Reduce {
-                input: Box::new(expr),
-                patterns,
-                init: Box::new(init),
-                update: Box::new(update),
-            });
+            return self.parse_ireduce(expr, patterns);
         }
         self.expect('|')?;
         self.skip_ws();
