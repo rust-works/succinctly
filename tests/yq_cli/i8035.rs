@@ -272,3 +272,57 @@ fn an_endless_source_with_nothing_to_fold_still_reaches_its_cap_8035() -> Result
     }
     Ok(())
 }
+
+/// `A // B` over an empty context answers only when `A` does: yq picks `B` for a falsy output of
+/// `A`, so an `A` that empties on its own leaves nothing (`(1 | select(false)) // 5`), where `null
+/// // 5` is `5`. The re-emit rule used to take the right side for such an `A`, in a plain pipe as
+/// in a fold over an empty list. Captured as `yq -o=json -I0 FILTER` on `{"a":[]}`.
+#[test]
+fn an_alternative_over_an_empty_context_needs_its_left_side_8035() -> Result<()> {
+    let input = "{\"a\":[]}\n";
+    for (filter, expected) in [
+        (".a[] | ((1 | select(false)) // 5)", ""),
+        (".a[] | (null // 5)", "5\n"),
+        (".a[] | (false // 5)", "5\n"),
+        (".a[] | (1 // 5)", "1\n"),
+        (".a[] | (.x // 5)", ""),
+        (".a[] | ((\"A\" | downcase) // 5)", "\"a\"\n"),
+        (".a[] | ((null | select(true)) // 5)", "5\n"),
+        (".a[] | ((1, (2 | select(false))) // 5)", "1\n"),
+        (".a[] | ((false, 1) // 5)", "5\n1\n"),
+        (".a[] | ((1 | select(false)) // (2 | select(false)))", ""),
+        (".a[] | (((1 | select(false)) // 5) // 6)", ""),
+        (".a[] | ([(1 | select(false)) // 5])", "[]\n"),
+        ("select(false) | ((1 | select(false)) // 5)", ""),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, input, JSON)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (expected, "", 0),
+            "{filter}"
+        );
+    }
+    for (filter, expected) in [
+        (
+            ".[] as $x ireduce (select(false); (1 | select(false)) // 5)",
+            "",
+        ),
+        (".[] as $x ireduce (select(false); null // 5)", "5\n"),
+        (
+            ".[] as $x ireduce (select(false); ($x | select(false)) // 5)",
+            "",
+        ),
+        (
+            ".[] as $x ireduce (select(false); ($x | select(true)) // 5)",
+            "1\n",
+        ),
+    ] {
+        let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, "[1]\n", JSON)?;
+        assert_eq!(
+            (stdout.as_str(), stderr.as_str(), code),
+            (expected, "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
