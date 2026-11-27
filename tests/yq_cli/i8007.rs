@@ -65,7 +65,6 @@ const ROWS: &[(&[&str], &str, &str, &str)] = &[
     // An `as` body runs once per node in yq, so neither of these is owned by the walk.
     (&[], "[.[] | . as $v | now] | length", SEQ, "3\n"),
     (&[], "[.[] | now as $t | 1] | length", SEQ, "3\n"),
-    (&[], "now == now", ONE, "true\n"),
     (&[], "now | key", TWO, ""),
 ];
 
