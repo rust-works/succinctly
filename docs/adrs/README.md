@@ -59,6 +59,7 @@ by Michael Nygard.
 | [ADR-0030](adr-0030.md) | 🟡 Proposed   | 2026-11-15 | Owned Values Carry a Handle to Their Source Node (#7243)      |
 | [ADR-0031](adr-0031.md) | ✅ Accepted   | 2026-11-27 | jq-Mode Regex Runs on Oniguruma at jq 1.7.1's Pin (#7965)     |
 | [ADR-0032](adr-0032.md) | ✅ Accepted   | 2026-11-27 | A Call Machine for jq Programs with a Recursive `def` (#7977) |
+| [ADR-0033](adr-0033.md) | 🟡 Proposed   | 2026-11-27 | One Model of jq's Input Reader Entered at Sync Points (#7987) |
 
 The inventory is maintained by the [`update-adr-inventory`](../../.claude/skills/update-adr-inventory/SKILL.md)
 skill, which scans `adr-*.md` for the title and status and derives the date from git history.
