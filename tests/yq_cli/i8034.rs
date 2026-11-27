@@ -85,6 +85,37 @@ fn a_path_read_after_the_candidate_does_not_re_emit_8034() -> Result<()> {
     Ok(())
 }
 
+/// A postfix index is part of the term in yq, so a path-reading collect indexed in place answers
+/// nothing after an empty stage (`[key][0]` is not `[] | .[0]`). Without the index, or with a
+/// stage that is not a navigation after it, the collect still re-emits.
+#[test]
+fn a_postfix_index_on_a_path_reading_candidate_does_not_re_emit_8034() -> Result<()> {
+    for (filter, expected) in [
+        (".b | map(select(key == \"zz\") | [key][0])", "[]"),
+        (".b | map(select(key == \"zz\") | [key][])", "[]"),
+        (
+            ".b | map_values(select(key == \"zz\") | [key][0])",
+            "{\"x\":1,\"y\":2}",
+        ),
+        (".b | map(select(key == \"zz\") | [key])", "[[]]"),
+        (".b | map(select(key == \"zz\") | [key] | length)", "[0]"),
+        (".b | map(select(key == \"zz\") | (1, key) | . + 1)", "[2]"),
+        (
+            ".b | map(select(key == \"zz\") | {\"a\": [key]})",
+            "[{\"a\":[]}]",
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, DOC, &["-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, format!("{expected}\n"), "{filter}");
+    }
+    let filter = ".[] |= (select(. > 3) | [key][0])";
+    let (stdout, code) = run_yq_stdin(filter, "{\"a\":2,\"b\":5}", &["-p=json", "-o=json", "-I0"])?;
+    assert_eq!(code, 0, "{filter}");
+    assert_eq!(stdout, "{\"a\":2,\"b\":\"b\"}\n", "{filter}");
+    Ok(())
+}
+
 /// A candidate's own path reads are of the empty context, and drop out of what it emits: a
 /// collect is `[]` and a comma keeps its constant branches, in `map` and on every #8002 site.
 #[test]

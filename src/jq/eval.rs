@@ -5520,6 +5520,15 @@ fn yq_reemit_after_empty_stage_as(
         if needs_path_context(&head) {
             return None;
         }
+        // A postfix index is part of the term in yq, so `select(false) | [key][0]` is nothing there
+        // and not `[] | .[0]`; the parser spells it as a pipe stage, so a candidate that reads path
+        // context declines when a navigation follows it, as it did before #8034 (an explicit
+        // `[key] | .[0]`, which yq answers `null`, declines with it: the two parse alike).
+        if needs_path_context(&written_flat[at])
+            && written_flat[at + 1..].iter().any(yq_stage_navigates)
+        {
+            return None;
+        }
         if prefix_matched(&Expr::pipe(flat[..at].to_vec()))? {
             continue;
         }
@@ -5529,6 +5538,16 @@ fn yq_reemit_after_empty_stage_as(
         return Some(Expr::pipe(rest));
     }
     None
+}
+
+/// Whether `stage` is a navigation the parser may have split off a postfix term (`[key][0]`,
+/// `[key].a`, `[key][]`, `[key][1:]`, `[key][0]?`), for [`yq_reemit_after_empty_stage_as`].
+fn yq_stage_navigates(stage: &Expr) -> bool {
+    match unwrap_paren(stage) {
+        Expr::Index { .. } | Expr::Field(_) | Expr::Iterate | Expr::Slice { .. } => true,
+        Expr::Optional(inner) => yq_stage_navigates(inner),
+        _ => false,
+    }
 }
 
 /// Whether `body` is a pipe [`yq_reemit_after_empty_stage`] may answer for: a stage of it (a nested
