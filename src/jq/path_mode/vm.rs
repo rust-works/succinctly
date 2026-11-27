@@ -33,9 +33,11 @@
 //! stays constant whatever the recursion depth; only a leaf recurses natively, bounded by its
 //! own text.
 //!
-//! A call-free subtree with no `.[]` and no `range` is a leaf, run by `Interp::eval` with
-//! `Reg::top()`; its outputs past the first become a fork point that yields them one per
-//! backtrack.
+//! A call-free subtree is a leaf, run by `Interp::eval` with `Reg::top()`, reading its free
+//! variables from the slots through a borrowed view ([`LeafView`]); its outputs past the first
+//! become a fork point that yields them one per backtrack. A leaf holds `.[]` and `range(n)` only
+//! where it takes all their outputs itself, under a `[...]` or in a `reduce` (#7977 step 3), so
+//! `[range(1e6)]` is built in one pass and `first(.[])` still stops after one element.
 //!
 //! The machine runs only once a caller turns it on ([`super::set_call_machine`]; the CLI does so
 //! for `SUCCINCTLY_CALL_MACHINE`, #7961). Off, the default, [`decide`] is never asked and nothing
@@ -527,6 +529,31 @@ fn element(container: &OwnedValue, i: usize) -> OwnedValue {
         OwnedValue::Array(items) => items[i].clone(),
         OwnedValue::Object(map) => map.iter_stored().as_slice()[i].1.clone(),
         _ => OwnedValue::Null,
+    }
+}
+
+/// The slots a leaf reads its free variables from, borrowed for the leaf's run (#7977 step 3):
+/// the leaf's variables, by name and `(level, index)` from the frame it runs in.
+pub(super) struct LeafView<'v> {
+    vars: &'v [(Box<str>, u16, u16)],
+    frames: &'v Stack<FrameRec>,
+    slots: &'v [Slot],
+}
+
+impl LeafView<'_> {
+    /// `LOADV` of the leaf's free variable `name`, or `None` when the leaf has none of that name
+    /// (a name the leaf binds itself is found before the view is asked).
+    pub(super) fn var(&self, name: &str) -> Option<OwnedValue> {
+        let (_, level, idx) = self.vars.iter().find(|(n, ..)| **n == *name)?;
+        let mut f = self.frames.index;
+        for _ in 0..*level {
+            f = self.frames.data[f as usize].value.env as isize;
+        }
+        let base = self.frames.data[f as usize].value.base as usize;
+        Some(match &self.slots[base + *idx as usize] {
+            Slot::Val(v) => v.clone(),
+            _ => OwnedValue::Null,
+        })
     }
 }
 
@@ -1299,11 +1326,14 @@ impl<'c, 'e> Vm<'c, 'e> {
         let code = self.code;
         let leaf = &code.leaves[k as usize];
         let input = self.data.pop();
-        let mut env = Env::default();
-        for (name, level, idx) in &leaf.vars {
-            let v = self.value(*level, *idx);
-            env = env.var_ref(name, v);
-        }
+        // The free variables are read where they are, as the leaf reads them: no frame is
+        // built for one, and none is copied unless the leaf reads it.
+        let view = LeafView {
+            vars: &leaf.vars,
+            frames: &self.frames,
+            slots: &self.slots,
+        };
+        let env = Env::over_slots(&view);
         let mut first = None;
         let mut rest = Vec::new();
         let mut full = false;

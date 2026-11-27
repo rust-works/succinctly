@@ -1843,5 +1843,239 @@
   "stdout": "",
   "stderr": "jq: error: $x is not defined at <top-level>, line 1:\ndef r: if false then r else . end; {\"a\":\"b\"} as {a: $x, ($x): $y} | $y                                                         \njq: 1 compile error\n",
   "exit": 3
+ },
+ {
+  "id": "leaf_collect_range",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [range(5)] | length",
+  "route": "take",
+  "stdin": null,
+  "stdout": "5\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_collect_each",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [1, 2, 3] | [.[] | . * 2]",
+  "route": "take",
+  "stdin": null,
+  "stdout": "[2,4,6]\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_collect_nested",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [[1, 2], [3]] | [.[] | [.[] | . * 10]]",
+  "route": "take",
+  "stdin": null,
+  "stdout": "[[10,20],[30]]\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_reduce_each",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [1, 2, 3] | reduce .[] as $x (0; . + $x)",
+  "route": "take",
+  "stdin": null,
+  "stdout": "6\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_reduce_range",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; reduce range(5) as $i ([]; . + [$i])",
+  "route": "take",
+  "stdin": null,
+  "stdout": "[0,1,2,3,4]\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_collect_object",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; {a: [1, 2]} | {b: [.a[] | . + 1]}",
+  "route": "take",
+  "stdin": null,
+  "stdout": "{\"b\":[2,3]}\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_collect_interp",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; \"\\([range(3)])\"",
+  "route": "take",
+  "stdin": null,
+  "stdout": "\"[0,1,2]\"\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_collect_error",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [range(3) | if . == 1 then error(\"e\") else . end]",
+  "route": "take",
+  "stdin": null,
+  "stdout": "",
+  "stderr": "jq: error (at <unknown>): e\n",
+  "exit": 5
+ },
+ {
+  "id": "leaf_collect_try",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [[1], 2] | try [.[] | .[]] catch .",
+  "route": "take",
+  "stdin": null,
+  "stdout": "\"Cannot iterate over number (2)\"\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_collect_negate",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [range(3) | -.]",
+  "route": "take",
+  "stdin": null,
+  "stdout": "[-0,-1,-2]\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_collect_vars",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; 3 as $a | def g($m): [range($m) | . * $a]; [g(2), (1 as $a | [range(2) | $a])]",
+  "route": "take",
+  "stdin": null,
+  "stdout": "[[0,3],[1,1]]\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_first_each_stops",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [1, 2, 3] | first(.[] | if . == 2 then error(\"never\") else . end)",
+  "route": "take",
+  "stdin": null,
+  "stdout": "1\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_limit_range_stops",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [limit(3; range(1e9))]",
+  "route": "take",
+  "stdin": null,
+  "stdout": "[0,1,2]\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_label_each_stops",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [1, 2, 3] | [label $x | .[] | ., break $x]",
+  "route": "take",
+  "stdin": null,
+  "stdout": "[1]\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_collect_debug",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [1, 2] | [.[] | debug]",
+  "route": "take",
+  "stdin": null,
+  "stdout": "[1,2]\n",
+  "stderr": "[\"DEBUG:\",1]\n[\"DEBUG:\",2]\n",
+  "exit": 0
+ },
+ {
+  "id": "leaf_pattern_twice",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; [[1,2],[3,4]] | reduce .[] as [$a, $a] (0; . + $a)",
+  "route": "take",
+  "stdin": null,
+  "stdout": "6\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "leaf_pattern_object_declined",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def r: if false then r else . end; {a: ([1,2] as [$a, $a] | $a)}",
+  "route": "decline",
+  "stdin": null,
+  "stdout": "{\"a\":2}\n",
+  "stderr": "",
+  "exit": 0
+ },
+ {
+  "id": "first_each_ladder",
+  "args": [
+   "-c",
+   "-n"
+  ],
+  "filter": "def w($n): if $n == 0 then first(.[]) else w($n - 1) end; [range(1000)] | w(1)",
+  "route": "take",
+  "stdin": null,
+  "stdout": "0\n",
+  "stderr": "",
+  "exit": 0
  }
 ]

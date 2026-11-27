@@ -700,9 +700,12 @@ fn unsupported(what: impl Into<String>) -> Raise {
 }
 
 /// The lexical environment: variables, function definitions, closure
-/// parameters and labels.
+/// parameters and labels, and below them all, in a leaf of the call machine
+/// (#7977 step 3), the machine's slots its free variables are read from: a
+/// borrowed view, inherited by every frame pushed on it, so a leaf's run builds
+/// no frame for a variable it reads.
 #[derive(Clone, Default)]
-struct Env<'e>(Option<Rc<Frame<'e>>>);
+struct Env<'e>(Option<Rc<Frame<'e>>>, Option<&'e vm::LeafView<'e>>);
 
 enum Frame<'e> {
     Var {
@@ -766,7 +769,14 @@ enum Callee<'e> {
 
 impl<'e> Env<'e> {
     fn push(frame: Frame<'e>) -> Self {
-        Self(Some(Rc::new(frame)))
+        let view = Self::parent(&frame).1;
+        Self(Some(Rc::new(frame)), view)
+    }
+
+    /// The environment of a call machine leaf: no frame, the leaf's free variables read from
+    /// `view`.
+    fn over_slots(view: &'e vm::LeafView<'e>) -> Self {
+        Self(None, Some(view))
     }
 
     fn parent<'a>(frame: &'a Frame<'e>) -> &'a Self {
@@ -789,7 +799,7 @@ impl<'e> Env<'e> {
             }
             at = Self::parent(frame);
         }
-        None
+        self.1.and_then(|view| view.var(name))
     }
 
     /// `LOADVN`: the variable's value, leaving `null` in its place, so a later

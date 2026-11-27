@@ -200,6 +200,26 @@ raw("pattern_key_outer_reduce", R + '"z" as $x | reduce ({"a":"b","z":1},{"a":"c
 raw("pattern_key_outer_nested", R + '"z" as $x | {"a":{"k":"b"},"z":5} as {a: {k: $x}, ($x): $y} | [$x,$y]')
 raw("pattern_key_unbound", R + '{"a":"b"} as {a: $x, ($x): $y} | $y', route="compile-error")
 
+# --- step 3: a call-free `[...]` or `reduce` is one leaf with the generators it collects ---
+raw("leaf_collect_range", R + "[range(5)] | length")
+raw("leaf_collect_each", R + "[1, 2, 3] | [.[] | . * 2]")
+raw("leaf_collect_nested", R + "[[1, 2], [3]] | [.[] | [.[] | . * 10]]")
+raw("leaf_reduce_each", R + "[1, 2, 3] | reduce .[] as $x (0; . + $x)")
+raw("leaf_reduce_range", R + "reduce range(5) as $i ([]; . + [$i])")
+raw("leaf_collect_object", R + "{a: [1, 2]} | {b: [.a[] | . + 1]}")
+raw("leaf_collect_interp", R + '"\\([range(3)])"')
+raw("leaf_collect_error", R + '[range(3) | if . == 1 then error("e") else . end]')
+raw("leaf_collect_try", R + "[[1], 2] | try [.[] | .[]] catch .")
+raw("leaf_collect_negate", R + "[range(3) | -.]")
+raw("leaf_collect_vars", R + "3 as $a | def g($m): [range($m) | . * $a]; [g(2), (1 as $a | [range(2) | $a])]")
+raw("leaf_first_each_stops", R + '[1, 2, 3] | first(.[] | if . == 2 then error("never") else . end)')
+raw("leaf_limit_range_stops", R + "[limit(3; range(1e9))]")
+raw("leaf_label_each_stops", R + "[1, 2, 3] | [label $x | .[] | ., break $x]")
+raw("leaf_collect_debug", R + "[1, 2] | [.[] | debug]")
+raw("leaf_pattern_twice", R + "[[1,2],[3,4]] | reduce .[] as [$a, $a] (0; . + $a)")
+raw("leaf_pattern_object_declined", R + "{a: ([1,2] as [$a, $a] | $a)}", route="decline")
+raw("first_each_ladder", "def w($n): if $n == 0 then first(.[]) else w($n - 1) end; [range(1000)] | w(1)")
+
 
 # --- measurement ladders (shape and cost; run on the bench boxes) ---------------
 LADDERS = [
