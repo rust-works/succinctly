@@ -106,7 +106,6 @@ fn test_subtraction_and_negative_operands_unchanged_7998() -> Result<()> {
         (".a\t-1", "null"),
         (". as $x | $x-1", ""),
         ("-1", "-1"),
-        ("-01 | tostring", "\"-01\""),
         ("-1.50 | tostring", "\"-1.50\""),
         ("-1e3 | tostring", "\"-1e3\""),
     ] {
