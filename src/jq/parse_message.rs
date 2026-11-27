@@ -86,8 +86,9 @@ struct Parser {
 
 /// jq's decNumber reader: an optionally signed decimal with an optional exponent, or
 /// `inf`/`infinity`/`nan`/`snan` in any case (`nan` and `snan` with a zero payload only: jq 1.8
-/// refuses a payload, #7522).
-fn is_number_token(token: &[u8]) -> bool {
+/// refuses a payload, #7522). The reader model's parser ([`super::jv_parse`]) reads its numbers by
+/// this one definition too.
+pub(super) fn is_number_token(token: &[u8]) -> bool {
     // The word grammar is one definition (#2877, #7522): the readers and this message must agree.
     if crate::json::validate::jq_special_number(token).is_some() {
         return true;
@@ -151,6 +152,16 @@ fn hex4(digits: &[u8]) -> Option<u32> {
         return None;
     }
     u32::from_str_radix(core::str::from_utf8(&digits[..4]).ok()?, 16).ok()
+}
+
+/// [`check_string`]'s refusal of a finished string token, in jq's words, or `None` when jq accepts
+/// it: the one definition of `found_string`'s checks, which the reader model's parser
+/// ([`super::jv_parse`]) shares.
+pub(super) fn string_token_fault(token: &[u8]) -> Option<&'static str> {
+    match check_string(token) {
+        Err(Stop::Fault(fault)) => Some(fault),
+        _ => None,
+    }
 }
 
 /// `found_string`'s checks on a finished string token (escapes, surrogate pairs, controls).

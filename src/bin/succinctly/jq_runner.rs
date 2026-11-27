@@ -41,6 +41,9 @@ use crate::cli::output::{
 
 mod call_machine;
 mod eof_location;
+// ADR-0033's reader model (#7987 step 3): no route enters it until step 5.
+#[allow(dead_code)]
+mod reader_model;
 mod window;
 
 /// One word taken by `--args` (a string) or `--jsonargs` (JSON text), kept

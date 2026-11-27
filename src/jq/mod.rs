@@ -98,6 +98,10 @@ mod go_sort;
 mod go_time;
 mod input_lines;
 mod json_fast;
+// ADR-0033's parser half (#7987 step 3): unused until the CLI's reader model is entered at step 5,
+// and then shared by `fromjson` and `--argjson`.
+#[allow(dead_code)]
+pub(crate) mod jv_parse;
 pub(crate) use eval_generic::SiblingShape;
 #[doc(hidden)]
 pub use json_fast::{parse_plain, parse_plain_stream};
