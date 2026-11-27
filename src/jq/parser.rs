@@ -18255,10 +18255,20 @@ mod tests {
                 "{filter:?}"
             );
         }
-        // Spaced, trailing and jq-mode `-` is still subtraction / a boundary.
-        for filter in ["length - 1", "length -1", ".a | length -1"] {
+        // Spaced and jq-mode `-` is still subtraction / a boundary.
+        for filter in ["length - 1", ".a | length - 1"] {
             assert!(
                 parse_program_with_mode(filter, ParserMode::Yq).is_ok(),
+                "{filter:?}"
+            );
+        }
+        // A `-` straight before a digit is a negative number in yq's lexer, so after `length` it
+        // is a second value, which yq refuses as `bad expression` (#7998).
+        for filter in ["length -1", ".a | length -1"] {
+            let err = parse_program_with_mode(filter, ParserMode::Yq).err();
+            assert_eq!(
+                err.map(|e| e.message).as_deref(),
+                Some("bad expression, please check expression syntax"),
                 "{filter:?}"
             );
         }

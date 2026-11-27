@@ -148347,7 +148347,7 @@ mod tests {
     /// operand still errors rather than silently succeeding.
     #[test]
     fn test_unary_minus_yq_mode_integer_zero_stays_integer_1056() {
-        yq_query!(br"null", "-(1-1)",
+        yq_query!(br"null", "-(1 - 1)",
             QueryResult::Owned(OwnedValue::Int(0)) => {}
         );
 
