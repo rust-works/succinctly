@@ -4300,6 +4300,39 @@ impl<'a> Parser<'a> {
         Ok(name)
     }
 
+    /// yq's hexadecimal integer token at the cursor, `0[xX][0-9a-fA-F]+` (#7615); `None` when the
+    /// text there is not one.
+    ///
+    /// yq's lexer reads the digits with `strconv.ParseInt(digits, 16, 64)` and keeps the token as
+    /// the node's text, so the literal is the integer a document's `0x10` is: the value 16 for
+    /// arithmetic, its spelling for `tostring`, `==`, `unique` and a YAML write (#2802). The token
+    /// has no sign (`-0x10` is the number `-0` and then an `x`, refused in both tools), and no `_`
+    /// or fraction (`0x_1`, `0x1.8` are refused). A value past `i64` is a lexer error worded as
+    /// Go's. jq has no hex literal, so jq mode never calls this.
+    fn parse_yq_hex_literal(&mut self) -> Result<Option<Literal>, ParseError> {
+        let start = self.pos;
+        let [b'0', b'x' | b'X', rest @ ..] = &self.input.as_bytes()[start..] else {
+            return Ok(None);
+        };
+        let digits = rest.iter().take_while(|b| b.is_ascii_hexdigit()).count();
+        if digits == 0 {
+            return Ok(None);
+        }
+        let spelled = &self.input[start..start + 2 + digits];
+        let Ok(n) = i64::from_str_radix(&spelled[2..], 16) else {
+            return Err(ParseError::new(
+                format!(
+                    "strconv.ParseInt: parsing \"{}\": value out of range",
+                    &spelled[2..]
+                ),
+                start,
+            ));
+        };
+        let literal = Literal::NumberLiteral(NumberRepr::Int(n), spelled.to_string());
+        self.pos = start + spelled.len();
+        Ok(Some(literal))
+    }
+
     /// Parse a number literal (integer or float).
     ///
     /// jq mode also reads one with no integer part (`.5`, `.00005`, #5299): the caller has
@@ -4308,6 +4341,12 @@ impl<'a> Parser<'a> {
     /// digits is dropped the same way (`1.e1` is read as `1e1`, #5614).
     fn parse_number_literal(&mut self) -> Result<Literal, ParseError> {
         let start = self.pos;
+
+        if self.mode == ParserMode::Yq {
+            if let Some(hex) = self.parse_yq_hex_literal()? {
+                return Ok(hex);
+            }
+        }
 
         // Optional negative sign
         if self.peek() == Some('-') {
