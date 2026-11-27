@@ -32,9 +32,8 @@
 //! bytes, so a number keeps its spelling and a string its decoding exactly as a document's would;
 //! this module decides only where each one begins and ends and which error fires.
 
-use crate::cli::jq_seq_reader::{
-    c_string, decode_string_in_place, number_is_valid, JQ_FGETS_CHUNK,
-};
+use crate::cli::jq_reader_profile::JQ_READER;
+use crate::cli::jq_seq_reader::{c_string, decode_string_in_place, number_is_valid};
 use succinctly::jq::{ArrayVec, OwnedValue};
 
 /// What jq's `p->last_seen` can hold.
@@ -323,7 +322,7 @@ impl ChunkedSources {
 enum ChunkEnd {
     /// After a newline.
     Newline,
-    /// At [`JQ_FGETS_CHUNK`] bytes.
+    /// At [`JQ_READER.read_len`](JQ_READER) bytes.
     Full,
     /// The source has no more bytes, or failed.
     Eof,
@@ -335,7 +334,7 @@ fn read_chunk(
     reader: &mut dyn std::io::BufRead,
     buf: &mut Vec<u8>,
 ) -> (ChunkEnd, Option<std::io::Error>) {
-    while buf.len() < JQ_FGETS_CHUNK {
+    while buf.len() < JQ_READER.read_len {
         let available = match reader.fill_buf() {
             Ok(available) => available,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -344,7 +343,7 @@ fn read_chunk(
         if available.is_empty() {
             return (ChunkEnd::Eof, None);
         }
-        let window = &available[..available.len().min(JQ_FGETS_CHUNK - buf.len())];
+        let window = &available[..available.len().min(JQ_READER.read_len - buf.len())];
         match window.iter().position(|&byte| byte == b'\n') {
             Some(newline) => {
                 buf.extend_from_slice(&window[..=newline]);
@@ -581,7 +580,7 @@ impl RefillCursor {
             } else {
                 0
             };
-            let room = JQ_FGETS_CHUNK - lead;
+            let room = JQ_READER.read_len - lead;
             let Some(len) = crate::cli::jq_seq_reader::fgets_chunk_len_in(raw, self.pos, room)
             else {
                 self.source += 1;
@@ -1065,6 +1064,9 @@ fn slurp_sources(
     sources: &[(Option<usize>, Vec<u8>)],
     failed_tail: bool,
 ) -> MemorySources<&[(Option<usize>, Vec<u8>)]> {
+    // #7523, #7807: the slurp reads to close, as jq 1.8.2's does. There is no code for jq 1.7.1's
+    // slurp loop, so the profile may not ask for it.
+    const _: () = assert!(JQ_READER.stream_slurp_reads_to_close);
     let memory = MemorySources::new(sources);
     if failed_tail {
         memory
@@ -2922,7 +2924,7 @@ mod tests {
                 let chunk = &raw[start..start + len];
                 start += len;
                 let newline = chunk.ends_with(b"\n");
-                let hit_eof = !newline && len < JQ_FGETS_CHUNK;
+                let hit_eof = !newline && len < JQ_READER.read_len;
                 refills.push((
                     index,
                     chunk.to_vec(),
@@ -2931,7 +2933,7 @@ mod tests {
                 ));
                 // #6760: a last chunk that filled the buffer is followed by a read that returns
                 // nothing, in the same source.
-                if !last_source && k + 1 == lens.len() && !newline && len == JQ_FGETS_CHUNK {
+                if !last_source && k + 1 == lens.len() && !newline && len == JQ_READER.read_len {
                     refills.push((index, Vec::new(), false, false));
                 }
             }
@@ -2963,13 +2965,13 @@ mod tests {
             b"\n\n\n".to_vec(),
             b"a\0b\n".to_vec(),
             b"a\0b".to_vec(),
-            long(JQ_FGETS_CHUNK - 1, b"\n"),
-            long(JQ_FGETS_CHUNK, b""),
-            long(JQ_FGETS_CHUNK - 1, b"\0"),
-            long(JQ_FGETS_CHUNK, b"\n"),
-            long(JQ_FGETS_CHUNK + 1, b""),
-            long(2 * JQ_FGETS_CHUNK, b"\nx"),
-            long(JQ_FGETS_CHUNK - 1, b"x\ny"),
+            long(JQ_READER.read_len - 1, b"\n"),
+            long(JQ_READER.read_len, b""),
+            long(JQ_READER.read_len - 1, b"\0"),
+            long(JQ_READER.read_len, b"\n"),
+            long(JQ_READER.read_len + 1, b""),
+            long(2 * JQ_READER.read_len, b"\nx"),
+            long(JQ_READER.read_len - 1, b"x\ny"),
         ];
         let mut cases: Vec<Vec<(Option<usize>, Vec<u8>)>> = vec![Vec::new()];
         for a in &pieces {

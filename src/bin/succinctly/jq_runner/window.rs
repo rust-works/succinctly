@@ -250,9 +250,9 @@ const MAX_READ_WHOLE_WINDOWS: usize = 16;
 const RS: u8 = 0x1e;
 
 /// The most bytes a scan of jq's reads leaves unread at the end of a piece: less than one read
-/// ([`crate::cli::jq_seq_reader::JQ_FGETS_CHUNK`]), so a piece with this much room past what is
-/// left always reads on (#7260).
-const JQ_READ_CARRY: usize = crate::cli::jq_seq_reader::JQ_FGETS_CHUNK;
+/// ([`crate::cli::jq_reader_profile::JQ_READER`]'s `read_len`), so a piece with this much room
+/// past what is left always reads on (#7260).
+const JQ_READ_CARRY: usize = crate::cli::jq_reader_profile::JQ_READER.read_len;
 
 /// Reads each RS byte of `bytes` as a space (#7082).
 fn blank_rs_bytes(bytes: &mut [u8]) {
@@ -1558,10 +1558,12 @@ impl SeenFault {
 }
 
 /// The deepest nesting the strict validator certifies a document at. jq's parser refuses a bracket
-/// when its stack holds [`succinctly::jq::JQ_MAX_PARSING_DEPTH`] entries, and an object takes two (its
-/// frame and the key waiting for a value), so 127 levels of anything stay under it. A deeper document
-/// is not certified; it goes to jq's parser, which is the judge.
+/// when its stack holds [`crate::cli::jq_reader_profile::JQ_READER`]'s `max_depth` entries, and an
+/// object takes two (its frame and the key waiting for a value), so 127 levels of anything stay
+/// under it. A deeper document is not certified; it goes to jq's parser, which is the judge.
 const CERTIFIED_DEPTH: usize = 127;
+
+const _: () = assert!(2 * CERTIFIED_DEPTH < crate::cli::jq_reader_profile::JQ_READER.max_depth);
 
 /// The first fault of a stream that cannot be read again (a pipe on standard input, #7024), found as
 /// the windows are handed out, before the text they drop is gone.

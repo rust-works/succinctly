@@ -563,7 +563,7 @@ fn scan_named_file(scan: &mut Scan, path: &PathBuf, block: &mut [u8]) -> Option<
 }
 
 /// jq's `fgets` chunk: a line, or this many bytes of a longer one.
-const CHUNK: u64 = crate::cli::jq_seq_reader::JQ_FGETS_CHUNK as u64;
+const CHUNK: u64 = crate::cli::jq_reader_profile::JQ_READER.read_len as u64;
 
 /// Counts the items of a text again, a block at a time, for where jq's reader stood once it had
 /// handed out the last one the program took: the end of the `fgets` chunk whose byte completed it

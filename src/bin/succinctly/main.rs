@@ -3920,6 +3920,7 @@ mod interrupt;
 mod jq_bench;
 mod jq_locate;
 mod jq_path_mode;
+mod jq_reader_profile;
 mod jq_runner;
 mod jq_seq_reader;
 mod jq_stream_errors;
