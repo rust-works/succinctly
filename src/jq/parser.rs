@@ -13775,6 +13775,32 @@ impl<'a> Parser<'a> {
         Ok(patterns)
     }
 
+    /// The rest of a yq `ireduce (INIT, ...` whose INIT is an unparenthesised union (#7617), from
+    /// just after that union to the closing `)`, and the error yq raises for it.
+    ///
+    /// yq's `,` and `;` share one precedence and associate to the right (`expression_postfix.go`
+    /// pops an operator only on a strictly greater precedence), so `(0, 1; U)` is `0, (1; U)`: the
+    /// block `reduceOperator` requires is not the argument's top, and it fails with `reduce must be
+    /// given a block, got UNION instead` before it evaluates SRC, INIT or UPDATE. The check is at
+    /// evaluation, so the expression is yq's `error` with that message, which fires where a
+    /// `reduceOperator` would run (an empty source or context too, not behind a short-circuited
+    /// `false and`). Whatever follows the union parses as an expression list, as yq's would
+    /// (`(0, 1)`, `(0, 1; .; .)`).
+    #[cold]
+    #[inline(never)] // one rare call site: out of line, so it does not grow the parser's frame
+    fn finish_ireduce_union_init(&mut self) -> Result<Expr, ParseError> {
+        while self.peek() == Some(';') {
+            self.next();
+            self.skip_ws();
+            self.parse_expr()?;
+            self.skip_ws();
+        }
+        self.expect(')')?;
+        Ok(Expr::Error(Some(Box::new(Expr::Literal(Literal::String(
+            "reduce must be given a block, got UNION instead".into(),
+        ))))))
+    }
+
     /// Parse the pattern part of an `as` binding, including any
     /// `?//`-separated alternatives (`. as [$a] ?// {$a} | ...`).
     /// Called after "as" has been consumed.
@@ -13788,6 +13814,9 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             let init = self.parse_expr()?;
             self.skip_ws();
+            if matches!(init, Expr::Comma(_)) {
+                return self.finish_ireduce_union_init();
+            }
             self.expect(';')?;
             self.skip_ws();
             let update = self.parse_expr()?;
