@@ -228,6 +228,85 @@ fn an_error_after_an_empty_stage_raises_in_an_update_8002() -> Result<()> {
     Ok(())
 }
 
+/// A `key` (or `path`) on an update's right side is the target's, not a literal: it is no stage that
+/// re-emits, and a stage after a re-emitted node reads that node's position, which has none.
+#[test]
+fn a_path_context_read_after_an_empty_stage_does_not_re_emit_8002() -> Result<()> {
+    for (input, filter, expected) in [
+        (
+            "{\"a\":1,\"b\":5}",
+            ".[] |= (select(. > 3) | key)",
+            "{\"a\":1,\"b\":\"b\"}\n",
+        ),
+        ("[1,2]", ".[] |= (select(. > 1) | key)", "[1,1]\n"),
+        ("[1,2]", ".[] |= (select(false) | 3 | key)", "[1,2]\n"),
+        (
+            "{\"a\":1,\"b\":2}",
+            "with(.a; . |= (select(false) | key))",
+            "{\"a\":1,\"b\":2}\n",
+        ),
+        (
+            "{\"a\":1,\"b\":5}",
+            "map_values(select(. > 3) | key)",
+            "{\"a\":1,\"b\":\"b\"}\n",
+        ),
+        (
+            "{\"a\":1,\"b\":5}",
+            "map_values(select(false) | 3 | key)",
+            "{\"a\":1,\"b\":5}\n",
+        ),
+        // A `key` before the candidate is read at the target, as the pipe reads it.
+        (
+            "{\"a\":1,\"b\":5}",
+            ".[] |= (select(key == \"b\") | 9)",
+            "{\"a\":9,\"b\":9}\n",
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, input, &["-p=json", "-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// A plain write's right side re-emits at the first stage whose input was empty, not at the first
+/// stage that could: a `[...]` at the head over a non-empty input is kept.
+#[test]
+fn a_write_right_side_re_emits_only_after_an_empty_stage_8002() -> Result<()> {
+    for (input, filter, expected) in [
+        (
+            "{\"a\":[1]}",
+            ".x = ([.a[]] | [select(length == 0)] | .[])",
+            "{\"a\":[1],\"x\":null}\n",
+        ),
+        (
+            "{\"a\":[1]}",
+            ".x = ([.a[]] | select(length == 0))",
+            "{\"a\":[1],\"x\":null}\n",
+        ),
+        (
+            "{\"a\":[]}",
+            ".x = ([.a[]] | select(length == 0))",
+            "{\"a\":[],\"x\":[]}\n",
+        ),
+        (
+            "{\"a\":[1]}",
+            ".x = ((.a[], 5) | select(. > 9) | 7)",
+            "{\"a\":[1],\"x\":7}\n",
+        ),
+        (
+            "{\"a\":{\"z\":1}}",
+            ".x = (.a.zz | true)",
+            "{\"a\":{\"z\":1},\"x\":true}\n",
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, input, &["-p=json", "-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
 /// `--eval-all` and `-i` take routes of their own and answer the same.
 #[test]
 fn the_rule_holds_under_eval_all_and_inplace_8002() -> Result<()> {
