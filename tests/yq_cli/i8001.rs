@@ -200,9 +200,15 @@ fn an_undefined_function_in_the_block_still_raises_8001() -> Result<()> {
         (".[] as $x ireduce (0; . + $x; 1; nope)", "nope/0"),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, INPUT, JSON)?;
+        // The first line only: under `RUST_BACKTRACE` (CI sets it) the message is followed by a
+        // backtrace.
         assert_eq!(
-            (stdout.as_str(), stderr.trim_end(), code),
-            ("", format!("Error: {name} is not defined").as_str(), 1),
+            (stdout.as_str(), stderr.lines().next(), code),
+            (
+                "",
+                Some(format!("Error: {name} is not defined").as_str()),
+                1
+            ),
             "{filter}"
         );
     }
