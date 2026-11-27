@@ -105,14 +105,31 @@ fn test_arg_binds_loc_without_jq_extensions_7997() -> Result<()> {
     Ok(())
 }
 
-/// Under `--jq-extensions` `$__loc__` is jq's location object, as in `succinctly jq`, and so, as in
-/// jq, it is not a name a program can bind or `--arg` can set.
+/// Under `--jq-extensions` `$__loc__` is jq's location object wherever no binding of the name
+/// reaches, as in `succinctly jq`, and `--arg __loc__` does not replace it (jq 1.7.1 neither). The flag
+/// only adds: yq's own `as` still binds the name, so a binding shadows the location (jq rejects
+/// every binding of `$__loc__` as a syntax error; yq mode does not adopt it, as for #5591). A `def`
+/// `$`-parameter, jq-only syntax yq's lexer rejects, binds it the same way.
 #[test]
 fn test_loc_is_jqs_location_under_jq_extensions_7997() -> Result<()> {
+    let loc = "{\"file\":\"<top-level>\",\"line\":1}\n";
     for (filter, expected) in [
-        ("$__loc__", "{\"file\":\"<top-level>\",\"line\":1}\n"),
+        ("$__loc__", loc),
         (".\n| $__loc__.line", "2\n"),
         ("[$__loc__] | length", "1\n"),
+        ("1 as $__loc__ | 2", "2\n"),
+        ("1 as $__loc__ | $__loc__", "1\n"),
+        ("$__loc__ as $__loc__ | 3", "3\n"),
+        // The source is outside the binding, so it is the location; the body reads the binding.
+        ("$__loc__ as $__loc__ | $__loc__ | .line", "1\n"),
+        ("\n\n$__loc__ as $__loc__ | $__loc__.line", "3\n"),
+        (
+            "[1 as $__loc__ | $__loc__, $__loc__]",
+            "[1,{\"file\":\"<top-level>\",\"line\":1}]\n",
+        ),
+        ("(1 as $__loc__ | $__loc__), $__loc__.line", "1\n1\n"),
+        ("def f($__loc__): $__loc__; f(5)", "5\n"),
+        ("def f: $__loc__.line; 1 as $__loc__ | f", "1\n"),
     ] {
         assert_eq!(
             run(
@@ -138,24 +155,13 @@ fn test_loc_is_jqs_location_under_jq_extensions_7997() -> Result<()> {
             ],
             ""
         )?,
-        (
-            "{\"file\":\"<top-level>\",\"line\":1}\n".to_string(),
-            String::new(),
-            0
-        )
+        (loc.to_string(), String::new(), 0)
     );
-    let (out, err, code) = run(
-        &["yq", "--jq-extensions", "-n", "1 as $__loc__ | $__loc__"],
-        "",
-    )?;
-    assert_eq!(out, "", "stderr: {err}");
-    assert_ne!(code, 0, "stderr: {err}");
-    assert!(err.contains("unexpected $__loc__"), "stderr: {err}");
     Ok(())
 }
 
 /// jq mode is unchanged (jq 1.7.1): `$__loc__` is the location, `--arg __loc__` does not replace
-/// it, and binding the name is a syntax error.
+/// it, and binding the name is a syntax error, in an `as` and in a `def` parameter.
 #[test]
 fn test_jq_mode_keeps_loc_7997() -> Result<()> {
     let loc = "{\"file\":\"<top-level>\",\"line\":1}\n".to_string();
@@ -171,6 +177,12 @@ fn test_jq_mode_keeps_loc_7997() -> Result<()> {
     assert_eq!((out.as_str(), code), ("", 3), "stderr: {err}");
     assert!(
         err.contains("syntax error, unexpected $__loc__, expecting BINDING or '[' or '{'"),
+        "stderr: {err}"
+    );
+    let (out, err, code) = run(&["jq", "-nc", "def f($__loc__): $__loc__; f(5)"], "")?;
+    assert_eq!((out.as_str(), code), ("", 3), "stderr: {err}");
+    assert!(
+        err.contains("syntax error, unexpected $__loc__, expecting IDENT or BINDING"),
         "stderr: {err}"
     );
     Ok(())

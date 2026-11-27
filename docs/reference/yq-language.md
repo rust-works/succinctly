@@ -809,7 +809,7 @@ jq's `$ENV` and `$ARGS` are not rejected, since yq lexes any `$name`, but yq has
 default each is an unbound variable name and reads as nothing, as `$foo` does (`[$ENV] | length` is
 `0`, #7616).
 With the flag they are jq's environment object and `{named, positional}` object.
-jq's `$__loc__` is the same (#7997): by default it is a name a program can bind (`1 as $__loc__ | $__loc__` is `1`), and with the flag it is jq's `{file, line}` object.
+jq's `$__loc__` is the same (#7997): by default it is a name a program can bind (`1 as $__loc__ | $__loc__` is `1`), and with the flag it is jq's `{file, line}` object wherever no binding of the name reaches.
 
 The flag also enables jq's generic postfix `?` after an expression such as
 `length?` or `(.x)?` (#3378). Default yq accepts optional navigation on

@@ -5567,10 +5567,11 @@ impl<'a> Parser<'a> {
     /// `{$__loc__}`/`{$__loc__: Pattern}` shorthand forms report a bare
     /// `unexpected $__loc__` with no expecting list -- all exit 3). Real yq
     /// v4.53.3 instead accepts it as an ordinary binding (`1 as $__loc__ |
-    /// 2` → `2`, confirmed live), so the reject follows the same test as
-    /// `dollar_var_expr` ([`Self::jq_pseudo_vars`]): jq mode, and yq mode
-    /// under `--jq-extensions`, where a reference is the location and a
-    /// binding of the name could never be read (#7997).
+    /// 2` → `2`, confirmed live), so the reject is gated to jq mode. Under
+    /// `--jq-extensions` yq mode keeps accepting the binding (the flag only
+    /// adds, as for #5591's reserved words): a reference there parses as the
+    /// location, and the resolver turns one inside a binding of the name back
+    /// into that variable (`resolve.rs`, as for `$ENV`; #7997).
     ///
     /// One definition for every binding site (a `def` `$`-param, the primary
     /// `$var` pattern, and the object-pattern shorthand) is deliberate: the
@@ -5592,7 +5593,7 @@ impl<'a> Parser<'a> {
         expecting: Option<&str>,
         sigil_offset: usize,
     ) -> Result<(), ParseError> {
-        if self.jq_pseudo_vars() && name == "__loc__" {
+        if self.mode == ParserMode::Jq && name == "__loc__" {
             let message = match expecting {
                 Some(expecting) => {
                     format!("syntax error, unexpected $__loc__, expecting {expecting}")

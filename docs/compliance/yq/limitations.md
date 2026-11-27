@@ -7413,7 +7413,7 @@ and nothing here, because the outer `$y` is not substituted into a body that reb
 `$ENV` and `$ARGS` are not variables of yq's, so here too they are unbound names unless the program binds them: `$ENV.x` prints nothing and `[$ENV, $ARGS] | length` is `0` (#7616).
 Under `--jq-extensions` they are jq's environment object and `{named, positional}` object.
 `$__loc__` is the same (#7997): without the flag a program can bind it (`1 as $__loc__ | $__loc__` is `1`, as in yq) and `--arg __loc__ X` sets it.
-Under `--jq-extensions` it is jq's `{file, line}` object, which, as in jq, no binding or `--arg` replaces (`1 as $__loc__` is a syntax error there).
+Under `--jq-extensions` it is jq's `{file, line}` object, which `--arg __loc__` does not replace (as in jq), but a binding of the name still shadows it, as yq's `as` does without the flag (jq rejects `1 as $__loc__` as a syntax error).
 
 ### `..` stops at an alias node — resolved for reads ([#4214](https://github.com/rust-works/succinctly/issues/4214)); the write path, owned routes and merge keys are residual ([#4223](https://github.com/rust-works/succinctly/issues/4223))
 
