@@ -5357,22 +5357,32 @@ fn yq_empty_context_reemit_in(expr: &Expr, bound: &[&str]) -> Option<Expr> {
         // context a fold whose source yields nothing is INIT's answer there
         // (`select(false) | (.[] as $x ireduce (0; . + 1))` is `0`), and one whose source re-emits
         // folds it from that answer, an empty list included (#8035): `((1, 2) as $x ireduce (0;
-        // . + $x))` is `3`. UPDATE runs on the accumulators as written. Only a single `$x`: the
-        // array pattern of a fold whose UPDATE reads its node (`bind_ireduce_node_reads`) comes
-        // with a source the parser rebuilt, which declines.
+        // . + $x))` is `3`. UPDATE runs on the accumulators as written. A fold whose UPDATE reads
+        // its node's position (`$x | key`) has a source the parser piped into a tuple
+        // (`bind_ireduce_node_reads`), whose collect would re-emit: the source as written decides,
+        // and one that re-emits declines, as does any other destructuring pattern.
         Expr::Reduce {
             input,
             patterns,
             init,
             update,
         } => {
-            let [Pattern::Var(_)] = patterns.as_slice() else {
-                return None;
+            let single = matches!(patterns.as_slice(), [Pattern::Var(_)]);
+            let source = match unwrap_paren(input) {
+                _ if single => &**input,
+                Expr::Pipe(stages) => match stages.as_slice() {
+                    [written @ Expr::Paren(_), Expr::Array(_)] => written,
+                    _ => return None,
+                },
+                _ => return None,
             };
             let init = yq_empty_context_reemit_in(init, bound);
-            let Some(input) = yq_empty_context_reemit_in(input, bound) else {
+            let Some(input) = yq_empty_context_reemit_in(source, bound) else {
                 return init;
             };
+            if !single {
+                return None;
+            }
             Some(Expr::Reduce {
                 input: Box::new(input),
                 patterns: patterns.clone(),
@@ -137478,6 +137488,72 @@ mod tests {
         };
         assert!(negated_answers("1"));
         assert!(!negated_answers("1 | select(false)"));
+        // #8044: a binding answers when its source and its body do, a variable it binds always.
+        for src in ["1 as $y | $y", "1 as $y | [.]", "1 as $y | {\"k\": $y}"] {
+            assert!(answers(src), "`{src}`");
+        }
+        for src in [
+            "1 as $y | ($y | select(false))",
+            "(1 | select(false)) as $y | 3",
+            "1 as $x ireduce (0; .)",
+        ] {
+            assert!(!answers(src), "`{src}`");
+        }
+    }
+
+    /// #8044: over an empty context yq evaluates a binding's body once per output of its source
+    /// with the variable bound, or once with nothing bound when the source yields nothing, and a
+    /// fold is its INIT there unless its source yields something to fold.
+    #[test]
+    fn test_yq_empty_context_reemit_binding_and_fold_8044() {
+        let yq = |src: &str| parse_with_mode_and_extensions(src, ParserMode::Yq, true).unwrap();
+        let reemit = |src: &str| yq_empty_context_reemit(&yq(src));
+        let is = |src: &str, want: &str| assert_eq!(reemit(src), Some(yq(want)), "`{src}`");
+        // A source that yields nothing leaves the body, unbound.
+        is(". as $y | 3", "3");
+        is(". as $y | [.]", "[]");
+        is(". as $a | . as $b | 3", "3");
+        is(". as $y | select(false) | 3", "3");
+        is("{\"a\": .} as $y | 3", "3");
+        // A source that re-emits binds it, and the variable is a value.
+        is("1 as $y | $y", "1 as $y | $y");
+        is("1 as $y | [$y]", "1 as $y | []");
+        is("1 as $y | $y + 1", "1 as $y | $y + 1");
+        is("1 as $y | . as $z | $y", "1 as $y | $y");
+        is("[.] as $y | $y", "[] as $y | $y");
+        // A source that may answer nothing asks first.
+        assert!(matches!(
+            reemit("(1 | select(false)) as $y | 3"),
+            Some(Expr::If { .. })
+        ));
+        // A key bound by the rewrite is kept for the object to stringify.
+        assert!(reemit("\"x\" as $y | {$y: 1}").is_some());
+        for src in [
+            ". as $y | $y",
+            ". as $y | .",
+            ". as $y | $y + 1",
+            "{\"a\": .} as $y | $y",
+            "3 as $y | .",
+            "$y",
+            "{$y: 1}",
+        ] {
+            assert_eq!(reemit(src), None, "`{src}`");
+        }
+        // A fold over a source that yields nothing is its INIT; one over a source that re-emits
+        // folds it, from `empty` for an INIT that yields nothing.
+        is(".[] as $x ireduce (0; . + 1)", "0");
+        is(".[] as $x ireduce ([]; . + [$x])", "[]");
+        is("1 as $x ireduce (0; . + $x)", "1 as $x ireduce (0; . + $x)");
+        is("1 as $x ireduce (.; 1)", "1 as $x ireduce (empty; 1)");
+        // UPDATE reads the node: the source as written decides.
+        is(".[] as $x ireduce (0; . + ($x | key))", "0");
+        assert_eq!(reemit("1 as $x ireduce (0; . + ($x | key))"), None);
+        for src in [
+            ".[] as $x ireduce (.; 1)",
+            ".[] as $x ireduce (select(false); [.])",
+        ] {
+            assert_eq!(reemit(src), None, "`{src}`");
+        }
     }
 
     /// #6943: the allocation-free test the pipe entry asks never says `false` where the rewrite
@@ -137527,6 +137603,17 @@ mod tests {
             "(1 | . + 1)",
             "map(1)",
             "[.[] | 1]",
+            // #8044: bindings and folds.
+            ". as $y | 3",
+            ". as $y | [.]",
+            ". as $y | $y",
+            "1 as $y | $y",
+            "1 as $y | . as $z | $y",
+            "\"x\" as $y | {$y: 1}",
+            "(1 | select(false)) as $y | 3",
+            ".[] as $x ireduce (0; . + 1)",
+            "1 as $x ireduce (.; 1)",
+            ".[] as $x ireduce (0; . + ($x | key))",
         ];
         for src in corpus {
             let expr = crate::jq::parse_with_mode(src, ParserMode::Yq).unwrap();
