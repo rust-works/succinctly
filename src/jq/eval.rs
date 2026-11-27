@@ -83723,6 +83723,9 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
             if split == 0 || !stages[split..].iter().all(deriving_stage) {
                 return None;
             }
+            if !yq_slot_rewrite_is_sound(&stages[..split], &stages[split..]) {
+                return None;
+            }
             // Without a step down from the root the derived value can be the document itself
             // (`. | tostring`, `.. | tostring`), which has no parent in yq: it stops the delete
             // instead of going, and the rewrite would delete the document.
@@ -83736,30 +83739,70 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
     }
 }
 
+/// Whether [`yq_slot_keeping_del_target`] may replace `navigation | tail` by the navigation's own
+/// nodes (#8020). Each case it declines leaves the target to the general rule, under which the tail
+/// is parentless or refused, so it deletes no more than yq:
+///
+/// - A navigation that reads node metadata (`.[] | select(style == "") | line`): on the owned
+///   value every metadata reader answers its default, so the `select` would keep every node, where
+///   yq keeps only the ones whose metadata matches. The document route resolves that shape on the
+///   cursor before it gets here.
+/// - `key` after `key` in the tail: yq's key node has no key of its own, so `.b | key | key`
+///   answers nothing and deletes nothing.
+/// - `..` or `.[]` on a document with aliases (`.e | .. | line`): yq's `..` stops at an alias,
+///   where the owned walk goes on through the anchor's copy and the alias redirect would delete
+///   from the anchor's node.
+fn yq_slot_rewrite_is_sound(navigation: &[Expr], tail: &[Expr]) -> bool {
+    let reads_metadata = navigation.iter().any(|stage| {
+        contains_builtin(stage, |b| {
+            is_yq_metadata_reader_builtin(b)
+                || matches!(b, Builtin::Key | Builtin::Parent | Builtin::ParentN(_))
+        })
+    });
+    let key_after_key = tail
+        .iter()
+        .skip_while(|stage| !matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key)))
+        .skip(1)
+        .any(|stage| matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key)));
+    let walks_through_aliases = alias_identity::active()
+        && navigation.iter().any(|stage| {
+            any_subexpr(stage, &mut |e| {
+                matches!(
+                    e,
+                    Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys | Expr::Iterate
+                )
+            })
+        });
+    !(reads_metadata || key_after_key || walks_through_aliases)
+}
+
 /// Whether `stage` is one of yq's node metadata readers (#8020): `line`, `column`, `kind`, `style`,
 /// `tag`, `anchor`, `alias`, the three comment readers, `path`, `document_index`, `file_index` and
 /// `filename`. Each answers a fresh scalar built with `CreateReplacement`, which keeps its input's
 /// parent and key, so as a `del()` target it is its input's slot, and at the root (which has no
 /// parent) it is a node of its own: not the document, which only `del(.)` deletes.
 fn is_yq_metadata_reader(stage: &Expr) -> bool {
+    matches!(unwrap_paren(stage), Expr::Builtin(b) if is_yq_metadata_reader_builtin(b))
+}
+
+/// [`is_yq_metadata_reader`] of the builtin itself.
+fn is_yq_metadata_reader_builtin(builtin: &Builtin) -> bool {
     matches!(
-        unwrap_paren(stage),
-        Expr::Builtin(
-            Builtin::Line
-                | Builtin::Column
-                | Builtin::Kind
-                | Builtin::Style
-                | Builtin::Tag
-                | Builtin::Anchor
-                | Builtin::Alias
-                | Builtin::HeadComment
-                | Builtin::LineComment
-                | Builtin::FootComment
-                | Builtin::PathNoArg
-                | Builtin::DocumentIndex
-                | Builtin::FileIndex
-                | Builtin::Filename
-        )
+        builtin,
+        Builtin::Line
+            | Builtin::Column
+            | Builtin::Kind
+            | Builtin::Style
+            | Builtin::Tag
+            | Builtin::Anchor
+            | Builtin::Alias
+            | Builtin::HeadComment
+            | Builtin::LineComment
+            | Builtin::FootComment
+            | Builtin::PathNoArg
+            | Builtin::DocumentIndex
+            | Builtin::FileIndex
+            | Builtin::Filename
     )
 }
 
