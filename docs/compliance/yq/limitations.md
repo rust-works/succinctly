@@ -4109,7 +4109,12 @@ The right side of `|=` (and of `with(...)` and `map_values`, which is `.[] |= f`
 The body of `with_entries` is one over each entry (`with_entries(select(false) | {"key": "z", "value": 9})` over two entries is two `z` entries in both).
 A collect over a computed value is one over its source (`.d | to_entries | map(select(false) | 1)` is `[1]`), and the right side of a plain write re-emits after an empty fan-out (`.x = (.a[] | 1)` is `x: 1`).
 Not matched on an update's right side: a union branch (`.a |= ((select(false) | 7), 8)` is `a: 7` in yq and `a: 8` here) and a stage behind a binding (`.a[] |= (. as $x | select(false) | 3)` writes `3` in yq and leaves the members here).
-A `map(f)` whose body reads path context, in a pipe too: `.b | map(select(key == 5) | 3)` over `b: [1, 2]` is `[3]` in yq and `[]` here.
+A `map(f)` whose body reads path context answers it too since [#8034](https://github.com/rust-works/succinctly/issues/8034): `.b | map(select(key == 5) | 3)` over `b: {x: 1, y: 2}` is `[3]` in both.
+A candidate's own `key`, `path` or `parent` reads the empty context and drops out of what it emits (`select(false) | [key]` is `[]` and `select(false) | (1, key)` is `1`, in `map`, `map_values`, `with_entries` and on the right side of `=` and `|=`), where a read after the candidate stands at a node with no position and emits nothing (`select(false) | 3 | key`).
+Not matched inside such a body: a comma of pipes is skipped as a whole when one of its prefixes matched, and its inner pipes are not asked per member (`.b | map((select(key == "zz") | 1), (select(key == "zz") | 2))` is `[1,2]` in yq and `[]` here).
+A candidate whose rewrite keeps a path read declines whole, so `map(select(key == "zz") | ((1 | key), 7))` is `[7]` in yq and `[]` here.
+A path-reading candidate followed by a navigation declines too, because a postfix index is part of the term in yq and the parser spells it as a pipe stage: `map(select(key == "zz") | [key][0])` is `[]` in both, and the explicit `[key] | .[0]`, which parses alike, is `[null]` in yq and `[]` here.
+The same postfix rule is missed for a collect that reads no path context: `[select(false) | [1][0]]` is `[]` in yq and `[null]` here.
 A collection `[...]` after a stage whose input list is empty is `[]` in yq and is answered here only when the whole pipe was empty.
 A pipe nested in an object or a call (`{"k": (select(false) | [1])}`) is asked once per node, as before.
 A literal bound to a variable (`.a[] | 1 as $x | $x` is `1` in yq and nothing here) is not a re-emitting stage.

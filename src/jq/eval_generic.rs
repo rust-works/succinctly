@@ -46895,7 +46895,8 @@ fn eval_map_family_positioned<S: EvalSemantics, V: DocumentValue>(
     };
     // #8002: `map_values(f)` is `.[] |= f` and `with_entries(f)` runs `f` on each entry, so a body
     // that may re-emit after an empty stage keeps each member to ask about it. (yq's `map(f)` with
-    // such a body never reaches here: the parser spells it `[.[] | f]`, the pipe's own rule.)
+    // such a body never reaches here: the parser spells it `[.[] | f]`, the pipe's own rule, which
+    // `owned_identity_prefetch` applies when `f` reads path context, #8034.)
     let reemits = S::TAG == EvalTag::Yq
         && matches!(family, MapFamily::MapValues | MapFamily::WithEntries)
         && yq_pipe_may_reemit(f);
@@ -47586,8 +47587,39 @@ fn owned_identity_prefetch<S: EvalSemantics, V: DocumentValue>(
             Flow::Exhausted
         }),
     );
-    if let Flow::Escaped(control) = flow {
-        *escaped.borrow_mut() = Some(control);
+    let exhausted = match flow {
+        Flow::Escaped(control) => {
+            *escaped.borrow_mut() = Some(control);
+            return Ok(values);
+        }
+        flow => matches!(flow, Flow::Exhausted),
+    };
+    // #8034: `sub` is a pipe evaluated as a whole at this position -- the body of a collect, as in
+    // `[.[] | select(key == 5) | 3]`, which yq's `map(f)` is spelled as when `f` reads path context
+    // -- so yq's empty-stage rule (#6943) holds for it as for any pipe: a literal (or `error`)
+    // after a stage that matched nothing still runs once. The stages before the candidate are
+    // asked at this position, through this pipe, since they read it (`key` is each member's).
+    if exhausted && values.is_empty() && S::TAG == EvalTag::Yq && yq_pipe_may_reemit(sub) {
+        let reemitted = super::eval::yq_reemit_after_empty_stage(sub, &mut |prefix| {
+            yq_positioned_prefix_yields::<S, V>(prefix, value, id.clone(), optional)
+        });
+        if let Some(reemitted) = reemitted {
+            // The rewrite reads no input and no path context (the candidate and every stage after
+            // it must not, as written), so any node stands in for the position.
+            let flow = eval_each_owned::<S>(
+                &reemitted,
+                &OwnedValue::Null,
+                optional,
+                Reentry::REBUILT,
+                &mut |v| {
+                    values.push(v);
+                    Demand::Continue
+                },
+            );
+            if let Flow::Escaped(control) = flow {
+                *escaped.borrow_mut() = Some(control);
+            }
+        }
     }
     Ok(values)
 }
