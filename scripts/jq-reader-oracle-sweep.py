@@ -38,14 +38,13 @@ SEED = 3
 CASES = 15000
 
 # (class, family, flags) -> the issue that tracks it. Captured at seed 3, cases 0..15000, on
-# main 1b01f0911 (macOS arm64).
+# main 1b01f0911 (macOS arm64); #7966 (E2) removed three: the `--seq` NUL cut that #7989's
+# `nul-in-string`/`mix` `--seq` rows came from, and #7991's `mix -n` rows, which are jq 1.7.1's
+# answer for a control character where the NUL is.
 RESIDUALS = {
-    ("BUG(split)", "nul-in-string", "--seq"): "#7989",
     ("BUG(split)", "nul-in-string", "--seq -n"): "#7989",
-    ("BUG(split)", "mix", "--seq"): "#7989",
     ("BUG(split)", "nul-in-string", "-n"): "#7991",
     ("BUG(split)", "nul-in-string", "-n -s"): "#7991",
-    ("BUG(split)", "mix", "-n"): "#7991",
 }
 
 

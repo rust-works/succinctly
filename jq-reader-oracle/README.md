@@ -73,6 +73,18 @@ For each case it runs both C readers in-process and the `--subject` binary as `j
     the run. The exit status is zero exactly when jq 1.7.1's is.
   - **E2:** the fault is at the first NUL outside a string, at its own line and column; the values before it are
     jq 1.7.1's from the bytes before the NUL (no NUL-ended number), and a fault that ends the run exits non-zero.
+    - **What follows the fault** is judged against the releases' run over a twin of the case (`nul_twin`), since
+      the releases themselves read the NUL as data. In the twin, each NUL outside a string becomes a byte jq
+      rejects at the same position (`]` inside an object, `}` elsewhere), and each NUL inside a string becomes
+      `0x01`. A run equal to jq 1.7.1's over the twin is E2 outright.
+    - **Where a NUL is** is found with jq's string state plus the fault rules that move it (`nuls_outside`):
+      - a quote that ends an invalid literal opens no string;
+      - a fault forgets the open containers;
+      - an RS resets the parser under `--seq`;
+      - a leading BOM, or the start of one, is no literal.
+
+      One gap is known: after a lone `0xEF` and a space, jq does not open a string at the next quote, and the
+      model does (seed 1, case 6094).
   - **`#5308`:** with the subject's echoed strings taken out, the output before jq's escape fault is exact, and the
     values and the exit status are those of jq on the stream with the escapes made valid.
 - **The floor** of all of them is the same: a value neither release prints is a bug. A line that is not JSON is such
