@@ -76,7 +76,8 @@ For each case it runs both C readers in-process and the `--subject` binary as `j
     - **What follows the fault** is judged against the releases' run over a twin of the case (`nul_twin`), since
       the releases themselves read the NUL as data. In the twin, each NUL outside a string becomes a byte jq
       rejects at the same position (`]` inside an object, `}` elsewhere), and each NUL inside a string becomes
-      `0x01`. A run equal to jq 1.7.1's over the twin is E2 outright.
+      `0x01`. A run equal to jq 1.7.1's over the twin is E2 outright, and so is one that differs from it only in
+      the line and column of the faults after the first, which E1 leaves best effort (#7967).
     - **Where a NUL is** is found with jq's string state plus the fault rules that move it (`nuls_outside`):
       - a quote that ends an invalid literal opens no string;
       - a fault forgets the open containers;

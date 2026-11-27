@@ -811,8 +811,13 @@ pub fn classify(
     if s == r171 {
         return if agree { Class::Same } else { Class::Split171 };
     }
-    // E2 read every NUL as the twin spells it, and jq 1.7.1 gave the rest: the pin's answer.
-    if facts.nul_twin.as_ref().is_some_and(|(t171, _)| s == t171) {
+    // E2 read every NUL as the twin spells it, and jq 1.7.1 gave the rest: the pin's answer. The
+    // line and column of a fault after the first are E1's best effort (#7967), so they are masked.
+    if facts
+        .nul_twin
+        .as_ref()
+        .is_some_and(|(t171, _)| s == t171 || same_but_later_positions(s, t171))
+    {
         return Class::E2;
     }
     if e2_consistent(stream, s, r171, r182, shape, facts) {
@@ -844,6 +849,30 @@ pub fn classify(
     } else {
         Class::BugSplit
     }
+}
+
+/// `text` with the `line N, column M` of every parse error after the first replaced by
+/// `line _, column _`: ADR-0018's #7963 amendment E1 owes the first fault's position, and leaves a
+/// later fault's best effort (#7967). Standard output goes first, as a trace's caught faults come
+/// before the one that ends a run.
+fn later_positions_masked(t: &Transcript) -> Vec<u8> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"line \d+, column \d+").expect("a valid regex"));
+    let text = [t.stdout.as_slice(), b"\0", t.stderr.as_slice()].concat();
+    let mut first = true;
+    re.replace_all(&text, |m: &regex::bytes::Captures<'_>| {
+        if std::mem::take(&mut first) {
+            m[0].to_vec()
+        } else {
+            b"line _, column _".to_vec()
+        }
+    })
+    .into_owned()
+}
+
+/// `s` is `r` but for the positions of the faults after the first (#7967), with `r`'s status.
+fn same_but_later_positions(s: &Transcript, r: &Transcript) -> bool {
+    s.status == r.status && later_positions_masked(s) == later_positions_masked(r)
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -1604,6 +1633,46 @@ mod tests {
 
     // #7966: after the NUL's fault, succinctly does what jq does after a fault at that byte. The
     // releases read the NUL as data, so their run over the stream is not E2's floor; the twin's is.
+    /// #7967: over the twin, E1 lets the positions after the first fault differ (seed 3, case 1707:
+    /// a NUL inside a string, the twin's later fault two columns on), and nothing else: a value the
+    /// twin's run does not print, or another first fault, is not E2.
+    #[test]
+    fn the_twins_answer_is_e1s_after_its_first_fault_7967() {
+        let trace = Shape {
+            trace: true,
+            ..Shape::default()
+        };
+        let stream = b"\"a\x00\" }\n2\n";
+        let real = tb(b"[\"E\",\"Invalid string at line 1, column 4\",\"<stdin>\",1]\n", b"", 0);
+        let t = tb(
+            b"[\"E\",\"Invalid string at line 1, column 4\",\"<stdin>\",1]\n[\"E\",\"Unmatched '}' at line 1, column 6\",\"<stdin>\",1]\n[\"V\",2,\"<stdin>\",2]\n",
+            b"",
+            0,
+        );
+        let facts = Facts {
+            nul_twin: Some((t.clone(), t.clone())),
+            ..Facts::default()
+        };
+        let later = tb(
+            b"[\"E\",\"Invalid string at line 1, column 4\",\"<stdin>\",1]\n[\"E\",\"Unmatched '}' at line 1, column 8\",\"<stdin>\",1]\n[\"V\",2,\"<stdin>\",2]\n",
+            b"",
+            0,
+        );
+        assert_eq!(classify(stream, &later, &real, &real, trace, &facts), Class::E2);
+        let extra = tb(
+            b"[\"E\",\"Invalid string at line 1, column 4\",\"<stdin>\",1]\n[\"V\",7,\"<stdin>\",1]\n[\"V\",2,\"<stdin>\",2]\n",
+            b"",
+            0,
+        );
+        assert_ne!(classify(stream, &extra, &real, &real, trace, &facts), Class::E2);
+        let first = tb(
+            b"[\"E\",\"Invalid string at line 1, column 5\",\"<stdin>\",1]\n[\"V\",2,\"<stdin>\",2]\n",
+            b"",
+            0,
+        );
+        assert_ne!(classify(stream, &first, &real, &real, trace, &facts), Class::E2);
+    }
+
     #[test]
     fn e2s_floor_after_the_fault_is_the_twins() {
         let seq = Shape {
