@@ -137167,7 +137167,6 @@ mod tests {
             "error(\"x\")",
             "{\"a\": 1}",
             "(1 | select(false)), 2",
-            "-(1)",
             "1 + 2",
             "1 == 2",
             "true and false",
@@ -137181,7 +137180,6 @@ mod tests {
             "error(1 | select(false))",
             "{\"a\": (1 | select(false))}",
             "(1 | select(false)), (2 | select(false))",
-            "-(1 | select(false))",
             "1 + (1 | select(false))",
             "(1 | select(false)) == 2",
             "true and (1 | select(false))",
@@ -137190,6 +137188,14 @@ mod tests {
         ] {
             assert!(!answers(src), "`{src}`");
         }
+        // yq has no unary minus (#8048), so a negation is built rather than parsed.
+        let negated_answers = |src: &str| {
+            let operand = parse_with_mode_and_extensions(src, ParserMode::Yq, true).unwrap();
+            let expr = Expr::Negate(Box::new(operand));
+            reemit_always_answers(&yq_empty_context_reemit(&expr).expect(src))
+        };
+        assert!(negated_answers("1"));
+        assert!(!negated_answers("1 | select(false)"));
     }
 
     /// #6943: the allocation-free test the pipe entry asks never says `false` where the rewrite
