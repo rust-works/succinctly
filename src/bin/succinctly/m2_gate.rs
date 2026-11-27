@@ -225,6 +225,10 @@ pub fn is_array_of_nodes(expr: &Expr) -> bool {
 fn is_navigation(stage: &Expr) -> bool {
     match stage {
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
+        // A spelled integer key (`.m[0x1]`, #7999) is one field or one index.
+        Expr::IndexExpr { .. } => stage
+            .spelled_int_bracket()
+            .is_some_and(|(target, ..)| is_navigation(target)),
         Expr::Optional(inner) | Expr::Paren(inner) => is_navigation(inner),
         Expr::Pipe(stages) => stages.iter().all(is_navigation),
         _ => false,
@@ -356,10 +360,13 @@ fn navigates_only(expr: &Expr) -> bool {
         | Expr::RecursiveDescent => true,
         Expr::Optional(inner) | Expr::Paren(inner) => navigates_only(inner),
         Expr::Pipe(stages) => stages.iter().all(navigates_only),
-        // #2126: a `del()` argument keeps `.["a"]` as a bracket on its target: navigation too.
+        // #2126: a `del()` argument keeps `.["a"]` as a bracket on its target: navigation too. So
+        // is a spelled integer key (`.s[0x1]`, `.m[01]`, #7999), a field or an index by the node.
         Expr::IndexExpr { .. } => expr
             .literal_bracket_key()
-            .is_some_and(|(target, _)| navigates_only(target)),
+            .map(|(target, _)| target)
+            .or_else(|| expr.spelled_int_bracket().map(|(target, ..)| target))
+            .is_some_and(navigates_only),
         _ => false,
     }
 }
@@ -449,6 +456,11 @@ mod tests {
         ".missing | [.[]?]",
         "[.missing]",
         "[.users[] | select(.name)]",
+        // #7999: a spelled integer key is a field or an index by the node.
+        "[.[0x1]]",
+        "[.users[0x0]]",
+        "[.a.b[01]]",
+        ".users[0x0] | [.[]]",
     ];
 
     /// #3475: yq streams an array whose every element is a node of the document, and keeps every

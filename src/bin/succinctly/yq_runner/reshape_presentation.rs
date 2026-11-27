@@ -31,6 +31,10 @@ pub(super) fn supported(expr: &Expr) -> bool {
     }
     match expr {
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
+        // A spelled integer key (`.m[0x1]`, #7999) is a field or an index by the node.
+        Expr::IndexExpr { .. } => expr
+            .spelled_int_bracket()
+            .is_some_and(|(target, ..)| supported(target)),
         Expr::Paren(inner) => supported(inner),
         Expr::Pipe(parts) => parts.iter().all(supported),
         Expr::Arithmetic {
@@ -110,6 +114,9 @@ fn pure_condition(expr: &Expr) -> bool {
         Expr::Pipe(parts) => parts.iter().all(pure_condition),
         // Reads of the item and closed literals; a write or a rebuilding builtin is not a test.
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
+        Expr::IndexExpr { .. } => expr
+            .spelled_int_bracket()
+            .is_some_and(|(target, ..)| pure_condition(target)),
         _ => is_closed_literal(expr),
     }
 }
@@ -241,6 +248,9 @@ fn array_operands(inner: &Expr) -> Vec<&Expr> {
 fn rename_target(expr: &Expr) -> bool {
     match expr {
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } | Expr::Iterate => true,
+        Expr::IndexExpr { .. } => expr
+            .spelled_int_bracket()
+            .is_some_and(|(target, ..)| rename_target(target)),
         Expr::Pipe(parts) => parts.iter().all(rename_target),
         Expr::Paren(inner) => rename_target(inner),
         _ => false,
@@ -250,6 +260,10 @@ fn rename_target(expr: &Expr) -> bool {
 fn static_path(expr: &Expr) -> bool {
     match expr {
         Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
+        // A spelled integer key (#7999): [`land`] and [`trace_at_depth`] resolve it by the node.
+        Expr::IndexExpr { .. } => expr
+            .spelled_int_bracket()
+            .is_some_and(|(target, ..)| static_path(target)),
         Expr::Pipe(parts) => parts.iter().all(static_path),
         Expr::Paren(inner) => static_path(inner),
         _ => false,
@@ -352,6 +366,22 @@ fn land<C: DocumentCursor>(expr: &Expr, from: Landed<C>) -> Option<Landed<C>> {
                 node: found,
                 element: true,
             })
+        }
+        // #7999: a spelled integer key is the field of its text on a mapping, the index of its
+        // value on a sequence.
+        Expr::IndexExpr { .. } => {
+            let (target, idx, text) = expr.spelled_int_bracket()?;
+            let at = land(target, from)?;
+            let is_mapping = at
+                .node
+                .as_ref()
+                .is_some_and(|node| node.value().as_object().is_some());
+            let step = if is_mapping {
+                Expr::Field(text.to_string())
+            } else {
+                Expr::index(idx)
+            };
+            land(&step, at)
         }
         _ => None,
     }
@@ -1048,6 +1078,17 @@ fn trace_at_depth(
                 .map_or_else(CommentTree::empty, |i| tree.at_index(i).clone());
             Some((evaluated(expr, value)?, meta))
         }
+        // #7999: a spelled integer key is the field of its text on a mapping, the index of its
+        // value on a sequence.
+        Expr::IndexExpr { .. } => {
+            let (target, idx, text) = expr.spelled_int_bracket()?;
+            let at = next(target, input)?;
+            let step = match &at.0 {
+                OwnedValue::Object(_) => Expr::Field(text.to_string()),
+                _ => Expr::index(idx),
+            };
+            next(&step, &at)
+        }
         Expr::Pipe(parts) => {
             let mut pair = input.clone();
             for part in parts {
@@ -1402,7 +1443,7 @@ fn trace_at_depth(
             if *written != loaded_value {
                 return None;
             }
-            let targets = collect_write_targets(expr)?;
+            let targets = collect_write_targets(expr, Some(value))?;
             let base = if matches!(value, OwnedValue::Null) {
                 // A null input has no mapping to write into: the write makes one.
                 empty_object()
@@ -1413,7 +1454,7 @@ fn trace_at_depth(
         }
         Expr::Assign { .. } | Expr::Update { .. } => {
             let result = evaluated(expr, value)?;
-            let targets = collect_write_targets(expr)?;
+            let targets = collect_write_targets(expr, Some(value))?;
             let meta = reconcile_presentation(value, tree, &result, &targets);
             Some((result, meta))
         }

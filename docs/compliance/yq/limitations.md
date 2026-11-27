@@ -6208,10 +6208,14 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   `True`/`yes`), and `"~" == null` is `true` here (yq `false`).
   Every one of these already shows in `tostring`.
   An integer of a *document* written `0x1f`, `0o17`, `01`, `+5` or `007` keeps its spelling since the integer slice of #2802, so `==`, `tostring`, `join`, `sort`, `unique` and `split` by such a separator (#4263) read its text as yq does (`.a == 31` on `a: 0x1f` is `false`).
-  The same integer written as a decimal filter literal still compares by value here (`1 == 01` is `true`, `false` in yq).
+  A decimal filter literal with leading zeros (`01`, `007`, `-01`) keeps its spelling since #7999, as a document's does: `1 == 01` is `false` and `01 | tostring` is `"01"`, as in yq.
+  A float literal does not: `01.5 | tostring` is `"1.5"` here and `"01.5"` in yq.
+  A mapping key spelled `08` or `09`, which YAML 1.1 cannot read as an octal integer, prints bare here (`{09: 1}` is `09: 1`), where yq tags it (`!!int 09: 1`).
+  A value spelled so is tagged as in yq (`[09]` is `- !!int 09`).
   A hexadecimal filter literal (`0x1f`, `0X1F`) keeps its spelling since #7615, as a document's does: `0x10 == 16` is `false` and `[0x1f, 31] | unique` is `[31,31]`, as in yq.
   A hex literal past `i64` is refused with yq's `strconv.ParseInt: parsing "FFFFFFFFFFFFFFFF": value out of range`, behind the `parse error at position N:` prefix every parse error has here.
   A spelled integer is still an index by value for `has` on a sequence, from a document or a literal: `[1,2] | has(0x1)` is `true` here, and in yq the error `strconv.ParseInt: parsing "0x1": invalid syntax`.
+  A spelled bracket key indexes a mapping by its text since #7999, as in yq: `.m[0x1] = 9` and `del(.m[01])` reach the keys `0x1` and `01`, not `1`, and a sequence is still indexed by the value (`.s[0x1]` is its second element).
   An underscored integer (`1_000`) is a string here, the recorded input-spec divergence.
 - **`split`'s separator literals** ([#4374](https://github.com/rust-works/succinctly/issues/4374)):
   the `{}` literal splits on the text `{}` as in yq (`"a{}b" | split({})` is `["a","b"]`), recognised
@@ -6286,7 +6290,7 @@ untouched. The key is `tostring`'s text, so `==` and `unique` agree about a numb
   gives `.anch | unique | length` of `3` in yq and `1` here (`group_by(.) | length` is `2` there and
   `1` here). Aliases are resolved before the key is built, so the identity is gone.
 - **Spellings `OwnedValue` cannot keep** ([#2802](https://github.com/rust-works/succinctly/issues/2802)):
-  the text a `True` keys on is its resolved text here, as is a `01` written as a filter literal (`[01, 1] | unique` is `[1]` here and `[1,1]` in yq; a `0x1f` literal keys on its text since #7615).
+  the text a `True` keys on is its resolved text here (a `0x1f` filter literal keys on its text since #7615, and a `01` one since #7999).
   A document `[01, 1, 0x1f, 31, True, true] | unique` has 5 elements here and 6 in yq: its integers key on their text since the integer slice of #2802, the `True` does not.
   The same residual `==` has.
 - **Cost.** yq mode builds one `String` key per element and probes a hashed `IndexSet`/`IndexMap`

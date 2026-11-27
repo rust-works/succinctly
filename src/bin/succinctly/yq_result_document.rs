@@ -91,6 +91,10 @@ fn either(a: Node, b: Node) -> Option<Node> {
 fn yields_one(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) | Expr::Identity | Expr::Field(_) | Expr::Index { .. } => true,
+        // A spelled integer key (`.m[0x1]`, #7999) is one field or one index.
+        Expr::IndexExpr { .. } => expr
+            .spelled_int_bracket()
+            .is_some_and(|(target, ..)| yields_one(target)),
         Expr::Paren(inner) => yields_one(inner),
         Expr::Pipe(stages) => stages.iter().all(yields_one),
         _ => false,

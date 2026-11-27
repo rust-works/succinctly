@@ -4623,7 +4623,18 @@ impl<'a> Parser<'a> {
         // `@json`/string interpolation -- `from_number_bytes` gates on the
         // identical check for document numbers, for the identical reason
         // (see its own doc comment).
-        if crate::json::validate::is_valid_number(num_str.as_bytes()) {
+        //
+        // #7999: yq's lexer keeps an integer token's text, so in yq mode `01`, `007` and `-01`
+        // are the spelled integers a document's are (#2802), as a hex `0x1` is (#7615): `01 |
+        // tostring` is `"01"`, `1 == 01` is `false`, and `.m[01]` names the key `01`.
+        let yq_spelled_int = self.mode == ParserMode::Yq
+            && matches!(repr, NumberRepr::Int(_))
+            && num_str
+                .strip_prefix('-')
+                .unwrap_or(num_str)
+                .bytes()
+                .all(|b| b.is_ascii_digit());
+        if yq_spelled_int || crate::json::validate::is_valid_number(num_str.as_bytes()) {
             Ok(Literal::NumberLiteral(repr, num_str.to_string()))
         } else {
             Ok(match repr {
@@ -5159,6 +5170,15 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(']') => {
                 self.next();
+                // #7999: yq indexes a mapping by a number key's text, so `.m[0x1]` and `.m[01]`
+                // name the keys `0x1` and `01`. Folded to `Expr::Index`, the key would be `1`;
+                // as a computed key it is the spelled integer, as `0x1 as $x | .[$x]` is.
+                if self.mode == ParserMode::Yq && Self::is_spelled_int_key(&key) {
+                    return Ok(Bracket::Dynamic {
+                        key,
+                        optional: false,
+                    });
+                }
                 Ok(match Self::fold_index_key(&key) {
                     // #3374: a wildcard key is a generator over the matching keys.
                     Some(Expr::Field(name))
@@ -5591,6 +5611,16 @@ impl<'a> Parser<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Whether a bracket key is an integer literal whose text is not its decimal value: yq's hex
+    /// `0x1` (#7615) or a yq-mode `01`, `-01`, `00` (#7999), seen through parens.
+    ///
+    /// yq indexes a mapping by the key's text and a sequence by its value, so such a key must not
+    /// fold to [`Expr::Index`], which keeps only the value. A canonical `1` still folds: the text
+    /// and the value name the same key. Only the yq parser keeps such a spelling.
+    fn is_spelled_int_key(key: &Expr) -> bool {
+        Expr::spelled_int_key(key).is_some()
     }
 
     /// Fold a slice bound to the `i64` every navigation step uses, seeing
@@ -13395,6 +13425,9 @@ impl<'a> Parser<'a> {
                     key: Some(NumberKey::Float(*f)),
                 })
             }
+            // A spelled integer (`0x1`, `01`, #7999) folds to its value too: the write through
+            // the sum is the no-op it is in yq whichever key it names, and a computed key here
+            // would read as a path expression that is not one.
             Expr::Literal(Literal::NumberLiteral(..)) => Self::fold_index_key(key),
             _ => None,
         }
