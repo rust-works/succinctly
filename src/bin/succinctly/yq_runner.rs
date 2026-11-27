@@ -6793,7 +6793,7 @@ fn resolve_spelled_brackets(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
             Expr::Pipe(stages) => {
                 let mut out = Vec::with_capacity(stages.len());
                 let mut at = node;
-                for stage in stages.iter() {
+                for stage in stages {
                     let (e, next) = walk(stage, at)?;
                     out.push(e);
                     at = next;
