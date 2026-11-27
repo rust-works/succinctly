@@ -12,7 +12,7 @@ ADR-0031 (`docs/adrs/adr-0031.md`) records why jq mode compiles and matches with
 - **Local changes:** none. `SHA256SUMS` lists every file; `shasum -a 256 -c SHA256SUMS` in this directory checks them.
 - **Upstream** ended on 2025-04-24 (the repository is archived). No advisory feed will report a fix, so this copy is ours to keep.
   A change to it is a change to jq-mode answers, and has to pass the regex corpus gate (`scripts/jq-regex-corpus.py`, #7965).
-- **Build:** `build.rs` compiles these files with the `cc` crate when the `onig-engine` feature is on, with `-std=gnu17` on non-MSVC targets.
+- **Build:** `build.rs` compiles these files with the `cc` crate whenever the `regex` feature is on (so in every `cli` build), with `-std=gnu17` on non-MSVC targets.
   The pinned sources do not compile as C23, which GCC 15 uses by default.
 
 To re-vendor (only with a decision to move off the pin):

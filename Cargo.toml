@@ -82,13 +82,11 @@ locale-time = ["std", "dep:libc"]
 
 # Enable regex support in jq query language. `fancy-regex` compiles only the jq
 # patterns the `regex` crate refuses for lookaround or a backreference (#5502).
-regex = ["dep:regex", "dep:regex-syntax", "dep:fancy-regex"]
-
-# Builds the vendored Oniguruma (`vendor/oniguruma`, the commit jq 1.7.1 bundles)
-# and its FFI (`src/jq/onig_ffi.rs`), the engine jq-mode regex moves to (#7965,
-# ADR-0031). Off by default and in no shipped build yet: nothing calls it until
-# the adapter lands. Needs a C compiler.
-onig-engine = ["std", "regex", "dep:cc"]
+# It also builds the vendored Oniguruma (`vendor/oniguruma`, the commit jq 1.7.1
+# bundles) and its FFI (`src/jq/onig_ffi.rs`), which needs a C compiler: jq mode
+# runs on it with `SUCCINCTLY_REGEX_ONIG=1`, until it becomes the default
+# (#7965, ADR-0031).
+regex = ["std", "dep:regex", "dep:regex-syntax", "dep:fancy-regex", "dep:cc"]
 
 # Test features (not for production)
 large-tests = []    # 1G bitvector tests (~125MB RAM)
@@ -171,7 +169,7 @@ libc = { version = "0.2", optional = true }
 jiff = { version = "1.0", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"], optional = true }
 
 [build-dependencies]
-# Only for `onig-engine`, which compiles the vendored Oniguruma (#7965).
+# Only for `regex`, which compiles the vendored Oniguruma (#7965).
 cc = { version = "1.2", optional = true }
 
 [dev-dependencies]

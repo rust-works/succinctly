@@ -1,6 +1,5 @@
-//! #7965 (ADR-0031 step 3): with `onig-engine` built in and `SUCCINCTLY_REGEX_ONIG=1`, jq-mode
-//! regex compiles and matches with Oniguruma at jq 1.7.1's pin, read the way jq 1.7.1's `f_match`
-//! reads it.
+//! #7965 (ADR-0031 step 3): with `SUCCINCTLY_REGEX_ONIG=1`, jq-mode regex compiles and matches with
+//! Oniguruma at jq 1.7.1's pin, read the way jq 1.7.1's `f_match` reads it.
 //!
 //! Every expected answer was captured from `/usr/bin/jq` 1.7.1, except `capture` on a group that
 //! took no part in an empty match, which follows jq 1.8.2 (#7520). The rows are the shape the corpus
@@ -9,7 +8,7 @@
 //! reports it at offset 0, counts its length from the start of the text, and reads its string from
 //! the raw bytes, each stray byte a U+FFFD.
 
-#![cfg(feature = "onig-engine")]
+#![cfg(feature = "regex")]
 
 use anyhow::Result;
 

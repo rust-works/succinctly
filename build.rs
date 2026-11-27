@@ -1,14 +1,13 @@
 //! Builds the vendored Oniguruma (`vendor/oniguruma`, the commit jq 1.7.1 bundles) when the
-//! `onig-engine` feature is on (#7965, ADR-0031). Every other build runs this script and does
-//! nothing.
+//! `regex` feature is on (#7965, ADR-0031). Every other build runs this script and does nothing.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    #[cfg(feature = "onig-engine")]
+    #[cfg(feature = "regex")]
     oniguruma::build();
 }
 
-#[cfg(feature = "onig-engine")]
+#[cfg(feature = "regex")]
 mod oniguruma {
     use std::env;
     use std::fs;
@@ -44,6 +43,17 @@ mod oniguruma {
         let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
         let bits = env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap_or_else(|_| "64".into());
         println!("cargo:rerun-if-changed=vendor/oniguruma/src");
+        // An MSVC target from a host that is not Windows has no `cl.exe` to compile with. That is
+        // the type-check of the Windows build that CI and `scripts/pre-push.sh` run from Linux and
+        // macOS (`cargo check --target x86_64-pc-windows-msvc`), which links nothing, so the
+        // library is left out; a `cargo build` for that target then fails at the link.
+        if target_env == "msvc" && !cfg!(windows) {
+            println!(
+                "cargo:warning=Oniguruma is not compiled for an MSVC target from this host; \
+                 a check only, not a build"
+            );
+            return;
+        }
 
         let mut cc = cc::Build::new();
         let config_h = out.join("config.h");

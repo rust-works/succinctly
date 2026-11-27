@@ -1499,11 +1499,10 @@ jobs:
           RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
         run: cargo check --locked --features cli,simd,regex,serde
 
-  # #7965 (ADR-0031): the vendored Oniguruma, built by `build.rs` through `cc` when the
-  # `onig-engine` feature is on, compiled and run on Linux and on a native Windows host with
-  # MSVC. It is the only job that compiles the C on Windows: the `Clippy` job's Windows step
-  # type-checks from Linux and does not compile C. Not a required check while nothing ships
-  # with the feature; it becomes one with step 4 of #7965.
+  # #7965 (ADR-0031): the vendored Oniguruma, built by `build.rs` through `cc` whenever the
+  # `regex` feature is on, run on Linux and on a native Windows host with MSVC. It is the only
+  # job that compiles the C on Windows: the `Clippy` job's Windows step type-checks from Linux,
+  # where `build.rs` leaves the C out.
   oniguruma:
     name: Oniguruma (${{ matrix.os }})
     needs: gate
@@ -1520,7 +1519,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build the vendored Oniguruma and run its FFI tests
-        run: cargo test --locked --lib --features onig-engine jq::onig_ffi
+        run: cargo test --locked --lib --features regex jq::onig_ffi
 
       # Step 3: jq's `f_match` ported onto the library, run with `SUCCINCTLY_REGEX_ONIG=1`
       # (`tests/jq_cli/i7965.rs`). The corpus gate itself is scripts/jq-regex-corpus.py's. Not on
@@ -1528,7 +1527,7 @@ jobs:
       # build above is what only Windows checks.
       - name: Run the jq adapter's CLI tests
         if: runner.os != 'Windows'
-        run: cargo test --locked --features cli,onig-engine --test jq_cli_tests per_issue::i7965
+        run: cargo test --locked --features cli --test jq_cli_tests per_issue::i7965
 
   # Pull-request coverage: the sticky patch-coverage comment, diffed against the
   # baseline that coverage-baseline.yml published for the PR's merge-base. Only

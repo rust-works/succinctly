@@ -33574,13 +33574,12 @@ enum RegexEngine {
     },
     /// Oniguruma itself, at jq 1.7.1's pin, called as jq's `f_match` calls it (ADR-0031, #7965).
     /// None of [`JqRegex`]'s other fields apply: the library answers for every construct.
-    #[cfg(feature = "onig-engine")]
     Onig(OnigEngine),
 }
 
 /// Whether jq-mode patterns compile with [`OnigEngine`]: `SUCCINCTLY_REGEX_ONIG=1`, read once.
 /// Off by default, and with `=0`, until the engine becomes the default (ADR-0031 step 4, #7961).
-#[cfg(feature = "onig-engine")]
+#[cfg(feature = "regex")]
 fn onig_engine_selected() -> bool {
     static SELECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SELECTED.get_or_init(|| std::env::var_os("SUCCINCTLY_REGEX_ONIG").is_some_and(|v| v == "1"))
@@ -33588,7 +33587,7 @@ fn onig_engine_selected() -> bool {
 
 /// A jq-mode pattern compiled by Oniguruma as jq 1.7.1's `f_match` (`src/builtin.c`) compiles it:
 /// `ONIG_OPTION_CAPTURE_GROUP` plus one option per modifier letter, UTF-8, `ONIG_SYNTAX_PERL_NG`.
-#[cfg(feature = "onig-engine")]
+#[cfg(feature = "regex")]
 struct OnigEngine {
     re: super::onig_ffi::OnigRegex,
     /// Entry `i` is group `i`'s name, entry 0 the whole match's (none). Where several groups share
@@ -33596,7 +33595,7 @@ struct OnigEngine {
     names: Vec<Option<Box<str>>>,
 }
 
-#[cfg(feature = "onig-engine")]
+#[cfg(feature = "regex")]
 impl OnigEngine {
     /// `onig_new` on `pattern`, after `f_match`'s check of `flags`: a letter it does not know
     /// refuses the whole string (`"gz is not a valid modifier string"`), and `g` sets no option
@@ -33711,7 +33710,6 @@ enum RegexCaptures<'h> {
     Mapped(Vec<Option<RegexMatch<'h>>>),
     /// A [`RegexEngine::Onig`] match: its groups as jq reads them ([`OnigEngine::group`]), and the
     /// whole match's byte span as the library reported it, where jq's next search starts from.
-    #[cfg(feature = "onig-engine")]
     Onig {
         groups: Vec<Option<RegexMatch<'h>>>,
         raw: (usize, usize),
@@ -33818,7 +33816,6 @@ impl<'h> RegexCaptures<'h> {
                 caps.get(i).map(|m| RegexMatch::at(m.as_str(), m.start()))
             }
             RegexCaptures::Mapped(groups) => groups.get(i).cloned().flatten(),
-            #[cfg(feature = "onig-engine")]
             RegexCaptures::Onig { groups, .. } => groups.get(i).cloned().flatten(),
         }
     }
@@ -33940,7 +33937,6 @@ impl JqRegex {
         }
         match &self.engine {
             // jq's test mode: the first search's answer.
-            #[cfg(feature = "onig-engine")]
             RegexEngine::Onig(engine) => Ok(engine.captures_at(input, 0)?.is_some()),
             RegexEngine::Std(re) | RegexEngine::Rewritten { re, .. } => {
                 let found = dv_is_match(re, input, self.needs_trailing_nl_check);
@@ -33993,7 +33989,6 @@ impl JqRegex {
             return found;
         }
         match &self.engine {
-            #[cfg(feature = "onig-engine")]
             RegexEngine::Onig(engine) => engine.captures_at(input, start),
             RegexEngine::Std(re) => {
                 let caps = dv_captures_at(
@@ -34061,7 +34056,6 @@ impl JqRegex {
 
     fn capture_names(&self) -> RegexCaptureNames<'_> {
         match &self.engine {
-            #[cfg(feature = "onig-engine")]
             RegexEngine::Onig(engine) => RegexCaptureNames::Mapped(engine.names.iter()),
             RegexEngine::Std(re) => RegexCaptureNames::Std(re.capture_names()),
             RegexEngine::Fancy(re) => RegexCaptureNames::Fancy(re.capture_names()),
@@ -34073,7 +34067,6 @@ impl JqRegex {
 
     fn captures_len(&self) -> usize {
         match &self.engine {
-            #[cfg(feature = "onig-engine")]
             RegexEngine::Onig(engine) => engine.names.len(),
             RegexEngine::Std(re) => re.captures_len(),
             RegexEngine::Fancy(re) => re.captures_len(),
@@ -40268,7 +40261,6 @@ fn build_regex_uncached<S: EvalSemantics>(
     // jq checks the modifiers before it compiles the pattern, so `test("(?P<n>a)"; "z")` is the
     // modifier error.
     // ADR-0031: Oniguruma compiles the pattern as jq does, and none of the passes below run.
-    #[cfg(feature = "onig-engine")]
     if S::TAG != EvalTag::Yq && onig_engine_selected() {
         return Ok(JqRegex {
             engine: RegexEngine::Onig(OnigEngine::compile(pattern, flags)?),
@@ -43468,7 +43460,6 @@ fn next_match_step<'h>(
     // Oniguruma's match: jq's own step from the span the library reported (`f_match`): the next
     // search starts where a match ended, or one *byte* after an empty one, inside a multibyte
     // character if one follows (#7965). The #6169 guard below still applies.
-    #[cfg(feature = "onig-engine")]
     if let RegexCaptures::Onig { raw, .. } = &caps {
         let (raw_start, raw_end) = *raw;
         let backward_repeat = raw_start < start && raw_end <= start;
