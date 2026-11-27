@@ -33572,6 +33572,133 @@ enum RegexEngine {
         /// on the rewrite (#6488).
         as_written: Option<Box<fancy_regex::Regex>>,
     },
+    /// Oniguruma itself, at jq 1.7.1's pin, called as jq's `f_match` calls it (ADR-0031, #7965).
+    /// None of [`JqRegex`]'s other fields apply: the library answers for every construct.
+    #[cfg(feature = "onig-engine")]
+    Onig(OnigEngine),
+}
+
+/// Whether jq-mode patterns compile with [`OnigEngine`]: `SUCCINCTLY_REGEX_ONIG=1`, read once.
+/// Off by default, and with `=0`, until the engine becomes the default (ADR-0031 step 4, #7961).
+#[cfg(feature = "onig-engine")]
+fn onig_engine_selected() -> bool {
+    static SELECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SELECTED.get_or_init(|| std::env::var_os("SUCCINCTLY_REGEX_ONIG").is_some_and(|v| v == "1"))
+}
+
+/// A jq-mode pattern compiled by Oniguruma as jq 1.7.1's `f_match` (`src/builtin.c`) compiles it:
+/// `ONIG_OPTION_CAPTURE_GROUP` plus one option per modifier letter, UTF-8, `ONIG_SYNTAX_PERL_NG`.
+#[cfg(feature = "onig-engine")]
+struct OnigEngine {
+    re: super::onig_ffi::OnigRegex,
+    /// Entry `i` is group `i`'s name, entry 0 the whole match's (none). Where several groups share
+    /// a name, each carries it, as `f_match_name_iter` sets it on every one.
+    names: Vec<Option<Box<str>>>,
+}
+
+#[cfg(feature = "onig-engine")]
+impl OnigEngine {
+    /// `onig_new` on `pattern`, after `f_match`'s check of `flags`: a letter it does not know
+    /// refuses the whole string (`"gz is not a valid modifier string"`), and `g` sets no option
+    /// (the caller's search loop reads it).
+    fn compile(pattern: &str, flags: Option<&str>) -> Result<Self, EvalError> {
+        use super::onig_ffi as ffi;
+        let mut options = ffi::ONIG_OPTION_CAPTURE_GROUP;
+        let flags = flags.unwrap_or_default();
+        for c in flags.chars() {
+            options |= match c {
+                'g' => ffi::ONIG_OPTION_NONE,
+                'i' => ffi::ONIG_OPTION_IGNORECASE,
+                'x' => ffi::ONIG_OPTION_EXTEND,
+                'm' => ffi::ONIG_OPTION_MULTILINE,
+                's' => ffi::ONIG_OPTION_SINGLELINE,
+                'p' => ffi::ONIG_OPTION_MULTILINE | ffi::ONIG_OPTION_SINGLELINE,
+                'l' => ffi::ONIG_OPTION_FIND_LONGEST,
+                'n' => ffi::ONIG_OPTION_FIND_NOT_EMPTY,
+                _ => {
+                    return Err(EvalError::new(format!(
+                        "{flags} is not a valid modifier string"
+                    )))
+                }
+            };
+        }
+        let re = ffi::OnigRegex::new(pattern, options).map_err(Self::failure)?;
+        let mut names: Vec<Option<Box<str>>> = vec![None; re.captures_len() + 1];
+        for (name, groups) in re.names() {
+            for g in groups {
+                if let Some(slot) = names.get_mut(g) {
+                    *slot = Some(name.as_str().into());
+                }
+            }
+        }
+        Ok(Self { re, names })
+    }
+
+    /// jq's error for a failed compile or search: `Regex failure: ` and the library's message,
+    /// whose bytes jq reads as a string (a name cut inside a character ends in U+FFFD).
+    fn failure(e: super::onig_ffi::OnigError) -> EvalError {
+        EvalError::new(format!("Regex failure: {}", e.text()))
+    }
+
+    /// The match `onig_search` finds from byte `start` to the end of `input`, its groups as jq
+    /// reads them.
+    fn captures_at<'h>(
+        &self,
+        input: &'h str,
+        start: usize,
+    ) -> Result<Option<RegexCaptures<'h>>, EvalError> {
+        let Some(spans) = self
+            .re
+            .search(input.as_bytes(), start)
+            .map_err(Self::failure)?
+        else {
+            return Ok(None);
+        };
+        let raw = spans
+            .first()
+            .copied()
+            .flatten()
+            .expect("group 0 holds the whole match");
+        let groups = (0..self.names.len())
+            .map(|i| {
+                spans
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map(|(b, e)| Self::group(input, b, e))
+            })
+            .collect();
+        Ok(Some(RegexCaptures::Onig { groups, raw }))
+    }
+
+    /// The byte span `beg..end` Oniguruma reported, as jq 1.7.1's `f_match` reads it (#7965).
+    ///
+    /// jq counts characters by walking lead bytes from the start of the text. An empty span is at
+    /// the count of characters that begin before it. A span that is not empty is at the character
+    /// that begins at `beg`, and when none does (jq's byte step after an empty match searched from
+    /// inside a character), at offset 0; either way its length counts every character that begins
+    /// before `end`. Its string is the bytes `beg..end`, which `jv_string_sized` reads with each
+    /// stray continuation byte, and a sequence cut at the end, as U+FFFD.
+    ///
+    /// The returned span is on character boundaries and gives those counts to every builtin that
+    /// counts or slices by it: `split` and `sub` read the offset and length as jq's definitions do.
+    fn group(input: &str, beg: usize, end: usize) -> RegexMatch<'_> {
+        let ceil = |mut at: usize| {
+            while !input.is_char_boundary(at) {
+                at += 1;
+            }
+            at
+        };
+        if beg == end {
+            let at = ceil(beg);
+            return RegexMatch::at(&input[at..at], at);
+        }
+        RegexMatch {
+            text: String::from_utf8_lossy(&input.as_bytes()[beg..end]),
+            start: if input.is_char_boundary(beg) { beg } else { 0 },
+            end: ceil(end),
+        }
+    }
 }
 
 /// One match's capture groups, from either [`RegexEngine`].
@@ -33582,6 +33709,13 @@ enum RegexCaptures<'h> {
     /// A [`RegexEngine::Rewritten`] match, its copies already read back into the original
     /// pattern's groups (each the last of its copies the match set).
     Mapped(Vec<Option<RegexMatch<'h>>>),
+    /// A [`RegexEngine::Onig`] match: its groups as jq reads them ([`OnigEngine::group`]), and the
+    /// whole match's byte span as the library reported it, where jq's next search starts from.
+    #[cfg(feature = "onig-engine")]
+    Onig {
+        groups: Vec<Option<RegexMatch<'h>>>,
+        raw: (usize, usize),
+    },
 }
 
 #[cfg(feature = "regex")]
@@ -33589,10 +33723,7 @@ impl<'h> RegexCaptures<'h> {
     /// `caps`, a match of a rewritten pattern, as the original pattern's groups.
     fn mapped(caps: regex::Captures<'h>, groups: &super::onig_capture_loop::LoopRewrite) -> Self {
         Self::mapped_with(groups, |i| {
-            caps.get(i).map(|m| RegexMatch {
-                text: m.as_str(),
-                start: m.start(),
-            })
+            caps.get(i).map(|m| RegexMatch::at(m.as_str(), m.start()))
         })
     }
 
@@ -33602,10 +33733,7 @@ impl<'h> RegexCaptures<'h> {
         groups: &super::onig_capture_loop::LoopRewrite,
     ) -> Self {
         Self::mapped_with(groups, |i| {
-            caps.get(i).map(|m| RegexMatch {
-                text: m.as_str(),
-                start: m.start(),
-            })
+            caps.get(i).map(|m| RegexMatch::at(m.as_str(), m.start()))
         })
     }
 
@@ -33635,33 +33763,49 @@ impl<'h> RegexCaptures<'h> {
 }
 
 /// One capture group's span: the subset of `regex::Match` the builtins read, for either engine.
+///
+/// `start..end` is the span the builtins count and slice by, always on character boundaries, and
+/// `text` is the group's string. They agree on every engine but Oniguruma's, where jq's `f_match`
+/// reads a span that begins inside a character (one its byte step after an empty match searched
+/// from) as offset 0 and its string as the raw bytes, each stray byte a U+FFFD (see
+/// [`OnigEngine::group`]).
 #[cfg(feature = "regex")]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RegexMatch<'h> {
-    text: &'h str,
+    text: Cow<'h, str>,
     start: usize,
+    end: usize,
 }
 
 #[cfg(feature = "regex")]
 impl<'h> RegexMatch<'h> {
+    /// The group `text` at byte `start` of the subject, its span the text's own.
+    fn at(text: &'h str, start: usize) -> Self {
+        Self {
+            text: Cow::Borrowed(text),
+            start,
+            end: start + text.len(),
+        }
+    }
+
     fn start(&self) -> usize {
         self.start
     }
 
     fn end(&self) -> usize {
-        self.start + self.text.len()
+        self.end
     }
 
-    fn as_str(&self) -> &'h str {
-        self.text
+    fn as_str(&self) -> &str {
+        &self.text
     }
 
     fn len(&self) -> usize {
-        self.text.len()
+        self.end - self.start
     }
 
     fn is_empty(&self) -> bool {
-        self.text.is_empty()
+        self.start == self.end
     }
 }
 
@@ -33669,15 +33813,13 @@ impl<'h> RegexMatch<'h> {
 impl<'h> RegexCaptures<'h> {
     fn get(&self, i: usize) -> Option<RegexMatch<'h>> {
         match self {
-            RegexCaptures::Std(caps) => caps.get(i).map(|m| RegexMatch {
-                text: m.as_str(),
-                start: m.start(),
-            }),
-            RegexCaptures::Fancy(caps) => caps.get(i).map(|m| RegexMatch {
-                text: m.as_str(),
-                start: m.start(),
-            }),
-            RegexCaptures::Mapped(groups) => groups.get(i).copied().flatten(),
+            RegexCaptures::Std(caps) => caps.get(i).map(|m| RegexMatch::at(m.as_str(), m.start())),
+            RegexCaptures::Fancy(caps) => {
+                caps.get(i).map(|m| RegexMatch::at(m.as_str(), m.start()))
+            }
+            RegexCaptures::Mapped(groups) => groups.get(i).cloned().flatten(),
+            #[cfg(feature = "onig-engine")]
+            RegexCaptures::Onig { groups, .. } => groups.get(i).cloned().flatten(),
         }
     }
 
@@ -33797,6 +33939,9 @@ impl JqRegex {
             return Ok(first_captures(self, input)?.is_some());
         }
         match &self.engine {
+            // jq's test mode: the first search's answer.
+            #[cfg(feature = "onig-engine")]
+            RegexEngine::Onig(engine) => Ok(engine.captures_at(input, 0)?.is_some()),
             RegexEngine::Std(re) | RegexEngine::Rewritten { re, .. } => {
                 let found = dv_is_match(re, input, self.needs_trailing_nl_check);
                 if found && self.caret_end.is_some() && ends_with_trailing_newline(input) {
@@ -33848,6 +33993,8 @@ impl JqRegex {
             return found;
         }
         match &self.engine {
+            #[cfg(feature = "onig-engine")]
+            RegexEngine::Onig(engine) => engine.captures_at(input, start),
             RegexEngine::Std(re) => {
                 let caps = dv_captures_at(
                     re,
@@ -33914,6 +34061,8 @@ impl JqRegex {
 
     fn capture_names(&self) -> RegexCaptureNames<'_> {
         match &self.engine {
+            #[cfg(feature = "onig-engine")]
+            RegexEngine::Onig(engine) => RegexCaptureNames::Mapped(engine.names.iter()),
             RegexEngine::Std(re) => RegexCaptureNames::Std(re.capture_names()),
             RegexEngine::Fancy(re) => RegexCaptureNames::Fancy(re.capture_names()),
             RegexEngine::Rewritten { groups, .. } | RegexEngine::RewrittenFancy { groups, .. } => {
@@ -33924,6 +34073,8 @@ impl JqRegex {
 
     fn captures_len(&self) -> usize {
         match &self.engine {
+            #[cfg(feature = "onig-engine")]
+            RegexEngine::Onig(engine) => engine.names.len(),
             RegexEngine::Std(re) => re.captures_len(),
             RegexEngine::Fancy(re) => re.captures_len(),
             RegexEngine::Rewritten { groups, .. } | RegexEngine::RewrittenFancy { groups, .. } => {
@@ -40116,6 +40267,22 @@ fn build_regex_uncached<S: EvalSemantics>(
     // A refusal from the jq pre-pass waits until the flags string has been read (#5529, #5524):
     // jq checks the modifiers before it compiles the pattern, so `test("(?P<n>a)"; "z")` is the
     // modifier error.
+    // ADR-0031: Oniguruma compiles the pattern as jq does, and none of the passes below run.
+    #[cfg(feature = "onig-engine")]
+    if S::TAG != EvalTag::Yq && onig_engine_selected() {
+        return Ok(JqRegex {
+            engine: RegexEngine::Onig(OnigEngine::compile(pattern, flags)?),
+            needs_trailing_nl_check: false,
+            exact_end: None,
+            caret_end: None,
+            capped_end: None,
+            suppress_empty: false,
+            engine_not_empty: false,
+            longest: None,
+            keep_anchored: None,
+            empty_steps_bytes: false,
+        });
+    }
     let mut deferred_refusal = None;
     // The pattern as the user wrote it, before the classes are rewritten (#6488).
     let source = pattern;
@@ -43298,6 +43465,20 @@ fn next_match_step<'h>(
         .get(0)
         .expect("capture group 0 is always present on a match");
     let (m_start, m_end) = (m.start(), m.end());
+    // Oniguruma's match: jq's own step from the span the library reported (`f_match`): the next
+    // search starts where a match ended, or one *byte* after an empty one, inside a multibyte
+    // character if one follows (#7965). The #6169 guard below still applies.
+    #[cfg(feature = "onig-engine")]
+    if let RegexCaptures::Onig { raw, .. } = &caps {
+        let (raw_start, raw_end) = *raw;
+        let backward_repeat = raw_start < start && raw_end <= start;
+        let next_start = if raw_end > raw_start && !backward_repeat {
+            raw_end
+        } else {
+            raw_end.max(start) + 1
+        };
+        return Ok(Some((caps, !backward_repeat, next_start, m_start, m_end)));
+    }
     // #6169: a `\K` inside a look-behind starts the match before the position the search began at
     // (`(?<=a\Kb)` on `"cab"` from offset 3 is `[2,3)`, as it was from offset 0). Resuming at
     // that match's end finds it again, so the search never ends, pushing a match each time (jq
@@ -43416,12 +43597,9 @@ fn global_captures<'h, S: EvalSemantics>(
                 let continuation = if is_empty_match && re.empty_steps_bytes {
                     input[m_start..].chars().next().map(|c| {
                         let resume = m_start + c.len_utf8();
-                        let at = RegexMatch {
-                            text: &input[resume..resume],
-                            start: resume,
-                        };
+                        let at = RegexMatch::at(&input[resume..resume], resume);
                         let step: Vec<Option<RegexMatch<'_>>> = (0..re.captures_len())
-                            .map(|i| caps.get(i).map(|_| at))
+                            .map(|i| caps.get(i).map(|_| at.clone()))
                             .collect();
                         (step, c.len_utf8())
                     })
@@ -43561,7 +43739,12 @@ fn build_match_object<S: EvalSemantics>(
             m0.start(),
         )),
     );
-    obj.insert("length".to_string(), OwnedValue::Int(char_len(m0.as_str())));
+    // The span's length, not the string's: they differ only where Oniguruma's match begins inside
+    // a character, which jq counts from the start of the text (see [`RegexMatch`]).
+    obj.insert(
+        "length".to_string(),
+        OwnedValue::Int(char_len(&input[m0.start()..m0.end()])),
+    );
     obj.insert(
         "string".to_string(),
         OwnedValue::String(m0.as_str().to_string().into()),
@@ -43593,7 +43776,10 @@ fn build_match_object<S: EvalSemantics>(
                         m.start(),
                     )),
                 );
-                cap_obj.insert("length".to_string(), OwnedValue::Int(char_len(m.as_str())));
+                cap_obj.insert(
+                    "length".to_string(),
+                    OwnedValue::Int(char_len(&input[m.start()..m.end()])),
+                );
                 cap_obj.insert(
                     "string".to_string(),
                     OwnedValue::String(m.as_str().to_string().into()),
@@ -43889,7 +44075,9 @@ fn stitch_replacement_rows<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             .get(0)
             .expect("capture group 0 is always present on a match");
         let mut outputs = eval_sub_replacement::<W, S>(replacement_expr, re, caps, optional)?;
-        let gap = &input[last_end..m.start()];
+        // jq's `$in[.previous:$edit.offset]`, which is `""` when the match begins before the last
+        // one ended: Oniguruma's match that begins inside a character is offset 0 (#7965).
+        let gap = input.get(last_end..m.start()).unwrap_or("");
         // One output is the overwhelmingly common case -- a literal or any
         // other non-generator replacement -- and it is stored inline rather
         // than behind its own `Vec` (#1834). Half a million matches in one
