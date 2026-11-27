@@ -80,13 +80,11 @@ local-zone = ["std", "dep:jiff"]
 # it, and elsewhere, the C locale's English names.
 locale-time = ["std", "dep:libc"]
 
-# Enable regex support in jq query language. `fancy-regex` compiles only the jq
-# patterns the `regex` crate refuses for lookaround or a backreference (#5502).
-# It also builds the vendored Oniguruma (`vendor/oniguruma`, the commit jq 1.7.1
-# bundles) and its FFI (`src/jq/onig_ffi.rs`), which needs a C compiler: jq mode
-# runs on it (`SUCCINCTLY_REGEX_ONIG=0` selects the earlier engine until it is
-# removed; #7965, ADR-0031).
-regex = ["std", "dep:regex", "dep:regex-syntax", "dep:fancy-regex", "dep:cc"]
+# Enable regex support in the jq query language. jq mode runs on the vendored
+# Oniguruma (`vendor/oniguruma`, the commit jq 1.7.1 bundles) through its FFI
+# (`src/jq/onig_ffi.rs`), which needs a C compiler (#7965, ADR-0031); yq mode
+# runs Go's dialect on the `regex` crate.
+regex = ["std", "dep:regex", "dep:cc"]
 
 # Test features (not for production)
 large-tests = []    # 1G bitvector tests (~125MB RAM)
@@ -127,11 +125,10 @@ libm = "0.2"
 memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3.10", optional = true }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"], optional = true }
-# regex-syntax 0.8.12 (with regex 1.13.2) keeps a prefix that can match more than one way in each
-# branch of an alternation (rust-lang/regex#1400); jq's leftmost-first match depends on it (#6149).
+# regex 1.13.2 requires regex-syntax 0.8.12, which keeps a prefix that can match more than one way
+# in each branch of an alternation (rust-lang/regex#1400); yq's leftmost-first match depends on it
+# (#6149).
 regex = { version = "1.13.2", optional = true }
-regex-syntax = { version = "0.8.12", optional = true }
-fancy-regex = { version = "0.20", optional = true, features = ["leftmost_longest"] }
 
 # CLI dependencies (optional, only for binary)
 clap = { version = "4.5", features = ["derive"], optional = true }
