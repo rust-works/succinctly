@@ -82,6 +82,13 @@ class PerRecordTests(unittest.TestCase):
             self.assertTrue(prelude.startswith("def ") and prelude.endswith(";"), name)
             self.assertNotIn("def ", body, name)
 
+    def test_the_switch_is_read_as_the_cli_reads_it(self):
+        import per_record
+
+        self.assertTrue(per_record.switched_on({"SUCCINCTLY_CALL_MACHINE": "1"}))
+        for off in ({}, {"SUCCINCTLY_CALL_MACHINE": ""}, {"SUCCINCTLY_CALL_MACHINE": "0"}):
+            self.assertFalse(per_record.switched_on(off), off)
+
     def test_its_bins_parse_as_the_ladders_do(self):
         import per_record
 

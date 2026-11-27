@@ -88,9 +88,12 @@ def check(binary, off=False):
             route_ok = not events
         else:
             want_decision = "taken" if c["route"] == "take" else "declined"
-            # A program the machine takes is compiled to be taken; one it declines may have
-            # been declined before compiling (no recursive `def`).
-            route_ok = decisions == [want_decision] and compiles == (1 if c["route"] == "take" else min(compiles, 1))
+            if c["route"] == "take":
+                compiles_ok = compiles == 1
+            else:
+                # Declined after compiling, or before (no recursive `def`).
+                compiles_ok = compiles <= 1
+            route_ok = decisions == [want_decision] and compiles_ok
         if not same:
             status = "known" if off and c.get("off_known") else "WRONG"
         else:

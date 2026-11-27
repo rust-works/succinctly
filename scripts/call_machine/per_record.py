@@ -25,7 +25,9 @@ removes.
 
 `--bin LABEL=PATH[@VAR=VALUE]...` sets each `VAR` in that binary's environment, as `ladders.py`
 does. Repetitions are interleaved: each one runs every (binary, workload) pair in a freshly
-shuffled order. A binary's two outputs must be equal to each other and to the first binary's, or
+shuffled order. Before timing, one untimed run of each pair reads the decision log: a binary
+with `SUCCINCTLY_CALL_MACHINE` on whose runs the machine did not take stops the script, since its
+times would be the shipped route's. A binary's two outputs must be equal to each other and to the first binary's, or
 the script stops: a timing of a wrong answer means nothing.
 """
 import argparse
@@ -57,6 +59,13 @@ PROGRAMS = {
 }
 LIMIT = 1.10
 LOG = "SUCCINCTLY_DEBUG_CALL_MACHINE_LOG"
+SWITCH = "SUCCINCTLY_CALL_MACHINE"
+
+
+def switched_on(env):
+    """Whether `env` (None: this process's) turns the machine on, as `succinctly jq` reads it."""
+    value = (env if env is not None else os.environ).get(SWITCH, "")
+    return value not in ("", "0")
 
 
 def run(path, env, args, log=None):
@@ -106,6 +115,16 @@ def main(argv):
                 "ndjson": [f"{prelude} {body}", ndjson],
                 "single": [f"{prelude} .[] | {body}", single],
             }
+            print(f"{name}: {n} records, {a.reps} interleaved reps, median wall")
+            for label, path, env in bins:
+                # One untimed run each, with the decision log: is it the machine's, and how often
+                # did it decide and compile? An arm with the switch on must be the machine's, or
+                # its timing measures the shipped route.
+                for w in work:
+                    decided, compiled = events(path, env, work[w], tmp)
+                    print(f"  {label:<10} {w:<7} decisions {decided} compilations {compiled}")
+                    if switched_on(env) and not (decided and all(d == "taken" for d in decided)):
+                        sys.exit(f"{name}: {label} {w} has {SWITCH} on but was not taken: {decided}")
             want = None
             times = {(b[0], w): [] for b in bins for w in work}
             for _ in range(a.reps):
@@ -120,13 +139,6 @@ def main(argv):
                     want = want if want is not None else out
                     if out != want:
                         sys.exit(f"{name}: {label} {w} printed other lines than {bins[0][0]}")
-            print(f"{name}: {n} records, {a.reps} interleaved reps, median wall")
-            for label, path, env in bins:
-                # One untimed run each, with the decision log: is it the machine's, and how often
-                # did it decide and compile? (A binary without the log line counts none.)
-                for w in work:
-                    decided, compiled = events(path, env, work[w], tmp)
-                    print(f"  {label:<10} {w:<7} decisions {decided} compilations {compiled}")
             for label, path, _ in bins:
                 nd = statistics.median(times[(label, "ndjson")])
                 sd = statistics.median(times[(label, "single")])
