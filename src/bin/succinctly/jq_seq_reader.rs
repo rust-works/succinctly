@@ -912,28 +912,6 @@ pub(crate) fn seed_token_byte(byte: Option<u8>) {
     SEEDED_TOKEN_BYTE.with(|seed| seed.set(byte));
 }
 
-/// The fault [`Reader::scan`] returns at the RS a stream was handed on after (#7260,
-/// [`seed_faulted_rs`]), whose line the stretch before it printed.
-const REPORTED_BEFORE_HAND_ON: &str = "(reported before the stream was handed on)";
-
-thread_local! {
-    /// Where the stream of every reader made on this thread from now on has an RS that jq's reader
-    /// met with a value pending ([`seed_faulted_rs`]).
-    static SEEDED_FAULTED_RS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-/// Has every reader made on this thread from now on read the RS at offset `at` of its stream as jq's
-/// reader met it in the stream it was handed on from (#7260): with a value pending, the fault that
-/// ends it already reported. The windows of a `--seq` stream hand a tail on at an RS ([`resumed_stream`]),
-/// and when the stretch read before it ended at that RS, jq's reader met it there as the end of a
-/// truncated value: an error the call returns, never the message-less return of an RS with nothing
-/// pending. A reader of the tail alone would have met it with nothing pending, and not counted the
-/// fault for the positions that hang off the final buffer ([`Reader::note_fault`]). `None` reads every
-/// RS as it comes.
-pub(crate) fn seed_faulted_rs(at: Option<usize>) {
-    SEEDED_FAULTED_RS.with(|seed| seed.set(at));
-}
-
 /// What jq's reader makes of a stretch of a `--seq` stream that is not RFC 7464's own framing
 /// ([`walk_stretch`], #7322).
 pub(crate) struct StretchWalk {
@@ -2189,9 +2167,6 @@ struct Reader<'a> {
     /// a BOM prefix scans nothing at all, so the running offset never
     /// leaves 0 and cannot stand in for "at the end".
     last_warning_at_eof: bool,
-    /// The RS of the stream jq's reader met with a value pending, whose fault was reported before
-    /// the stream was handed on ([`seed_faulted_rs`], #7260).
-    faulted_rs: Option<usize>,
     /// Set once the byte loop is done, so [`Reader::warn`] can tell jq's
     /// EOF branch apart from a mid-stream detection.
     at_eof: bool,
@@ -2263,7 +2238,6 @@ impl<'a> Reader<'a> {
             yielded_at: Vec::new(),
             suppress_eof_warning: false,
             last_warning_at_eof: false,
-            faulted_rs: SEEDED_FAULTED_RS.with(std::cell::Cell::get),
             at_eof: false,
             final_buffer_start: usize::MAX,
             warned_in_final_buffer: false,
@@ -2277,17 +2251,11 @@ impl<'a> Reader<'a> {
     }
 
     fn warn(&mut self, body: &str) {
-        self.note_fault();
-        self.emit_warning(body);
-    }
-
-    /// What a fault jq's reader returns does to the call that returns it, whether or not it is reported
-    /// here: [`Reader::warn`]'s, and a fault the stream was handed on after ([`seed_faulted_rs`]).
-    fn note_fault(&mut self) {
         self.last_warning_at_eof = self.at_eof;
         if self.offset >= self.final_buffer_start && !self.at_eof {
             self.warned_in_final_buffer = true;
         }
+        self.emit_warning(body);
     }
 
     /// Whether the diagnostic being reported now is raised with jq's position lost (#5640).
@@ -2449,9 +2417,7 @@ impl<'a> Reader<'a> {
             }
             if let Err(category) = self.scan(ch) {
                 let (line, column) = (self.line, self.column);
-                if category == REPORTED_BEFORE_HAND_ON {
-                    self.note_fault();
-                } else if ch == ASCII_RS {
+                if ch == ASCII_RS {
                     self.warn(&format!("{category} at line {line}, column {column}"));
                 } else {
                     self.warn(&format!(
@@ -2495,9 +2461,6 @@ impl<'a> Reader<'a> {
         if let Some((start, end)) = self.completed.as_mut() {
             shift(start);
             shift(end);
-        }
-        if let Some(at) = self.faulted_rs.as_mut() {
-            shift(at);
         }
         if self.final_buffer_start != usize::MAX {
             shift(&mut self.final_buffer_start);
@@ -2543,12 +2506,6 @@ impl<'a> Reader<'a> {
         }
 
         if ch == ASCII_RS {
-            if self.faulted_rs == Some(self.offset) {
-                // #7260: the RS the stream was handed on after, which jq's reader met with a value
-                // pending: the fault is the call's return, its line already printed.
-                self.faulted_rs = None;
-                return Err(REPORTED_BEFORE_HAND_ON);
-            }
             if self.check_truncation() {
                 // jq consults `check_literal` for its side effect here: a
                 // pending *number* token becomes the value that makes this
