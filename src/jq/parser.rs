@@ -13775,6 +13775,35 @@ impl<'a> Parser<'a> {
         Ok(patterns)
     }
 
+    /// The `ireduce (INIT; UPDATE)` after yq's `SRC as $v` (#5456): `reduce SRC as $v (INIT; UPDATE)`.
+    ///
+    /// Out of line, so its locals stay off the frame of [`Self::parse_as_pattern`], which every `as`
+    /// binding pays for (#7617).
+    #[inline(never)]
+    fn parse_ireduce(&mut self, expr: Expr, patterns: Vec<Pattern>) -> Result<Expr, ParseError> {
+        self.consume_keyword("ireduce");
+        self.skip_ws();
+        self.expect('(')?;
+        self.skip_ws();
+        let init = self.parse_expr()?;
+        self.skip_ws();
+        if matches!(init, Expr::Comma(_)) {
+            return self.finish_ireduce_union_init();
+        }
+        self.expect(';')?;
+        self.skip_ws();
+        let update = self.parse_expr()?;
+        self.skip_ws();
+        self.expect(')')?;
+        let (expr, patterns, update) = bind_ireduce_node_reads(expr, patterns, update);
+        Ok(Expr::Reduce {
+            input: Box::new(expr),
+            patterns,
+            init: Box::new(init),
+            update: Box::new(update),
+        })
+    }
+
     /// The rest of a yq `ireduce (INIT, ...` whose INIT is an unparenthesised union (#7617), from
     /// just after that union to the closing `)`, and the error yq raises for it.
     ///
@@ -13807,29 +13836,8 @@ impl<'a> Parser<'a> {
     /// Called after "as" has been consumed.
     fn parse_as_pattern(&mut self, expr: Expr) -> Result<Expr, ParseError> {
         let mut patterns = self.parse_pattern_alternatives()?;
-        // #5456: yq's `SRC as $v ireduce (INIT; UPDATE)` is `reduce SRC as $v (INIT; UPDATE)`.
         if self.mode == ParserMode::Yq && self.matches_keyword("ireduce") {
-            self.consume_keyword("ireduce");
-            self.skip_ws();
-            self.expect('(')?;
-            self.skip_ws();
-            let init = self.parse_expr()?;
-            self.skip_ws();
-            if matches!(init, Expr::Comma(_)) {
-                return self.finish_ireduce_union_init();
-            }
-            self.expect(';')?;
-            self.skip_ws();
-            let update = self.parse_expr()?;
-            self.skip_ws();
-            self.expect(')')?;
-            let (expr, patterns, update) = bind_ireduce_node_reads(expr, patterns, update);
-            return Ok(Expr::Reduce {
-                input: Box::new(expr),
-                patterns,
-                init: Box::new(init),
-                update: Box::new(update),
-            });
+            return self.parse_ireduce(expr, patterns);
         }
         self.expect('|')?;
         self.skip_ws();
