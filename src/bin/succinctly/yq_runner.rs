@@ -7866,7 +7866,19 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
                                 | Builtin::System(..)
                         )
                     });
-                let beyond = !jq::yq_condition_is_value_only(cond);
+                // `tag`/`type` keep their own rule (`selects_by_tag`: the owned value answers a
+                // document's core tags, and `!!map`/`!!seq` tests must stay there, #6895), and
+                // `key`/`parent` are answered on the owned value from the path (#6089).
+                let beyond = !jq::yq_condition_within(cond, &|b| {
+                    matches!(
+                        b,
+                        Builtin::Tag
+                            | Builtin::Type
+                            | Builtin::Key
+                            | Builtin::Parent
+                            | Builtin::ParentN(_)
+                    )
+                });
                 inexact |= beyond
                     && (!jq::yq_condition_is_cursor_exact(cond)
                         && (jq::walk::uses_cursor_metadata_builtins(cond)

@@ -177,7 +177,7 @@ pub use eval::{go_query_unescape, go_quote_bytes};
 pub use eval::yq_parse_int64;
 // #8020: whether a yq `select` condition reads values alone, for the CLI's metadata write resolution.
 #[doc(hidden)]
-pub use eval::{yq_condition_is_cursor_exact, yq_condition_is_value_only};
+pub use eval::{yq_condition_is_cursor_exact, yq_condition_is_value_only, yq_condition_within};
 #[doc(hidden)]
 pub use glob::yq_match_key;
 // #6560: the CLI's switch for reading `$ENV` once; `std` only, like the `thread_local!` behind it.

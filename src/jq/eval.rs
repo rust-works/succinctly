@@ -83812,7 +83812,8 @@ pub fn yq_condition_is_cursor_exact(cond: &Expr) -> bool {
 
 /// The allowlist behind [`yq_condition_is_value_only`] and [`yq_condition_is_cursor_exact`]:
 /// `reader` admits the builtins beyond the values-only ones.
-fn yq_condition_within(cond: &Expr, reader: &dyn Fn(&Builtin) -> bool) -> bool {
+#[doc(hidden)]
+pub fn yq_condition_within(cond: &Expr, reader: &dyn Fn(&Builtin) -> bool) -> bool {
     use Builtin as B;
     let within = |e: &Expr| yq_condition_within(e, reader);
     match cond {
