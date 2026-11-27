@@ -7814,10 +7814,20 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         }
         _ => false,
     };
-    let split = stages
+    // The tail starts at a reader and holds readers and the `select`s that test a reader's answer
+    // without reading metadata (`line | select(. > 1)`), which keep its fresh node.
+    let in_tail = |stage: &Expr| {
+        is_reader(stage)
+            || matches!(strip_parens(stage), Expr::Builtin(Builtin::Select(cond))
+                if !selects_by_node_metadata(cond) && !jq::walk::uses_cursor_metadata_builtins(cond))
+    };
+    let mut split = stages
         .iter()
-        .rposition(|stage| !is_reader(stage))
+        .rposition(|stage| !in_tail(stage))
         .map_or(0, |at| at + 1);
+    while split < stages.len() && !is_reader(stages[split]) {
+        split += 1;
+    }
     let (navigation, tail) = stages.split_at(split);
     if navigation.is_empty() {
         return None;
