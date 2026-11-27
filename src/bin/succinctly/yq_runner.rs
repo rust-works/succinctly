@@ -7896,7 +7896,12 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         matched.push(Expr::pipe(member));
     }
     Some(match matched.len() {
-        0 => Expr::Builtin(Builtin::Empty),
+        // Nothing selected: `empty` with the tail kept, so a key rename stays spelled `PATH | key`.
+        0 => Expr::pipe(
+            core::iter::once(Expr::Builtin(Builtin::Empty))
+                .chain(tail.iter().map(|stage| (*stage).clone()))
+                .collect(),
+        ),
         1 => matched.remove(0),
         _ => Expr::Paren(Box::new(Expr::Comma(matched))),
     })
