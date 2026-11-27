@@ -10,7 +10,7 @@ use alloc::collections::BTreeSet;
 use proptest::prelude::*;
 
 /// Every instruction, by [`compile::insn_name`].
-const INSTRUCTIONS: [&str; 37] = [
+const INSTRUCTIONS: [&str; 40] = [
     "Dup",
     "DupN",
     "Pop",
@@ -39,6 +39,8 @@ const INSTRUCTIONS: [&str; 37] = [
     "LoadAcc",
     "Bin",
     "Cmp",
+    "BinK",
+    "CmpK",
     "ToBool",
     "Not",
     "Negate",
@@ -47,6 +49,7 @@ const INSTRUCTIONS: [&str; 37] = [
     "Raise",
     "SetPath",
     "Call",
+    "TailJump",
     "Ret",
 ];
 
@@ -103,6 +106,10 @@ const INSTRUCTION_ROWS: &[(&str, &[&str])] = &[
     (
         "def r($n): if $n <= 0 then . else r($n - 1) end; try (1 | .[]) catch .",
         &[r#""Cannot iterate over number (1)""#],
+    ),
+    (
+        "def f: if . < 3 then . + 1 | f else . end; [0 | f] | [.[0] + .[0], .[0] < .[0]]",
+        &["[6,false]"],
     ),
 ];
 
@@ -250,18 +257,47 @@ fn machine_within(limits: Limits, filter: &str) -> Answer {
 /// [`machine_within`], with last-use moves (`moves`) or without them; `Err` when the machine
 /// declines.
 fn machine_compiled(limits: Limits, filter: &str, moves: bool) -> Result<Answer, String> {
+    machine_built(
+        limits,
+        filter,
+        Build {
+            moves,
+            ..Build::SHIPPED
+        },
+    )
+}
+
+/// What a test turns off of the compiler and the machine, to check that it changes no answer.
+#[derive(Clone, Copy, Debug)]
+struct Build {
+    /// Last-use moves ([`compile::compile_built`]).
+    moves: bool,
+    /// Tail jumps ([`compile::compile_built`]).
+    jumps: bool,
+    /// Dropping dead fork points ([`Vm::drop_dead_forks`]).
+    drops: bool,
+}
+
+impl Build {
+    const SHIPPED: Self = Self {
+        moves: true,
+        jumps: true,
+        drops: true,
+    };
+}
+
+/// [`machine_compiled`] of the machine `build` says.
+fn machine_built(limits: Limits, filter: &str, build: Build) -> Result<Answer, String> {
     let program = program(filter);
     with_prelude(|prelude| {
         let it = Interp::new(prelude);
-        let code = if moves {
-            compile::compile(&it, &program)?
-        } else {
-            compile::compile_without_moves(&it, &program)?
-        };
+        let code = compile::compile_built(&it, &program, build.moves, build.jumps)?;
         let mut input = OwnedValue::Null;
         it.prepare(&program, &mut input);
         let mut outputs = Vec::new();
-        let result = run_code(limits, &it, &code, input, &mut |v| {
+        let mut vm = Vm::new(&it, &code, limits);
+        vm.drops = build.drops;
+        let result = vm.exec(input, &mut |v| {
             outputs.push(v.to_json_jq_preserve());
             true
         });
@@ -1649,5 +1685,158 @@ fn a_helper_given_a_closure_keeps_its_own_count_7977() {
              def f: if . < 100 then (g | select(true)), (. + 1 | f) else empty end; [0 | f] | length"
         ),
         refused(0, "f/0: maximum outputs exceeded")
+    );
+}
+
+/// Whether `filter`'s own code holds a [`Insn::TailJump`].
+fn jumps(filter: &str) -> bool {
+    own_instructions(filter).contains("TailJump")
+}
+
+/// A self tail call of a zero-argument `def` compiles to a jump when nothing makes a closure over
+/// the frame it reuses: not when the body passes a closure argument (which closes over it) or
+/// declares a `def`, and not for a call that is not in tail position (under `try` or `label`,
+/// or an operand). `$__loc__` is a constant, and a finished `reduce` or `foreach` leaves nothing
+/// over the frame, so those jump; a fork point the round leaves protects the frame, and the jump
+/// is then the ordinary tail call. Every answer is jq 1.7.1's.
+#[test]
+fn a_zero_argument_self_tail_call_compiles_to_a_jump_7977() {
+    for (filter, jump, want) in [
+        ("def f: if . < 3 then . + 1 | f else . end; 0 | f", true, "3"),
+        (
+            "def f: if . < 3 then . + 1 | f else $__loc__ end; 0 | f",
+            true,
+            r#"{"file":"<top-level>","line":1}"#,
+        ),
+        (
+            "def f: if . < 10 then reduce (1, 2) as $x (.; . + $x) | f else . end; 0 | f",
+            true,
+            "12",
+        ),
+        (
+            "[def f: foreach (1, 2) as $x (.; . + $x; if . < 10 then f else . end); 0 | f] | length",
+            true,
+            "60",
+        ),
+        (
+            "[def f: if . < 3 then (. + 1, . + 10) | f else . end; 0 | f]",
+            true,
+            "[3,12,11,10]",
+        ),
+        (
+            "[def f: if . < 3 then ., (. + 1 | f) else . end; 0 | f]",
+            true,
+            "[0,1,2,3]",
+        ),
+        (
+            "def f: if . < 5 then (label $x | (. + 1, break $x)) | f else . end; 0 | f",
+            true,
+            "5",
+        ),
+        // A closure argument closes over the frame, and so does a `def` the body declares.
+        (
+            "def f: if . < 3 then (. + 1 | first(.)) | f else . end; 0 | f",
+            false,
+            "3",
+        ),
+        (
+            "def f: def g: . + 1; if . < 3 then g | f else . end; 0 | f",
+            false,
+            "3",
+        ),
+        // Not a tail call.
+        (
+            "def f: try (if . < 3 then . + 1 | f else . end); 0 | f",
+            false,
+            "3",
+        ),
+        (
+            "def f: label $x | if . < 3 then . + 1 | f else . end; 0 | f",
+            false,
+            "3",
+        ),
+        (
+            "def f: if . < 3 then (. + 1 | f) + 0 else . end; 0 | f",
+            false,
+            "3",
+        ),
+        // Arguments: not a zero-argument definition.
+        (
+            "def f($n): if $n < 3 then f($n + 1) else $n end; f(0)",
+            false,
+            "3",
+        ),
+    ] {
+        assert_eq!(jumps(filter), jump, "{filter}");
+        assert_eq!(machine(filter), ok(&[want]), "{filter}");
+    }
+    // The prelude's `until` and `while` loop through a zero-argument `def` of their own.
+    let until = "def f: f; 0 | until(. >= 3; . + 1)";
+    let program = program(until);
+    with_prelude(|prelude| {
+        let it = Interp::new(prelude);
+        let code = compile::compile(&it, &program).expect("compiles");
+        assert!(code
+            .insns
+            .iter()
+            .any(|i| matches!(i, Insn::TailJump { .. })));
+    });
+}
+
+/// The tail jump keeps every bound of the call it replaces: the loop cap refuses at the same
+/// round with the same wording, the output bound starts after the same unweighted rounds, and
+/// the dead fork points a round leaves are dropped as the call drops them. Each row answers the
+/// same compiled with jumps and without, around each bound.
+#[test]
+fn a_tail_jump_meets_each_bound_where_the_call_does_7977() {
+    let limits = small(1 << 20, 100, 70);
+    let rows = [
+        "def f: if . < {n} then . + 1 | f else . end; 0 | f",
+        "def f: if . < {n} then (. + 1, empty) | f else . end; 0 | f",
+        "def f: if . < {n} then ((. + 1) // 0) | f else . end; 0 | f",
+        "def f: if . < {n} then (try (. + 1) catch 0) | f else . end; 0 | f",
+        "def f: if . < {n} then range(2), (. + 1 | f) else empty end; [0 | f] | length",
+        "def f: if . < {n} then . as $x | $x + 1 | f else . end; [0 | f] | length",
+        "def f: f; 0 | until(. >= {n}; . + 1)",
+        "def f: f; [0 | while(. < {n}; . + 1)] | length",
+        "def g: def f: if . < {n} then . + 1 | f else . end; f; 0 | g",
+    ];
+    let mut refusals = BTreeSet::new();
+    for row in rows {
+        for n in [34, 35, 36, 64, 65, 66, 98, 99, 100, 101, 102] {
+            let filter = row.replace("{n}", &n.to_string());
+            let jumped = machine_built(limits, &filter, Build::SHIPPED);
+            let called = machine_built(
+                limits,
+                &filter,
+                Build {
+                    jumps: false,
+                    ..Build::SHIPPED
+                },
+            );
+            assert_eq!(jumped, called, "{filter}");
+            if let Ok(Answer {
+                error: Some(error), ..
+            }) = jumped
+            {
+                refusals.insert(error);
+            }
+        }
+    }
+    assert_eq!(
+        refusals,
+        [
+            "f/0 exceeded maximum recursion depth",
+            "f/0: maximum outputs exceeded",
+            // The nested loop is named for the definition it started at, as the shipped loop
+            // names it.
+            "g/0 exceeded maximum recursion depth",
+            "until: maximum iterations exceeded",
+            "while: maximum iterations exceeded",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
+        "the rows reach every bound"
     );
 }

@@ -210,6 +210,12 @@ impl Stack<OwnedValue> {
         let free = self.top_free();
         self.index = self.data[i].next as isize;
         if free {
+            // The top block is most often the last: taken off whole, with nothing left to drop.
+            if i + 1 == self.data.len() {
+                if let Some(block) = self.data.pop() {
+                    return block.value;
+                }
+            }
             let value = core::mem::replace(&mut self.data[i].value, OwnedValue::Null);
             self.data.truncate(i);
             value
@@ -412,6 +418,10 @@ struct Vm<'c, 'e> {
     /// The instructions run, for the tests that pin how work scales.
     #[cfg(test)]
     steps: u64,
+    /// Whether dead fork points are dropped ([`Vm::drop_dead_forks`]); off only for the
+    /// differential test that dropping them changes no answer.
+    #[cfg(test)]
+    drops: bool,
 }
 
 /// Make room for one more element in `v` by doubling its charged capacity `cap`, or say it
@@ -570,18 +580,6 @@ fn run_within<'e>(
     result
 }
 
-/// [`run`] of a compiled program, within `limits`, on vectors of its own.
-#[cfg(test)]
-fn run_code<'e>(
-    limits: Limits,
-    it: &Interp<'e>,
-    code: &'e Code,
-    input: OwnedValue,
-    on_value: &mut dyn FnMut(OwnedValue) -> bool,
-) -> R {
-    Vm::new(it, code, limits).exec(input, on_value)
-}
-
 /// The vectors a run leaves for the next document of the same code (#7977 step 5): empty, each
 /// with the capacity it grew to, cut back to [`KEEP_BYTES`]. A per-record run then allocates its
 /// stacks once. Nothing else carries over: a run's bounds, counts and state are its own
@@ -632,6 +630,8 @@ impl<'c, 'e> Vm<'c, 'e> {
             limits,
             #[cfg(test)]
             steps: 0,
+            #[cfg(test)]
+            drops: true,
         }
     }
 
@@ -1150,6 +1150,18 @@ impl<'c, 'e> Vm<'c, 'e> {
                     *op, &l, &r,
                 )))?;
             }
+            Insn::BinK(op, k) => {
+                let l = self.data.pop();
+                let r = &code.consts[*k as usize];
+                self.push(combine(*op, &l, r).map_err(raise_eval)?)?;
+            }
+            Insn::CmpK(op, k) => {
+                let l = self.data.pop();
+                let r = &code.consts[*k as usize];
+                self.push(OwnedValue::Bool(apply_compare_op::<JqSemantics>(
+                    *op, &l, r,
+                )))?;
+            }
             Insn::ToBool => {
                 let v = self.data.pop();
                 self.push(OwnedValue::Bool(truthy(&v)))?;
@@ -1211,6 +1223,7 @@ impl<'c, 'e> Vm<'c, 'e> {
                 self.push(written)?;
             }
             Insn::Call { callee, args, tail } => return self.call(pc, *callee, args, *tail),
+            Insn::TailJump { func, level } => return self.tail_jump(pc, *func, *level),
             Insn::Ret => {
                 // Outputs are counted in a loop's frames (and charged to an owner's), where a
                 // bound can apply; a frame of an ordinary call that is not yet a loop counts none.
@@ -1447,6 +1460,66 @@ impl<'c, 'e> Vm<'c, 'e> {
         Ok(Flow::Next(f.entry))
     }
 
+    /// [`Insn::TailJump`]: the self tail call of a zero-argument definition that makes no closure
+    /// over its frame (#7977 step 4). When the call is the next round of the loop (as `call`'s
+    /// self tail call reads it: counted, below the cap) and, once the dead fork points are
+    /// dropped as `call` drops them, no fork point protects the frame, the round runs in the
+    /// frame it is in: the state is the one `call` would reach by popping the frame and pushing
+    /// its successor in the same place (the same function, static link, return address, `exit`
+    /// and slot base, the loop's counts a round on, the slots fresh, the input on top), without
+    /// building it. Anything else is `call`'s `Tail::Pop` call, which keeps the frame a fork
+    /// point protects, and counts or refuses a round past the cap.
+    #[inline(always)]
+    fn tail_jump(&mut self, pc: usize, func: u32, level: u16) -> Result<Flow, Raise> {
+        let call = |vm: &mut Self| vm.call(pc, Callee::Def { func, level }, &[], Tail::Pop);
+        let code = self.code;
+        let f = &code.funcs[func as usize];
+        let nslots = f.nslots as usize;
+        // `call` checks the room first, so a refusal past the budget is the same.
+        if !self.room_for_call(nslots) {
+            return Err(self.call_refusal(func));
+        }
+        let top = self.frames.index as usize;
+        let fr = self.frames.data[top].value;
+        debug_assert_eq!(
+            fr.func, func,
+            "a tail jump runs in its own function's frame"
+        );
+        let rounds = fr.counts.rounds;
+        if rounds == UNCOUNTED || rounds >= self.limits.rounds {
+            return call(self);
+        }
+        if !self.frames.top_free() {
+            if !self.forks.is_empty() {
+                self.drop_dead_forks();
+            }
+            if !self.frames.top_free() {
+                return call(self);
+            }
+        }
+        // `call` would push the successor at `max(index, limit) + 1` once the frame is popped:
+        // here, unless the frame sits above a gap the stack left.
+        let below = self.frames.data[top].next as isize;
+        if (below.max(self.frames.limit) + 1) as usize != top {
+            return call(self);
+        }
+        self.frames.data.truncate(top + 1);
+        self.frames.data[top].value.counts = fr.counts.next_round(rounds + 1);
+        self.slots.truncate(fr.base as usize);
+        for _ in 0..nslots {
+            self.slots.push(Slot::Val(OwnedValue::Null));
+        }
+        // The input, which `call` pops and pushes again: where it is already when nothing lies
+        // above it and it lies where the push would put it.
+        let i = self.data.index;
+        let next = self.data.data[i as usize].next as isize;
+        if self.data.data.len() != i as usize + 1 || next.max(self.data.limit) + 1 != i {
+            let input = self.data.pop();
+            self.push(input)?;
+        }
+        Ok(Flow::Next(f.entry))
+    }
+
     /// Drop the fork points at the top that can only answer nothing, so a loop whose round left
     /// one (an update `. + 1, empty`, or `x // d` once `x` gave a truthy output) does not keep a
     /// frame per round. A `FORK` resuming at a `BACKTRACK`, or at `//`'s check of a `found` slot
@@ -1457,6 +1530,10 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[cold]
     #[inline(never)]
     fn drop_dead_forks(&mut self) {
+        #[cfg(test)]
+        if !self.drops {
+            return;
+        }
         while let Some(fork) = self.forks.last() {
             let Kind::Branch(at) = fork.kind else {
                 break;

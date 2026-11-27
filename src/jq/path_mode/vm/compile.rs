@@ -127,6 +127,10 @@ pub(super) enum Insn {
     Bin(ArithOp),
     /// `[r, l] -> [l op r]`.
     Cmp(CompareOp),
+    /// `[l] -> [l op k]`: [`Insn::Bin`] of a constant right operand.
+    BinK(ArithOp, u32),
+    /// `[l] -> [l op k]`: [`Insn::Cmp`] of a constant right operand.
+    CmpK(CompareOp, u32),
     /// `[v] -> [truthy(v)]`.
     ToBool,
     /// `[v] -> [not truthy(v)]`.
@@ -147,6 +151,15 @@ pub(super) enum Insn {
         callee: Callee,
         args: Box<[ArgSpec]>,
         tail: Tail,
+    },
+    /// A self tail call of a zero-argument definition that makes no closure over its frame
+    /// (gojq's `opjump` case of `optimizeTailRec`, #7977 step 4): `[in] -> [out]`. It is the
+    /// `Tail::Pop` call of `Callee::Def { func, level }` in every respect but one: where no fork
+    /// point protects the frame, the next round reuses it, back at the function's entry
+    /// ([`super::Vm::tail_jump`]).
+    TailJump {
+        func: u32,
+        level: u16,
     },
     /// `RET`.
     Ret,
@@ -185,6 +198,8 @@ pub(super) fn insn_name(insn: &Insn) -> &'static str {
         Insn::LoadAcc(_) => "LoadAcc",
         Insn::Bin(_) => "Bin",
         Insn::Cmp(_) => "Cmp",
+        Insn::BinK(..) => "BinK",
+        Insn::CmpK(..) => "CmpK",
         Insn::ToBool => "ToBool",
         Insn::Not => "Not",
         Insn::Negate => "Negate",
@@ -193,6 +208,7 @@ pub(super) fn insn_name(insn: &Insn) -> &'static str {
         Insn::Raise => "Raise",
         Insn::SetPath => "SetPath",
         Insn::Call { .. } => "Call",
+        Insn::TailJump { .. } => "TailJump",
         Insn::Ret => "Ret",
     }
 }
@@ -221,6 +237,10 @@ pub(super) struct Func {
     /// Whether its body declares definitions of its own: a loop round into it is charged
     /// `BOUND_ROUND_WEIGHT`, as the shipped tail loop charges a round that binds a body.
     pub binds: bool,
+    /// Whether its code passes a closure argument (a new closure over its own frame). With
+    /// [`Func::binds`] this is every way a closure over its frame is made, so a function with
+    /// neither has its self tail calls compiled to [`Insn::TailJump`].
+    lends: bool,
 }
 
 impl Func {
@@ -314,25 +334,38 @@ struct Compiler<'c, 'e> {
     kills: BTreeMap<usize, Vec<u16>>,
     /// Whether last reads move ([`LastUse`]); off only in a test.
     moves: bool,
+    /// The calls, by address, of a zero-argument definition from its own body, in ascending
+    /// order: the candidates for [`Insn::TailJump`].
+    self_calls: Vec<usize>,
+    /// Whether those become [`Insn::TailJump`]s; off only in a test.
+    jumps: bool,
 }
 
 /// Compile `program`, or say why the machine declines it.
 pub(super) fn compile<'e>(it: &Interp<'e>, program: &'e Expr) -> Result<Code, String> {
     super::note(super::super::CallMachineEvent::Compiled);
-    compile_moving(it, program, true)
+    compile_moving(it, program, true, true)
 }
 
-/// [`compile`] with no last-use moves (`moves: false`): every read a `Load`, no `Kill`, for the
-/// differential test that the moves change no answer.
+/// [`compile`] with or without last-use moves (`moves: false`: every read a `Load`, no `Kill`) and
+/// tail jumps (`jumps: false`: every self tail call a `Tail::Pop` call), for the differential tests
+/// that they change no answer and no bound.
 #[cfg(test)]
-pub(super) fn compile_without_moves<'e>(
+pub(super) fn compile_built<'e>(
     it: &Interp<'e>,
     program: &'e Expr,
+    moves: bool,
+    jumps: bool,
 ) -> Result<Code, String> {
-    compile_moving(it, program, false)
+    compile_moving(it, program, moves, jumps)
 }
 
-fn compile_moving<'e>(it: &Interp<'e>, program: &'e Expr, moves: bool) -> Result<Code, String> {
+fn compile_moving<'e>(
+    it: &Interp<'e>,
+    program: &'e Expr,
+    moves: bool,
+    jumps: bool,
+) -> Result<Code, String> {
     if any_subexpr(program, &mut declined_anywhere) {
         return Err(String::from(
             "a path form, `last`, `?//` or an input builtin",
@@ -358,6 +391,8 @@ fn compile_moving<'e>(it: &Interp<'e>, program: &'e Expr, moves: bool) -> Result
         last: BTreeSet::new(),
         kills: BTreeMap::new(),
         moves,
+        self_calls: Vec::new(),
+        jumps,
     };
     let main = c.new_func("", 0, 0, Vec::new());
     c.pending.push((main, Body::Main(program), Vec::new()));
@@ -528,6 +563,7 @@ impl<'e> Compiler<'_, 'e> {
             loop_name: loop_name.filter(|_| arity == 0 && !name.is_empty()),
             nested_loop: None,
             binds: false,
+            lends: false,
         });
         (self.code.funcs.len() - 1) as u32
     }
@@ -717,6 +753,7 @@ impl<'e> Compiler<'_, 'e> {
                 specs.push(ArgSpec::Ref { level, idx });
             } else {
                 let l = self.lambda(arg)?;
+                self.code.funcs[self.cur as usize].lends = true;
                 specs.push(ArgSpec::Lambda(l));
             }
         }
@@ -901,8 +938,21 @@ impl<'e> Compiler<'_, 'e> {
         Ok(())
     }
 
-    /// A binary operator: the right operand runs first, as in jq (`gen_binop`).
+    /// A binary operator: the right operand runs first, as in jq (`gen_binop`). A constant right
+    /// operand is read where it is kept ([`Insn::BinK`], [`Insn::CmpK`]): it has no effect, no
+    /// error and one output, so running it first or not at all is the same, and its input is not
+    /// copied for it.
     fn binop(&mut self, left: &'e Expr, right: &'e Expr, op: Insn) -> C {
+        if let Some(value) = self.it.constant(right) {
+            let fused = match op {
+                Insn::Bin(op) => Insn::BinK(op, self.konst(value)),
+                Insn::Cmp(op) => Insn::CmpK(op, self.konst(value)),
+                other => unreachable!("a binary operator: {other:?}"),
+            };
+            self.expr(left)?;
+            self.emit(fused);
+            return Ok(());
+        }
         self.emit(Insn::Dup);
         self.expr(right)?;
         self.emit(Insn::Swap);
@@ -1136,6 +1186,9 @@ impl<'e> Compiler<'_, 'e> {
                     let level = owner.map_or(NO_LEVEL, |o| self.level(o));
                     let args: Vec<&'e Expr> = args.iter().collect();
                     self.call_func(Callee::Def { func, level }, func, &args)?;
+                    if func == self.cur && args.is_empty() {
+                        self.self_calls.push(self.here() - 1);
+                    }
                 }
                 Some(Entry::Param(_, f, idx)) => {
                     let level = self.level(f);
@@ -1306,7 +1359,11 @@ impl<'e> Compiler<'_, 'e> {
     }
 
     /// `tail_call_analyze`: a call followed by `RET` (through jumps) that holds no closure over
-    /// the current frame, callee included, becomes a tail call.
+    /// the current frame, callee included, becomes a tail call. A self tail call of a
+    /// zero-argument definition that makes no closure over its frame, neither a closure argument
+    /// nor a `def` of its own, becomes a [`Insn::TailJump`] (gojq's `optimizeTailRec`): nothing
+    /// a closure holds can then refer to the frame the next round reuses, and what a fork point
+    /// holds the machine checks as it jumps.
     fn mark_tails(&mut self) {
         for pc in 0..self.code.insns.len() {
             let Insn::Call { callee, args, .. } = &self.code.insns[pc] else {
@@ -1330,10 +1387,25 @@ impl<'e> Compiler<'_, 'e> {
                     _ => break false,
                 }
             };
-            if ret {
-                if let Insn::Call { tail, .. } = &mut self.code.insns[pc] {
+            if !ret {
+                continue;
+            }
+            let jump = match self.code.insns[pc] {
+                Insn::Call {
+                    callee: Callee::Def { func, level },
+                    ..
+                } if self.jumps && !closes_here && self.self_calls.binary_search(&pc).is_ok() => {
+                    let f = &self.code.funcs[func as usize];
+                    (!f.binds && !f.lends).then_some(Insn::TailJump { func, level })
+                }
+                _ => None,
+            };
+            match (jump, &mut self.code.insns[pc]) {
+                (Some(jump), insn) => *insn = jump,
+                (None, Insn::Call { tail, .. }) => {
                     *tail = if closes_here { Tail::Keep } else { Tail::Pop };
                 }
+                (None, _) => {}
             }
         }
     }
