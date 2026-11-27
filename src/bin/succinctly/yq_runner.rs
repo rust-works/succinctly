@@ -6861,19 +6861,27 @@ fn resolve_spelled_brackets(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
             _ => None,
         }
     }
+    /// `expr` resolved when it is a comma of navigation, parenthesized or not: a comma has no one
+    /// node to continue from, so it is only taken whole, at the top (`(.m[0x1], .m[01]) = ...`).
+    fn top(expr: &Expr, root: &OwnedValue) -> Option<Expr> {
+        match expr {
+            Expr::Paren(inner) if matches!(**inner, Expr::Comma(_) | Expr::Paren(_)) => {
+                top(inner, root).map(Expr::paren)
+            }
+            Expr::Comma(items) => {
+                let resolved = items
+                    .iter()
+                    .map(|item| walk(item, Some(root)).map(|(e, _)| e))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(Expr::Comma(resolved))
+            }
+            _ => walk(expr, Some(root)).map(|(e, _)| e),
+        }
+    }
     if !jq::walk::any_subexpr(expr, &mut |e| e.spelled_int_bracket().is_some()) {
         return None;
     }
-    match expr {
-        Expr::Comma(items) => {
-            let resolved = items
-                .iter()
-                .map(|item| walk(item, Some(root)).map(|(e, _)| e))
-                .collect::<Option<Vec<_>>>()?;
-            Some(Expr::Comma(resolved))
-        }
-        _ => walk(expr, Some(root)).map(|(e, _)| e),
-    }
+    top(expr, root)
 }
 
 /// `expr` with each negative array index of its static navigation counted from the end of the
