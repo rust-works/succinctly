@@ -51,9 +51,10 @@ LEDGER_PATHS = (
 )
 RUST_PATHS = ("*.rs", "Cargo.toml", "Cargo.lock", "rust-toolchain*", "clippy.toml", ".cargo/*")
 
-# What can leave `fuzz/Cargo.lock` or `bench-compare/Cargo.lock` behind its manifest (#7467): both
-# crates depend on the main crate by path, so its manifest counts as theirs.
-NESTED_LOCK_PATHS = ("Cargo.toml", "fuzz/Cargo.*", "bench-compare/Cargo.*")
+# What can leave `fuzz/Cargo.lock`, `bench-compare/Cargo.lock` or `jq-reader-oracle/Cargo.lock`
+# behind its manifest (#7467): the first two crates depend on the main crate by path, so its
+# manifest counts as theirs; jq-reader-oracle (#7970) does not.
+NESTED_LOCK_PATHS = ("Cargo.toml", "fuzz/Cargo.*", "bench-compare/Cargo.*", "jq-reader-oracle/Cargo.*")
 
 RELEASE_FEATURES = "cli,simd,regex,serde,bench-runner"  # comparison/jq/manifest.toml
 
@@ -163,8 +164,9 @@ GATES = (
         (
             "cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null",
             "cargo metadata --locked --format-version 1 --manifest-path bench-compare/Cargo.toml > /dev/null",
+            "cargo metadata --locked --format-version 1 --manifest-path jq-reader-oracle/Cargo.toml > /dev/null",
         ),
-        (r"^cargo metadata --locked --format-version 1 --manifest-path (fuzz|bench-compare)/Cargo\.toml > /dev/null$",),
+        (r"^cargo metadata --locked --format-version 1 --manifest-path (fuzz|bench-compare|jq-reader-oracle)/Cargo\.toml > /dev/null$",),
         paths=NESTED_LOCK_PATHS,
         cost=1,
     ),
