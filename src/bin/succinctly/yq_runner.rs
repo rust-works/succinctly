@@ -6070,8 +6070,10 @@ fn push_static_nav_steps<'e>(
                 return false;
             }
             if let Some((_, name)) = expr.literal_bracket_key() {
+                // patchcov: coverage tolerate reason="unreachable from the CLI: the parser keeps `.["b"]` as a bracket on a navigable target only inside a `del()` argument (#2126), and no caller of `static_nav_steps` is handed one (a `(A + B)["k"]` target is refused above); kept so the two spellings of a field stay one step"
                 out.push(TreeStep::Key(name));
                 return true;
+                // patchcov: coverage end
             }
             let Some((_, idx, text)) = expr.spelled_int_bracket() else {
                 return false;

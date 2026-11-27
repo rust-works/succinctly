@@ -320,6 +320,93 @@ fn test_spelled_bracket_key_in_a_pipe_keeps_presentation_7999() -> Result<()> {
     Ok(())
 }
 
+/// A spelled key inside a `select`, a reshape (`map`, `with_entries`, `sort_by`, `to_entries`,
+/// `sort`), a construction of reads (`[...]`, `{...}`), a comparison and a copy's source lands each
+/// node's comments, quoting and anchors where the static `.s[1]` and `.m["0x1"]` land them, as in
+/// yq: the presentation passes resolve the key against the node it reaches.
+#[test]
+fn test_spelled_bracket_key_in_reshapes_and_reads_keeps_presentation_7999() -> Result<()> {
+    const PAIRS: &str = "s:\n  - - \"a\" # a0\n    - b # b0\n  - - 'c' # c0\n    - d # d0\n  - - e # e0\n    - \"f\" # f0\n";
+    const ENTRIES: &str = "m:\n  p: [\"k\", 1] # p\n  q: ['j', 2] # q\n";
+    const MIXED: &str = "m:\n  \"0x1\": &h 'five' # h\n  \"1\": six # o\n  \"01\": seven # z\ns:\n  - x # x0\n  - &y \"y\" # y0\n";
+    const NESTED: &str =
+        "m:\n  \"0x1\":\n    b: 2 # b\n    a: 1 # a\ns:\n  - [3, 1] # s0\n  - [2, 1] # s1\n";
+    const ROOT: &str = "\"0x1\": &r 'v' # r\nk: 1\n";
+    const ALIAS: &str = "a: &x 1\nb: *x\nm:\n  \"1\": six # o\n";
+    const SUM: &str = "a: {\"0x1\": 1} # a\nb: {\"1\": 2} # b\n";
+    let rows: &[(&str, &str, &str)] = &[
+        (".s | map(select(.[0x0] == \"a\"))", PAIRS, "- - \"a\" # a0\n  - b # b0\n"),
+        (".s | map(select(.[01] == \"d\"))", PAIRS, "- - 'c' # c0\n  - d # d0\n"),
+        (".m | with_entries(select(.value[01] == 2))", ENTRIES, "q: ['j', 2] # q\n"),
+        ("[.m[0x1], .s[01]]", MIXED, "- &h 'five' # h\n- &y \"y\" # y0\n"),
+        ("{\"v\": .m[01], \"w\": .s[0x0]}", MIXED, "v: seven # z\nw: x # x0\n"),
+        ("[.m[0x2], .n[0x1]]", MIXED, "- null\n- null\n"),
+        (".m[0x1] | [.]", MIXED, "- &h 'five' # h\n"),
+        (".m[0x1] | to_entries", NESTED, "- key: b\n  value: 2 # b\n- key: a\n  value: 1 # a\n"),
+        (".m[0x1] | keys", NESTED, "- b\n- a\n"),
+        (".m[0x1] | with_entries(.)", NESTED, "b: 2 # b\na: 1 # a\n"),
+        (".s[01] | sort", NESTED, "[1, 2] # s1\n"),
+        (".s | sort_by(.[01])", NESTED, "- [3, 1] # s0\n- [2, 1] # s1\n"),
+        (".s | sort_by(.[0x0])", NESTED, "- [2, 1] # s1\n- [3, 1] # s0\n"),
+        (".m[0x1] == \"five\"", MIXED, "true\n"),
+        (".s[01] == \"y\"", MIXED, "true\n"),
+        (".t = 1 | .s[-01]", MIXED, "y\n"),
+        (
+            ".s[-01] = \"q\"",
+            MIXED,
+            "m:\n  \"0x1\": &h 'five' # h\n  \"1\": six # o\n  \"01\": seven # z\ns:\n  - x # x0\n  - &y \"q\" # y0\n",
+        ),
+        (
+            "(.m[0x1], .m[01]) = \"q\"",
+            MIXED,
+            "m:\n  \"0x1\": &h 'q' # h\n  \"1\": six # o\n  \"01\": q # z\ns:\n  - x # x0\n  - &y \"y\" # y0\n",
+        ),
+        (
+            ".c = .m[0x1]",
+            MIXED,
+            "m:\n  \"0x1\": &h 'five' # h\n  \"1\": six # o\n  \"01\": seven # z\ns:\n  - x # x0\n  - &y \"y\" # y0\nc: 'five' # h\n",
+        ),
+        (
+            ".c = .s[01]",
+            MIXED,
+            "m:\n  \"0x1\": &h 'five' # h\n  \"1\": six # o\n  \"01\": seven # z\ns:\n  - x # x0\n  - &y \"y\" # y0\nc: \"y\" # y0\n",
+        ),
+        (
+            ".c = .s[-01]",
+            MIXED,
+            "m:\n  \"0x1\": &h 'five' # h\n  \"1\": six # o\n  \"01\": seven # z\ns:\n  - x # x0\n  - &y \"y\" # y0\nc: \"y\" # y0\n",
+        ),
+        (
+            ".c = .s[0][0x1]",
+            PAIRS,
+            "s:\n  - - \"a\" # a0\n    - b # b0\n  - - 'c' # c0\n    - d # d0\n  - - e # e0\n    - \"f\" # f0\nc: b # b0\n",
+        ),
+        (
+            "del(.s[0]) | .s[1][0x0] = 9",
+            PAIRS,
+            "s:\n  - - 'c' # c0\n    - d # d0\n  - - 9 # e0\n    - \"f\" # f0\n",
+        ),
+        (".c = .[0x1]", ROOT, "\"0x1\": &r 'v' # r\nk: 1\nc: 'v' # r\n"),
+        (".c = (.b, .m[0x2])", ALIAS, "a: &x 1\nb: *x\nm:\n  \"1\": six # o\nc: *x\n"),
+        (".c = (.b, .m[01])", ALIAS, "a: &x 1\nb: *x\nm:\n  \"1\": six # o\nc: *x\n"),
+        ("(.a + .b)[0x1] = 9", SUM, SUM),
+    ];
+    for (filter, input, want) in rows {
+        let mut file = NamedTempFile::new()?;
+        file.write_all(input.as_bytes())?;
+        let path = file.path().to_str().expect("utf-8 temp path");
+        let (out, code) = run_yq_file(filter, path, &[])?;
+        assert_eq!((out.as_str(), code), (*want, 0), "{filter} over {input:?}");
+        let (out, code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(
+            (out.as_str(), code),
+            (*want, 0),
+            "{filter} over stdin {input:?}"
+        );
+    }
+    Ok(())
+}
+
 /// A key spelled `-0` is the mapping key `-0` and the sequence slot 0, as in yq.
 #[test]
 fn test_minus_zero_bracket_key_7999() -> Result<()> {
