@@ -178,6 +178,25 @@ fn test_8008_c_in_place_keeps_what_yq_keeps() -> Result<()> {
     Ok(())
 }
 
+/// A known divergence, pinned as succinctly's current answer: after a fan-out, yq evaluates a comma
+/// once over the whole list (#2451's branch-major union), so the targets of
+/// `del(.c[] | (env(X), .))` on `c: [hi, x]` arrive as `[env, hi, x]` and yq deletes both members
+/// (`c: []`). succinctly runs the comma per member (`[env, hi, env, x]`), so the loop stops at the
+/// second env reader and only `x` goes. A literal in the same place does the same on main
+/// (`del(.c[] | (1, .))` is `c: []` in yq). It deletes less than yq, never more.
+#[test]
+fn test_8008_f_a_comma_after_a_fan_out_still_runs_per_member() -> Result<()> {
+    for filter in ["del(.c[] | (env(I8008_X), .))", "del(.c[] | (1, .))"] {
+        let (out, err, code) = run(&["yq", filter], "c: [hi, x]\n")?;
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            ("c: [hi]\n", "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
 /// An unset variable is still yq's error, in front of the order rule.
 #[test]
 fn test_8008_d_an_unset_variable_still_errors() -> Result<()> {

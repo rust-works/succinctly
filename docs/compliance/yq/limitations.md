@@ -2998,6 +2998,7 @@ The order rule applies when every target is plain navigation or a parentless val
 its syntax (`del_target_shape`): a literal, a constructor, `env(NAME)`, `strenv(NAME)` or `now`, or a pipe ending in one. A lone
 parentless target therefore deletes nothing, as in yq (`del(1)`, `del(.a | 1)`, `del(.. | 1)`).
 yq's env readers and `now` build a node of their own whatever their input, as a literal does ([#8008](https://github.com/rust-works/succinctly/issues/8008)): `del(env(X))` and `del(.[] | env(X))` leave the document, `del(env(X), .a)` deletes `.a` and `del(.a, env(X))` deletes nothing, where `succinctly yq` raised `Invalid path expression with result "hi"` (`tests/yq_cli/i8008.rs`).
+A comma after a fan-out is still run per member here, where yq runs it once over the whole list (rule 1 of [#2451](https://github.com/rust-works/succinctly/issues/2451)), so `del(.c[] | (env(X), .))` and `del(.c[] | (1, .))` on `c: [hi, x]` stop at the second parentless target and leave `c: [hi]`, where yq deletes both members (`c: []`): the safe direction, deleting less than yq.
 A pipe of navigation that ends in `tostring`, `length`, `not`, `@json`, `tojson` or `type` deletes the navigation, as
 yq's derived value keeps its source's slot (`del(.b | tostring)` deletes `.b`, `del(.arr[] |
 tostring)` empties `.arr`, [#4476](https://github.com/rust-works/succinctly/issues/4476)): those
