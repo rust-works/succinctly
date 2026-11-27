@@ -276,6 +276,21 @@ fn range_start(start: OwnedValue, end: &OwnedValue) -> OwnedValue {
     }
 }
 
+/// `range/3`'s first output, as the shipped route's `range` emits it: an integer literal's
+/// spelling is dropped, unless it is `-0` or an integer a double cannot hold, which jq prints as
+/// written. So `0 as $x | range($x; 3; 1) | -.` starts at `-0`, as in jq.
+fn range_by_start(value: OwnedValue) -> OwnedValue {
+    match value {
+        OwnedValue::NumberLiteral(NumberRepr::Int(i), text)
+            if !(i == 0 && text.starts_with('-'))
+                && super::super::eval::jq_int_within_exact_f64_range(i) =>
+        {
+            OwnedValue::Int(i)
+        }
+        other => other,
+    }
+}
+
 /// The number of elements `EACH` visits in `container`.
 fn length(container: &OwnedValue) -> usize {
     match container {
@@ -794,6 +809,7 @@ impl Vm<'_, '_> {
         for spec in args.iter().rev() {
             scratch.push(match *spec {
                 ArgSpec::Value => Slot::Val(self.data.pop()),
+                ArgSpec::RangeStart => Slot::Val(range_by_start(self.data.pop())),
                 ArgSpec::Lambda(l) => Slot::Clo(Closure {
                     func: l,
                     frame: cur,

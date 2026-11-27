@@ -45,6 +45,9 @@ pub(super) enum Callee {
 pub(super) enum ArgSpec {
     /// A value the caller pushed (a `$` parameter in value mode).
     Value,
+    /// `range/3`'s `$from`, a value the caller pushed, passed as the shipped route's `range`
+    /// emits its first output ([`super::range_by_start`]).
+    RangeStart,
     /// A new closure: this code over the current frame.
     Lambda(u32),
     /// A copy of a closure the caller holds in a slot (jq's `CLOSURE_REF`).
@@ -257,8 +260,6 @@ struct Compiler<'c, 'e> {
     kills: BTreeMap<usize, Vec<u16>>,
     /// Whether last reads move ([`LastUse`]); off only in a test.
     moves: bool,
-    /// The `from` operands of `range/3`, by address ([`range_by_start`]).
-    range_starts: BTreeSet<usize>,
 }
 
 /// Compile `program`, or say why the machine declines it.
@@ -301,7 +302,6 @@ fn compile_moving<'e>(it: &Interp<'e>, program: &'e Expr, moves: bool) -> Result
         last: BTreeSet::new(),
         kills: BTreeMap::new(),
         moves,
-        range_starts: BTreeSet::new(),
     };
     let main = c.new_func("", 0, 0, Vec::new());
     c.pending.push((main, Body::Main(program), Vec::new()));
@@ -377,34 +377,43 @@ fn blocks_leaf(e: &Expr) -> bool {
     }
 }
 
-/// A constant `from` of `range/3` as the shipped route's `range` emits it first: an integer
-/// literal's spelling is dropped, unless it is `-0` or an integer a double cannot hold, which jq
-/// prints as written. So `range(0; 3; 1) | -.` starts at `-0`, as in jq. A `from` that is not a
-/// constant reaches the prelude body as it is.
-fn range_by_start(value: OwnedValue) -> OwnedValue {
-    match value {
-        OwnedValue::NumberLiteral(NumberRepr::Int(i), text)
-            if !(i == 0 && text.starts_with('-'))
-                && super::super::super::eval::jq_int_within_exact_f64_range(i) =>
-        {
-            OwnedValue::Int(i)
-        }
-        other => other,
-    }
-}
-
 /// Whether `e` runs as one [`Insn::Leaf`]. A leaf runs to its end before its first output is
-/// used, so it may not hold a side effect (`debug`, `stderr`) unless it is that builtin alone,
-/// which answers once: in a leaf that can answer more than once, the effect of a later output
+/// used, so it may not hold a side effect ([`is_effect`]) unless it is that builtin alone, with
+/// none in its arguments: in a leaf that can answer more than once, the effect of a later output
 /// would fire before the consumer had seen the earlier one, and past a consumer that stops.
 fn is_leaf(e: &Expr) -> bool {
-    !any_subexpr(e, &mut blocks_leaf) && (is_effect(e) || !any_subexpr(e, &mut is_effect))
+    if any_subexpr(e, &mut blocks_leaf) {
+        return false;
+    }
+    let mut effects = 0;
+    any_subexpr(e, &mut |n| {
+        effects += usize::from(is_effect(n));
+        false
+    });
+    effects == 0 || (effects == 1 && is_effect(e))
 }
 
-/// A C builtin with a side effect at the moment it runs. (`halt` and `halt_error` raise, and a
-/// leaf's raise waits for its earlier outputs; `input` and its kin are declined.)
+/// A C builtin that touches the outside world at the moment it runs: `debug` and `stderr`
+/// write, `halt_error/1` writes its message before it raises, and `modulemeta` reports a module
+/// it cannot load; yq's `load`, `system` and `eval` are here should they ever reach a jq-mode
+/// program. `halt` only raises, and a leaf's raise waits for its earlier outputs; `halt_error/0`
+/// is a prelude call, which no leaf holds; `input` and its kin are declined. The rest read only
+/// the process's own state (`env`, `$ENV`, `now`, `input_filename`, `get_search_list`), so it
+/// does not matter when in a leaf they run.
 fn is_effect(e: &Expr) -> bool {
-    matches!(e, Expr::Builtin(Builtin::Debug | Builtin::Stderr))
+    use Builtin as B;
+    matches!(
+        e,
+        Expr::Builtin(
+            B::Debug
+                | B::Stderr
+                | B::HaltErrorCode(_)
+                | B::ModuleMeta
+                | B::Load(..)
+                | B::System(..)
+                | B::EvalExpr(..)
+        )
+    )
 }
 
 /// Names a leaf binds inside itself, and the names it reads.
@@ -725,13 +734,15 @@ impl<'e> Compiler<'_, 'e> {
     }
 
     /// A destructuring pattern (`gen_array_matcher`, `gen_object_matcher`): `[v] -> []`,
-    /// binding its variables in new slots. `mark` is the scope's height before the pattern.
-    fn pattern(&mut self, p: &'e Pattern, mark: usize) -> C {
+    /// storing its variables in new slots. They come into scope only once the whole pattern is
+    /// compiled ([`Self::bind_pattern`]): a key expression (`{a: $x, ($x): $y}`) sees the scope
+    /// outside the pattern, as in jq, where `$x` there is not the pattern's own.
+    fn pattern(&mut self, p: &'e Pattern, pending: &mut Vec<(&'e str, u16)>) -> C {
         match p {
             Pattern::Var(name) => {
                 let s = self.slot()?;
                 self.emit(Insn::Store(s));
-                self.bind_pattern_var(name, s, mark);
+                Self::pend_pattern_var(pending, name, s);
             }
             Pattern::Array(elems) => {
                 // `gen_array_matcher`: the last element first.
@@ -739,7 +750,7 @@ impl<'e> Compiler<'_, 'e> {
                     self.emit(Insn::Dup);
                     let k = self.konst(OwnedValue::Int(i as i64));
                     self.emit(Insn::IndexK(k));
-                    self.pattern(sub, mark)?;
+                    self.pattern(sub, pending)?;
                 }
                 self.emit(Insn::Pop);
             }
@@ -762,9 +773,9 @@ impl<'e> Compiler<'_, 'e> {
                         let s = self.slot()?;
                         self.emit(Insn::Dup);
                         self.emit(Insn::Store(s));
-                        self.bind_pattern_var(name, s, mark);
+                        Self::pend_pattern_var(pending, name, s);
                     }
-                    self.pattern(&entry.pattern, mark)?;
+                    self.pattern(&entry.pattern, pending)?;
                 }
                 self.emit(Insn::Pop);
             }
@@ -772,18 +783,25 @@ impl<'e> Compiler<'_, 'e> {
         Ok(())
     }
 
-    /// Bring `$name`, stored in slot `s`, into scope, unless the pattern begun at scope height
-    /// `mark` has bound it already. A name bound twice in one pattern is the first store that
-    /// runs, as in jq: the last element of an array pattern runs first, an object pattern's
-    /// entries in order (`[1,2] as [$a, $a] | $a` is `2`, `{"a":1,"b":2} as {a: $x, b: $x} | $x`
-    /// is `1`). The later stores still run, for their errors.
-    fn bind_pattern_var(&mut self, name: &'e str, s: u16, mark: usize) {
-        let bound = self.scope[mark..]
-            .iter()
-            .any(|e| matches!(e, Entry::Var(n, ..) if *n == name));
-        if !bound {
+    /// Note `$name`, stored in slot `s`, for [`Self::bind_pattern`], unless the pattern has
+    /// stored it already. A name bound twice in one pattern is the first store that runs, as in
+    /// jq: the last element of an array pattern runs first, an object pattern's entries in order
+    /// (`[1,2] as [$a, $a] | $a` is `2`, `{"a":1,"b":2} as {a: $x, b: $x} | $x` is `1`). The
+    /// later stores still run, for their errors.
+    fn pend_pattern_var(pending: &mut Vec<(&'e str, u16)>, name: &'e str, s: u16) {
+        if !pending.iter().any(|(n, _)| *n == name) {
+            pending.push((name, s));
+        }
+    }
+
+    /// Compile pattern `p` and bring its variables into scope.
+    fn bind_pattern(&mut self, p: &'e Pattern) -> C {
+        let mut pending = Vec::new();
+        self.pattern(p, &mut pending)?;
+        for (name, s) in pending {
             self.scope.push(Entry::Var(name, self.cur, s));
         }
+        Ok(())
     }
 
     /// A binary operator: the right operand runs first, as in jq (`gen_binop`).
@@ -798,10 +816,7 @@ impl<'e> Compiler<'_, 'e> {
 
     /// Compile `e`: `[in] -> [out]`, or a backtrack.
     fn expr(&mut self, e: &'e Expr) -> C {
-        if let Some(mut value) = self.it.constant(e) {
-            if self.range_starts.contains(&(e as *const Expr as usize)) {
-                value = range_by_start(value);
-            }
+        if let Some(value) = self.it.constant(e) {
             let k = self.konst(value);
             self.emit(Insn::Const(k));
             return Ok(());
@@ -931,7 +946,7 @@ impl<'e> Compiler<'_, 'e> {
                 let f = self.emit(Insn::Fork(0));
                 self.emit(Insn::DupN);
                 self.expr(source)?;
-                self.pattern(&patterns[0], mark)?;
+                self.bind_pattern(&patterns[0])?;
                 self.emit(Insn::LoadMove(0, acc));
                 self.expr(update)?;
                 self.emit(Insn::Store(acc));
@@ -956,7 +971,7 @@ impl<'e> Compiler<'_, 'e> {
                 let f = self.emit(Insn::Fork(0));
                 self.emit(Insn::DupN);
                 self.expr(source)?;
-                self.pattern(&patterns[0], mark)?;
+                self.bind_pattern(&patterns[0])?;
                 self.emit(Insn::LoadMove(0, state));
                 self.expr(update)?;
                 self.emit(Insn::Dup);
@@ -1070,7 +1085,7 @@ impl<'e> Compiler<'_, 'e> {
                 let mark = self.scope.len();
                 self.emit(Insn::Dup);
                 self.expr(source)?;
-                self.pattern(&patterns[0], mark)?;
+                self.bind_pattern(&patterns[0])?;
                 let bound: Vec<(&str, u16)> = self.scope[mark..]
                     .iter()
                     .filter_map(|entry| match entry {
@@ -1108,9 +1123,13 @@ impl<'e> Compiler<'_, 'e> {
                 to: Some(to),
                 step: Some(step),
             } => {
-                let start: &Expr = from;
-                self.range_starts.insert(start as *const Expr as usize);
                 self.prelude_call("_sp_range", &[from, to, step])?;
+                // `$from` is `range`'s first output: passed as the shipped route emits it.
+                if let Some(Insn::Call { args, .. }) = self.code.insns.last_mut() {
+                    if let Some(first @ ArgSpec::Value) = args.first_mut() {
+                        *first = ArgSpec::RangeStart;
+                    }
+                }
             }
             // `CALL_BUILTIN`: the last argument is the outermost loop.
             Expr::Builtin(Builtin::SetPath(path, value)) => {

@@ -1,8 +1,8 @@
 //! #7977: the call machine, behind `SUCCINCTLY_CALL_MACHINE`, off by default.
 //!
-//! The corpus is `scripts/call_machine/cases.py`: 109 programs from the #7957 spikes and 22 from
-//! the review of #7984 (standard input, several documents, exit statuses, flags, side effects in
-//! leaves, duplicate pattern names, `range`'s first value), with jq 1.7.1's stdout, stderr and exit status captured into
+//! The corpus is `scripts/call_machine/cases.py`: 109 programs from the #7957 spikes and 33 from
+//! the reviews of #7984 (standard input, several documents, exit statuses, flags, side effects in
+//! leaves, pattern names and keys, `range`'s first value), with jq 1.7.1's stdout, stderr and exit status captured into
 //! `tests/data/call-machine-corpus-7977.json` by `scripts/call_machine/check.py capture`
 //! (`/usr/bin/jq` 1.7.1, macOS arm64). With the switch on, every answer is jq's and every "take"
 //! program reaches the machine; with it unset, the machine is never asked, so a program runs as on
@@ -74,7 +74,7 @@ fn the_corpus_matches_jq_on_the_call_machine_7977() -> Result<()> {
     let rows: Vec<serde_json::Value> = serde_json::from_str(&text)?;
     assert_eq!(
         rows.len(),
-        131,
+        142,
         "the corpus of scripts/call_machine/cases.py"
     );
     let dir = tempfile::tempdir()?;
@@ -106,14 +106,22 @@ fn the_corpus_matches_jq_on_the_call_machine_7977() -> Result<()> {
                 (&got.stdout, &got.stderr, got.exit)
             ));
         }
-        // Every decision for the program is the route the corpus says, and there is one.
-        let route = if row["route"] == "take" {
-            "taken"
-        } else {
-            "declined"
+        // Every decision for the program is the route the corpus says, and there is one; a
+        // program jq rejects at compile time is never routed.
+        let routed_as = match row["route"].as_str() {
+            Some("take") => Some("taken"),
+            Some("decline") => Some("declined"),
+            _ => None,
         };
-        if got.decisions.is_empty() || got.decisions.lines().any(|l| l != route) {
-            wrong.push(format!("{id}: want {route}, decided {:?}", got.decisions));
+        let routed = match routed_as {
+            Some(route) => !got.decisions.is_empty() && got.decisions.lines().all(|l| l == route),
+            None => got.decisions.is_empty(),
+        };
+        if !routed {
+            wrong.push(format!(
+                "{id}: want {routed_as:?}, decided {:?}",
+                got.decisions
+            ));
         }
     }
     assert!(

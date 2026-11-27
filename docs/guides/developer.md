@@ -229,7 +229,7 @@ with `path_mode::set_call_machine`. Unset, nothing asks the machine, so a run be
 It is a runtime switch, not a feature, so one binary is measured both ways with the variable set in both arms
 (`=1` against `=0`, #7961). `SUCCINCTLY_DEBUG_CALL_MACHINE_LOG=<file>`
 has each routing decision append `taken` or `declined` while the switch is on.
-`scripts/call_machine/check.py check <binary>` runs its 131-program corpus against the jq 1.7.1 answers in
+`scripts/call_machine/check.py check <binary>` runs its 142-program corpus against the jq 1.7.1 answers in
 `tests/data/call-machine-corpus-7977.json` (`tests/jq_cli/i7977.rs` runs the same file in CI), and
 `scripts/call_machine/ladders.py` holds its timing ladders, for the bench boxes only.
 

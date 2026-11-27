@@ -318,6 +318,21 @@ fn every_instruction_runs_as_jq_7977() {
     for (filter, want) in INSTRUCTION_ROWS {
         assert_eq!(machine(filter), ok(want), "{filter}");
     }
+    // `INSTRUCTIONS` is every name `compile::insn_name` can return, read from its own source:
+    // a variant named there and missing here fails, as one missing from both cannot compile.
+    let source = include_str!("compile.rs");
+    let body = &source[source.find("fn insn_name(").expect("insn_name")..];
+    let body = &body[..body.find("\n}\n").expect("its end")];
+    let named: BTreeSet<&str> = body
+        .lines()
+        .filter_map(|line| line.split("=> \"").nth(1))
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert_eq!(
+        named,
+        INSTRUCTIONS.iter().copied().collect::<BTreeSet<&str>>(),
+        "INSTRUCTIONS and insn_name name the same instructions"
+    );
     let ran = EXECUTED.with(|seen| seen.borrow().clone());
     let all: BTreeSet<&str> = INSTRUCTIONS.iter().copied().collect();
     assert_eq!(all.len(), INSTRUCTIONS.len(), "a name listed twice");
@@ -400,6 +415,44 @@ fn a_name_bound_twice_in_a_pattern_is_its_first_store_7977() {
     }
 }
 
+/// A key expression in an object pattern sees the scope outside the pattern, not the pattern's
+/// own variables, as in jq (#7977 re-review); with no outer binding the machine declines the
+/// program, and the shipped route reports jq's compile error.
+#[test]
+fn a_pattern_key_sees_only_the_scope_outside_the_pattern_7977() {
+    const R: &str = "def r: if false then r else . end; ";
+    for (filter, want) in [
+        (
+            r#""z" as $x | {"a":"b","b":"c","z":9} as {a: $x, ($x): $y} | [$x, $y]"#,
+            r#"["b",9]"#,
+        ),
+        (
+            r#""z" as $x | {"x":1,"z":9} as {$x, ($x): $y} | [$x,$y]"#,
+            "[1,9]",
+        ),
+        (
+            r#""z" as $x | reduce ({"a":"b","z":1},{"a":"c","z":2}) as {a: $x, ($x): $y} (0; . + $y)"#,
+            "3",
+        ),
+        (
+            r#""z" as $x | [foreach ({"a":"b","z":1}) as {a: $x, ($x): $y} (0; . + $y)]"#,
+            "[1]",
+        ),
+        (
+            r#""z" as $x | {"a":{"k":"b"},"z":5} as {a: {k: $x}, ($x): $y} | [$x,$y]"#,
+            r#"["b",5]"#,
+        ),
+    ] {
+        assert_eq!(machine(&format!("{R}{filter}")), ok(&[want]), "{filter}");
+    }
+    let unbound = r#"def r: if false then r else . end; {"a":"b"} as {a: $x, ($x): $y} | $y"#;
+    let program = parse(unbound).expect("parses");
+    assert!(
+        with_prelude(|prelude| compile::compile(&Interp::new(prelude), &program).is_err()),
+        "declines {unbound}"
+    );
+}
+
 /// `range`'s first output has the shipped route's representation, so `range(0; 1) | -.` is `-0`
 /// as in jq (#7977 review).
 #[test]
@@ -411,6 +464,11 @@ fn ranges_first_output_negates_as_jqs_7977() {
         ("[range(0;2) | [., -.]]", &["[[0,-0],[1,-1]]"]),
         ("range(0.0;2)", &["0.0", "1"]),
         ("[range(1.0;3)]", &["[1.0,2]"]),
+        // `range/3`'s `$from` when it is not a constant (#7977 re-review).
+        ("0 as $x | [range($x; 2; 1) | -.]", &["[-0,-1]"]),
+        ("[0 | range(.;3;1) | -.]", &["[-0,-1,-2]"]),
+        ("[range((0,1);3;1) | -.]", &["[-0,-1,-2,-1,-2]"]),
+        ("def g($n): [range($n; 2; 1) | -.]; g(0)", &["[-0,-1]"]),
     ] {
         assert_eq!(machine(&format!("{R}{filter}")), ok(want), "{filter}");
     }
@@ -427,6 +485,9 @@ fn a_side_effect_never_runs_inside_a_leaf_that_answers_twice_7977() {
         "def r: if false then r else . end; first({a: (1, (2|debug))})",
         r#"def r: if false then r else . end; "\((1,2)|stderr)""#,
         "def r: if false then r else . end; [5,6] | .[((0,1)|debug)]",
+        // `halt_error/1` writes its message when it runs (#7977 re-review).
+        r#"def r: if false then r else . end; first({a: (1, ("bye\n" | halt_error(1)))})"#,
+        r#"def r: if false then r else . end; first("\(1, ("bye\n" | halt_error(1)))")"#,
     ] {
         assert!(declines(filter), "declines {filter}");
     }
