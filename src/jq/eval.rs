@@ -5582,7 +5582,7 @@ fn yq_owned_reemit_after_empty_stage<S: EvalSemantics>(
     reentry: Reentry,
 ) -> Option<Expr> {
     // Asked only under `S::TAG == EvalTag::Yq`, as every caller of the rule is.
-    debug_assert!(S::TAG == EvalTag::Yq);
+    debug_assert_eq!(S::TAG, EvalTag::Yq);
     yq_reemit_after_empty_stage_as(body, as_written, &mut |prefix| {
         let mut seen = false;
         let flow = eval_each_owned::<S>(prefix, input, false, reentry, &mut |_| {
