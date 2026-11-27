@@ -299,6 +299,33 @@ class Watch(unittest.TestCase):
                 generate.stale(log, generate.STALE_PERCENT)
         self.assertEqual(watch.parse(out.getvalue()), (1536, 1468, 68, 4.4, 5.0))
 
+    def test_a_job_log_is_asked_for_again_with_the_flag_only_when_gh_says_to(self):
+        calls = []
+
+        def refusing(*args):
+            calls.append(args)
+            if watch.ESCAPES not in args:
+                raise RuntimeError("gh api x: the response contains terminal escape sequences; "
+                                   f"pass {watch.ESCAPES} to output it anyway")
+            return self.LOG
+
+        self.assertEqual(watch.job_log(7, refusing), self.LOG)
+        self.assertEqual(calls, [("api", f"repos/{watch.REPO}/actions/jobs/7/logs"),
+                                 ("api", watch.ESCAPES, f"repos/{watch.REPO}/actions/jobs/7/logs")])
+
+        calls.clear()
+        self.assertEqual(watch.job_log(7, lambda *a: calls.append(a) or self.LOG), self.LOG)
+        self.assertEqual(len(calls), 1)
+
+        def failing(*args):
+            calls.append(args)
+            raise RuntimeError("gh api x: HTTP 404: Not Found")
+
+        calls.clear()
+        with self.assertRaisesRegex(RuntimeError, "404"):
+            watch.job_log(7, failing)
+        self.assertEqual(len(calls), 1)
+
     def test_an_issue_is_opened_once_and_then_edited(self):
         self.assertIsNone(watch.decide(3.9, 4.0, []))
         self.assertIsNone(watch.decide(4.0, 4.0, [12]))

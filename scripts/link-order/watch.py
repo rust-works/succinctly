@@ -27,6 +27,7 @@ from ci_leg_times import REPO, api, gh  # noqa: E402
 TITLE = "perf(build): regenerate the link-order list (scripts/link-order/symbols.txt)"
 JOB = "Perf Regression Guard (x86_64)"
 THRESHOLD = 4.0
+ESCAPES = "--allow-escape-sequences"
 LINE = re.compile(r"link-order list: (\d+) listed, (\d+) found, (\d+) no longer resolve "
                   r"\(([\d.]+)%, limit ([\d.]+)%\)")
 
@@ -41,6 +42,20 @@ def parse(log):
     return int(listed), int(ok), int(gone), float(share), float(limit)
 
 
+def job_log(job_id, run=gh):
+    """A job's log. A job log holds terminal escapes (the runner colours each step's command), and a
+    recent `gh` (the runners') refuses to print a response holding them unless passed ESCAPES, a flag
+    older ones (2.96) reject: so ask without it, and again with it only when `gh` says to
+    (2026-11-27's scheduled run failed on the first ask)."""
+    path = f"repos/{REPO}/actions/jobs/{job_id}/logs"
+    try:
+        return run("api", path)
+    except RuntimeError as e:
+        if ESCAPES not in str(e):
+            raise
+        return run("api", ESCAPES, path)
+
+
 def newest_reading(runs=10):
     """(run, counts) for the newest completed main `push` run of ci.yml whose x86_64 perf-guard job
     printed the line, or (None, None)."""
@@ -50,7 +65,7 @@ def newest_reading(runs=10):
         jobs = api(f"repos/{REPO}/actions/runs/{run['id']}/jobs", per_page=100, filter="latest")
         for job in jobs.get("jobs", []):
             if job["name"] == JOB and job.get("conclusion") in ("success", "failure"):
-                counts = parse(gh("api", f"repos/{REPO}/actions/jobs/{job['id']}/logs"))
+                counts = parse(job_log(job["id"]))
                 if counts:
                     return run, counts
     return None, None
