@@ -1507,6 +1507,14 @@ Three things differ.
   `env(X) | document_index` over three documents is `0 0 0` in yq and `0 1 2` here, and `env(X) | filename` is empty in yq and the file's name here: the node reads the document it was evaluated over, as a literal's node does ([#7180](https://github.com/rust-works/succinctly/issues/7180)).
   No `---` is written between the values either way.
 
+### `now` reads the clock once for its whole context ([#8007](https://github.com/rust-works/succinctly/issues/8007))
+
+yq's `nowOp` returns one new node for the nodes it is given, as `envOperator` does, so `[.x[] | now] | length` is `1`, `select(false) | now` is one value, several documents print one value each with no `---` between them, and `--eval-all` prints one in all.
+`succinctly yq` follows that in yq mode, through the same context-list walk and parser rewrite as `env(NAME)` above.
+`succinctly jq`'s `now` is a number read once per input, as jq reads it.
+The three differences recorded for `env(NAME)` above hold for `now` too: `.y = [.x[] | (now, now)]` writes six values here and two in yq, `limit(1; repeat(1) | now)` under `--jq-extensions` runs `repeat` to its limit, and `now | document_index` over three documents is `0 1 2` here and `0 0 0` in yq.
+yq also tags the node `!!timestamp`, which an owned value cannot carry ([#2802](https://github.com/rust-works/succinctly/issues/2802)), so `now | type` is still `!!str` here, as the datetime section records.
+
 ### Duplicate mapping keys — an owned value keeps every entry (#1344); a few narrower gaps remain
 
 **Since [#1344](https://github.com/rust-works/succinctly/issues/1344) ([ADR-0027](../../adrs/adr-0027.md)) an `OwnedValue::Object` keeps a repeated mapping key's earlier entries beside its collapsed `IndexMap`.**
