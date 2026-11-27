@@ -13782,10 +13782,11 @@ impl<'a> Parser<'a> {
     /// pops an operator only on a strictly greater precedence), so `(0, 1; U)` is `0, (1; U)`: the
     /// block `reduceOperator` requires is not the argument's top, and it fails with `reduce must be
     /// given a block, got UNION instead` before it evaluates SRC, INIT or UPDATE. The check is at
-    /// evaluation, so the expression is yq's `error` with that message, which fires where a
-    /// `reduceOperator` would run (an empty source or context too, not behind a short-circuited
-    /// `false and`). Whatever follows the union parses as an expression list, as yq's would
-    /// (`(0, 1)`, `(0, 1; .; .)`).
+    /// evaluation, so the expression is yq's `error` with that message, which fires where yq's fold
+    /// runs in a pipe: over an empty source or a `select(false)` context too, and not behind a
+    /// short-circuited `false and`. Under `|=` or `with_entries`, a right side whose context empties
+    /// before the fold does not run it, where yq still raises (#8002). Whatever follows the union
+    /// parses as an expression list, as yq's would (`(0, 1)`, `(0, 1; .; .)`).
     #[cold]
     #[inline(never)] // one rare call site: out of line, so it does not grow the parser's frame
     fn finish_ireduce_union_init(&mut self) -> Result<Expr, ParseError> {
