@@ -189,6 +189,132 @@ const SELECT_ROWS: &[(&str, &str)] = &[
     ("del((kind | select(. == \"map\")), .a)", "b: hi\n"),
 ];
 
+/// Scalars of three styles, one with a line comment: the documents of the review rows.
+const STYLED: &str = "a: \"x\"\nb: 1\nc: 2 # hi\n";
+/// A key whose value is a mapping.
+const NESTED: &str = "a: 1\nb: {c: 2}\n";
+/// An anchor, an alias to it, and a scalar.
+const ALIASED: &str = "d: &x {p: 1, q: 2}\ne: *x\nf: 3\n";
+/// A mapping, a sequence and the keys a fresh container would name.
+const CONTAINERS: &str = "a: 0\nb: {c: 1}\nc: 5\narr: [1, 2]\n";
+
+/// A metadata `select` before a reader is resolved on the cursor: the owned value answers every
+/// reader's default, so its `select` would keep every node (#8020 review). `key` straight after
+/// `key` answers nothing. (document, filter, yq's stdout.)
+const REVIEW_ROWS: &[(&str, &str, &str)] = &[
+    (
+        STYLED,
+        "del(.[] | select(style == \"\") | line)",
+        "a: \"x\"\n",
+    ),
+    (
+        STYLED,
+        "del(.[] | select(line_comment == \"\") | line)",
+        "c: 2 # hi\n",
+    ),
+    (
+        STYLED,
+        "del(.. | select(style == \"\") | line)",
+        "a: \"x\"\n",
+    ),
+    (
+        STYLED,
+        "del(.[] | select(style == \"\") | kind)",
+        "a: \"x\"\n",
+    ),
+    (
+        STYLED,
+        "del(.[] | select(style == \"\") | key | line)",
+        "a: \"x\"\n",
+    ),
+    (
+        STYLED,
+        "del(.[] | select(style == \"double\") | key)",
+        "b: 1\nc: 2 # hi\n",
+    ),
+    (
+        STYLED,
+        "del(.[] | select(style == \"double\") | line)",
+        "b: 1\nc: 2 # hi\n",
+    ),
+    (
+        STYLED,
+        "del(.[] | select(line_comment == \"# hi\") | line)",
+        STYLED,
+    ),
+    (
+        STYLED,
+        "del(.a, (.[] | select(style == \"\") | line))",
+        "{}\n",
+    ),
+    (
+        STYLED,
+        "del((.[] | select(style == \"\") | line), .a)",
+        "{}\n",
+    ),
+    (STYLED, "(.[] | select(style == \"\") | line) = 9", STYLED),
+    (NESTED, "del(.b | key | key)", NESTED),
+    (NESTED, "del(.[] | key | key)", NESTED),
+    (NESTED, "del(.. | key | key)", NESTED),
+    (NESTED, "del(.b.c | key | key)", NESTED),
+    (NESTED, "del(.b | key | key | line)", NESTED),
+    (NESTED, "del(.b | key | line)", "a: 1\n"),
+    (NESTED, "del(.b | line | key)", "a: 1\n"),
+    (NESTED, "del(.b | key | line | key)", "a: 1\n"),
+    (NESTED, "del(.b | key | kind)", "a: 1\n"),
+    (NESTED, "del(.b | line | line)", "a: 1\n"),
+    (ALIASED, "del(.. | line)", "{}\n"),
+    (ALIASED, "del(.e | line)", "d: &x {p: 1, q: 2}\nf: 3\n"),
+    (ALIASED, "del(.e.p | line)", "d: &x {q: 2}\ne: *x\nf: 3\n"),
+    (ALIASED, "del(.e | .[] | line)", "d: &x {}\ne: *x\nf: 3\n"),
+    (
+        ALIASED,
+        "del(.. | select(style == \"\") | line)",
+        "d: &x {}\n",
+    ),
+    (
+        ALIASED,
+        "del(.e | .[] | select(style == \"\") | line)",
+        "d: &x {}\ne: *x\nf: 3\n",
+    ),
+];
+
+/// Shapes `succinctly yq` refuses where yq answers, the safe direction recorded in
+/// `docs/compliance/yq/limitations.md`: a deriving stage after a metadata `select`, and a fresh
+/// container after one (#8037), whose `path` is not the node yq writes. (document, filter.)
+const REFUSED_ROWS: &[(&str, &str)] = &[
+    (STYLED, "del(.[] | select(style == \"\") | tostring)"),
+    (ALIASED, "del(.e | .. | tostring)"),
+    (
+        CONTAINERS,
+        "(.b | select(kind == \"map\") | {\"a\": 1} | .a) = 9",
+    ),
+    (
+        CONTAINERS,
+        "(.b | select(kind == \"map\") | {\"a\": 1} | .a) |= 9",
+    ),
+    (
+        CONTAINERS,
+        "del(.b | select(kind == \"map\") | {\"a\": 1} | .a)",
+    ),
+    (
+        CONTAINERS,
+        "del(.arr | select(kind == \"seq\") | [.[]] | .[0])",
+    ),
+    (
+        CONTAINERS,
+        "del(.b | select(kind == \"map\") | with_entries(.) | .c)",
+    ),
+];
+
+/// A `..` below a step down on a document with aliases: yq's `..` stops at the alias and deletes
+/// `e`, where the owned walk would go through it into the anchor, so `succinctly yq` deletes
+/// nothing (the safe direction, recorded). (filter, `succinctly yq`'s stdout over [`ALIASED`].)
+const LESS_ROWS: &[(&str, &str)] = &[
+    ("del(.e | .. | line)", ALIASED),
+    ("del(.e | .. | select(style == \"\") | line)", ALIASED),
+];
+
 fn run(args: &[&str], stdin: &str) -> Result<(String, String, i32)> {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
@@ -291,6 +417,77 @@ fn a_select_after_a_parentless_target_still_stops_the_loop_8020() -> Result<()> 
 fn del_through_key_deletes_the_slot_8020() -> Result<()> {
     for (filter, want) in KEY_ROWS {
         assert_row(&[filter], DOC, want)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_metadata_select_before_a_reader_tail_matches_yq_8020() -> Result<()> {
+    for (doc, filter, want) in REVIEW_ROWS {
+        assert_row(&[filter], doc, want)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_target_whose_path_is_not_yqs_node_is_refused_8020() -> Result<()> {
+    for (doc, filter) in REFUSED_ROWS {
+        let got = run(&[filter], doc)?;
+        assert_eq!((got.0.as_str(), got.2), ("", 1), "{filter} over {doc:?}");
+        assert!(
+            got.1.starts_with("Error: Invalid path expression"),
+            "{filter} over {doc:?}: {}",
+            got.1
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_descent_below_an_alias_deletes_less_than_yq_8020() -> Result<()> {
+    for (filter, want) in LESS_ROWS {
+        assert_row(&[filter], ALIASED, want)?;
+    }
+    Ok(())
+}
+
+/// One `-i` row per review finding: the file holds yq's result, or is left as it was.
+#[test]
+fn inplace_review_rows_keep_the_file_8020() -> Result<()> {
+    let rows: &[(&str, &str, &str, i32)] = &[
+        (
+            STYLED,
+            "del(.[] | select(style == \"\") | line)",
+            "a: \"x\"\n",
+            0,
+        ),
+        (NESTED, "del(.b | key | key)", NESTED, 0),
+        (ALIASED, "del(.e | .. | line)", ALIASED, 0),
+        (
+            CONTAINERS,
+            "del(.arr | select(kind == \"seq\") | [.[]] | .[0])",
+            CONTAINERS,
+            1,
+        ),
+        (
+            CONTAINERS,
+            "(.b | select(kind == \"map\") | {\"a\": 1} | .a) = 9",
+            CONTAINERS,
+            1,
+        ),
+    ];
+    for (doc, filter, want, status) in rows {
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(file.path(), doc)?;
+        let path = file.path().to_str().expect("utf-8 temp path");
+        let got = run(&["-i", filter, path], "")?;
+        assert_eq!(
+            (got.0.as_str(), got.2),
+            ("", *status),
+            "{filter}: {}",
+            got.1
+        );
+        assert_eq!(std::fs::read_to_string(file.path())?, *want, "{filter}");
     }
     Ok(())
 }
