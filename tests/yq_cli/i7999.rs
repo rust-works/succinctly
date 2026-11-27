@@ -1,0 +1,304 @@
+//! #7999: yq indexes a mapping by a bracket key's text and a sequence by its value. A hex key
+//! (`0x1`, #7615) or a decimal one with leading zeros (`01`) on a mapping names the key `0x1` or
+//! `01`; the parser used to fold it to the integer index `1`, so a read, write or `del` landed on
+//! the key `1`, one the filter never named. In yq mode `01` is now the spelled integer a
+//! document's `01` is, as `0x1` already was. Every yq row is a live yq v4.53.3 capture; the jq
+//! rows are jq 1.7.1's, and jq mode is unchanged.
+
+use std::io::Write;
+
+use anyhow::Result;
+use tempfile::NamedTempFile;
+
+use crate::{run_jq_stdin, run_jq_stdin_with_stderr, run_yq_file, run_yq_stdin};
+
+fn yq_json(filter: &str, input: &str, extra: &[&str]) -> Result<(String, i32)> {
+    let mut args = vec!["-o=json", "-I0"];
+    args.extend_from_slice(extra);
+    let (out, code) = run_yq_stdin(filter, input, &args)?;
+    Ok((out.trim_end().to_string(), code))
+}
+
+/// A read through a spelled key on a mapping takes the key with that text.
+#[test]
+fn test_spelled_bracket_key_reads_a_mapping_by_its_text_7999() -> Result<()> {
+    let input = "m: {\"0x1\": 5, \"1\": 6, \"01\": 7, \"0X1\": 8}\n";
+    for (filter, want) in [
+        (".m[0x1]", "5"),
+        (".m[0X1]", "8"),
+        (".m[01]", "7"),
+        (".m[(0x1)]", "5"),
+        (".m[((0x1))]", "5"),
+        (".m.[0x1]", "5"),
+        (".m | .[0x1]", "5"),
+        (".m | .[(0x1)]", "5"),
+        (".m[0x1]?", "5"),
+        (".m.[0x1]?", "5"),
+        (".m[0x1, 1]", "5\n6"),
+        (".m[0x01]", "null"),
+        (".m[00]", "null"),
+        // A canonical key reads as before.
+        (".m[1]", "6"),
+        (".m[0]", "null"),
+    ] {
+        assert_eq!(
+            yq_json(filter, input, &[])?,
+            (want.to_string(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// A write, an update and a delete land on the key the filter names, not on `1`.
+#[test]
+fn test_spelled_bracket_key_writes_the_mapping_key_it_names_7999() -> Result<()> {
+    let input = "m: {\"1\": 6, \"0x1\": 5}\n";
+    for (filter, want) in [
+        (".m[0x1] = 9", r#"{"m":{"1":6,"0x1":9}}"#),
+        (".m[0x1] |= 9", r#"{"m":{"1":6,"0x1":9}}"#),
+        (".m[0x1] |= . + 1", r#"{"m":{"1":6,"0x1":6}}"#),
+        (".m[0x1] += 1", r#"{"m":{"1":6,"0x1":6}}"#),
+        (".m[0x1] *= 2", r#"{"m":{"1":6,"0x1":10}}"#),
+        ("(.m[0x1]) = 9", r#"{"m":{"1":6,"0x1":9}}"#),
+        (".m[(0x1)] = 9", r#"{"m":{"1":6,"0x1":9}}"#),
+        (".m.[0x1] = 9", r#"{"m":{"1":6,"0x1":9}}"#),
+        (".m | .[(0x1)] = 9", r#"{"1":6,"0x1":9}"#),
+        ("with(.m[0x1]; . = 9)", r#"{"m":{"1":6,"0x1":9}}"#),
+        (".m[01] = 9", r#"{"m":{"1":6,"0x1":5,"01":9}}"#),
+        (".m[01] |= 9", r#"{"m":{"1":6,"0x1":5,"01":9}}"#),
+        ("del(.m[0x1])", r#"{"m":{"1":6}}"#),
+        ("del(.m[(0x1)])", r#"{"m":{"1":6}}"#),
+        (".m | del(.[0x1])", r#"{"1":6}"#),
+        ("del(.m[01])", r#"{"m":{"1":6,"0x1":5}}"#),
+        (".m | has(0x1)", "true"),
+        (".m | has(01)", "false"),
+        (".m[0x1] as $v | $v", "5"),
+        // A canonical key writes as before.
+        (".m[1] = 9", r#"{"m":{"1":9,"0x1":5}}"#),
+    ] {
+        assert_eq!(
+            yq_json(filter, input, &[])?,
+            (want.to_string(), 0),
+            "{filter}"
+        );
+    }
+    for (filter, input, want) in [
+        (".e[0x1] = 9", "e: {}\n", r#"{"e":{"0x1":9}}"#),
+        (".e[01] = 9", "e: {}\n", r#"{"e":{"01":9}}"#),
+        (".e[1] = 9", "e: {}\n", r#"{"e":{"1":9}}"#),
+        (".m[0x1]", "m: {\"1\": 6}\n", "null"),
+        (".m[0x1] = 9", "m: {\"1\": 6}\n", r#"{"m":{"1":6,"0x1":9}}"#),
+        ("del(.m[0x1])", "m: {\"1\": 6}\n", r#"{"m":{"1":6}}"#),
+        (".m | has(0x1)", "m: {\"1\": 6}\n", "false"),
+        (".m | has(0x1)", "m: {\"0x1\": 6}\n", "true"),
+        (".n[0x1][0x1] = 3", "n: {}\n", r#"{"n":{"0x1":[null,3]}}"#),
+        // An absent or `null` target still becomes a sequence: the key is a number.
+        (".e[0x1] = 9", "m: {}\n", r#"{"m":{},"e":[null,9]}"#),
+        (".e[01] = 9", "m: {}\n", r#"{"m":{},"e":[null,9]}"#),
+        (".[0x1] = 1", "null\n", "[null,1]"),
+        (".[01] = 1", "null\n", "[null,1]"),
+        ("del(.[0x1])", "null\n", "[null]"),
+        // A write through a sum is a no-op in yq whatever the key.
+        (
+            "(.a + .b)[0x1] = 9",
+            "a: {\"0x1\": 1}\nb: {\"1\": 2}\n",
+            r#"{"a":{"0x1":1},"b":{"1":2}}"#,
+        ),
+        ("(.a + .b)[0x1]", "a: {\"0x1\": 1}\nb: {\"1\": 2}\n", "1"),
+    ] {
+        assert_eq!(
+            yq_json(filter, input, &[])?,
+            (want.to_string(), 0),
+            "{filter} over {input:?}"
+        );
+    }
+    // The written key keeps its spelling in YAML.
+    let (out, code) = run_yq_stdin(".m[01] = 9", "m: {\"1\": 6, \"0x1\": 5}\n", &[])?;
+    assert_eq!(
+        (out.as_str(), code),
+        ("m: {\"1\": 6, \"0x1\": 5, 01: 9}\n", 0)
+    );
+    let (out, code) = run_yq_stdin(".e[0x1] = 9", "e: {}\n", &[])?;
+    assert_eq!((out.as_str(), code), ("e:\n  0x1: 9\n", 0));
+    Ok(())
+}
+
+/// A sequence is still indexed by the key's value, and a slice bound is unchanged.
+#[test]
+fn test_spelled_bracket_key_indexes_a_sequence_by_value_7999() -> Result<()> {
+    let input = "s: [a, b, c]\n";
+    for (filter, want) in [
+        (".s[0x1]", r#""b""#),
+        (".s[01]", r#""b""#),
+        (".s[0X2]", r#""c""#),
+        (".s[(0x1)]", r#""b""#),
+        (".s.[0x1]", r#""b""#),
+        (".s | .[0x1]", r#""b""#),
+        (".s[0x1]?", r#""b""#),
+        (".s[0x1] = \"z\"", r#"{"s":["a","z","c"]}"#),
+        (".s[01] = \"z\"", r#"{"s":["a","z","c"]}"#),
+        (".s[0x1] |= \"z\"", r#"{"s":["a","z","c"]}"#),
+        (".s[0x1] += \"q\"", r#"{"s":["a","bq","c"]}"#),
+        (".s[0x5] = \"z\"", r#"{"s":["a","b","c",null,null,"z"]}"#),
+        ("del(.s[0x1])", r#"{"s":["a","c"]}"#),
+        ("del(.s[01])", r#"{"s":["a","c"]}"#),
+        (".s[0x1:]", r#"["b","c"]"#),
+        (".s[:0x2]", r#"["a","b"]"#),
+        (".s[01:]", r#"["b","c"]"#),
+        (".s[0x1:0x2]", r#"["b"]"#),
+        (".s | pick([0x1])", r#"["b"]"#),
+    ] {
+        assert_eq!(
+            yq_json(filter, input, &[])?,
+            (want.to_string(), 0),
+            "{filter}"
+        );
+    }
+    for (filter, want) in [
+        ("[1,2,3] | .[01]", "2"),
+        ("[1,2,3] | .[-01]", "3"),
+        ("[1,2,3] | .[-01:]", "[3]"),
+        ("[1,2,3] | .[01:02]", "[2]"),
+        ("{0x1: 2} | .[0x1]", "2"),
+        ("{01: 2} | .[01]", "2"),
+    ] {
+        assert_eq!(
+            yq_json(filter, "", &["-n"])?,
+            (want.to_string(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// A large document takes the same rule on the file and stdin routes, sequence and mapping alike.
+#[test]
+fn test_spelled_bracket_key_on_a_large_document_7999() -> Result<()> {
+    let mut yaml = String::new();
+    for i in 0..20000 {
+        yaml.push_str(&format!(
+            "- {{\"0x1\": {i}, \"1\": {}, \"01\": {}}}\n",
+            -i,
+            i * 10
+        ));
+    }
+    let mut file = NamedTempFile::new()?;
+    file.write_all(yaml.as_bytes())?;
+    let path = file.path().to_str().expect("utf-8 temp path");
+    for (filter, want) in [
+        (".[0x0] | .[0x1]", "0"),
+        (".[0x0][0x1]", "0"),
+        (".[0x0].[0x1]", "0"),
+        (".[0x4e1f][0x1]", "19999"),
+        (".[01][01]", "10"),
+        (".[0x0][1]", "0"),
+        (".[0][0x1]", "0"),
+        (".[0x0][0x1] = 9 | .[0x0]", r#"{"0x1":9,"1":0,"01":0}"#),
+        (".[0x0][01] |= 9 | .[0x0]", r#"{"0x1":0,"1":0,"01":9}"#),
+        ("del(.[0x0][0x1]) | .[0x0]", r#"{"1":0,"01":0}"#),
+    ] {
+        let (out, code) = run_yq_file(filter, path, &["-o=json", "-I0"])?;
+        assert_eq!((out.trim_end(), code), (want, 0), "{filter} on a file");
+        assert_eq!(
+            yq_json(filter, &yaml, &[])?,
+            (want.to_string(), 0),
+            "{filter} on stdin"
+        );
+    }
+    Ok(())
+}
+
+/// In yq mode a `01` literal is the spelled integer a document's `01` is.
+#[test]
+fn test_leading_zero_literal_keeps_its_spelling_7999() -> Result<()> {
+    for (filter, want) in [
+        ("01", "1"),
+        ("007", "7"),
+        ("01 | tostring", r#""01""#),
+        ("00 | tostring", r#""00""#),
+        ("-01 | tostring", r#""-01""#),
+        ("\"x\" + (01 | tostring)", r#""x01""#),
+        ("01 as $x | $x | tostring", r#""01""#),
+        ("[01] | .[0] | tostring", r#""01""#),
+        ("1 == 01", "false"),
+        ("01 == 01", "true"),
+        ("01 == 1.0", "false"),
+        ("01 == \"01\"", "true"),
+        ("[01, 1] | unique", "[1,1]"),
+        ("[00, 0] | unique", "[0,0]"),
+        ("{01: 2}", r#"{"01":2}"#),
+        ("{\"01\": 1} | has(01)", "true"),
+        ("[1,2] | has(01)", "true"),
+        ("01 + 1", "2"),
+        ("1 - 01", "0"),
+        ("01 * 2", "2"),
+        ("01 < 2", "true"),
+        ("01 | tag", r#""!!int""#),
+        ("01 | @json", r#""1""#),
+        ("01 | @yaml", r#""01\n""#),
+    ] {
+        assert_eq!(
+            yq_json(filter, "", &["-n", "--"])?,
+            (want.to_string(), 0),
+            "{filter}"
+        );
+    }
+    for (filter, want) in [
+        ("01", "01\n"),
+        ("007", "007\n"),
+        ("-01", "-01\n"),
+        ("[01, 1]", "- 01\n- 1\n"),
+        ("{01: 2}", "01: 2\n"),
+        ("[01, 1] | sort", "- 01\n- 1\n"),
+    ] {
+        let (out, code) = run_yq_stdin(filter, "", &["-n", "--"])?;
+        assert_eq!((out.as_str(), code), (want, 0), "{filter}");
+    }
+    let (out, code) = run_yq_stdin(".a = [01, 007] | .b = -01", "{}\n", &[])?;
+    assert_eq!((out.as_str(), code), ("a:\n  - 01\n  - 007\nb: -01\n", 0));
+    Ok(())
+}
+
+/// `path()` (a `--jq-extensions` builtin) names the mapping key by its text and the sequence
+/// position by its value, as the read and the write do.
+#[test]
+fn test_spelled_bracket_key_path_under_jq_extensions_7999() -> Result<()> {
+    let input = "m: {\"1\": 6, \"0x1\": 5}\ns: [a, b]\n";
+    for (filter, want) in [
+        ("path(.m[0x1])", r#"["m","0x1"]"#),
+        ("path(.m[01])", r#"["m","01"]"#),
+        ("path(.m | .[0x1])", r#"["m","0x1"]"#),
+        ("path(.s[0x1])", r#"["s",1]"#),
+    ] {
+        assert_eq!(
+            yq_json(filter, input, &["--jq-extensions"])?,
+            (want.to_string(), 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// jq reads `01` as the number 1 (jq 1.7.1), so jq mode is unchanged.
+#[test]
+fn test_jq_mode_leading_zero_literal_is_unchanged_7999() -> Result<()> {
+    for (filter, want) in [
+        ("01", "1"),
+        ("01 | tostring", r#""1""#),
+        ("-01 | tostring", r#""-1""#),
+        ("1 == 01", "true"),
+        ("[01, 1] | unique", "[1]"),
+        ("[1,2,3] | .[01]", "2"),
+        ("[1,2,3] | .[01:]", "[2,3]"),
+        ("path(.[01])", "[1]"),
+        ("[1,2,3] | .[01] = 9", "[1,9,3]"),
+    ] {
+        let (out, code) = run_jq_stdin(filter, "", &["-n", "-c"])?;
+        assert_eq!((out.trim_end(), code), (want, 0), "{filter}");
+    }
+    let (out, err, code) = run_jq_stdin_with_stderr("{\"1\": 5} | .[01]", "", &["-n"])?;
+    assert_eq!((out.as_str(), code), ("", 5));
+    assert!(err.contains("Cannot index object with number"), "{err}");
+    Ok(())
+}
