@@ -7748,24 +7748,7 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
         Expr::Pipe(pipe) => (pipe.first()?, Some(pipe)),
         other => (other, None),
     };
-    let rewritten = retarget_write(write, &mut |target| {
-        // A comma is resolved member by member (#8020), so a member that selects by metadata is
-        // resolved on the cursor while a reader or a literal beside it is left to the evaluator,
-        // which applies yq's rule to it: `del(1, (.. | select(style == "x")))` keeps the document.
-        let Expr::Comma(members) = strip_parens(target) else {
-            return cursor_metadata_target(cursor, target);
-        };
-        let mut changed = false;
-        let members = members
-            .iter()
-            .map(|member| {
-                let resolved = cursor_metadata_target(cursor, member);
-                changed |= resolved.is_some();
-                resolved.unwrap_or_else(|| member.clone())
-            })
-            .collect();
-        changed.then(|| Expr::Paren(Box::new(Expr::Comma(members))))
-    })?;
+    let rewritten = retarget_write(write, &mut |target| cursor_metadata_target(cursor, target))?;
     Some(match pipe {
         None => rewritten,
         Some(pipe) => {
@@ -7806,6 +7789,21 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
             Expr::Pipe(stages) => stages.iter().for_each(|stage| flatten(stage, out)),
             other => out.push(other),
         }
+    }
+    // A comma is resolved member by member, so a member that selects by metadata is resolved on
+    // the cursor while a reader or a literal beside it is left to the evaluator, which applies
+    // yq's rule to it: `del(1, (.. | select(style == "x")))` keeps the document.
+    if let Expr::Comma(members) = strip_parens(target) {
+        let mut changed = false;
+        let members = members
+            .iter()
+            .map(|member| {
+                let resolved = cursor_metadata_target(cursor, member);
+                changed |= resolved.is_some();
+                resolved.unwrap_or_else(|| member.clone())
+            })
+            .collect();
+        return changed.then(|| Expr::Paren(Box::new(Expr::Comma(members))));
     }
     let mut stages = Vec::new();
     flatten(target, &mut stages);

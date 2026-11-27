@@ -280,11 +280,14 @@ const REVIEW_ROWS: &[(&str, &str, &str)] = &[
 ];
 
 /// Shapes `succinctly yq` refuses where yq answers, the safe direction recorded in
-/// `docs/compliance/yq/limitations.md`: a deriving stage after a metadata `select`, and a fresh
-/// container after one (#8037), whose `path` is not the node yq writes. (document, filter.)
+/// `docs/compliance/yq/limitations.md`: a deriving stage after a metadata `select`, a fresh
+/// container after one (#8037), whose `path` is not the node yq writes, and a metadata `select`
+/// the cursor cannot resolve soundly. (document, filter.)
 const REFUSED_ROWS: &[(&str, &str)] = &[
     (STYLED, "del(.[] | select(style == \"\") | tostring)"),
     (ALIASED, "del(.e | .. | tostring)"),
+    // A metadata `select` under a `..` below a step down on a document with aliases.
+    (ALIASED, "del(.e | .. | select(style == \"\") | line)"),
     (
         CONTAINERS,
         "(.b | select(kind == \"map\") | {\"a\": 1} | .a) = 9",
@@ -310,10 +313,7 @@ const REFUSED_ROWS: &[(&str, &str)] = &[
 /// A `..` below a step down on a document with aliases: yq's `..` stops at the alias and deletes
 /// `e`, where the owned walk would go through it into the anchor, so `succinctly yq` deletes
 /// nothing (the safe direction, recorded). (filter, `succinctly yq`'s stdout over [`ALIASED`].)
-const LESS_ROWS: &[(&str, &str)] = &[
-    ("del(.e | .. | line)", ALIASED),
-    ("del(.e | .. | select(style == \"\") | line)", ALIASED),
-];
+const LESS_ROWS: &[(&str, &str)] = &[("del(.e | .. | line)", ALIASED)];
 
 fn run(args: &[&str], stdin: &str) -> Result<(String, String, i32)> {
     use std::io::Write;
