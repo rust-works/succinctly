@@ -933,8 +933,9 @@ jobs:
       - name: cancel-stale-merge-group-runs self-tests
         run: python3 scripts/test_cancel_stale_merge_group_runs.py -v
 
-      # #7390: the stripped-size budget check run after the release build below: a fake strip,
-      # no build. It also pins that this job's release build is the one release.yml ships.
+      # #7390, #7959: the stripped-size check run after the release build below (a PR's growth against
+      # its base, and the budget as a report), and scheduled.yml's tracking-issue job: a fake strip and a
+      # fake `gh`, no build. It also pins that this job's release build is the one release.yml ships.
       - name: binary_size.py self-tests
         run: python3 scripts/test_binary_size.py -v
 
@@ -1185,26 +1186,56 @@ jobs:
             target/
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
-      - name: Run perf guard
+      # The one place that says which binary is this run's base, for the perf guard and the size check
+      # below: main's push-run artifact when "Verify baseline binary" kept it, else the merge-base build
+      # on a pull request, else the previous-commit build on a push that made one. Empty when none exists.
+      - name: Resolve base binary
         run: |
           if [ -n "$PERF_GUARD_BASELINE_BIN" ]; then
-            EXTRA_ARGS="--baseline-binary $PERF_GUARD_BASELINE_BIN"
+            BASE_BIN="$PERF_GUARD_BASELINE_BIN"
           elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            EXTRA_ARGS="--baseline-binary /tmp/perf-guard-merge-base/target/release/succinctly"
+            BASE_BIN=/tmp/perf-guard-merge-base/target/release/succinctly
           elif [ "${{ github.event_name }}" = "push" ] && [ "$PERF_GUARD_PREV_BUILT" = "1" ]; then
-            EXTRA_ARGS="--baseline-binary /tmp/perf-guard-prev-commit/target/release/succinctly"
+            BASE_BIN=/tmp/perf-guard-prev-commit/target/release/succinctly
           else
-            EXTRA_ARGS=""
+            BASE_BIN=""
+          fi
+          echo "PERF_GUARD_BASE_BIN=$BASE_BIN" >> "$GITHUB_ENV"
+
+      - name: Run perf guard
+        run: |
+          EXTRA_ARGS=""
+          if [ -n "$PERF_GUARD_BASE_BIN" ]; then
+            EXTRA_ARGS="--baseline-binary $PERF_GUARD_BASE_BIN"
           fi
           python3 scripts/perf-guard.py --binary target/release/succinctly --arch "${{ matrix.name }}" --check $EXTRA_ARGS
 
       # #7390: the stripped size of the binary built above (release.yml's own command, so the shipped
-      # shape) against tests/data/binary-size-budget.json, failing past 5% growth. An intended increase
-      # bumps the committed number in the same PR: the failure prints the measured size and the edit.
-      # Runs whether or not the perf guard passed, so each reports on its own.
+      # shape). Runs whether or not the perf guard passed, so each reports on its own.
+      #
+      # #7959: a pull request is gated on its own growth against its base, the binary the perf guard
+      # compares with (main's push-run artifact, else the merge-base build above), stripped the same way:
+      # more than `max_pr_growth` in tests/data/binary-size-budget.json fails, unless a commit message or
+      # the PR body carries a line `[size-growth: ok #N]`. If a PR's base binary is missing, the budget is
+      # enforced instead (the check fails towards checking).
+      #
+      # The committed budget is only a report here, on a PR and on a push to main (`--budget-mode
+      # report`): a PR cannot bump a number that every other PR also edits and that the drift of every
+      # earlier PR has already used up, and failing every push to main would leave main red with no
+      # owner. The slow drift is caught instead by scheduled.yml's `binary-size` job, which opens a
+      # tracking issue per target that is over, and by release.yml, which fails on it.
       - name: Check stripped binary size
         if: ${{ !cancelled() && steps.release-build.outcome == 'success' }}
-        run: python3 scripts/binary_size.py check --binary target/release/succinctly
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            python3 scripts/binary_size.py check --binary target/release/succinctly \
+              --baseline-binary "$PERF_GUARD_BASE_BIN" --budget-mode report --commit-range origin/main..HEAD
+          else
+            python3 scripts/binary_size.py check --binary target/release/succinctly --budget-mode report
+          fi
 
   clippy:
     name: Clippy
