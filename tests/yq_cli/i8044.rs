@@ -70,7 +70,40 @@ const BINDING_ROWS: &[(&str, &str)] = &[
         "select(false) | ((1, (2 | select(false))) as $y | $y)",
         "1\n",
     ),
+    (
+        "select(false) | ((1 | select(false)) as $y | ($y, 4))",
+        "4\n",
+    ),
+    (
+        "select(false) | ((1, (2 | select(false))) as $y | ($y, 4))",
+        "1\n4\n",
+    ),
+    (
+        "select(false) | ((1 | select(false)) as $y | (1 | select(false)) as $z | [$y, $z])",
+        "[]\n",
+    ),
+    // #8034's postfix rule holds inside the body: `[key][0]` is one term in yq.
+    ("select(false) | (. as $y | [key][0])", ""),
+    ("select(false) | (. as $y | [key][1:])", "[]\n"),
+    (".[] |= (select(false) | (. as $y | [key][0]))", "[1,2]\n"),
+    // A binding that re-emits nothing leaves `map`'s members to the ordinary walk.
+    ("map(select(true) | . as $v | {})", "[{},{}]\n"),
+    ("map(select(true) | (1 as $y | [$y]))", "[[1],[1]]\n"),
 ];
+
+/// A nest of bindings whose sources all yield nothing is one body run, however deep: yq answers in
+/// a quarter of a second, and a rewrite that doubled per level would build millions of branches.
+#[test]
+fn a_deep_nest_of_empty_sources_answers_8044() -> Result<()> {
+    let bindings: String = (1..=24)
+        .map(|i| format!("(1 | select(false)) as $a{i} | "))
+        .collect();
+    let filter = format!("select(false) | ({bindings}3)");
+    let started = std::time::Instant::now();
+    assert_rows(INPUT, &[(filter.as_str(), "3\n")])?;
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    Ok(())
+}
 
 #[test]
 fn a_binding_after_an_empty_stage_runs_its_body_8044() -> Result<()> {
@@ -89,6 +122,10 @@ const FOLD_ROWS: &[(&str, &str)] = &[
     ),
     (
         "select(false) | (.[] as $x ireduce (0; . + ($x | key)))",
+        "0\n",
+    ),
+    (
+        "select(false) | (1 as $x ireduce (0; . + ($x | key)))",
         "0\n",
     ),
     // A source that re-emits is folded, from an empty list when INIT answers nothing (#8035).
@@ -140,6 +177,21 @@ fn a_fold_that_dropped_its_accumulators_stays_empty_8044() -> Result<()> {
             ("[select(false) | (.[] as $x ireduce (0; . + 1))]", "[0]\n"),
             ("(select(false) | (. as $y | 3)) as $q | $q", "3\n"),
             ("1 + (select(false) | (. as $y | 3))", "4\n"),
+        ],
+    )?;
+    // Over `[5]` the source's `.[]` folds the member, which UPDATE drops; rewriting the fold as
+    // one over an empty context would keep only the `1` branch and answer it.
+    assert_rows(
+        "[5]\n",
+        &[
+            (
+                "((.[], 1) as $x ireduce (0; select($x == 1) | . + 1)) as $q | [$q]",
+                "[]\n",
+            ),
+            (
+                "1 + ((.[], 1) as $x ireduce (0; select($x == 1) | . + 1))",
+                "1\n",
+            ),
         ],
     )
 }
