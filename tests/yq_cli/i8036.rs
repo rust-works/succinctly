@@ -111,22 +111,24 @@ fn a_fold_as_a_path_without_errors_is_unchanged_8036() -> Result<()> {
 #[test]
 fn break_and_halt_end_a_fold_as_a_path_at_once_8036() -> Result<()> {
     let ext = &["--jq-extensions", "-o", "json", "-I0"];
-    for (filter, expected_stderr) in [
+    for (filter, expected_stderr, expected_code) in [
         (
             "label $f | del((1, 2, error(\"s\")) as $x ireduce (.; break $f))",
             "",
+            0,
         ),
         (
             "del((1, error(\"s\")) as $x ireduce (.; \"bye\" | halt_error))",
             "bye",
+            1,
         ),
         (
             "del((1, error(\"s\")) as $x ireduce ((\"bye\" | halt_error); .))",
             "bye",
+            1,
         ),
     ] {
         let (stdout, stderr, code) = run_yq_stdin_with_stderr(filter, INPUT, ext)?;
-        let expected_code = if expected_stderr.is_empty() { 0 } else { 1 };
         assert_eq!(
             (stdout.as_str(), stderr.as_str(), code),
             ("", expected_stderr, expected_code),
