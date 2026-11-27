@@ -7879,6 +7879,15 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
     for (path, _) in &results {
         let at = navigation_for(path)?;
         let at_root = matches!(at, Expr::Identity);
+        // The root has no key, and a reader's answer at the root has none either: a tail with
+        // `key` answers nothing there.
+        if at_root
+            && tail
+                .iter()
+                .any(|stage| matches!(strip_parens(stage), Expr::Builtin(Builtin::Key)))
+        {
+            continue;
+        }
         let mut member: Vec<Expr> = Vec::with_capacity(tail.len() + 1);
         if !at_root || tail.is_empty() {
             member.push(at);
