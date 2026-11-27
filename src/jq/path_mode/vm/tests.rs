@@ -362,7 +362,7 @@ fn an_error_after_an_output_ends_the_run_after_the_output_7977() {
 
 #[test]
 fn a_consumer_that_stops_stops_the_producer_7977() {
-    let program = program("def nat: ., (. + 1 | nat); 0 | nat");
+    let program = decide(&program("def nat: ., (. + 1 | nat); 0 | nat")).expect("takes");
     let outputs = with_prelude(|prelude| {
         let it = Interp::new(prelude);
         let mut seen = Vec::new();
@@ -537,7 +537,7 @@ fn the_router_takes_recursive_programs_and_declines_the_rest_7977() {
         "def f: if . > 0 then (. - 1 | f), . else . end; [5 | f]",
         "def nat: ., (. + 1 | nat); first(0 | nat | select(. > 5))",
     ] {
-        assert!(decide(&program(filter)), "takes {filter}");
+        assert!(decide(&program(filter)).is_some(), "takes {filter}");
     }
     for filter in [
         // No recursive def.
@@ -553,7 +553,242 @@ fn the_router_takes_recursive_programs_and_declines_the_rest_7977() {
         "def f($n): if $n == 0 then 1 else f($n - 1) end; {a: f(2)}",
         r#"def f($n): if $n == 0 then 1 else f($n - 1) end; "\(f(2))""#,
     ] {
-        assert!(!decide(&program(filter)), "declines {filter}");
+        assert!(decide(&program(filter)).is_none(), "declines {filter}");
+    }
+}
+
+/// #7977 step 5: a pinned program is decided and compiled once, as its route is pinned, and every
+/// document of the run runs that code; the pin frees it. A program that is not pinned is decided
+/// per call, and a pinned program the machine declined is not decided again. `no_std` pins
+/// nothing.
+#[cfg(feature = "std")]
+#[test]
+fn a_pinned_program_keeps_its_code_for_the_run_7977() {
+    let taken = program("def f($n): if $n == 0 then 0 else f($n - 1) + 1 end; f(10)");
+    let pin = super::super::pin(&taken, &Route::Interpreter, decide(&taken));
+    assert!(matches!(route(&taken), Route::Interpreter));
+    let first = machine_for(&taken).expect("pinned with its code");
+    for _ in 0..3 {
+        let again = machine_for(&taken).expect("pinned with its code");
+        assert!(Rc::ptr_eq(&first, &again), "one compilation for the run");
+    }
+    // Another program is decided afresh, per call, and leaves the pin as it is.
+    let other = program("def g: if . > 0 then . - 1 | g else . end; 3 | g");
+    let (a, b) = (machine_for(&other), machine_for(&other));
+    assert!(a.is_some() && b.is_some() && !Rc::ptr_eq(&a.unwrap(), &b.unwrap()));
+    assert!(Rc::ptr_eq(
+        &first,
+        &machine_for(&taken).expect("still pinned")
+    ));
+    drop(first);
+    drop(pin);
+    assert!(PINNED_MACHINE.with(|machine| machine.borrow().is_none()));
+
+    // A pinned program the machine was not given finds no code, though it would take it.
+    let _pin = super::super::pin(&taken, &Route::Interpreter, None);
+    assert!(machine_for(&taken).is_none());
+}
+
+/// Run `machine`, compiled code a run keeps, on `input` (an integer) within `limits`, as `run_program` runs
+/// a document: its stacks are those the last document left. `stop` stops the consumer after that
+/// many outputs.
+fn kept_run(limits: Limits, machine: &Compiled, input: &str, stop: Option<usize>) -> Answer {
+    with_prelude(|prelude| {
+        let it = Interp::new(prelude);
+        let mut input = OwnedValue::Int(input.parse().expect("an integer"));
+        it.prepare_keys(machine.hands_out_keys(), &mut input);
+        let mut outputs = Vec::new();
+        let result = run_within(limits, &it, machine, input, &mut |v| {
+            outputs.push(v.to_json_jq_preserve());
+            stop.is_none_or(|n| outputs.len() < n)
+        });
+        let error = match result {
+            Ok(()) | Err(Raise::Stop) => None,
+            Err(raise) => match Interp::outcome(raise) {
+                Outcome::Error(error) => Some(match error.payload() {
+                    OwnedValue::String(s) => s.as_str().to_string(),
+                    other => other.to_json_jq_preserve(),
+                }),
+                other => panic!("{other:?}"),
+            },
+        };
+        Answer { outputs, error }
+    })
+}
+
+/// The bytes of the vectors `machine` keeps for its next document, per vector.
+fn kept_bytes(machine: &Compiled) -> [usize; 5] {
+    let spare = machine.spare.take();
+    let bytes = [
+        spare.data.capacity() * core::mem::size_of::<Block<OwnedValue>>(),
+        spare.frames.capacity() * core::mem::size_of::<Block<FrameRec>>(),
+        spare.slots.capacity() * core::mem::size_of::<Slot>(),
+        spare.forks.capacity() * core::mem::size_of::<Fork>(),
+        spare.scratch.capacity() * core::mem::size_of::<Slot>(),
+    ];
+    assert!(
+        spare.data.is_empty()
+            && spare.frames.is_empty()
+            && spare.slots.is_empty()
+            && spare.forks.is_empty()
+            && spare.scratch.is_empty(),
+        "a kept vector holds nothing of the run before"
+    );
+    machine.spare.set(spare);
+    bytes
+}
+
+/// #7977 step 5: the stacks a document leaves are reused by the next one, emptied, and nothing
+/// else carries over. Whatever the document before left (a refusal at the byte budget or the
+/// loop cap, an error with fork points live, a consumer that stopped), the next answers exactly
+/// as on a fresh machine, and refuses at the same bounds: the budget charges a kept vector only
+/// as the run grows into it.
+#[test]
+fn a_document_after_a_dirty_one_answers_as_on_a_fresh_machine_7977() {
+    // One program, so one machine, whose input picks the shape: `f` grows the data and frame
+    // stacks, `h` the fork points (a `,` live at every level, then an error), `t` a tail loop.
+    let filter = r#"def f($n): if $n == 0 then 0 else f($n - 1) + 1 end;
+        def h($n): if $n == 0 then error("boom") else $n, h($n - 1) end;
+        def t: if . > 0 then . - 1 | t else . end;
+        if . >= 0 then f(.) elif . > -1000000 then h(-.) else -. - 1000000 | t end"#;
+    let limits = small(1 << 16, 50, 1 << 20);
+    let fresh = |input: &str| {
+        let machine = decide(&program(filter)).expect("takes");
+        kept_run(limits, &machine, input, None)
+    };
+    // The deepest `f` and `h` the budget answers on a fresh machine.
+    let deepest = |sign: i64| {
+        (1..4000)
+            .take_while(|n| {
+                let a = fresh(&(sign * n).to_string());
+                a.error.is_none() || a.error.as_deref() == Some("boom")
+            })
+            .last()
+            .expect("some depth fits")
+    };
+    let (f_depth, h_depth) = (deepest(1), deepest(-1));
+    let probes = [
+        f_depth.to_string(),
+        (f_depth + 1).to_string(),
+        String::from("3"),
+        (-h_depth).to_string(),
+        (-h_depth - 1).to_string(),
+        String::from("-2"),
+        String::from("-1000049"),
+        String::from("-1000051"),
+    ];
+    assert_eq!(
+        fresh(&probes[1]).error.as_deref(),
+        Some("f/1 exceeded maximum recursion depth")
+    );
+    assert_eq!(
+        fresh(&probes[4]).error.as_deref(),
+        Some("h/1 exceeded maximum recursion depth")
+    );
+    for (dirty, stop, ended) in [
+        // Refused at the byte budget with its data and frame stacks at their largest.
+        (
+            probes[1].clone(),
+            None,
+            Some("f/1 exceeded maximum recursion depth"),
+        ),
+        // Refused at the byte budget with a fork point live at every level.
+        (
+            probes[4].clone(),
+            None,
+            Some("h/1 exceeded maximum recursion depth"),
+        ),
+        // An error raised with fork points live.
+        (String::from("-40"), None, Some("boom")),
+        // A consumer that stopped with every fork point live.
+        (String::from("-40"), Some(3), None),
+        // Refused at the loop cap.
+        (
+            String::from("-1001000"),
+            None,
+            Some("t/0 exceeded maximum recursion depth"),
+        ),
+    ] {
+        let machine = decide(&program(filter)).expect("takes");
+        let first = kept_run(limits, &machine, &dirty, stop);
+        assert_eq!(first.error.as_deref(), ended, "{dirty}");
+        assert_eq!(first.outputs.len(), stop.unwrap_or(first.outputs.len()));
+        // The vectors are kept, emptied.
+        assert!(kept_bytes(&machine).iter().any(|&b| b > 0), "{dirty}");
+        // Every document after it, on the same machine, answers as on a fresh machine, at and
+        // past each bound, and the dirty document again answers as it did.
+        for input in probes.iter().chain([&dirty]) {
+            assert_eq!(
+                kept_run(limits, &machine, input, None),
+                fresh(input),
+                "{input} after {dirty}"
+            );
+        }
+    }
+}
+
+/// A document that grew its stacks near the budget leaves at most `KEEP_BYTES` of each for the
+/// next one: what a run holds on to between documents stays small, and uncharged memory with it.
+#[test]
+fn a_kept_vector_is_cut_back_after_a_large_document_7977() {
+    let machine = decide(&program(
+        "def f($n): if $n == 0 then 0 else f($n - 1) + 1 end; f(.)",
+    ))
+    .expect("takes");
+    let answer = kept_run(SHIPPED, &machine, "100000", None);
+    assert_eq!(answer.outputs, ["100000"]);
+    for bytes in kept_bytes(&machine) {
+        assert!(bytes <= KEEP_BYTES, "{bytes}");
+    }
+    // A small document after it keeps what it grew, and answers.
+    assert_eq!(kept_run(SHIPPED, &machine, "3", None).outputs, ["3"]);
+    assert!(kept_bytes(&machine).iter().any(|&b| b > 0));
+}
+
+/// The code a run keeps answers each document as a fresh compilation does: nothing in it changes
+/// as it runs (#7977 step 5), and labels keep counting across documents in the interpreter.
+#[test]
+fn one_compilation_answers_every_document_7977() {
+    let filter = "def f($n): if $n == 0 then [label $out | 1, break $out] else f($n - 1) end; \
+                  [f(. % 3)], ([.] as $a | $a | setpath([0]; 9)), [label $l | try break $l catch .]";
+    let program = program(filter);
+    let machine = Rc::new(decide(&program).expect("takes"));
+    let run_on = |code: &vm::Compiled, input: i64| {
+        with_prelude(|prelude| {
+            let it = Interp::new(prelude);
+            it.next_label.set(LabelNumbers::resume(&program));
+            let mut input = OwnedValue::Int(input);
+            it.prepare(&program, &mut input);
+            let mut outputs = Vec::new();
+            vm::run(&it, code, input, &mut |v| {
+                outputs.push(v.to_json_jq_preserve());
+                true
+            })
+            .unwrap_or_else(|_| panic!("{filter}"));
+            LabelNumbers::keep(&program, it.next_label.get());
+            outputs
+        })
+    };
+    let mut kept = Vec::new();
+    for input in 0..6 {
+        kept.push(run_on(&machine, input));
+    }
+    LabelNumbers::keep(&program, 0);
+    let mut fresh = Vec::new();
+    for input in 0..6 {
+        fresh.push(run_on(&decide(&program).expect("takes"), input));
+    }
+    assert_eq!(kept, fresh);
+    // jq 1.7.1 over `0 1 2 3 4 5`: the label value counts on from one document to the next.
+    // `no_std` keeps no count across documents (`LabelNumbers`), so there each starts at 0.
+    for (input, outputs) in kept.iter().enumerate() {
+        let n = if cfg!(feature = "std") {
+            2 * input + 1
+        } else {
+            1
+        };
+        let label = format!(r#"[{{"__jq":{n}}}]"#);
+        assert_eq!(outputs, &["[[1]]", "[9]", label.as_str()], "{input}");
     }
 }
 
@@ -967,7 +1202,7 @@ fn a_call_or_a_fork_point_past_the_budget_is_refused_7977() {
         let func = |name: &str| {
             code.funcs
                 .iter()
-                .position(|f| f.name == name)
+                .position(|f| &*f.name == name)
                 .expect("compiled") as u32
         };
         let (f, g) = (func("f"), func("g"));
@@ -1037,22 +1272,30 @@ fn a_call_or_a_fork_point_past_the_budget_is_refused_7977() {
 #[test]
 fn a_growth_past_the_budget_or_the_allocator_is_refused_7977() {
     let mut v: Vec<u64> = Vec::new();
-    assert_eq!(grow(&mut v, 0, 31), Err(()));
-    assert_eq!(grow(&mut v, 0, 32), Ok(32));
-    assert_eq!(v.capacity(), 4);
+    let mut cap = 0;
+    assert_eq!(grow(&mut v, &mut cap, 0, 31), Err(()));
+    assert_eq!(grow(&mut v, &mut cap, 0, 32), Ok(32));
+    assert_eq!((v.capacity(), cap), (4, 4));
     // From 4 to 8: the old block (32 bytes, in `used`) and the new one (64) are held at once.
-    assert_eq!(grow(&mut v, 32, 95), Err(()));
-    assert_eq!(grow(&mut v, 32, 96), Ok(32));
+    assert_eq!(grow(&mut v, &mut cap, 32, 95), Err(()));
+    assert_eq!(grow(&mut v, &mut cap, 32, 96), Ok(32));
     assert_eq!(
-        grow(&mut v, 64 + 8, 64 + 128),
+        grow(&mut v, &mut cap, 64 + 8, 64 + 128),
         Err(()),
         "the bytes held already count"
     );
+    // A vector kept with room is charged as a fresh one grows, and allocates nothing until the
+    // charge passes its capacity.
+    let mut kept: Vec<u64> = Vec::with_capacity(64);
+    let mut cap = 0;
+    assert_eq!(grow(&mut kept, &mut cap, 0, 31), Err(()), "charged from 0");
+    assert_eq!(grow(&mut kept, &mut cap, 0, 32), Ok(32));
+    assert_eq!((kept.capacity(), cap), (64, 4));
     // One element of 2^47 bytes, and four: past any address space, so the allocator refuses.
     #[cfg(target_pointer_width = "64")]
     {
         let mut huge: Vec<[u64; 1 << 44]> = Vec::new();
-        assert_eq!(grow(&mut huge, 0, usize::MAX), Err(()));
+        assert_eq!(grow(&mut huge, &mut 0, 0, usize::MAX), Err(()));
         assert_eq!(reserve(&mut huge), Err(()));
     }
     let mut items: Vec<OwnedValue> = Vec::new();

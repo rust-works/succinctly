@@ -26,8 +26,27 @@ struct Answer {
     stdout: String,
     stderr: String,
     exit: i32,
-    /// The machine's routing decisions, one per line (`taken` or `declined`).
+    /// The machine's routing decisions and compilations, one per line (`taken`, `declined` or
+    /// `compiled`), in the order they happened.
     decisions: String,
+}
+
+impl Answer {
+    /// The routing decisions alone.
+    fn routes(&self) -> Vec<&str> {
+        self.decisions
+            .lines()
+            .filter(|line| *line != "compiled")
+            .collect()
+    }
+
+    /// How many times the run compiled a program for the machine.
+    fn compilations(&self) -> usize {
+        self.decisions
+            .lines()
+            .filter(|line| *line == "compiled")
+            .count()
+    }
 }
 
 /// Run `succinctly jq <args>` with the switch set to `switch` (`None`: removed from the
@@ -106,15 +125,22 @@ fn the_corpus_matches_jq_on_the_call_machine_7977() -> Result<()> {
                 (&got.stdout, &got.stderr, got.exit)
             ));
         }
-        // Every decision for the program is the route the corpus says, and there is one; a
-        // program jq rejects at compile time is never routed.
+        // The run decides once, the route the corpus says, whatever its number of documents,
+        // and compiles once for a program the machine takes (#7977 step 5); a program jq
+        // rejects at compile time is never routed.
         let routed_as = match row["route"].as_str() {
             Some("take") => Some("taken"),
             Some("decline") => Some("declined"),
             _ => None,
         };
         let routed = match routed_as {
-            Some(route) => !got.decisions.is_empty() && got.decisions.lines().all(|l| l == route),
+            Some(route) => {
+                got.routes() == [route]
+                    && match route {
+                        "taken" => got.compilations() == 1,
+                        _ => got.compilations() <= 1,
+                    }
+            }
             None => got.decisions.is_empty(),
         };
         if !routed {
@@ -144,9 +170,10 @@ fn with_the_switch_off_the_machine_is_never_asked_7977() -> Result<()> {
         "{}",
         on.stderr
     );
-    // Decided as the route is pinned, then once more on the first document: two today, one
-    // once the compiled program is kept for the run (#7977 step 5).
-    assert_eq!(on.decisions, "taken\ntaken\n");
+    // Decided, and compiled, once, as the route is pinned: the code is kept with the pin and
+    // runs the document (#7977 step 5). Before, the first document decided again and `run`
+    // compiled once more.
+    assert_eq!(on.decisions, "compiled\ntaken\n");
     for switch in [None, Some("0"), Some("")] {
         let off = run(&["-n", DEEP], switch, dir.path())?;
         assert_eq!(off.stdout, "", "{switch:?}");
@@ -179,10 +206,37 @@ fn a_program_the_machine_declines_keeps_the_shipped_route_7977() -> Result<()> {
         "{}",
         got.stderr
     );
-    assert!(
-        !got.decisions.is_empty() && got.decisions.lines().all(|l| l == "declined"),
-        "{:?}",
-        got.decisions
+    assert_eq!(got.routes(), ["declined"], "{:?}", got.decisions);
+    Ok(())
+}
+
+/// #7977 step 5: a routed program over 100,000 NDJSON records decides once and compiles once,
+/// as its route is pinned, and every record runs the kept code. Before, each record compiled the
+/// program again (100,002 compilations, 2 decisions). The answers are jq 1.7.1's: each record's
+/// label value counts on from the record before, as jq numbers labels across inputs.
+#[test]
+fn a_routed_program_compiles_once_over_100000_records_7977() -> Result<()> {
+    const RECORDS: usize = 100_000;
+    let dir = tempfile::tempdir()?;
+    let input = dir.path().join("records.ndjson");
+    let mut text = String::with_capacity(RECORDS * 8);
+    for i in 0..RECORDS {
+        text.push_str(&format!("{}\n", i % 7));
+    }
+    std::fs::write(&input, text)?;
+    let path = input.to_str().context("utf-8 path")?;
+    let filter = "def f($n): if $n == 0 then . else f($n - 1) end; \
+                  f(. % 3) as $x | [label $l | try break $l catch .] | [$x, .[0].__jq]";
+    let got = run(&["-c", filter, path], Some("1"), dir.path())?;
+    assert_eq!(got.exit, 0, "{}", got.stderr);
+    let lines: Vec<&str> = got.stdout.lines().collect();
+    assert_eq!(lines.len(), RECORDS);
+    // jq 1.7.1 on the first three records, and on the last.
+    assert_eq!(&lines[..3], ["[0,0]", "[1,1]", "[2,2]"]);
+    assert_eq!(
+        lines[RECORDS - 1],
+        format!("[{},{}]", (RECORDS - 1) % 7, RECORDS - 1)
     );
+    assert_eq!(got.decisions, "compiled\ntaken\n");
     Ok(())
 }

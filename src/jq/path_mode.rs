@@ -1440,13 +1440,20 @@ pub(crate) fn route(program: &Expr) -> Route {
 /// [`route`] decided afresh: the walk a run whose program [`pin_route`] did not
 /// pin makes per document.
 fn route_unpinned(program: &Expr) -> Route {
-    route_walked(program, LabelHints::default())
+    route_walked(program, LabelHints::default(), &mut None)
 }
 
 /// [`route_unpinned`]'s walk, starting from `labels`: a caller that already
 /// knows whether the run spells jq's label value ([`SentinelNote`]) says so
 /// there, and the walk then reads no name or string for it.
-fn route_walked(program: &Expr, mut labels: LabelHints) -> Route {
+///
+/// A program the call machine takes (#7977) leaves its compiled code in
+/// `machine`, for [`pin`] to keep for the run; a caller that pins nothing drops it.
+fn route_walked(
+    program: &Expr,
+    mut labels: LabelHints,
+    machine: &mut Option<vm::Compiled>,
+) -> Route {
     // One walk of the program: the entries ask once per document. It ends at
     // the first node the shipped route keeps, whatever else the program holds.
     let mut dynamic = false;
@@ -1469,8 +1476,11 @@ fn route_walked(program: &Expr, mut labels: LabelHints) -> Route {
     // #7977: with the call machine on (`set_call_machine`), a program it takes runs on this
     // route, where `run_program_seeing` hands it to the machine. Off (the default), the machine
     // is never asked, so nothing of it runs.
-    if extension.is_none() && vm::switched_on() && vm::takes(program) {
-        return Route::Interpreter;
+    if extension.is_none() && vm::switched_on() {
+        *machine = vm::decide(program);
+        if machine.is_some() {
+            return Route::Interpreter;
+        }
     }
     if !dynamic {
         // #7719: a program that can observe jq's label values runs here too,
@@ -1506,6 +1516,10 @@ std::thread_local! {
     /// walked as before. `no_std` has no `thread_local!`, so there nothing is
     /// pinned.
     static PINNED_ROUTE: Cell<(usize, u8)> = const { Cell::new((0, PIN_NONE)) };
+
+    /// The call machine's code for the pinned program, while its pin is [`PIN_MACHINE`]
+    /// (#7977): compiled once as the route is pinned, and run on every document of the run.
+    static PINNED_MACHINE: RefCell<Option<Rc<vm::Compiled>>> = const { RefCell::new(None) };
 }
 
 #[cfg(feature = "std")]
@@ -1514,6 +1528,9 @@ const PIN_NONE: u8 = 0;
 const PIN_INTERPRETER: u8 = 1;
 #[cfg(feature = "std")]
 const PIN_SHIPPED: u8 = 2;
+/// [`Route::Interpreter`], on the call machine: [`PINNED_MACHINE`] holds the code.
+#[cfg(feature = "std")]
+const PIN_MACHINE: u8 = 3;
 
 /// The pinned route of `program`, if [`pin_route`] pinned this program.
 #[inline]
@@ -1523,7 +1540,7 @@ fn pinned_route(program: &Expr) -> Option<Route> {
         let (key, code) = PINNED_ROUTE.with(Cell::get);
         if key == program as *const Expr as usize {
             return match code {
-                PIN_INTERPRETER => Some(Route::Interpreter),
+                PIN_INTERPRETER | PIN_MACHINE => Some(Route::Interpreter),
                 PIN_SHIPPED => Some(Route::Shipped),
                 _ => None,
             };
@@ -1545,8 +1562,28 @@ pub struct RoutePin(());
 impl Drop for RoutePin {
     fn drop(&mut self) {
         #[cfg(feature = "std")]
-        PINNED_ROUTE.with(|pin| pin.set((0, PIN_NONE)));
+        {
+            PINNED_ROUTE.with(|pin| pin.set((0, PIN_NONE)));
+            PINNED_MACHINE.with(|machine| machine.borrow_mut().take());
+        }
     }
+}
+
+/// The call machine's code for `program` (#7977), when the machine runs it: the code pinned with
+/// its route, or for a program that is not pinned, decided afresh. A pinned program the machine
+/// was not given is not decided again.
+fn machine_for(program: &Expr) -> Option<Rc<vm::Compiled>> {
+    #[cfg(feature = "std")]
+    {
+        let (key, code) = PINNED_ROUTE.with(Cell::get);
+        if key == program as *const Expr as usize {
+            return match code {
+                PIN_MACHINE => PINNED_MACHINE.with(|machine| machine.borrow().clone()),
+                _ => None,
+            };
+        }
+    }
+    vm::decide(program).map(Rc::new)
 }
 
 /// Turn the call machine (#7977) on or off for this process: programs it takes then run on it.
@@ -1557,12 +1594,25 @@ pub fn set_call_machine(on: bool) {
     vm::set_switched_on(on);
 }
 
-/// While the call machine is on, have `observer` told of each routing decision: `true` when the
-/// machine takes the program, `false` when it declines it (#7977). `None` removes it. The CLI uses
-/// it for `SUCCINCTLY_DEBUG_CALL_MACHINE_LOG`.
+/// What [`observe_call_machine`]'s observer is told of (#7977).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallMachineEvent {
+    /// The machine takes a program.
+    Taken,
+    /// The machine declines a program.
+    Declined,
+    /// The machine compiled a program, to decide whether it takes it. A run whose route is
+    /// pinned compiles once whatever its number of documents (#7977 step 5).
+    Compiled,
+}
+
+/// While the call machine is on, have `observer` told of each routing decision and each
+/// compilation ([`CallMachineEvent`], #7977). `None` removes it. The CLI uses it for
+/// `SUCCINCTLY_DEBUG_CALL_MACHINE_LOG`.
 #[doc(hidden)]
 #[cfg(feature = "std")]
-pub fn observe_call_machine(observer: Option<fn(bool)>) {
+pub fn observe_call_machine(observer: Option<fn(CallMachineEvent)>) {
     vm::set_observer(observer);
 }
 
@@ -1573,7 +1623,9 @@ pub fn observe_call_machine(observer: Option<fn(bool)>) {
 /// must stay where it is for that time: the pin names it by address. A refused
 /// program is not pinned (the CLI reports [`refusal`] and runs nothing).
 pub fn pin_route(program: &Expr) -> RoutePin {
-    pin(program, &route_unpinned(program))
+    let mut machine = None;
+    let route = route_walked(program, LabelHints::default(), &mut machine);
+    pin(program, &route, machine)
 }
 
 /// [`pin_route`] for a program whose named arguments were substituted into it
@@ -1591,25 +1643,29 @@ pub fn pin_route_noted(program: &Expr, note: SentinelNote) -> Result<RoutePin, S
         sentinel_noted: true,
         ..LabelHints::default()
     };
-    match route_walked(program, labels) {
+    let mut machine = None;
+    match route_walked(program, labels, &mut machine) {
         Route::Refused(error) => Err(error.message),
-        route => Ok(pin(program, &route)),
+        route => Ok(pin(program, &route, machine)),
     }
 }
 
-/// Pin `route` as `program`'s, for [`pin_route`].
-fn pin(program: &Expr, route: &Route) -> RoutePin {
+/// Pin `route` as `program`'s, for [`pin_route`], with the call machine's code when it takes the
+/// program.
+fn pin(program: &Expr, route: &Route, machine: Option<vm::Compiled>) -> RoutePin {
     #[cfg(feature = "std")]
     {
-        let code = match route {
-            Route::Interpreter => PIN_INTERPRETER,
-            Route::Shipped => PIN_SHIPPED,
-            Route::Refused(_) => PIN_NONE,
+        let code = match (route, &machine) {
+            (Route::Interpreter, Some(_)) => PIN_MACHINE,
+            (Route::Interpreter, None) => PIN_INTERPRETER,
+            (Route::Shipped, _) => PIN_SHIPPED,
+            (Route::Refused(_), _) => PIN_NONE,
         };
         PINNED_ROUTE.with(|pin| pin.set((program as *const Expr as usize, code)));
+        PINNED_MACHINE.with(|pinned| *pinned.borrow_mut() = machine.map(Rc::new));
     }
     #[cfg(not(feature = "std"))]
-    let _ = (program, route);
+    let _ = (program, route, machine);
     RoutePin(())
 }
 
@@ -2107,15 +2163,24 @@ fn run_program_seeing(
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
     see: impl FnOnce(&OwnedValue),
 ) -> Option<Control> {
-    let on_machine = vm::switched_on() && vm::takes(program);
+    let machine = if vm::switched_on() {
+        machine_for(program)
+    } else {
+        None
+    };
     with_prelude(|prelude| {
         let interp = Interp::new(prelude);
         interp.next_label.set(LabelNumbers::resume(program));
         let mut input = input;
-        interp.prepare(program, &mut input);
+        // The call machine's code knows the answer of `prepare`'s walk of the program, so a
+        // document of a routed run does not walk it again (#7977 step 5).
+        match &machine {
+            Some(machine) => interp.prepare_keys(machine.hands_out_keys(), &mut input),
+            None => interp.prepare(program, &mut input),
+        }
         see(&input);
-        let result = if on_machine {
-            vm::run(&interp, program, input, on_value)
+        let result = if let Some(machine) = &machine {
+            vm::run(&interp, machine, input, on_value)
         } else {
             interp.eval(program, &Env::default(), input, Reg::top(), &mut |v, _| {
                 if on_value(v) {
@@ -2301,7 +2366,11 @@ impl<'e> Interp<'e> {
     /// Decide [`Self::key_ids`] for a run of `program`, and give `input`
     /// (a document, materialized for this run) its identities to match.
     fn prepare(&self, program: &Expr, input: &mut OwnedValue) {
-        let keys = hands_out_keys(program);
+        self.prepare_keys(hands_out_keys(program), input);
+    }
+
+    /// [`Self::prepare`], given [`hands_out_keys`] of the program.
+    fn prepare_keys(&self, keys: bool, input: &mut OwnedValue) {
         self.key_ids.set(keys);
         input.promote_identities(keys);
     }

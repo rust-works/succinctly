@@ -19,7 +19,8 @@ const SWITCH: &str = "SUCCINCTLY_CALL_MACHINE";
 const LOG: &str = "SUCCINCTLY_DEBUG_CALL_MACHINE_LOG";
 
 /// `(stdout, stderr, exit, decisions)` of `succinctly jq -nc <filter>`, with the switch on when
-/// `on`, under the shell prefix `limit` (`ulimit ...`) when there is one.
+/// `on`, under the shell prefix `limit` (`ulimit ...`) when there is one. `decisions` holds the
+/// decision log's `taken` and `declined` lines.
 fn run(
     filter: &str,
     on: bool,
@@ -59,7 +60,14 @@ fn run(
         String::from_utf8(output.stdout)?,
         String::from_utf8(output.stderr)?,
         exit,
-        std::fs::read_to_string(&log).unwrap_or_default(),
+        // The routing decisions alone: the log also records each compilation (`compiled`, #7977
+        // step 5), which these rows do not count.
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line != "compiled")
+            .map(|line| format!("{line}\n"))
+            .collect(),
     ))
 }
 

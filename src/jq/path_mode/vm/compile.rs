@@ -198,9 +198,9 @@ pub(super) fn insn_name(insn: &Insn) -> &'static str {
 }
 
 /// A compiled function: the main program, a `def` body, a closure argument or a prelude body.
-pub(super) struct Func<'e> {
+pub(super) struct Func {
     /// The definition's name (empty for the main program and for closure arguments).
-    pub name: &'e str,
+    pub name: Box<str>,
     pub arity: usize,
     /// The address of its first instruction.
     pub entry: usize,
@@ -223,7 +223,7 @@ pub(super) struct Func<'e> {
     pub binds: bool,
 }
 
-impl Func<'_> {
+impl Func {
     /// Whether its tail loop's outputs are bounded (`MAX_LOOP_OUTPUTS`): a user's `def` with
     /// no parameters, the loops the shipped tail loop bounds (#5379).
     pub fn bounds_outputs(&self) -> bool {
@@ -243,18 +243,23 @@ fn prelude_loop(name: &str) -> Option<&'static str> {
 }
 
 /// A leaf: a call-free subtree `Interp::eval` runs, and where its free variables live.
-pub(super) struct LeafCode<'e> {
-    pub expr: &'e Expr,
+///
+/// The subtree is a copy, so that [`Code`] borrows neither the program nor the prelude and can be
+/// kept for every document of a run (#7977 step 5). `Interp` keys its constant sites by node
+/// address, which the copy keeps stable for as long as the code lives.
+pub(super) struct LeafCode {
+    pub expr: Expr,
     /// The free variables the leaf reads: name and `(level, index)`.
-    pub vars: Vec<(&'e str, u16, u16)>,
+    pub vars: Vec<(Box<str>, u16, u16)>,
 }
 
-/// A compiled program.
-pub(super) struct Code<'e> {
+/// A compiled program. It owns everything it holds and nothing in it changes while it runs (a
+/// run's state is the [`super::Vm`]'s), so one compilation serves every document of a run.
+pub(super) struct Code {
     pub insns: Vec<Insn>,
-    pub funcs: Vec<Func<'e>>,
+    pub funcs: Vec<Func>,
     pub consts: Vec<OwnedValue>,
-    pub leaves: Vec<LeafCode<'e>>,
+    pub leaves: Vec<LeafCode>,
     /// The main program's function.
     pub main: u32,
     /// The functions compiled from prelude bodies, for tests that look at the program's own code.
@@ -292,7 +297,7 @@ type C = Result<(), String>;
 
 struct Compiler<'c, 'e> {
     it: &'c Interp<'e>,
-    code: Code<'e>,
+    code: Code,
     /// Functions still to compile, with the scope each sees.
     pending: Vec<(u32, Body<'e>, Vec<Entry<'e>>)>,
     /// The prelude definitions compiled so far, by name, arity and the loop name their nested
@@ -312,7 +317,8 @@ struct Compiler<'c, 'e> {
 }
 
 /// Compile `program`, or say why the machine declines it.
-pub(super) fn compile<'e>(it: &Interp<'e>, program: &'e Expr) -> Result<Code<'e>, String> {
+pub(super) fn compile<'e>(it: &Interp<'e>, program: &'e Expr) -> Result<Code, String> {
+    super::note(super::super::CallMachineEvent::Compiled);
     compile_moving(it, program, true)
 }
 
@@ -322,11 +328,11 @@ pub(super) fn compile<'e>(it: &Interp<'e>, program: &'e Expr) -> Result<Code<'e>
 pub(super) fn compile_without_moves<'e>(
     it: &Interp<'e>,
     program: &'e Expr,
-) -> Result<Code<'e>, String> {
+) -> Result<Code, String> {
     compile_moving(it, program, false)
 }
 
-fn compile_moving<'e>(it: &Interp<'e>, program: &'e Expr, moves: bool) -> Result<Code<'e>, String> {
+fn compile_moving<'e>(it: &Interp<'e>, program: &'e Expr, moves: bool) -> Result<Code, String> {
     if any_subexpr(program, &mut declined_anywhere) {
         return Err(String::from(
             "a path form, `last`, `?//` or an input builtin",
@@ -512,7 +518,7 @@ impl<'e> Compiler<'_, 'e> {
         let prelude = outer.is_some_and(|f| f.prelude);
         let loop_name = outer.filter(|f| f.prelude).and_then(|f| f.nested_loop);
         self.code.funcs.push(Func {
-            name,
+            name: name.into(),
             arity,
             entry: 0,
             nslots: 0,
@@ -810,12 +816,15 @@ impl<'e> Compiler<'_, 'e> {
         let mut vars = Vec::new();
         for name in &read {
             match self.find_var_named(name) {
-                Some(found) => vars.push(found),
+                Some((name, level, idx)) => vars.push((name.into(), level, idx)),
                 None if inside.contains(name) => {}
                 None => return Err(format!("${name} is not bound")),
             }
         }
-        self.code.leaves.push(LeafCode { expr: e, vars });
+        self.code.leaves.push(LeafCode {
+            expr: e.clone(),
+            vars,
+        });
         let k = (self.code.leaves.len() - 1) as u32;
         self.emit(Insn::Leaf(k));
         Ok(())
@@ -1197,7 +1206,7 @@ impl<'e> Compiler<'_, 'e> {
             Expr::While { cond, update } => {
                 // `range/3` runs a `while` of its own, whose cap is `range`'s (#7977).
                 let cur = &self.code.funcs[self.cur as usize];
-                let tag = (cur.prelude && cur.name == "_sp_range").then_some("range");
+                let tag = (cur.prelude && &*cur.name == "_sp_range").then_some("range");
                 self.prelude_call_tagged("_sp_while", &[cond, update], tag)?;
             }
             Expr::Repeat(g) => self.prelude_call("_sp_repeat", &[g])?,
