@@ -85568,8 +85568,14 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     if reads_source_first {
         if fork_index == 0 {
             // #8036: no fork read the source.
+            // `fold_pattern_admitted` admits a yq fold here only with one `$var` pattern.
             return resolve_yq_fold_without_accumulators::<S>(
-                patterns, update, init_flow, input, value, trackable,
+                &patterns[0],
+                update,
+                init_flow,
+                input,
+                value,
+                trackable,
             );
         }
         // INIT's own error outranks a step's.
@@ -85596,17 +85602,13 @@ fn resolve_reduce<'a, S: EvalSemantics>(
 /// the loop variable, which writes nothing here: yq writes through a loop variable that is a node
 /// (`del(.[] as $x ireduce (select(false); $x))` over `[1, 2]` is `[1]` in yq).
 fn resolve_yq_fold_without_accumulators<S: EvalSemantics>(
-    patterns: &[Pattern],
+    pattern: &Pattern,
     update: &Expr,
     init_flow: ResolveFlow,
     source: &Expr,
     value: &OwnedValue,
     trackable: bool,
 ) -> ResolveFlow {
-    let [pattern] = patterns else {
-        unreachable!("a yq fold in path position binds one variable (`fold_pattern_admitted`)")
-        // patchcov: coverage tolerate-line reason="unreachable: `fold_pattern_admitted` admits a yq fold to the path route only with one `$var` pattern"
-    };
     let mut init_flow = Some(match init_flow {
         ResolveFlow::Escaped(e) => Flow::Escaped(e.into()),
         ResolveFlow::Exhausted | ResolveFlow::Stopped => Flow::Exhausted,
