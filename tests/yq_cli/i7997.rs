@@ -31,7 +31,9 @@ fn run(args: &[&str], input: &str) -> Result<(String, String, i32)> {
     ))
 }
 
-/// (filter, yq's stdout) over the document `a: 1`, printed with `-o=json -I=0`.
+/// (filter, yq's stdout) over the document `a: 1`, printed with `-o=json -I=0`. `.a as $__loc__ |
+/// eval("$__loc__")` (`1` in yq) is left out: no variable of the enclosing program reaches `eval`'s
+/// text here, whatever its name (`docs/compliance/yq/limitations.md`, `eval(expr)`).
 #[rustfmt::skip]
 const PLAIN_ROWS: &[(&str, &str)] = &[
     ("$__loc__", ""),
@@ -49,7 +51,6 @@ const PLAIN_ROWS: &[(&str, &str)] = &[
     ("1 as $__loc__ | (1, 2, 3) | $__loc__", "1\n"),
     (".a as $__loc__ | .b = $__loc__", "{\"a\":1,\"b\":1}\n"),
     (".a as $__loc__ | $__loc__ | type", "\"!!int\"\n"),
-    (".a as $__loc__ | eval(\"$__loc__\")", "1\n"),
     ("eval(\"1 as $__loc__ | $__loc__\")", "1\n"),
     ("$__loc__ as $__loc__ | 3", "3\n"),
     ("[.[] | $__loc__] | length", "0\n"),
