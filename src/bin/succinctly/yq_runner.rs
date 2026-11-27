@@ -7637,13 +7637,17 @@ fn selects_by_tag(target: &Expr) -> bool {
     let mut scalar_compares = 0usize;
     jq::walk::any_subexpr(target, &mut |e| {
         match e {
-            Expr::Builtin(Builtin::Tag) => tag_reads += 1,
+            Expr::Builtin(Builtin::Tag | Builtin::Type) => tag_reads += 1,
             Expr::Compare { left, right, .. } => {
                 let literal = match (left.as_ref(), right.as_ref()) {
-                    (Expr::Builtin(Builtin::Tag), Expr::Literal(Literal::String(tag)))
-                    | (Expr::Literal(Literal::String(tag)), Expr::Builtin(Builtin::Tag)) => {
-                        Some(tag.as_ref())
-                    }
+                    (
+                        Expr::Builtin(Builtin::Tag | Builtin::Type),
+                        Expr::Literal(Literal::String(tag)),
+                    )
+                    | (
+                        Expr::Literal(Literal::String(tag)),
+                        Expr::Builtin(Builtin::Tag | Builtin::Type),
+                    ) => Some(tag.as_ref()),
                     _ => None,
                 };
                 if literal.is_some_and(|tag: &str| !matches!(tag, "!!map" | "!!seq")) {
@@ -7832,15 +7836,41 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
     if navigation.is_empty() {
         return None;
     }
-    // A selection that reads node metadata (`select(style == "")`). A reader that only answers a
-    // node -- a stage of its own, or a member of a comma or a `first(..)` of navigation and
-    // readers (`first(.a, line)`, `.b | (style, .)`) -- selects nothing, and the evaluator takes
-    // its fresh node as yq does. Any other place a reader appears counts as a selection.
+    // A selection the owned value cannot run exactly: one that reads node metadata
+    // (`select(style == "")`), or a `select`/`if` condition outside the values-only allowlist
+    // (`type`, which is yq's tag, `eval(..)`, a `def` call; `jq::yq_condition_is_value_only`). A
+    // reader that only answers a node -- a stage of its own, or a member of a comma or a
+    // `first(..)` of navigation and readers (`first(.a, line)`, `.b | (style, .)`) -- selects
+    // nothing, and the evaluator takes its fresh node as yq does. A condition with an effect of its
+    // own (`input`, `debug`, `halt`) is not run twice: the target runs as written.
     let explicit_tags = cursor.index().has_explicit_tags();
+    let mut effectful = false;
     let filters = navigation.iter().any(|stage| {
-        !answers_without_selecting(stage, &is_reader)
-            && (selects_by_node_metadata(stage) || (explicit_tags && selects_by_tag(stage)))
+        if answers_without_selecting(stage, &is_reader) {
+            return false;
+        }
+        let beyond_values = jq::walk::any_subexpr(stage, &mut |e| match e {
+            Expr::Builtin(Builtin::Select(cond)) | Expr::If { cond, .. } => {
+                effectful |= jq::walk::uses_input_builtins(cond)
+                    || jq::walk::can_halt(cond)
+                    || jq::walk::contains_builtin(cond, |b| {
+                        matches!(
+                            b,
+                            Builtin::Debug
+                                | Builtin::DebugMsg(_)
+                                | Builtin::Stderr
+                                | Builtin::System(..)
+                        )
+                    });
+                !jq::yq_condition_is_value_only(cond)
+            }
+            _ => false,
+        });
+        beyond_values || selects_by_node_metadata(stage) || (explicit_tags && selects_by_tag(stage))
     });
+    if effectful {
+        return None;
+    }
     // A navigation that starts at a fresh node (`1 | select(kind == "scalar")`, `line |
     // select(true)`) selects among nodes of its own, whose metadata the owned value answers as yq
     // does, and has no document node to resolve: it runs as written.
@@ -7852,21 +7882,9 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         return None;
     }
     let navigation_expr = Expr::pipe(navigation.iter().map(|stage| (*stage).clone()).collect());
-    let descent = |e: &Expr| matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys);
-    let mut stepped = false;
-    let descends_below_a_step = navigation.iter().any(|stage| {
-        if descent(stage) {
-            return stepped;
-        }
-        if jq::walk::any_subexpr(stage, &mut |e| descent(e)) {
-            return true;
-        }
-        stepped |= !matches!(stage, Expr::Identity | Expr::Builtin(Builtin::Select(_)));
-        false
-    });
-    if !navigates_and_filters_only(&navigation_expr)
-        || (descends_below_a_step && cursor.index().has_aliases())
-    {
+    // The cursor's `..` stops at an alias as yq's does (`[.e | .. | path]` is `[["e"]]` in both), so
+    // a descent below an alias resolves here; only the owned walk goes on through it.
+    if !navigates_and_filters_only(&navigation_expr) {
         return Some(Expr::Error(Some(Box::new(Expr::Literal(Literal::String(
             "Invalid path expression: a target that selects by node metadata must only navigate \
              and filter here"

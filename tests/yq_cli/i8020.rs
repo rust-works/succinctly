@@ -322,8 +322,6 @@ const REVIEW_ROWS: &[(&str, &str, &str)] = &[
 const REFUSED_ROWS: &[(&str, &str)] = &[
     (STYLED, "del(.[] | select(style == \"\") | tostring)"),
     (ALIASED, "del(.e | .. | tostring)"),
-    // A metadata `select` under a `..` below a step down on a document with aliases.
-    (ALIASED, "del(.e | .. | select(style == \"\") | line)"),
     (
         CONTAINERS,
         "(.b | select(kind == \"map\") | {\"a\": 1} | .a) = 9",
@@ -358,6 +356,63 @@ const WRITES_LESS_ROWS: &[(&str, &str)] = &[(
     "(.[] | select(style == \"double\") | line | key) = 9",
     STYLED,
 )];
+
+/// A custom tag on one scalar, for `type`, which is yq's tag.
+const TAGGED: &str = "a: !Foo x\nb: y\nc: 1\n";
+/// Two members of a nested mapping, one double-quoted.
+const INNER: &str = "x: {a: \"q\", b: 2}\n";
+
+/// Selections the owned value cannot run exactly though they name no metadata reader: `type` (yq's
+/// tag), `eval(..)`, a `..` below an alias and yq's `first(f)`, all resolved on the cursor (#8020
+/// second review). (document, filter, yq's stdout.)
+const ALLOWLIST_ROWS: &[(&str, &str, &str)] = &[
+    (
+        TAGGED,
+        "del(.[] | select(type == \"!!str\") | line)",
+        "a: !Foo x\nc: 1\n",
+    ),
+    (
+        TAGGED,
+        "del(.[] | select(tag == \"!!str\") | line)",
+        "a: !Foo x\nc: 1\n",
+    ),
+    (
+        TAGGED,
+        "del(.[] | select(type == \"!Foo\"))",
+        "b: y\nc: 1\n",
+    ),
+    (
+        TAGGED,
+        "(.[] | select(type == \"!!str\")) = 9",
+        "a: !Foo x\nb: 9\nc: 1\n",
+    ),
+    (
+        STYLED,
+        "del(.[] | select(eval(\"style\") == \"\") | line)",
+        "a: \"x\"\n",
+    ),
+    (
+        STYLED,
+        "del(.[] | select(eval(\"style\") == \"\"))",
+        "a: \"x\"\n",
+    ),
+    (
+        ALIASED,
+        "del(.e | .. | select(style == \"\"))",
+        "d: &x {p: 1, q: 2}\nf: 3\n",
+    ),
+    (
+        ALIASED,
+        "del(.e | .. | select(style == \"\") | line)",
+        "d: &x {p: 1, q: 2}\nf: 3\n",
+    ),
+    (INNER, "del(.x | first(style == \"\"))", "x: {a: \"q\"}\n"),
+    (
+        INNER,
+        "del(.x | first(style == \"double\") | line)",
+        "x: {b: 2}\n",
+    ),
+];
 
 fn run(args: &[&str], stdin: &str) -> Result<(String, String, i32)> {
     use std::io::Write;
@@ -503,6 +558,30 @@ fn a_key_rename_through_a_reader_writes_less_than_yq_8020() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_selection_beyond_values_is_resolved_on_the_cursor_8020() -> Result<()> {
+    for (doc, filter, want) in ALLOWLIST_ROWS {
+        assert_row(&[filter], doc, want)?;
+    }
+    Ok(())
+}
+
+/// A `def` (`--jq-extensions`; yq has none) whose body reads metadata: the owned value cannot run
+/// it, so the reader stays parentless and nothing is deleted, never more than the inline
+/// `select(style == "")` deletes (`a: "x"` stays either way).
+#[test]
+fn a_def_that_reads_metadata_deletes_nothing_through_a_reader_8020() -> Result<()> {
+    let filter = "def f: style == \"\"; del(.[] | select(f) | line)";
+    assert_row(&["--jq-extensions", filter], STYLED, STYLED)?;
+    let file = tempfile::NamedTempFile::new()?;
+    std::fs::write(file.path(), STYLED)?;
+    let path = file.path().to_str().expect("utf-8 temp path");
+    let got = run(&["--jq-extensions", "-i", filter, path], "")?;
+    assert_eq!((got.0.as_str(), got.1.as_str(), got.2), ("", "", 0));
+    assert_eq!(std::fs::read_to_string(file.path())?, STYLED);
+    Ok(())
+}
+
 /// One `-i` row per review finding: the file holds yq's result, or is left as it was.
 #[test]
 fn inplace_review_rows_keep_the_file_8020() -> Result<()> {
@@ -514,6 +593,18 @@ fn inplace_review_rows_keep_the_file_8020() -> Result<()> {
             0,
         ),
         (NESTED, "del(.b | key | key)", NESTED, 0),
+        (
+            TAGGED,
+            "del(.[] | select(type == \"!!str\") | line)",
+            "a: !Foo x\nc: 1\n",
+            0,
+        ),
+        (
+            STYLED,
+            "del(.[] | select(eval(\"style\") == \"\") | line)",
+            "a: \"x\"\n",
+            0,
+        ),
         (
             STYLED,
             "(.[] | select(style == \"double\") | key) = 9",

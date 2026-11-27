@@ -83743,10 +83743,11 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
 /// nodes (#8020). Each case it declines leaves the target to the general rule, under which the tail
 /// is parentless or refused, so it deletes no more than yq:
 ///
-/// - A navigation that reads node metadata (`.[] | select(style == "") | line`): on the owned
-///   value every metadata reader answers its default, so the `select` would keep every node, where
-///   yq keeps only the ones whose metadata matches. The document route resolves that shape on the
-///   cursor before it gets here.
+/// - A navigation the owned value cannot run exactly ([`yq_owned_navigation_is_exact`]), such as
+///   one that reads node metadata (`.[] | select(style == "") | line`): on the owned value every
+///   metadata reader answers its default, so the `select` would keep every node, where yq keeps
+///   only the ones whose metadata matches. The document route resolves that shape on the cursor
+///   before it gets here.
 /// - `key` straight after `key` in the tail: yq's key node has no key of its own, so `.b | key |
 ///   key` answers nothing and deletes nothing (`.b | key | line | key` deletes `.b`: the answer of
 ///   `line` on a key node keeps that node as its key).
@@ -83755,18 +83756,89 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
 ///   from the anchor's node, which can lie outside the walk. A `..` from the root also reaches
 ///   every anchor itself, so the redirect deletes nothing that walk does not.
 fn yq_slot_rewrite_is_sound(navigation: &[Expr], tail: &[Expr]) -> bool {
-    let reads_metadata = navigation.iter().any(|stage| {
-        contains_builtin(stage, |b| {
-            is_yq_metadata_reader_builtin(b)
-                || matches!(b, Builtin::Key | Builtin::Parent | Builtin::ParentN(_))
-        })
-    });
+    let reads_metadata = !navigation.iter().all(yq_owned_navigation_is_exact);
     let is_key = |stage: &Expr| matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key));
     let key_after_key = tail
         .windows(2)
         .any(|pair| is_key(&pair[0]) && is_key(&pair[1]));
     let walks_through_aliases = alias_identity::active() && descends_below_a_step(navigation);
     !(reads_metadata || key_after_key || walks_through_aliases)
+}
+
+/// Whether a `del()` navigation stage selects on the owned value exactly the nodes yq selects on the
+/// document (#8020): an allowlist, not a list of the reads that differ. Navigation (keys, indexes,
+/// slices, `.[]`, `..`) and `select` over a condition [`yq_condition_is_value_only`] passes.
+/// Anything else -- `type` (yq's tag), `eval`, a call of a `def`, a variable -- may read what only
+/// the document holds, and declines.
+fn yq_owned_navigation_is_exact(stage: &Expr) -> bool {
+    match stage {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate
+        | Expr::RecursiveDescent
+        | Expr::RecursiveDescentWithKeys => true,
+        Expr::Builtin(Builtin::Select(cond)) => yq_condition_is_value_only(cond),
+        Expr::Optional(inner) | Expr::Paren(inner) => yq_owned_navigation_is_exact(inner),
+        Expr::Pipe(stages) => stages.iter().all(yq_owned_navigation_is_exact),
+        Expr::Comma(items) => items.iter().all(yq_owned_navigation_is_exact),
+        _ => false,
+    }
+}
+
+/// Whether a yq `select` condition reads values alone, so the owned value answers it exactly as the
+/// document does (#8020): navigation, literals, comparisons, arithmetic, `and`/`or`/`not`, `//`,
+/// and a short list of builtins over values (`length`, `has`, `contains`, `test`, ...). An
+/// allowlist: every metadata read (`style`, `line_comment`, `tag`, `type`, `kind`, `anchor`, ...),
+/// `eval`, a call of a `def`, a variable and any builtin not listed answers `false`.
+#[doc(hidden)]
+pub fn yq_condition_is_value_only(cond: &Expr) -> bool {
+    use Builtin as B;
+    match cond {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate
+        | Expr::Literal(_)
+        | Expr::Not => true,
+        Expr::Optional(inner) | Expr::Paren(inner) | Expr::Negate(inner) => {
+            yq_condition_is_value_only(inner)
+        }
+        Expr::Pipe(stages) => stages.iter().all(yq_condition_is_value_only),
+        Expr::Comma(items) => items.iter().all(yq_condition_is_value_only),
+        Expr::Compare { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
+            yq_condition_is_value_only(left) && yq_condition_is_value_only(right)
+        }
+        Expr::And(left, right) | Expr::Or(left, right) | Expr::Alternative(left, right) => {
+            yq_condition_is_value_only(left) && yq_condition_is_value_only(right)
+        }
+        Expr::Builtin(builtin) => match builtin {
+            B::Length
+            | B::Keys
+            | B::KeysUnsorted
+            | B::ToString
+            | B::ToNumber
+            | B::AsciiDowncase
+            | B::AsciiUpcase
+            | B::Downcase
+            | B::Upcase => true,
+            B::Select(arg)
+            | B::Has(arg)
+            | B::Contains(arg)
+            | B::Startswith(arg)
+            | B::Endswith(arg)
+            | B::Test(arg) => yq_condition_is_value_only(arg),
+            B::TestFlags(re, flags) => {
+                yq_condition_is_value_only(re) && yq_condition_is_value_only(flags)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Whether a `..` in `navigation` can start below the root (#8020): after a stage that steps down,
