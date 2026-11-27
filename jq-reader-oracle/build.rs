@@ -60,14 +60,26 @@ fn main() {
     let manifest =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+    let unix = std::env::var("CARGO_CFG_TARGET_FAMILY")
+        .unwrap_or_default()
+        .split(',')
+        .any(|f| f == "unix");
+    if !unix {
         // jv.c includes <unistd.h> and <pthread.h>, util.h's MIN/MAX are GNU statement
         // expressions, and jv.c's `_MSC_VER` thread-local block does not compile. The oracle is a
         // development tool for the Linux and macOS boxes; it is not built for Windows.
-        panic!("jq-reader-oracle does not build for an MSVC target (jq's C sources need POSIX and GNU C)");
+        panic!(
+            "jq-reader-oracle builds only for a unix target (jq's C sources need POSIX and GNU C)"
+        );
+    }
+    if std::env::var("CARGO_CFG_TARGET_ENDIAN").as_deref() != Ok("little") {
+        // `IEEE_8087` below tells jv_dtoa.c the target stores doubles little-endian.
+        panic!("jq-reader-oracle builds only for a little-endian target (jv_dtoa.c is built with IEEE_8087)");
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/shim.c");
+    // Every vendored file, including the headers the sources include.
+    println!("cargo:rerun-if-changed=vendor");
     for release in RELEASES {
         build(&manifest, &target_os, release);
     }

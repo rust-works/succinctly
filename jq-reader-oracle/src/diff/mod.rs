@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use classify::{Class, Kind};
 use gen::{Case, Entry, Family, Generator};
 
-use crate::reader::{self, Opts, Release, Transcript, UtilReader};
+use crate::reader::{self, Item, Opts, Reader, Release, Transcript, UtilReader};
 
 /// Items the trace program reads at most (`Malformed BOM` repeats forever under `input`).
 pub const TRACE_LIMIT: u64 = 64;
@@ -37,6 +37,7 @@ fn shape(case: &Case, cfg: &Config) -> classify::Shape {
     classify::Shape {
         trace: case.flags.null_input,
         slurp: case.flags.slurp,
+        seq: case.flags.seq,
         lenient_e1: cfg.lenient_e1,
     }
 }
@@ -84,14 +85,15 @@ fn stage(dir: &Path, case: &Case) -> std::io::Result<Staged> {
 pub mod oracle {
     use super::*;
 
-    /// What jq `release` prints for `case`, from its own reader in-process. Standard input is
-    /// read from the staged stdin file: jq's `fgets` loop reads a pipe and a file alike, and only
-    /// `input_filename` tells them apart (jq names standard input `"<stdin>"`).
+    /// What jq `release` prints for `case`, from its own reader in-process, and how many items
+    /// its reader gave before the first parse error (`None` when it gave none). Standard input
+    /// is read from the staged stdin file: jq's `fgets` loop reads a pipe and a file alike, and
+    /// only `input_filename` tells them apart (jq names standard input `"<stdin>"`).
     pub(super) fn run(
         release: Release,
         case: &Case,
         staged: &Staged,
-    ) -> reader::Result<Transcript> {
+    ) -> reader::Result<(Transcript, Option<usize>)> {
         let opts = Opts {
             flags: if case.flags.seq { reader::PARSE_SEQ } else { 0 },
             raw: false,
@@ -101,7 +103,11 @@ pub mod oracle {
             Some(p) => vec![p.to_string_lossy().into_owned()],
             None => staged.paths.clone(),
         };
-        let mut r = UtilReader::new(release, opts, &files)?;
+        let mut r = Counting {
+            inner: UtilReader::new(release, opts, &files)?,
+            values: 0,
+            before_error: None,
+        };
         let mut t = if case.flags.null_input {
             reader::run_trace(&mut r, TRACE_LIMIT, case.flags.seq)?
         } else {
@@ -111,8 +117,57 @@ pub mod oracle {
             let name = reader::json_string(p.to_string_lossy().as_bytes())?;
             t.stdout = replace(&t.stdout, &name, b"\"<stdin>\"");
         }
-        Ok(t)
+        Ok((t, r.before_error))
     }
+
+    /// A reader that counts the values it gave before its first error.
+    struct Counting<R> {
+        inner: R,
+        values: usize,
+        before_error: Option<usize>,
+    }
+
+    impl<R: Reader> Reader for Counting<R> {
+        fn next(&mut self) -> reader::Result<Option<Item>> {
+            let item = self.inner.next()?;
+            match &item {
+                Some(Item::Value(_)) => self.values += 1,
+                Some(Item::Error(_)) => {
+                    self.before_error.get_or_insert(self.values);
+                }
+                None => {}
+            }
+            Ok(item)
+        }
+        fn errors(&self) -> i32 {
+            self.inner.errors()
+        }
+        fn take_errs(&mut self) -> Vec<u8> {
+            self.inner.take_errs()
+        }
+        fn filename(&self) -> reader::Result<Option<Vec<u8>>> {
+            self.inner.filename()
+        }
+        fn line(&self) -> u64 {
+            self.inner.line()
+        }
+    }
+}
+
+/// `case` with every escape jq's parser rejects made valid in place
+/// ([`classify::escapes_made_valid`]), file by file.
+fn escapes_made_valid(case: &Case) -> Case {
+    let valid = classify::escapes_made_valid(&case.stream());
+    let mut at = 0;
+    let mut c = case.clone();
+    for f in &mut c.files {
+        if let Some(d) = f.data.as_mut() {
+            let n = d.len();
+            d.copy_from_slice(&valid[at..at + n]);
+            at += n;
+        }
+    }
+    c
 }
 
 fn replace(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
@@ -279,8 +334,8 @@ pub struct Config {
 /// Run one case: stage it in `dir`, run both C readers and the subject, and classify.
 pub fn run_case(cfg: &Config, case: Case, dir: &Path) -> Result<Outcome, String> {
     let staged = stage(dir, &case).map_err(|e| format!("staging case {}: {e}", case.index))?;
-    let jq171 = oracle::run(Release::V171, &case, &staged).map_err(|e| e.to_string())?;
-    let jq182 = oracle::run(Release::V182, &case, &staged).map_err(|e| e.to_string())?;
+    let (jq171, k171) = oracle::run(Release::V171, &case, &staged).map_err(|e| e.to_string())?;
+    let (jq182, k182) = oracle::run(Release::V182, &case, &staged).map_err(|e| e.to_string())?;
     let subject = if cfg.c_only {
         jq171.clone()
     } else {
@@ -302,10 +357,28 @@ pub fn run_case(cfg: &Config, case: Case, dir: &Path) -> Result<Outcome, String>
             }
         }
     }
-    let class = classify::classify(&case.stream(), &subject, &jq171, &jq182, shape(&case, cfg));
+    let stream = case.stream();
+    let escapes_valid = if classify::bad_escape(&stream) {
+        let valid = escapes_made_valid(&case);
+        let staged = stage(&dir.join("valid"), &valid).map_err(|e| e.to_string())?;
+        let run = |r| oracle::run(r, &valid, &staged).map(|o| o.0);
+        Some((
+            run(Release::V171).map_err(|e| e.to_string())?,
+            run(Release::V182).map_err(|e| e.to_string())?,
+        ))
+    } else {
+        None
+    };
+    let facts = classify::Facts {
+        before_fault: [k171, k182],
+        before_nul: classify::values_before_nul(&stream, case.flags.seq)
+            .map_err(|e| e.to_string())?,
+        escapes_valid,
+    };
+    let class = classify::classify(&stream, &subject, &jq171, &jq182, shape(&case, cfg), &facts);
     let kind = classify::kind(&subject, &jq171);
     let reason = if class == Class::Recorded {
-        classify::recorded(&case.stream(), &subject, &jq171, &jq182, shape(&case, cfg))
+        classify::recorded(&stream, &subject, &jq171, &jq182, shape(&case, cfg), &facts)
     } else {
         None
     };
@@ -731,7 +804,7 @@ fn run_inner(cfg: &Config) -> Result<i32, String> {
                 );
                 if let Some(st) = staged {
                     for r in Release::ALL {
-                        if let Ok(t) = oracle::run(r, &small, &st) {
+                        if let Ok((t, _)) = oracle::run(r, &small, &st) {
                             let _ = writeln!(md, "jq {}:     {}", r.version(), show(&t));
                         }
                     }

@@ -7,7 +7,7 @@ input-reader migration plan).
 It is a development tool and is never shipped. It is a separate package with its own lockfile, like `fuzz/` and
 `bench-compare/`, so the succinctly crate has no feature, build script or C code for it. The shipped binary, the
 published crate and every `--all-features` build are unchanged. It needs a C compiler and builds on Linux and macOS
-only: jq's sources need POSIX and GNU C, and `build.rs` refuses an MSVC target.
+only: jq's sources need POSIX and GNU C, and `build.rs` refuses a non-unix or big-endian target.
 
 ```bash
 cd jq-reader-oracle
@@ -59,15 +59,27 @@ For each case it runs both C readers in-process and the `--subject` binary as `j
 | `same`        | equal to both releases, which agree                                                            |
 | `split=1.7.1` | the releases differ; equal to 1.7.1, the pinned release                                        |
 | `split=1.8.2` | the releases differ; equal to 1.8.2 only: a deviation from the pin unless a recorded adoption  |
-| `E2`          | a NUL outside a string, reported as a fault, printing no value neither release prints          |
+| `E2`          | a NUL outside a string, reported as a fault at its own line and column, every value before it  |
 | `E1`          | equal to a release through its first fault; best effort above the floor after it               |
-| `E2-pending`  | a NUL outside a string that the subject does not report as a fault yet (#7966), no wrong value |
+| `E2-pending`  | E2's ground, not reported at the NUL yet (#7966): no fault before it, its values kept, floor   |
 | `recorded`    | a divergence `docs/compliance/jq/limitations.md` records (#5804, #5308, #2103)                 |
 | `BUG(agree)`  | the releases agree and the subject differs outside E1, E2 and the recorded ones                |
 | `BUG(split)`  | the releases differ and the subject equals neither, outside E1, E2 and the recorded ones       |
 
-- **The predicates** are spike E's (`preds.py`), applied to whole transcripts. E1 and E2 are the owner's 2026-11-27
-  decisions (#7963, #7966, #7967). The floor of both is the same: a value neither release prints is a bug.
+- **The predicates** are spike E's (`preds.py`), applied to whole transcripts and tightened to ADR-0018's #7963
+  amendment, which states E1 and E2 (`classify.rs` documents each one):
+  - **E1:** equal to a release through its first fault: the values before it (when the run goes on past the fault, as
+    under `--seq`, the oracle counts them), the message and its position, and the exit status when the fault ends
+    the run. The exit status is zero exactly when jq 1.7.1's is.
+  - **E2:** the fault is at the first NUL outside a string, at its own line and column; the values before it are
+    jq 1.7.1's from the bytes before the NUL (no NUL-ended number), and a fault that ends the run exits non-zero.
+  - **`#5308`:** with the subject's echoed strings taken out, the output before jq's escape fault is exact, and the
+    values and the exit status are those of jq on the stream with the escapes made valid.
+- **The floor** of all of them is the same: a value neither release prints is a bug. A line that is not JSON is such
+  a value, and numbers compare as decimals, not as `f64`. The floor's first two bullets (resume at the next line or
+  record; every value lies wholly after the fault) are only approximated: the subject's values must be a
+  subsequence of one release's, so a value assembled across the fault, or read from a resume point jq does not use,
+  is caught only when no release prints an equal value.
 - **Checking the oracle:** `--jq171 PATH --jq182 PATH --verify-every K` also spawns the real binaries on every `k`-th
   case and reports where they disagree with the in-process reader. The exit status is then 3.
 - **Output:** `--out DIR` writes `summary.txt` and `cases.jsonl` (every case that is not `same` or `split=1.7.1`). It

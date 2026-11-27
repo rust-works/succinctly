@@ -271,7 +271,7 @@ fn sync_point_resumes_are_exact() {
 }
 
 /// Every global symbol of both C builds carries its release's prefix (vendor/rename-*.h), so the
-/// two builds cannot bind to each other's functions. Needs `nm`; skipped without it.
+/// two builds cannot bind to each other's functions. Needs `nm`, and fails without it.
 #[test]
 fn every_global_symbol_is_renamed() {
     let out = Path::new(env!("OUT_DIR"));
@@ -293,14 +293,16 @@ fn every_global_symbol_is_renamed() {
         objects.len(),
         out.display()
     );
-    let Ok(nm) = std::process::Command::new("nm")
+    let nm = std::process::Command::new("nm")
         .arg("-g")
         .args(&objects)
         .output()
-    else {
-        eprintln!("SKIPPED: no nm");
-        return;
-    };
+        .expect("nm runs (the test needs it: install binutils or Xcode's command-line tools)");
+    assert!(
+        nm.status.success(),
+        "nm failed: {}",
+        String::from_utf8_lossy(&nm.stderr)
+    );
     let text = String::from_utf8_lossy(&nm.stdout);
     let mut bad = Vec::new();
     for line in text.lines() {
