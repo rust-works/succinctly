@@ -440,7 +440,7 @@ With 4,088 spaces, `123`, a NUL, six spaces and a newline in a file, `[., input_
 The number is read as both releases read it, and only the line count differs.
 Both releases count the newline their read reaches when the `123` starts at byte 4,087 to 4,090, and all three say `1` from byte 4,091 on.
 With the `123` at byte 4,085 or 4,086 jq 1.7.1 says `1`, and jq 1.8.2 says `0`, as `succinctly jq` does.
-#7948's second shape, a line counted past invalid UTF-8 after a fault, is recorded further down, beside #7938; no test pins either.
+#7948's second shape, a line counted past invalid UTF-8 after a fault, is fixed and recorded further down, beside #7938; no test pins this first shape.
 
 ## A `-f` program file with a NUL byte is refused, as jq 1.8.2 refuses it; jq 1.7.1 ends the program at the NUL (#7434)
 
@@ -11468,10 +11468,11 @@ A program that read on past a caught fault met the moved resumption point as a f
 And behind a byte-order mark, whose three bytes #7569 counts in the first read, the resumption point could fall inside a number and read part of it as a value jq never reads, which ran the program again and made the run exit 0 where jq exits 5 ([#7934](https://github.com/rust-works/succinctly/issues/7934); [#7931](https://github.com/rust-works/succinctly/issues/7931) has the `(at f:0)` and double-fault shapes).
 A file that starts inside a replacement, with a character's bytes cut across two files, has its reads counted from its own first byte, inside that replacement, where they were counted from the replacement's end.
 The windowed document loop still counts a value's line over the window's text, since a window does not keep the substitution's edits: on a regular file of 4 MiB or more, a runtime error's `(at …)` line for a value just past a read boundary after invalid UTF-8 on a long line can be one short ([#7938](https://github.com/rust-works/succinctly/issues/7938)).
-`input_line_number` past a fault on a first line that holds invalid UTF-8 can be one short too, on a file of any size ([#7948](https://github.com/rust-works/succinctly/issues/7948)).
-Over a 4,083-byte line of spaces that holds five strings with six invalid bytes in them, a `1`, a bare `0xC3` byte at offset 4,079 and a newline at offset 4,082, `select(type == "number") | input_line_number` prints `0` here, where jq 1.7.1 and 1.8.2 print `1`; all three report the parse error at column 4081 and exit 5.
-With every byte above `0x7F` written as `z`, `succinctly jq` gives `1` too, so on this route the line is counted over the text with U+FFFD in it, as #7938's is.
-Open as #7948, whose other shape, after a NUL, is in the section on NUL bytes near the top of this page; no test pins either.
+`input_line_number` past a fault on a first line that holds invalid UTF-8 could be one short too, on a file of any size, until [#7948](https://github.com/rust-works/succinctly/issues/7948).
+Over a 4,083-byte line of spaces that holds five strings with six invalid bytes in them, a `1`, a bare `0xC3` byte at offset 4,079 and a newline at offset 4,082, `select(type == "number") | input_line_number` printed `0` here, where jq 1.7.1 and 1.8.2 print `1`; all three report the parse error at column 4081 and exit 5.
+When the fault falls past a quarter of the file, the documents before it are handed to the program as a lazy prefix, and that hand-off did not count its lines in the bytes jq read as #7934's other hand-offs do, so the line was counted over the text with U+FFFD in it.
+It now counts them as the others do: over a 4,090-byte line with three strings holding invalid bytes, a `1`, a bare `0xC3` at byte 4,086 and a newline, it prints the fault at column 4088 and then `1`, as both releases do; pinned by `tests/jq_cli/i7948.rs`.
+#7948's other shape, after a NUL, is in the section on NUL bytes near the top of this page.
 A sibling with the same symptom as #7934 on input that is ASCII but for the mark and a NUL has another cause and is not fixed by this ([#7937](https://github.com/rust-works/succinctly/issues/7937)): the NUL pass rewrites a number that a fault's dropped read splits, and the resume reads part of it.
 Since the reads are counted where jq's are, a shape with invalid UTF-8 before such a number reaches it as its ASCII twin does (a mark, a surrogate's three bytes before `]123`, a NUL and a newline one byte past the end of the second read print `[]` and exit 0, where before #7934 the run exited 5 with the fault named a line late).
 The column a parse error names is counted over the bytes jq read, an invalid byte one column, since [#5964](https://github.com/rust-works/succinctly/issues/5964) (`\xff }` is column 2).

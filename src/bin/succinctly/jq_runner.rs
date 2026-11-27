@@ -9896,6 +9896,11 @@ fn read_inputs(
                     if let Some(spans) = lazy_prefix {
                         offset = spans.last().map_or(0, |&(_, end)| end);
                         defer_lazy_start(std::rc::Rc::clone(&raw), spans, src, seam.clone(), None);
+                        // #7948: its documents' lines count jq's reads in the bytes jq read, as
+                        // the moved stream's do above (#7934).
+                        if let Some(lossy) = lossy {
+                            mark_lazy_read_as(lossy.clone());
+                        }
                         lazy_inputs = true;
                     }
                     let tail_cx = TailContext {
