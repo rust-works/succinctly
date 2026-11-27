@@ -237,9 +237,13 @@ const WRITE_ROWS: &[(&str, &str)] = &[
 ];
 
 fn run(args: &[&str], filter: &str, stdin: &str) -> Result<(String, String, i32)> {
+    run_tool("yq", args, filter, stdin)
+}
+
+fn run_tool(tool: &str, args: &[&str], filter: &str, stdin: &str) -> Result<(String, String, i32)> {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
-        .arg("yq")
+        .arg(tool)
         .args(args)
         .arg(filter)
         .env("TZ", "UTC")
@@ -281,6 +285,29 @@ fn a_write_reads_with_dtf_over_a_once_stage_once_8028() -> Result<()> {
         assert_eq!(
             (got.0.as_str(), got.1.as_str(), got.2),
             (*want, "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// `succinctly jq` keeps jq's per-value pipe for its `with_dtf` extension (jq 1.7.1 has no
+/// `with_dtf`): the body runs once per input.
+#[test]
+fn jq_mode_reads_with_dtf_per_value_8028() -> Result<()> {
+    for (filter, want) in [
+        ("[.[] | with_dtf(\"2006\"; now)] | length", "3\n"),
+        ("[.[] | with_dtf(\"2006\"; strenv(X))] | length", "3\n"),
+        ("map(with_dtf(\"2006\"; now)) | length", "3\n"),
+        (
+            "[.[] | select(false) | with_dtf(\"2006\"; now)] | length",
+            "0\n",
+        ),
+    ] {
+        let got = run_tool("jq", &["-c"], filter, "[1,2,3]")?;
+        assert_eq!(
+            (got.0.as_str(), got.1.as_str(), got.2),
+            (want, "", 0),
             "{filter}"
         );
     }

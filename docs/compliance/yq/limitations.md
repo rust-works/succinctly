@@ -1548,6 +1548,7 @@ yq also tags the node `!!timestamp`, which an owned value cannot carry ([#2802](
 yq's `withDateTimeFormat` sets the layout and evaluates `f` over the whole context it was given, not once per node.
 So a `with_dtf` whose `f` holds a stage yq answers once for its whole context (`now`, `env(NAME)`, `strenv(NAME)`, `{}`, a `$name`) is answered once too: `[.x[] | with_dtf("2006"; now)] | length` is `1`, and so is `with_dtf("2006"; select(true) | now)`.
 `succinctly yq` follows that through the walk and the parser rewrite above, which look through `with_dtf` to its body (`yq_once_wrapper_body`).
+The three differences recorded for `env(NAME)` hold for such a call too: `limit(1; repeat(1) | with_dtf("2006"; now))` under `--jq-extensions` runs `repeat` to its limit, and `with_dtf("2006"; now) | document_index` over three documents is `0 1 2` here and `0 0 0` in yq.
 Any other body is still read once per node, which differs from yq wherever the body's answer depends on the whole list.
 - **A union in the body.**
   `[.x[] | with_dtf("2006"; ., 0)]` over `x: [1, 2, 3]` is `[1,2,3,0,0,0]` in yq, branch-major over the list, and `[1,0,2,0,3,0]` here.
