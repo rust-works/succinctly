@@ -5517,9 +5517,9 @@ fn query_result_is_empty<W>(result: &QueryResult<'_, W>) -> bool {
 /// [`yq_reemit_after_empty_stage`] over the values `body` was evaluated on, one context list: a
 /// stage's input was empty when the stages before it yield nothing over any of them. `None` in jq
 /// mode and over an empty list.
-fn yq_reemit_over_values<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
+fn yq_reemit_over_values<W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     body: &Expr,
-    context: &[StandardJson<'a, W>],
+    context: &[StandardJson<'_, W>],
     optional: bool,
 ) -> Option<Expr> {
     if S::TAG != EvalTag::Yq || context.is_empty() {

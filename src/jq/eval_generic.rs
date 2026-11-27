@@ -42421,7 +42421,7 @@ fn eval_builtin_in<S: EvalSemantics, V: DocumentValue>(
                     return GenericResult::None; // patchcov: coverage tolerate-line reason="unreachable: `to_entries` of an object is an array"
                 };
                 let mut mapped: Vec<OwnedValue> = Vec::new();
-                for entry in listed.iter() {
+                for entry in listed {
                     if let Flow::Escaped(control) = super::eval::eval_each_owned_reemitting::<S>(
                         f,
                         entry,
