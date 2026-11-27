@@ -12364,6 +12364,23 @@ mod path_base {
         f()
     }
 
+    /// Whether a prefix is installed: [`current`] without the clone.
+    pub(crate) fn is_installed() -> bool {
+        CURRENT.with(|c| c.borrow().is_some())
+    }
+
+    /// Removes the prefix and the ancestry for `f`'s dynamic extent, restoring both on the way out.
+    pub(crate) fn cleared<R>(f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<Rc<Vec<OwnedValue>>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT.with(|c| *c.borrow_mut() = self.0.take());
+            }
+        }
+        let _restore = Restore(CURRENT.with(|c| c.borrow_mut().take()));
+        with_ancestry(None, f)
+    }
+
     thread_local! {
         static ANCESTRY: RefCell<Option<Rc<UpdateAncestry>>> = const { RefCell::new(None) };
     }
@@ -12404,6 +12421,14 @@ mod path_base {
         f()
     }
 
+    pub(crate) fn is_installed() -> bool {
+        false
+    }
+
+    pub(crate) fn cleared<R>(f: impl FnOnce() -> R) -> R {
+        f()
+    }
+
     pub(crate) fn ancestry() -> Option<Rc<UpdateAncestry>> {
         None
     }
@@ -12426,6 +12451,21 @@ pub(crate) struct UpdateAncestry {
     pub(crate) pre: OwnedValue,
     pub(crate) base_len: usize,
     pub(crate) outer: Option<Rc<UpdateAncestry>>,
+}
+
+/// Run `f` with no ambient prefix and no [`UpdateAncestry`] (#8039): the filter of an update that
+/// names no position for it (one whose path-context reads cannot all be resolved at its target,
+/// such as `5 | . |= key`). The prefix an enclosing update installed describes that update's
+/// target, which this filter's nested updates are not known to stand at; with none they stand
+/// nowhere, as a node yq builds (the `5`) does, so `.a |= (.b |= (5 | . |= key))` leaves `5`.
+/// The caller asks [`update_base_installed`] first, so the top level of every program pays nothing.
+pub(crate) fn without_update_base<R>(f: impl FnOnce() -> R) -> R {
+    path_base::cleared(f)
+}
+
+/// Whether an ambient prefix is installed, which [`without_update_base`] would remove.
+pub(crate) fn update_base_installed() -> bool {
+    path_base::is_installed()
 }
 
 /// The ambient [`UpdateAncestry`], if an enclosing update installed one (#8039).

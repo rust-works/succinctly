@@ -56019,6 +56019,14 @@ fn update_root_with_filter<S: EvalSemantics>(
             pos.pre.map(|pre| (pre, pos.base_len)),
             run,
         )?,
+        // #8039: an update that names no position for a filter that reads one leaves its nested
+        // updates none either, rather than the enclosing update's.
+        None if S::TAG == EvalTag::Yq
+            && super::eval_generic::update_base_installed()
+            && needs_path_context(filter_expr) =>
+        {
+            super::eval_generic::without_update_base(run)?
+        }
         None => run()?,
     };
     let wrote = output.is_some();
