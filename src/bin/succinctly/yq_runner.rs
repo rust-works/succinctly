@@ -7868,7 +7868,7 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         let at = navigation_for(path)?;
         let at_root = matches!(at, Expr::Identity);
         let mut member: Vec<Expr> = Vec::with_capacity(tail.len() + 1);
-        if !(at_root && !tail.is_empty()) {
+        if !at_root || tail.is_empty() {
             member.push(at);
         }
         member.extend(tail.iter().map(|stage| (*stage).clone()));
