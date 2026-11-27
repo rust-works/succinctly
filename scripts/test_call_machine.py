@@ -7,7 +7,7 @@
   in CI, holds exactly the cases of `cases.py`, in order: a case edited without `check.py capture`
   fails here instead of leaving CI checking the old program.
 - `ladders.py --bin LABEL=PATH@VAR=VALUE` gives that binary its own environment, which the A/B of
-  a runtime switch needs (#7961).
+  a runtime switch needs (#7961), and `per_record.py` reads its `--bin` the same way.
 """
 import json
 import os
@@ -71,6 +71,21 @@ class LadderTests(unittest.TestCase):
             self.assertTrue(lad["sizes"], lad["id"])
             if lad["sizes"] != [0]:
                 self.assertIn("{N}", lad["filter"], lad["id"])
+
+
+@unittest.skipIf(ladders is None, "no POSIX `resource` module")
+class PerRecordTests(unittest.TestCase):
+    def test_every_program_is_a_def_and_a_body(self):
+        import per_record
+
+        for name, (prelude, body) in per_record.PROGRAMS.items():
+            self.assertTrue(prelude.startswith("def ") and prelude.endswith(";"), name)
+            self.assertNotIn("def ", body, name)
+
+    def test_its_bins_parse_as_the_ladders_do(self):
+        import per_record
+
+        self.assertIs(per_record.parse_bin, ladders.parse_bin)
 
 
 if __name__ == "__main__":
