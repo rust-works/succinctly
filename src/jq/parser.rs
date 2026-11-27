@@ -6982,9 +6982,8 @@ impl<'a> Parser<'a> {
                     };
                     // jq's `'-' Exp` makes the negation cover the
                     // multiplicative chain after its operand: `-.a * 2` is
-                    // `-(.a * 2)`. yq has no unary minus (`-E` is its own
-                    // extension, `E * -1`), and keeps the single operand.
-                    let operand = if self.mode == ParserMode::Jq && !self.expd_operand {
+                    // `-(.a * 2)`. (yq mode refused the `-` above.)
+                    let operand = if !self.expd_operand {
                         self.parse_multiplicative_from(first)?
                     } else {
                         first

@@ -20071,11 +20071,10 @@ fn arith_sub<S: EvalSemantics>(
 ///
 /// **The past-`2^53` rounding is jq-mode only**: real yq has no unary-minus
 /// operator at all (confirmed live against yq v4.53.3: `-.a` is a hard
-/// parse error, `'-' expects 2 args but there is 1`) -- succinctly's own
-/// support for it in yq mode is a pre-existing, unrelated extension (#1056
-/// doesn't touch whether it exists), so there's no oracle to say a
-/// yq-mode `Int` past that magnitude should round to a double rather than
-/// stay exact. `S::OVERFLOW_WRAPS` gates the whole jq-only branch, matching
+/// parse error, `'-' expects 2 args but there is 1`), and since #8048
+/// `succinctly yq` refuses it the same way, so no yq-mode filter reaches
+/// this function and there's no oracle to say a yq-mode `Int` past that
+/// magnitude should round to a double rather than stay exact. `S::OVERFLOW_WRAPS` gates the whole jq-only branch, matching
 /// every other call site of this rounding model (`arith_add`/`arith_sub`/
 /// `arith_mul`).
 ///
