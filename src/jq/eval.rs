@@ -102465,13 +102465,20 @@ fn bind_yq_update<'e>(
 /// yq's `reduce` (#6802): a fold over a *list* of accumulators, where jq's is one independent fork per
 /// INIT output that keeps UPDATE's last output.
 ///
-/// yq's `reduceOperator` (`pkg/yqlib/operator_reduce.go`, v4.53.3) evaluates INIT once into a list,
-/// reads the source **once**, and runs UPDATE against the whole list for each source node: every
-/// output of UPDATE is an accumulator of the next step, an UPDATE with no output drops its
+/// yq's `reduceOperator` (`pkg/yqlib/operator_reduce.go`, v4.53.3) reads the source **once**, in
+/// full, then evaluates INIT once into a list, and runs UPDATE against the whole list for each source
+/// node: every output of UPDATE is an accumulator of the next step, an UPDATE with no output drops its
 /// accumulator, and a union in UPDATE is branch-major over the list. The answers are the final list.
 /// `. as $i ireduce (0; (. + $i, . * 10))` over `[1, 2]` is `3 2 10 0`, a `select(false)` UPDATE
 /// prints nothing, and INIT `(0, 100)` folds both over the same source (`3 103`; jq's later forks read
 /// a `null` source, #3895).
+///
+/// Reading the source first is visible only through errors (#8022), so the source is still streamed
+/// here, INIT first, and the order is recovered by precedence: an error anywhere in the source
+/// outranks INIT's and UPDATE's, and the source is read to its end even when INIT failed or yielded
+/// nothing and after UPDATE failed or dropped every accumulator. `error("s") as $x ireduce
+/// (error("i"); .)` and `(1, error("s")) as $x ireduce (0; select(false))` are `Error: s`, as in yq;
+/// jq's `reduce` evaluates INIT first and never reads the source of an empty one (#2440).
 ///
 /// One accumulator -- the common case -- is stepped through the ordinary UPDATE dispatch
 /// ([`fold_step_each`], collecting every output), so a fold that never fans out costs what it did.
@@ -102494,21 +102501,24 @@ fn reduce_list_yq<S: EvalSemantics>(
         accumulators.push(seed);
         Demand::Continue
     });
-    if let Flow::Escaped(control) = init_flow {
-        return finish_fork_flow(Some(control), optional);
-    }
-    // Nothing to fold: the source is never read, as for jq (#2440).
-    if accumulators.is_empty() {
-        return finish_fork_flow(None, optional);
-    }
+    // #8022: INIT's failure, an UPDATE step's and a binding's are each held while the rest of the
+    // source is read, since yq has read all of it before INIT and an error in it wins.
+    let mut failure: Option<Control> = match init_flow {
+        Flow::Escaped(control) => Some(control),
+        _ => None,
+    };
 
     // The list's growth is what is charged: a step on one accumulator is free, as the first fork of
     // jq's fold is, and each accumulator past the first spends a unit, so a union in UPDATE that
     // doubles the list every step is refused at 100,000 accumulators where yq grows it until the
     // process dies (`ireduce (0; (. + 1, . + 2))` over 30 elements is 2^30).
     let mut extra_budget = REDUCE_FOREACH_MAX_STEPS;
-    let mut failure: Option<Control> = None;
     let source_flow = drive_source(SourceInput::Real, &mut |element| {
+        // Nothing left to fold (INIT yielded nothing, or UPDATE dropped every accumulator) or a
+        // failure held: the element is read only for the error a later one may raise.
+        if failure.is_some() || accumulators.is_empty() {
+            return Demand::Continue;
+        }
         let sets_flow = each_pattern_binding_set::<S>(pattern, &element, false, &mut |bindings| {
             let current = core::mem::take(&mut accumulators);
             let stepped: Result<Vec<OwnedValue>, Control> = if current.len() == 1 {
@@ -102542,7 +102552,7 @@ fn reduce_list_yq<S: EvalSemantics>(
                     }
                     extra_budget -= extra;
                     accumulators = next;
-                    // An empty list stays empty: the rest of the source is not read.
+                    // An empty list stays empty: the rest of the source is only read.
                     if accumulators.is_empty() {
                         Demand::Stop
                     } else {
@@ -102558,14 +102568,11 @@ fn reduce_list_yq<S: EvalSemantics>(
         if let Flow::Escaped(control) = sets_flow {
             failure.get_or_insert(control);
         }
-        if failure.is_some() || accumulators.is_empty() {
-            Demand::Stop
-        } else {
-            Demand::Continue
-        }
+        Demand::Continue
     });
+    // An error in the source outranks every failure held above (#8022).
     if let Flow::Escaped(control) = source_flow {
-        failure.get_or_insert(control);
+        return finish_fork_flow(Some(control), optional);
     }
     if let Some(control) = failure {
         return finish_fork_flow(Some(control), optional);
