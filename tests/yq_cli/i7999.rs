@@ -208,6 +208,106 @@ fn test_spelled_bracket_key_keeps_presentation_7999() -> Result<()> {
     Ok(())
 }
 
+/// A spelled key in a pipe of writes, and as the navigation in front of a write or behind one,
+/// keeps the presentation the static `.s[1]` and `.m["0x1"]` keep. A later stage's key under a node
+/// an earlier stage renumbered is the slot of its value; a navigation in front of a metadata write
+/// is taken whole, not refused as a write behind a navigation (#2679).
+#[test]
+fn test_spelled_bracket_key_in_a_pipe_keeps_presentation_7999() -> Result<()> {
+    const NESTED: &str = "s:\n- [a] # c0\n- - p # p0\n  - \"q\" # q1\n- [c] # c2\n";
+    const FLOWS: &str = "s:\n  - [a] # c0\n  - [b] # c1\n  - [c] # c2\n";
+    const INNER: &str = "s:\n  - x\n  - - a # c0\n    - \"b\" # c1\n    - c # c2\n";
+    const MAP_SEQ: &str = "m:\n  \"0x1\":\n    - p # p0\n    - \"q\" # q1\n  \"1\": [z] # z1\n";
+    const MAP_MAP: &str = "m:\n  \"0x1\":\n    a: 1 # c\n    b: \"two\" # d\n  \"1\": {a: 3} # e\n";
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            "del(.s[0]) | del(.s[0][0x0])",
+            NESTED,
+            "s:\n  - - \"q\" # q1\n  - [c] # c2\n",
+        ),
+        (
+            "del(.s[0x0]) | del(.s[0x0][0x0])",
+            NESTED,
+            "s:\n  - - \"q\" # q1\n  - [c] # c2\n",
+        ),
+        (
+            "del(.s[0]) | .s[0][01] = 9",
+            NESTED,
+            "s:\n  - - p # p0\n    - 9 # q1\n  - [c] # c2\n",
+        ),
+        (
+            "del(.s[0]) | .s[0][01] = 9",
+            FLOWS,
+            "s:\n  - [b, 9] # c1\n  - [c] # c2\n",
+        ),
+        (
+            "del(.s[0x0]) | .s[0x0][01] = 9",
+            FLOWS,
+            "s:\n  - [b, 9] # c1\n  - [c] # c2\n",
+        ),
+        (
+            ".s[0x1][0x0] = 9 | del(.s[0x0])",
+            FLOWS,
+            "s:\n  - [9] # c1\n  - [c] # c2\n",
+        ),
+        (".s[01] | del(.[0])", INNER, "- \"b\" # c1\n- c # c2\n"),
+        (".s[01] | del(.[0x0])", INNER, "- \"b\" # c1\n- c # c2\n"),
+        (
+            ".s[01] | .[0] line_comment = \"z\"",
+            INNER,
+            "- a # z\n- \"b\" # c1\n- c # c2\n",
+        ),
+        (
+            ".s[01] | .[0x1] = \"q\"",
+            INNER,
+            "- a # c0\n- \"q\" # c1\n- c # c2\n",
+        ),
+        (
+            ".s[0x0] = \"y\" | .s[01]",
+            INNER,
+            "- a # c0\n- \"b\" # c1\n- c # c2\n",
+        ),
+        (".m[0x1] | del(.[0])", MAP_SEQ, "- \"q\" # q1\n"),
+        (
+            ".m[0x1] | .[0] line_comment = \"z\"",
+            MAP_SEQ,
+            "- p # z\n- \"q\" # q1\n",
+        ),
+        (
+            "del(.m[0x1][0]) | .m[0x1][0] = \"r\"",
+            MAP_SEQ,
+            "m:\n  \"0x1\":\n    - \"r\" # q1\n  \"1\": [z] # z1\n",
+        ),
+        (".m[1] = 5 | .m[0x1]", MAP_SEQ, "- p # p0\n- \"q\" # q1\n"),
+        (
+            ".m[0x1] | .a line_comment = \"x\"",
+            MAP_MAP,
+            "a: 1 # x\nb: \"two\" # d\n",
+        ),
+        (".m[0x1] | .b = \"z\"", MAP_MAP, "a: 1 # c\nb: \"z\" # d\n"),
+        (".m[0x1] | del(.a)", MAP_MAP, "b: \"two\" # d\n"),
+        (
+            ".m[0x1].a = 5 | .m[0x1]",
+            MAP_MAP,
+            "a: 5 # c\nb: \"two\" # d\n",
+        ),
+    ];
+    for (filter, input, want) in rows {
+        let mut file = NamedTempFile::new()?;
+        file.write_all(input.as_bytes())?;
+        let path = file.path().to_str().expect("utf-8 temp path");
+        let (out, code) = run_yq_file(filter, path, &[])?;
+        assert_eq!((out.as_str(), code), (*want, 0), "{filter} over {input:?}");
+        let (out, code) = run_yq_stdin(filter, input, &[])?;
+        assert_eq!(
+            (out.as_str(), code),
+            (*want, 0),
+            "{filter} over stdin {input:?}"
+        );
+    }
+    Ok(())
+}
+
 /// A key spelled `-0` is the mapping key `-0` and the sequence slot 0, as in yq.
 #[test]
 fn test_minus_zero_bracket_key_7999() -> Result<()> {

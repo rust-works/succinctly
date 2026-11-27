@@ -3648,7 +3648,7 @@ enum PathStep {
     /// A spelled integer key (`.m[0x1]`, `.s[01]`, #7999) as the AST names it: the key of that
     /// text in a mapping, the slot of that value anywhere else. [`collect_write_targets`]
     /// resolves it against the document into a [`PathStep::Key`] or [`PathStep::Index`] before
-    /// anything else reads the path, or declines the write.
+    /// anything else reads the path, and `chained_write_stages` into the index.
     Spelled(i64, String),
 }
 
@@ -4084,33 +4084,28 @@ fn collect_write_targets(expr: &Expr, doc: Option<&OwnedValue>) -> Option<Vec<Wr
     if !walk(expr, &mut DefScope::default(), &mut out) {
         return None;
     }
-    if !resolve_spelled_steps(&mut out, doc) {
-        return None;
-    }
+    resolve_spelled_steps(&mut out, doc);
     resolve_stage_order(out)
 }
 
 /// Turn every [`PathStep::Spelled`] of `targets` into the step it names in `doc`, the document the
 /// first write reads (#7999): the key of its text where the node it indexes is a mapping, the slot
 /// of its value anywhere else (a sequence, or a `null` or absent node, which the write makes a
-/// sequence, as in yq). `false`, declining the write, when there is no document, the step follows
-/// a `.[]` (whose members may differ in kind), or an earlier stage wrote at or above the node it
-/// indexes, or removed a slot of a sequence above it: that node may no longer be the one `doc`
-/// holds there.
-fn resolve_spelled_steps(targets: &mut [WriteTarget], doc: Option<&OwnedValue>) -> bool {
+/// sequence, as in yq).
+///
+/// Where `doc` cannot say which node the step indexes, it is the slot of its value, the integer
+/// index the parser folded such a key to before #7999: with no document, after a `.[]` (whose
+/// members may differ in kind), or under a node an earlier stage wrote at or above, or renumbered
+/// by removing a slot of a sequence above it. That is right on a sequence and, on a mapping, a
+/// target the reconcile does not find, as it always was; the write itself names the key.
+fn resolve_spelled_steps(targets: &mut [WriteTarget], doc: Option<&OwnedValue>) {
     for i in 0..targets.len() {
         for p in 0..targets[i].path.len() {
             let PathStep::Spelled(idx, text) = &targets[i].path[p] else {
                 continue;
             };
             let (idx, text) = (*idx, text.clone());
-            let Some(doc) = doc else {
-                return false;
-            };
             let container = &targets[i].path[..p];
-            if container.contains(&PathStep::Each) {
-                return false;
-            }
             let leads = |steps: &[PathStep]| {
                 steps.len() <= container.len()
                     && steps
@@ -4125,17 +4120,14 @@ fn resolve_spelled_steps(targets: &mut [WriteTarget], doc: Option<&OwnedValue>) 
                         && u.path.len() <= container.len()
                         && leads(&u.path[..u.path.len() - 1]))
             });
-            if moved {
-                return false;
-            }
-            let step = match read_owned_at(doc, container) {
+            let known = doc.filter(|_| !moved && !container.contains(&PathStep::Each));
+            let step = match known.and_then(|doc| read_owned_at(doc, container)) {
                 Some(OwnedValue::Object(_)) => PathStep::Key(text),
                 _ => PathStep::Index(idx),
             };
             targets[i].path[p] = step;
         }
     }
-    true
 }
 
 /// Whether `target` removes an array slot, renumbering the ones after it.
@@ -4696,12 +4688,19 @@ fn chained_write_stages<'e>(
     let mut stages = Vec::new();
     for stage in flat {
         // A spelled key (#7999) needs the document each stage reads, which this plan does not
-        // hold, so a chain through one is reconciled whole.
+        // hold: it is the slot of its value, as before #7999, and a stage that finds a mapping
+        // there cannot be applied, so the chain is reconciled whole.
         let static_path = |path: &Expr| {
             let mut steps = Vec::new();
-            (static_path_steps(path, &mut steps)
-                && !steps.iter().any(|s| matches!(s, PathStep::Spelled(..))))
-            .then_some(steps)
+            static_path_steps(path, &mut steps).then(|| {
+                steps
+                    .into_iter()
+                    .map(|step| match step {
+                        PathStep::Spelled(idx, _) => PathStep::Index(idx),
+                        other => other,
+                    })
+                    .collect::<Vec<_>>()
+            })
         };
         let literal = |value: &Expr| evaluate_input_quiet(&OwnedValue::Null, value);
         match strip_parens(stage) {
@@ -4991,7 +4990,7 @@ fn set_owned_at(node: &mut OwnedValue, path: &[PathStep], new: OwnedValue) -> Op
             set_owned_at(&mut items[at], rest, new)
         }
         // A chain stage's path is static (`static_path_steps`), so it holds no `Each`, and
-        // `chained_write_stages` declines a spelled key.
+        // `chained_write_stages` has made a spelled key an index.
         PathStep::Each | PathStep::Spelled(..) => None,
     }
 }
@@ -6034,32 +6033,65 @@ fn comment_tree_at_path_mut<'t>(
 /// (rule 4(b), see the entry this issue adds to
 /// `docs/compliance/yq/limitations.md`).
 fn static_nav_steps(expr: &Expr) -> Option<Vec<TreeStep<'_>>> {
+    static_nav_steps_in(expr, None)
+}
+
+/// [`static_nav_steps`], with a spelled integer key (`.m[0x1]`, `.s[01]`, #7999) resolved against
+/// `doc`, the document the navigation reads: the key of its text where it indexes a mapping, the
+/// slot of its value anywhere else. With no document it is the slot, the integer index the parser
+/// folded such a key to before #7999, so a navigation through one is static as it always was.
+fn static_nav_steps_in<'e>(expr: &'e Expr, doc: Option<&OwnedValue>) -> Option<Vec<TreeStep<'e>>> {
+    let mut steps = Vec::new();
+    push_static_nav_steps(expr, doc, &mut steps).then_some(steps)
+}
+
+/// The body of [`static_nav_steps_in`]: `expr`'s steps pushed onto `out`, which holds the steps
+/// before it (what a spelled key is resolved under); `false` for anything else.
+fn push_static_nav_steps<'e>(
+    expr: &'e Expr,
+    doc: Option<&OwnedValue>,
+    out: &mut Vec<TreeStep<'e>>,
+) -> bool {
     match expr {
-        Expr::Field(name) => Some(vec![TreeStep::Key(name.as_str())]),
-        Expr::Index { idx, .. } if *idx >= 0 => Some(vec![TreeStep::Index(*idx as usize)]),
+        Expr::Field(name) => {
+            out.push(TreeStep::Key(name.as_str()));
+            true
+        }
+        Expr::Index { idx, .. } if *idx >= 0 => {
+            out.push(TreeStep::Index(*idx as usize));
+            true
+        }
         // #2126: a `del()` argument keeps `.["b"]` as a bracket on its target; the same
         // navigation as `.b`.
-        Expr::IndexExpr { .. } => {
-            let (target, name) = expr.literal_bracket_key()?;
+        Expr::IndexExpr { target, .. } => {
             // `.["b"]` is a bracket on the root node (`Identity`), which has no steps of its
             // own: the bare-root case this function otherwise declines.
-            let mut steps = if matches!(target, Expr::Identity) {
-                Vec::new()
-            } else {
-                static_nav_steps(target)?
-            };
-            steps.push(TreeStep::Key(name));
-            Some(steps)
-        }
-        Expr::Paren(inner) | Expr::Optional(inner) => static_nav_steps(inner),
-        Expr::Pipe(stages) => {
-            let mut steps = Vec::new();
-            for stage in stages {
-                steps.extend(static_nav_steps(stage)?);
+            if !matches!(**target, Expr::Identity) && !push_static_nav_steps(target, doc, out) {
+                return false;
             }
-            Some(steps)
+            if let Some((_, name)) = expr.literal_bracket_key() {
+                out.push(TreeStep::Key(name));
+                return true;
+            }
+            let Some((_, idx, text)) = expr.spelled_int_bracket() else {
+                return false;
+            };
+            let on_mapping = doc
+                .and_then(|doc| owned_value_at(doc, &meta_path_of(out)))
+                .is_some_and(|node| matches!(node, OwnedValue::Object(_)));
+            match (on_mapping, usize::try_from(idx)) {
+                (true, _) => out.push(TreeStep::Key(text)),
+                (false, Ok(idx)) => out.push(TreeStep::Index(idx)),
+                // A negative slot is declined, as `.[-1]` is.
+                (false, Err(_)) => return false,
+            }
+            true
         }
-        _ => None,
+        Expr::Paren(inner) | Expr::Optional(inner) => push_static_nav_steps(inner, doc, out),
+        Expr::Pipe(stages) => stages
+            .iter()
+            .all(|stage| push_static_nav_steps(stage, doc, out)),
+        _ => false,
     }
 }
 
@@ -9524,6 +9556,8 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
                     let Some(whole) = sink.materialize(DiagStyle::Yq, whole, &no_location()) else {
                         return Ok(Vec::new());
                     };
+                    // A spelled key (#7999) is the key or the slot the document has there.
+                    let steps = static_nav_steps_in(&nav, Some(&whole.0)).unwrap_or(steps);
                     descend_value_and_tree(&whole.0, &whole.1, &steps).map(Some)
                 } else {
                     Some(None)
@@ -9570,12 +9604,20 @@ fn evaluate_yaml_cursor_in_document<W: AsRef<[u64]> + Clone>(
         CoreRoute::inner(None),
     )?;
     let path = meta_path_of(&steps);
+    let spelled = jq::walk::any_subexpr(&nav, &mut |e| e.spelled_int_bracket().is_some());
     let mut out = Vec::with_capacity(docs.len());
     for (value, tree) in docs {
+        // A spelled key (#7999) is the key or the slot this document has there.
+        let resolved = spelled
+            .then(|| static_nav_steps_in(&nav, Some(&value)))
+            .flatten();
+        let resolved_path = resolved.as_deref().map(meta_path_of);
+        let steps = resolved.as_deref().unwrap_or(&steps);
+        let path = resolved_path.as_deref().unwrap_or(&path);
         // A path the written document has is answered by walking it, without the serialize and
         // re-index pass the evaluator costs; a path it lacks (`null` for an absent key, nothing
         // for a key under a scalar, ...) is the evaluator's to answer, with no tree to attach.
-        let navigated: Vec<(OwnedValue, CommentTree)> = match owned_value_at(&value, &path) {
+        let navigated: Vec<(OwnedValue, CommentTree)> = match owned_value_at(&value, path) {
             Some(node) => {
                 let sub = steps.iter().fold(&tree, |node, step| match step {
                     TreeStep::Key(k) => node.field(k),
