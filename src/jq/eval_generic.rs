@@ -25034,7 +25034,7 @@ enum YqListStage {
     /// `EvaluateTogether`: real yq builds **one** empty mapping however many nodes its context
     /// holds (`yq ea '{}' f1 f2` prints one `{}`, where `0` prints one per document), so
     /// `ireduce ({}; ...)` starts one fold and not one per document (#2427); `env(X)` and
-    /// `strenv(X)` likewise read the variable once (#7996).
+    /// `strenv(X)` likewise read the variable once (#7996), and `now` the clock (#8007).
     BuiltOnce,
     /// A plain or compound assignment (`=`, `+=`, `-=`, `*=`, `/=`, `%=`) over inputs that all
     /// carry `EvaluateTogether`: real yq's `assignUpdateOperator` evaluates the right side
@@ -25117,7 +25117,8 @@ fn yq_list_stage(stages: &[Expr], together: bool) -> Option<(usize, YqListStage)
             break;
         }
         // An empty `{}` is one mapping whatever reaches it, with or without
-        // `EvaluateTogether` (#6801): `.x[] | {}` is one `{}`, and `env(X)` is one node (#7996).
+        // `EvaluateTogether` (#6801): `.x[] | {}` is one `{}`, and `env(X)` (#7996) and `now`
+        // (#8007) are one node each.
         // At any index: the stage list here is the rest of a pipe the walk already split, or a
         // union branch, whose inputs are the list the stage before it left.
         if yq_stage_built_once(stage) {

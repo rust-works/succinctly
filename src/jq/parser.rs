@@ -3063,7 +3063,7 @@ fn yq_var_stage_once(stages: Vec<Expr>, env_args_pseudo: bool) -> Expr {
 /// (`mapOperator`, `GetMatchingNodes(splatted, RHS)`), so a union in `f` runs each branch over every
 /// member before the next: `map(.a, .b)` is every `.a`, then every `.b`. An empty `{}` stage in `f`
 /// is built once, not per member (#6801: `.x | map({})` is `[{}]`), as are `env(X)` and `strenv(X)` (#7996:
-/// `map(env(X))` is `[hi]`) and a bare `$name` stage (#6821: `.n as $v | .x | map($v)` is `[7]`). That is the walk
+/// `map(env(X))` is `[hi]`), `now` (#8007) and a bare `$name` stage (#6821: `.n as $v | .x | map($v)` is `[7]`). That is the walk
 /// `[.[] | f]` already takes (the context-list model, `eval_yq_context_pipe`), so a union-bodied
 /// (or empty-`{}`-bodied) `map` over a sequence or a mapping with members is written
 /// `(if has-members then [.[] | f] else . end) | map(.)`.
