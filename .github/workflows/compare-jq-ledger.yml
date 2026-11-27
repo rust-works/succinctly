@@ -35,6 +35,8 @@ on:
       - 'scripts/jq-grammar-fuzz.py'
       - 'scripts/ledger_refs.py'
       - 'scripts/test_ledger_refs.py'
+      - 'scripts/jq-reader-oracle-sweep.py'
+      - 'jq-reader-oracle/**'
       - '.github/workflows/compare-jq-ledger.yml'
   push:
     branches: [main]
@@ -47,6 +49,8 @@ on:
       - 'scripts/jq-grammar-fuzz.py'
       - 'scripts/ledger_refs.py'
       - 'scripts/test_ledger_refs.py'
+      - 'scripts/jq-reader-oracle-sweep.py'
+      - 'jq-reader-oracle/**'
       - '.github/workflows/compare-jq-ledger.yml'
   schedule:
     - cron: '41 5 * * 1'      # weekly, Monday 05:41 UTC
@@ -125,6 +129,7 @@ jobs:
           key: ${{ steps.jq-cache.outputs.cache-primary-key }}
 
       - name: Build succinctly (the manifest's feature set)
+        id: build
         run: cargo build --release --features cli,simd,regex,serde,bench-runner
 
       - name: Compare
@@ -135,6 +140,14 @@ jobs:
             --dimension smoke --dimension features --dimension cli \
             --dimension differential --dimension fuzz --dimension input --dimension robustness \
             --out data/compare/ledger 2>&1 | tee data/compare/ledger/compare.log
+
+      # The `reader-oracle` sweep of comparison/jq/manifest.toml (#7986), which `--quick` above
+      # does not run: jq's own C readers, in-process, against the input layer. About a minute to
+      # build the package and one or two to run its 15,000 cases and minimise a repro per bug
+      # signature. After the comparison, and run whatever it found, so each reports on its own.
+      - name: Input reader against jq's own readers
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 -I scripts/jq-reader-oracle-sweep.py ./target/release/succinctly --out data/compare/ledger/reader-oracle
 
       - name: Summarize the drift
         if: always()

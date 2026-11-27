@@ -295,7 +295,9 @@ The input layer (jq's 4,095- and 4,091-byte reads, NUL bytes, BOMs, invalid UTF-
 [`jq-reader-oracle/`](../../jq-reader-oracle/README.md) links jq 1.7.1's and jq 1.8.2's own readers in-process and
 runs a differential harness against a `succinctly` binary, classifying each difference as a release split, as covered
 by E1 or E2 (#7963), as a recorded divergence, or as a bug (#7970). It is a separate package with its own lockfile,
-not part of the crate, and needs a C compiler; it is not yet folded into `dev compare jq`.
+not part of the crate, and needs a C compiler. A fixed-seed subset of it is the `reader-oracle` sweep, which
+`dev compare jq` and the Ledger drift job on pull requests both run; its `RESIDUALS` list holds the known bugs, each
+with its issue (`scripts/jq-reader-oracle-sweep.py`, #7986).
 
 ### Coverage
 

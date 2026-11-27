@@ -101,16 +101,18 @@ file writes; the spike timed the C reads alone at 18,032 cases/s.
 
 Spawning the subject is the cost. A 3,000-case subset takes 2-5 s.
 
-### Wiring into CI (not done here)
+### In CI (#7986)
 
-`diff`'s exit status is the contract of a `[[sweep]]` entry in `comparison/jq/manifest.toml`: 0 agrees, 1 diverges,
-anything else is an error. A fixed-seed 3,000-case subset (`--seed 1 --cases 3000`) can join `succinctly dev compare
-jq` there, with this package built first (`cargo build --release --manifest-path jq-reader-oracle/Cargo.toml`, on the
-Linux and macOS legs only).
-
-Two steps should come with that:
-- a `cargo test` of this package beside the `fuzz harness compile check` job;
-- `cargo audit`/`cargo deny` for its lockfile in `security.yml`, as `fuzz/` and `bench-compare/` have.
-
-The 1.8.2 adoptions the reader keeps on purpose would then need listing, so that `split=1.8.2` rows of a recorded
-adoption stop counting.
+- **Build and tests:** `ci.yml`'s `jq-reader-oracle` job runs `cargo test --locked` on this package, on x86_64 Linux.
+- **Lockfile:** `security.yml` runs `cargo audit` and `cargo deny` (with `deny.toml` here) on its lockfile, as for
+  `fuzz/` and `bench-compare/`. `ci.yml`'s nested-lockfile step checks that the lockfile matches the manifest.
+- **The sweep:** `scripts/jq-reader-oracle-sweep.py SUCCINCTLY` builds this package and runs `diff` over a
+  fixed subset, `--seed 3 --cases 15000`. It is the `reader-oracle` `[[sweep]]` of `comparison/jq/manifest.toml`,
+  so `succinctly dev compare jq` runs it. The Ledger drift job (`compare-jq-ledger.yml`) runs it too, on every
+  pull request that touches `src/**`.
+- **What fails the sweep:** a `BUG(agree)` or `BUG(split)` case whose (class, family, flags) signature is not in the
+  script's `RESIDUALS` list, or a listed residual that no longer shows. Each residual names its issue. A fix
+  deletes its entries in the same change.
+- **What doesn't:** `split=1.8.2` rows. They are #7971's to sort out.
+- **Why seed 3:** its case 14434 is the lazy-prefix line count of #7948 and #7980, so reverting #7974 fails the
+  sweep. Seed 1's first 40,000 cases never reach that shape.

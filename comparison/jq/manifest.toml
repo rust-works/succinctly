@@ -320,6 +320,16 @@ script = "scripts/jq-path-register-sweep.py"
 args = ["--candidate", "{subject}", "--jq", "{jq}", "--jq-latest", "{jq_secondary}", "--jq-gate", "--sample", "20000", "--seed", "7"]
 timeout_s = 900
 
+# The input reader against jq 1.7.1's and 1.8.2's own C readers, run in-process by
+# jq-reader-oracle/ (#7970, #7986); `{jq}` is not used. The script builds the package first (it
+# compiles jq's vendored C, so Linux and macOS only), runs a fixed-seed 15,000-case subset and fails on
+# a BUG case outside its RESIDUALS list or on a listed residual that no longer shows.
+[[sweep]]
+id = "reader-oracle"
+script = "scripts/jq-reader-oracle-sweep.py"
+args = ["{subject}"]
+timeout_s = 600
+
 # `--jq-gate`, as for foreach-update-if-arm. Every 4th row of the 108,864-row grid: the whole grid is
 # all MATCH and takes about 7.5 minutes on an M4 Pro, the sample about 1.5.
 [[sweep]]

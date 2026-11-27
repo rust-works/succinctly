@@ -1,0 +1,46 @@
+# deny.toml -- cargo-deny configuration for the jq-reader-oracle/ package
+# Reference: https://embarkstudios.github.io/cargo-deny/
+#
+# jq-reader-oracle/ is a test oracle with its own workspace and lockfile (see its
+# Cargo.toml's header), so it gets its own policy file rather than sharing the root
+# deny.toml, as fuzz/ and bench-compare/ do. Its dependencies need no licence beyond
+# the root's.
+#
+# Run locally with:  cargo deny --manifest-path jq-reader-oracle/Cargo.toml --config jq-reader-oracle/deny.toml check all
+
+[graph]
+targets = []
+all-features = true
+
+# ── Advisories ────────────────────────────────────────────────────────
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+unmaintained = "workspace"
+yanked = "warn"
+ignore = []
+
+# ── Licenses ──────────────────────────────────────────────────────────
+# Same as root.
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# ── Bans ──────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+# ── Sources ───────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

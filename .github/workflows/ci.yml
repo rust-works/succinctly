@@ -1743,3 +1743,22 @@ jobs:
       - name: Compile-check the fuzz targets
         if: needs.gate.outputs.code == 'true'
         run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
+  # Build and test jq-reader-oracle/ (#7970), jq 1.7.1's and 1.8.2's own input readers run
+  # in-process: the judge of `succinctly jq`'s input layer, as the `reader-oracle` sweep in
+  # comparison/jq/manifest.toml and the Ledger drift job's reader step (#7986). Nothing else in this
+  # workflow builds it, so without this it could break and be found broken only when needed. It
+  # compiles jq's vendored C, so Linux only here (build.rs refuses a non-unix or big-endian target);
+  # its tests need no jq binary. Per-STEP gate, as fuzz-build.
+  jq-reader-oracle:
+    name: jq reader oracle tests
+    needs: gate
+    if: needs.gate.outputs.retest != 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.gate.outputs.code == 'true'
+
+      - name: Test the jq reader oracle
+        if: needs.gate.outputs.code == 'true'
+        run: cargo test --locked --manifest-path jq-reader-oracle/Cargo.toml
