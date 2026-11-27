@@ -83687,7 +83687,7 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
 /// `map`, arithmetic) is left to the general rule. `None` when nothing in `expr` has that shape.
 fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
     let deriving_stage = |stage: &Expr| {
-        is_yq_metadata_reader(stage)
+        is_yq_slot_reader(stage)
             || matches!(
                 unwrap_paren(stage),
                 Expr::Builtin(
@@ -83763,8 +83763,16 @@ fn is_yq_metadata_reader(stage: &Expr) -> bool {
     )
 }
 
+/// [`is_yq_metadata_reader`], or `key`: yq's `key` answers its input's key node, whose parent and
+/// key are its input's too, so as a `del()` target after a step down it is its input's slot
+/// (`del(.b | key)` deletes `.b`, `del(.c[0] | key)` the element). At the root it answers nothing,
+/// as the root has no key, which the resolver already does.
+fn is_yq_slot_reader(stage: &Expr) -> bool {
+    is_yq_metadata_reader(stage) || matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key))
+}
+
 /// [`yq_slot_keeping_del_target`] for a pipe of navigation that ends in metadata readers
-/// ([`is_yq_metadata_reader`]) and may yield the root (#8020): `stages[..split]` is the navigation,
+/// ([`is_yq_slot_reader`]) and may yield the root (#8020): `stages[..split]` is the navigation,
 /// none of it stepping down. A reader's answer at the root is a parentless node of its own, which
 /// stops yq's back-to-front loop, and a bare reader resolves to such a parentless target here. So
 /// the navigation is split where it can still reach a node below the root: `(A, B) | R` is
@@ -83773,7 +83781,7 @@ fn is_yq_metadata_reader(stage: &Expr) -> bool {
 /// deletes `.b`, all as in yq v4.53.3). `None` for any other shape, which the general rule takes:
 /// a reader there is parentless, so it can only stop the loop early, never delete the document.
 fn yq_reader_del_target_from_root(stages: &[Expr], split: usize) -> Option<Expr> {
-    if !stages[split..].iter().all(is_yq_metadata_reader) {
+    if !stages[split..].iter().all(is_yq_slot_reader) {
         return None;
     }
     let rest = &stages[1..];

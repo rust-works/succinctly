@@ -7829,17 +7829,16 @@ fn cursor_write_target<W: AsRef<[u64]> + Clone>(
 /// Whether an output of a write target can be the answer of a node metadata reader (`line`,
 /// `kind`, `tag`, `path`, `document_index`, ...), a fresh node in yq rather than one of the
 /// document's (#8020). A reader inside a `select` condition, a comparison or an `if` condition only
-/// chooses nodes; any other place a reader appears counts, so a shape this does not know answers
-/// `true` and keeps its target as written.
+/// chooses nodes; any other place a reader appears counts, so the target is kept as written.
 fn metadata_reader_reaches_output(target: &Expr) -> bool {
-    let is_reader =
-        |b: &Builtin| is_node_metadata_slot(b) || matches!(b, Builtin::Tag | Builtin::PathNoArg);
     match strip_parens(target) {
+        Expr::Builtin(b)
+            if is_node_metadata_slot(b) || matches!(b, Builtin::Tag | Builtin::PathNoArg) =>
+        {
+            true
+        }
         Expr::Builtin(Builtin::Select(_)) => false,
         Expr::Compare { .. } | Expr::And(..) | Expr::Or(..) | Expr::Not => false,
-        Expr::Optional(inner) => metadata_reader_reaches_output(inner),
-        Expr::Pipe(stages) => stages.iter().any(metadata_reader_reaches_output),
-        Expr::Comma(items) => items.iter().any(metadata_reader_reaches_output),
         Expr::If {
             then_branch,
             else_branch,
@@ -7848,10 +7847,15 @@ fn metadata_reader_reaches_output(target: &Expr) -> bool {
             metadata_reader_reaches_output(then_branch)
                 || metadata_reader_reaches_output(else_branch)
         }
-        Expr::Alternative(left, right) => {
-            metadata_reader_reaches_output(left) || metadata_reader_reaches_output(right)
+        // Any other shape: whether a child can, `select` conditions and comparisons still pruned.
+        other => {
+            let mut reaches = false;
+            jq::walk::map_subexprs(other, &mut |child| {
+                reaches = reaches || metadata_reader_reaches_output(child);
+                child.clone()
+            });
+            reaches
         }
-        other => jq::walk::contains_builtin(other, is_reader),
     }
 }
 
