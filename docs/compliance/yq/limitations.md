@@ -8267,9 +8267,10 @@ Matching either needs a string that can hold bytes that are not UTF-8, or the su
   A write probes nothing that holds a `system(..)`: `.c = system("cmd")` runs `cmd` once, as yq does.
   A plain assignment to several targets (`(.a, .b) = system("cmd")`, `.[] = system("cmd")`) runs it once here, where yq runs it once per target.
   `system` is yq mode only; `succinctly jq` does not have it.
-- **`--security-disable-env-ops` and `--security-disable-file-ops` refuse an operator when it runs, where yq refuses it when its handler is called.**
-  `select(false) | strenv(X)`, `.zz[] | strenv(X)` and `.a | select(. == 2) | strenv(X)` fail with `env operations have been disabled` in yq, because the handler is called with an empty context.
-  Here they print nothing and exit 0, since no value reaches the operator and nothing reads the environment.
+- **`--security-disable-file-ops` refuses an operator when it runs, where yq refuses it when its handler is called.**
+  `select(false) | load("f")` fails with `file operations have been disabled` in yq, because the handler is called with an empty context.
+  Here it prints nothing and exits 0, since no value reaches the operator and nothing reads a file.
+  `--security-disable-env-ops` agrees since [#7996](https://github.com/rust-works/succinctly/issues/7996): `env(..)` and `strenv(..)` run once for their whole context, whatever reaches them, so `select(false) | strenv(X)`, `.zz[] | strenv(X)` and `.a | select(. == 2) | strenv(X)` fail with `env operations have been disabled` in both.
   The operators that yq does not call (`.a // strenv(X)` with a truthy `.a`, `map(strenv(X))` over an empty list, `with(select(false); strenv(X))`) agree.
 - **The env flag also refuses the environment readers yq has no token for.**
   Under `--jq-extensions`, `$ENV`, `env` and `env.X` read the environment, and `--security-disable-env-ops` refuses them with the same message.

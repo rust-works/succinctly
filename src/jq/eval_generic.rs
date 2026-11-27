@@ -24825,15 +24825,31 @@ pub(super) fn is_empty_object_literal(stage: &Expr) -> bool {
     matches!(unwrap_paren(stage), Expr::Object(entries) if entries.is_empty())
 }
 
-/// [`yq_pipe_has_union`] with the second kind of stage the walk owns in any context: an empty
-/// `{}` after another stage (#6801), which yq builds once however many nodes reach it.
+/// The one definition of a stage yq builds **once** over its whole context list, however many
+/// nodes reach it and even when none does: an empty `{}` (#6801), and `env(NAME)` and
+/// `strenv(NAME)` (#7996), whose handler (`envOperator`, `operator_env.go`, v4.53.3) reads the
+/// variable and returns `context.SingleChildContext(node)`, one new node with no document, without
+/// looking at the nodes it was given. `.[] | env(X)` over three members is one `hi`, and so is
+/// `select(false) | env(X)`. [`yq_pipe_has_list_stage`] (the entry check), [`yq_list_stage`] (the
+/// split) and the parser's `map` rewrite all ask it: they must agree on which pipes the walk owns,
+/// or a pipe is sent in that the split then declines.
+pub(super) fn yq_stage_built_once(stage: &Expr) -> bool {
+    is_empty_object_literal(stage)
+        || matches!(
+            unwrap_paren(stage),
+            Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_))
+        )
+}
+
+/// [`yq_pipe_has_union`] with the second kind of stage the walk owns in any context: a stage yq
+/// builds once however many nodes reach it ([`yq_stage_built_once`]), after another stage.
 /// `seen` is whether a stage already stands before `stages`, in the pipe that holds them.
 fn yq_pipe_has_list_stage(stages: &[Expr], seen: bool) -> bool {
     let mut seen = seen;
     for stage in stages {
         match unwrap_paren(stage) {
             Expr::Comma(_) => return true,
-            other if seen && is_empty_object_literal(other) => return true,
+            other if seen && yq_stage_built_once(other) => return true,
             Expr::Pipe(inner) if yq_pipe_has_list_stage(inner, seen) => return true,
             _ => {}
         }
@@ -25013,12 +25029,12 @@ enum YqListStage {
     /// file -- `. as $item ireduce ({}; . * $item)` is yq's own recipe for
     /// merging several files into one (#2427).
     Fold,
-    /// The empty object literal `{}` over inputs that all carry
-    /// `EvaluateTogether`: real yq builds **one** empty mapping however many
-    /// nodes its context holds (`yq ea '{}' f1 f2` prints one `{}`, where `0`
-    /// prints one per document), so `ireduce ({}; ...)` starts one fold and not
-    /// one per document (#2427).
-    EmptyObject,
+    /// A stage yq builds once over its whole context ([`yq_stage_built_once`]), with or without
+    /// `EvaluateTogether`: real yq builds **one** empty mapping however many nodes its context
+    /// holds (`yq ea '{}' f1 f2` prints one `{}`, where `0` prints one per document), so
+    /// `ireduce ({}; ...)` starts one fold and not one per document (#2427); `env(X)` and
+    /// `strenv(X)` likewise read the variable once (#7996).
+    BuiltOnce,
     /// A plain or compound assignment (`=`, `+=`, `-=`, `*=`, `/=`, `%=`) over inputs that all
     /// carry `EvaluateTogether`: real yq's `assignUpdateOperator` evaluates the right side
     /// **once** against the whole context and applies its last output to every node, so
@@ -25100,11 +25116,11 @@ fn yq_list_stage(stages: &[Expr], together: bool) -> Option<(usize, YqListStage)
             break;
         }
         // An empty `{}` is one mapping whatever reaches it, with or without
-        // `EvaluateTogether` (#6801): `.x[] | {}` is one `{}`. At any index: the stage list
-        // here is the rest of a pipe the walk already split, or a union branch, whose inputs
-        // are the list the stage before it left.
-        if is_empty_object_literal(stage) {
-            found = Some((i, YqListStage::EmptyObject));
+        // `EvaluateTogether` (#6801): `.x[] | {}` is one `{}`, and `env(X)` is one node (#7996).
+        // At any index: the stage list here is the rest of a pipe the walk already split, or a
+        // union branch, whose inputs are the list the stage before it left.
+        if yq_stage_built_once(stage) {
+            found = Some((i, YqListStage::BuiltOnce));
             break;
         }
         if together {
@@ -25318,14 +25334,58 @@ fn eval_yq_context_pipe<S: EvalSemantics, V: DocumentValue>(
                 Err(flow) => return flow,
             }
         }
-        // A node real yq builds from scratch: no flag, no origin.
-        YqListStage::EmptyObject => vec![YqContextItem::new(
-            YqContextNode::Owned(OwnedValue::object_from([])),
-            YqContextTag::default(),
-        )],
+        YqListStage::BuiltOnce => match built_once::<S, V>(&stages[at], optional) {
+            Ok(items) => items,
+            Err(flow) => return flow,
+        },
     };
 
     eval_yq_context_pipe::<S, V>(rest, &produced, optional, cur, sink)
+}
+
+/// The node a [`YqListStage::BuiltOnce`] stage builds, once for the whole context list: a node real
+/// yq builds from scratch, so it carries no flag and no origin (`yq ea 'env(X)' f1 f2` prints one
+/// `hi`, and yq writes no `---` before it, #7996). `{}` is the empty mapping; `env(NAME)` and
+/// `strenv(NAME)` read no node, so they run once over a stand-in, and an error of theirs (an unset
+/// variable in `env(..)`, `--security-disable-env-ops`) ends the walk however many nodes reached
+/// them, none included, as in yq.
+fn built_once<S: EvalSemantics, V: DocumentValue>(
+    stage: &Expr,
+    optional: bool,
+) -> Result<Vec<YqContextItem<V>>, Flow> {
+    if is_empty_object_literal(stage) {
+        return Ok(vec![YqContextItem::new(
+            YqContextNode::Owned(OwnedValue::object_from([])),
+            YqContextTag::default(),
+        )]);
+    }
+    let stand_in = YqContextItem::new(
+        YqContextNode::Owned(OwnedValue::Null),
+        YqContextTag::default(),
+    );
+    // Through the per-value pipe, not `collect_yq_context`: the split would find this very stage
+    // at its head again. A one-stage pipe is one the walk never owns (`yq_pipe_has_list_stage`
+    // asks for a stage before it).
+    let mut rest = RestPipe::of_tail(RestTail::unowned(core::slice::from_ref(stage)));
+    let mut out: Vec<YqContextItem<V>> = Vec::new();
+    let mut stray: Option<Control> = None;
+    let flow =
+        run_yq_stages_bare::<S, V>(
+            &mut rest,
+            &stand_in,
+            optional,
+            &mut |item| match yq_context_item::<_, S>(item, YqContextTag::default()) {
+                Ok(entry) => {
+                    out.push(entry);
+                    Demand::Continue
+                }
+                Err(control) => stop_with_escape(&mut stray, control),
+            },
+        );
+    match (stray, flow) {
+        (Some(control), _) | (None, Flow::Escaped(control)) => Err(Flow::Escaped(control)),
+        (None, Flow::Exhausted | Flow::Stopped { .. }) => Ok(out),
+    }
 }
 
 /// An operand of a list-stage operator (`//`, `and`, `or`) read over the whole context list: the

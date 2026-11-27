@@ -153,6 +153,8 @@ fn fresh_regardless(stage: &Expr, cx: Cx<'_>) -> bool {
         Expr::Literal(_) | Expr::StringInterpolation(_) => true,
         Expr::Object(entries) => entries.is_empty(),
         Expr::Builtin(Builtin::Keys | Builtin::KeysUnsorted | Builtin::WithEntries(_)) => true,
+        // `env(NAME)` and `strenv(NAME)` read no node: `envOperator` returns one new node (#7996).
+        Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_)) => true,
         Expr::Paren(inner) => fresh_regardless(inner, cx),
         Expr::Comma(items) => items.iter().all(|item| fresh_regardless(item, cx)),
         Expr::Alternative(left, _) => {
@@ -295,6 +297,8 @@ fn builtin_node(builtin: &Builtin, input: Node) -> Option<Node> {
         // `keys` (which yq mode parses as `KeysUnsorted`, document order) and `with_entries` build
         // a new collection whatever their input.
         Builtin::Keys | Builtin::KeysUnsorted | Builtin::WithEntries(_) => Some(FRESH),
+        // A node `envOperator` builds from the variable alone (#7996).
+        Builtin::EnvObject(_) | Builtin::StrEnv(_) => Some(FRESH),
         Builtin::Length
         | Builtin::Has(_)
         | Builtin::Contains(_)
@@ -380,6 +384,13 @@ mod tests {
             "del(.a) | \"x\"",
             "(.a // 1) | \"x\"",
             "sort_keys(.) | keys",
+            "env(X)",
+            "strenv(X)",
+            "env(X) | .",
+            "env(X), strenv(X)",
+            ".a | env(X)",
+            "env(X) | .b",
+            "select(true) | strenv(X)",
         ] {
             assert!(fresh(filter), "{filter}");
         }
@@ -415,6 +426,9 @@ mod tests {
             "false // .a",
             "(.[] | split_doc) as $x | \"x\"",
             "{\"a\": 1}",
+            ".a, env(X)",
+            "env(X) as $e | .",
+            ".a = env(X)",
         ] {
             assert!(!fresh(filter), "{filter}");
         }
