@@ -157,7 +157,7 @@ const UTF8_PIECE: usize = 128 * 1024;
 /// checks.
 ///
 /// Each piece of the text is read once for its largest byte
-/// ([`crate::util::simd::max_byte::max_byte`]): under 0x80 is ASCII, which is UTF-8 with no further
+/// (`util::simd::max_byte::max_byte`): under 0x80 is ASCII, which is UTF-8 with no further
 /// check, and only a piece with a byte past 0x7F is validated, while it is still in the cache. On
 /// ASCII text that costs less than [`validate_utf8`] itself. #7437 found it as a NUL scan's other
 /// half (`scan_utf8_and_nul`): plain `validate_utf8` in its place read +1.7-2.9% wall clock on
