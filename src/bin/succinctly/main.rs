@@ -1480,6 +1480,7 @@ pub struct YqCommand {
     /// Separator between a key and its value for `-o=props` (#6922)
     #[arg(
         long = "properties-separator",
+        allow_hyphen_values = true,
         value_name = "SEPARATOR",
         default_value = " = ",
         overrides_with = "properties_separator"
@@ -1496,6 +1497,7 @@ pub struct YqCommand {
     /// The field separator of `-p csv` and `-o=csv`, one byte (#6922, #6925)
     #[arg(
         long = "csv-separator",
+        allow_hyphen_values = true,
         value_name = "CHAR",
         default_value = ",",
         overrides_with = "csv_separator"
@@ -1536,6 +1538,7 @@ pub struct YqCommand {
     /// Text before the table of `-o=lua`; `\n`, `\r`, `\t`, `\\`, `\'` and `\"` are read (#6924)
     #[arg(
         long = "lua-prefix",
+        allow_hyphen_values = true,
         value_name = "PREFIX",
         default_value = "return ",
         overrides_with = "lua_prefix"
@@ -1545,6 +1548,7 @@ pub struct YqCommand {
     /// Text after the table of `-o=lua`, escapes as for `--lua-prefix` (#6924)
     #[arg(
         long = "lua-suffix",
+        allow_hyphen_values = true,
         value_name = "SUFFIX",
         default_value = ";\\n",
         overrides_with = "lua_suffix"
@@ -1625,6 +1629,7 @@ pub struct YqCommand {
     /// Prefix of a key that is an attribute in `-o=xml` (#6924)
     #[arg(
         long = "xml-attribute-prefix",
+        allow_hyphen_values = true,
         value_name = "PREFIX",
         default_value = "+@",
         overrides_with = "xml_attribute_prefix"
@@ -1634,6 +1639,7 @@ pub struct YqCommand {
     /// Key that holds an element's text in `-o=xml` (#6924)
     #[arg(
         long = "xml-content-name",
+        allow_hyphen_values = true,
         value_name = "NAME",
         default_value = "+content",
         overrides_with = "xml_content_name"
@@ -1643,6 +1649,7 @@ pub struct YqCommand {
     /// Prefix of a key that is a processing instruction in `-o=xml` (#6924)
     #[arg(
         long = "xml-proc-inst-prefix",
+        allow_hyphen_values = true,
         value_name = "PREFIX",
         default_value = "+p_",
         overrides_with = "xml_proc_inst_prefix"
@@ -1652,6 +1659,7 @@ pub struct YqCommand {
     /// Key that holds a directive in `-o=xml` (#6924)
     #[arg(
         long = "xml-directive-name",
+        allow_hyphen_values = true,
         value_name = "NAME",
         default_value = "+directive",
         overrides_with = "xml_directive_name"
@@ -1661,6 +1669,7 @@ pub struct YqCommand {
     /// Separator between the parts of a variable name for `-o=shell` (#6850)
     #[arg(
         long = "shell-key-separator",
+        allow_hyphen_values = true,
         value_name = "SEPARATOR",
         default_value = "_",
         overrides_with = "shell_key_separator"
@@ -1736,12 +1745,22 @@ pub struct YqCommand {
     ///
     /// Deliberately long-only, unlike real yq's `-s`/`--split-exp`:
     /// succinctly's `-s` is already `--slurp` (#715).
-    #[arg(long = "split-exp", value_name = "EXPR", overrides_with = "split_exp")]
+    #[arg(
+        long = "split-exp",
+        value_name = "EXPR",
+        allow_hyphen_values = true,
+        overrides_with = "split_exp"
+    )]
     pub split_exp: Option<String>,
 
     // === Program Input ===
     /// Read filter from file instead of command line
-    #[arg(long = "from-file", value_name = "FILE", overrides_with = "from_file")]
+    #[arg(
+        long = "from-file",
+        value_name = "FILE",
+        allow_hyphen_values = true,
+        overrides_with = "from_file"
+    )]
     pub from_file: Option<PathBuf>,
 
     /// Take the filter from this flag, so every positional argument is an input file
@@ -1750,6 +1769,7 @@ pub struct YqCommand {
     /// `--from-file` wins over it, in either order, as in yq.
     #[arg(
         long = "expression",
+        allow_hyphen_values = true,
         value_name = "EXPR",
         overrides_with = "expression"
     )]
@@ -1760,6 +1780,7 @@ pub struct YqCommand {
     /// It wins over `--split-exp`, and an empty file means no split at all, as in yq.
     #[arg(
         long = "split-exp-file",
+        allow_hyphen_values = true,
         value_name = "FILE",
         overrides_with = "split_exp_file"
     )]
