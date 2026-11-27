@@ -1,9 +1,13 @@
-//! #7748: a NUL glued to a number token in the front of a lone source the lazy `input`/`inputs` route
-//! reads (its first 256 KiB on standard input, its first 16 KiB of a file), past the first chunk the
-//! route scans to start on it. #7437 rewrote the windows read after the front and the sources read
-//! whole, not the front itself, so `[12`, NUL, `x,34]` there was refused on standard input
-//! (`Invalid JSON text: expected ',' or ']', found '\0'`), where jq reads `[12,34]`. Every answer
-//! was captured from jq 1.7.1 (`/usr/bin/jq`), and jq 1.8.2 (`/opt/homebrew/bin/jq`) gives the same.
+//! #7748, re-pinned by #7966: a NUL glued to a number token in the front of a lone source the
+//! lazy `input`/`inputs` route reads (its first 256 KiB on standard input, its first 16 KiB of a
+//! file), past the first chunk the route scans to start on it. jq 1.7.1 and 1.8.2 read `[12`, NUL,
+//! `x,34]` as `[12,34]` (the number parser reads the token as a C string), `[[1]1`, NUL, `]` as
+//! `Expected separator between values` at column 7 and `1`, NUL, `}` as `Unmatched '}'` at column 3.
+//! Under ADR-0018's #7963 amendment E2 the NUL is the fault at its own column, the token before it
+//! checked first, as jq master (unreleased; commit fbee8f4, jqlang/jq#3606) reads it: `Invalid
+//! character` at column 4, `Expected separator between values` at column 6 (the `1` after `[1]`
+//! is refused at the NUL) and `Invalid character` at column 2. Each first fault was checked against
+//! a driver over master's `jv_parse.c`; standard input, `-` and the file answer alike.
 
 use anyhow::Result;
 
@@ -29,56 +33,56 @@ const ROWS: &[Row] = &[
         3000,
         "[12\0x,34]\n",
         [
-            ("16001\n", "", 0),
-            ("[12,34]\n", "", 0),
-            ("16001\n", "", 0),
-            ("[[12,34],3001]\n", "", 0),
+            ("", "jq: error (at <stdin>:3001): Invalid character at line 3001, column 4\n", 5),
+            ("", "jq: error (at <stdin>:3001): Invalid character at line 3001, column 4\n", 5),
+            ("", "jq: error (at <stdin>:3001): Invalid character at line 3001, column 4\n", 5),
+            ("", "jq: parse error: Invalid character at line 3001, column 4\n", 5),
         ],
     ),
     (
         400,
         "[12\0x,34]\n",
         [
-            ("13401\n", "", 0),
-            ("[12,34]\n", "", 0),
-            ("13401\n", "", 0),
-            ("[[12,34],401]\n", "", 0),
+            ("", "jq: error (at <stdin>:401): Invalid character at line 401, column 4\n", 5),
+            ("", "jq: error (at <stdin>:401): Invalid character at line 401, column 4\n", 5),
+            ("", "jq: error (at <stdin>:401): Invalid character at line 401, column 4\n", 5),
+            ("", "jq: parse error: Invalid character at line 401, column 4\n", 5),
         ],
     ),
     (
         9000,
         "[12\0x,34]\n",
         [
-            ("22001\n", "", 0),
-            ("[12,34]\n", "", 0),
-            ("22001\n", "", 0),
-            ("[[12,34],9001]\n", "", 0),
+            ("", "jq: error (at <stdin>:9001): Invalid character at line 9001, column 4\n", 5),
+            ("", "jq: error (at <stdin>:9001): Invalid character at line 9001, column 4\n", 5),
+            ("", "jq: error (at <stdin>:9001): Invalid character at line 9001, column 4\n", 5),
+            ("", "jq: parse error: Invalid character at line 9001, column 4\n", 5),
         ],
     ),
     (
         3000,
         "[[1]1\0]\n",
         [
-            ("", "jq: error (at <stdin>:3001): Expected separator between values at line 3001, column 7\n", 5),
-            ("", "jq: error (at <stdin>:3001): Expected separator between values at line 3001, column 7\n", 5),
-            ("", "jq: error (at <stdin>:3001): Expected separator between values at line 3001, column 7\n", 5),
-            ("", "jq: parse error: Expected separator between values at line 3001, column 7\n", 5),
+            ("", "jq: error (at <stdin>:3001): Expected separator between values at line 3001, column 6\n", 5),
+            ("", "jq: error (at <stdin>:3001): Expected separator between values at line 3001, column 6\n", 5),
+            ("", "jq: error (at <stdin>:3001): Expected separator between values at line 3001, column 6\n", 5),
+            ("", "jq: parse error: Expected separator between values at line 3001, column 6\n", 5),
         ],
     ),
     (
         3000,
         "1\0}\n",
         [
-            ("", "jq: error (at <stdin>:3001): Unmatched '}' at line 3001, column 3\n", 5),
-            ("", "jq: error (at <stdin>:3001): Unmatched '}' at line 3001, column 3\n", 5),
-            ("", "jq: error (at <stdin>:3001): Unmatched '}' at line 3001, column 3\n", 5),
-            ("", "jq: parse error: Unmatched '}' at line 3001, column 3\n", 5),
+            ("", "jq: error (at <stdin>:3001): Invalid character at line 3001, column 2\n", 5),
+            ("", "jq: error (at <stdin>:3001): Invalid character at line 3001, column 2\n", 5),
+            ("", "jq: error (at <stdin>:3001): Invalid character at line 3001, column 2\n", 5),
+            ("", "jq: parse error: Invalid character at line 3001, column 2\n", 5),
         ],
     ),
 ];
 
 #[test]
-fn a_nul_tail_in_the_lazy_front_is_read_as_jq_reads_it_7748() -> Result<()> {
+fn a_nul_in_the_lazy_front_is_a_fault_at_its_own_column_7966() -> Result<()> {
     for (before, line, answers) in ROWS {
         let text = [
             RECORD.repeat(*before).as_str(),

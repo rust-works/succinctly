@@ -150,6 +150,113 @@ pub fn validate_utf8(input: &[u8]) -> Result<(), Utf8Error> {
     }
 }
 
+/// The bytes [`is_utf8`] reads for one piece: a 128 KiB piece stays in L2 for its validation.
+const UTF8_PIECE: usize = 128 * 1024;
+
+/// Whether `text` is UTF-8, as [`validate_utf8`] answers, for the jq reading routes' whole-text
+/// checks.
+///
+/// Each piece of the text is read once for its largest byte
+/// (`util::simd::max_byte::max_byte`): under 0x80 is ASCII, which is UTF-8 with no further
+/// check, and only a piece with a byte past 0x7F is validated, while it is still in the cache. On
+/// ASCII text that costs less than [`validate_utf8`] itself. #7437 found it as a NUL scan's other
+/// half (`scan_utf8_and_nul`): plain `validate_utf8` in its place read +1.7-2.9% wall clock on
+/// whole-file `-c .` rows of 10 and 100 MB on a Ryzen 9 7950X (#7966, 25 interleaved reps).
+///
+/// The pieces are cut before a byte that is not a continuation byte, so no character is cut: a
+/// UTF-8 text cut there is pieces that are each UTF-8, and a text that is not leaves a piece that is
+/// not (a sequence cut short ends the piece before it, and a stray continuation byte stays in one).
+#[must_use]
+pub fn is_utf8(text: &[u8]) -> bool {
+    is_utf8_in(text, UTF8_PIECE)
+}
+
+/// [`is_utf8`] with pieces of about `piece` bytes.
+fn is_utf8_in(text: &[u8], piece: usize) -> bool {
+    let mut at = 0;
+    while at < text.len() {
+        let mut end = (at + piece).min(text.len());
+        // On to the end of the character `end` is inside of, three bytes at most: a fourth
+        // continuation byte in a row is no character's, and the piece after it is not UTF-8.
+        let ceiling = (end + 3).min(text.len());
+        while end < ceiling && text[end] & 0xC0 == 0x80 {
+            end += 1;
+        }
+        let bytes = &text[at..end];
+        if crate::util::simd::max_byte::max_byte(bytes) >= 0x80 && validate_utf8(bytes).is_err() {
+            return false;
+        }
+        at = end;
+    }
+    true
+}
+
+#[cfg(test)]
+mod is_utf8_tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    /// Every piece size answers as a validation of the whole text does, on texts of one- to
+    /// four-byte characters (so pieces end inside each) and with a byte that breaks the UTF-8 at
+    /// every offset (ported from #7437's scan test).
+    #[test]
+    fn is_utf8_answers_as_a_validation_of_the_whole_text_does_7966() {
+        let chars: [&[u8]; 6] = [
+            b"a",
+            b"{\"k\":1}",
+            "\u{e9}".as_bytes(),
+            "\u{20ac}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            b" \n",
+        ];
+        let mut seed: u32 = 7966;
+        let mut next = move |n: usize| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 8) as usize % n
+        };
+        let whole = |text: &[u8]| core::str::from_utf8(text).is_ok();
+        for round in 0..400 {
+            let mut text = Vec::new();
+            while text.len() < 40 + round % 60 {
+                text.extend_from_slice(chars[next(chars.len())]);
+            }
+            for piece in [1, 2, 3, 4, 5, 7, 16, 32, 64] {
+                assert_eq!(
+                    is_utf8_in(&text, piece),
+                    whole(&text),
+                    "{text:?} piece {piece}"
+                );
+                for at in 0..text.len() {
+                    for bad in [0x80, 0xC3, 0xF0, 0xFF] {
+                        let mut one = text.clone();
+                        one[at] = bad;
+                        assert_eq!(
+                            is_utf8_in(&one, piece),
+                            whole(&one),
+                            "{one:?} piece {piece}"
+                        );
+                    }
+                }
+            }
+        }
+        // The default piece size, with the bad byte at each piece edge.
+        let len = 3 * UTF8_PIECE + 64;
+        let ascii: Vec<u8> = (0..len).map(|i| b'a' + (i % 26) as u8).collect();
+        assert!(is_utf8(&ascii));
+        for edge in [UTF8_PIECE, 2 * UTF8_PIECE, 3 * UTF8_PIECE] {
+            for at in [edge - 1, edge, edge + 1] {
+                let mut one = ascii.clone();
+                one[at] = 0xFF;
+                assert!(!is_utf8(&one), "0xFF at {at}");
+                let mut two = ascii.clone();
+                two[at..at + 2].copy_from_slice("\u{e9}".as_bytes());
+                assert!(is_utf8(&two), "é at {at}");
+            }
+        }
+        assert!(is_utf8(b""));
+    }
+}
+
 /// Which RFC 3629 / Unicode bound (if any) a decoded code point violates for
 /// its sequence length -- shared by [`validate_utf8_scalar`] (whole-buffer
 /// scan, needs to report *which* rule failed) and

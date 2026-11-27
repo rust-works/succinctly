@@ -33,7 +33,7 @@
 //! this module decides only where each one begins and ends and which error fires.
 
 use crate::cli::jq_seq_reader::{
-    c_string, decode_string_in_place, fgets_visible_len, number_is_valid, JQ_FGETS_CHUNK,
+    c_string, decode_string_in_place, number_is_valid, JQ_FGETS_CHUNK,
 };
 use succinctly::jq::{ArrayVec, OwnedValue};
 
@@ -82,6 +82,8 @@ enum Cls {
     Whitespace,
     Structure,
     Quote,
+    /// A NUL, which jq master's `classify` refuses (#7966, [`succinctly::jq::INVALID_CHARACTER`]).
+    Invalid,
 }
 
 fn classify(c: u8) -> Cls {
@@ -89,6 +91,7 @@ fn classify(c: u8) -> Cls {
         b' ' | b'\t' | b'\r' | b'\n' => Cls::Whitespace,
         b'"' => Cls::Quote,
         b'[' | b',' | b']' | b'{' | b':' | b'}' => Cls::Structure,
+        0 => Cls::Invalid,
         _ => Cls::Literal,
     }
 }
@@ -455,9 +458,6 @@ impl RefillSource for ChunkedSources {
                 self.unsettled = true;
                 self.unsettled_full = end == ChunkEnd::Full;
             }
-            // The parser sees a chunk with no newline up to its first NUL (`strlen`).
-            let visible = fgets_visible_len(buf);
-            buf.truncate(visible);
             let is_last = last_source && hit_eof;
             self.last = Some((source, is_last));
             return Some(Refill {
@@ -505,8 +505,8 @@ impl RefillSource for ChunkedSources {
 ///
 /// A file is read a line at a time (`fgets` into 4096 bytes), and the refill is the last one when
 /// `fgets` hit the end of the last file: a chunk that ends in a newline, or fills the buffer, has
-/// not hit it yet and is followed by a refill that returns nothing. The parser sees a chunk with no
-/// newline up to its first NUL (`strlen`).
+/// not hit it yet and is followed by a refill that returns nothing. The parser sees every byte of a
+/// chunk, a NUL included (#7966).
 #[derive(Default)]
 struct RefillCursor {
     source: usize,
@@ -597,7 +597,6 @@ impl RefillCursor {
             }
             let newline = chunk.ends_with(b"\n");
             let hit_eof = !newline && len < room;
-            let bytes = &chunk[..fgets_visible_len(chunk)];
             let hit_end = last_source && at_end && hit_eof;
             let is_last = hit_end && !self.reads_to_close;
             self.last = Some((source, is_last));
@@ -606,7 +605,7 @@ impl RefillCursor {
             }
             return Some(CursorRefill {
                 source,
-                bytes,
+                bytes: chunk,
                 newline,
                 is_last,
                 hit_end,
@@ -1790,6 +1789,8 @@ impl Parser {
             }
             match cls {
                 Cls::Literal => self.token_add(ch),
+                // A value the token before it completed is dropped with the fault.
+                Cls::Invalid => return Err(succinctly::jq::INVALID_CHARACTER),
                 Cls::Whitespace => {}
                 Cls::Quote => self.st = St::Str,
                 Cls::Structure => self.stream_token(ch)?,
@@ -2071,8 +2072,9 @@ impl Parser {
                     self.token_buf.resize(self.token_buf.len() * 2 + 256, 0);
                 }
                 self.token_buf[self.token_len] = 0;
-                // ... which also means the number parser reads the token as a C string: a NUL in
-                // it ends the number (`2.5` then NUL then `{}` is the number `2.5`).
+                // ... which also means the number parser reads the token as a C string. A bare
+                // token holds no NUL (#7966), but an RS asks whether an open string's bytes are a
+                // number, and those end at a NUL.
                 let token = c_string(&self.token_buf[..self.token_len]);
                 if !number_is_valid(token) {
                     return Err("Invalid numeric literal");
@@ -2769,28 +2771,36 @@ mod tests {
         );
     }
 
+    /// #7966: a NUL outside a string is `Invalid character` at its own column, the token before it
+    /// checked first, as jq master (fbee8f4, jqlang/jq#3606) reads it; captured from a driver over
+    /// master's `jv_parse.c` with `JV_PARSE_STREAMING`: `2.5`, NUL, `{}` is `Invalid character at
+    /// line 1, column 4`, and `tru`, NUL is `Invalid literal at line 1, column 4`. jq 1.7.1 and 1.8.2
+    /// read the first as `2.5` and `{}` (#5474: the number parser reads the token as a C string),
+    /// and the second as `Invalid literal at line 2, column 0`, at the newline that ended the token.
     #[test]
-    fn a_nul_ends_a_number_token_but_not_a_keyword_5474() {
-        // The number parser reads the token as a C string.
-        assert_eq!(run("2.5\u{0}{}\n"), ["[[],2.5]", "[[],{}]"]);
-        // `tru` + NUL is five bytes where `true` is four.
+    fn a_nul_outside_a_string_is_invalid_character_7966() {
+        assert_eq!(
+            run("2.5\u{0}{}\n"),
+            [r#"["Invalid character at line 1, column 4",[]]"#]
+        );
         assert_eq!(
             run("tru\u{0}\n"),
-            [r#"["Invalid literal at line 2, column 0",[]]"#]
+            [r#"["Invalid literal at line 1, column 4",[]]"#]
         );
     }
 
+    /// #7966: a NUL in a chunk with no newline is read like any other byte. jq 1.7.1 handed its
+    /// parser such a chunk only up to the NUL (`1 `, NUL, `2 3` was `1` alone); jq master gives `1`
+    /// and then `Invalid character at line 1, column 3`, with or without the newline.
     #[test]
-    fn a_chunk_with_no_newline_stops_at_its_first_nul() {
-        assert_eq!(run("1 \u{0}2 3"), ["[[],1]"]);
-        // ... but a chunk that ends in a newline is scanned whole, the NUL included.
-        assert_eq!(
-            run("1 \u{0}2 3\n"),
-            [
-                "[[],1]",
-                r#"["Invalid numeric literal at line 1, column 5",[]]"#
-            ]
-        );
+    fn a_nul_in_a_chunk_with_no_newline_is_read_7966() {
+        for input in ["1 \u{0}2 3", "1 \u{0}2 3\n"] {
+            assert_eq!(
+                run(input),
+                ["[[],1]", r#"["Invalid character at line 1, column 3",[]]"#],
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
@@ -2913,14 +2923,9 @@ mod tests {
                 start += len;
                 let newline = chunk.ends_with(b"\n");
                 let hit_eof = !newline && len < JQ_FGETS_CHUNK;
-                let bytes = if newline {
-                    chunk
-                } else {
-                    &chunk[..chunk.iter().position(|&b| b == 0).unwrap_or(len)]
-                };
                 refills.push((
                     index,
-                    bytes.to_vec(),
+                    chunk.to_vec(),
                     newline,
                     last_source && k + 1 == lens.len() && hit_eof,
                 ));

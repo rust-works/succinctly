@@ -337,7 +337,7 @@ pub(super) struct Place {
     /// An invalid byte was substituted in an earlier file: the position jq's parser names is counted
     /// over the bytes as read, so a message that names one is worded from the files read again.
     pub substituted: bool,
-    /// The carry is text the file before validated whole, with nothing substituted and no NUL in it
+    /// The carry is text the file before validated whole, with nothing substituted in it
     /// (#7750, #7792): it is not validated again, which for one value spread over many files was every
     /// byte before each file boundary again.
     pub carry_validated: bool,
@@ -486,9 +486,6 @@ pub(super) struct WindowedFile {
     blank_rs: bool,
     /// A read failed: the bytes read before it are run, and the error is returned after them.
     read_error: Option<io::Error>,
-    /// The bytes of the BOM taken off the front of the file, which jq's first read of its first line
-    /// holds (#7437).
-    front_lead: usize,
     /// The file's place in the stream it is one of (#7024).
     index: usize,
     /// Another file follows, so the open tail at this file's end is cut off and handed on.
@@ -564,8 +561,6 @@ pub(super) struct WindowedFile {
     /// jq's parser over the value a stream is read on for, once it is long (#7812): where the value starts
     /// in the stream, the reader, and where in the stream it has read to ([`Self::open_value_faults`]).
     open_check: Option<(usize, succinctly::jq::JqOpenTail, usize)>,
-    /// A NUL was found in the text validated so far (#7437), which the validation changed.
-    nul_seen: bool,
     /// How much of the front was validated before the file was read: a carry the file before
     /// validated whole ([`Place::carry_validated`]), or 0.
     front_validated: usize,
@@ -607,7 +602,6 @@ impl WindowedFile {
             done: false,
             blank_rs: false,
             read_error: None,
-            front_lead: 0,
             index: place.index,
             hold_tail: place.hold_tail,
             seam_raw: place.seam.clone(),
@@ -638,7 +632,6 @@ impl WindowedFile {
             tail_reader: None,
             tail_read_to: 0,
             open_check: None,
-            nul_seen: false,
             front_validated: carry_validated,
             #[cfg(test)]
             bytes_read: 0,
@@ -815,7 +808,6 @@ impl WindowedFile {
                     // waits for it to close, where a bare number or literal on its own would be split
                     // as a whole value before the next file's bytes that go on with it are read.
                     let validated = self.raw_map.regions.is_empty()
-                        && !self.nul_seen
                         && !self.blank_rs
                         && self.seq_gate.is_none()
                         && stitcher.reader.is_some();
@@ -1218,7 +1210,6 @@ impl WindowedFile {
             let bom = crate::cli::front_matter::leading_bom_len(&self.buf);
             if bom > 0 {
                 self.buf.drain(..bom);
-                self.front_lead = bom;
                 self.offset += bom;
                 // jq's first read holds the mark, so the reads of the first line start before the
                 // text (#7569).
@@ -1305,38 +1296,7 @@ impl WindowedFile {
             return;
         }
         let from = self.validated;
-        let blanks_nul_tails = !self.blank_rs && self.seq_gate.is_none();
-        // #7437: the region is searched for a NUL as it is validated, while it is in the cache
-        // (`scan_utf8_and_nul`); a region with none is not read again for it.
-        let scan = if blanks_nul_tails {
-            succinctly::jq::scan_utf8_and_nul(&self.buf[from..end])
-        } else {
-            succinctly::jq::TextScan {
-                utf8: succinctly::text::utf8::validate_utf8(&self.buf[from..end]).is_ok(),
-                nul: false,
-            }
-        };
-        self.nul_seen |= scan.nul;
-        if blanks_nul_tails && scan.nul {
-            // #7437: a number token's NUL tail, as the whole-file route blanks it
-            // (`blank_nul_number_tails_in`): the region is whole lines, so its reads are jq's, and
-            // its first line is the file's first when no line has been dropped, behind the BOM.
-            // Before the substitution, as there (#7934): jq's reads are counted in the bytes it read,
-            // where a replaced byte is one byte and not U+FFFD's three. The substitution adds no NUL
-            // (it writes U+FFFD), so a region with none has none after it.
-            let lead = if from == 0 && self.lines_before == 0 {
-                self.front_lead
-            } else {
-                0
-            };
-            succinctly::jq::blank_nul_number_tails(
-                &mut self.buf[from..end],
-                Some(crate::cli::jq_seq_reader::JQ_FGETS_CHUNK),
-                lead,
-                &mut [],
-            );
-        }
-        if scan.utf8 {
+        if succinctly::text::utf8::is_utf8(&self.buf[from..end]) {
             self.validated = end;
         } else {
             // The first region after a carry that was not validated again: the substitution moves the

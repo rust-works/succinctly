@@ -341,8 +341,7 @@ succinctly::cli::jq_runner::unopened_tail_name
 <core::option::Option<alloc::string::String>>::filter::<succinctly::cli::jq_runner::run_jq_on_stack_floor::{closure#23}>
 succinctly::cli::jq_runner::input_names
 succinctly::cli::jq_runner::run_jq_on_stack_floor::{closure#25}
-succinctly::jq::parse_message::scan_utf8_and_nul
-succinctly::cli::jq_runner::blank_nul_number_tails_in::<core::slice::iter::IterMut<alloc::vec::Vec<u8>>>
+succinctly::text::utf8::is_utf8
 succinctly::cli::jq_runner::strip_leading_json_bom::<core::slice::iter::IterMut<alloc::vec::Vec<u8>>>
 <alloc::raw_vec::RawVec<core::option::Option<core::num::nonzero::NonZero<usize>>>>::grow_one
 succinctly::cli::jq_runner::stitch_json_file_seams::<core::slice::iter::IterMut<alloc::vec::Vec<u8>>>
@@ -409,7 +408,7 @@ succinctly::cli::jq_bench::run_with_time_macos
 succinctly::cli::yq_bench::run_with_time_macos
 succinctly::dsv::simd::neon::build_index_simd
 succinctly::json::simd::neon::process_chunk_standard
-succinctly::util::simd::nul::nul_free_prefix_neon
+succinctly::util::simd::max_byte::max_neon
 succinctly::yaml::simd::neon::find_block_scalar_end_neon_impl
 succinctly::yaml::simd::neon::parse_anchor_name_neon_impl
 # -- end of startup block --
@@ -434,7 +433,7 @@ succinctly::util::simd::clamp::below_avx2
 <std::sync::once_lock::OnceLock<bool>>::initialize::<<std::sync::once_lock::OnceLock<bool>>::get_or_init<succinctly::json::simd::avx2_enabled::{closure#0}>::{closure#0}, !>
 <std::sync::once::Once>::call_once_force::<<std::sync::once_lock::OnceLock<bool>>::initialize<<std::sync::once_lock::OnceLock<bool>>::get_or_init<succinctly::json::simd::avx2_enabled::{closure#0}>::{closure#0}, !>::{closure#0}>::{closure#0}
 <succinctly::jq::parser::Parser>::skip_ws_after_dot
-succinctly::util::simd::nul::min_max_avx2
+succinctly::util::simd::max_byte::max_avx2
 <std::path::Components as core::iter::traits::iterator::Iterator>::next
 <std::path::Components as core::cmp::PartialEq>::eq
 <std::path::Path>::_starts_with
@@ -1105,7 +1104,6 @@ succinctly::jq::value::format_shifted_mantissa
 succinctly::jq::value::assemble_scientific
 <u128>::_fmt_inner
 <alloc::borrow::Cow<str> as core::fmt::Display>::fmt
-succinctly::util::simd::nul::nul_free_prefix_avx2
 <u128 as core::fmt::Display>::fmt
 <succinctly::jq::value::SharableString as core::cmp::Ord>::cmp
 core::slice::sort::shared::pivot::median3_rec::<(succinctly::jq::eval_generic::SortKey, succinctly::json::light::JsonCursor), <[(succinctly::jq::eval_generic::SortKey, succinctly::json::light::JsonCursor)]>::sort_by<succinctly::jq::eval_generic::sort_keyed_elements<succinctly::jq::eval::JqSemantics, succinctly::json::light::StandardJson>::{closure#1}>::{closure#0}>
@@ -1138,7 +1136,6 @@ succinctly::jq::eval_generic::push_generic_owned_elems::<succinctly::json::light
 <regex_syntax::hir::literal::PreferenceTrie>::minimize::{closure#0}
 <regex_syntax::hir::translate::TranslatorI as regex_syntax::ast::visitor::Visitor>::visit_post
 <regex_automata::meta::regex::Builder>::build
-succinctly::cli::jq_runner::blank_lazy_window_nul_tails
 <succinctly::jq::eval_generic::slot_memo::Guard>::swap
 succinctly::cli::jq_runner::read_lazy_window
 core::ptr::drop_glue::<regex_syntax::ast::Ast>

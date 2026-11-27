@@ -4,8 +4,10 @@
 //! ...`, exit 3). They used to carry `serde_json`'s or the splitter's wording (`Invalid JSON in
 //! stream: EOF while parsing a value at line 1 column 3`).
 //!
-//! A number with a NUL glued to it is read as jq's number parser reads a C string (`1.5e3`, a NUL
-//! is `[1.5E+3]`), where both routes refused the file.
+//! A NUL outside a string is a fault at its own column (#7966, ADR-0018's #7963 amendment E2),
+//! worded `Invalid character` as jq master (unreleased; commit fbee8f4) words it: jq 1.7.1 and
+//! 1.8.2 read a number glued to a NUL up to the NUL (`1.5e3`, a NUL is `[1.5E+3]`), and refuse a
+//! token that starts with one one byte later than the NUL. Those rows are [`REFUSED_AS_E2`].
 //!
 //! Every row was captured from jq 1.7.1 (`/usr/bin/jq`, macOS); jq 1.8.2 answers the same except
 //! where a row says otherwise (a 1.8 rewording, and its 10,000-level parse depth).
@@ -70,16 +72,6 @@ const REFUSED: &[(&[u8], &str)] = &[
         b"\"\\ud800\"\n",
         "Invalid \\uXXXX\\uXXXX surrogate pair escape at line 1, column 8",
     ),
-    // NUL bytes: one that does not end a number is a token jq refuses.
-    (
-        b"[1,\x002]\n",
-        "Invalid numeric literal at line 1, column 6",
-    ),
-    (
-        b"[1,\x00",
-        "Invalid numeric literal at EOF at line 1, column 4",
-    ),
-    (b"\x00\n", "Invalid numeric literal at line 2, column 0"),
     // Bytes that are not UTF-8 outside a string: one column each, as jq counts the bytes.
     (b"\xff\n", "Invalid numeric literal at line 2, column 0"),
     (
@@ -139,11 +131,22 @@ const ACCEPTED: &[(&[u8], &str)] = &[
     (b"\"a\xffb\"\n", "[\"a\u{fffd}b\"]"),
     (b"{\"a\":1}{\"b\":2}\n", "[{\"a\":1},{\"b\":2}]"),
     (b"nan\n", "[null]"),
-    // A NUL ends the number it is glued to, and jq's number parser drops the rest of the token.
-    (b"1\x00\n", "[1]"),
-    (b"1.5e3\x00", "[1.5E+3]"),
-    (b"-1.5e3\x00", "[-1.5E+3]"),
-    (b"01\x00null-\"a\"", "[1,\"a\"]"),
+];
+
+/// (file bytes, the fault) for a NUL outside a string (#7966): `Invalid character` at the NUL's own
+/// column, captured from a driver over jq master's `jv_parse.c`. Neither release refuses these as
+/// this does: jq 1.7.1 and 1.8.2 say `Invalid numeric literal at line 1, column 6`, `... at EOF at
+/// line 1, column 4` and `... at line 2, column 0` for the first three (the NUL is a token byte to
+/// them), and read the last four as `[1]`, `[1.5E+3]`, `[-1.5E+3]` and `[1,"a"]` (their number
+/// parser reads the token as a C string).
+const REFUSED_AS_E2: &[(&[u8], &str)] = &[
+    (b"[1,\x002]\n", "Invalid character at line 1, column 4"),
+    (b"[1,\x00", "Invalid character at line 1, column 4"),
+    (b"\x00\n", "Invalid character at line 1, column 1"),
+    (b"1\x00\n", "Invalid character at line 1, column 2"),
+    (b"1.5e3\x00", "Invalid character at line 1, column 6"),
+    (b"-1.5e3\x00", "Invalid character at line 1, column 7"),
+    (b"01\x00null-\"a\"", "Invalid character at line 1, column 3"),
 ];
 
 fn run(dir: &std::path::Path, args: &[&str]) -> Result<(String, String, Option<i32>)> {
@@ -199,6 +202,7 @@ fn a_refused_file_is_worded_as_jqs_parser_words_it_7769() -> Result<()> {
         .iter()
         .chain(REFUSED_1_7_1_ONLY)
         .chain(REFUSED_AS_1_8_2)
+        .chain(REFUSED_AS_E2)
     {
         check_refused(dir.path(), bytes, detail)?;
     }
