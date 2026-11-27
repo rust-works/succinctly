@@ -659,3 +659,28 @@ fn jq_mode_reads_env_per_value_7996() -> Result<()> {
     }
     Ok(())
 }
+
+/// `--jq-extensions` only, so no yq row: the stages before `env(X)` run to the end before it is
+/// read, as they do before a `$name` stage (#6821), so an early exit cannot stop an endless prefix.
+/// Recorded in `docs/compliance/yq/limitations.md`.
+#[test]
+fn an_endless_prefix_runs_to_its_limit_before_env_7996() -> Result<()> {
+    for (filter, want) in [
+        (
+            "limit(1; repeat(1) | env(SUCCINCTLY_X7996))",
+            ("", "Error: repeat: maximum iterations exceeded\n", 1),
+        ),
+        (
+            ".n as $v | limit(1; repeat(1) | $v)",
+            ("", "Error: repeat: maximum iterations exceeded\n", 1),
+        ),
+        (
+            "limit(1; range(3) | env(SUCCINCTLY_X7996))",
+            ("\"hi\"\n", "", 0),
+        ),
+    ] {
+        let got = run(&["--jq-extensions", "-o", "json", "-I0"], filter, "n: 7\n")?;
+        assert_eq!((got.0.as_str(), got.1.as_str(), got.2), want, "{filter}");
+    }
+    Ok(())
+}

@@ -1488,6 +1488,25 @@ Four things differ.
   `del(.x[] | $v)` is `Invalid path expression` here, as before this change, and a no-op in yq ([#2643](https://github.com/rust-works/succinctly/issues/2643)).
   The left side of a write (`(.x[] | $v) = 5`) is a no-op in both.
 
+### `env(NAME)` and `strenv(NAME)` read the variable once for their whole context ([#7996](https://github.com/rust-works/succinctly/issues/7996))
+
+yq's `envOperator` returns one new node for the nodes it is given, however many there are and even when there are none, and the node has no document index.
+So over several documents yq prints one value per document with no `---` between them, `--eval-all` prints one in all, `.x[] | env(X)` is one value and `select(false) | env(X)` is one value too.
+`succinctly yq` follows that in yq mode, through the context-list walk that owns an empty `{}` and through the parser rewrite that answers a `$name` stage once ([#6821](https://github.com/rust-works/succinctly/issues/6821)).
+`succinctly jq` reads its `env(VAR)` and `strenv(VAR)` extensions once per input, as jq reads every filter.
+Three things differ.
+- **A union branch in a write's right side.**
+  `.y = [.a[] | (env(X), env(X))]` over `a: [1, 2, 3]` writes two `hi` in yq and six here.
+  The owned-value evaluator that a write's right side takes reads a union branch per node; `.y = [.a[] | ({}, {})]` and a `$name` branch (`.y = [.a[] | ($v, $v)]`) differ too.
+  Outside a write the walk answers it as yq does (`[.a[] | (env(X), env(X))]` is two `hi`).
+- **An early exit over an endless prefix (`--jq-extensions`).**
+  `limit(1; repeat(1) | env(X))` stops with `repeat: maximum iterations exceeded`, where it printed `"hi"` before this change.
+  The stages before `env(X)` run to the end before it is read, as they do before a `$name` stage: `.n as $v | limit(1; repeat(1) | $v)` stops the same way.
+  A prefix that ends (`limit(1; range(3) | env(X))`) prints one value.
+- **The origin of the node.**
+  `env(X) | document_index` over three documents is `0 0 0` in yq and `0 1 2` here, and `env(X) | filename` is empty in yq and the file's name here: the node reads the document it was evaluated over, as a literal's node does ([#7180](https://github.com/rust-works/succinctly/issues/7180)).
+  No `---` is written between the values either way.
+
 ### Duplicate mapping keys — an owned value keeps every entry (#1344); a few narrower gaps remain
 
 **Since [#1344](https://github.com/rust-works/succinctly/issues/1344) ([ADR-0027](../../adrs/adr-0027.md)) an `OwnedValue::Object` keeps a repeated mapping key's earlier entries beside its collapsed `IndexMap`.**
