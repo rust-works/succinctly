@@ -147,6 +147,34 @@ const KEY_ROWS: &[(&str, &str)] = &[
     ("del(.[] | key)", "# head\n{}\n"),
 ];
 
+/// A double-quoted scalar, for the rows whose other target selects by style on the cursor.
+const QUOTED: &str = "a: \"x\"\nb: hi\n";
+
+/// A target that selects by node metadata is resolved on the cursor to the paths it selects, while
+/// a reader or a literal beside it in a comma is left as written: its `path` is `[]`, the root's,
+/// which as a target is the document. A root path from anything but navigation keeps the target as
+/// written too. (filter, yq's stdout over [`QUOTED`].)
+const CURSOR_ROWS: &[(&str, &str)] = &[
+    ("del(1, (.. | select(style == \"x\")))", QUOTED),
+    ("del(1, (.. | select(style == \"double\")))", "b: hi\n"),
+    ("del((.. | select(style == \"double\")), 1)", QUOTED),
+    ("del(line, (.. | select(style == \"double\")))", "b: hi\n"),
+    ("del((.. | select(style == \"double\")), line)", QUOTED),
+    (
+        "(1, (.. | select(style == \"double\"))) = 9",
+        "a: 9\nb: hi\n",
+    ),
+    (
+        "((.. | select(style == \"double\")), line) = 9",
+        "a: 9\nb: hi\n",
+    ),
+    ("(.. | select(style == \"double\")) = 9", "a: 9\nb: hi\n"),
+    ("del(1 | select(kind == \"scalar\"))", QUOTED),
+    ("del([.b] | select(kind == \"seq\"))", QUOTED),
+    // The root node itself still goes, as in yq.
+    ("del(.. | select(kind == \"map\"))", ""),
+];
+
 fn run(args: &[&str], stdin: &str) -> Result<(String, String, i32)> {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
@@ -225,6 +253,14 @@ fn a_metadata_reader_del_target_on_the_owned_route_8020() -> Result<()> {
             "",
             "b: 2\n",
         )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_reader_or_literal_beside_a_cursor_selection_is_not_the_document_8020() -> Result<()> {
+    for (filter, want) in CURSOR_ROWS {
+        assert_row(&[filter], QUOTED, want)?;
     }
     Ok(())
 }

@@ -7752,32 +7752,28 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
         // #8020: a metadata reader's answer is a fresh node, whose `path` is the path of the node
         // it read: `line | path` is `[]`. Rewritten to that path, `del(.a, line)` became
         // `del(.a, .)` and deleted the document, and `(.a, line) = 7` replaced it, where yq
-        // deletes and writes nothing through such a node. A target that can answer one is not
-        // rewritten, except member by member for a comma, whose other members still select by
-        // metadata on the cursor; the evaluator applies yq's rule to what is left as written.
-        if metadata_reader_reaches_output(target) {
-            let Expr::Comma(members) = strip_parens(target) else {
+        // deletes and writes nothing through such a node. A target that can answer one is kept as
+        // written, and a comma is resolved member by member, so a member that selects by metadata
+        // is still resolved on the cursor while a reader or a literal beside it is left to the
+        // evaluator, which applies yq's rule to it.
+        let Expr::Comma(members) = strip_parens(target) else {
+            if metadata_reader_reaches_output(target) {
                 return None;
-            };
-            let mut changed = false;
-            let members = members
-                .iter()
-                .map(|member| {
-                    if metadata_reader_reaches_output(member) {
-                        return member.clone();
-                    }
-                    match cursor_write_target(cursor, member) {
-                        Some(paths) => {
-                            changed = true;
-                            paths
-                        }
-                        None => member.clone(),
-                    }
-                })
-                .collect();
-            return changed.then(|| Expr::Paren(Box::new(Expr::Comma(members))));
-        }
-        cursor_write_target(cursor, target)
+            }
+            return cursor_write_target(cursor, target);
+        };
+        let mut changed = false;
+        let members = members
+            .iter()
+            .map(|member| {
+                let resolved = (!metadata_reader_reaches_output(member))
+                    .then(|| cursor_write_target(cursor, member))
+                    .flatten();
+                changed |= resolved.is_some();
+                resolved.unwrap_or_else(|| member.clone())
+            })
+            .collect();
+        changed.then(|| Expr::Paren(Box::new(Expr::Comma(members))))
     })?;
     Some(match pipe {
         None => rewritten,
@@ -7815,6 +7811,18 @@ fn cursor_write_target<W: AsRef<[u64]> + Clone>(
     if scratch.hit() {
         return None;
     }
+    // #8020: the empty path is the document only for an output that is the root node itself. A
+    // fresh node with no parent -- a literal, a constructor, a reader's answer at the root -- has
+    // it too (`1 | path` is `[]`), and rewriting that to `.` deleted or replaced the document
+    // (`del(1, (.. | select(style == "x")))` printed nothing, where yq keeps it). Only a target
+    // that navigates and filters can reach the root, so any other one runs as written.
+    if !navigates_and_filters_only(target)
+        && results
+            .iter()
+            .any(|(path, _)| matches!(path, OwnedValue::Array(steps) if steps.is_empty()))
+    {
+        return None;
+    }
     let mut matched = results
         .iter()
         .map(|(path, _)| navigation_for(path))
@@ -7824,6 +7832,24 @@ fn cursor_write_target<W: AsRef<[u64]> + Clone>(
         1 => matched.remove(0),
         _ => Expr::Paren(Box::new(Expr::Comma(matched))),
     })
+}
+
+/// Whether every output of a write target is a node of the document it navigated to: `.`, `..`,
+/// keys, indexes, `.[]`, slices and `select`, through pipes, commas, `?` and parentheses (#8020).
+fn navigates_and_filters_only(target: &Expr) -> bool {
+    match strip_parens(target) {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Iterate
+        | Expr::RecursiveDescent
+        | Expr::Builtin(Builtin::Select(_)) => true,
+        Expr::Optional(inner) => navigates_and_filters_only(inner),
+        Expr::Pipe(stages) => stages.iter().all(navigates_and_filters_only),
+        Expr::Comma(items) => items.iter().all(navigates_and_filters_only),
+        _ => false,
+    }
 }
 
 /// Whether an output of a write target can be the answer of a node metadata reader (`line`,
