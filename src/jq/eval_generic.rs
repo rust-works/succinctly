@@ -85,16 +85,16 @@ use super::eval::{
     streams_unbounded, substitute_bound_var_from, substitute_deferred_var, substitute_vars,
     suppresses, tonumber_from_str, tostring_owned, tostring_owned_styled, try_compare_op,
     try_handler_root, vec_with_capacity, yq_absent_key_read_is_empty, yq_assign_rhs_document,
-    yq_bool_null_key_into_null, yq_dedup_key, yq_empty_context_reemit, yq_empty_left_skips_right,
-    yq_empty_operand_output, yq_field_index_on_scalar_is_empty, yq_first_of_each_key,
-    yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text, yq_negative_index_check,
-    yq_negative_index_error, yq_numeric_index_on_object_is_null, yq_object_key_stringify,
-    yq_pipe_may_reemit, yq_read_only_context, yq_scalar_text, yq_sort_by, yq_stage_can_reemit,
-    yq_stage_can_reemit_in, yq_together_rhs, BinaryFanoutRules, ComputedSliceBound, Control,
-    Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow, JqSemantics, LimitN,
-    PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RestTail, RootWitness,
-    SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics, DEFERRED_BIND_UNRESOLVED,
-    MAX_RANGE_TOTAL,
+    yq_bool_null_key_into_null, yq_dedup_key, yq_empty_context_reemit, yq_empty_input_reemit,
+    yq_empty_left_skips_right, yq_empty_operand_output, yq_field_index_on_scalar_is_empty,
+    yq_first_of_each_key, yq_index_key_is_numeric, yq_literal_index_text, yq_mapping_index_text,
+    yq_negative_index_check, yq_negative_index_error, yq_numeric_index_on_object_is_null,
+    yq_object_key_stringify, yq_pipe_may_reemit, yq_read_only_context, yq_scalar_text, yq_sort_by,
+    yq_stage_can_reemit, yq_stage_can_reemit_in, yq_together_rhs, BinaryFanoutRules,
+    ComputedSliceBound, Control, Demand, EmptyOperandOp, EvalError, EvalSemantics, EvalTag, Flow,
+    JqSemantics, LimitN, PathTrail, QueryResult, RangeEnd, RangeNum, Reentry, RestPipe, RestTail,
+    RootWitness, SliceTargetKind, StashedEscape, StashedVerdict, YqSemantics,
+    DEFERRED_BIND_UNRESOLVED, MAX_RANGE_TOTAL,
 };
 use super::eval::{
     collect_tostream_events, share_path_component, yq_yaml_unwrapped_text, LoopAbort,
@@ -24401,7 +24401,7 @@ fn eval_yq_empty_context_pipe<S: EvalSemantics, V: DocumentValue>(
         if !yq_stage_can_reemit(&exprs[at]) {
             continue;
         }
-        let Some(head) = yq_empty_context_reemit(&exprs[at]) else {
+        let Some(head) = yq_empty_input_reemit(&exprs[at]) else {
             continue;
         };
         // Did the context reaching stage `at` hold anything?
@@ -25654,7 +25654,7 @@ fn reemit_over_empty_context_list<S: EvalSemantics, V: DocumentValue>(
         if !yq_stage_can_reemit(&stages[at]) {
             continue;
         }
-        let Some(head) = yq_empty_context_reemit(&stages[at]) else {
+        let Some(head) = yq_empty_input_reemit(&stages[at]) else {
             continue;
         };
         let empty = if at == 0 {
