@@ -391,11 +391,12 @@ The first fault of a stream is the first byte at which jq's parser reports a par
 `succinctly jq` owes jq the values before it and their positions, the fault's message, line and column, and the exit status when the fault ends the run.
 
 **After the first fault, output is best effort above a floor (E1).**
-The floor has three parts:
+The floor has four parts:
 
 - reading resumes at the start of the next line, or under `--seq` at the next record separator;
 - every value printed after the fault is a complete JSON text that lies wholly after it;
-- a value that neither jq release prints is a bug.
+- a value that neither jq release prints is a bug;
+- the run's exit status is zero exactly when jq 1.7.1's is.
 
 Above the floor, later faults and their positions, `input_line_number` and `input_filename` after the first fault, the number of U+FFFD in a string read after it, and how many values the fault loses are best effort.
 A difference there, such as #7947's U+FFFD count after a caught fault or #7948's line count past invalid UTF-8 after one, is therefore not owed.
