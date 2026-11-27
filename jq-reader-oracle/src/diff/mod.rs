@@ -157,13 +157,18 @@ pub mod oracle {
 /// `case` with every escape jq's parser rejects made valid in place
 /// ([`classify::escapes_made_valid`]), file by file.
 fn escapes_made_valid(case: &Case) -> Case {
-    let valid = classify::escapes_made_valid(&case.stream());
+    with_stream(case, &classify::escapes_made_valid(&case.stream()))
+}
+
+/// `case` with its files' bytes replaced, in order, by `stream`'s, which is as long as
+/// `case.stream()`.
+fn with_stream(case: &Case, stream: &[u8]) -> Case {
     let mut at = 0;
     let mut c = case.clone();
     for f in &mut c.files {
         if let Some(d) = f.data.as_mut() {
             let n = d.len();
-            d.copy_from_slice(&valid[at..at + n]);
+            d.copy_from_slice(&stream[at..at + n]);
             at += n;
         }
     }
@@ -376,11 +381,24 @@ pub fn run_case(cfg: &Config, case: Case, dir: &Path) -> Result<Outcome, String>
     } else {
         None
     };
+    let nul_twin = match classify::nul_twin(&stream, case.flags.seq) {
+        Some(twin) => {
+            let twin = with_stream(&case, &twin);
+            let staged = stage(&dir.join("twin"), &twin).map_err(|e| e.to_string())?;
+            let run = |r| oracle::run(r, &twin, &staged).map(|o| o.0);
+            Some((
+                run(Release::V171).map_err(|e| e.to_string())?,
+                run(Release::V182).map_err(|e| e.to_string())?,
+            ))
+        }
+        None => None,
+    };
     let facts = classify::Facts {
         before_fault: [k171, k182],
         before_nul: classify::values_before_nul(&stream, case.flags.seq)
             .map_err(|e| e.to_string())?,
         escapes_valid,
+        nul_twin,
     };
     let class = classify::classify(&stream, &subject, &jq171, &jq182, shape(&case, cfg), &facts);
     let kind = classify::kind(&subject, &jq171);

@@ -50,6 +50,10 @@ pub struct Facts {
     /// ([`escapes_made_valid`]), when the stream has one: what they print where succinctly
     /// forwards the string (#5308).
     pub escapes_valid: Option<(Transcript, Transcript)>,
+    /// jq 1.7.1's and jq 1.8.2's transcripts for the case with its first NUL outside a string
+    /// replaced by a byte that faults there ([`nul_twin`]): what jq does after a fault at the NUL,
+    /// where the releases themselves read the NUL as data.
+    pub nul_twin: Option<(Transcript, Transcript)>,
 }
 
 /// The verdict on one case.
@@ -455,19 +459,87 @@ pub fn wrong_value(s: &Transcript, r171: &Transcript, r182: &Transcript, shape: 
     wrong_value_vs(s, r171, shape) && wrong_value_vs(s, r182, shape)
 }
 
-/// The first NUL that jq's tokenizer would see outside a string, with the files read as one
-/// stream (jq's parser never learns where a file ends): its index, and its line and column as
-/// jq's parser counts them (a line's first byte is column 1; a leading BOM is not counted).
-/// String state only, no reset at faults.
-fn nul_outside(stream: &[u8]) -> Option<(usize, (u64, u64))> {
+/// Does jq's parser take `token` (a run of literal bytes) as a value? Asked of jq 1.7.1's own reader,
+/// so a number, `true`, `nan` and the rest are whatever jq says they are.
+fn literal_ok(token: &[u8]) -> bool {
+    use crate::reader::{Item, Opts, PortReader, Reader, Release, Source};
+    let opts = Opts {
+        flags: 0,
+        raw: false,
+        slurp: false,
+    };
+    let source = Source {
+        name: "literal".into(),
+        data: Some(token.to_vec()),
+    };
+    let Ok(mut r) = PortReader::new(Release::V171, opts, vec![source]) else {
+        return true;
+    };
+    matches!(r.next(), Ok(Some(Item::Value(_)))) && matches!(r.next(), Ok(None))
+}
+
+/// How many of the stream's first bytes are a BOM or the start of one.
+fn bom_prefix_len(stream: &[u8]) -> usize {
+    b"\xef\xbb\xbf"
+        .iter()
+        .zip(stream)
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+/// Every NUL that jq's tokenizer would see outside a string, with the files read as one stream (jq's
+/// parser never learns where a file ends), each with the byte that jq's parser rejects at that same
+/// position: `]` where the innermost open container is an object, `}` anywhere else.
+///
+/// The model is jq's string state plus two of its fault rules:
+/// - a quote that ends an invalid literal (`a"`) is consumed by that literal's fault and opens no
+///   string, where one after a valid literal (`1"`, `true"`) does (captured from jq 1.7.1 and 1.8.2
+///   under `--seq`);
+/// - a fault resets the parser, so the containers open before a NUL are forgotten after it;
+/// - under `--seq` an RS resets it too, inside a string or not (jq abandons the text before it).
+///
+/// A leading BOM, or the start of one, is the parser's BOM state, not literal bytes.
+fn nuls_outside(stream: &[u8], seq: bool) -> Vec<(usize, u8)> {
+    let mut out = Vec::new();
+    let mut open = Vec::new();
+    let mut token = Vec::new();
     let mut st = 0; // 0 normal, 1 string, 2 escape
-    let mut at = None;
-    for (i, &b) in stream.iter().enumerate() {
+    // jq's parser takes a leading BOM, or the start of one, off the stream before it tokenizes.
+    let bom = bom_prefix_len(stream);
+    for (i, &b) in stream.iter().enumerate().skip(bom) {
+        if seq && b == 0x1e {
+            st = 0;
+            open.clear();
+            token.clear();
+            continue;
+        }
         match st {
-            0 if b == b'"' => st = 1,
-            0 if b == 0 => {
-                at = Some(i);
-                break;
+            0 => {
+                if b == 0 {
+                    let twin = if open.last() == Some(&b'{') { b']' } else { b'}' };
+                    out.push((i, twin));
+                    open.clear();
+                    token.clear();
+                } else if b == b'"' {
+                    let faults = !token.is_empty() && !literal_ok(&token);
+                    token.clear();
+                    if faults {
+                        open.clear();
+                    } else {
+                        st = 1;
+                    }
+                } else if literal_byte(b) {
+                    token.push(b);
+                } else {
+                    token.clear();
+                    match b {
+                        b'[' | b'{' => open.push(b),
+                        b']' | b'}' => {
+                            open.pop();
+                        }
+                        _ => {}
+                    }
+                }
             }
             1 if b == b'\\' => st = 2,
             1 if b == b'"' => st = 0,
@@ -475,11 +547,16 @@ fn nul_outside(stream: &[u8]) -> Option<(usize, (u64, u64))> {
             _ => {}
         }
     }
-    let i = at?;
-    let mut pre = &stream[..i];
-    if pre.starts_with(b"\xef\xbb\xbf") {
-        pre = &pre[3..];
-    }
+    out
+}
+
+/// The first NUL outside a string ([`nuls_outside`]): its index, and its line and column as jq's
+/// parser counts them (a line's first byte is column 1; a leading BOM is not counted).
+fn nul_outside(stream: &[u8], seq: bool) -> Option<(usize, (u64, u64))> {
+    let i = nuls_outside(stream, seq).first()?.0;
+    // A leading BOM, or the start of one, is not counted (jq 1.7.1 and 1.8.2: `\xef}` faults at
+    // line 1, column 1).
+    let pre = &stream[bom_prefix_len(stream)..i];
     let line = pre.iter().filter(|&&b| b == b'\n').count() as u64 + 1;
     let col = match pre.iter().rposition(|&b| b == b'\n') {
         Some(nl) => pre.len() - nl - 1,
@@ -489,8 +566,30 @@ fn nul_outside(stream: &[u8]) -> Option<(usize, (u64, u64))> {
 }
 
 /// E2's trigger: a NUL that jq's tokenizer would see outside a string (`nul_outside`).
-pub fn nul_outside_string(stream: &[u8]) -> bool {
-    nul_outside(stream).is_some()
+pub fn nul_outside_string(stream: &[u8], seq: bool) -> bool {
+    nul_outside(stream, seq).is_some()
+}
+
+/// The stream as E2 reads it, for the releases to run: every NUL outside a string
+/// ([`nuls_outside`]) replaced by a byte that jq's parser rejects at that same position, and every
+/// NUL inside one by `0x01`, another control character.
+/// - **Outside a string:** jq master's NUL rule (jqlang/jq#3606) gives the column such a byte gives,
+///   on every shape captured for #7966 (`1\0`, `[1\0x`, `true\0`, `tr\0ue`, `[[1]1\0]`). So the
+///   releases' run over the twin is jq's answer after a fault at each NUL: E2's floor for what
+///   follows the first.
+/// - **Inside a string:** E2 leaves a NUL there to the control-character error, with no cut at it.
+///   So jq 1.7.1's run over the twin is the pin's answer for it.
+///
+/// `None` without a NUL.
+pub fn nul_twin(stream: &[u8], seq: bool) -> Option<Vec<u8>> {
+    if !stream.contains(&0) {
+        return None;
+    }
+    let mut twin: Vec<u8> = stream.iter().map(|&b| if b == 0 { 1 } else { b }).collect();
+    for (at, byte) in nuls_outside(stream, seq) {
+        twin[at] = byte;
+    }
+    Some(twin)
 }
 
 /// A byte jq's tokenizer adds to a literal (a number, `true`, ...): anything but whitespace, a
@@ -507,7 +606,7 @@ fn literal_byte(b: u8) -> bool {
 /// E2 makes the NUL a parse error, so there is no NUL-ended number. `None` without such a NUL.
 pub fn values_before_nul(stream: &[u8], seq: bool) -> crate::reader::Result<Option<Vec<Vec<u8>>>> {
     use crate::reader::{Item, Opts, PortReader, Reader, Release, Source, PARSE_SEQ};
-    let Some((i, _)) = nul_outside(stream) else {
+    let Some((i, _)) = nul_outside(stream, seq) else {
         return Ok(None);
     };
     let mut end = i;
@@ -613,24 +712,38 @@ pub fn e2_consistent(
     shape: Shape,
     facts: &Facts,
 ) -> bool {
-    let Some((_, npos)) = nul_outside(stream) else {
+    let Some((_, npos)) = nul_outside(stream, shape.seq) else {
         return false;
     };
-    if wrong_value(s, r171, r182, shape) {
-        return false;
-    }
+    // What follows a fault is E1's best effort. Its floor is the releases' answer, over the stream
+    // as it is or over the twin (`nul_twin`): the releases read the NUL itself as data, and the
+    // twin is their answer after a fault at it.
+    let twin = facts.nul_twin.as_ref();
+    let floor = !wrong_value(s, r171, r182, shape)
+        || twin.is_some_and(|(t171, t182)| !wrong_value(s, t171, t182, shape));
     let early: Vec<(&Transcript, Option<usize>)> = [r171, r182]
         .into_iter()
         .zip(facts.before_fault)
         .filter(|(r, _)| fault_before_nul(r, npos))
         .collect();
     if !early.is_empty() {
-        return early
-            .into_iter()
-            .all(|(r, k)| e1_clean(s, r, k, r171, shape.lenient_e1));
+        return floor
+            && early
+                .into_iter()
+                .all(|(r, k)| e1_clean(s, r, k, r171, shape.lenient_e1));
     }
+    // The NUL is the first fault.
+    // Where the run goes on past the fault (a trace or `--seq`), its status is zero exactly when
+    // jq 1.7.1's is, over the stream or over the twin.
+    let goes_on = shape.trace || shape.seq;
+    let status = e2_status(s, r171, shape)
+        || (goes_on && twin.is_some_and(|(t171, _)| (s.status == 0) == (t171.status == 0)));
     let at_nul = fault_msg(s, shape).and_then(position) == Some(npos);
-    at_nul && e2_status(s, r171, shape) && kept_before_nul(s, shape, facts, false)
+    // The values owed: those before the NUL, or exactly what a release prints over the twin (a
+    // slurp that a later fault or a file that will not open empties, say).
+    let kept = kept_before_nul(s, shape, facts, false)
+        || twin.is_some_and(|(t171, t182)| s.stdout == t171.stdout || s.stdout == t182.stdout);
+    floor && at_nul && status && kept
 }
 
 /// E2's ground that succinctly does not implement yet (#7966): the NUL is the first fault (no
@@ -646,7 +759,7 @@ fn e2_pending(
     shape: Shape,
     facts: &Facts,
 ) -> bool {
-    let Some((_, npos)) = nul_outside(stream) else {
+    let Some((_, npos)) = nul_outside(stream, shape.seq) else {
         return false;
     };
     if [r171, r182].iter().any(|r| fault_before_nul(r, npos)) {
@@ -697,6 +810,10 @@ pub fn classify(
     let agree = r171 == r182;
     if s == r171 {
         return if agree { Class::Same } else { Class::Split171 };
+    }
+    // E2 read every NUL as the twin spells it, and jq 1.7.1 gave the rest: the pin's answer.
+    if facts.nul_twin.as_ref().is_some_and(|(t171, _)| s == t171) {
+        return Class::E2;
     }
     if e2_consistent(stream, s, r171, r182, shape, facts) {
         return Class::E2;
@@ -1062,9 +1179,9 @@ mod tests {
 
     #[test]
     fn e2_needs_a_nul_outside_a_string_and_a_fault() {
-        assert!(nul_outside_string(b"1\x00"));
-        assert!(!nul_outside_string(b"\"a\x00\""));
-        assert!(nul_outside_string(b"\"a\\\"\" \x00"));
+        assert!(nul_outside_string(b"1\x00", false));
+        assert!(!nul_outside_string(b"\"a\x00\"", false));
+        assert!(nul_outside_string(b"\"a\\\"\" \x00", false));
         let r = t("1\n", "", 0);
         let s = t(
             "",
@@ -1445,5 +1562,84 @@ mod tests {
             classify(stream, &at(b'2'), &r171, &r182, seq, &facts),
             Class::BugSplit
         );
+    }
+
+    #[test]
+    fn a_nul_twin_faults_where_the_nul_is() {
+        // `]` inside an object, `}` anywhere else; only the first NUL outside a string.
+        assert_eq!(nul_twin(b"1\x00", false), Some(b"1}".to_vec()));
+        assert_eq!(nul_twin(b"[1\x00x,2]", false), Some(b"[1}x,2]".to_vec()));
+        assert_eq!(nul_twin(b"{\"a\":1\x00}", false), Some(b"{\"a\":1]}".to_vec()));
+        assert_eq!(nul_twin(b"[{}\x00]", false), Some(b"[{}}]".to_vec()));
+        assert_eq!(
+            nul_twin(b"\"{\\\"\x00\" \x00", false),
+            Some(b"\"{\\\"\x01\" }".to_vec())
+        );
+        assert_eq!(nul_twin(b"\"a\x00b\"", false), Some(b"\"a\x01b\"".to_vec()));
+        assert_eq!(nul_twin(b"[1]", false), None);
+        // A quote that ends an invalid literal opens no string; one after a valid literal does.
+        assert_eq!(
+            nul_twin(b"\x1ea\"\x00\"\"\n", true),
+            Some(b"\x1ea\"}\"\"\n".to_vec())
+        );
+        assert_eq!(nul_twin(b"\x1e1\"\x00\"\n", true), Some(b"\x1e1\"\x01\"\n".to_vec()));
+        // Every NUL outside a string, and a fault forgets the open containers.
+        assert_eq!(
+            nul_twin(b"\x1e\x00\x00\"\"\n", true),
+            Some(b"\x1e}}\"\"\n".to_vec())
+        );
+        assert_eq!(nul_twin(b"{\x00\x00", false), Some(b"{]}".to_vec()));
+        // Under `--seq` an RS ends an open string; a partial BOM is no literal.
+        assert_eq!(
+            nul_twin(b"\"\x1e\"\"\x00\"3\n", true),
+            Some(b"\"\x1e\"\"}\"3\n".to_vec())
+        );
+        assert_eq!(nul_twin(b"\xef\x00\"9\n", true), Some(b"\xef}\"9\n".to_vec()));
+        // A leading BOM is no literal: the quote after it opens a string.
+        assert_eq!(
+            nul_twin(b"\xef\xbb\xbf\"\"\x00", false),
+            Some(b"\xef\xbb\xbf\"\"}".to_vec())
+        );
+    }
+
+    // #7966: after the NUL's fault, succinctly does what jq does after a fault at that byte. The
+    // releases read the NUL as data, so their run over the stream is not E2's floor; the twin's is.
+    #[test]
+    fn e2s_floor_after_the_fault_is_the_twins() {
+        let seq = Shape {
+            seq: true,
+            ..Shape::default()
+        };
+        // Captured from jq 1.7.1 and 1.8.2 (case 2315, seed 3): RS, NUL, `9`, a newline.
+        let stream = b"\x1e\x009\n";
+        let r = tb(
+            b"",
+            b"jq: ignoring parse error: Invalid numeric literal at line 2, column 0 (need RS to resync)\n",
+            0,
+        );
+        // The twin `\x1e}9\n`, the same in both.
+        let t = tb(
+            b"\x1e9\n",
+            b"jq: ignoring parse error: Unmatched '}' at line 1, column 2 (need RS to resync)\n",
+            0,
+        );
+        let s = tb(
+            b"\x1e9\n",
+            b"jq: ignoring parse error: Invalid character at line 1, column 2 (need RS to resync)\n",
+            0,
+        );
+        let without = Facts {
+            before_nul: values_before_nul(stream, true).expect("the 1.7.1 reader"),
+            ..Facts::default()
+        };
+        assert_eq!(classify(stream, &s, &r, &r, seq, &without), Class::BugAgree);
+        let with = Facts {
+            nul_twin: Some((t.clone(), t)),
+            ..without
+        };
+        assert_eq!(classify(stream, &s, &r, &r, seq, &with), Class::E2);
+        // A value the twin does not print either is still a bug.
+        let s8 = tb(b"\x1e8\n", &s.stderr, 0);
+        assert_eq!(classify(stream, &s8, &r, &r, seq, &with), Class::BugAgree);
     }
 }
