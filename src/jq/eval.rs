@@ -84948,6 +84948,13 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     // #4506: see [`reduce_alternative_is_immaterial`].
     let alternative_is_immaterial =
         S::TAG == EvalTag::Jq && reduce_alternative_is_immaterial(patterns, update);
+    // #8036: yq reads the whole source, then INIT, then runs UPDATE, so an error in the source
+    // outranks INIT's and INIT's outranks a step's, as on the value route ([`reduce_list_yq`]).
+    // The forks still run INIT first, and the order is recovered by precedence: a step's
+    // ordinary error ([`held_until_the_source_ends`]) is held here while its fork reads the rest
+    // of the source and INIT yields the rest of its outputs, neither running UPDATE again.
+    let reads_source_first = S::TAG == EvalTag::Yq;
+    let mut held_step_failure: Option<Control> = None;
     let mut drive_fork = |init_branch: PathBranch<'a>| -> Demand {
         let init_branch = &init_branch;
         fork_outcome.begin(); // #3293
@@ -84956,6 +84963,10 @@ fn resolve_reduce<'a, S: EvalSemantics>(
             fork_index += 1;
             i
         };
+        if held_step_failure.is_some() {
+            // An INIT output after a failed step: read only for INIT's own error.
+            return Demand::Continue;
+        }
         let mut budget = FoldBudget::for_fork(&mut shared_budget, fork_index == 0);
         let (mut reg, acc) =
             FoldRegister::enter(init_branch, value, trackable, init_keeps_register, frame);
@@ -85065,8 +85076,14 @@ fn resolve_reduce<'a, S: EvalSemantics>(
         // re-enters the step, so [`reclaim_fold_escape`] supersedes it against
         // the source drive's own verdict.
         let source_may_alias = fold_source_may_alias_register::<S>(input);
+        // #8036: this fork's held step failure (`reads_source_first`).
+        let mut held: Option<Control> = None;
         let source_flow = drive_fold_source::<S>(input, &ambient, relocate_base, &mut |elem| {
             aborted.begin();
+            if held.is_some() {
+                // Read only for the error a later element may raise.
+                return Demand::Continue;
+            }
             if let Some(control) = budget.charge_step("reduce") {
                 return aborted.stop(control);
             }
@@ -85411,14 +85428,29 @@ fn resolve_reduce<'a, S: EvalSemantics>(
                     &aborted,
                 ) {
                     FoldStepOutcome::Retry => continue,
+                    FoldStepOutcome::Return(Demand::Stop) if reads_source_first => {
+                        // #8036: an ordinary error waits for the rest of the source.
+                        held = aborted.take_if(held_until_the_source_ends);
+                        return if held.is_some() {
+                            Demand::Continue
+                        } else {
+                            Demand::Stop
+                        };
+                    }
                     FoldStepOutcome::Return(demand) => return demand,
                 }
             }
             unreachable!("the last alternative always returns") // patchcov: coverage tolerate-line reason="unreachable: every arm of the loop's last iteration returns -- a walk refusal, an exhausted walk, and a step outcome that never retries on the last alternative (#2979, #2872)"
         });
-        if let Some(control) =
-            reclaim_fold_escape(aborted, source_flow, direct_pattern_retry(input))
-        {
+        // #8036: the source's own error outranks the step's held one (`reclaim_fold_escape`
+        // answers it first: the stash is empty once a failure is held), and with none the step's
+        // waits for INIT's.
+        let reclaimed = reclaim_fold_escape(aborted, source_flow, direct_pattern_retry(input));
+        if reclaimed.is_none() && held.is_some() {
+            held_step_failure = held;
+            return Demand::Continue;
+        }
+        if let Some(control) = reclaimed {
             // The stop this fork answers is *not* retryable: a `?//` in INIT
             // would otherwise take it for an ordinary satisfied-consumer stop
             // and try its next alternative, running the fold again past a
@@ -85533,9 +85565,71 @@ fn resolve_reduce<'a, S: EvalSemantics>(
     {
         return outcome;
     }
+    if reads_source_first {
+        if fork_index == 0 {
+            // #8036: no fork read the source.
+            return resolve_yq_fold_without_accumulators::<S>(
+                patterns, update, init_flow, input, value, trackable,
+            );
+        }
+        // INIT's own error outranks a step's.
+        if let (ResolveFlow::Exhausted | ResolveFlow::Stopped, Some(control)) =
+            (&init_flow, held_step_failure)
+        {
+            return ResolveFlow::Escaped(control.into());
+        }
+    }
     match init_flow {
         ResolveFlow::Escaped(e) => ResolveFlow::Escaped(e),
         ResolveFlow::Exhausted | ResolveFlow::Stopped => ResolveFlow::Exhausted,
+    }
+}
+
+/// A yq fold in path position whose INIT yielded no accumulator, or failed before its first
+/// (#8036): no fork has read the source, which yq reads before INIT, so the fold's verdict is the
+/// value route's over an empty list, with INIT's `flow` standing in for INIT ([`reduce_list_yq`],
+/// the one definition of the order): an error in the source outranks INIT's, and UPDATE runs over
+/// the empty list for every element (#8035), so `del(error("s") as $x ireduce (error("i"); .))`
+/// is `Error: s` and `del(.[] as $x ireduce (select(false); error("u")))` is `Error: u`, as in yq.
+///
+/// Only the verdict is kept. What UPDATE answers over the empty list is a collect, a literal or
+/// the loop variable, which writes nothing here: yq writes through a loop variable that is a node
+/// (`del(.[] as $x ireduce (select(false); $x))` over `[1, 2]` is `[1]` in yq).
+fn resolve_yq_fold_without_accumulators<S: EvalSemantics>(
+    patterns: &[Pattern],
+    update: &Expr,
+    init_flow: ResolveFlow,
+    source: &Expr,
+    value: &OwnedValue,
+    trackable: bool,
+) -> ResolveFlow {
+    let [pattern] = patterns else {
+        unreachable!("a yq fold in path position binds one variable (`fold_pattern_admitted`)")
+        // patchcov: coverage tolerate-line reason="unreachable: `fold_pattern_admitted` admits a yq fold to the path route only with one `$var` pattern"
+    };
+    let mut init_flow = Some(match init_flow {
+        ResolveFlow::Escaped(e) => Flow::Escaped(e.into()),
+        ResolveFlow::Exhausted | ResolveFlow::Stopped => Flow::Exhausted,
+    });
+    let flow = reduce_list_yq::<S>(
+        pattern,
+        update,
+        &mut |_| init_flow.take().unwrap_or(Flow::Exhausted),
+        false,
+        &mut |_, element| {
+            eval_each_owned::<S>(
+                source,
+                value,
+                false,
+                Reentry::at_register(trackable),
+                element,
+            )
+        },
+        &mut |_| Demand::Continue,
+    );
+    match flow {
+        Flow::Escaped(control) => ResolveFlow::Escaped(control.into()),
+        Flow::Exhausted | Flow::Stopped { .. } => ResolveFlow::Exhausted,
     }
 }
 
@@ -100754,6 +100848,18 @@ impl<T: Nonretryable> StashedVerdict<T> {
              answering Stop, with no `?//` attempt in between"
         );
         true
+    }
+
+    /// Take the stashed verdict out while the drive goes on, when `hold` accepts it; any other
+    /// stays stashed (#8036: a yq fold holds a step's ordinary error while it reads its source).
+    pub(crate) fn take_if(&self, hold: impl FnOnce(&T) -> bool) -> Option<T> {
+        match self.slot.take() {
+            Some(verdict) if hold(&verdict) => Some(verdict),
+            other => {
+                self.slot.set(other);
+                None
+            }
+        }
     }
 
     /// Whether a verdict is currently stashed.
