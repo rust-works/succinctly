@@ -33,6 +33,7 @@
 //! this module decides only where each one begins and ends and which error fires.
 
 use crate::cli::jq_reader_profile::JQ_READER;
+use crate::cli::jq_runner::reader_model::Fgets;
 use crate::cli::jq_seq_reader::{c_string, decode_string_in_place, number_is_valid};
 use succinctly::jq::{ArrayVec, OwnedValue};
 
@@ -581,12 +582,12 @@ impl RefillCursor {
                 0
             };
             let room = JQ_READER.read_len - lead;
-            let Some(len) = crate::cli::jq_seq_reader::fgets_chunk_len_in(raw, self.pos, room)
-            else {
+            let Some(read) = raw.get(self.pos..).and_then(|rest| Fgets::of(rest, room)) else {
                 self.source += 1;
                 self.pos = 0;
                 continue;
             };
+            let Fgets { len, newline } = read;
             let chunk = &raw[self.pos..self.pos + len];
             self.pos += len;
             let at_end = self.pos == raw.len();
@@ -594,12 +595,11 @@ impl RefillCursor {
                 self.source += 1;
                 self.pos = 0;
             }
-            let newline = chunk.ends_with(b"\n");
-            let hit_eof = !newline && len < room;
+            let hit_eof = read.meets_end(room);
             let hit_end = last_source && at_end && hit_eof;
             let is_last = hit_end && !self.reads_to_close;
             self.last = Some((source, is_last));
-            if at_end && !last_source && !newline && len == room {
+            if at_end && !last_source && !newline && read.fills(room) {
                 self.empty_after = Some(source);
             }
             return Some(CursorRefill {

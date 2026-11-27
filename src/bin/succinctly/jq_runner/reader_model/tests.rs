@@ -589,3 +589,156 @@ fn skip_plain_refuses_what_is_not_its_closed_form_7987() {
     let after = skip(&start, &good, NON_SEQ).expect("plain");
     assert_eq!(skip(&after, &[run(1, 1, 1, 0, true)], NON_SEQ), None);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The read arithmetic the routes call (#7987 step 4): `LineReads` against `Fgets` one read at a
+// time, as `step`'s `read_more` takes them.
+// ---------------------------------------------------------------------------------------------
+
+/// Files of `a`s and newlines whose lines run to around one and two reads, and short ones.
+fn line_files(rng: &mut Rng, read_len: usize) -> Vec<Vec<u8>> {
+    let lens = [
+        0,
+        1,
+        read_len.saturating_sub(1),
+        read_len,
+        read_len + 1,
+        2 * read_len - 1,
+        2 * read_len,
+        2 * read_len + 1,
+    ];
+    (0..=rng.below(3))
+        .map(|_| {
+            let mut file = Vec::new();
+            for _ in 0..rng.below(5) {
+                file.resize(file.len() + *rng.pick(&lens) + rng.below(2), b'a');
+                if rng.below(4) != 0 {
+                    file.push(b'\n');
+                }
+            }
+            file
+        })
+        .collect()
+}
+
+/// Where each line's reads fall and where the read that meets a file's end starts are
+/// [`LineReads`]'s closed forms of what [`Fgets`] reaches one read at a time: the reads `step`
+/// takes. The routes' read formulas (`EofTail`'s, `LineCounter`'s, the `--seq` reader's) call these,
+/// so this holds them to the model's own reads.
+#[test]
+fn line_reads_are_the_reads_step_takes_7987() {
+    for read_len in [1, 2, 3, 4, 7, 16, JQ_READER.read_len] {
+        let profile = ReaderProfile {
+            read_len,
+            ..JQ_READER
+        };
+        let reads = LineReads::of(&profile);
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ read_len as u64);
+            let files = line_files(&mut rng, read_len);
+            let sources: Vec<&[u8]> = files.iter().map(Vec::as_slice).collect();
+            let mut reader =
+                Reader::resume(ReaderState::start(NON_SEQ), &sources, &profile, NON_SEQ);
+            // Per file: where its last line starts, the reads of that line so far, and where the
+            // read that met its end started.
+            let mut line_start = 0;
+            let mut line_reads = 0;
+            let mut met_end = vec![None; files.len()];
+            loop {
+                let (chunk, is_last) = reader.read_more();
+                let file = reader.next_file.checked_sub(1);
+                let (Some(file), Some(open)) = (file, reader.input) else {
+                    assert!(is_last && chunk.is_empty(), "seed {seed}");
+                    break;
+                };
+                let bytes = sources[file];
+                let start = open.offset - chunk.len();
+                if start == 0 {
+                    line_start = 0;
+                    line_reads = 0;
+                }
+                let context = format!("read_len {read_len}, seed {seed}, file {file} at {start}");
+                if !chunk.is_empty() {
+                    assert_eq!(reads.index(start - line_start), line_reads, "{context}");
+                    let last = start + chunk.len() - 1;
+                    assert_eq!(reads.index(last - line_start), line_reads, "{context}");
+                    let newline = bytes[start..].iter().position(|&b| b == b'\n');
+                    let end = (line_start + reads.end(start - line_start))
+                        .min(newline.map_or(bytes.len(), |at| start + at + 1))
+                        .min(bytes.len());
+                    assert_eq!(start + chunk.len(), end, "{context}");
+                    let read = Fgets::of(&bytes[start..], read_len).expect("a read");
+                    assert_eq!(read.len, chunk.len(), "{context}");
+                    assert_eq!(read.meets_end(read_len), open.eof, "{context}");
+                    line_reads += 1;
+                    if read.newline {
+                        line_start = start + chunk.len();
+                        line_reads = 0;
+                    }
+                }
+                if open.eof && met_end[file].is_none() {
+                    met_end[file] = Some(start);
+                }
+                if is_last {
+                    break;
+                }
+            }
+            for (file, bytes) in files.iter().enumerate() {
+                let line_start = bytes
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map_or(0, |at| at + 1);
+                assert_eq!(
+                    Some(reads.start_before(line_start, bytes.len())),
+                    met_end[file],
+                    "read_len {read_len}, seed {seed}, file {file}: {:?}",
+                    files.iter().map(Vec::len).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+/// The shapes `EofTail` documents, at jq's 4,095-byte read: a last line that fills its reads leaves
+/// an empty read to meet the end, and one short of that is met by the read that holds its last byte.
+#[test]
+fn the_read_that_meets_the_end_at_4095_bytes_7987() {
+    let reads = JQ_LINE_READS;
+    assert_eq!(JQ_READER.read_len, 4095);
+    // `1` and 4,093 spaces: one short read.
+    assert_eq!(reads.start_before(0, 4094), 0);
+    // 4,094 spaces and `1`: one full read, and the empty one after it.
+    assert_eq!(reads.start_before(0, 4095), 4095);
+    assert_eq!(reads.start_before(0, 4096), 4095);
+    // After a newline the reads start again.
+    assert_eq!(reads.start_before(10, 10 + 2 * 4095), 10 + 2 * 4095);
+    assert_eq!(reads.start_before(10, 11 + 2 * 4095), 10 + 2 * 4095);
+    assert_eq!((reads.index(4094), reads.end(4094)), (0, 4095));
+    assert_eq!((reads.index(4095), reads.end(4095)), (1, 8190));
+    let full = Fgets::of(&[b'a'; 5000], 4095).expect("a read");
+    assert_eq!(
+        full,
+        Fgets {
+            len: 4095,
+            newline: false
+        }
+    );
+    assert!(full.fills(4095) && !full.meets_end(4095));
+    let line = Fgets::of(b"ab\ncd", 4095).expect("a read");
+    assert_eq!(
+        line,
+        Fgets {
+            len: 3,
+            newline: true
+        }
+    );
+    assert!(!line.fills(4095) && !line.meets_end(4095));
+    let short = Fgets::of(b"cd", 4095).expect("a read");
+    assert!(!short.fills(4095) && short.meets_end(4095));
+    // A read with less room: the first of a source whose mark a route took off its text (#7569).
+    assert_eq!(
+        Fgets::of(&[b'a'; 5000], 4092).map(|read| read.len),
+        Some(4092)
+    );
+    assert_eq!(Fgets::of(b"", 4095), None);
+}

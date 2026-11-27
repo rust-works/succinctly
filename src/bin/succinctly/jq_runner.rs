@@ -38,12 +38,13 @@ use crate::cli::output::{
     self, escape_json_string, escape_json_string_ascii, exit_codes, flush_then_err, ColorScheme,
     DiagStyle, ErrorSink, InputLocation, JsonFormatOpts, LoudFlushWriter, StreamFault, Terminator,
 };
+use reader_model::JQ_LINE_READS;
 
 mod call_machine;
 mod eof_location;
-// ADR-0033's reader model (#7987 step 3): no route enters it until step 5.
-#[allow(dead_code)]
-mod reader_model;
+// ADR-0033's reader model (#7987): the routes' read arithmetic is its `Fgets` and `LineReads`
+// (step 4), and no route enters its `ReaderState` until step 5.
+pub(crate) mod reader_model;
 mod window;
 
 /// One word taken by `--args` (a string) or `--jsonargs` (JSON text), kept
@@ -10638,8 +10639,7 @@ impl EofTail {
             .iter()
             .rposition(|&b| b == b'\n')
             .map_or(base, |at| base + at + 1);
-        let partial = (last.len() - line_start) % JQ_READER.read_len;
-        last.len() - partial
+        JQ_LINE_READS.start_before(line_start, last.len())
     }
 
     /// [`of`](Self::of) for the one source [`lazy_json_scan`] accepted, from the spans it found
@@ -11589,7 +11589,9 @@ fn closer_lags_in_joined_text(raws: &[Vec<u8>]) -> bool {
 /// file that returns nothing follows it (#6760). One definition for [`closing_event_lags`] and the
 /// joined-text test of [`held_back_closer_before`] (#6732), which must agree on it.
 fn last_read_fills_buffer(raw: &[u8]) -> bool {
-    crate::cli::jq_seq_reader::fgets_chunk_lens(raw).last() == Some(JQ_READER.read_len)
+    crate::cli::jq_seq_reader::fgets_reads(raw)
+        .last()
+        .is_some_and(|read| read.fills(JQ_READER.read_len))
 }
 
 /// Whether the last record of the `--seq` text `raw` leaves jq's stream parser holding its closing
@@ -14308,7 +14310,7 @@ impl<'a> LineCounter<'a> {
     /// The end of the [`JQ_READER.read_len`](JQ_READER)-byte read holding `at`, in the bytes jq
     /// read.
     fn raw_chunk_end(&self, at: usize) -> usize {
-        self.raw_line_start() + (self.read_of(at) + 1) * JQ_READER.read_len - self.lead
+        self.raw_line_start() + JQ_LINE_READS.end(self.offset_in_line(at)) - self.lead
     }
 
     /// Where the line holding the counter's position starts in the bytes jq read. On the text's first
@@ -14414,12 +14416,14 @@ impl<'a> LineCounter<'a> {
             .rposition(|&b| b == b'\n')
             .map_or(start, |newline| start + newline + 1);
         let chunk_end = if self.edits.is_empty() {
-            line_start + ((at - line_start) / JQ_READER.read_len + 1) * JQ_READER.read_len
+            line_start + JQ_LINE_READS.end(at - line_start)
         } else {
             // #7934: in the bytes jq read, where the moved bytes hold a replacement.
             let raw_line = self.read_offset(line_start);
-            let reads = (self.read_offset(at) - raw_line) / JQ_READER.read_len + 1;
-            self.text_read_end(raw_line + reads * JQ_READER.read_len, at)
+            self.text_read_end(
+                raw_line + JQ_LINE_READS.end(self.read_offset(at) - raw_line),
+                at,
+            )
         };
         let read_end = match self.bytes[at..end].iter().position(|&b| b == b'\n') {
             Some(newline) if at + newline < chunk_end => at + newline + 1,
@@ -14445,7 +14449,7 @@ impl<'a> LineCounter<'a> {
     fn read_end(&self, at: usize) -> usize {
         let at = at.max(self.line_start);
         let chunk_end = if self.edits.is_empty() {
-            self.line_start + (self.read_of(at) + 1) * JQ_READER.read_len - self.lead
+            self.line_start + JQ_LINE_READS.end(self.offset_in_line(at)) - self.lead
         } else {
             self.text_read_end(self.raw_chunk_end(at), at)
         };
@@ -14489,7 +14493,14 @@ impl<'a> LineCounter<'a> {
     /// Which of the reads of the line holding `at` (from `line_start`) holds it, counted from 0: the
     /// first read of the text's first line holds the [`lead`](Self::lead) bytes too (#7569).
     fn read_of(&self, at: usize) -> usize {
-        (self.read_offset(at) - self.raw_line_start() + self.lead) / JQ_READER.read_len
+        JQ_LINE_READS.index(self.offset_in_line(at))
+    }
+
+    /// How far `at` is into the reads of the line holding it, as [`LineReads`](reader_model::LineReads)
+    /// counts it: in the bytes jq read, from the line's start, with the first read of the text's first
+    /// line holding the [`lead`](Self::lead) bytes too (#7569).
+    fn offset_in_line(&self, at: usize) -> usize {
+        self.read_offset(at) - self.raw_line_start() + self.lead
     }
 
     /// Same result [`line_at`] would return for this `end`, given every
@@ -18643,7 +18654,7 @@ impl WalkedSeqInputs {
         let (newlines, line_start) = self.walk.last_source_lines();
         // [`EofTail::final_read_start`] of the last source, from where its last line starts.
         let total = self.walk.total();
-        let final_read_start = total - (total - line_start) % JQ_READER.read_len;
+        let final_read_start = JQ_LINE_READS.start_before(line_start, total);
         let unknown = self
             .walk
             .last_value()

@@ -74,6 +74,7 @@
 
 use crate::cli::front_matter::UTF8_BOM;
 use crate::cli::jq_reader_profile::JQ_READER;
+use crate::cli::jq_runner::reader_model::{Fgets, JQ_LINE_READS};
 
 // #7718: the reader reads every record, as jq 1.8.2 does (the module's comment above). There is no
 // code for jq 1.7.1's end at an empty record, so the profile may not ask for it.
@@ -91,30 +92,27 @@ pub(crate) fn ignored_parse_error(body: &str) -> String {
 
 /// jq's `fgets` chunks over one source, as their lengths in order: each
 /// ends just after a newline or after [`JQ_READER.read_len`](JQ_READER) bytes, whichever
-/// comes first. The one definition of that rule, shared by
+/// comes first. The rule is the reader model's [`Fgets`] (#7987), shared by
 /// [`final_buffer_start`] and [`refill_boundaries`] (#3200).
 pub(crate) fn fgets_chunk_lens(raw: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    fgets_reads(raw).map(|read| read.len)
+}
+
+/// [`fgets_chunk_lens`] with whether each chunk ends at a newline: the reader model's [`Fgets`]
+/// reads of one source, in order.
+pub(crate) fn fgets_reads(raw: &[u8]) -> impl Iterator<Item = Fgets> + '_ {
     let mut pos = 0usize;
     std::iter::from_fn(move || {
-        let len = fgets_chunk_len_at(raw, pos)?;
-        pos += len;
-        Some(len)
+        let read = Fgets::of(&raw[pos..], JQ_READER.read_len)?;
+        pos += read.len;
+        Some(read)
     })
 }
 
 /// The length of the `fgets` chunk that starts at `pos` in `raw`, or `None` at its end: one step
 /// of [`fgets_chunk_lens`], for a reader that finds the chunks as it goes (#5498).
 pub(crate) fn fgets_chunk_len_at(raw: &[u8], pos: usize) -> Option<usize> {
-    fgets_chunk_len_in(raw, pos, JQ_READER.read_len)
-}
-
-/// [`fgets_chunk_len_at`] for a chunk with room for `room` bytes of `raw`: the first chunk of a
-/// source whose BOM it also holds, which `raw` no longer has (#7569).
-pub(crate) fn fgets_chunk_len_in(raw: &[u8], pos: usize, room: usize) -> Option<usize> {
-    let rest = raw.get(pos..).filter(|rest| !rest.is_empty())?;
-    let chunk = &rest[..rest.len().min(room)];
-    // #7263: searched a block at a time; a byte at a time this was most of a long line's walk.
-    Some(find_byte(b'\n', chunk).map_or(chunk.len(), |index| index + 1))
+    Fgets::of(raw.get(pos..)?, JQ_READER.read_len).map(|read| read.len)
 }
 
 /// `bytes` read as a C string, up to its first NUL: what jq's number parser reads of a token
@@ -144,10 +142,9 @@ fn refill_boundaries(raw_bytes: &[(Option<usize>, Vec<u8>)], size_limit: bool) -
         }
         if size_limit {
             let mut chunk_end = 0usize;
-            for len in fgets_chunk_lens(raw) {
-                chunk_end += len;
-                if len == JQ_READER.read_len && raw[chunk_end - 1] != b'\n' && chunk_end < raw.len()
-                {
+            for read in fgets_reads(raw) {
+                chunk_end += read.len;
+                if read.fills(JQ_READER.read_len) && !read.newline && chunk_end < raw.len() {
                     boundaries.push(source_start + chunk_end);
                 }
             }
@@ -268,10 +265,10 @@ fn final_buffer_start_after(final_chunk: Option<(usize, usize, bool)>, total: us
         // *empty* buffer follows and that one is final; otherwise this
         // chunk is.
         Some((start, len, newline)) => {
-            if len == JQ_READER.read_len || newline {
-                total
-            } else {
+            if (Fgets { len, newline }).meets_end(JQ_READER.read_len) {
                 start
+            } else {
+                total
             }
         }
     }
@@ -450,7 +447,7 @@ impl NoRsScan {
             // Reads start after a newline and then every JQ_READER.read_len bytes along a line;
             // `bytes` starts at one, so the line in it after its last newline starts at one too.
             let line_start = rfind_byte(b'\n', bytes).map_or(0, |at| at + 1);
-            line_start + (bytes.len() - line_start) / JQ_READER.read_len * JQ_READER.read_len
+            JQ_LINE_READS.start_before(line_start, bytes.len())
         };
         self.visible(&bytes[..upto])?;
         Some(upto)
@@ -1590,18 +1587,16 @@ impl SeqStreamWalker {
     /// Finds the next chunk of the current source if it is whole now; `false` when there is none.
     fn whole_chunk(&mut self) -> bool {
         let rest = &self.data[self.chunk_at - self.base..];
-        if rest.is_empty() {
+        let Some(read) = Fgets::of(rest, JQ_READER.read_len) else {
+            return false;
+        };
+        // A read that would meet the end is whole only once the source has ended.
+        if read.meets_end(JQ_READER.read_len) && !self.source_ended {
             return false;
         }
-        let room = &rest[..rest.len().min(JQ_READER.read_len)];
-        let len = match find_byte(b'\n', room) {
-            Some(at) => at + 1,
-            None if room.len() == JQ_READER.read_len || self.source_ended => room.len(),
-            None => return false,
-        };
+        let Fgets { len, newline } = read;
         let chunk_start = self.chunk_at;
-        let newline = room[len - 1] == b'\n';
-        let full = len == JQ_READER.read_len && !newline;
+        let full = read.fills(JQ_READER.read_len) && !newline;
         let after_full = std::mem::replace(&mut self.after_full_chunk, full);
         if let Some(reader) = self.reader.as_mut() {
             if after_full && reader.resets_per_call {

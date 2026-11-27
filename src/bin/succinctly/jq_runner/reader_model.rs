@@ -28,14 +28,122 @@
 //! the parser half's own departures (#7522, #7525). Input is in memory: a file that fails to open
 //! and a read error (`ferror`) are not modelled, and standard input is one more source.
 //!
-//! Nothing in any route calls this yet: step 4 moves the routes' read arithmetic onto
-//! [`ReaderState::skip_plain`], and step 5 enters the model.
+//! The read arithmetic both are built on is the one the routes call (step 4): [`Fgets`], one
+//! `fgets` read, and [`LineReads`], where a line's reads fall as a closed form of the offset into
+//! it. No route enters [`ReaderState`] itself until step 5, so the items only the model and its
+//! tests read are marked as such.
 
-use crate::cli::jq_reader_profile::ReaderProfile;
+use crate::cli::jq_reader_profile::{ReaderProfile, JQ_READER};
+use crate::cli::jq_seq_reader::find_byte;
 use succinctly::jq::jv_parse::{Fault, FaultPlace, JvParser, Next, ParserSync, Span, BOM_DONE};
+
+/// One `fgets` call of `jq_util_input_read_more` (`src/util.c`): the bytes it returns from the
+/// front of what is left of the file. They end just after the first newline or after `room` bytes,
+/// whichever comes first: `room` is the profile's [`read_len`](ReaderProfile::read_len), less what
+/// the buffer already holds (the first read of a source whose byte-order mark a route has taken
+/// off its text, #7569). The one definition of a read, for [`ReaderState::step`] and every route
+/// that finds jq's reads one at a time (#7987 step 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Fgets {
+    /// How many bytes it returns.
+    pub len: usize,
+    /// Whether the last of them is a newline.
+    pub newline: bool,
+}
+
+impl Fgets {
+    /// The read at the front of `rest`, the file's bytes not yet read, or `None` when there are
+    /// none: `fgets` returns NULL there and meets the end of the file.
+    #[inline]
+    pub(crate) fn of(rest: &[u8], room: usize) -> Option<Self> {
+        if rest.is_empty() {
+            return None;
+        }
+        let window = &rest[..rest.len().min(room)];
+        // #7263: searched a block at a time; a byte at a time this was most of a long line's walk.
+        Some(match find_byte(b'\n', window) {
+            Some(at) => Self {
+                len: at + 1,
+                newline: true,
+            },
+            None => Self {
+                len: window.len(),
+                newline: false,
+            },
+        })
+    }
+
+    /// Whether it filled its buffer of `room` bytes.
+    #[inline]
+    pub(crate) const fn fills(self, room: usize) -> bool {
+        self.len == room
+    }
+
+    /// `feof` after it: it stopped short of both a newline and a full buffer of `room` bytes, so it
+    /// met the end of the file. A read that ends on a newline or fills its buffer leaves the end to
+    /// the next read, which returns nothing.
+    #[inline]
+    pub(crate) const fn meets_end(self, room: usize) -> bool {
+        !self.newline && self.len < room
+    }
+}
+
+/// Where jq's reads fall along one line (#7987 step 4). `fgets` reads a line in pieces of
+/// [`read_len`](ReaderProfile::read_len) bytes, counted from where the line's reads start (the
+/// front of the file, or just after a newline), and the line's newline or the file's end ends the
+/// last piece. Which read holds a byte of the line, and where that read ends, are therefore a closed
+/// form of the byte's offset into the line: what [`Fgets`] reaches one read at a time, and what
+/// [`ReaderState::skip_plain`] reads a stretch's last line with. Offsets here count from where the
+/// line's reads start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LineReads {
+    read_len: usize,
+}
+
+/// The reads of a line under the profile the CLI ships.
+pub(crate) const JQ_LINE_READS: LineReads = LineReads::of(&JQ_READER);
+
+impl LineReads {
+    /// The reads of a line under `profile`.
+    pub(crate) const fn of(profile: &ReaderProfile) -> Self {
+        Self {
+            read_len: profile.read_len,
+        }
+    }
+
+    /// Which of the line's reads holds its byte `into`, counted from 0.
+    #[inline]
+    pub(crate) const fn index(self, into: usize) -> usize {
+        into / self.read_len
+    }
+
+    /// Where the read holding the line's byte `into` ends, unless the line's newline or the
+    /// file's end comes first.
+    #[inline]
+    pub(crate) const fn end(self, into: usize) -> usize {
+        (self.index(into) + 1) * self.read_len
+    }
+
+    /// How many of the line's first `len` bytes the read in progress after them holds: 0 when
+    /// they fill their reads exactly.
+    #[inline]
+    pub(crate) const fn in_progress(self, len: usize) -> usize {
+        len % self.read_len
+    }
+
+    /// Where the read in progress at `at` starts, on a line whose reads start at `line_start`
+    /// (both offsets in the same text): `at` itself when the line's bytes before it fill their
+    /// reads. At a file's end that is where the read that meets the end starts, and the file's
+    /// length when that read is empty.
+    #[inline]
+    pub(crate) const fn start_before(self, line_start: usize, at: usize) -> usize {
+        at - self.in_progress(at - line_start)
+    }
+}
 
 /// How a run reads its input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ReadMode {
     /// `--seq` (`JV_PARSE_SEQ`).
     pub seq: bool,
@@ -43,6 +151,7 @@ pub(crate) struct ReadMode {
 
 /// `current_input`: the file being read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct OpenFile {
     /// How many of its bytes `fgets` has read.
     pub offset: usize,
@@ -54,6 +163,7 @@ pub(crate) struct OpenFile {
 /// jq's reader at a sync point: its parser between top-level values at the start of one of its
 /// reads (ADR-0033, "Sync points and state").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ReaderState {
     /// `curr_file`: how many files `next_file` has handed out. The open file, when there is one,
     /// is the last of them.
@@ -69,6 +179,7 @@ pub(crate) struct ReaderState {
 
 /// What `input_filename` and `input_line_number` answer (`jq_util_input_get_position`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Position {
     /// The file, by its index among the inputs; `None` is `<unknown>` (`null`).
     pub file: Option<usize>,
@@ -78,6 +189,7 @@ pub(crate) struct Position {
 
 /// What one `jq_util_input_next_input` call returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Item {
     /// A value, as its span in the inputs read as one stream.
     Value(Span),
@@ -89,6 +201,7 @@ pub(crate) enum Item {
 
 /// One call's answer and the position right after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Read {
     pub item: Item,
     pub at: Position,
@@ -96,6 +209,7 @@ pub(crate) struct Read {
 
 /// Where [`ReaderState::step`] stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Stop {
     /// At the next sync point.
     Synced,
@@ -106,6 +220,7 @@ pub(crate) enum Stop {
 
 /// What a route knows about one file's share of a plain stretch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PlainRun {
     /// The file, by its index among the inputs.
     pub file: usize,
@@ -131,6 +246,7 @@ pub(crate) struct PlainRun {
 /// (after white space, `]`, `}` or `"`, or at the end of the input) and at the end of a read: after
 /// a newline, a whole number of reads after the last one, or at the end of its file.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct PlainStretch<'r> {
     pub runs: &'r [PlainRun],
     /// How many input files the run has.
@@ -143,6 +259,7 @@ pub(crate) struct PlainStretch<'r> {
 }
 
 /// The offset in the inputs read as one stream at which `file` starts.
+#[cfg_attr(not(test), allow(dead_code))]
 fn file_start(sources: &[&[u8]], file: usize) -> usize {
     sources[..file.min(sources.len())]
         .iter()
@@ -151,6 +268,7 @@ fn file_start(sources: &[&[u8]], file: usize) -> usize {
 }
 
 /// `jq_util_input_state` and its parser, between two sync points.
+#[cfg_attr(not(test), allow(dead_code))]
 struct Reader<'s, 'b> {
     profile: &'s ReaderProfile,
     mode: ReadMode,
@@ -161,6 +279,7 @@ struct Reader<'s, 'b> {
     parser: JvParser<'b>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl<'s, 'b> Reader<'s, 'b> {
     fn resume(
         state: ReaderState,
@@ -223,25 +342,23 @@ impl<'s, 'b> Reader<'s, 'b> {
         if let Some(file) = self.input.as_mut() {
             let source: &'b [u8] = self.sources[self.next_file - 1];
             let rest = &source[file.offset..];
-            if rest.is_empty() {
+            let read_len = self.profile.read_len;
+            match Fgets::of(rest, read_len) {
                 // `fgets` returns NULL at the end of the file.
-                file.eof = true;
-            } else {
-                let read_len = self.profile.read_len;
-                let window = &rest[..read_len.min(rest.len())];
-                let newline = window.iter().position(|&byte| byte == b'\n');
-                let read = newline.map_or(window.len(), |at| at + 1);
-                file.offset += read;
-                // `fgets` met the end of the file before a newline or a full buffer.
-                if newline.is_none() && read < read_len {
-                    file.eof = true;
+                None => file.eof = true,
+                Some(read) => {
+                    file.offset += read.len;
+                    // `fgets` met the end of the file before a newline or a full buffer.
+                    if read.meets_end(read_len) {
+                        file.eof = true;
+                    }
+                    if read.newline {
+                        self.current_line += 1;
+                    }
+                    // jq 1.7.1 measures a newline-less read with `strlen` and loses it from its
+                    // first NUL; under E2 the NUL reaches the parser, which refuses it (#7966).
+                    chunk = &rest[..read.len];
                 }
-                if newline.is_some() {
-                    self.current_line += 1;
-                }
-                // jq 1.7.1 measures a newline-less read with `strlen` and loses it from its first
-                // NUL; under E2 the NUL reaches the parser, which refuses it (#7966).
-                chunk = &window[..read];
             }
         }
         let is_last =
@@ -316,6 +433,8 @@ impl<'s, 'b> Reader<'s, 'b> {
     }
 }
 
+// `position` is read by no test either: the routes read it once they enter the model (step 5).
+#[allow(dead_code)]
 impl ReaderState {
     /// The reader before its first read.
     pub(crate) const fn start(mode: ReadMode) -> Self {
@@ -371,7 +490,7 @@ impl ReaderState {
         {
             return None;
         }
-        let read_len = profile.read_len;
+        let reads = LineReads::of(profile);
         let (last, _) = stretch.runs.split_last()?;
         for (i, run) in stretch.runs.iter().enumerate() {
             let consistent = run.tail <= run.len
@@ -430,8 +549,8 @@ impl ReaderState {
             if run.to_end {
                 // The last read is short, and meets the end, unless it ended on a newline or was a
                 // whole read.
-                file.eof = run.tail % read_len != 0;
-            } else if run.tail % read_len != 0 {
+                file.eof = reads.in_progress(run.tail) != 0;
+            } else if reads.in_progress(run.tail) != 0 {
                 return None; // not at the end of a read
             }
         }
