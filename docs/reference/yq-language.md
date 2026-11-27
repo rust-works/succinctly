@@ -805,6 +805,11 @@ surface (#1512):
 The flag also reaches the text `eval(...)` runs (#7012): `eval("paths")` is a parse error by
 default and runs with the flag.
 
+jq's `$ENV` and `$ARGS` are not rejected, since yq lexes any `$name`, but yq has neither, so by
+default each is an unbound variable name and reads as nothing, as `$foo` does (`[$ENV] | length` is
+`0`, #7616).
+With the flag they are jq's environment object and `{named, positional}` object.
+
 The flag also enables jq's generic postfix `?` after an expression such as
 `length?` or `(.x)?` (#3378). Default yq accepts optional navigation on
 fields and brackets (`.x?`, `.[0]?`), as in real yq. `.?` is optional access
