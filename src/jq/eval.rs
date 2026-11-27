@@ -83747,8 +83747,9 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
 ///   value every metadata reader answers its default, so the `select` would keep every node, where
 ///   yq keeps only the ones whose metadata matches. The document route resolves that shape on the
 ///   cursor before it gets here.
-/// - `key` after `key` in the tail: yq's key node has no key of its own, so `.b | key | key`
-///   answers nothing and deletes nothing.
+/// - `key` straight after `key` in the tail: yq's key node has no key of its own, so `.b | key |
+///   key` answers nothing and deletes nothing (`.b | key | line | key` deletes `.b`: the answer of
+///   `line` on a key node keeps that node as its key).
 /// - `..` below a step down on a document with aliases (`.e | .. | line`): yq's `..` stops at an
 ///   alias, where the owned walk goes on through the anchor's copy and the alias redirect deletes
 ///   from the anchor's node, which can lie outside the walk. A `..` from the root also reaches
@@ -83760,11 +83761,10 @@ fn yq_slot_rewrite_is_sound(navigation: &[Expr], tail: &[Expr]) -> bool {
                 || matches!(b, Builtin::Key | Builtin::Parent | Builtin::ParentN(_))
         })
     });
+    let is_key = |stage: &Expr| matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key));
     let key_after_key = tail
-        .iter()
-        .skip_while(|stage| !matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key)))
-        .skip(1)
-        .any(|stage| matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key)));
+        .windows(2)
+        .any(|pair| is_key(&pair[0]) && is_key(&pair[1]));
     let walks_through_aliases = alias_identity::active() && descends_below_a_step(navigation);
     !(reads_metadata || key_after_key || walks_through_aliases)
 }

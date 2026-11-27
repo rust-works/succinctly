@@ -7855,8 +7855,8 @@ fn cursor_navigation_to<W: AsRef<[u64]> + Clone>(
 /// keep the parent and key of the node they read, so each answer is deleted from that node's slot,
 /// and the owned value cannot run the selection (every metadata reader answers its default there,
 /// so the `select` would keep every node). A node at the root keeps the readers as written, a
-/// parentless target the evaluator stops at. `None` for any other shape, a tail with `key` after
-/// `key` (a key node has no key: yq deletes nothing), a `..` below a step down on a document with
+/// parentless target the evaluator stops at. `None` for any other shape, a tail with `key` straight
+/// after `key` (a key node has no key: yq deletes nothing), a `..` below a step down on a document with
 /// aliases (yq's `..` stops at an alias), and a root node under a tail with `key`; the evaluator
 /// then refuses or deletes less than yq. `Some(None)` declines the rewrite as well, and keeps the
 /// caller from resolving the target another way.
@@ -7890,10 +7890,8 @@ fn cursor_reader_tail_del_target<W: AsRef<[u64]> + Clone>(
     }
     let is_key = |stage: &&Expr| matches!(strip_parens(stage), Expr::Builtin(Builtin::Key));
     let key_after_key = tail
-        .iter()
-        .skip_while(|s| !is_key(s))
-        .skip(1)
-        .any(|s| is_key(&s));
+        .windows(2)
+        .any(|pair| is_key(&pair[0]) && is_key(&pair[1]));
     // yq's `..` stops at an alias; a `..` below a step down on a document with aliases could reach
     // an anchor outside the walk through one, and the alias redirect would delete from it.
     let descent = |e: &Expr| matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys);
