@@ -102505,13 +102505,11 @@ fn reduce_list_yq<S: EvalSemantics>(
     // source is read, since yq has read all of it before INIT and an error in it wins. A
     // `break`, a `halt` and the step budget's refusal are not held: yq has none of them, and
     // each ends the fold at once ([`held_until_the_source_ends`]).
-    let mut failure: Option<Control> = None;
-    if let Flow::Escaped(control) = init_flow {
-        if !held_until_the_source_ends(&control) {
-            return finish_fork_flow(Some(control), optional);
-        }
-        failure = Some(control);
-    }
+    let mut failure: Option<Control> = match init_flow {
+        Flow::Escaped(control) if held_until_the_source_ends(&control) => Some(control),
+        Flow::Escaped(control) => return finish_fork_flow(Some(control), optional),
+        _ => None,
+    };
     let mut immediate: Option<Control> = None;
 
     // The list's growth is what is charged: a step on one accumulator is free, as the first fork of
