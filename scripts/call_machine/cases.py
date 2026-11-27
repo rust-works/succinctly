@@ -24,11 +24,16 @@ CORRECT = []
 
 
 def take(cid, body, inp="null", args=("-c", "-n")):
-    CORRECT.append(dict(id=cid, args=list(args), filter=wrap(body, inp), route="take"))
+    CORRECT.append(dict(id=cid, args=list(args), filter=wrap(body, inp), route="take", stdin=None))
 
 
-def raw(cid, filt, route="take", args=("-c", "-n")):
-    CORRECT.append(dict(id=cid, args=list(args), filter=filt, route=route))
+def raw(cid, filt, route="take", args=("-c", "-n"), stdin=None, off_known=None):
+    """`stdin`: the text fed to the run (`None`: nothing, as `-n` reads none). `off_known`: why the
+    shipped route (`check.py check --off`) answers otherwise, for a case jq and the machine agree on."""
+    row = dict(id=cid, args=list(args), filter=filt, route=route, stdin=stdin)
+    if off_known:
+        row["off_known"] = off_known
+    CORRECT.append(row)
 
 
 # --- forms, each under a routed recursive def -------------------------------------
@@ -137,7 +142,8 @@ raw("label_through_def", "def f($n): if $n == 0 then 1, 2, 3 else f($n - 1) end;
 raw("break_out_of_recursion", "def nat: ., (. + 1 | nat); [label $q | 0 | nat | if . > 3 then break $q else . end]")
 raw("reduce_over_recursion", "def nat($m): if . < $m then ., (. + 1 | nat($m)) else empty end; reduce (0 | nat(100)) as $x (0; . + $x)")
 raw("debug_order", "def f($n): if $n == 0 then (1 | debug), (2 | debug) else f($n - 1) end; first(f(2))")
-raw("deep_ok_10000", "def f($n): if $n == 0 then 0 else f($n - 1) + 1 end; f(10000)")
+raw("deep_ok_10000", "def f($n): if $n == 0 then 0 else f($n - 1) + 1 end; f(10000)",
+    off_known="the shipped evaluators refuse it at their native-stack floor")
 
 # --- programs the spikes must decline (main answers) ------------------------------
 raw("decl_no_recursion", "def k(f): f * 2; [1, 2] | map(k(.))", route="decline")
@@ -145,6 +151,40 @@ raw("decl_alt_pattern", "def f($n): if $n == 0 then [1] as [$x] ?// $x | $x else
 raw("decl_input", "def f($n): if $n == 0 then input else f($n - 1) end; f(2)", route="decline", args=("-c", "-n"))
 raw("decl_path", "def d($n): if $n == 0 then .a else d($n - 1) end; {a: 1} | path(d(3))", route="decline")
 raw("decl_last", "def f($n): if $n == 0 then 1, 2 else f($n - 1) end; last(f(3))", route="decline")
+
+# --- the run around the machine: stdin, several documents, exit statuses, flags (#7977 review) ---
+raw("ndjson_caught_break", "def f($n): if $n == 0 then (label $out | try (break $out) catch .) else f($n - 1) end; f(2)",
+    args=("-c",), stdin="1\n2\n")
+raw("stdin_error_location", "def f($n): if $n == 0 then . + 1 else f($n - 1) end; f(2)",
+    args=("-c",), stdin='1\n"x"\n')
+raw("halt_error", 'def f($n): if $n == 0 then "bye\\n" | halt_error else f($n - 1) end; f(2)')
+raw("exit_status_e", "def f($n): if $n == 0 then false else f($n - 1) end; f(2)", args=("-c", "-e", "-n"))
+raw("slurp", "def f($n): if $n == 0 then add else f($n - 1) end; f(2)", args=("-c", "-s"), stdin="1 2 3")
+
+# --- a side effect inside a leaf that can answer twice: declined, so jq's order holds (#7977 review) ---
+raw("leaf_debug_first", "def f($n): if $n == 0 then {a: ((1,2) | debug)} else f($n - 1) end; first(f(2))", route="decline")
+raw("leaf_debug_first_object", "def r: if false then r else . end; first({a: (1, (2|debug))})", route="decline")
+raw("leaf_stderr_interp", 'def r: if false then r else . end; first("\\((1,2)|stderr)")', route="decline")
+raw("leaf_debug_index", "def r: if false then r else . end; [5,6] | first(.[((0,1)|debug)])", route="decline")
+raw("leaf_debug_order", "def f($n): if $n == 0 then {a: ((1,2) | debug)} else f($n - 1) end; f(0) | debug | empty",
+    route="decline")
+raw("native_debug_optional", "def r: if false then r else . end; first(((1,2)|debug)?)")
+raw("native_debug_negate", "def r: if false then r else . end; first(-((1,2)|debug))")
+
+# --- a name bound twice in one pattern is its first store (#7977 review) ---
+R = "def r: if false then r else . end; "
+raw("dup_array", R + "[1,2] as [$a, $a] | $a")
+raw("dup_object", R + '{"a":1,"b":2} as {a: $x, b: $x} | $x')
+raw("dup_nested_array", R + "[[1,2],3] as [[$a, $a], $a] | $a")
+raw("dup_object_array", R + '{"a":1,"b":[2]} as {a: $x, b: [$x]} | $x')
+raw("dup_array_object", R + '[{"a":1},2] as [{a: $x}, $x] | $x')
+raw("dup_reduce", R + "reduce ([1,2],[3,4]) as [$a, $a] (0; . + $a)")
+raw("dup_foreach", R + "[foreach ([1,2],[3,4]) as [$a, $a] (0; . + $a)]")
+
+# --- `range`'s first output negates as jq's (#7977 review) ---
+raw("range2_negate", R + "range(0;1) | -.")
+raw("range3_negate", R + "[range(0;3;1) | -.]")
+raw("range2_pairs", R + "[range(0;2) | [., -.]]")
 
 
 # --- measurement ladders (shape and cost; run on the bench boxes) ---------------

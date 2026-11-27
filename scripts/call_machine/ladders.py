@@ -103,10 +103,19 @@ def heartbeat(path, stop):
             pass
 
 
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
 def parse_bin(spec):
-    """`LABEL=PATH[@VAR=VALUE]...` as `(label, path, env)`, env `None` when no variable is set."""
+    """`LABEL=PATH[@VAR=VALUE]...` as `(label, path, env)`, env `None` when no variable is set.
+
+    The assignments are the trailing `@` segments that start `NAME=`, so a path may hold `@`."""
     label, rest = spec.split("=", 1)
-    path, *assignments = rest.split("@")
+    parts = rest.split("@")
+    assignments = []
+    while len(parts) > 1 and ASSIGNMENT.match(parts[-1]):
+        assignments.insert(0, parts.pop())
+    path = "@".join(parts)
     if not assignments:
         return label, path, None
     env = dict(os.environ)
@@ -143,6 +152,10 @@ def main():
     bins = [(l, [p, "jq"], False) for l, p, _ in map(parse_bin, a.bin)]
     bins += [(l, [p], True) for l, p in (s.split("=", 1) for s in a.jq)]
     envs = {l: e for l, _, e in map(parse_bin, a.bin)}
+    if not a.cachegrind:
+        missing = [l for l in a.aa.split(",") if l not in {b[0] for b in bins}]
+        if missing:
+            sys.exit(f"--aa names {','.join(missing)}, which no --bin or --jq labels")
     only = set(filter(None, a.only.split(",")))
     done, aa_fails = set(), {}
     if os.path.exists(a.state):

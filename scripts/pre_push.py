@@ -107,7 +107,8 @@ GATES = (
             'for t in scripts/test_*.py; do out=$(python3 "$t" 2>&1) || {{ echo "$t:"; echo "$out"; exit 1; }}; done',
         ),
         (r"^python3 scripts/test_\w+\.py",),
-        paths=("scripts/*.py", ".github/workflows/*"),
+        # The call machine's golden corpus, which `test_call_machine.py` checks against its cases.
+        paths=("scripts/*.py", ".github/workflows/*", "tests/data/call-machine-corpus-7977.json"),
         cost=0,
     ),
     Gate(

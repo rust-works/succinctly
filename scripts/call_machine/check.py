@@ -9,11 +9,12 @@ start `jq-1.7.1`) and writes `tests/data/call-machine-corpus-7977.json`: per cas
 arguments, filter, route, and jq's stdout, stderr and exit status. `tests/jq_cli/i7977.rs` runs
 the same golden file through the test binary, so CI checks what this script checks.
 
-`check` runs each case with `SUCCINCTLY_CALL_MACHINE=1` (`=0` with `--off`) and
-`SUCCINCTLY_DEBUG_CALL_MACHINE_LOG` naming a file, from which it reads whether the machine took
-the program. A case is ok when the three answers equal jq's and, with the switch on, a "take"
-case was taken. With `--off` nothing reaches the machine, and every case but `deep_ok_10000`
-(which the shipped evaluators refuse at their native-stack floor) should still match.
+`check` runs each case, with its standard input if it has one, under `SUCCINCTLY_CALL_MACHINE=1`
+(`=0` with `--off`) and `SUCCINCTLY_DEBUG_CALL_MACHINE_LOG` naming a file, from which it reads the
+machine's routing decisions. With the switch on, a case is ok when the three answers equal jq's
+and every decision is `taken` for a "take" case, `declined` for a "decline" one. With `--off` no
+decision may be made, and a case whose `off_known` says why the shipped route answers otherwise
+(`deep_ok_10000`, refused at the native-stack floor) is reported `known`, not a failure.
 
 Run from anywhere: paths are relative to this file.
 """
@@ -35,9 +36,11 @@ JQ = "/usr/bin/jq"
 TIMEOUT = 120
 
 
-def run(cmd, env=None):
+def run(cmd, env=None, stdin=None):
+    """Run `cmd` with `stdin` (text) on its standard input, or none (`/dev/null`)."""
+    feed = dict(input=stdin.encode()) if stdin is not None else dict(stdin=subprocess.DEVNULL)
     try:
-        p = subprocess.run(cmd, capture_output=True, timeout=TIMEOUT, env=env, stdin=subprocess.DEVNULL)
+        p = subprocess.run(cmd, capture_output=True, timeout=TIMEOUT, env=env, **feed)
         return dict(stdout=p.stdout.decode("utf-8", "replace"), stderr=p.stderr.decode("utf-8", "replace"), exit=p.returncode)
     except subprocess.TimeoutExpired:
         return dict(stdout="", stderr="TIMEOUT", exit=None)
@@ -50,8 +53,8 @@ def capture(jq):
     rows = []
     env = dict(os.environ, LC_ALL="C")
     for c in CORRECT:
-        got = run([jq] + c["args"] + [c["filter"]], env)
-        rows.append(dict(id=c["id"], args=c["args"], filter=c["filter"], route=c["route"], **got))
+        got = run([jq] + c["args"] + [c["filter"]], env, c["stdin"])
+        rows.append(dict(id=c["id"], args=c["args"], filter=c["filter"], route=c["route"], stdin=c["stdin"], **got))
         print(c["id"], got["exit"])
     with open(GOLDEN, "w") as f:
         json.dump(rows, f, indent=1)
@@ -67,26 +70,35 @@ def check(binary, off=False):
         log = tempfile.NamedTemporaryFile(delete=False, prefix="call-machine-")
         log.close()
         env = dict(os.environ, LC_ALL="C", **{SWITCH: "0" if off else "1", LOG: log.name})
-        got = run([binary, "jq"] + c["args"] + [c["filter"]], env)
+        got = run([binary, "jq"] + c["args"] + [c["filter"]], env, c["stdin"])
         with open(log.name) as f:
             decisions = f.read().split()
         os.unlink(log.name)
         taken = "taken" in decisions
-        want = golden[c["id"]]
-        if want["filter"] != c["filter"] or want["args"] != c["args"]:
+        want = golden.get(c["id"])
+        if want is None or any(want[k] != c[k] for k in ("filter", "args", "route", "stdin")):
             sys.exit(f"{c['id']}: {GOLDEN} is stale, run `check.py capture`")
         want = dict(stdout=want["stdout"], stderr=want["stderr"], exit=want["exit"])
         same = got == want
-        route_ok = off or (taken if c["route"] == "take" else True)
-        status = "ok" if same and route_ok else ("WRONG" if not same else "NOT-TAKEN")
-        if status != "ok":
+        if off:
+            route_ok = not decisions
+        elif c["route"] == "take":
+            route_ok = bool(decisions) and all(d == "taken" for d in decisions)
+        else:
+            route_ok = bool(decisions) and all(d == "declined" for d in decisions)
+        if not same:
+            status = "known" if off and c.get("off_known") else "WRONG"
+        else:
+            status = "ok" if route_ok else "MISROUTED"
+        if status not in ("ok", "known"):
             bad += 1
         rows.append((c["id"], c["route"], "taken" if taken else "declined", status))
         if not same:
             print(f"--- {c['id']}: expected {want!r}\n    got      {got!r}")
     for r in rows:
         print("%-28s %-8s %-9s %s" % r)
-    print(f"{len(rows) - bad} of {len(rows)} ok")
+    known = sum(1 for r in rows if r[3] == "known")
+    print(f"{len(rows) - bad} of {len(rows)} ok" + (f" ({known} known on the shipped route)" if known else ""))
     return bad
 
 

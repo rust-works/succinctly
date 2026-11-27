@@ -19,7 +19,11 @@ sys.path.insert(0, os.path.join(HERE, "call_machine"))
 
 import cases  # noqa: E402
 import check  # noqa: E402
-import ladders  # noqa: E402
+
+try:  # ladders.py sets resource limits on its children, which needs a POSIX `resource`
+    import ladders  # noqa: E402
+except ImportError:
+    ladders = None
 
 
 class GoldenTests(unittest.TestCase):
@@ -27,11 +31,13 @@ class GoldenTests(unittest.TestCase):
         with open(check.GOLDEN) as f:
             golden = json.load(f)
         self.assertEqual(
-            [(r["id"], r["args"], r["filter"], r["route"]) for r in golden],
-            [(c["id"], c["args"], c["filter"], c["route"]) for c in cases.CORRECT],
+            [(r["id"], r["args"], r["filter"], r["route"], r["stdin"]) for r in golden],
+            [(c["id"], c["args"], c["filter"], c["route"], c["stdin"]) for c in cases.CORRECT],
         )
         for row in golden:
-            self.assertEqual(set(row), {"id", "args", "filter", "route", "stdout", "stderr", "exit"})
+            self.assertEqual(
+                set(row), {"id", "args", "filter", "route", "stdin", "stdout", "stderr", "exit"}
+            )
 
     def test_case_ids_are_unique(self):
         ids = [c["id"] for c in cases.CORRECT]
@@ -43,6 +49,7 @@ class GoldenTests(unittest.TestCase):
                 self.assertIn("def ", c["filter"], c["id"])
 
 
+@unittest.skipIf(ladders is None, "no POSIX `resource` module")
 class LadderTests(unittest.TestCase):
     def test_a_bin_without_assignments_inherits_the_environment(self):
         self.assertEqual(ladders.parse_bin("main=bin/main"), ("main", "bin/main", None))
@@ -53,6 +60,11 @@ class LadderTests(unittest.TestCase):
         self.assertEqual(env["SUCCINCTLY_CALL_MACHINE"], "1")
         self.assertEqual(env["X"], "a=b")
         self.assertEqual(env.get("PATH"), os.environ.get("PATH"))
+
+    def test_a_path_may_hold_an_at_sign(self):
+        self.assertEqual(ladders.parse_bin("a=/x@y/bin"), ("a", "/x@y/bin", None))
+        label, path, env = ladders.parse_bin("a=/x@y/bin@V=1")
+        self.assertEqual((label, path, env["V"]), ("a", "/x@y/bin", "1"))
 
     def test_every_ladder_has_a_size_placeholder_and_sizes(self):
         for lad in cases.LADDERS:
