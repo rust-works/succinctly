@@ -210,6 +210,12 @@ impl Stack<OwnedValue> {
         let free = self.top_free();
         self.index = self.data[i].next as isize;
         if free {
+            // The top block is most often the last: taken off whole, with nothing left to drop.
+            if i + 1 == self.data.len() {
+                if let Some(block) = self.data.pop() {
+                    return block.value;
+                }
+            }
             let value = core::mem::replace(&mut self.data[i].value, OwnedValue::Null);
             self.data.truncate(i);
             value
@@ -412,6 +418,10 @@ struct Vm<'c, 'e> {
     /// The instructions run, for the tests that pin how work scales.
     #[cfg(test)]
     steps: u64,
+    /// Whether dead fork points are dropped ([`Vm::drop_dead_forks`]); off only for the
+    /// differential test that dropping them changes no answer.
+    #[cfg(test)]
+    drops: bool,
 }
 
 /// Make room for one more element in `v` by doubling its charged capacity `cap`, or say it
@@ -570,18 +580,6 @@ fn run_within<'e>(
     result
 }
 
-/// [`run`] of a compiled program, within `limits`, on vectors of its own.
-#[cfg(test)]
-fn run_code<'e>(
-    limits: Limits,
-    it: &Interp<'e>,
-    code: &'e Code,
-    input: OwnedValue,
-    on_value: &mut dyn FnMut(OwnedValue) -> bool,
-) -> R {
-    Vm::new(it, code, limits).exec(input, on_value)
-}
-
 /// The vectors a run leaves for the next document of the same code (#7977 step 5): empty, each
 /// with the capacity it grew to, cut back to [`KEEP_BYTES`]. A per-record run then allocates its
 /// stacks once. Nothing else carries over: a run's bounds, counts and state are its own
@@ -632,6 +630,8 @@ impl<'c, 'e> Vm<'c, 'e> {
             limits,
             #[cfg(test)]
             steps: 0,
+            #[cfg(test)]
+            drops: true,
         }
     }
 
@@ -1150,6 +1150,18 @@ impl<'c, 'e> Vm<'c, 'e> {
                     *op, &l, &r,
                 )))?;
             }
+            Insn::BinK(op, k) => {
+                let l = self.data.pop();
+                let r = &code.consts[*k as usize];
+                self.push(combine(*op, &l, r).map_err(raise_eval)?)?;
+            }
+            Insn::CmpK(op, k) => {
+                let l = self.data.pop();
+                let r = &code.consts[*k as usize];
+                self.push(OwnedValue::Bool(apply_compare_op::<JqSemantics>(
+                    *op, &l, r,
+                )))?;
+            }
             Insn::ToBool => {
                 let v = self.data.pop();
                 self.push(OwnedValue::Bool(truthy(&v)))?;
@@ -1211,6 +1223,7 @@ impl<'c, 'e> Vm<'c, 'e> {
                 self.push(written)?;
             }
             Insn::Call { callee, args, tail } => return self.call(pc, *callee, args, *tail),
+            Insn::TailJump { func, level } => return self.tail_jump(pc, *func, *level),
             Insn::Ret => {
                 // Outputs are counted in a loop's frames (and charged to an owner's), where a
                 // bound can apply; a frame of an ordinary call that is not yet a loop counts none.
@@ -1447,38 +1460,158 @@ impl<'c, 'e> Vm<'c, 'e> {
         Ok(Flow::Next(f.entry))
     }
 
-    /// Drop the fork points at the top that can only answer nothing, so a loop whose round left
-    /// one (an update `. + 1, empty`, or `x // d` once `x` gave a truthy output) does not keep a
-    /// frame per round. A `FORK` resuming at a `BACKTRACK`, or at `//`'s check of a `found` slot
-    /// that is set, would backtrack at once with no effect, so dropping it, and lowering the
-    /// watermarks to what it saved, is the state its resumption would reach. The shipped
-    /// evaluators run these loops in constant memory too, stepping in place a round whose update
-    /// answers once.
+    /// [`Insn::TailJump`]: the self tail call of a zero-argument definition that makes no closure
+    /// over its frame (#7977 step 4). When the call is the next round of the loop (as `call`'s
+    /// self tail call reads it: counted, below the cap) and, once the dead fork points are
+    /// dropped as `call` drops them, no fork point protects the frame, the round runs in the
+    /// frame it is in: the state is the one `call` would reach by popping the frame and pushing
+    /// its successor in the same place (the same function, static link, return address, `exit`
+    /// and slot base, the loop's counts a round on, the slots fresh, the input on top), without
+    /// building it. Anything else is `call`'s `Tail::Pop` call, which keeps the frame a fork
+    /// point protects, and counts or refuses a round past the cap.
+    #[inline(always)]
+    fn tail_jump(&mut self, pc: usize, func: u32, level: u16) -> Result<Flow, Raise> {
+        let call = |vm: &mut Self| vm.call(pc, Callee::Def { func, level }, &[], Tail::Pop);
+        let code = self.code;
+        let f = &code.funcs[func as usize];
+        let nslots = f.nslots as usize;
+        // `call` checks the room first, so a refusal past the budget is the same.
+        if !self.room_for_call(nslots) {
+            return Err(self.call_refusal(func));
+        }
+        let top = self.frames.index as usize;
+        let fr = self.frames.data[top].value;
+        debug_assert_eq!(
+            fr.func, func,
+            "a tail jump runs in its own function's frame"
+        );
+        let rounds = fr.counts.rounds;
+        if rounds == UNCOUNTED || rounds >= self.limits.rounds {
+            return call(self);
+        }
+        if !self.frames.top_free() {
+            if !self.forks.is_empty() {
+                self.drop_dead_forks();
+            }
+            if !self.frames.top_free() {
+                return call(self);
+            }
+        }
+        // `call` would push the successor at `max(index, limit) + 1` once the frame is popped:
+        // here, unless the frame sits above a gap the stack left.
+        let below = self.frames.data[top].next as isize;
+        if (below.max(self.frames.limit) + 1) as usize != top {
+            return call(self);
+        }
+        self.frames.data.truncate(top + 1);
+        self.frames.data[top].value.counts = fr.counts.next_round(rounds + 1);
+        self.slots.truncate(fr.base as usize);
+        for _ in 0..nslots {
+            self.slots.push(Slot::Val(OwnedValue::Null));
+        }
+        // The input, which `call` pops and pushes again: where it is already when nothing lies
+        // above it and it lies where the push would put it.
+        let i = self.data.index;
+        let next = self.data.data[i as usize].next as isize;
+        if self.data.data.len() != i as usize + 1 || next.max(self.data.limit) + 1 != i {
+            let input = self.data.pop();
+            self.push(input)?;
+        }
+        Ok(Flow::Next(f.entry))
+    }
+
+    /// Drop the fork points at the top that are dead: ones a backtrack would pass without
+    /// resuming any code and without changing what it carries. So a loop whose round left them
+    /// does not keep a frame per round: an update `. + 1, empty`, `x // d` once `x` gave a truthy
+    /// output, a finished `try` or label (`try (. + 1) catch 0`, `label $x | . + 1`), or
+    /// `first(. + 1, 0)`, whose `break` ends its label. The shipped evaluators run these loops in
+    /// constant memory too, stepping in place a round whose update answers once.
+    ///
+    /// A backtrack reaches the fork points at the top either with no error, when a later output
+    /// is asked for, or with an error the code above them raises later. Read by
+    /// [`Vm::backtrack`]'s arms, a run of fork points is dead when both come out of it as they
+    /// went in, with no code resumed:
+    /// - With no error, a `FORK` resuming at a `BACKTRACK`, at `//`'s check of a `found` slot
+    ///   that is set, or at a `break` passes, the last raising the break through the fork points
+    ///   below; `TRY_END` and a `try` pass.
+    /// - An error, the break included, passes a `FORK`, `EACH`, `RANGE` or a leaf's outputs;
+    ///   `TRY_END` wraps it and a `try` unwraps it again. A `try` it reaches unwrapped catches
+    ///   it, or swallows it (no `catch`), or stops it (a label's own break).
+    ///
+    /// For an error raised later that last is a change, so a `try` is passed only with its
+    /// `TRY_END` above it in the run: a `try` or label whose body has finished. For the break,
+    /// its own label's `try` ending it, or a `try` without `catch` swallowing it, is the end the
+    /// backtrack would reach. The longest run after which both readings are clean (no break in
+    /// flight, every `TRY_END` unwrapped) is dropped, and the watermarks are lowered to what its
+    /// lowest fork point saved: the state a backtrack through it would reach.
     #[cold]
     #[inline(never)]
     fn drop_dead_forks(&mut self) {
-        while let Some(fork) = self.forks.last() {
-            let Kind::Branch(at) = fork.kind else {
-                break;
-            };
-            let dead = match self.code.insns[at] {
-                Insn::Backtrack => true,
-                Insn::JumpIfSet(s, t) => {
-                    matches!(self.code.insns[t], Insn::Backtrack) && fork.frames.0 >= 0 && {
-                        let base = self.frames.data[fork.frames.0 as usize].value.base as usize;
-                        matches!(&self.slots[base + s as usize], Slot::Val(v) if truthy(v))
+        #[cfg(test)]
+        if !self.drops {
+            return;
+        }
+        // The `TRY_END`s an error raised later has passed and no `try` has unwrapped.
+        let mut wraps = 0u32;
+        // The break a backtrack with no error raises on its way down: its label's id, and the
+        // `TRY_END`s it has passed and no `try` has unwrapped.
+        let mut raised: Option<(u64, u32)> = None;
+        let mut cut = self.forks.len();
+        for i in (0..self.forks.len()).rev() {
+            let fork = &self.forks[i];
+            match fork.kind {
+                Kind::TryEnd => wraps += 1,
+                Kind::Try(_) if wraps > 0 => wraps -= 1,
+                Kind::Try(_) => break,
+                _ => {}
+            }
+            match (&fork.kind, raised) {
+                (Kind::Branch(at), None) => match self.code.insns[*at] {
+                    Insn::Backtrack => {}
+                    Insn::JumpIfSet(s, t)
+                        if matches!(self.code.insns[t], Insn::Backtrack)
+                            && matches!(self.slot_of(fork, 0, s), Some(Slot::Val(v)) if truthy(v)) =>
+                        {}
+                    Insn::Break(level, idx) => match self.slot_of(fork, level, idx) {
+                        Some(Slot::Val(OwnedValue::Int(id))) => raised = Some((*id as u64, 0)),
+                        _ => break,
+                    },
+                    _ => break,
+                },
+                (Kind::Each { .. } | Kind::Range { .. } | Kind::Values { .. }, None) => break,
+                (_, None) => {}
+                (Kind::TryEnd, Some((id, n))) => raised = Some((id, n + 1)),
+                (Kind::Try(_), Some((id, n))) if n > 0 => raised = Some((id, n - 1)),
+                (Kind::Try(Handler::None), Some(_)) => raised = None,
+                (Kind::Try(Handler::Label { id: own, .. }), Some((id, _))) => {
+                    if *own == id {
+                        raised = None;
                     }
                 }
-                _ => false,
-            };
-            if !dead {
-                break;
+                (Kind::Try(Handler::Code(_)), Some(_)) => break,
+                (_, Some(_)) => {}
             }
+            if wraps == 0 && raised.is_none() {
+                cut = i;
+            }
+        }
+        if let Some(fork) = self.forks.get(cut) {
             let (data, frames) = (fork.data.1, fork.frames.1);
-            self.forks.pop();
+            self.forks.truncate(cut);
             self.data.limit = data;
             self.frames.limit = frames;
         }
+    }
+
+    /// The slot `idx` of the frame `level` static links out from the one `fork` resumes in, as
+    /// the instruction it resumes at would read it ([`Vm::slot`]), if there is one.
+    fn slot_of(&self, fork: &Fork, level: u16, idx: u16) -> Option<&Slot> {
+        let mut f = fork.frames.0;
+        for _ in 0..level {
+            f = self.frames.data.get(usize::try_from(f).ok()?)?.value.env as isize;
+        }
+        let base = self.frames.data.get(usize::try_from(f).ok()?)?.value.base as usize;
+        self.slots.get(base + idx as usize)
     }
 
     /// The refusal of a call to `func` whose frame does not fit: named for it, or for the
