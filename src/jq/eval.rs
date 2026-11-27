@@ -83889,6 +83889,9 @@ fn del_target_shape(expr: &Expr) -> DelTargetShape {
         // `del(.a, line)` deletes nothing and `del(line, .a)` deletes `.a`. After a step down it
         // is its input's slot, which `yq_slot_keeping_del_target` rewrote it to.
         stage if is_yq_metadata_reader(stage) => Parentless,
+        // No target at all: what the document route writes for a comma member that selects by
+        // metadata and matched nothing (`del(1, (.. | select(style == "x")))`, #8020).
+        Expr::Builtin(Builtin::Empty) => Navigation,
         _ => Other,
     }
 }

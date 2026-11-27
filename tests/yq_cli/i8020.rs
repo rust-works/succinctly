@@ -171,8 +171,11 @@ const CURSOR_ROWS: &[(&str, &str)] = &[
     ("(.. | select(style == \"double\")) = 9", "a: 9\nb: hi\n"),
     ("del(1 | select(kind == \"scalar\"))", QUOTED),
     ("del([.b] | select(kind == \"seq\"))", QUOTED),
-    // The root node itself still goes, as in yq.
+    // The root node itself still goes, as in yq, through any navigation that reaches it.
     ("del(.. | select(kind == \"map\"))", ""),
+    ("del((.b, .) | select(kind == \"map\"))", ""),
+    ("del(.[]? | select(style == \"double\"))", "b: hi\n"),
+    ("del(.a | select(style == \"double\"))", "b: hi\n"),
 ];
 
 fn run(args: &[&str], stdin: &str) -> Result<(String, String, i32)> {
