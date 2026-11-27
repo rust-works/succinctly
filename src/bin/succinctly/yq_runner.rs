@@ -7822,12 +7822,15 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
     if navigation.is_empty() {
         return None;
     }
-    // A selection that reads node metadata in a condition (`select(style == "")`); a reader that
-    // is a stage of its own answers a fresh node and selects nothing.
+    // A selection that reads node metadata (`select(style == "")`). A reader that only answers a
+    // node -- a stage of its own, or a member of a comma or a `first(..)` of navigation and
+    // readers (`first(.a, line)`, `.b | (style, .)`) -- selects nothing, and the evaluator takes
+    // its fresh node as yq does. Any other place a reader appears counts as a selection.
     let explicit_tags = cursor.index().has_explicit_tags();
-    let filters = navigation
-        .iter()
-        .any(|stage| selects_by_node_metadata(stage) || (explicit_tags && selects_by_tag(stage)));
+    let filters = navigation.iter().any(|stage| {
+        !answers_without_selecting(stage, &is_reader)
+            && (selects_by_node_metadata(stage) || (explicit_tags && selects_by_tag(stage)))
+    });
     // A navigation that starts at a fresh node (`1 | select(kind == "scalar")`, `line |
     // select(true)`) selects among nodes of its own, whose metadata the owned value answers as yq
     // does, and has no document node to resolve: it runs as written.
@@ -7905,6 +7908,32 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         1 => matched.remove(0),
         _ => Expr::Paren(Box::new(Expr::Comma(matched))),
     })
+}
+
+/// Whether `stage` only answers nodes, without choosing among them by a condition: navigation,
+/// node readers (`is_reader`), and commas, pipes and `first`/`last` of them (#8020).
+fn answers_without_selecting(stage: &Expr, is_reader: &dyn Fn(&Expr) -> bool) -> bool {
+    match strip_parens(stage) {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Iterate
+        | Expr::RecursiveDescent => true,
+        Expr::Optional(inner)
+        | Expr::FirstExpr(inner)
+        | Expr::LastExpr(inner)
+        | Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
+            answers_without_selecting(inner, is_reader)
+        }
+        Expr::Pipe(stages) => stages
+            .iter()
+            .all(|s| answers_without_selecting(s, is_reader)),
+        Expr::Comma(items) => items
+            .iter()
+            .all(|s| answers_without_selecting(s, is_reader)),
+        other => is_reader(other),
+    }
 }
 
 /// Whether every output of a write target is a node of the document it navigated to: `.`, `..`,
