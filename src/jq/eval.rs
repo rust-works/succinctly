@@ -5312,20 +5312,34 @@ pub(crate) fn yq_empty_input_reemit(expr: &Expr) -> Option<Expr> {
     reemit_within_budget(expr, true)
 }
 
-/// [`yq_empty_context_reemit_in`] of `expr` from the top, within [`REEMIT_MAX_STEPS`]: a rewrite
-/// that ran out of steps declines whole, never a part of it, since a part could answer what the
-/// whole would not (a comma that lost a branch).
+/// [`yq_empty_context_reemit_in`] of `expr` from the top, within [`REEMIT_MAX_COPIED_NODES`].
 fn reemit_within_budget(expr: &Expr, input_empty: bool) -> Option<Expr> {
-    let steps = core::cell::Cell::new(REEMIT_MAX_STEPS);
+    reemit_with_budget(expr, input_empty, REEMIT_MAX_COPIED_NODES)
+}
+
+/// [`reemit_within_budget`] with `budget` nodes for the copies: a rewrite whose copies would pass it
+/// declines whole, never a part of it, since a part could answer what the whole would not (a comma
+/// that lost a branch).
+fn reemit_with_budget(expr: &Expr, input_empty: bool, budget: usize) -> Option<Expr> {
+    let budget = ReemitBudget {
+        left: core::cell::Cell::new(budget),
+        exhausted: core::cell::Cell::new(false),
+    };
     let rewrite = yq_empty_context_reemit_in(
         expr,
         ReemitScope {
             bound: &[],
             input_empty,
-            steps: &steps,
+            budget: &budget,
         },
     );
-    rewrite.filter(|_| steps.get() > 0)
+    rewrite.filter(|_| !budget.exhausted.get())
+}
+
+/// What the rewrite of one expression may still copy ([`ReemitScope::charge`]).
+struct ReemitBudget {
+    left: core::cell::Cell<usize>,
+    exhausted: core::cell::Cell<bool>,
 }
 
 /// Where [`yq_empty_context_reemit_in`] rewrites an expression (#8044).
@@ -5336,24 +5350,40 @@ struct ReemitScope<'s> {
     bound: &'s [&'s str],
     /// Whether the context is known to be empty ([`yq_empty_input_reemit`]) or only came up empty.
     input_empty: bool,
-    /// The rewrite steps left; at zero the whole rewrite declines ([`reemit_within_budget`]).
-    steps: &'s core::cell::Cell<u32>,
+    /// The nodes the rewrite may still copy; once spent, the whole rewrite declines.
+    budget: &'s ReemitBudget,
 }
 
 impl ReemitScope<'_> {
-    /// Spend one step, `false` once none is left.
-    fn spend(&self) -> bool {
-        let left = self.steps.get();
-        self.steps.set(left.saturating_sub(1));
-        left > 0
+    /// Charge `nodes` copied nodes, `false` (and the rewrite declines) when the budget has not got
+    /// them. A rewrite that spends it exactly still answers.
+    fn charge(&self, nodes: usize) -> bool {
+        let left = self.budget.left.get();
+        if nodes > left {
+            self.budget.exhausted.set(true);
+            return false;
+        }
+        self.budget.left.set(left - nodes);
+        true
     }
 }
 
-/// How many expressions one rewrite may visit. A binding whose body's rewrite reads its variable,
-/// over a source that may answer nothing, writes that body twice (bound and not), so a nest of them
-/// doubles per level; ten thousand steps answer some dozen such levels of an ordinary body and
-/// decline a deeper nest.
-const REEMIT_MAX_STEPS: u32 = 10_000;
+/// The number of nodes in `expr`, for [`ReemitScope::charge`].
+fn reemit_nodes(expr: &Expr) -> usize {
+    let mut nodes = 0;
+    super::walk::any_subexpr(expr, &mut |_| {
+        nodes += 1;
+        false
+    });
+    nodes
+}
+
+/// How many nodes one rewrite may write beyond its input's own size. Only a copy is charged: a
+/// binding whose body's rewrite reads its variable, over a source that may answer nothing, writes
+/// that body a second time (unbound), and a `//` whose left side may answer nothing writes that side
+/// three times, so a nest of either multiplies per level. A rewrite that copies nothing (a comma or
+/// an object of any size) is never refused.
+const REEMIT_MAX_COPIED_NODES: usize = 1_000_000;
 
 /// The variable the rewrite of an `as` whose source may answer nothing binds that source's
 /// outputs to, collected (#8044). Its `\u{1}` keeps it out of any name a program can spell.
@@ -5365,7 +5395,7 @@ const REEMIT_SOURCE_VAR: &str = "\u{1}reemit-source";
 /// the context), so `select(false) | (1 as $y | $y)` is `1`; any other reference is one yq finds
 /// unbound over the empty context, which answers nothing.
 fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Expr> {
-    if !scope.spend() {
+    if scope.budget.exhausted.get() {
         return None;
     }
     match super::eval_generic::strip_parens(expr) {
@@ -5405,7 +5435,7 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
             // `select(false) | ((1 | select(false)) as $y | 3)` is `3`. The source runs once, into a
             // list. A body whose rewrite never reads the variable is written once, bound to `null`
             // for an empty list, so a nest of such bindings stays linear; one that reads it is
-            // written twice, bound and not, within the rewrite's step budget.
+            // written twice, bound and not, within the rewrite's budget for copies.
             let collected = Expr::Var(REEMIT_SOURCE_VAR.into());
             let no_outputs = Expr::Compare {
                 op: CompareOp::Eq,
@@ -5436,6 +5466,10 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
                 }
             } else {
                 let unbound = yq_empty_context_reemit_in(body, scope);
+                // The second copy of the body is what a nest of such bindings multiplies.
+                if !scope.charge(unbound.as_ref().map_or(0, reemit_nodes)) {
+                    return None;
+                }
                 Expr::If {
                     cond: Box::new(no_outputs),
                     then_branch: Box::new(unbound.unwrap_or(Expr::Builtin(Builtin::Empty))),
@@ -5613,6 +5647,11 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
                 yq_empty_context_reemit_in(right, scope).unwrap_or(Expr::Builtin(Builtin::Empty));
             if reemit_always_answers(&left) {
                 return Some(Expr::Alternative(Box::new(left), Box::new(right)));
+            }
+            // The left side is written three times and the right side twice, which a nest of `//`
+            // multiplies per level (#8044).
+            if !scope.charge(2 * reemit_nodes(&left) + reemit_nodes(&right)) {
+                return None;
             }
             let operator = Expr::Alternative(Box::new(left.clone()), Box::new(right));
             Some(Expr::If {
@@ -137743,12 +137782,33 @@ mod tests {
         let reads: Vec<String> = (1..=30).map(|i| format!("$a{i}")).collect();
         // A collect drops the reads, so every level is written once.
         assert!(yq_empty_context_reemit(&nest(&format!("[{}]", reads.join(", ")))).is_some());
-        // A union keeps them, so the levels past the cap decline (yq answers nothing: every
-        // variable is unbound).
+        // A union keeps them, so the copies pass the budget and the rewrite declines (yq answers
+        // nothing: every variable is unbound).
         assert_eq!(
             yq_empty_context_reemit(&nest(&format!("({})", reads.join(", ")))),
             None
         );
+    }
+
+    /// #8044: only a copy is charged, so a rewrite that copies nothing is never refused, and one
+    /// that spends the budget exactly still answers.
+    #[test]
+    fn test_reemit_budget_charges_only_copies_8044() {
+        let yq = |src: &str| parse_with_mode_and_extensions(src, ParserMode::Yq, true).unwrap();
+        let ones = vec!["1"; 20_000].join(", ");
+        assert!(reemit_with_budget(&yq(&format!("({ones})")), true, 0).is_some());
+        let object: Vec<String> = (0..20_000).map(|i| format!("\"k{i}\": {i}")).collect();
+        assert!(reemit_with_budget(&yq(&format!("{{{}}}", object.join(", "))), true, 0).is_some());
+        // The unbound copy of `($y, 1)` is `1`, one node.
+        let split = yq("(1 | select(false)) as $y | ($y, 1)");
+        assert!(reemit_with_budget(&split, true, 1).is_some());
+        assert_eq!(reemit_with_budget(&split, true, 0), None);
+        // A `//` whose left side may answer nothing writes it three times and its right side twice.
+        let alternative = yq("(1 | select(false)) // 2");
+        let left = reemit_nodes(&yq("1 | select(false)"));
+        let exact = 2 * left + 1;
+        assert!(reemit_with_budget(&alternative, true, exact).is_some());
+        assert_eq!(reemit_with_budget(&alternative, true, exact - 1), None);
     }
 
     /// #6943: the allocation-free test the pipe entry asks never says `false` where the rewrite

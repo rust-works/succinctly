@@ -110,6 +110,26 @@ fn a_binding_after_an_empty_stage_runs_its_body_8044() -> Result<()> {
     assert_rows(INPUT, BINDING_ROWS)
 }
 
+/// Only a copy the rewrite makes counts against its budget: a union of 20,000 literals after an
+/// empty stage prints all of them, as in yq, and fifteen nested `//` whose left side empties answer
+/// promptly (nothing, in both tools).
+#[test]
+fn a_long_union_and_a_nest_of_alternatives_answer_8044() -> Result<()> {
+    let ones = vec!["1"; 20_000].join(", ");
+    let filter = format!("select(false) | ({ones})");
+    let (stdout, stderr, code) = run_yq_stdin_with_stderr(&filter, INPUT, JSON)?;
+    assert_eq!((stderr.as_str(), code), ("", 0));
+    assert_eq!(stdout, "1\n".repeat(20_000));
+    let mut nest = String::from("(1 | select(false))");
+    for _ in 0..15 {
+        nest = format!("({nest} // 1)");
+    }
+    let started = std::time::Instant::now();
+    assert_rows(INPUT, &[(format!("select(false) | {nest}").as_str(), "")])?;
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    Ok(())
+}
+
 /// A body that reads its variables is written twice per binding, bound and not, and a level whose
 /// rewrite drops its reads (a collect) is written once. yq answers each row below.
 #[test]
