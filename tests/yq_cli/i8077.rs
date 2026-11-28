@@ -47,12 +47,8 @@ const ROWS: &[(&[&str], &str, &str, &str)] = &[
         TWO,
         "- a\n- a\n",
     ),
-    (
-        &[],
-        "now | format_datetime(\"2006\") | document_index",
-        TWO,
-        "0\n0\n",
-    ),
+    // No `document_index` row: yq answers `0` for every such node, and succinctly the number of
+    // the document it was evaluated over (`now | document_index`, docs/compliance/yq/limitations.md).
     (
         &[],
         "\"2021-03-04T05:06:07Z\" | format_datetime(\"2006\")",
