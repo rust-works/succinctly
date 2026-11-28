@@ -6206,6 +6206,8 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             stitch_json_file_seams(raw_inputs.iter_mut(), false, false, &bom_cuts)
         };
         note_bom_leads(&mut seams, &bom_cuts, raw_inputs.len());
+        // Not `map`: a closure here would renumber this function's later ones (the link order).
+        #[allow(clippy::manual_map)]
         let mut model = match model_as_read {
             Some(as_read) => Some(model_default::DefaultModel::new(as_read, &bom_cuts)),
             None => None,
@@ -6463,10 +6465,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // the fault the run stops at ([`model_default`]).
             let model_fault = match model.as_mut() {
                 Some(model)
-                    if model.plans(split_error, originals.get(idx).is_some_and(Option::is_some)) =>
+                    if model
+                        .plans(split_error, originals.get(idx).is_some_and(Option::is_some)) =>
                 {
                     let texts = model_default::Texts {
-                        texts: &raw_inputs,
+                        files: &raw_inputs,
                         lossy: &originals,
                         seams: &seams,
                     };

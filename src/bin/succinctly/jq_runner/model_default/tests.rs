@@ -46,7 +46,7 @@ fn stream(rng: &mut Rng) -> Vec<u8> {
         1 => out.extend_from_slice(b"\xef\xbb"),
         _ => {}
     }
-    for _ in 0..1 + rng.below(12) {
+    for _ in 0..=rng.below(12) {
         out.extend_from_slice(VALUES[rng.below(VALUES.len())]);
         match rng.below(8) {
             0 => out.extend(std::iter::repeat(b' ').take(4_080 + rng.below(30))),
@@ -80,7 +80,7 @@ fn route(files: &[Vec<u8>]) -> Vec<String> {
         let (mut values, mut split_error) = split_json_values(text);
         let fault = if model.plans(split_error, lossy[file].is_some()) {
             let route_texts = Texts {
-                texts: &texts,
+                files: &texts,
                 lossy: &lossy,
                 seams: &seams,
             };

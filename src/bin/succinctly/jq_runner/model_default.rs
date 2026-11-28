@@ -66,13 +66,15 @@ impl Facts {
     /// The first fault jq's reader meets in the sources as read, rebuilt from the route's `texts`
     /// and `lossy`, in jq's words: what the route words a fault the program met inside a value with
     /// (#5576), in place of `jq_stream_fault`'s reading.
+    // `reads` is drained, not consumed: the buffer is the next step's.
+    #[allow(clippy::iter_with_drain)]
     pub(super) fn first_fault(
         &self,
         texts: &[Vec<u8>],
         lossy: &[Option<LossySource>],
     ) -> Option<String> {
         let texts = Texts {
-            texts,
+            files: texts,
             lossy,
             seams: &[],
         };
@@ -119,7 +121,7 @@ impl AsRead {
 /// onto its front from earlier files (`Seam::base`; empty when nothing was stitched).
 #[derive(Clone, Copy)]
 pub(super) struct Texts<'t> {
-    pub texts: &'t [Vec<u8>],
+    pub files: &'t [Vec<u8>],
     pub lossy: &'t [Option<LossySource>],
     pub seams: &'t [Seam],
 }
@@ -137,7 +139,7 @@ impl Texts<'_> {
     /// The bytes as read that file `file`'s text was made from.
     fn original(&self, file: usize) -> &[u8] {
         self.lossy(file)
-            .map_or(self.texts[file].as_slice(), |lossy| &lossy.original)
+            .map_or(self.files[file].as_slice(), |lossy| &lossy.original)
     }
 }
 
@@ -157,10 +159,10 @@ impl Stream {
         let as_read = &facts.as_read;
         let total: usize = as_read.lens.iter().sum();
         let mut bytes = Vec::with_capacity(total);
-        let mut text_starts = Vec::with_capacity(texts.texts.len() + 1);
+        let mut text_starts = Vec::with_capacity(texts.files.len() + 1);
         // The mark's bytes each source lost: a mark cut across sources (#7566) goes on in the next.
         let mut mark = 0;
-        for file in 0..texts.texts.len() {
+        for file in 0..texts.files.len() {
             let cut = facts.cuts.get(file).copied().unwrap_or(0);
             let next = (mark + cut).min(UTF8_BOM.len());
             bytes.extend_from_slice(&UTF8_BOM[mark..next]);
@@ -169,7 +171,7 @@ impl Stream {
             bytes.extend_from_slice(texts.original(file));
         }
         text_starts.push(bytes.len());
-        if bytes.len() != total || texts.texts.len() != as_read.lens.len() {
+        if bytes.len() != total || texts.files.len() != as_read.lens.len() {
             return None;
         }
         let mut sources = Vec::with_capacity(as_read.lens.len() + 1);
@@ -346,7 +348,7 @@ impl DefaultModel {
     }
 
     /// The values the route evaluates in file `file`, whose text the splitter read as `values`
-    /// (spans of `texts.texts[file]`) and `split_error`, with the triggers in it read by the model:
+    /// (spans of `texts.files[file]`) and `split_error`, with the triggers in it read by the model:
     /// `values` is replaced and `split_error` taken. The fault the run stops at once those values are
     /// out comes back, in jq's words. Cold: only a run with a trigger reaches it.
     #[cold]
@@ -536,7 +538,7 @@ impl Entered {
         let base = texts.base(file);
         let (carried, carried_at) = self.carried;
         let own = from.max(base);
-        let entry = match newline_between_values(&texts.texts[file], own, edit, route) {
+        let entry = match newline_between_values(&texts.files[file], own, edit, route) {
             Some(newline) => Some(self.stream.of_text(texts, file, newline + 1)),
             None if from == 0 && base == 0 => {
                 // The source's start, mark included: jq's first read of it starts there.
@@ -573,6 +575,8 @@ impl Entered {
     /// stream offset `past` with the mark decided: its values that end after `drop_through` are
     /// queued.
     #[inline(never)]
+    // `reads` is drained, not consumed: the buffer is the next step's.
+    #[allow(clippy::iter_with_drain)]
     fn region(
         &mut self,
         from: (ReaderState, usize),
