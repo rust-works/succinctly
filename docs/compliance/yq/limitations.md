@@ -2618,6 +2618,7 @@ The new name keeps the key's quoting, anchor and comments, and the value under i
 `=` evaluates its right side against the document and every target takes its last output; `|=` binds `.` to each key's text and takes the first.
 A target that is a sequence item or the document root renames nothing, as in yq.
 A target that does not exist is created as `null` and renamed (`(.a.zz | key) = "q"` adds `q: null`), as in yq.
+An integer bracket on a mapping names the member its read takes, so `(.m[1] | key) = "q"` renames the key `'1'` or `1`, and `(.m[0x1] | key) = "q"` the key `"0x1"`, as in yq (#8070).
 
 Not reproduced:
 
