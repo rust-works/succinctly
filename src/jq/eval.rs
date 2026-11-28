@@ -51702,7 +51702,6 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
                 path: base.clone(),
                 base_len: base.len(),
                 pre: None,
-                resolve: true,
                 shares_pre: false,
             });
             // #3036: a root path before any write updates the document
@@ -51937,34 +51936,15 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // path_base`) plus the components `update_path` walks. Both the snapshot
     // and the gate are paid only for a filter that actually reads a position
     // -- an ordinary `.a |= . + 1` clones nothing and resolves nothing.
-    //
-    // #8039: a yq update whose reads cannot all be resolved at its target
-    // still names the target for the updates nested in its filter, which
-    // stand at it (`.b |= (.d = 1 | .c |= path)` is `["b","c"]`); only the
-    // rewrite is skipped. A value the filter builds with no position takes
-    // the prefix away from the updates it reaches (`.b |= (5 | . |= path)` is
-    // `[]`), which the owned identity pipe decides as it runs them, so only a
-    // filter that pipe runs whole is placed: the eager evaluator carries no
-    // position from stage to stage (`keys as $v | $v | . |= path`).
-    let placed = S::TAG == EvalTag::Yq
-        && !positioned
-        && needs_path_context(filter_expr)
-        && super::eval_generic::update_filter_on_owned_identity_pipe(filter_expr);
-    let base = if positioned || placed {
+    let base = if positioned {
         super::eval_generic::current_path_base()
     } else {
         Vec::new()
     };
     // #8039: an update nested in the filter at the target itself climbs out of
     // this update's snapshot for a `parent` above its own input.
-    // `placed` updates hand theirs on too: a target they create is in it
-    // (`.x |= (.zz |= (.b | . |= (parent(2) | keys)))` lists `zz`).
-    let names_position = positioned || placed;
-    let climbs = reads_parent(filter_expr);
-    let shares_pre = S::TAG == EvalTag::Yq
-        && names_position
-        && climbs
-        && nests_parent_reading_update(filter_expr);
+    let climbs = positioned && reads_parent(filter_expr);
+    let shares_pre = S::TAG == EvalTag::Yq && climbs && nests_parent_reading_update(filter_expr);
     // `parent`'s source, and only built for a filter that actually climbs:
     // every target auto-created, none of them written yet. `Expr::Identity`
     // as the filter is exactly `yq_prepare_assign_targets`' own vivification
@@ -51973,9 +51953,7 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // filter is about to be handed. Named apart from `pre` above
     // (`alias_identity`'s own snapshot, taken for a different reason and
     // consumed after the loop).
-    // A `placed` update reads nothing of it itself, so it builds one only to
-    // hand on.
-    let pre_update = ((positioned && climbs) || shares_pre).then(|| {
+    let pre_update = climbs.then(|| {
         let mut vivified = result.clone();
         for path in &paths {
             // A path that cannot even be walked contributes no vivification;
@@ -52002,11 +51980,10 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     let mut deletes = DeferredUpdateDeletes::default();
     let mut untouched = true;
     for path in &paths {
-        let pos = names_position.then(|| UpdatePos {
+        let pos = positioned.then(|| UpdatePos {
             path: base.clone(),
             base_len: base.len(),
             pre: pre_update.as_ref(),
-            resolve: positioned,
             shares_pre,
         });
         // #3036: a root path before any successful write still updates the
@@ -55773,11 +55750,6 @@ struct UpdatePos<'a> {
     path: Vec<OwnedValue>,
     base_len: usize,
     pre: Option<&'a Rc<OwnedValue>>,
-    /// Whether the filter's own path-context reads are rewritten at this
-    /// position. `false` for a yq update whose reads cannot all be resolved
-    /// here (#8039): the position is still installed for the updates nested in
-    /// its filter, which stand at it (`.b |= (.d = 1 | .c |= path)`).
-    resolve: bool,
     /// Whether [`pre`](Self::pre) is handed on to the updates nested in the
     /// filter for a `parent` above their own input (#8039, yq mode, and only
     /// where a nested update's filter climbs).
@@ -55794,7 +55766,6 @@ impl UpdatePos<'_> {
             path,
             base_len: self.base_len,
             pre: self.pre,
-            resolve: self.resolve,
             shares_pre: self.shares_pre,
         }
     }
@@ -55809,7 +55780,6 @@ impl UpdatePos<'_> {
             path,
             base_len: self.base_len,
             pre: self.pre,
-            resolve: self.resolve,
             shares_pre: self.shares_pre,
         }
     }
@@ -55817,11 +55787,18 @@ impl UpdatePos<'_> {
     /// `key`: the last component of the absolute path, the one `path` answers. At the update
     /// input's own position (`. |= key`) that is the last component of the prefix a route above
     /// installed, naming the input itself (#8039): `with(.b; . |= key)` is `.b |= (. |= key)`, and
-    /// yq writes `"b"` there as it does for `.b |= key`. `None` only where there is no prefix
-    /// either, at the document root, whose `key` answers nothing in yq. jq
+    /// yq writes `"b"` there as it does for `.b |= key`. `None` where no route named that
+    /// component: at the document root, whose `key` answers nothing in yq, and inside an update
+    /// that names no position for its filter, whose prefix ends at that update's input rather
+    /// than at its target ([`ambient_stale_len`](super::eval_generic::ambient_stale_len)). jq
     /// mode (`whole_path` false) keeps `None` at the input's own position.
     fn key(&self, whole_path: bool) -> Option<&OwnedValue> {
-        if whole_path || self.path.len() > self.base_len {
+        let trusted = if whole_path {
+            super::eval_generic::ambient_stale_len()
+        } else {
+            self.base_len
+        };
+        if self.path.len() > self.base_len || self.path.len() > trusted {
             self.path.last()
         } else {
             None
@@ -56076,7 +56053,7 @@ fn update_root_with_filter<S: EvalSemantics>(
     reentry: Reentry,
     mut deletes: Option<&mut DeferredUpdateDeletes>,
 ) -> Result<bool, EvalEscape> {
-    let positioned = position_update_filter::<S>(filter_expr, pos.filter(|pos| pos.resolve))?;
+    let positioned = position_update_filter::<S>(filter_expr, pos)?;
     let as_written = positioned.is_some().then_some(filter_expr);
     let filter_expr = positioned.as_ref().unwrap_or(filter_expr);
     let run = || eval_owned_multi_first_as::<S>(filter_expr, as_written, root, reentry);
@@ -56088,6 +56065,15 @@ fn update_root_with_filter<S: EvalSemantics>(
                 .map(|pre| (Rc::clone(pre), pos.base_len)),
             run,
         )?,
+        // #8039: an update that names no position for a filter that reads one leaves the prefix
+        // describing its input, not its target, for the updates nested in the filter: none of them
+        // may take a `key` or a `parent` from it.
+        None if S::TAG == EvalTag::Yq
+            && super::eval_generic::ambient_update_base_installed()
+            && needs_path_context(filter_expr) =>
+        {
+            super::eval_generic::with_stale_update_base(run)?
+        }
         None => run()?,
     };
     let wrote = output.is_some();

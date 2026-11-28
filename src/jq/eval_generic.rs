@@ -12366,6 +12366,23 @@ mod path_base {
 
     thread_local! {
         static ANCESTRY: RefCell<Option<Rc<UpdateAncestry>>> = const { RefCell::new(None) };
+        static STALE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+
+    pub(crate) fn stale_len() -> usize {
+        STALE.with(core::cell::Cell::get)
+    }
+
+    /// Sets the stale length for `f`'s dynamic extent, restoring the previous one on the way out.
+    pub(crate) fn with_stale<R>(len: usize, f: impl FnOnce() -> R) -> R {
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                STALE.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(STALE.with(|c| c.replace(len)));
+        f()
     }
 
     pub(crate) fn ancestry() -> Option<Rc<UpdateAncestry>> {
@@ -12408,6 +12425,14 @@ mod path_base {
         None
     }
 
+    pub(crate) fn stale_len() -> usize {
+        0
+    }
+
+    pub(crate) fn with_stale<R>(_len: usize, f: impl FnOnce() -> R) -> R {
+        f()
+    }
+
     pub(crate) fn with_ancestry<R>(
         _ancestry: Option<Rc<UpdateAncestry>>,
         f: impl FnOnce() -> R,
@@ -12434,7 +12459,31 @@ pub(crate) struct UpdateAncestry {
 /// `.a |= (.b |= (5 | . |= path))` is `[]` and `{} | .k | . |= path` is `["k"]`, where composing
 /// the prefix an enclosing update installed would have put the document's target in front.
 pub(crate) fn with_unplaced_update_base<R>(path: Vec<OwnedValue>, f: impl FnOnce() -> R) -> R {
-    path_base::with(Rc::new(path), || path_base::with_ancestry(None, f))
+    path_base::with(Rc::new(path), || {
+        path_base::with_ancestry(None, || path_base::with_stale(0, f))
+    })
+}
+
+/// Run the filter of an update that names no position for it (#8039): the prefix stays as the
+/// routes above installed it, describing that update's input rather than its target, so up to
+/// its length it names no `key` ([`ambient_stale_len`]) and no ancestry is climbed. Only what a
+/// route appends below it (`.c` in `.b |= (.c | . |= key)`, or a positioned update's own walk)
+/// is the nested update's own.
+pub(crate) fn with_stale_update_base<R>(f: impl FnOnce() -> R) -> R {
+    let len = path_base::current().map_or(0, |base| base.len());
+    path_base::with_ancestry(None, || path_base::with_stale(len, f))
+}
+
+/// Whether a route installed an ambient prefix: where none is, the top level of every program,
+/// [`with_stale_update_base`] has nothing to mark.
+pub(crate) fn ambient_update_base_installed() -> bool {
+    path_base::current().is_some()
+}
+
+/// How much of the ambient prefix names no position an update can take a `key` from
+/// ([`with_stale_update_base`]): `0` where every component is the one a route walked.
+pub(crate) fn ambient_stale_len() -> usize {
+    path_base::stale_len()
 }
 
 /// The ambient [`UpdateAncestry`], if an enclosing update installed one (#8039).
@@ -44892,14 +44941,6 @@ fn charge_def_spine(unfolded: u8, then: &Expr) -> Option<u8> {
     } else {
         None
     }
-}
-
-/// Whether every stage of an update filter is one the owned identity pipe runs (#8039): the
-/// route that carries a stage's position to the updates nested in it, and takes the position away
-/// from one a value with no position reaches. A filter any of whose stages the eager evaluator
-/// would run instead names no position for its nested updates.
-pub(crate) fn update_filter_on_owned_identity_pipe(filter: &Expr) -> bool {
-    owned_identity_pipe_supported(owned_identity_body_stages(filter))
 }
 
 /// [`owned_identity_pipe_supported`], `unfolded` levels of `def` binding in.
