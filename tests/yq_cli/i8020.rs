@@ -483,6 +483,88 @@ const LESS_ROWS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// An inline merge key, with no alias in the document (#8020 fourth review).
+const INLINE_MERGE: &str = "m: {<<: {x: 1, y: 2}, z: 3}\nn: {x: 5}\no: {a: 1}\n";
+/// An inline merge of a list.
+const LIST_MERGE: &str = "m: {<<: [{x: 1}, {y: 2}], z: 3}\nn: {x: 5}\no: {a: 1}\n";
+/// Spelled booleans beside a canonical one and the string that spells it.
+const SPELLED_TRUE: &str = "a: True\nb: true\nc: \"true\"\nd: TRUE\n";
+/// A document of canonical scalars, for the metadata writes the gate must leave alone.
+const CANONICAL: &str = "a: \"x\"\nb: \"keep\"\nc: plain\nd: null\ne: \"y\"\n";
+
+/// The owned value expands a merge key, alias or not, and reads `True` as `true`: with a reader
+/// tail such a `select` keeps the reader parentless and nothing goes, where yq deletes some (the
+/// safe direction, recorded). The merge key prints expanded, as it did before for a `del()` that
+/// deletes nothing. (document, filter, `succinctly yq`'s stdout.)
+const SHAPE_LESS_ROWS: &[(&str, &str, &str)] = &[
+    (
+        INLINE_MERGE,
+        "del(.[] | select(has(\"x\")) | line)",
+        "m: {x: 1, y: 2, z: 3}\nn: {x: 5}\no: {a: 1}\n",
+    ),
+    (
+        INLINE_MERGE,
+        "del(.[] | select(length > 2) | line)",
+        "m: {x: 1, y: 2, z: 3}\nn: {x: 5}\no: {a: 1}\n",
+    ),
+    (
+        INLINE_MERGE,
+        "del(.[] | select(contains({\"x\": 1})) | line)",
+        "m: {x: 1, y: 2, z: 3}\nn: {x: 5}\no: {a: 1}\n",
+    ),
+    (
+        INLINE_MERGE,
+        "del(.[] | select(has(\"x\")) | key)",
+        "m: {x: 1, y: 2, z: 3}\nn: {x: 5}\no: {a: 1}\n",
+    ),
+    (
+        LIST_MERGE,
+        "del(.[] | select(has(\"x\")) | line)",
+        "m: {y: 2, x: 1, z: 3}\nn: {x: 5}\no: {a: 1}\n",
+    ),
+    (
+        SPELLED_TRUE,
+        "del(.[] | select(. == \"true\") | line)",
+        SPELLED_TRUE,
+    ),
+    (
+        "a: False\nb: false\nc: \"false\"\n",
+        "del(.[] | select(. == \"false\") | line)",
+        "a: False\nb: false\nc: \"false\"\n",
+    ),
+    (
+        "- [False]\n- [false]\n- [\"false\"]\n",
+        "del(.[] | select(.[0] == \"false\") | line)",
+        "- [False]\n- [false]\n- [\"false\"]\n",
+    ),
+];
+
+/// Metadata selections over a document with nothing the owned value reads differently resolve on
+/// the cursor as they did before the gate (#5479): a `!=` or `== null` over a value is exact there.
+/// (filter, yq's stdout over [`CANONICAL`].)
+const CANONICAL_ROWS: &[(&str, &str)] = &[
+    (
+        "del(.[] | select(style == \"double\" and . != \"keep\"))",
+        "b: \"keep\"\nc: plain\nd: null\n",
+    ),
+    (
+        "(.[] | select(style == \"double\" and . != \"keep\")) = \"Z\"",
+        "a: \"Z\"\nb: \"keep\"\nc: plain\nd: null\ne: \"Z\"\n",
+    ),
+    (
+        "(.. | select(style == \"double\" and . != \"keep\")) style = \"single\"",
+        "a: 'x'\nb: \"keep\"\nc: plain\nd: null\ne: 'y'\n",
+    ),
+    (
+        "del(.[] | select(style == \"double\" and . == null))",
+        CANONICAL,
+    ),
+    (
+        "del(.[] | select(style == \"\" and . == null))",
+        "a: \"x\"\nb: \"keep\"\nc: plain\ne: \"y\"\n",
+    ),
+];
+
 fn run(args: &[&str], stdin: &str) -> Result<(String, String, i32)> {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
@@ -686,6 +768,33 @@ fn a_metadata_selection_with_an_effect_runs_as_written_8020() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_select_over_a_merge_key_or_a_spelled_boolean_deletes_less_than_yq_8020() -> Result<()> {
+    for (doc, filter, want) in SHAPE_LESS_ROWS {
+        assert_row(&[filter], doc, want)?;
+    }
+    // On the cursor route the same reads refuse: the cursor reads `True` as `true` too.
+    let got = run(
+        &["del(.[] | select(style == \"\" and . == \"true\") | line)"],
+        SPELLED_TRUE,
+    )?;
+    assert_eq!((got.0.as_str(), got.2), ("", 1), "{}", got.1);
+    assert!(
+        got.1.starts_with("Error: Invalid path expression"),
+        "{}",
+        got.1
+    );
+    Ok(())
+}
+
+#[test]
+fn a_metadata_selection_over_canonical_scalars_resolves_as_before_8020() -> Result<()> {
+    for (filter, want) in CANONICAL_ROWS {
+        assert_row(&[filter], CANONICAL, want)?;
+    }
+    Ok(())
+}
+
 /// One `-i` row per review finding: the file holds yq's result, or is left as it was.
 #[test]
 fn inplace_review_rows_keep_the_file_8020() -> Result<()> {
@@ -697,6 +806,24 @@ fn inplace_review_rows_keep_the_file_8020() -> Result<()> {
             0,
         ),
         (NESTED, "del(.b | key | key)", NESTED, 0),
+        (
+            INLINE_MERGE,
+            "del(.[] | select(has(\"x\")) | line)",
+            "m: {x: 1, y: 2, z: 3}\nn: {x: 5}\no: {a: 1}\n",
+            0,
+        ),
+        (
+            SPELLED_TRUE,
+            "del(.[] | select(. == \"true\") | line)",
+            SPELLED_TRUE,
+            0,
+        ),
+        (
+            CANONICAL,
+            "(.[] | select(style == \"double\" and . != \"keep\")) = \"Z\"",
+            "a: \"Z\"\nb: \"keep\"\nc: plain\nd: null\ne: \"Z\"\n",
+            0,
+        ),
         (
             ALIAS_LIKE,
             "del(.[] | select(has(\"p\")) | line)",
