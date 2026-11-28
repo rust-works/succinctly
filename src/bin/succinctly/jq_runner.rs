@@ -43,8 +43,9 @@ use reader_model::JQ_LINE_READS;
 mod call_machine;
 mod eof_location;
 // ADR-0033's reader model (#7987): the routes' read arithmetic is its `Fgets` and `LineReads`
-// (step 4), and the materializing route of `read_inputs` enters its `ReaderState` on a trigger
-// (step 5, `model_read`).
+// (step 4), the materializing route of `read_inputs` enters its `ReaderState` on a trigger
+// (step 5, `model_read`), and the default route enters it and hands back at the next sync point
+// (step 6, `model_default`).
 mod model_default;
 mod model_read;
 pub(crate) mod reader_model;

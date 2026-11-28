@@ -99,7 +99,9 @@ impl Facts {
 }
 
 impl AsRead {
-    /// The facts of `raws`, the sources as read.
+    /// The facts of `raws`, the sources as read. Out of line, so the per-run cost of the model on
+    /// clean input is this one call (and a breakpoint can count it).
+    #[inline(never)]
     pub(super) fn of(raws: &[Vec<u8>]) -> Self {
         let mark = raws
             .iter()
@@ -346,7 +348,9 @@ impl DefaultModel {
     /// The values the route evaluates in file `file`, whose text the splitter read as `values`
     /// (spans of `texts.texts[file]`) and `split_error`, with the triggers in it read by the model:
     /// `values` is replaced and `split_error` taken. The fault the run stops at once those values are
-    /// out comes back, in jq's words.
+    /// out comes back, in jq's words. Cold: only a run with a trigger reaches it.
+    #[cold]
+    #[inline(never)]
     pub(super) fn plan(
         &mut self,
         file: usize,
@@ -489,6 +493,7 @@ impl Entered {
 
     /// The model reads from the stream's start to its first fault: its values before file `file`'s
     /// text are the route's, already out, and the rest are queued, the fault after them.
+    #[inline(never)]
     fn fault_mode(
         &mut self,
         file: usize,
@@ -567,6 +572,7 @@ impl Entered {
     /// The model reads from `from` (a sync point and the reader there) to the first sync point past
     /// stream offset `past` with the mark decided: its values that end after `drop_through` are
     /// queued.
+    #[inline(never)]
     fn region(
         &mut self,
         from: (ReaderState, usize),
