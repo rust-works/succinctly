@@ -1554,8 +1554,10 @@ Any other body is still read once per node, which differs from yq wherever the b
 - **A union in the body** ([#8076](https://github.com/rust-works/succinctly/issues/8076)).
   `[.x[] | with_dtf("2006"; ., 0)]` over `x: [1, 2, 3]` is `[1,2,3,0,0,0]` in yq, branch-major over the list, and `[1,0,2,0,3,0]` here.
   `[.x[] | with_dtf("2006"; now, now)]` holds two values in yq and six here.
-- **A body that answers over an empty context** ([#8075](https://github.com/rust-works/succinctly/issues/8075)).
-  `[.x[] | select(false) | with_dtf("2006"; "x")]` is `["x"]` in yq, as `[.x[] | select(false) | "x"]` is in both, and `[]` here; `with_dtf("2006"; [now])` there is `[[]]` in yq and `[]` here.
+- **A layout that answers nothing over an empty context.**
+  Since [#8075](https://github.com/rust-works/succinctly/issues/8075) a call over an empty context answers what its body answers there, under its layout's first answer, as in yq: `[.x[] | select(false) | with_dtf("2006"; "x")]` is `["x"]` and `with_dtf("2006"; [now])` there is `[[]]` in both.
+  yq reads the layout over that empty context too, so a layout that reads the node raises `could not get date time format: could not find layout for format_time` there, whatever the body: `select(false) | with_dtf(.fmt; "x")` and `select(false) | with_dtf(.fmt; .)` raise in yq and print nothing here.
+  A layout from a variable bound outside the empty stage is answered there in yq, as a bare `$f` is in both: `"2006" as $f | [.x[] | select(false) | with_dtf($f; "x")]` is `["x"]` in yq and `[]` here.
 - **A layout that reads the node.**
   yq reads the layout once over the whole context and uses its first answer, so `[.x[] | with_dtf(.fmt; now)]` is one value in yq.
   Here only a layout that reads no node (a literal, a `$name`, `env(NAME)` or `strenv(NAME)`) makes the call a once-stage, and `with_dtf(.fmt; now)` is still answered per node, each under its own node's layout: two values over two members.
@@ -4145,6 +4147,11 @@ In a pipe, a stage that builds a node of its own (a literal, a constructor, an o
 It is the list that is empty, not a node: `.d[] | select(false) | 1` is one `1` however many members `d` has, and `.d[] | 1 | select(false)` is nothing because the `1` was emitted.
 The first such stage whose input list is empty is the one that emits, and the stages after it run on what it emitted, so a later stage that follows another empty one emits in its turn (`.d[] | select(false) | 1 | select(false) | 2` is `2`).
 A union is evaluated over the empty list branch by branch (`.a[] | (1, 2)` is `1`, `2`), and `map(f)` is `[.[] | f]` to the rule, so `map(select(false) | 1)` is `[1]`.
+Since [#8075](https://github.com/rust-works/succinctly/issues/8075) `now`, `env(NAME)` and `strenv(NAME)`, which yq builds once whatever the context holds, count as literals inside an operator, an object, a binding, a fold or an `error`: `select(false) | (now + "1h")`, `select(false) | {"t": strenv(X)}` and `select(false) | (. as $t | now)` are one value each in both.
+A `with_dtf(L; E)` counts when its layout and its body do (`select(false) | with_dtf("2006"; "x")` is `"x"`).
+An object or a collection emitted after an empty stage is printed with a `---` between the documents here, where yq prints none: `.x[] | select(false) | {"t": 1}` over `x: [1]` / `---` / `x: [2]` is `t: 1` twice without one in yq, which predates #8075 and holds for `{"t": strenv(X)}` and `with_dtf("2006"; {"a": 1})` too.
+So does a once-built stage behind `//` or as a fold's INIT, over a context with nodes too: `.x[0] | (now // .)` and `.x[0] | (.[] as $i ireduce (now; .))` print a `---` between the documents here and none in yq.
+`now` is a string here, not yq's `!!timestamp` ([#2802](https://github.com/rust-works/succinctly/issues/2802)), so the date arithmetic and comparisons yq refuses on it answer here after an empty stage as they do over a node: `select(false) | (now + "x")` raises `unable to parse duration` in yq and is a string here, as `.x[0] | (now + "x")` is.
 `succinctly jq` is unchanged: jq's pipe loops zero times over an empty stage.
 
 It is answered where the pipe is evaluated: the sink route counts what the pipe emitted and, when that is nothing, asks which stage's input was empty (the stages before it run once more, only then).
