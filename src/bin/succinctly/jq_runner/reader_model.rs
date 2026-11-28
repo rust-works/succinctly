@@ -35,7 +35,9 @@
 //! Since step 5 the materializing route of `read_inputs` enters the model on its triggers
 //! (`jq_runner/model_read.rs`): it carries a [`ReaderState`] from the stream's start over the plain
 //! stretch before the trigger with [`ReaderState::skip_plain`], then reads the rest of the input
-//! with [`ReaderState::read_to_end`]. [`enabled`] is the switch that keeps the deciders the model
+//! with [`ReaderState::read_to_end`]. Since step 6 the default route enters it on its triggers too
+//! and hands back to the semi-index at the next sync point, carrying the [`ReaderState`] there
+//! (`jq_runner/model_default.rs`). [`enabled`] is the switch that keeps the deciders the model
 //! replaces selectable until step 10.
 
 use crate::cli::jq_reader_profile::{ReaderProfile, JQ_READER};

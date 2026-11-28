@@ -43,8 +43,10 @@ use reader_model::JQ_LINE_READS;
 mod call_machine;
 mod eof_location;
 // ADR-0033's reader model (#7987): the routes' read arithmetic is its `Fgets` and `LineReads`
-// (step 4), and the materializing route of `read_inputs` enters its `ReaderState` on a trigger
-// (step 5, `model_read`).
+// (step 4), the materializing route of `read_inputs` enters its `ReaderState` on a trigger
+// (step 5, `model_read`), and the default route enters it and hands back at the next sync point
+// (step 6, `model_default`).
+mod model_default;
 mod model_read;
 pub(crate) mod reader_model;
 mod window;
@@ -6179,6 +6181,22 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             None => input_names(&files),
         };
         jq::cli_context::set_input_names(names);
+        // ADR-0033 step 6 (#7987): plain JSON read whole enters jq's reader model on a trigger and
+        // hands back at the next sync point ([`model_default`]). Not `--slurp`, `--seq` or
+        // `--validate`, whose readers are other steps', a window at a time (step 7), or with a file
+        // that did not open, whose report the reads place. (No closure is added to this function for
+        // the model: the link order names them by number.)
+        let model_as_read = if reader_model::enabled()
+            && windowed.is_none()
+            && !args.slurp
+            && !args.seq
+            && !args.validate
+            && failures.is_empty()
+        {
+            Some(model_default::AsRead::of(&raw_inputs))
+        } else {
+            None
+        };
         // #5291: jq skips a BOM at the start of its input, `--validate` included.
         let bom_cuts = strip_leading_json_bom(raw_inputs.iter_mut());
         // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
@@ -6188,6 +6206,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             stitch_json_file_seams(raw_inputs.iter_mut(), false, false, &bom_cuts)
         };
         note_bom_leads(&mut seams, &bom_cuts, raw_inputs.len());
+        // Not `map`: a closure here would renumber this function's later ones (the link order).
+        #[allow(clippy::manual_map)]
+        let mut model = match model_as_read {
+            Some(as_read) => Some(model_default::DefaultModel::new(as_read, &bom_cuts)),
+            None => None,
+        };
         // Substitution is skipped under `--validate` so the strict validator
         // in the loop below still sees the *original* bytes (#1247).
         // Substituting first silently repaired a non-UTF-8 document, leaving
@@ -6267,8 +6291,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             (None, None) => {
                 let raw_inputs = std::rc::Rc::clone(&raw_inputs);
                 let originals = std::rc::Rc::clone(&originals);
-                StreamFault::new(move || {
-                    jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0)
+                // #7987: jq's first fault, from the reader model where the run reads with it.
+                let facts = model.as_ref().map(model_default::DefaultModel::facts);
+                StreamFault::new(move || match &facts {
+                    Some(facts) => facts.first_fault(&raw_inputs, &originals),
+                    None => jq::jq_stream_fault(parser_chunks(&raw_inputs, &originals), 1, 0),
                 })
             }
             (Some(_), _) => {
@@ -6427,12 +6454,28 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // A slurped input is already split: the one span is the whole
             // synthesized array, and scanning it again would be a second pass
             // over the entire input for nothing.
-            let (mut values, split_error) = if slurped.is_some() {
+            let (mut values, mut split_error) = if slurped.is_some() {
                 (vec![(0, raw.len())], None)
             } else if let Some(split) = window_split {
                 split
             } else {
                 split_json_values(raw)
+            };
+            // #7987: the file's triggers read by jq's reader model, which gives the values there and
+            // the fault the run stops at ([`model_default`]).
+            let model_fault = match model.as_mut() {
+                Some(model)
+                    if model
+                        .plans(split_error, originals.get(idx).is_some_and(Option::is_some)) =>
+                {
+                    let texts = model_default::Texts {
+                        files: &raw_inputs,
+                        lossy: &originals,
+                        seams: &seams,
+                    };
+                    model.plan(idx, &texts, &mut values, &mut split_error)
+                }
+                _ => None,
             };
             // jq's main loop ends the run once an open has failed, after the one value it was
             // fetching when it met the failure: the first the files past it hold. It reads
@@ -6885,6 +6928,11 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
             // #7322: the warnings met after the window's last value.
             for (_, warning) in notes {
                 eprintln!("{warning}");
+            }
+            if let Some(message) = model_fault {
+                sink.report_parse_error(&message);
+                run_stopped = true;
+                break;
             }
             if let Some(offset) = split_error {
                 // #5497: jq meets its depth limit first when the refused bracket comes before

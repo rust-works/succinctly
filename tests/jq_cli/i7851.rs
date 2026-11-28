@@ -7,10 +7,11 @@
 //!
 //! The exit status, the standard output and the file named were captured from jq 1.7.1
 //! (`/usr/bin/jq`); jq 1.8.2 agrees on every row. jq words the fault `Malformed BOM`, and so does
-//! `succinctly jq` on the routes ADR-0033's reader model reads (`--stream`, and since step 5 of
-//! #7987 the materializing route a program that reads `input` takes). The default route (`.`) and
-//! `--slurp` still word it as a numeric literal, the divergence recorded in
-//! docs/compliance/jq/limitations.md (#5804), so those rows pin succinctly's wording.
+//! `succinctly jq` on the routes ADR-0033's reader model reads (`--stream`, since step 5 of #7987
+//! the materializing route a program that reads `input` takes, and since step 6 the default route,
+//! `.`). `--slurp`, and the default route over a list with a file that did not open, still word it
+//! as a numeric literal, the divergence recorded in docs/compliance/jq/limitations.md (#5804), so
+//! those rows pin succinctly's wording.
 
 use anyhow::Result;
 
@@ -37,6 +38,9 @@ macro_rules! literal {
     };
 }
 
+/// jq's `Malformed BOM` as its main loop reports it (#7987 step 6).
+const BROKEN: &str = "jq: parse error: Malformed BOM\n";
+
 /// jq's `Malformed BOM` as `input` raises it, at `file`, line 0 (#7987 step 5).
 macro_rules! malformed {
     ($file:literal) => {
@@ -46,7 +50,7 @@ macro_rules! malformed {
 
 static ROWS: &[Row] = &[
     // The issue's three commands.
-    (&["-c", "."], &["ef", "ef", "gone"], literal!("2"), 5),
+    (&["-c", "."], &["ef", "ef", "gone"], BROKEN, 5),
     (
         &["-c", "-n", "[inputs]"],
         &["ef", "ef", "empty"],
@@ -60,13 +64,8 @@ static ROWS: &[Row] = &[
         5,
     ),
     // The whole-text routes, a directory and a file with bytes after the mark.
-    (&["-c", "."], &["efbb", "ef", "adir"], literal!("3"), 5),
-    (
-        &["-c", "."],
-        &["ef", "efbb", "empty", "one"],
-        literal!("3"),
-        5,
-    ),
+    (&["-c", "."], &["efbb", "ef", "adir"], BROKEN, 5),
+    (&["-c", "."], &["ef", "efbb", "empty", "one"], BROKEN, 5),
     (&["-c", "-s", "."], &["ef", "ef", "gone"], literal!("2"), 5),
     (
         &["-c", "-s", "."],
@@ -81,7 +80,7 @@ static ROWS: &[Row] = &[
         5,
     ),
     // A mark that breaks off inside the first file.
-    (&["-c", "."], &["efbad", "gone"], literal!("4"), 5),
+    (&["-c", "."], &["efbad", "gone"], BROKEN, 5),
     (
         &["-c", "-n", "input"],
         &["efbad", "one"],
@@ -125,7 +124,8 @@ static ROWS: &[Row] = &[
         malformed!("efbb.json"),
         5,
     ),
-    // A file that does not open before the file the mark breaks off in is reported, as before.
+    // A file that does not open before the file the mark breaks off in is reported, as before (jq
+    // then says `Malformed BOM`; a list with a file that did not open keeps the old reader).
     (
         &["-c", "."],
         &["ef", "gone", "ef", "gone"],
