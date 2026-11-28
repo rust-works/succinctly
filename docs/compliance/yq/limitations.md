@@ -4176,6 +4176,17 @@ Under `--eval-all`, an alternative whose left side is a pipe that re-emits is st
 The library built without `std` has no hand-off between the context-list walk and the rest of a pipe it owns, so there the walk asks the question once per entry of its list.
 A pipe whose answer is empty is evaluated up to three times (the route, the count and the probe of the stages before the re-emitting one, then the rewritten pipe), which a pipe with outputs never pays.
 
+### An `error` message that reads its position (#8080)
+
+`error(msg)` evaluates `msg` at the node the call stands at, as `msg as $m | error($m)` does, so `.b | error(key)` over `a: 1` / `b: 5` is `Error: b` and `.b | error(line)` is `Error: 2`, as in yq v4.53.3.
+Before [#8080](https://github.com/rust-works/succinctly/issues/8080) such a message was evaluated over a copy with no position, which raised `aborted`, an empty message or `0`.
+A message that reads its position therefore answers what `msg as $m | error($m)` answers, including where the construct around it differs from yq, and three of those differences used to be hidden by the `aborted` the unpositioned message raised:
+- yq raises `aborted` for a document whose stage before `error` matched nothing (the `error(.q)` residual of the next section), where nothing is raised here and the next document raises its own position: `.a.x | error(key)` over `a: 1` / `---` / `b: 2` is `Error: aborted` in yq and `Error: x` here, and `[.b | error(key)]` under `--eval-all` over the same documents is `Error: aborted` in yq and `Error: b` here;
+- `with(..; f)` runs `f` at a descendant before the root here, where yq starts at the root (`with(..; . |= error(.))` over `a: 1` / `b: 5` is `Error: 1` here and the root's empty message in yq), so `with(..; error(key))` is `Error: aborted` in yq, whose root has no key, and `Error: a` here;
+- an update over several targets raises at its first target here and at its last in yq (`.[] |= error(.)` is `Error: 1` here and `Error: 5` in yq), so `.[] |= error(key)` is `Error: a` here and `Error: b` in yq.
+A message that is an array or a mapping is printed as its JSON text here and as an empty message in yq (`.b | error(path)` is `Error: ["b"]` here and `Error: ` in yq), as for any such message (`error([1])`).
+Pinned by `tests/yq_cli/i8080.rs`.
+
 ### An operand's evaluation context — a context-free stage re-emits against an empty context (#2540, #2588)
 
 A literal or constructor is not really "empty" against a read-only, zero-node context in
