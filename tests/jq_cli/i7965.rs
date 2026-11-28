@@ -1,5 +1,5 @@
-//! #7965 (ADR-0031 step 3): with `SUCCINCTLY_REGEX_ONIG=1`, jq-mode regex compiles and matches with
-//! Oniguruma at jq 1.7.1's pin, read the way jq 1.7.1's `f_match` reads it.
+//! #7965 (ADR-0031): jq-mode regex compiles and matches with Oniguruma at jq 1.7.1's pin, read the
+//! way jq 1.7.1's `f_match` reads it.
 //!
 //! Every expected answer was captured from `/usr/bin/jq` 1.7.1, except `capture` on a group that
 //! took no part in an empty match, which follows jq 1.8.2 (#7520). The rows are the shape the corpus
@@ -14,15 +14,10 @@ use anyhow::Result;
 
 use crate::{spawn_jq, spawn_jq_with_env};
 
-/// `filter` on the JSON text `input`, compact, with the engine switch at `value`: stdout and the
-/// exit code, or stderr's message when it fails.
-fn run(value: &str, filter: &str, input: &str) -> Result<(String, i32)> {
-    let (out, code) = spawn_jq_with_env(
-        &["-c", filter],
-        "SUCCINCTLY_REGEX_ONIG",
-        value,
-        Some(input.as_bytes()),
-    )?;
+/// `filter` on the JSON text `input`, compact: stdout and the exit code, or stderr's message when
+/// it fails.
+fn run(filter: &str, input: &str) -> Result<(String, i32)> {
+    let (out, code) = spawn_jq(&["-c", filter], Some(input.as_bytes()))?;
     let text = if code == 0 { out.stdout } else { out.stderr };
     Ok((String::from_utf8(text)?.trim_end().to_string(), code))
 }
@@ -52,7 +47,7 @@ fn a_match_that_begins_inside_a_character_is_read_as_jq_reads_it_7965() -> Resul
         ),
     ] {
         assert_eq!(
-            run("1", filter, input)?,
+            run(filter, input)?,
             (expected.to_string(), 0),
             "{input} | {filter}"
         );
@@ -74,7 +69,7 @@ fn split_and_sub_slice_by_jq_offsets_after_such_a_match_7965() -> Result<()> {
         (r#""ſß""#, r#"sub("(?<=(ſ)|ß)"; "<>"; "g")"#, r#""ſ<><><>""#),
     ] {
         assert_eq!(
-            run("1", filter, input)?,
+            run(filter, input)?,
             (expected.to_string(), 0),
             "{input} | {filter}"
         );
@@ -114,7 +109,7 @@ fn flags_refusals_and_adoptions_are_jqs_7965() -> Result<()> {
         ),
     ] {
         assert_eq!(
-            run("1", filter, input)?,
+            run(filter, input)?,
             (expected.to_string(), code),
             "{input} | {filter}"
         );
@@ -122,16 +117,20 @@ fn flags_refusals_and_adoptions_are_jqs_7965() -> Result<()> {
     Ok(())
 }
 
-/// Since step 4b the engine is the default: with no variable, jq's answer (captured from
-/// `/usr/bin/jq` 1.7.1); `SUCCINCTLY_REGEX_ONIG=0` still selects the earlier engine until step 6.
+/// Step 6 deleted the earlier engine, and the variable that selected it (`SUCCINCTLY_REGEX_ONIG=0`)
+/// now changes nothing: jq's answer (captured from `/usr/bin/jq` 1.7.1) either way.
 #[test]
-fn the_engine_is_the_default_and_the_switch_off_selects_the_earlier_one_7965() -> Result<()> {
+fn the_earlier_engine_switch_is_gone_7965() -> Result<()> {
     let (input, filter) = (r#""éſ""#, r#"[scan("(?<=(?:é|ſ))"; "g")]"#);
     let jq = r#"["","�",""]"#;
-    let (absent, code) = spawn_jq(&["-c", filter], Some(input.as_bytes()))?;
+    assert_eq!(run(filter, input)?, (jq.to_string(), 0));
+    let (off, code) = spawn_jq_with_env(
+        &["-c", filter],
+        "SUCCINCTLY_REGEX_ONIG",
+        "0",
+        Some(input.as_bytes()),
+    )?;
     assert_eq!(code, 0);
-    assert_eq!(String::from_utf8(absent.stdout)?.trim_end(), jq);
-    assert_eq!(run("1", filter, input)?, (jq.to_string(), 0));
-    assert_ne!(run("0", filter, input)?.0, jq);
+    assert_eq!(String::from_utf8(off.stdout)?.trim_end(), jq);
     Ok(())
 }
