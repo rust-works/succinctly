@@ -62,7 +62,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// recorded in `docs/compliance/jq/limitations.md`. It bounds the machine's own state, not
 /// memory: what the values hold is not counted, nor are `[...]` accumulators and buffered leaf
 /// outputs, which hold values the program builds (they grow fallibly, so a failed allocation is
-/// a refusal too).
+/// a refusal too). What a run holds in all is bounded by the memory limit ([`Limits::memory`],
+/// #8064) where a caller installed a probe.
 const BUDGET: usize = 1 << 30;
 
 /// A frame's `rounds` in a `repeat` loop a consumer can stop (`limit`, `first`), which the
