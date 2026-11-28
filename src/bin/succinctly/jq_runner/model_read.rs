@@ -276,7 +276,7 @@ fn span_bytes<'s>(
 
 /// A value's text as the crate's value reader reads it, which is how the route reads every value:
 /// a string's invalid UTF-8 is jq's substitution of it (`jvp_utf8_next`).
-fn decode(text: &[u8]) -> Result<OwnedValue, EvalError> {
+pub(super) fn decode(text: &[u8]) -> Result<OwnedValue, EvalError> {
     let substituted;
     let text = match std::str::from_utf8(text) {
         Ok(text) => text,

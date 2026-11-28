@@ -48,6 +48,7 @@ mod eof_location;
 // (step 6, `model_default`), and the routes that read a window at a time feed it the windows they
 // hold (step 7, `model_window`).
 mod model_default;
+mod model_lazy;
 mod model_read;
 mod model_window;
 pub(crate) mod reader_model;
@@ -9833,6 +9834,9 @@ fn read_inputs(
                         last_span: None,
                         recorded_tail: None,
                         rest: None,
+                        // #7987 step 7b: a later fault is read by jq's reader model too.
+                        model: model_route,
+                        sync_before: None,
                     });
                     defer_lazy_start(
                         std::rc::Rc::new(raw),
@@ -9970,6 +9974,8 @@ fn read_inputs(
                                 last_span: None,
                                 recorded_tail,
                                 rest: None,
+                                model: model_route,
+                                sync_before: None,
                             });
                             if recorded_tail.is_none() {
                                 // A BOM's lead is no stitch (#7569).
@@ -15945,6 +15951,14 @@ struct LazyMore {
     /// (#6451), each of several files read a window at a time on none of it (#7024), and the rest is
     /// read when the scan gets past that ([`read_lazy_rest`]).
     rest: Option<LazyRest>,
+    /// A fault the scan meets is read by jq's reader model, which hands back to the scan at the next
+    /// sync point ([`lazy_fault_by_model`], #7987 step 7b): with the model on, a source read a window
+    /// at a time, or one the materializing route read whole. Elsewhere the eager reader reads the rest
+    /// of the stream.
+    model: bool,
+    /// With `model`: the byte after the last newline among the documents handed out that none of them
+    /// holds, a sync point the model can be entered at when a fault comes before any newline after them.
+    sync_before: Option<usize>,
 }
 
 /// The text a source read in windows has dropped from the front of `LazyJsonInputs::text`
@@ -15960,6 +15974,10 @@ struct DroppedText {
     /// the text (#7480), all of which go with the first window dropped: they are not the file's lines,
     /// but they are in jq's input ahead of the window.
     moved_newlines: usize,
+    /// How many of the file's own bytes, as read, came before the window: `bytes` less the moved
+    /// bytes, counted over the bytes jq read where the text is a substitution of them (#7987 step 7b:
+    /// the reader model names a file's own offsets as read).
+    own_read: usize,
 }
 
 impl DroppedText {
@@ -16330,6 +16348,8 @@ fn defer_windowed_lazy_sources(
         unknown: true,
     });
     let last_source = locations.last_src();
+    // #7987 step 7b: a fault in these sources is read by jq's reader model.
+    let model = reader_model::enabled();
     for (src, (text, spans, rest, lead)) in sources.into_iter().enumerate() {
         let seam = Seam { lead, ..Seam::NONE };
         let more = LazyMore {
@@ -16340,6 +16360,8 @@ fn defer_windowed_lazy_sources(
             last_span: None,
             recorded_tail: None,
             rest: Some(rest),
+            model,
+            sync_before: None,
         };
         defer_lazy_start(std::rc::Rc::new(text), spans, src, seam, Some(more));
     }
@@ -16855,7 +16877,9 @@ fn read_lazy_window(lazy: &mut LazyJsonInputs, more: &mut LazyMore, want: usize)
         // #7738: a stream is not read to its end for a byte that is not UTF-8: the window is jq's
         // substitution of its bytes, appended to the text with what it was made of, and the stream goes
         // on a window at a time.
-        if rest.windows.is_stream() {
+        // #7987 step 7b: so is a regular file with the reader model on, whose faults it reads from
+        // the bytes as read: the rest of the file is not read for it.
+        if rest.windows.is_stream() || more.model {
             append_lossy_window(lazy, more, &fresh);
             return lazy_window_read_on(more, rest);
         }
@@ -16998,15 +17022,30 @@ fn slide_lazy_window(
         return;
     };
     // #7738: a stream read on after a substitution keeps its text, which the bytes it is a
-    // substitution of are offsets into.
-    if lazy.lossy.is_some() {
+    // substitution of are offsets into. #7987 step 7b: with the reader model on, those are dropped
+    // with it ([`drop_lossy_front`]), so a stream or file with invalid UTF-8 holds a window too.
+    if lazy.lossy.is_some() && !more.model {
         return;
     }
     // Cheap to keep a little: dropping moves what is left, so it waits for a block's worth.
-    let drop = place.line_start().min(more.scanned_to);
+    let mut drop = place.line_start().min(more.scanned_to);
+    // #7987 step 7b: not past the last sync point among the documents handed out (the counter's line
+    // start can be inside a document over several lines), so a fault before the next one finds a place
+    // to enter the model at in the text.
+    if let Some(sync) = more.sync_before.filter(|_| more.model) {
+        drop = drop.min(sync);
+    }
     if drop == 0 || drop < lazy_window_bytes() / 4 || drop >= more.scanned_to {
         return;
     }
+    // The bytes as read the drop takes; `None` when it would cut a substituted run.
+    let Some(read_drop) = lazy
+        .lossy
+        .as_mut()
+        .map_or(Some(drop), |lossy| drop_lossy_front(lossy, drop))
+    else {
+        return;
+    };
     #[cfg(test)]
     LAZY_WINDOWS_READ.with(|n| n.set((n.get().0, n.get().1 + drop)));
     // #7480: the bytes an earlier file's cut document moved onto the front go with the first drop (the
@@ -17018,18 +17057,26 @@ fn slide_lazy_window(
         return;
     }
     let moved = lazy.seam.base.min(drop);
-    // Every line break before the counter's line start is before its position, and counted.
+    // Every line break before the counter's line start is before its position, and counted; a drop
+    // short of that line start (the sync point above) leaves the ones after it in the text.
+    let kept_newlines = if drop < place.line_start() {
+        count_newlines(&lazy.text.as_bytes()[drop..place.pos])
+    } else {
+        0
+    };
     lazy.dropped = DroppedText {
         bytes: lazy.dropped.bytes + drop,
-        newlines: place.newlines_before(),
+        newlines: place.newlines_before() - kept_newlines,
         moved_newlines: lazy.dropped.moved_newlines
             + count_newlines(&lazy.text.as_bytes()[..moved]),
+        own_read: lazy.dropped.own_read + read_drop - moved,
     };
     std::rc::Rc::make_mut(&mut lazy.text).drain(..drop);
     more.scanned_to -= drop;
     more.last_span = more
         .last_span
         .map(|(first, end)| (first, end.saturating_sub(drop)));
+    more.sync_before = more.sync_before.and_then(|at| at.checked_sub(drop));
     lazy.seam = std::mem::take(&mut lazy.seam).after_front_dropped(drop);
     more.seams = std::mem::take(&mut more.seams)
         .into_iter()
@@ -17040,6 +17087,28 @@ fn slide_lazy_window(
         place.seam = std::mem::take(&mut place.seam).after_front_dropped(drop);
         place
     });
+}
+
+/// Drops the first `drop` bytes of the text `lossy` is a substitution of from it (#7987 step 7b): the
+/// bytes they were made of, and the edits before them, with the rest moved back. Answers how many bytes
+/// as read went, or `None` (and nothing is dropped) when `drop` is inside a substituted run.
+fn drop_lossy_front(lossy: &mut LossySource, drop: usize) -> Option<usize> {
+    let first = lossy.edits.partition_point(|edit| edit.text.end <= drop);
+    if lossy
+        .edits
+        .get(first)
+        .is_some_and(|edit| edit.text.start < drop)
+    {
+        return None;
+    }
+    let read_drop = lossy.original_offset(drop);
+    lossy.original.drain(..read_drop);
+    lossy.edits.drain(..first);
+    for edit in &mut lossy.edits {
+        edit.raw = edit.raw.start - read_drop..edit.raw.end - read_drop;
+        edit.text = edit.text.start - drop..edit.text.end - drop;
+    }
+    Some(read_drop)
 }
 
 /// The first chunk of a lazy stream covers about this much text, and each chunk after it twice the
@@ -17212,6 +17281,9 @@ fn lazy_json_producer_then(
     // the eager reader an earlier file's fault hands the stream to (#6455).
     let mut sources = sources;
     let mut cursor = LazyCursor::default();
+    // #7987 step 7b: what jq's reader model carries from one fault it read to the next, and what it
+    // read there that is not handed out yet.
+    let mut carry = model_lazy::Carry::default();
     Box::new(move || {
         loop {
             let Some((lazy, later)) = sources.make_contiguous().split_first_mut() else {
@@ -17221,12 +17293,22 @@ fn lazy_json_producer_then(
             if cursor.next < lazy.spans.len() {
                 break;
             }
-            let handed_off =
-                lazy_scan_on(lazy, later, &mut tail, &mut exhausted, &mut cursor.lines);
+            // The model's answers come after the documents the scan found before its entry.
+            if let Some(item) = carry.pending.pop_front() {
+                return item;
+            }
+            let handed_off = lazy_scan_on(
+                lazy,
+                later,
+                &mut tail,
+                &mut exhausted,
+                &mut cursor.lines,
+                &mut carry,
+            );
             // The documents read are forgotten, so the spans held are a chunk's, not the stream's.
             cursor.next = 0;
             cursor.batch = None;
-            let finished = lazy.spans.is_empty() && lazy.more.is_none();
+            let finished = lazy.spans.is_empty() && lazy.more.is_none() && carry.pending.is_empty();
             if handed_off {
                 // The eager reader holds every file after this one now.
                 sources.truncate(1);
@@ -17234,6 +17316,7 @@ fn lazy_json_producer_then(
             if finished {
                 pop_finished_source(&mut sources);
                 cursor = LazyCursor::default();
+                carry.at = None;
             }
         }
         let Some(lazy) = sources.front() else {
@@ -17296,11 +17379,12 @@ fn lazy_json_producer_then(
         };
         // In 64 bits, as `InputLocations::push` keeps the eager route's lines (#7472).
         let produced = jq::ProducedInput::converted(converted, lazy.source, line as u64);
-        if cursor.next == lazy.spans.len() && lazy.more.is_none() {
+        if cursor.next == lazy.spans.len() && lazy.more.is_none() && carry.pending.is_empty() {
             // The source's text goes with its last document, not with the read past it; the next
             // source starts its own count.
             pop_finished_source(&mut sources);
             cursor = LazyCursor::default();
+            carry.at = None;
         }
         produced
     })
@@ -17340,6 +17424,7 @@ fn lazy_scan_on(
     tail: &mut Box<dyn Iterator<Item = jq::ProducedInput>>,
     exhausted: &mut Option<(u32, u64)>,
     lines: &mut Option<LinePlace>,
+    carry: &mut model_lazy::Carry,
 ) -> bool {
     let Some(mut more) = lazy.more.take() else {
         lazy.spans.clear();
@@ -17347,6 +17432,15 @@ fn lazy_scan_on(
     };
     if let Some(&(start, end)) = lazy.spans.last() {
         more.last_span = Some((lazy.text.as_bytes()[start], end));
+        // #7987 step 7b: the last sync point among them, for a fault met before the next newline.
+        if more.model {
+            let from = lazy.spans[0].0;
+            if let Some(newline) =
+                model_window::newline_between_values(lazy.text.as_bytes(), from, end, &lazy.spans)
+            {
+                more.sync_before = Some(newline + 1);
+            }
+        }
     }
     lazy.spans.clear();
     // #6451, #7023: the text after the front of a lone source is read a window at a time, when the
@@ -17429,7 +17523,10 @@ fn lazy_scan_on(
             .rest
             .as_mut()
             .is_some_and(|rest| rest.windows.is_stream());
-    if chunk.end == ChunkEnd::Fault && more.rest.is_some() && !stream_fault {
+    // #7987 step 7b: jq's reader model reads the fault, from the last sync point before it to the next
+    // one after, and the scan goes on from there: the rest of the source is not read for it.
+    let by_model = more.model && chunk.end == ChunkEnd::Fault;
+    if chunk.end == ChunkEnd::Fault && more.rest.is_some() && !stream_fault && !by_model {
         read_lazy_rest(lazy, &mut more);
     }
     more.chunks += 1;
@@ -17466,10 +17563,33 @@ fn lazy_scan_on(
             carry_cut_document(lazy, start, &mut later[0], lines, more.last_source);
             return false;
         }
+        if by_model {
+            match lazy_fault_by_model(lazy, &mut more, end_of_last, carry, exhausted) {
+                Some(true) => {
+                    lazy.more = Some(more);
+                    return false;
+                }
+                // patchcov: coverage tolerate-line reason="unreachable: the end of input is in the last file, which has no file after it"
+                Some(false) => return false,
+                // The region runs on into the next file: the eager reader reads the stream.
+                None => read_lazy_rest(lazy, &mut more),
+            }
+        }
         let (handed, end) = hand_off_later_sources(lazy, end_of_last, later, more.last_source);
         *tail = handed;
         *exhausted = end;
         return true;
+    }
+    if by_model {
+        match lazy_fault_by_model(lazy, &mut more, end_of_last, carry, exhausted) {
+            Some(true) => {
+                lazy.more = Some(more);
+                return false;
+            }
+            Some(false) => return false,
+            None if !stream_fault => read_lazy_rest(lazy, &mut more),
+            None => {}
+        }
     }
     let settled = |tail: EofTail| (!tail.unknown).then_some((more.last_source, tail.newlines));
     match chunk.end {
@@ -17530,6 +17650,192 @@ fn lazy_scan_on(
         }
     }
     false
+}
+
+/// A source read a window at a time, as jq's reader model reads a region of it (#7987 step 7b).
+struct LazyRegionHeld<'a> {
+    lazy: &'a mut LazyJsonInputs,
+    more: &'a mut LazyMore,
+}
+
+impl LazyRegionHeld<'_> {
+    /// The file offset as read of the text's first byte of the file's own: the mark jq's first read
+    /// held, and the file's own bytes the windows dropped.
+    fn front(&self) -> usize {
+        self.lazy.seam.lead + self.lazy.dropped.own_read
+    }
+}
+
+impl model_lazy::LazyHeld for LazyRegionHeld<'_> {
+    fn view(&self) -> model_lazy::TextView<'_> {
+        let lazy = &*self.lazy;
+        let front = self.front();
+        model_lazy::TextView {
+            text: lazy.text.as_bytes(),
+            lossy: lazy.lossy.as_ref(),
+            base: lazy.seam.base.min(lazy.text.len()),
+            front,
+            // The mark is before the text only while nothing of the file was dropped.
+            lead: if front == lazy.seam.lead {
+                lazy.seam.lead
+            } else {
+                0
+            },
+            // Bytes moved off the end onto the next file are this file's, which the text no longer
+            // holds.
+            to_end: self.more.rest.is_none() && lazy.seam.moved_len == 0,
+        }
+    }
+
+    fn read_on(&mut self) -> bool {
+        if self.more.rest.is_none() {
+            return false;
+        }
+        read_lazy_window(self.lazy, self.more, lazy_window_bytes());
+        true
+    }
+}
+
+/// jq's reader model reads the fault a lazy source's scan stopped at (#7987 step 7b,
+/// [`model_lazy`]): entered at the last sync point before the value the scan stopped in (which starts
+/// at the first byte from `end_of_last` that is not white space), it reads to the first sync point
+/// past that byte, and its answers are queued in `carry` after the documents the scan found before
+/// the entry, which `lazy.spans` keeps. `Some(true)` when it handed back (the scan goes on from
+/// `more.scanned_to`), `Some(false)` when it read to the end of the input (`exhausted` is settled),
+/// and `None` when it was not entered or needed a read of another file: nothing was handed out, and
+/// the caller reads the fault as before.
+#[cold]
+#[inline(never)]
+fn lazy_fault_by_model(
+    lazy: &mut LazyJsonInputs,
+    more: &mut LazyMore,
+    end_of_last: usize,
+    carry: &mut model_lazy::Carry,
+    exhausted: &mut Option<(u32, u64)>,
+) -> Option<bool> {
+    let text = lazy.text.as_bytes();
+    let base = lazy.seam.base.min(text.len());
+    let end_of_last = end_of_last.min(text.len());
+    let fault_from = text[end_of_last..]
+        .iter()
+        .position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        .map_or(text.len(), |at| end_of_last + at);
+    // A fault in the bytes an earlier file's cut document moved onto this one: its sync point is in
+    // that file, whose text is gone.
+    if fault_from < base {
+        return None;
+    }
+    let file = lazy.source as usize;
+    let dropped = lazy.dropped;
+    let seed = line_seed();
+    // The file's own line breaks before the text, and the 1-based stream line the text starts on.
+    let (own_before, line0) = if dropped.bytes == 0 {
+        (0, lazy.file_start.0)
+    } else {
+        (
+            dropped.newlines.saturating_sub(seed),
+            dropped.window_start(lazy.file_start).0.saturating_sub(seed),
+        )
+    };
+    let held = LazyRegionHeld {
+        lazy: &mut *lazy,
+        more: &mut *more,
+    };
+    let view = model_lazy::LazyHeld::view(&held);
+    let text = view.text;
+    // The documents handed out end by `handed`: the entry is after them, or they are dropped.
+    let handed = held.more.last_span.map_or(0, |(_, end)| end);
+    let carried = carry
+        .at
+        .filter(|&(at, _)| at >= view.front)
+        .map(|(at, state)| (view.text_offset(at), state))
+        .filter(|&(at, _)| at <= fault_from);
+    let low = base.max(handed).max(carried.map_or(0, |(at, _)| at));
+    let newline = model_window::newline_between_values(text, low, fault_from, &held.lazy.spans);
+    // The last sync point before the fault: a line start after the documents handed out, where the
+    // model last handed back, a line start among the documents handed out, or the file's front.
+    let line_start = newline.map(|newline| newline + 1).or_else(|| {
+        held.more
+            .sync_before
+            .filter(|&at| at >= base && at <= fault_from && carried.map_or(true, |(c, _)| at > c))
+    });
+    let at_line = |entry: usize| {
+        model_lazy::at_line_start(
+            file,
+            view.file_offset(entry),
+            own_before + count_newlines(&text[base..entry]),
+            line0 + count_newlines(&text[..entry]) - 1,
+            carry.lag,
+        )
+    };
+    let (entry, state, front) = match (line_start, carried) {
+        (Some(entry), Some((at, state))) if entry <= at => (at, state, false),
+        (Some(entry), _) => (entry, at_line(entry), false),
+        (None, Some((at, state))) => (at, state, false),
+        (None, None) if dropped.bytes == 0 && base == 0 => {
+            let (line, column) = held.lazy.file_start;
+            let front = (line, column) == StreamOrigin::ALONE.file;
+            let state = model_lazy::at_file_start(file, line, column, front, carry.lag);
+            (0, state, front)
+        }
+        // No sync point the text holds: the eager reader reads the fault.
+        (None, None) => return None,
+    };
+    let region = model_lazy::Entry {
+        state,
+        file,
+        files: held.more.last_source as usize + 1,
+        front,
+        drop_through: view.file_offset(entry.max(handed.min(fault_from))),
+        past: view.file_offset(fault_from),
+    };
+    #[cfg(test)]
+    LAZY_MODEL_REGIONS.with(|n| n.set(n.get() + 1));
+    let mut held = held;
+    let pending = carry.pending.len();
+    let end = model_lazy::read_region(&mut held, &region, carry)?;
+    // The scan's documents from the entry on are the model's.
+    let kept = held.lazy.spans.partition_point(|&(_, end)| end <= entry);
+    held.lazy.spans.truncate(kept);
+    debug_assert!(
+        pending == 0,
+        "a region's answers are handed out before the next scan"
+    );
+    let view = model_lazy::LazyHeld::view(&held);
+    let last_span = carry
+        .last_value
+        .take()
+        .map(|(first, end)| (first, view.text_offset(end.max(view.front))));
+    // Where the scan reads on, the reader there, and the stream's 1-based line there, which the
+    // parser's count lags by the line breaks the faults dropped.
+    let handed_back = match end {
+        model_lazy::RegionEnd::HandBack(at, state) => {
+            let resume = view.text_offset(at);
+            let line = line0 + count_newlines(&view.text[..resume.min(view.text.len())]);
+            Some((at, state, resume, line))
+        }
+        model_lazy::RegionEnd::End(at) => {
+            *exhausted = model_lazy::exhausted_at(at, held.more.last_source);
+            None
+        }
+    };
+    if last_span.is_some() {
+        held.more.last_span = last_span;
+    }
+    let Some((at, state, resume, line)) = handed_back else {
+        // The model read to the end of the input.
+        return Some(false);
+    };
+    carry.lag = line.saturating_sub(state.parser.line);
+    carry.at = Some((at, state));
+    held.more.scanned_to = resume;
+    Some(true)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: how many regions of a lazy source jq's reader model was entered for (#7987 step 7b).
+    static LAZY_MODEL_REGIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// jq's parser reading the value a lone stream is read on for (#7812): where the value starts in the text,
@@ -17806,6 +18112,8 @@ fn carry_cut_document(
         last_span: None,
         recorded_tail: None,
         rest: None,
+        model: false,
+        sync_before: None,
     });
     more.seams = vec![next.seam.clone()];
 }
@@ -25311,6 +25619,95 @@ mod tests {
         assert!(
             windows > slid.0 + streams.len() && dropped > slid.1,
             "the windows were read and the text before them dropped: {windows} {dropped}"
+        );
+    }
+
+    /// #7987 step 7b: with the reader model on, the lazy routes (a lone source started on its front and
+    /// read a window at a time, and several files each read a window at a time) read every fault through
+    /// the model and hand back to the scan after it, so what `input` pops, with the `(at ...)` marker after
+    /// each, through the first end of input, is the model's own read of the files from the stream's start
+    /// ([`model_read::transcript_alone`]): past every fault, not only through the first, and over the
+    /// bytes as read where a byte is not UTF-8. Every region is entered from a sync point the producer's
+    /// counters give or the last hand-back carried, and every fault here is one the model was entered for.
+    /// The pin can fail: it does with the line breaks a fault dropped counted in the next region's entry
+    /// (the carried lag), with the hand-back's state not carried to a second fault on the same line, and
+    /// with the end of input after a fault at EOF read off the text.
+    #[test]
+    fn the_lazy_routes_read_past_their_faults_as_the_model_reads_the_files_7987() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let observe = |files: &[&[u8]], front: Option<usize>, window: usize| {
+            reader_model::MODEL_ON.with(|model| model.set(Some(true)));
+            LAZY_PREFIX_OVERRIDE.with(|c| c.set(front));
+            LAZY_WINDOW_OVERRIDE.with(|c| c.set(Some(window)));
+            LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(Some(1)));
+            let seen = observe_inputs_once(dir.path(), files, &[], false, Some(8)).0;
+            LAZY_RAW_MIN_OVERRIDE.with(|c| c.set(None));
+            LAZY_PREFIX_OVERRIDE.with(|c| c.set(None));
+            LAZY_WINDOW_OVERRIDE.with(|c| c.set(None));
+            reader_model::MODEL_ON.with(|model| model.set(None));
+            let through_end = seen
+                .iter()
+                .position(|row| row.starts_with("end "))
+                .map_or(seen.len(), |at| at + 1);
+            seen[..through_end].to_vec()
+        };
+        let clean: &[u8] =
+            b"{\"a\":\"\xc3\xa9\"} [1,\n2]\n\"x\" 3\n{\"b\":\n[]} true\n\n\n7\n[\"x\"]\n";
+        let inserts: [&[u8]; 7] = [
+            b"}",
+            b"6 } 7",
+            b"} }\n}",
+            b"\"\xc3(\" }",
+            b"\xff",
+            b"[1 2]",
+            b"\"x",
+        ];
+        // The line starts of `clean` that no value holds: each stream has a fault there, and a second
+        // one later on, and its three files are cut there.
+        let (values, _) = split_json_values(clean);
+        let starts: Vec<usize> = (0..=clean.len())
+            .filter(|&at| at == 0 || clean[at - 1] == b'\n')
+            .filter(|&at| !values.iter().any(|&(start, end)| start < at && at < end))
+            .collect();
+        let mut streams: Vec<(Vec<u8>, usize)> = Vec::new();
+        for insert in inserts {
+            for &at in &starts {
+                let stream = [&clean[..at], insert, b"\n", clean, b"}\n", clean].concat();
+                streams.push((stream, at));
+            }
+        }
+        let regions = LAZY_MODEL_REGIONS.with(std::cell::Cell::get);
+        let hand_offs = HAND_OFFS.with(std::cell::Cell::get);
+        for (stream, cut) in &streams {
+            let model = model_read::transcript_alone(&[stream]);
+            for (front, window) in [(Some(6), 1), (Some(13), 9), (Some(21), 40), (None, 4)] {
+                assert_eq!(
+                    observe(&[stream], front, window),
+                    model,
+                    "front {front:?} window {window} of {:?}",
+                    String::from_utf8_lossy(stream)
+                );
+            }
+            // Several files, cut where a line starts between values, so no value runs on across a
+            // seam (a fault in a value cut across files is read by the eager reader).
+            let files: [&[u8]; 3] = [&stream[..*cut], clean, &stream[*cut..]];
+            assert_eq!(
+                observe(&files, None, 9),
+                model_read::transcript_alone(&files),
+                "three files of {:?}",
+                String::from_utf8_lossy(stream)
+            );
+        }
+        let regions = LAZY_MODEL_REGIONS.with(std::cell::Cell::get) - regions;
+        assert!(
+            regions > 4 * streams.len(),
+            "{regions} regions over {} streams",
+            streams.len()
+        );
+        assert_eq!(
+            HAND_OFFS.with(std::cell::Cell::get),
+            hand_offs,
+            "no fault was handed to the eager reader"
         );
     }
 
@@ -34857,6 +35254,7 @@ mod lines_past_u32_tests_7472 {
             bytes: 1,
             newlines: 1 << 32,
             moved_newlines: 0,
+            own_read: 0,
         };
         let tail = EofTail {
             newlines: 5,

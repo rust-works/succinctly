@@ -376,3 +376,142 @@ fn the_switch_selects_the_old_reader_on_the_windowed_routes_7987() -> Result<()>
     assert_eq!(got.0.lines().count(), 2 * SIDE);
     Ok(())
 }
+
+/// Step 7b's sweep: every `input` to the end, each fault caught with where the reader stood.
+const SWEEP: &str = "[label $s | foreach range(1; 1e6) as $i (null; try [input, input_line_number, \
+                     input_filename] catch (if . == \"No more inputs\" or . == \"break\" then break $s \
+                     else \"E:\\(.)@\\(input_line_number)@\\(input_filename)\" end))] \
+                     | [length, map(strings), .[-1]]";
+
+/// Step 7b: a lone source past its front (a file, and a pipe) meets its faults on the lazy route, and
+/// jq's reader model reads each from the last sync point before it to the next one after, where the
+/// lazy scan goes on. The reads a fault drops (`6 } 7`, `1 tru`) and the line breaks jq's parser then
+/// never counts are the model's, so every fault after the first is placed as jq places it, where the
+/// eager reader that took the rest of the stream counted the dropped line breaks. A fault on a line
+/// with invalid UTF-8 is read over the bytes as read. jq 1.7.1's answers (1.8.2 agrees).
+#[test]
+fn a_lone_source_reads_on_past_its_faults_through_the_model_7987() -> Result<()> {
+    let input = [
+        records(0, 2 * SIDE),
+        b"}\n".to_vec(),
+        records(2 * SIDE, 10),
+        b"[4,\n5]\n6 } 7\n".to_vec(),
+        records(2 * SIDE + 10, SIDE),
+        b"{\"a\":\"\xe9\" 1}\n".to_vec(),
+        records(3 * SIDE + 10, 10),
+        b"1 tru\n9\n".to_vec(),
+    ]
+    .concat();
+    for stdin in [false, true] {
+        let name = if stdin { "<stdin>" } else { "in.json" };
+        let got = run_windowed(&input, &["-c", "-n", SWEEP], stdin, &[])?;
+        let want = format!(
+            "[18028,[\"E:Unmatched '}}' at line 12001, column 1@12001@{name}\",\
+             \"E:Unmatched '}}' at line 12013, column 3@12014@{name}\",\
+             \"E:Expected separator between values at line 18013, column 11@18015@{name}\",\
+             \"E:Invalid literal at line 18024, column 0@18026@{name}\"],[9,18027,\"{name}\"]]\n"
+        );
+        assert_eq!(
+            (got.0, got.1, got.2),
+            (want, String::new(), 0),
+            "stdin {stdin}"
+        );
+    }
+    Ok(())
+}
+
+/// Step 7b: several files on the lazy route, a fault in the second and two in the third. The model
+/// hands back to the scan after each, and the line breaks the faults dropped from jq's parser's count
+/// carry into the next file, which has its own reads. jq 1.7.1's answer (1.8.2 agrees).
+#[test]
+fn several_files_carry_the_reader_across_their_faults_7987() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let files: [(&str, Vec<u8>); 3] = [
+        ("a.json", records(0, SIDE)),
+        (
+            "b.json",
+            [
+                records(SIDE, SIDE),
+                b"}\n".to_vec(),
+                records(2 * SIDE, 10),
+                b"6 } 7\n".to_vec(),
+                records(2 * SIDE + 10, SIDE),
+            ]
+            .concat(),
+        ),
+        (
+            "c.json",
+            [
+                records(3 * SIDE + 10, SIDE),
+                b"[1 2]\n".to_vec(),
+                records(4 * SIDE + 10, 5),
+                b"nul".to_vec(),
+            ]
+            .concat(),
+        ),
+    ];
+    for (name, bytes) in &files {
+        std::fs::write(dir.path().join(name), bytes)?;
+    }
+    let window = small_window::WINDOW.to_string();
+    let log = dir.path().join("routes.log");
+    let log_path = log.to_string_lossy().into_owned();
+    let mut env = vec![("SUCCINCTLY_DEBUG_JQ_ROUTE_LOG", log_path.as_str())];
+    if cfg!(debug_assertions) {
+        env.push((small_window::ENV, &window));
+    }
+    let want = "[24020,[\"E:Unmatched '}' at line 12001, column 1@6001@b.json\",\
+                \"E:Unmatched '}' at line 12011, column 3@6012@b.json\",\
+                \"E:Expected separator between values at line 24011, column 5@6001@c.json\",\
+                \"E:Invalid literal at EOF at line 24016, column 3@6006@c.json\"],\
+                \"E:Invalid literal at EOF at line 24016, column 3@6006@c.json\"]\n";
+    let args = ["-c", "-n", SWEEP, "a.json", "b.json", "c.json"];
+    let got = run(dir.path(), &args, b"", &env)?;
+    assert_eq!(got, (want.to_owned(), String::new(), 0));
+    if cfg!(debug_assertions) {
+        assert_eq!(
+            std::fs::read_to_string(&log)?,
+            "inputs\n",
+            "the several files' lazy route"
+        );
+    }
+    // `SUCCINCTLY_READER_MODEL=0` keeps the eager reader that took the rest of the stream at the
+    // first fault, which counted the line breaks jq's parser never reads.
+    env.push(("SUCCINCTLY_READER_MODEL", "0"));
+    let got = run(dir.path(), &args, b"", &env)?;
+    assert!(
+        got.0.contains("at line 12012, column 3@6012@b.json"),
+        "{}",
+        got.0
+    );
+    Ok(())
+}
+
+/// `SUCCINCTLY_READER_MODEL=0` keeps the old reader on a lone source's lazy route too: the eager
+/// reader takes the rest of the stream at the first fault and places the later ones by the line
+/// breaks in the text, the dropped ones included. With the model on, jq 1.7.1's line (1.8.2 agrees).
+#[test]
+fn the_switch_selects_the_old_reader_past_a_lone_sources_fault_7987() -> Result<()> {
+    let input = [
+        records(0, 2 * SIDE),
+        b"}\n".to_vec(),
+        records(2 * SIDE, 10),
+        b"6 } 7\n".to_vec(),
+        records(2 * SIDE + 10, 10),
+    ]
+    .concat();
+    let off = [("SUCCINCTLY_READER_MODEL", "0")];
+    let got = run_windowed(&input, &["-c", "-n", SWEEP], false, &off)?;
+    assert!(
+        got.0.contains("at line 12012, column 3@12012@in.json"),
+        "{}",
+        got.0
+    );
+    let got = run_windowed(&input, &["-c", "-n", SWEEP], false, &[])?;
+    assert!(
+        got.0.contains("at line 12011, column 3@12012@in.json"),
+        "{}",
+        got.0
+    );
+    Ok(())
+}
