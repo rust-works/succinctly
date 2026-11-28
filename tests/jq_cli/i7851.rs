@@ -6,8 +6,10 @@
 //! past it, reported the files that did not open, exited 2 and named the last file.
 //!
 //! The exit status, the standard output and the file named were captured from jq 1.7.1
-//! (`/usr/bin/jq`); jq 1.8.2 agrees on every row. Outside `--stream` jq words the fault `Malformed
-//! BOM` where `succinctly jq` words it as a numeric literal, the divergence recorded in
+//! (`/usr/bin/jq`); jq 1.8.2 agrees on every row. jq words the fault `Malformed BOM`, and so does
+//! `succinctly jq` on the routes ADR-0033's reader model reads (`--stream`, and since step 5 of
+//! #7987 the materializing route a program that reads `input` takes). The default route (`.`) and
+//! `--slurp` still word it as a numeric literal, the divergence recorded in
 //! docs/compliance/jq/limitations.md (#5804), so those rows pin succinctly's wording.
 
 use anyhow::Result;
@@ -23,7 +25,8 @@ type Row = (
     i32,
 );
 
-/// The numeric-literal wording of `Malformed BOM` (#5804) at `column`.
+/// The numeric-literal wording of `Malformed BOM` (#5804) at `column`, on the routes the reader
+/// model has not reached.
 macro_rules! literal {
     ($column:literal) => {
         concat!(
@@ -32,14 +35,12 @@ macro_rules! literal {
             "\n"
         )
     };
-    ($file:literal, $column:literal) => {
-        concat!(
-            "jq: error (at ",
-            $file,
-            ":0): Invalid numeric literal at EOF at line 1, column ",
-            $column,
-            "\n"
-        )
+}
+
+/// jq's `Malformed BOM` as `input` raises it, at `file`, line 0 (#7987 step 5).
+macro_rules! malformed {
+    ($file:literal) => {
+        concat!("jq: error (at ", $file, ":0): Malformed BOM\n")
     };
 }
 
@@ -49,7 +50,7 @@ static ROWS: &[Row] = &[
     (
         &["-c", "-n", "[inputs]"],
         &["ef", "ef", "empty"],
-        literal!("ef.json", "2"),
+        malformed!("ef.json"),
         5,
     ),
     (
@@ -84,44 +85,44 @@ static ROWS: &[Row] = &[
     (
         &["-c", "-n", "input"],
         &["efbad", "one"],
-        literal!("efbad.json", "4"),
+        malformed!("efbad.json"),
         5,
     ),
     // `input` and `inputs` name the file the mark broke off in, past one with no bytes too.
     (
         &["-c", "-n", "input"],
         &["ef", "ef", "gone"],
-        literal!("ef.json", "2"),
+        malformed!("ef.json"),
         5,
     ),
     (
         &["-c", "-n", "input"],
         &["efbb", "ef", "bf"],
-        literal!("ef.json", "3"),
+        malformed!("ef.json"),
         5,
     ),
     (
         &["-c", "-n", "[inputs]"],
         &["ef", "efbb", "adir"],
-        literal!("efbb.json", "3"),
+        malformed!("efbb.json"),
         5,
     ),
     (
         &["-c", "-n", "[inputs]"],
         &["efbb", "efbb", "bbbf"],
-        literal!("efbb.json", "4"),
+        malformed!("efbb.json"),
         5,
     ),
     (
         &["-c", "-n", "[inputs]"],
         &["ef", "ef", "-"],
-        literal!("ef.json", "2"),
+        malformed!("ef.json"),
         5,
     ),
     (
         &["-c", "-n", "[inputs]"],
         &["ef", "empty", "efbb", "one"],
-        literal!("efbb.json", "3"),
+        malformed!("efbb.json"),
         5,
     ),
     // A file that does not open before the file the mark breaks off in is reported, as before.

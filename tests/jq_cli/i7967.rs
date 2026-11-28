@@ -102,10 +102,12 @@ fn a_long_line_after_a_fault_is_read_on_from_jqs_next_read_7967() -> Result<()> 
     Ok(())
 }
 
-/// A later fault is placed where it is in the text (best effort above the floor). jq 1.7.1 and 1.8.2
-/// place the second `}` of `}\n}\n` at line 1, column 2, from where the first fault left their parser
-/// (they do not count the newline the first fault's read dropped); the values and the order of the
-/// faults stay jq's.
+/// A later fault is best effort above the floor. jq 1.7.1 and 1.8.2 place the second `}` of `}\n}\n`
+/// at line 1, column 2, from where the first fault left their parser (they do not count the newline
+/// the first fault's read dropped). The routes that keep their own deciders place it where it is in
+/// the text (line 2, column 1); since step 5 of #7987 the materializing route these runs take reads
+/// past the first fault with ADR-0033's reader model, which places it as jq does. The values and the
+/// order of the faults are jq's either way.
 #[test]
 fn a_later_fault_is_placed_where_it_is_in_the_text_7967() -> Result<()> {
     let filter = "[limit(4; repeat(try input catch .))]";
@@ -113,7 +115,7 @@ fn a_later_fault_is_placed_where_it_is_in_the_text_7967() -> Result<()> {
         (
             "}\n}\n[4]\n",
             "[\"Unmatched '}' at line 1, column 1\",\"Unmatched '}' at line 1, column 2\",[4],\"break\"]\n",
-            "[\"Unmatched '}' at line 1, column 1\",\"Unmatched '}' at line 2, column 1\",[4],\"break\"]\n",
+            "[\"Unmatched '}' at line 1, column 1\",\"Unmatched '}' at line 1, column 2\",[4],\"break\"]\n",
         ),
         (
             "tru\n}\n5\n",

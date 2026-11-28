@@ -4,10 +4,12 @@
 //! end: the second `try input catch .` said `break`, an `input` after a caught `inputs` said `break`
 //! at `(at <unknown>)`, and a stream with more text after the mark handed that text out as documents.
 //!
-//! Every row was captured from jq 1.7.1 (`/usr/bin/jq`); jq 1.8.2 gives the same on each. The first
-//! read of the fault keeps the numeric-literal wording the plain routes give a mark that breaks off
-//! (#5804, recorded in docs/compliance/jq/limitations.md), so `first` says what `succinctly jq` says
-//! where jq says `Malformed BOM` for the first read; the reads after it are jq's own words.
+//! Every row was captured from jq 1.7.1 (`/usr/bin/jq`); jq 1.8.2 gives the same on each. Since step
+//! 5 of #7987 the materializing route these runs take reads the mark through ADR-0033's reader model,
+//! so the first read says `Malformed BOM` too, as jq does. A pipe longer than its first read is read
+//! lazily, a route the model has not reached, whose first read keeps the numeric-literal wording
+//! (#5804, recorded in docs/compliance/jq/limitations.md): `first` says what `succinctly jq` says
+//! there; the reads after it are jq's own words.
 
 use anyhow::Result;
 
@@ -40,7 +42,7 @@ static ROWS: &[Row] = &[
         stdout: THREE_BOM,
         stderr: "",
         status: 0,
-        first: Some(AT_LINE_2),
+        first: None,
     },
     // Text after the mark is never read: it is not handed out as documents.
     Row {
@@ -51,7 +53,7 @@ static ROWS: &[Row] = &[
         stdout: THREE_BOM,
         stderr: "",
         status: 0,
-        first: Some(AT_LINE_2),
+        first: None,
     },
     Row {
         label: "EF BB, then a byte that is not BF",
@@ -61,7 +63,7 @@ static ROWS: &[Row] = &[
         stdout: THREE_BOM,
         stderr: "",
         status: 0,
-        first: Some(AT_LINE_2),
+        first: None,
     },
     Row {
         label: "EF BF BD, a character that is not the mark",
@@ -71,7 +73,7 @@ static ROWS: &[Row] = &[
         stdout: THREE_BOM,
         stderr: "",
         status: 0,
-        first: Some("Invalid numeric literal at EOF at line 1, column 4"),
+        first: None,
     },
     // The first fault is caught by `?`: the `input` after it says it, at the same place.
     Row {
@@ -92,7 +94,7 @@ static ROWS: &[Row] = &[
         stdout: "\"Malformed BOM\"\n\"Malformed BOM\"\n",
         stderr: "",
         status: 0,
-        first: Some(AT_LINE_2),
+        first: None,
     },
     Row {
         label: "the marker names the file the mark broke off in",
@@ -112,7 +114,7 @@ static ROWS: &[Row] = &[
         stdout: THREE_BOM,
         stderr: "",
         status: 0,
-        first: Some("Invalid numeric literal at EOF at line 1, column 4"),
+        first: None,
     },
     Row {
         label: "a mark cut across files that departs in the second",
@@ -122,7 +124,7 @@ static ROWS: &[Row] = &[
         stdout: THREE_BOM,
         stderr: "",
         status: 0,
-        first: Some("Invalid numeric literal at line 1, column 2"),
+        first: None,
     },
     Row {
         label: "input_line_number and input_filename after the fault",
@@ -132,7 +134,7 @@ static ROWS: &[Row] = &[
         stdout: "\"Malformed BOM\"\n1\n\"<stdin>\"\n",
         stderr: "",
         status: 0,
-        first: Some(AT_LINE_2),
+        first: None,
     },
     Row {
         label: "inputs",
@@ -142,7 +144,7 @@ static ROWS: &[Row] = &[
         stdout: "",
         stderr: "jq: error (at <stdin>:1): Malformed BOM\n",
         status: 5,
-        first: Some(AT_LINE_2),
+        first: None,
     },
     // A mark that ends the input is no fault (#7454): the stream is empty, so every read is its end.
     Row {

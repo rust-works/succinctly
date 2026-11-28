@@ -8701,37 +8701,17 @@ fn read_inputs(
         && handed.is_none();
     // The triggers known before anything is read as JSON: a mark that is not whole, and several
     // sources not all UTF-8 (never read lazily). The model reads the whole input, as it was read.
-    let sources_utf8 = (model_route && raw_bytes.len() > 1)
-        .then(|| raw_bytes.iter().all(|(_, raw)| std::str::from_utf8(raw).is_ok()));
-    if model_route
-        && (sources_utf8 == Some(false)
-            || model_read::mark_not_whole(raw_bytes.iter().map(|(_, raw)| raw.as_slice())))
-    {
-        let sources: Vec<&[u8]> = raw_bytes.iter().map(|(_, raw)| raw.as_slice()).collect();
-        let tags: Vec<usize> = raw_bytes.iter().map(|(tag, _)| tag.unwrap_or(0)).collect();
-        let mut locations =
-            InputLocations::new(files.iter().map(|p| Some(input_display_name(p))).collect());
-        let (mut values, mut errors) = (Vec::new(), Vec::new());
-        model_read::read_whole(
-            &sources,
-            &tags,
-            model_read::Sink {
-                values: &mut values,
-                locations: &mut locations,
-                errors: &mut errors,
-            },
-        );
-        return Ok(Ok((values, locations, None, errors)));
+    // (No closure is added to this function for the model: the link order names them by number.)
+    let sources_utf8 = if model_route {
+        model_read::sources_utf8(&raw_bytes)
+    } else {
+        None
+    };
+    if model_route && model_read::read_whole_on_trigger(&raw_bytes, sources_utf8) {
+        return Ok(Ok(model_read::read_whole_as_read(&raw_bytes, &files)));
     }
     // What the model needs of the sources as read, should the loop below meet a trigger.
-    let (model_lens, model_tags): (Vec<usize>, Vec<usize>) = if model_route {
-        raw_bytes
-            .iter()
-            .map(|(tag, raw)| (raw.len(), tag.unwrap_or(0)))
-            .unzip()
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let model_sources = model_read::SourcesAsRead::of(model_route, &raw_bytes);
     // `--seq` keeps the mark: its reader removes it as jq's does, and reacts to one that breaks off.
     let bom_cuts = if json_input_mode {
         // #5291: jq skips a BOM at the start of its input.
@@ -8766,11 +8746,12 @@ fn read_inputs(
     // mark it reads is whole in one source, valid UTF-8 cut whole.
     let several_lazy = lazy_read_flags(args, track_eof)
         && raw_bytes.len() > 1
-        && sources_utf8.unwrap_or_else(|| {
-            raw_bytes
+        && match sources_utf8 {
+            Some(all) => all,
+            None => raw_bytes
                 .iter()
-                .all(|(_, raw)| std::str::from_utf8(raw).is_ok())
-        });
+                .all(|(_, raw)| std::str::from_utf8(raw).is_ok()),
+        };
     let mut seams = if several_lazy {
         vec![Seam::NONE; raw_bytes.len()]
     } else if json_input_mode && !args.validate && !args.stream_errors && !stream_by_reader {
@@ -9951,7 +9932,7 @@ fn read_inputs(
                     let mut model_ends: Vec<usize> = Vec::new();
                     if let Some(spans) = lazy_prefix {
                         if model_route {
-                            model_ends.extend(spans.iter().map(|&(_, end)| end));
+                            model_read::push_ends(&mut model_ends, &spans);
                         }
                         offset = spans.last().map_or(0, |&(_, end)| end);
                         defer_lazy_start(std::rc::Rc::clone(&raw), spans, src, seam.clone(), None);
@@ -9994,20 +9975,13 @@ fn read_inputs(
                     if model_route {
                         let lazy = model_ends.len();
                         model_ends.extend_from_slice(&ends);
-                        // A lone source that is not UTF-8 is read as the substitution of it from its
-                        // first changed byte, which is a trigger of its own.
-                        let changed = lossy.and_then(|lossy| lossy.edits.first()).map(|edit| edit.text.start);
-                        let trigger = match (first_fault, changed) {
-                            (Some(fault), Some(changed)) => Some(fault.min(changed)),
-                            (fault, changed) => fault.or(changed),
-                        };
                         model_files.push(model_read::EagerFile {
                             text: std::rc::Rc::clone(&raw),
                             base: seam.base,
                             ends: model_ends,
                             lazy,
                             values_before: documents_before,
-                            trigger,
+                            trigger: model_read::EagerFile::trigger_of(first_fault, lossy),
                         });
                     }
                     continue;
@@ -10117,35 +10091,17 @@ fn read_inputs(
         // ADR-0033 step 5 (#7987): the loop met a trigger (a fault, or a lone source's first byte
         // that is not UTF-8). Its values before the last sync point ahead of it stand, and jq's
         // reader model reads the rest of the input from there, over the sources as they were read.
-        if model_files.iter().any(|file| file.trigger.is_some()) {
-            let stream =
-                model_read::original_stream(&model_files, &lossy_sources, &bom_cuts, &model_lens);
-            debug_assert!(stream.is_some(), "the texts read are the sources read");
-            if let Some(stream) = stream {
-                let mut sources: Vec<&[u8]> = Vec::with_capacity(model_lens.len());
-                let mut at = 0;
-                for &len in &model_lens {
-                    sources.push(&stream[at..at + len]);
-                    at += len;
-                }
-                if let Some(entry) = model_read::entry_before(&model_files, &sources, &bom_cuts) {
-                    values.truncate(entry.keep);
-                    locations.truncate_values(entry.keep);
-                    resumed_errors.clear();
-                    model_read::read_rest(
-                        &sources,
-                        &model_tags,
-                        entry.state,
-                        entry.drop_through,
-                        model_read::Sink {
-                            values: &mut values,
-                            locations: &mut locations,
-                            errors: &mut resumed_errors,
-                        },
-                    );
-                }
-            }
-        }
+        model_read::enter_after_trigger(
+            &model_files,
+            &model_sources,
+            &lossy_sources,
+            &bom_cuts,
+            model_read::Sink {
+                values: &mut values,
+                locations: &mut locations,
+                errors: &mut resumed_errors,
+            },
+        );
     }
 
     // #5661: a lazy candidate's tail is set on whichever route took the stream, as every other
@@ -24872,7 +24828,47 @@ mod tests {
     }
 
     /// [`observe_inputs`] with `flags` (`-R`) before the program.
+    ///
+    /// Read with the deciders ADR-0033's reader model replaces (`SUCCINCTLY_READER_MODEL=0`): the
+    /// lazy routes keep them until step 7, and these tests hold those routes to the eager reader they
+    /// were built to match. The eager reader is also read with the model on (step 5: it enters the
+    /// model on a trigger), and where it entered the model its answer is held, through the first end
+    /// of input, to the model's own read of the files from the start of the stream: the entry at a
+    /// sync point, carried there by `skip_plain`, and the splice of the route's values before it
+    /// change nothing the model answers. Whether that answer is jq's is the reader model's own
+    /// tests' and the reader oracle's to say.
     pub(super) fn observe_inputs_with(
+        dir: &std::path::Path,
+        files: &[&[u8]],
+        flags: &[&str],
+        lazy_off: bool,
+        chunk: Option<usize>,
+    ) -> (Vec<String>, usize) {
+        if lazy_off {
+            reader_model::MODEL_ON.with(|model| model.set(Some(true)));
+            let entered = model_read::ENTERED.with(std::cell::Cell::get);
+            let (on, _) = observe_inputs_once(dir, files, flags, lazy_off, chunk);
+            reader_model::MODEL_ON.with(|model| model.set(None));
+            if model_read::ENTERED.with(std::cell::Cell::get) > entered {
+                let through_end = on
+                    .iter()
+                    .position(|row| row.starts_with("end "))
+                    .map_or(on.len(), |at| at + 1);
+                assert_eq!(
+                    on[..through_end],
+                    model_read::transcript_alone(files)[..],
+                    "the route reads {files:?} as the model does from the start"
+                );
+            }
+        }
+        reader_model::MODEL_ON.with(|model| model.set(Some(false)));
+        let off = observe_inputs_once(dir, files, flags, lazy_off, chunk);
+        reader_model::MODEL_ON.with(|model| model.set(None));
+        off
+    }
+
+    /// One read of [`observe_inputs_with`].
+    fn observe_inputs_once(
         dir: &std::path::Path,
         files: &[&[u8]],
         flags: &[&str],
