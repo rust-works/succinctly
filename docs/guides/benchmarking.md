@@ -1417,6 +1417,10 @@ link-order wrapper takes the seed (`scripts/link-order/link.py`, "Measurement bu
 - A seed perturbs the layout. `--mode pad` is lld's `--randomize-section-padding=N`, which keeps the
   order and is the Linux default. `--mode shuffle` is a seeded permutation of the ordered block,
   which stays first; it is the only mode on macOS, where ld64 has no padding option.
+  Shuffle seeds cannot judge a change to the order itself, such as a regenerated `symbols.txt`,
+  since they permute the very block being compared. Judge one with padding seeds on Linux, and on
+  macOS with an interleaved A/A'/B, where A' is cargo's own A binary and A its unseeded re-link
+  (#8073).
 - `SUCCINCTLY_LINK_ORDER_LIST=<tree>/scripts/link-order/symbols.txt` links an older commit's
   objects with that commit's own list. Set it, and point `CARGO_TARGET_<TRIPLE>_LINKER` at this
   branch's `scripts/link-order/cc`, when the trees being compared predate these variables.
@@ -1448,7 +1452,7 @@ On #7933's pair, A = `e43c3f9c4` and B = `6362c4bc4`, with C = A plus a planted 
   interval includes 0 on every row, and its value per seed runs from -3.9% to +4.4%. That is
   placement.
 - The planted cost's interval excludes 0 on every row, while the plain A/B under-reads it.
-- Shuffle seeds tell the same story on this row. On an Apple M4, with shuffle seeds only, the
+- Shuffle seeds tell the same story on this row. On an Apple M4 Pro, with shuffle seeds only, the
   planted cost read zero on the `-s` rows it never runs on and was detected on both
   `strings_upcase` rows.
 
