@@ -409,6 +409,7 @@ Resuming at the start of the next line instead would be simpler, but on a line l
 `1 } 2`, 6,000 spaces and `3` on one line, then `4` on the next, read with `[limit(5; repeat(try input catch .))]` under `-n`, is `[1,"Unmatched '}' at line 1, column 3",3,4,"break"]` in jq 1.7.1, jq 1.8.2 and `succinctly jq` (`tests/jq_cli/i7967.rs`).
 What #7967 stopped modelling is jq's state after a fault where it decides no value, only a position:
 - a fault after the first is placed where it is in the text, where jq does not count the bytes the earlier fault made it drop and carries that count into the next file (#5923), so `}`, a newline, `}` and a newline give the second fault at line 2, column 1 where jq 1.7.1 and 1.8.2 say line 1, column 2;
+  since step 5 of #7987 the materializing route reads past the first fault with the reader model, which places it as jq does (the paragraph on the reader model below);
 - a `--seq` stream handed on from its windows at an RS jq's reader met with a value pending no longer has that RS read as a fault (#7260, #7404), which only moved the positions after it.
 Where it decides a value it is kept, because a value neither release prints is a bug: the read jq resumes at, a read that starts inside a character or a replaced run (#5975, #5990, #7934), the stitch of a token cut by a file's end after a fault, and the substitution of a string read past a fault from the bytes jq read (#7947), which the count of U+FFFD it gives and the bytes jq's replacement swallows (`\xe1A` is one U+FFFD in jq) both depend on.
 The tests that pinned those positions (`i5923`, `i5936`, `i5964`, `i5975`, `i5990`, `i6019`, `i6454`, `i6465`, `i6663`, `i6678`, `i7470`, `i7611`, `i7897`, `i7921`, `i7966`) keep jq's captured output and check it through the first fault exactly, and after it with the line and column of every later fault masked (`masked` in `tests/jq_cli/i7967.rs`), so a value lost, added or moved still fails them.
@@ -429,7 +430,21 @@ Three adoptions of jq 1.8.2 stay as listed exceptions:
 No further reader fact moves to jq 1.8.2 case by case; moving the reader to a newer jq is revisited when jq 1.9 ships.
 A reader answer that follows jq 1.8.2 outside these exceptions is a bug against the pin ([#7971](https://github.com/rust-works/succinctly/issues/7971)).
 Not adopted: free wording for a malformed byte-order mark, so `Malformed BOM` stays owed.
-#5804's numeric-literal wording stays until ADR-0033's reader model reaches the materializing route (step 5 of #7987), which retires it in favour of `Malformed BOM`, as both releases word it.
+ADR-0033's reader model retires #5804's numeric-literal wording route by route, in favour of `Malformed BOM`, as both releases word it: since step 5 of #7987 the materializing route says it (the next paragraph), and the routes the model has not reached yet keep the old wording ([below](#a-partial-bom-at-the-start-of-the-input-stream-is-worded-as-a-numeric-literal-fault-on-the-routes-the-reader-model-has-not-reached-5804)).
+
+**The materializing route reads its edges through jq's reader model (ADR-0033 step 5, #7987).**
+A program that reads `input`, `inputs` or `input_line_number` over plain JSON read whole (several files under 4 MiB in all, a lone file of 256 KiB or less, standard input that ends sooner, or a lone source whose first chunk holds a fault) is read by the semi-index as before, and enters the model of jq 1.7.1's reader (`src/bin/succinctly/jq_runner/model_read.rs`) only on a trigger.
+The triggers are a byte-order mark that is not whole (the stream's first byte is `EF` and its first three bytes are not the whole mark in one source), several sources not all UTF-8, a fault, and the first substituted byte of a lone source that is not UTF-8.
+A file seam is not one.
+On a mark or several sources not all UTF-8 the model reads the whole input; on a fault or a substituted byte it is entered at the last sync point before it (the start of the stream, the start of a file nothing was carried onto, or the byte after a newline between values), the values before that point stand, and the model reads the rest.
+So everything up to and including the first fault is jq 1.7.1's on that route, and after it the model goes on as jq's reader does, which E1 leaves best effort.
+`--slurp`, `--stream`, `--stream-errors`, `--seq`, a list with a file that did not open, and the routes that read lazily or a window at a time keep their own deciders until the later steps of ADR-0033.
+`SUCCINCTLY_READER_MODEL=0` turns the model off, for an A/B or a bisection, while the two readers coexist (until step 10).
+
+**The model validates what it steps over (ADR-0033 decision 3).**
+Inside the region it reads, from the sync point before a trigger onwards, the model diagnoses a malformed value as jq's parser does, even one a lazy route would never have read, since otherwise jq's first fault there would be missed, which E1 forbids.
+Between sync points far from any trigger, validation stays lazy ([#3035](https://github.com/rust-works/succinctly/issues/3035), the #2103 amendment), so the same malformed bytes still pass on a route that reads lazily, as [#7750's entry](#input-files-are-one-byte-stream-4305) records for a file cut.
+On the materializing route every value is read anyway, so the boundary shows there only in what the model reads after the first fault; it shows on the default route once that route enters the model (step 6).
 
 ## A NUL byte outside a string is a parse error at its own position (#7966)
 
@@ -13374,11 +13389,13 @@ glibc's merge sort and Apple's insertion sort (up to six items) leave them in in
 Apple's `qsort` permutes longer runs (`[range(8)] | sort_by(nan)` is `[7,1,2,3,0,5,6,4]` on macOS), an order that comes from its algorithm and is not reproduced.
 The scan for a NaN before a sort costs one pass over the keys; a sort of keys without one is unchanged.
 
-### A partial BOM at the start of the input stream is worded as a numeric-literal fault (#5804)
+### A partial BOM at the start of the input stream is worded as a numeric-literal fault on the routes the reader model has not reached (#5804)
 
 jq's parser reports a text that opens with part of the UTF-8 BOM (`EF`, or `EF BB`) and then departs from it as `Malformed BOM`.
 `fromjson` and `tonumber` word it that way here (`"\ufffd" | try fromjson catch .` is `"Malformed BOM (while parsing ...)"`).
-The primary input stream does not: `printf '\xef\xbf\xbd1' | jq .` is `jq: parse error: Malformed BOM` in jq and `jq: parse error: Invalid numeric literal at EOF at line 1, column 4` here.
+Since ADR-0033 step 5 (#7987) so does the materializing route, the one a program that reads `input`, `inputs` or `input_line_number` takes over input read whole: `printf '\xef\xbf\xbd1' | jq -n input` is `jq: error (at <stdin>:0): Malformed BOM` in jq 1.7.1, jq 1.8.2 and `succinctly jq`, exit 5, and every later read says it again at the same place.
+The routes the reader model has not reached yet still word the first read as the token they read: `printf '\xef\xbf\xbd1' | jq .` is `jq: parse error: Malformed BOM` in jq and `jq: parse error: Invalid numeric literal at EOF at line 1, column 4` here.
+Those are the default route (a program that reads no `input`, step 6 of #7987), `--slurp`, which the model does not read yet, and the lazy route of a pipe or standard input longer than its first 256 KiB (step 7).
 Both exit 5 with no output, so only the message differs, when the mark breaks off at a byte that is not the next one of it.
 The read stops in the file the mark breaks off in, as jq's read does, since jq's main loop stops at the parser's fault: the files after it are not opened (#7851), so one that does not open or is a directory is not reported and does not make the run exit 2, and the `(at FILE:0)` of `-n input` names that file.
 A mark that breaks off because the input ends (`printf '\xef' | jq .`, or `EF BB`) is no fault in jq: its parser keeps its place in the mark across a refill, so the input is empty, `.` prints nothing and `-s .` prints `[]`, both with exit 0 (#7454).
@@ -13387,9 +13404,9 @@ A mark cut across the first files (`EF BB` in one and `BF [2]` in the next, or a
 The routes that read several files a window at a time skip a mark at the front of the first file with bytes only, so a list whose first file with bytes is only the start of the mark is read whole, which joins it.
 `--stream` and `--stream-errors` read with a model of jq's streaming parser that matches the mark as `jv_parser_set_buf` does, and since [#7603](https://github.com/rust-works/succinctly/issues/7603) they answer a mark that breaks off as jq does: `jq: parse error: Malformed BOM`, exit 5, with no event, and under `-n` the error `Malformed BOM` from every `input`, since jq's parser never reads past it.
 Before #7603 `--stream-errors` turned it into a numeric-literal event and exited 0 (`printf '\xef1\n' | jq -c --stream-errors .` printed `["Invalid numeric literal at line 2, column 0",[]]`), and `--stream` worded it as that numeric literal.
-Only the plain routes, which do not read with the streaming parser, keep the numeric-literal wording.
-Only the first read of that fault has the wording: jq's parser stays in the fault, so on the plain routes too every read after it (`input` a second time, `inputs`, `first(inputs)`) says `Malformed BOM` at the same `(at FILE:LINE)`, and the text after the mark is never read (#7863).
-Pinned by `tests/jq_cli/i7863.rs`.
+Only the plain routes the reader model has not reached, which do not read with the streaming parser, keep the numeric-literal wording.
+Only the first read of that fault has the wording: jq's parser stays in the fault, so on those routes too every read after it (`input` a second time, `inputs`, `first(inputs)`) says `Malformed BOM` at the same `(at FILE:LINE)`, and the text after the mark is never read (#7863).
+Pinned by `tests/jq_cli/i7863.rs`, whose rows are jq 1.7.1's own words since step 5 but for the pipe longer than its first read, and by `tests/jq_cli/i7851.rs`.
 
 ### A leading BOM is read in jq's first 4,095-byte read, as jq 1.7.1 reads it; jq 1.8.2 reads 4,091 bytes (#7569)
 

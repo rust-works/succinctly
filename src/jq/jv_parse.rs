@@ -23,8 +23,8 @@
 //!   (`seq_check_truncation` and the end-of-input check are both behind `JV_PARSE_SEQ`).
 //!
 //! It is `no_std` with `alloc`, so that `fromjson`, `--argjson` and the CLI's reader model can share
-//! it (ADR-0033 decision 4). Nothing calls it yet outside its tests: the CLI's reader model is
-//! entered at step 5.
+//! it (ADR-0033 decision 4). Since step 5 the CLI's reader model runs it on the materializing route
+//! of `read_inputs`, entered on that route's triggers.
 
 use alloc::format;
 use alloc::string::String;
