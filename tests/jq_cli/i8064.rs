@@ -191,3 +191,43 @@ fn a_shared_value_collected_many_times_answers_8064() -> Result<()> {
     }
     Ok(())
 }
+
+/// The limit counts the whole process, the input document included, so it is sized from the
+/// memory available and not fixed: a 217 MB document, which the machine materializes into more
+/// than 1.5 GiB (1,871 MB peak on an Apple M5 Max), still answers a recursive-def program as the
+/// shipped route and jq 1.7.1 do (`2097152`; jq peaks at 1,945 MB), where a fixed 1.5 GiB limit
+/// refused it. Ignored for its weight: it writes the document and needs about 2 GB of memory.
+#[test]
+#[ignore = "writes a 217 MB fixture and needs about 2 GB of memory"]
+fn a_document_past_one_and_a_half_gib_loaded_answers_8064() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let doc = dir.path().join("users.json");
+    let generated = Command::new(succinctly_bin())
+        .args([
+            "json", "generate", "300mb", "-p", "users", "-s", "8064", "-o",
+        ])
+        .arg(&doc)
+        .output()?;
+    assert!(generated.status.success(), "{generated:?}");
+    let filter = "def f: f; .users | length";
+    let mut answers = Vec::new();
+    for on in ["0", "1"] {
+        let output = Command::new(succinctly_bin())
+            .args(["jq", filter])
+            .arg(&doc)
+            .env(SWITCH, on)
+            .env_remove(MEMORY)
+            .output()?;
+        answers.push((
+            String::from_utf8(output.stdout)?,
+            String::from_utf8(output.stderr)?,
+            output.status.code(),
+        ));
+    }
+    assert_eq!(
+        answers[1],
+        (String::from("2097152\n"), String::new(), Some(0))
+    );
+    assert_eq!(answers[0], answers[1]);
+    Ok(())
+}

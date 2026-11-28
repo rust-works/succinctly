@@ -11,23 +11,18 @@
 //!
 //! **The limit**, computed once per process ([`limit`]): the least of half the physical memory,
 //! half the cgroup's `memory.max` (v2, or v1's `memory.limit_in_bytes`), a quarter of the address
-//! space a `ulimit -v` cap leaves when the process starts, and [`CEILING`].
+//! space a `ulimit -v` cap leaves when the process starts. There is no fixed term: ADR-0018 lets
+//! the machine refuse only to keep the host up, and a fixed ceiling would refuse programs jq
+//! answers on a machine with the memory for them, counting the input document too (the process's
+//! memory is what is read).
 //! - Half, because the bound is sampled: a run can pass the limit between two samples, and a leaf
 //!   can grow inside one evaluation, which no check point sees. What is left also holds the
 //!   refusal and whatever else runs on the machine or in the cgroup.
 //! - A quarter under an address-space cap, because the cap counts address space, not memory: a
 //!   vector's reserved but untouched capacity, the evaluation thread's stack and the mapped input
 //!   count against it and not against the resident set.
-//! - [`CEILING`], so that a runaway collector on a large machine is refused at a size jq itself
-//!   handles comfortably, rather than after taking half of the machine.
 
 #![allow(unsafe_code)] // `sysconf`, `sysctlbyname` and `proc_pid_rusage`, each writing only into a local
-
-/// The most the call machine lets the process hold however much memory is available: 1.5 GiB.
-/// It answers `[range(1e7), range(1e7), range(1e7), range(1e7)] | length`, which jq 1.7.1
-/// answers in 1.84 GB, and refuses #8064's runaway collectors within the 1.5 GiB its acceptance
-/// asks for.
-pub const CEILING: usize = 3 << 29;
 
 /// The bytes the process holds now, or `None` where they cannot be read.
 pub fn resident() -> Option<usize> {
@@ -51,18 +46,22 @@ pub fn limit() -> Option<usize> {
     static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
         resident()?;
-        Some(limit_from(
+        limit_from(
             physical(),
             cgroup(),
             crate::cli::address_space::cap().map(|cap| cap.saturating_sub(mapped().unwrap_or(0))),
-        ))
+        )
     })
 }
 
-/// [`limit`] from the physical memory, the cgroup's limit and the address space a cap leaves.
-fn limit_from(physical: Option<usize>, cgroup: Option<usize>, room: Option<usize>) -> usize {
+/// [`limit`] from the physical memory, the cgroup's limit and the address space a cap leaves:
+/// `None` when none of them is known, and then no probe is installed.
+fn limit_from(
+    physical: Option<usize>,
+    cgroup: Option<usize>,
+    room: Option<usize>,
+) -> Option<usize> {
     [
-        Some(CEILING),
         physical.map(|b| b / 2),
         cgroup.map(|b| b / 2),
         room.map(|b| b / 4),
@@ -70,7 +69,6 @@ fn limit_from(physical: Option<usize>, cgroup: Option<usize>, room: Option<usize
     .into_iter()
     .flatten()
     .min()
-    .unwrap_or(CEILING)
 }
 
 /// The physical memory of the machine.
@@ -231,11 +229,21 @@ mod tests {
 
     #[test]
     fn the_limit_is_the_least_share_of_what_is_available_8064() {
-        assert_eq!(limit_from(None, None, None), CEILING);
-        assert_eq!(limit_from(Some(64 << 30), None, None), CEILING);
-        assert_eq!(limit_from(Some(2 << 30), None, None), 1 << 30);
-        assert_eq!(limit_from(Some(64 << 30), Some(1 << 30), None), 512 << 20);
-        assert_eq!(limit_from(Some(64 << 30), None, Some(1 << 30)), 256 << 20);
+        assert_eq!(limit_from(None, None, None), None);
+        assert_eq!(limit_from(Some(128 << 30), None, None), Some(64 << 30));
+        assert_eq!(limit_from(Some(2 << 30), None, None), Some(1 << 30));
+        assert_eq!(
+            limit_from(Some(64 << 30), Some(1 << 30), None),
+            Some(512 << 20)
+        );
+        assert_eq!(
+            limit_from(Some(64 << 30), None, Some(1 << 30)),
+            Some(256 << 20)
+        );
+        assert_eq!(
+            limit_from(None, Some(4 << 30), Some(1 << 30)),
+            Some(256 << 20)
+        );
     }
 
     #[test]
@@ -256,7 +264,7 @@ mod tests {
     }
 
     /// Where a probe exists, it reads the process: some MiB at least, no more than the machine
-    /// has, and a limit within the ceiling. Whether it follows what the process holds is
+    /// has, and a limit within half of it. Whether it follows what the process holds is
     /// `tests/jq_cli/i8064.rs`'s to show, in a process of its own: in this one other tests
     /// allocate and free concurrently, and freed pages the allocator keeps are reused unseen.
     #[test]
@@ -271,6 +279,9 @@ mod tests {
             assert!(now <= physical, "{now} of {physical}");
         }
         let limit = limit().expect("a probe, so a limit");
-        assert!(limit > 0 && limit <= CEILING, "{limit}");
+        assert!(limit > 0, "{limit}");
+        if let Some(physical) = physical() {
+            assert!(limit <= physical / 2, "{limit} of {physical}");
+        }
     }
 }
