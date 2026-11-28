@@ -24834,13 +24834,75 @@ pub(super) fn is_empty_object_literal(stage: &Expr) -> bool {
 /// does the same with the clock. `.[] | env(X)` over three members is one `hi`, and so is
 /// `select(false) | env(X)`. [`yq_pipe_has_list_stage`] (the entry check), [`yq_list_stage`] (the
 /// split) and the parser's `map` rewrite all ask it: they must agree on which pipes the walk owns,
-/// or a pipe is sent in that the split then declines.
+/// or a pipe is sent in that the split then declines. A wrapper yq evaluates over the whole context
+/// is one too when its body starts with such a stage ([`yq_once_wrapper_body`], #8028): the walk
+/// builds the stage over a stand-in, so a body whose once-stage comes after other stages
+/// (`with_dtf(L; test("A") | now)`) is not one here, as those stages would read the stand-in, not
+/// the nodes; the parser cuts such a body at its once-stage first (`yq_once_wrapper_split`).
 pub(super) fn yq_stage_built_once(stage: &Expr) -> bool {
     is_empty_object_literal(stage)
         || matches!(
             unwrap_paren(stage),
             Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now)
         )
+        || yq_once_wrapper_body(unwrap_paren(stage)).is_some_and(yq_head_built_once)
+}
+
+/// Whether `expr` is a stage [`yq_stage_built_once`] answers, or a parenthesis or pipe whose first
+/// stage is one.
+fn yq_head_built_once(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => yq_head_built_once(inner),
+        Expr::Pipe(stages) => stages.first().is_some_and(yq_head_built_once),
+        other => yq_stage_built_once(other),
+    }
+}
+
+/// The one definition of a wrapper that passes "once per context" through (#8028): the body of
+/// `with_dtf(LAYOUT; E)`, whose `withDateTimeFormat` (`operator_datetime.go`, v4.53.3) sets the
+/// layout and returns `d.GetMatchingNodes(context, E)`, `E` over the whole context list it was
+/// handed rather than once per node. So the call answers once however many nodes reach it exactly
+/// when `E` holds a stage yq answers once: `[.x[] | with_dtf("2006"; now)]` is one timestamp over
+/// three members in yq, and so are `with_dtf("2006"; now | tostring)` and
+/// `with_dtf("2006"; test("A") | strenv(X))` (the stages before the once-stage still run over
+/// every node, so `split("x") | now` over integers raises `cannot split`), where
+/// `with_dtf("2006"; .)` and `with_dtf("2006"; [now])` are three. No other yq operator hands its
+/// argument the whole context and returns what it answers (`(E)` is a parenthesis, which both
+/// predicates already look through). [`yq_stage_built_once`] (the context-list walk) and the
+/// parser's `yq_stage_head_once` and `yq_once_wrapper_split` (its once-stage rewrite) all ask it.
+///
+/// Only a layout that reads no node counts (a literal, a `$name`, `env(NAME)` or `strenv(NAME)`):
+/// yq reads the layout once over the whole context and uses its first answer, which a once-stage
+/// evaluated over a stand-in cannot reproduce for `with_dtf(.fmt; now)`, so such a call stays per
+/// node, as it was before #8028.
+pub(super) fn yq_once_wrapper_body(stage: &Expr) -> Option<&Expr> {
+    match stage {
+        Expr::Builtin(Builtin::WithDtf(layout, body)) if yq_layout_reads_no_node(layout) => {
+            Some(body)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a `with_dtf` layout reads nothing of the node it is evaluated over
+/// ([`yq_once_wrapper_body`]).
+fn yq_layout_reads_no_node(layout: &Expr) -> bool {
+    matches!(
+        unwrap_paren(layout),
+        Expr::Literal(_) | Expr::Var(_) | Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_))
+    )
+}
+
+/// Whether `expr` is, or is a stage of, a stage yq builds once however many nodes reach it
+/// ([`yq_stage_built_once`]). Looks through parentheses and nested pipes, and stops at an `as`
+/// body: `. as $v | {}` is one `{}` per node in yq, and `map(. as $v | env(X))` one `env(X)` per
+/// member.
+pub(super) fn yq_has_flat_built_once_stage(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(inner) => yq_has_flat_built_once_stage(inner),
+        Expr::Pipe(stages) => stages.iter().any(yq_has_flat_built_once_stage),
+        other => yq_stage_built_once(other),
+    }
 }
 
 /// [`yq_pipe_has_union`] with the second kind of stage the walk owns in any context: a stage yq

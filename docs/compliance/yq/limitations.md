@@ -1543,6 +1543,24 @@ yq's `nowOp` returns one new node for the nodes it is given, as `envOperator` do
 The three differences recorded for `env(NAME)` above hold for `now` too: `.y = [.x[] | (now, now)]` writes six values here and two in yq, `limit(1; repeat(1) | now)` under `--jq-extensions` runs `repeat` to its limit, and `now | document_index` over three documents is `0 1 2` here and `0 0 0` in yq.
 yq also tags the node `!!timestamp`, which an owned value cannot carry ([#2802](https://github.com/rust-works/succinctly/issues/2802)), so `now | type` is still `!!str` here, as the datetime section records.
 
+### `with_dtf(layout; f)` over a once-stage is answered once ([#8028](https://github.com/rust-works/succinctly/issues/8028))
+
+yq's `withDateTimeFormat` sets the layout and evaluates `f` over the whole context it was given, not once per node.
+So a `with_dtf` whose `f` holds a stage yq answers once for its whole context, under a layout that reads no node, (`now`, `env(NAME)`, `strenv(NAME)`, `{}`, a `$name`) is answered once too: `[.x[] | with_dtf("2006"; now)] | length` is `1`, and so is `with_dtf("2006"; select(true) | now)`.
+`succinctly yq` follows that through the walk and the parser rewrite above, which look through `with_dtf` to its body (`yq_once_wrapper_body`).
+Stages of the body before its once-stage still run over every node, as in yq: the rewrite cuts `with_dtf(L; P | now)` into `with_dtf(L; P)`, run over each node for its errors, and `with_dtf(L; now)`, answered once, so `[.s[] | with_dtf("2006"; test("A") | now)]` is one value and `[.x[] | with_dtf("2006"; split("x") | now)]` over integers raises `cannot split` in both.
+The three differences recorded for `env(NAME)` hold for such a call too: `limit(1; repeat(1) | with_dtf("2006"; now))` under `--jq-extensions` runs `repeat` to its limit, and `with_dtf("2006"; now) | document_index` over three documents is `0 1 2` here and `0 0 0` in yq.
+Any other body is still read once per node, which differs from yq wherever the body's answer depends on the whole list.
+- **A union in the body** ([#8076](https://github.com/rust-works/succinctly/issues/8076)).
+  `[.x[] | with_dtf("2006"; ., 0)]` over `x: [1, 2, 3]` is `[1,2,3,0,0,0]` in yq, branch-major over the list, and `[1,0,2,0,3,0]` here.
+  `[.x[] | with_dtf("2006"; now, now)]` holds two values in yq and six here.
+- **A body that answers over an empty context** ([#8075](https://github.com/rust-works/succinctly/issues/8075)).
+  `[.x[] | select(false) | with_dtf("2006"; "x")]` is `["x"]` in yq, as `[.x[] | select(false) | "x"]` is in both, and `[]` here; `with_dtf("2006"; [now])` there is `[[]]` in yq and `[]` here.
+- **A layout that reads the node.**
+  yq reads the layout once over the whole context and uses its first answer, so `[.x[] | with_dtf(.fmt; now)]` is one value in yq.
+  Here only a layout that reads no node (a literal, a `$name`, `env(NAME)` or `strenv(NAME)`) makes the call a once-stage, and `with_dtf(.fmt; now)` is still answered per node, each under its own node's layout: two values over two members.
+- A `{}` body in a write's right side is read per node, as a bare `{}` stage there is: `.y = [.x[] | with_dtf("2006"; {})]` writes three `{}` here and one in yq.
+
 ### Duplicate mapping keys — an owned value keeps every entry (#1344); a few narrower gaps remain
 
 **Since [#1344](https://github.com/rust-works/succinctly/issues/1344) ([ADR-0027](../../adrs/adr-0027.md)) an `OwnedValue::Object` keeps a repeated mapping key's earlier entries beside its collapsed `IndexMap`.**
@@ -4550,6 +4568,7 @@ Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, 
 - A missing key as the layout, format or zone argument (`with_dtf(.nope; f)`, `format_datetime(.nope)`) reads as `null` here, so it is the layout `null`; yq navigates it read-only, finds no node and raises `could not find layout for format_time`.
   An empty layout, or a container's, is RFC 3339 in both tools.
 - A stage after `with_dtf` that reads path context (`with_dtf(f; .a) | path`) reads the position of `with_dtf`'s input (`[]` where yq has `["a"]`).
+- `with_dtf`'s result is a value with no comments, anchors, aliases or style: over `# head` / `a: &x 1 # line` / `b: *x`, `with_dtf("2006"; .)` prints `a: 1` / `b: 1`, where yq prints the document as it was read, as `.` does in both ([#8078](https://github.com/rust-works/succinctly/issues/8078)).
   A write through it (`with_dtf(f; .a) = 5`, `|=`, `del`) lands where yq's does.
 - `tz` with an IANA name needs the `local-zone` feature (on in `cli`, not on Windows); without it only `UTC`, the empty name and `Local` load, and every other name is `unknown time zone`.
 - A `no_std` build has no thread-local layout, so `with_dtf` raises `with_dtf requires the std feature` there.

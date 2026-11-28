@@ -38,7 +38,7 @@ use super::eval::{
     pattern_alternatives_var_names, try_compare_op, yields_at_most_one_value, EvalError,
     EvalSemantics, JqSemantics, YqSemantics,
 };
-use super::eval_generic::yq_stage_built_once;
+use super::eval_generic::{yq_has_flat_built_once_stage, yq_once_wrapper_body};
 use super::expr::{
     ArithOp, ArithSettleMemo, AssignOp, Builtin, CompareOp, Expr, FormatType, FuncDefBound, Import,
     Include, Libm1, Libm2, Libm3, Literal, LoadKind, MergeFlags, MetaObject, MetaSlot, MetaValue,
@@ -2860,19 +2860,6 @@ fn has_flat_union(expr: &Expr) -> bool {
     }
 }
 
-/// Whether `expr` is, or is a stage of, a stage yq builds once however many nodes reach it: an
-/// empty `{}` (#6801), `env(NAME)` / `strenv(NAME)` (#7996) or `now` (#8007), the stages the
-/// context-list walk owns in `[.[] | f]` ([`yq_stage_built_once`]). Looks through parentheses and
-/// nested pipes as `has_flat_union` does, and stops at an `as` body: `. as $v | {}` is one `{}` per
-/// node in yq, and `map(. as $v | env(X))` one `env(X)` per member, so the walk does not own it.
-fn has_flat_built_once_stage(expr: &Expr) -> bool {
-    match expr {
-        Expr::Paren(inner) => has_flat_built_once_stage(inner),
-        Expr::Pipe(stages) => stages.iter().any(has_flat_built_once_stage),
-        other => yq_stage_built_once(other),
-    }
-}
-
 /// Whether a pipe in `expr` has a stage after its first that yq answers once over an empty context
 /// list (#6943, [`yq_stage_can_reemit`](super::eval::yq_stage_can_reemit)): `select(c) | "x"` is `"x"`
 /// when `c` holds for no member, where each member's own run of it would answer nothing. Looks
@@ -2923,23 +2910,10 @@ fn yq_stage_single_valued(stage: &Expr) -> bool {
     }
 }
 
-/// Whether `expr` is, or holds as a stage of its pipes, a bare `$name` (#6821): the stage yq
-/// answers once however many nodes reach it. Looks through parentheses and nested pipes as
-/// [`has_flat_built_once_stage`] does, and stops at an `as` body: `. as $w | $v` is one `$v` per node in
-/// yq.
-fn has_flat_var_stage(expr: &Expr, env_args_pseudo: bool) -> bool {
-    match expr {
-        Expr::Paren(inner) => has_flat_var_stage(inner, env_args_pseudo),
-        Expr::Pipe(stages) => stages
-            .iter()
-            .any(|stage| has_flat_var_stage(stage, env_args_pseudo)),
-        other => yq_stage_head_var(other, env_args_pseudo),
-    }
-}
-
 /// Whether `stage` is one [`yq_var_stage_once`] answers once: a bare `$name` (#6821), or
 /// `env(NAME)` / `strenv(NAME)` (#7996) or `now` (#8007), whose handler returns one node for its
-/// whole context without reading it, or a pipe or parenthesised pipe that starts with one.
+/// whole context without reading it, a `with_dtf(LAYOUT; E)` whose `E` starts with such a stage
+/// (#8028, [`yq_once_wrapper_body`]), or a pipe or parenthesised pipe that starts with one.
 fn yq_stage_head_once(stage: &Expr, env_args_pseudo: bool) -> bool {
     match stage {
         Expr::Paren(inner) => yq_stage_head_once(inner, env_args_pseudo),
@@ -2947,18 +2921,109 @@ fn yq_stage_head_once(stage: &Expr, env_args_pseudo: bool) -> bool {
             .first()
             .is_some_and(|stage| yq_stage_head_once(stage, env_args_pseudo)),
         Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now) => true,
-        other => yq_stage_head_var(other, env_args_pseudo),
+        other => match yq_once_wrapper_body(other) {
+            Some(body) => yq_stage_head_once(body, env_args_pseudo),
+            None => yq_stage_head_var(other, env_args_pseudo),
+        },
     }
 }
 
-/// [`has_flat_var_stage`] for every stage [`yq_stage_head_once`] answers.
+/// Visits the stages `stage` is made of once nested pipes are spliced in (`A | (B | C)` is
+/// `A | B | C`), in order, until `visit` answers `true`; whether it did. The one definition of a
+/// flat stage list, which [`yq_splice_stage`] collects and [`yq_once_wrapper_splits`] scans.
+fn yq_visit_flat_stages(stage: &Expr, visit: &mut dyn FnMut(&Expr) -> bool) -> bool {
+    match stage {
+        // `((A | B))` is `A | B` too, however many parentheses stand around it.
+        Expr::Paren(inner) if matches!(super::eval::unwrap_paren(inner), Expr::Pipe(_)) => {
+            yq_visit_flat_stages(inner, visit)
+        }
+        Expr::Pipe(inner) => inner.iter().any(|stage| yq_visit_flat_stages(stage, visit)),
+        other => visit(other),
+    }
+}
+
+/// The flat stages of `stage` ([`yq_visit_flat_stages`]), appended to `out`.
+fn yq_splice_stage(stage: &Expr, out: &mut Vec<Expr>) {
+    yq_visit_flat_stages(stage, &mut |stage| {
+        out.push(stage.clone());
+        false
+    });
+}
+
+/// Whether the flat stage at `index` of a `with_dtf` body is where [`yq_once_wrapper_split`] cuts
+/// it: a once-stage after the first ([`yq_stage_head_once`]; a first one makes the whole call a
+/// once-stage), or a `with_dtf` that is cut itself.
+fn yq_once_wrapper_cuts_at(index: usize, stage: &Expr, env_args_pseudo: bool) -> bool {
+    (index > 0 && yq_stage_head_once(stage, env_args_pseudo))
+        || yq_once_wrapper_splits(stage, env_args_pseudo)
+}
+
+/// Whether `stage` is a `with_dtf(LAYOUT; P | O | R)` whose once-stage `O` comes after other stages
+/// `P` (#8028): yq runs `P` over every node of the context, then `O` once, so `[.s[] |
+/// with_dtf("2006"; test("A") | now)]` is one timestamp and `[.x[] | with_dtf("2006"; split("x") |
+/// now)]` over integers raises `cannot split`. Allocation-free, for the checks every pipe makes.
+fn yq_once_wrapper_splits(stage: &Expr, env_args_pseudo: bool) -> bool {
+    let Some(body) = yq_once_wrapper_body(super::eval::unwrap_paren(stage)) else {
+        return false;
+    };
+    if yq_stage_head_once(body, env_args_pseudo) {
+        return false;
+    }
+    let mut index = 0;
+    yq_visit_flat_stages(body, &mut |stage| {
+        let cut = yq_once_wrapper_cuts_at(index, stage, env_args_pseudo);
+        index += 1;
+        cut
+    })
+}
+
+/// A `with_dtf` [`yq_once_wrapper_splits`] answers, cut in two at its once-stage:
+/// `with_dtf(L; P | O | R)` is `with_dtf(L; P)`, which the rewrite runs over every node for its
+/// errors, and `with_dtf(L; O | R)`, a once-stage. A `with_dtf` standing at the cut is cut itself:
+/// `with_dtf(L; with_dtf(M; P | O))` is `with_dtf(L; with_dtf(M; P))` and
+/// `with_dtf(L; with_dtf(M; O))`. Both halves run under the layout, as the body does in yq.
+fn yq_once_wrapper_split(stage: &Expr, env_args_pseudo: bool) -> Option<(Expr, Expr)> {
+    if !yq_once_wrapper_splits(stage, env_args_pseudo) {
+        return None;
+    }
+    let Expr::Builtin(Builtin::WithDtf(layout, body)) = super::eval::unwrap_paren(stage) else {
+        return None;
+    };
+    let mut before = Vec::new();
+    yq_splice_stage(body, &mut before);
+    let at = before
+        .iter()
+        .enumerate()
+        .position(|(index, stage)| yq_once_wrapper_cuts_at(index, stage, env_args_pseudo))?;
+    let mut after = before.split_off(at);
+    if let Some((inner_before, inner_after)) = yq_once_wrapper_split(&after[0], env_args_pseudo) {
+        before.push(inner_before);
+        after[0] = inner_after;
+    }
+    let half = |stages: Vec<Expr>| {
+        Expr::Builtin(Builtin::WithDtf(
+            layout.clone(),
+            Box::new(Expr::pipe(stages)),
+        ))
+    };
+    Some((half(before), half(after)))
+}
+
+/// Whether `expr` is, or holds as a stage of its pipes, a stage [`yq_stage_head_once`] answers (a
+/// bare `$name` (#6821), `env(NAME)`, `strenv(NAME)`, `now` or a `with_dtf` that starts with one),
+/// or a `with_dtf` [`yq_once_wrapper_splits`] cuts. Looks through parentheses and nested pipes as
+/// [`yq_has_flat_built_once_stage`] does, and stops at an `as` body: `. as $w | $v` is one `$v` per
+/// node in yq.
 fn has_flat_once_stage(expr: &Expr, env_args_pseudo: bool) -> bool {
     match expr {
         Expr::Paren(inner) => has_flat_once_stage(inner, env_args_pseudo),
         Expr::Pipe(stages) => stages
             .iter()
             .any(|stage| has_flat_once_stage(stage, env_args_pseudo)),
-        other => yq_stage_head_once(other, env_args_pseudo),
+        other => {
+            yq_stage_head_once(other, env_args_pseudo)
+                || yq_once_wrapper_splits(other, env_args_pseudo)
+        }
     }
 }
 
@@ -3095,13 +3160,6 @@ fn yq_assign_after_descent(stages: Vec<Expr>) -> Vec<Expr> {
 fn yq_var_stage_once(stages: Vec<Expr>, env_args_pseudo: bool) -> Expr {
     // A nested pipe is the same stages spliced in (`A | (B | $v)` is `A | B | $v`), so the variable
     // is found wherever it stands; a pipe with none is returned as it was parsed.
-    fn splice(stage: &Expr, out: &mut Vec<Expr>) {
-        match stage {
-            Expr::Paren(inner) if matches!(**inner, Expr::Pipe(_)) => splice(inner, out),
-            Expr::Pipe(inner) => inner.iter().for_each(|stage| splice(stage, out)),
-            other => out.push(other.clone()),
-        }
-    }
     if !stages
         .iter()
         .any(|stage| has_flat_once_stage(stage, env_args_pseudo))
@@ -3110,18 +3168,25 @@ fn yq_var_stage_once(stages: Vec<Expr>, env_args_pseudo: bool) -> Expr {
     }
     let mut flat = Vec::with_capacity(stages.len());
     for stage in &stages {
-        splice(stage, &mut flat);
+        yq_splice_stage(stage, &mut flat);
     }
     // A prefix that answers one node per input leaves one node for the variable either way, so it
     // is left alone, with the bound node's position and its path context as they were.
     let Some(at) = (1..flat.len()).rev().find(|&i| {
-        yq_stage_head_once(&flat[i], env_args_pseudo)
+        (yq_stage_head_once(&flat[i], env_args_pseudo)
+            || yq_once_wrapper_splits(&flat[i], env_args_pseudo))
             && !flat[..i].iter().all(yq_stage_single_valued)
     }) else {
         return Expr::pipe(stages);
     };
     let mut prefix = flat;
-    let rest = prefix.split_off(at);
+    let mut rest = prefix.split_off(at);
+    // A `with_dtf` whose once-stage comes after other stages (#8028) is cut there: the stages
+    // before it join the prefix, which runs over every node, and the rest is the once-stage.
+    if let Some((before, after)) = yq_once_wrapper_split(&rest[0], env_args_pseudo) {
+        prefix.push(before);
+        rest[0] = after;
+    }
     let mut out = Vec::with_capacity(rest.len() + 1);
     out.push(Expr::Reduce {
         input: Box::new(yq_var_stage_once(prefix, env_args_pseudo)),
@@ -3137,7 +3202,7 @@ fn yq_var_stage_once(stages: Vec<Expr>, env_args_pseudo: bool) -> Expr {
 /// (`mapOperator`, `GetMatchingNodes(splatted, RHS)`), so a union in `f` runs each branch over every
 /// member before the next: `map(.a, .b)` is every `.a`, then every `.b`. An empty `{}` stage in `f`
 /// is built once, not per member (#6801: `.x | map({})` is `[{}]`), as are `env(X)` and `strenv(X)` (#7996:
-/// `map(env(X))` is `[hi]`), `now` (#8007) and a bare `$name` stage (#6821: `.n as $v | .x | map($v)` is `[7]`). That is the walk
+/// `map(env(X))` is `[hi]`), `now` (#8007), a bare `$name` stage (#6821: `.n as $v | .x | map($v)` is `[7]`) and a `with_dtf` over any of them (#8028). That is the walk
 /// `[.[] | f]` already takes (the context-list model, `eval_yq_context_pipe`), so a union-bodied
 /// (or empty-`{}`-bodied) `map` over a sequence or a mapping with members is written
 /// `(if has-members then [.[] | f] else . end) | map(.)`.
@@ -3156,9 +3221,9 @@ fn yq_map_union_body_over_the_list(
         return call;
     };
     let owned_by_the_list = has_flat_union(body)
-        || has_flat_built_once_stage(body)
+        || yq_has_flat_built_once_stage(body)
         || has_flat_reemit_stage(body)
-        || (var_stage_once && has_flat_var_stage(body, env_args_pseudo));
+        || (var_stage_once && has_flat_once_stage(body, env_args_pseudo));
     if !owned_by_the_list {
         return call;
     }
@@ -14968,6 +15033,60 @@ mod tests {
         }
     }
     use super::*;
+
+    /// #8028: the cut a `with_dtf` body takes at its once-stage. The predicate every pipe asks
+    /// (`yq_once_wrapper_splits`) and the cut itself (`yq_once_wrapper_split`) must agree, or the
+    /// rewrite finds a stage it then cannot cut; and each half is what the doc says. Parsed in jq
+    /// mode, which has no once-stage rewrite of its own, so the body is as written.
+    #[test]
+    fn a_with_dtf_body_is_cut_at_its_once_stage_8028() {
+        let jq = |src: &str| parse_with_mode(src, ParserMode::Jq).expect(src);
+        let dtf = |layout: &str, body: Expr| {
+            Expr::Builtin(Builtin::WithDtf(
+                Box::new(Expr::Literal(Literal::String(layout.into()))),
+                Box::new(body),
+            ))
+        };
+        let l = |body: &str| dtf("L", jq(body));
+        for (stage, halves) in [
+            (l("now"), None),
+            (l("now | tostring"), None),
+            (l("."), None),
+            (l("[now]"), None),
+            (l("now, now"), None),
+            // A layout that reads the node keeps the call per node.
+            (
+                Expr::Builtin(Builtin::WithDtf(
+                    Box::new(jq(".fmt")),
+                    Box::new(jq("test(\"A\") | now")),
+                )),
+                None,
+            ),
+            (l("test(\"A\") | now"), Some((l("test(\"A\")"), l("now")))),
+            (
+                l("ascii_downcase | (strenv(X) | tostring) | length"),
+                Some((l("ascii_downcase"), l("strenv(X) | tostring | length"))),
+            ),
+            (
+                dtf(
+                    "L",
+                    Expr::pipe(vec![dtf("M", jq("keys | now")), jq("tostring")]),
+                ),
+                Some((
+                    dtf("L", dtf("M", jq("keys"))),
+                    dtf("L", Expr::pipe(vec![dtf("M", jq("now")), jq("tostring")])),
+                )),
+            ),
+        ] {
+            let split = yq_once_wrapper_split(&stage, false);
+            assert_eq!(
+                yq_once_wrapper_splits(&stage, false),
+                split.is_some(),
+                "{stage:?}"
+            );
+            assert_eq!(split, halves, "{stage:?}");
+        }
+    }
 
     /// #7716: the recovery from a malformed object entry runs only after a syntax error: a program
     /// that parses never reaches it, so it leaves its lexer unbuilt and bison's quiet stretch unset.
