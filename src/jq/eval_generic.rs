@@ -44894,6 +44894,14 @@ fn charge_def_spine(unfolded: u8, then: &Expr) -> Option<u8> {
     }
 }
 
+/// Whether every stage of an update filter is one the owned identity pipe runs (#8039): the
+/// route that carries a stage's position to the updates nested in it, and takes the position away
+/// from one a value with no position reaches. A filter any of whose stages the eager evaluator
+/// would run instead names no position for its nested updates.
+pub(crate) fn update_filter_on_owned_identity_pipe(filter: &Expr) -> bool {
+    owned_identity_pipe_supported(owned_identity_body_stages(filter))
+}
+
 /// [`owned_identity_pipe_supported`], `unfolded` levels of `def` binding in.
 fn owned_identity_pipe_supported_at(stages: &[Expr], unfolded: u8) -> bool {
     let body = |e: &Expr| owned_identity_pipe_supported_at(owned_identity_body_stages(e), unfolded);

@@ -51943,8 +51943,13 @@ fn eval_update_impl<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
     // stand at it (`.b |= (.d = 1 | .c |= path)` is `["b","c"]`); only the
     // rewrite is skipped. A value the filter builds with no position takes
     // the prefix away from the updates it reaches (`.b |= (5 | . |= path)` is
-    // `[]`), which the owned identity pipe decides as it runs them.
-    let placed = S::TAG == EvalTag::Yq && !positioned && needs_path_context(filter_expr);
+    // `[]`), which the owned identity pipe decides as it runs them, so only a
+    // filter that pipe runs whole is placed: the eager evaluator carries no
+    // position from stage to stage (`keys as $v | $v | . |= path`).
+    let placed = S::TAG == EvalTag::Yq
+        && !positioned
+        && needs_path_context(filter_expr)
+        && super::eval_generic::update_filter_on_owned_identity_pipe(filter_expr);
     let base = if positioned || placed {
         super::eval_generic::current_path_base()
     } else {
