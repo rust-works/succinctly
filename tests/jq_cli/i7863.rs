@@ -7,9 +7,9 @@
 //! Every row was captured from jq 1.7.1 (`/usr/bin/jq`); jq 1.8.2 gives the same on each. Since step
 //! 5 of #7987 the materializing route these runs take reads the mark through ADR-0033's reader model,
 //! so the first read says `Malformed BOM` too, as jq does. A pipe longer than its first read is read
-//! lazily, a route the model has not reached, whose first read keeps the numeric-literal wording
-//! (#5804, recorded in docs/compliance/jq/limitations.md): `first` says what `succinctly jq` says
-//! there; the reads after it are jq's own words.
+//! lazily, and since step 7 that route reads a mark that breaks off through the model too, from the
+//! front it has read: every row is jq's own words. `first` is kept for a route that words the first
+//! read otherwise (none does now).
 
 use anyhow::Result;
 
@@ -31,7 +31,6 @@ struct Row {
 
 const THREE: &str = "(try input catch .), (try input catch .), (try input catch .)";
 const THREE_BOM: &str = "\"Malformed BOM\"\n\"Malformed BOM\"\n\"Malformed BOM\"\n";
-const AT_LINE_2: &str = "Invalid numeric literal at line 2, column 0";
 
 static ROWS: &[Row] = &[
     Row {
@@ -223,7 +222,9 @@ fn every_read_after_a_malformed_mark_repeats_jqs_fault_7863() -> Result<()> {
 }
 
 /// A pipe is read a window at a time past its first 256 KiB, where the fault is met in the first read
-/// of it and the text after it is a megabyte of documents jq never reads.
+/// of it and the text after it is a megabyte of documents jq never reads. Since #7987 step 7 the
+/// model reads the mark from the front the route has read, so the first read is jq's `Malformed BOM`
+/// too (jq 1.7.1 and 1.8.2: three `"Malformed BOM"`, exit 0), where it was the numeric literal.
 #[test]
 fn a_pipe_longer_than_its_first_read_repeats_the_fault_too_7863() -> Result<()> {
     let mut stdin = b"\xef1\n".to_vec();
@@ -236,7 +237,7 @@ fn a_pipe_longer_than_its_first_read_repeats_the_fault_too_7863() -> Result<()> 
         stdout: THREE_BOM,
         stderr: "",
         status: 0,
-        first: Some(AT_LINE_2),
+        first: None,
     };
     let (stdout, stderr) = expected(&row);
     assert_eq!(run(&row, &stdin)?, (stdout, stderr, 0));

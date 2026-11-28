@@ -637,15 +637,18 @@ fn line_reads_are_the_reads_step_takes_7987() {
             let mut rng = Rng(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) ^ read_len as u64);
             let files = line_files(&mut rng, read_len);
             let sources: Vec<&[u8]> = files.iter().map(Vec::as_slice).collect();
+            let mut whole = Whole::new(&sources);
             let mut reader =
-                Reader::resume(ReaderState::start(NON_SEQ), &sources, &profile, NON_SEQ);
+                Session::resume(ReaderState::start(NON_SEQ), &whole, &profile, NON_SEQ);
             // Per file: where its last line starts, the reads of that line so far, and where the
             // read that met its end started.
             let mut line_start = 0;
             let mut line_reads = 0;
             let mut met_end = vec![None; files.len()];
             loop {
-                let (chunk, is_last) = reader.read_more();
+                let Ok((chunk, is_last)) = reader.read_more(&mut whole) else {
+                    panic!("whole sources hold every read");
+                };
                 let file = reader.next_file.checked_sub(1);
                 let (Some(file), Some(open)) = (file, reader.input) else {
                     assert!(is_last && chunk.is_empty(), "seed {seed}");
@@ -741,4 +744,209 @@ fn the_read_that_meets_the_end_at_4095_bytes_7987() {
         Some(4092)
     );
     assert_eq!(Fgets::of(b"", 4095), None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Step 7: a session over the windows a route holds, and the state at a line start.
+
+/// A stream of jq-shaped pieces, faults, marks, invalid UTF-8 and NULs among them, cut into one to
+/// three files: the inputs a windowed route meets.
+fn edge_stream(rng: &mut Rng, read_len: usize) -> Vec<Vec<u8>> {
+    const PIECES: &[&[u8]] = &[
+        b"1",
+        b"[1,2]",
+        b"{\"a\":\"b\"}",
+        b"\"str\"",
+        b"true",
+        b"null",
+        b"-1.5e3",
+        b"[]",
+        b"{}",
+        b"\"\xff\"",
+        b"[\"\xc3(\"]",
+        b"\"a\xe9b\"",
+        b"}",
+        b"[1 2]",
+        b"tru",
+        b"1}",
+        b"\"abc",
+        b"\x00",
+        b"[1,\x002]",
+        b"\xef\xbb\xbf",
+        b"\xef",
+        b"\xef\xbb",
+        b"\x1e",
+    ];
+    let mut stream = Vec::new();
+    if rng.below(5) == 0 {
+        stream.extend_from_slice(rng.pick(&[
+            &b"\xef\xbb\xbf"[..],
+            b"\xef",
+            b"\xef\xbb",
+            b"\xef\xbf\xbd",
+        ]));
+    }
+    for _ in 0..=rng.below(12) {
+        // Mostly clean, so a fault is often late.
+        if rng.below(3) == 0 {
+            stream.extend_from_slice(rng.pick(PIECES));
+        } else {
+            stream.extend_from_slice(rng.pick(&PIECES[..9]));
+        }
+        stream.extend(white_space(rng, read_len));
+    }
+    let mut files = Vec::new();
+    let mut from = 0;
+    for _ in 0..rng.below(3) {
+        let cut = from + rng.below(stream.len() - from + 1);
+        files.push(stream[from..cut].to_vec());
+        from = cut;
+    }
+    files.push(stream[from..].to_vec());
+    files
+}
+
+/// A source that holds a growing prefix of each file, as a route's windows do: a read it does not
+/// hold the bytes of is short, and the test then holds more.
+struct Growing<'a> {
+    files: &'a [&'a [u8]],
+    held: Vec<usize>,
+}
+
+impl Source for Growing<'_> {
+    fn files(&self) -> usize {
+        self.files.len()
+    }
+
+    fn start_of(&self, file: usize) -> usize {
+        self.files[..file].iter().map(|f| f.len()).sum()
+    }
+
+    fn held(&mut self, file: usize, offset: usize, _want: usize) -> Held<'_> {
+        let end = self.held[file].max(offset);
+        Held {
+            bytes: &self.files[file][offset..end],
+            to_end: end == self.files[file].len(),
+        }
+    }
+}
+
+/// ADR-0033 step 7: a [`Session`] fed the bytes of its input a window at a time, short of what a
+/// read needs and then given more, answers every `input` call as it does over the files whole,
+/// with the same positions, and stops at the same sync points: its place survives a short read,
+/// a value in progress included.
+#[test]
+fn a_session_fed_windows_reads_as_over_the_whole_files_7987() {
+    for read_len in [3, 7, 16, JQ_READER.read_len] {
+        let profile = ReaderProfile {
+            read_len,
+            ..JQ_READER
+        };
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ read_len as u64);
+            let files = edge_stream(&mut rng, read_len);
+            let sources: Vec<&[u8]> = files.iter().map(Vec::as_slice).collect();
+            let mut whole = Vec::new();
+            let stuck =
+                ReaderState::start(NON_SEQ)
+                    .read_to_end(&sources, &profile, NON_SEQ, |read| whole.push(read));
+            let mut growing = Growing {
+                files: &sources,
+                held: vec![0; sources.len()],
+            };
+            let mut session =
+                Session::resume(ReaderState::start(NON_SEQ), &growing, &profile, NON_SEQ);
+            let mut windowed = Vec::new();
+            let mut shorts = 0;
+            let fed_stuck = loop {
+                match session.step(&mut growing, &mut windowed) {
+                    Stop::Short => {
+                        shorts += 1;
+                        let (file, _) = session.stands();
+                        let file = file.min(sources.len() - 1);
+                        let grow = 1 + rng.below(2 * read_len);
+                        growing.held[file] = (growing.held[file] + grow).min(sources[file].len());
+                    }
+                    Stop::Stuck => break true,
+                    Stop::Synced => {
+                        assert!(session.state().is_some(), "seed {seed}");
+                        if windowed.iter().any(|read: &Read| read.item == Item::End) {
+                            break false;
+                        }
+                    }
+                }
+                assert!(shorts < 1_000_000, "seed {seed}: no end");
+            };
+            let end = windowed
+                .iter()
+                .position(|read| read.item == Item::End)
+                .map_or(windowed.len(), |at| at + 1);
+            windowed.truncate(end);
+            assert_eq!(fed_stuck, stuck, "seed {seed}, read_len {read_len}");
+            assert_eq!(
+                windowed, whole,
+                "seed {seed}, read_len {read_len}: {files:?}"
+            );
+        }
+    }
+}
+
+/// ADR-0033 step 7: at the byte after a newline of a file's own bytes that no value holds, before
+/// any fault, [`ReaderState::at_line_start`] of the file, the offset and the two newline counts is
+/// the state [`ReaderState::step`] stops at there, over plain streams and over streams with marks,
+/// invalid UTF-8 and faults after the point.
+#[test]
+fn at_line_start_is_the_state_step_stops_at_after_a_newline_7987() {
+    let mut checked = 0;
+    for read_len in [3, 7, 16, JQ_READER.read_len] {
+        let profile = ReaderProfile {
+            read_len,
+            ..JQ_READER
+        };
+        for seed in 1..=400u64 {
+            let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) ^ read_len as u64);
+            let files = if seed % 2 == 0 {
+                generate(&mut rng, read_len).files
+            } else {
+                edge_stream(&mut rng, read_len)
+            };
+            let sources: Vec<&[u8]> = files.iter().map(Vec::as_slice).collect();
+            let mut state = ReaderState::start(NON_SEQ);
+            let mut reads = Vec::new();
+            loop {
+                let was = stands(&state);
+                let stop = state.step(&sources, &profile, NON_SEQ, &mut reads);
+                if stop == Stop::Stuck
+                    || reads
+                        .iter()
+                        .any(|read| matches!(read.item, Item::Fault(_) | Item::End))
+                {
+                    break;
+                }
+                let (file, offset) = stands(&state);
+                let Some(bytes) = sources.get(file) else {
+                    break;
+                };
+                // Right after the read that ended at the newline: a read that then finds the file's
+                // end stands there too, past the sync point.
+                if (file, offset) == was
+                    || offset == 0
+                    || bytes[offset - 1] != b'\n'
+                    || state.input.is_none()
+                {
+                    continue;
+                }
+                let count = |bytes: &[u8]| bytes.iter().filter(|&&b| b == b'\n').count();
+                let before: usize = sources[..file].iter().map(|f| count(f)).sum();
+                let file_lines = count(&bytes[..offset]);
+                assert_eq!(
+                    ReaderState::at_line_start(file, offset, file_lines, before + file_lines),
+                    state,
+                    "seed {seed}, read_len {read_len}, file {file} at {offset}: {files:?}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 1_000, "{checked}");
 }

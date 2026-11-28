@@ -286,6 +286,39 @@ impl<'a> JvParser<'a> {
         self.bom == BOM_MALFORMED
     }
 
+    /// The parser with its buffer let go, once it is read through: between two buffers it holds
+    /// none of them, so the next can come from a source the last did not (#7987, step 7: a reader
+    /// fed the windows a route holds, one read at a time, where its whole input is not in memory).
+    /// Everything else, a value in progress included, goes on as it was. In C the buffer is the
+    /// caller's too, and `jv_parser_set_buf` only ever replaces it once it is read through. A
+    /// parser stuck on `Malformed BOM` reads nothing more of its buffer, so it lets go of it too.
+    pub(crate) fn rebind<'b>(self) -> JvParser<'b> {
+        debug_assert!(
+            self.remaining() == 0 || self.malformed_bom(),
+            "the buffer is read through"
+        );
+        JvParser {
+            seq: self.seq,
+            max_depth: self.max_depth,
+            buf: None,
+            pos: 0,
+            partial: self.partial,
+            buf_base: self.buf_base,
+            fed: self.fed,
+            eof: self.eof,
+            bom: self.bom,
+            stack: self.stack,
+            next: self.next,
+            token: self.token,
+            line: self.line,
+            column: self.column,
+            st: self.st,
+            last_ch_was_ws: self.last_ch_was_ws,
+            value_start: self.value_start,
+            token_end: self.token_end,
+        }
+    }
+
     /// `jv_parser_set_buf`: the next buffer of the stream. While the mark is not decided its bytes
     /// are matched one at a time across buffers, and a matched byte is skipped without being
     /// counted in `column`.

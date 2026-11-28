@@ -312,6 +312,19 @@ pub(super) struct EagerFile {
 }
 
 impl EagerFile {
+    /// A source past the first trigger, which the loop did not read as JSON (#8082): only its text
+    /// is the model's, to rebuild the sources as read with ([`original_stream`]).
+    pub(super) fn unread(text: Rc<String>, base: usize, values_before: usize) -> Self {
+        Self {
+            text,
+            base,
+            ends: Vec::new(),
+            lazy: 0,
+            values_before,
+            trigger: None,
+        }
+    }
+
     /// The trigger of a source the route met its first fault in at `fault` (where that value
     /// starts), or that is the substitution `lossy` of bytes that are not UTF-8: whichever comes
     /// first.
@@ -347,9 +360,14 @@ fn original_stream(
 ) -> Option<Vec<u8>> {
     let total: usize = lens.iter().sum();
     let mut stream = Vec::with_capacity(total);
+    // The mark's bytes each source lost: a mark cut across sources (#7566) goes on in the next, as
+    // `model_default`'s `Stream::of` rebuilds it.
+    let mut mark = 0;
     for (at, file) in files.iter().enumerate() {
         let cut = cuts.get(at).copied().unwrap_or(0);
-        stream.extend_from_slice(&UTF8_BOM[..cut.min(UTF8_BOM.len())]);
+        let next = (mark + cut).min(UTF8_BOM.len());
+        stream.extend_from_slice(&UTF8_BOM[mark..next]);
+        mark = next;
         match lossy.get(at).and_then(Option::as_ref) {
             Some(lossy) => stream.extend_from_slice(&lossy.original),
             None => stream.extend_from_slice(file.text.as_bytes()),
@@ -522,4 +540,42 @@ pub(super) fn transcript_alone(files: &[&[u8]]) -> Vec<String> {
         seen.push(format!("{what} at {at:?}"));
     });
     seen
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(text: &str) -> EagerFile {
+        EagerFile::unread(Rc::new(text.to_owned()), 0, 0)
+    }
+
+    /// #7987 step 7: a mark cut across sources goes on in each later one when the sources are
+    /// rebuilt as read (`UTF8_BOM[..cut]` per source rebuilt `EF BB` in front of the second source of
+    /// `EF | BB BF 1`). Unreachable from the route while such a mark is read whole up front
+    /// ([`read_whole_on_trigger`]); this holds the rebuild to the bytes should that change.
+    #[test]
+    fn a_mark_cut_across_sources_is_rebuilt_as_read_7987() {
+        let cases: &[(&[&[u8]], &[usize])] = &[
+            (&[b"\xef", b"\xbb\xbf1\n"], &[1, 2]),
+            (&[b"\xef\xbb", b"\xbf1\n"], &[2, 1]),
+            (&[b"\xef", b"\xbb", b"\xbf1\n2"], &[1, 1, 1]),
+            (&[b"", b"\xef\xbb\xbf1\n"], &[0, 3]),
+            (&[b"\xef\xbb\xbf1\n", b"2\n"], &[3, 0]),
+        ];
+        for &(sources, cuts) in cases {
+            let files: Vec<EagerFile> = sources
+                .iter()
+                .zip(cuts)
+                .map(|(source, &cut)| file(std::str::from_utf8(&source[cut..]).expect("text")))
+                .collect();
+            let lens: Vec<usize> = sources.iter().map(|source| source.len()).collect();
+            let lossy = vec![None; sources.len()];
+            assert_eq!(
+                original_stream(&files, &lossy, cuts, &lens),
+                Some(sources.concat()),
+                "{sources:?}"
+            );
+        }
+    }
 }
