@@ -1,13 +1,15 @@
-//! #8064: the call machine (`SUCCINCTLY_CALL_MACHINE=1`) bounds what a run holds by bytes, and
-//! has no bound on a loop's outputs.
+//! #8064: the call machine (`SUCCINCTLY_CALL_MACHINE=1`) is bounded by the memory the process
+//! holds, and has no bound on a loop's outputs.
 //!
 //! The shipped evaluators refuse a zero-argument `def`'s tail loop after 2^20 outputs
 //! (`f/0: maximum outputs exceeded`, #5379), to keep a collector from exhausting memory; jq 1.7.1
-//! has no such bound. The machine counts the heap a run holds instead, as the allocator counts it
-//! (what a collected value holds, nested containers, strings and objects, a `reduce`'s or a
-//! `foreach`'s state, each once however many places share it), and refuses past 1.25 GiB with
-//! the recursion wording. So it answers as jq does where the shipped evaluators refuse a loop's
-//! outputs, and refuses in bounded memory where jq grows until its allocation fails.
+//! has no such bound. `succinctly jq` gives the machine a probe of the process's resident memory
+//! (`/proc/self/statm` on Linux, the physical footprint on macOS) and a limit computed from the
+//! memory available to it, and the machine samples it as it runs, refusing past the limit with
+//! `memory limit exceeded`. So it answers as jq does where the shipped evaluators refuse a loop's
+//! outputs, and refuses in bounded memory where jq grows until its allocation fails. These rows
+//! run the probe for real; `SUCCINCTLY_DEBUG_CALL_MACHINE_MEMORY_LIMIT` lowers the limit so they
+//! do not fill the test machine.
 
 use std::path::Path;
 use std::process::Command;
@@ -18,34 +20,30 @@ use crate::{spawn_with_signal_retry, succinctly_bin};
 
 const SWITCH: &str = "SUCCINCTLY_CALL_MACHINE";
 const LOG: &str = "SUCCINCTLY_DEBUG_CALL_MACHINE_LOG";
+const MEMORY: &str = "SUCCINCTLY_DEBUG_CALL_MACHINE_MEMORY_LIMIT";
+
+/// 256 MiB: low enough that the rows refused at it are quick and light, high enough above what
+/// the binary holds at rest.
+const LOW: &str = "268435456";
 
 /// `(stdout, stderr, exit, taken)` of `succinctly jq -nc <filter>` with the switch on when `on`,
-/// under the shell prefix `limit` when there is one; `taken` is whether the decision log holds
-/// only `taken` lines.
+/// with the machine's memory limit set to `memory` bytes when given; `taken` is whether the
+/// decision log holds only `taken` lines.
 fn run(
     filter: &str,
     on: bool,
-    limit: Option<&str>,
+    memory: Option<&str>,
     dir: &Path,
 ) -> Result<(String, String, i32, bool)> {
     let log = dir.join("decisions.log");
     let (output, exit) = spawn_with_signal_retry(
         || {
             let _ = std::fs::remove_file(&log);
-            let mut command = match limit {
-                Some(limit) => {
-                    let mut sh = Command::new("bash");
-                    sh.arg("-c")
-                        .arg(format!("{limit} && exec \"$0\" jq -nc \"$1\""))
-                        .arg(succinctly_bin())
-                        .arg(filter);
-                    sh
-                }
-                None => {
-                    let mut direct = Command::new(succinctly_bin());
-                    direct.args(["jq", "-nc", filter]);
-                    direct
-                }
+            let mut command = Command::new(succinctly_bin());
+            command.args(["jq", "-nc", filter]);
+            match memory {
+                Some(bytes) => command.env(MEMORY, bytes),
+                None => command.env_remove(MEMORY),
             };
             command.env(LOG, &log);
             command.env(SWITCH, if on { "1" } else { "0" });
@@ -119,11 +117,12 @@ fn a_loop_past_the_shipped_output_bound_answers_as_jq_does_8064() -> Result<()> 
 
 /// #8064's memory repros: collectors whose values hold heap of their own (objects, arrays,
 /// strings), a `reduce`'s and a `foreach`'s state, and collectors the shipped output bound did not
-/// see (a loop through a local `def`, an `as` source that does not settle). Each grew past 3 GB on
-/// a budget that charged a slot per collected value; each is refused here with the recursion
-/// wording at the heap budget. jq grows on each until memory runs out.
+/// see (a loop through a local `def`, an `as` source that does not settle). Each grew past 3 GB
+/// on a budget that charged a slot per collected value; each is refused here at the memory limit
+/// with its own wording, naming the innermost definition on the call chain or none. jq grows on
+/// each until memory runs out.
 #[test]
-fn a_collector_past_the_heap_budget_is_refused_8064() -> Result<()> {
+fn a_collector_past_the_memory_limit_is_refused_8064() -> Result<()> {
     let dir = tempfile::tempdir()?;
     for filter in [
         "[def f: def m: .+1 | f; ([range(100)] | tostring), m; 0|f] | length",
@@ -133,22 +132,48 @@ fn a_collector_past_the_heap_budget_is_refused_8064() -> Result<()> {
         "reduce (def f: ., (.+1|f); 0|f) as $x (null; [$x, [range(100)], .]) | length",
         "foreach (def f: ., (.+1|f); 0|f) as $x (null; [$x, [range(100)], .]; empty)",
         "[def f: \"\\(.)-\\([range(100)])\", (.+1|f); 0|f] | length",
+        // A recursion whose frames keep what each built, collecting nothing.
+        "def f: [range(1000)] as $a | f, ($a | length); f | empty",
     ] {
-        let (stdout, stderr, exit, taken) = run(filter, true, None, dir.path())?;
+        let (stdout, stderr, exit, taken) = run(filter, true, Some(LOW), dir.path())?;
         assert_eq!((stdout.as_str(), exit), ("", 5), "{filter}: {stderr}");
         assert!(
             stderr.starts_with("jq: error (at <unknown>): ")
-                && stderr.ends_with("exceeded maximum recursion depth\n"),
+                && stderr.ends_with("memory limit exceeded\n")
+                && !stderr.contains("recursion"),
             "{filter}: {stderr}"
         );
         assert!(taken, "{filter}: declined");
     }
+    // Uncatchable, as the shipped resource refusals are.
+    let (stdout, stderr, exit, _) = run(
+        r#"[try ([def f: {a: [range(100)]}, (.+1|f); 0|f] | length) catch "caught"]"#,
+        true,
+        Some(LOW),
+        dir.path(),
+    )?;
+    assert_eq!((stdout.as_str(), exit), ("", 5), "{stderr}");
+    assert!(stderr.ends_with("memory limit exceeded\n"), "{stderr}");
     Ok(())
 }
 
-/// A value shared with one the run holds is charged once: `$big`, a 2^20-element array, collected
-/// and folded two thousand times answers, as jq answers it, where charging each copy would be
-/// 64 GB.
+/// The limit is sized from the memory available, not fixed below what jq answers: an array of
+/// 4 x 10^7 numbers, which jq 1.7.1 answers in 1.84 GB, the shipped route and main's machine
+/// answer, answers on the machine at the computed limit (#8064's finding 3).
+#[test]
+fn an_array_jq_answers_answers_at_the_computed_limit_8064() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let filter = "def f: f; [range(10000000), range(10000000), range(10000000), range(10000000)] \
+                  | length";
+    let (stdout, stderr, exit, taken) = run(filter, true, None, dir.path())?;
+    assert_eq!((stdout.as_str(), exit), ("40000000\n", 0), "{stderr}");
+    assert!(taken, "declined");
+    Ok(())
+}
+
+/// A value shared with one the run holds is held once: `$big`, a 2^20-element array, collected
+/// and folded two thousand times answers within a 256 MiB limit, as jq answers it, where a copy
+/// each would be 64 GB.
 #[test]
 fn a_shared_value_collected_many_times_answers_8064() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -160,7 +185,7 @@ fn a_shared_value_collected_many_times_answers_8064() -> Result<()> {
         ("reduce f(0) as $x ([]; . + [$x]) | length", "2000\n"),
     ] {
         let filter = format!("{big} {tail}");
-        let (stdout, stderr, exit, taken) = run(&filter, true, None, dir.path())?;
+        let (stdout, stderr, exit, taken) = run(&filter, true, Some(LOW), dir.path())?;
         assert_eq!((stdout.as_str(), exit), (want, 0), "{filter}: {stderr}");
         assert!(taken, "{filter}: declined");
     }

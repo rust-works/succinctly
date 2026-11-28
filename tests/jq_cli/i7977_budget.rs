@@ -1,7 +1,7 @@
 //! #7977 step 2: the call machine's bounds, with `SUCCINCTLY_CALL_MACHINE=1`.
 //!
 //! A loop that never deepens is refused after the shipped `MAX_LOOP_ROUNDS` rounds, and a run whose
-//! control state or heap passes its byte budget, or whose allocation of it fails, with the shipped
+//! control state passes its byte budget, or whose allocation of it fails, with the shipped
 //! recursion wording. Each loop refusal is the one the shipped evaluators give with the switch off,
 //! so those rows are checked against that run too, and against the decision log, so a row the
 //! machine declined cannot pass. jq spins or runs out of memory on every row (an ADR-0018 rule
@@ -169,8 +169,8 @@ fn a_loop_that_never_deepens_is_refused_as_the_shipped_evaluators_refuse_it_7977
 }
 
 /// What the shipped evaluators answer, the machine answers, though it bounds its control state,
-/// its heap and its loops: what `[...]` holds here is within the heap budget (2^25 slots of
-/// `[range(1e7), range(1e7)]`, which jq 1.7.1 answers in 1.18 GB), a `repeat` a consumer can stop
+/// the memory the process holds and its loops: what `[...]` holds here is within the memory limit
+/// (`[range(1e7), range(1e7)]`, which jq 1.7.1 answers in 1.18 GB), a `repeat` a consumer can stop
 /// is not bounded, and recursion through a closure that does not compose is not a closure chain.
 #[test]
 fn the_machine_answers_what_the_shipped_evaluators_answer_7977() -> Result<()> {
@@ -259,12 +259,12 @@ fn a_recursion_past_the_byte_budget_is_refused_7977() -> Result<()> {
 
 /// #5634 and #7733 with the switch on: under a cap on the address space, and on the main thread
 /// at the process limit, a runaway recursion and a runaway collector are still refused, because
-/// the machine's stacks and collectors grow fallibly and its heap budget is held to half the room
-/// the cap leaves (#8064), so the refusal is made while there is room to make it, not an abort
-/// (`memory allocation of 2 bytes failed`) when an allocation the machine does not make fallibly
-/// fails first. The 1.5 GiB cap also holds every budget refusal above within the acceptance bound
-/// of #7977 step 2. Linux only: macOS refuses `ulimit -v` and does not count threads against
-/// `RLIMIT_NPROC`.
+/// the machine's stacks and collectors grow fallibly and its memory limit is held to a quarter of
+/// the room the cap leaves (#8064), so the refusal is made while there is room to make it, not an
+/// abort (`memory allocation of 2 bytes failed`) when an allocation the machine does not make
+/// fallibly fails first. The 1.5 GiB cap also holds every budget refusal above within the
+/// acceptance bound of #7977 step 2. Linux only: macOS refuses `ulimit -v` and does not count
+/// threads against `RLIMIT_NPROC`.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_machine_refuses_under_a_capped_address_space_and_at_the_thread_limit_7977() -> Result<()> {
@@ -296,7 +296,8 @@ fn the_machine_refuses_under_a_capped_address_space_and_at_the_thread_limit_7977
                 "{limit}: {filter}: {stderr}"
             );
             assert!(
-                stderr.contains("exceeded maximum recursion depth"),
+                stderr.contains("exceeded maximum recursion depth")
+                    || stderr.contains("memory limit exceeded"),
                 "{limit}: {filter}: {stderr}"
             );
             assert!(decisions.lines().all(|l| l == "taken"), "{decisions:?}");

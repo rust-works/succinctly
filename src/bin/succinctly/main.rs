@@ -3950,6 +3950,7 @@ mod m2_gate;
 mod main_thread_stack;
 mod malloc_arena;
 mod output;
+mod process_memory;
 mod relocation_pages;
 mod select_stats_report;
 mod sigpipe;
