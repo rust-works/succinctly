@@ -25,9 +25,30 @@ _spec = importlib.util.spec_from_file_location("jq_regex_corpus", _PATH)
 corpus = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(corpus)
 
-# sha256 of MANIFEST followed by every chunk, for `gen` with its defaults. The corpus the ADR-0031
-# measurements were taken on (459,678 rows, 330,133 patterns) has this digest.
-DEFAULT_CORPUS_SHA256 = "7fefc97e9f823f477434ba03d69dcf2d450c414c167d40ec073087b9e6ba28f1"
+# sha256 of MANIFEST followed by every chunk. The corpus the ADR-0031 measurements were taken on
+# (459,678 rows, 330,133 patterns) is `gen --literal 0`; the default adds 40,000 literal rows in
+# chunks of their own (step 5).
+MEASURED_CORPUS_SHA256 = "7fefc97e9f823f477434ba03d69dcf2d450c414c167d40ec073087b9e6ba28f1"
+DEFAULT_CORPUS_SHA256 = "017e532daeacc2975d008181373328f8e35d23ec16f8040328bf690ec0141ab6"
+
+
+def gen_quietly(d, opt):
+    with open(os.devnull, "w") as null:
+        saved, sys.stdout = sys.stdout, null
+        try:
+            return corpus.cmd_gen([d], opt)
+        finally:
+            sys.stdout = saved
+
+
+def corpus_digest(d):
+    h = hashlib.sha256()
+    manifest = pathlib.Path(d, "MANIFEST").read_bytes()
+    names = [l.split()[0] for l in manifest.decode().splitlines()]
+    h.update(manifest)
+    for n in names:
+        h.update(pathlib.Path(d, n).read_bytes())
+    return names, h.hexdigest()
 
 
 def line(rid, *answers):
@@ -35,23 +56,39 @@ def line(rid, *answers):
 
 
 class GeneratorTests(unittest.TestCase):
-    def test_the_default_corpus_is_the_one_the_measurements_used(self):
+    def test_without_literal_rows_the_corpus_is_the_one_the_measurements_used(self):
         with tempfile.TemporaryDirectory() as d:
-            with open(os.devnull, "w") as null:
-                saved, sys.stdout = sys.stdout, null
-                try:
-                    self.assertEqual(corpus.cmd_gen([d], {}), 0)
-                finally:
-                    sys.stdout = saved
-            h = hashlib.sha256()
-            manifest = pathlib.Path(d, "MANIFEST").read_bytes()
-            names = [l.split()[0] for l in manifest.decode().splitlines()]
-            h.update(manifest)
-            for n in names:
-                h.update(pathlib.Path(d, n).read_bytes())
+            self.assertEqual(gen_quietly(d, {"--literal": "0"}), 0)
+            names, digest = corpus_digest(d)
             self.assertEqual(len(names), 92)
-            self.assertEqual(h.hexdigest(), DEFAULT_CORPUS_SHA256,
+            self.assertEqual(digest, MEASURED_CORPUS_SHA256,
                              "the corpus changed: every stored answer has to be regenerated with it")
+
+    def test_the_default_corpus_adds_the_literal_chunks_after_the_measured_ones(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as d0:
+            self.assertEqual(gen_quietly(d, {}), 0)
+            self.assertEqual(gen_quietly(d0, {"--literal": "0"}), 0)
+            names, digest = corpus_digest(d)
+            self.assertEqual(len(names), 100)
+            self.assertEqual(digest, DEFAULT_CORPUS_SHA256,
+                             "the corpus changed: every stored answer has to be regenerated with it")
+            # The 92 measured chunks are byte for byte the ones without literal rows, so every
+            # answer stored for them still applies.
+            for n in names[:92]:
+                self.assertEqual(pathlib.Path(d, n).read_bytes(), pathlib.Path(d0, n).read_bytes(), n)
+
+    def test_literal_rows_are_literal_or_one_step_from_it(self):
+        rows = corpus.generate_literal(2000, 1, 100)
+        self.assertEqual([r[0] for r in rows], list(range(100, 2100)))
+        gens = {r[1] for r in rows}
+        self.assertEqual(gens, {"literal", "near-literal"})
+        for rid, gen, op, pat, fl, subjects in rows:
+            self.assertIn(op, corpus.OPEXPR)
+            self.assertEqual(len(subjects), 3)
+            literal = (fl in (None, "", "g") and all(pat.split("|"))
+                       and not any(c in corpus.LIT_META for c in pat.replace("|", "")))
+            # A near-literal is one the fast path has to refuse; a literal one it has to take.
+            self.assertEqual(literal, gen == "literal", (gen, pat, fl))
 
     def test_a_seed_gives_the_same_rows_and_another_seed_does_not(self):
         a, _ = corpus.generate(500, 7)

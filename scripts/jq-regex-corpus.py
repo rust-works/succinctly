@@ -6,8 +6,14 @@ The corpus is the gate for moving jq mode onto Oniguruma. A row is one regex bui
 `split`) on one pattern and flags string, evaluated on three subject strings. The generators
 cover look-behind bodies, references and calls, malformed pieces, classes, intervals, escapes,
 option runs, comments and blanks, ordinary patterns, and 133 probe patterns from a reading of the
-old text passes. The default corpus (seed 2026, 330,000 patterns requested) has 330,133 distinct
-patterns in 459,678 rows; it is regenerated, not committed.
+old text passes. Those 459,678 rows (seed 2026, 330,000 patterns requested, 330,133 distinct) are
+the corpus the ADR-0031 measurements used, in chunks 0 to 91.
+
+After them, in chunks of their own, come 40,000 rows of literal patterns (`--literal ROWS`, 0 for
+none): literals and alternations of literals, which jq mode searches without Oniguruma (ADR-0031
+step 5), and near-literals one metacharacter, empty alternative or flag away, which it must not.
+They have their own random stream, so the earlier rows, and every answer stored for them, are
+unchanged by their presence. The corpus is regenerated, not committed.
 
 Each binary answers a chunk in one process per 400 rows, each row under `try`/`catch`, so a run is
 about 1,150 processes rather than 1.4 million. A row's answer is `["ok", value]` or `["err",
@@ -17,7 +23,7 @@ the pattern as a literal in the program and no `try`, which `validate` compares 
 
 Subcommands:
 
-    gen       <corpus-dir> [--patterns N] [--seed S] [--chunk ROWS]
+    gen       <corpus-dir> [--patterns N] [--seed S] [--chunk ROWS] [--literal ROWS]
     run       <label> <binary> <corpus-dir> <res-dir> [--workers N] [--budget SECONDS]
               [--standalone K] [--env K=V[,K=V]] [--load-max L] [--heartbeat FILE]
     analyze   <corpus-dir> <res-dir> <candidate> [--base LABEL] [--top N] [--examples N] [--out FILE]
@@ -262,21 +268,76 @@ def generate(npat, seed):
     return rows, len(seen)
 
 
+# Literal patterns (ADR-0031 step 5): every ASCII character Oniguruma's Perl_NG syntax reads as
+# text, controls and NUL included, and characters of two, three and four bytes. A few are drawn
+# often so that alternatives overlap and subjects match.
+LIT_META = "\\^$.|?*+()[]{}"
+LIT_CHARS = [chr(b) for b in range(0x01, 0x80) if chr(b) not in LIT_META] + list("éößÉ\u0301日本語\u2028😀")
+LIT_COMMON = list("abé日 ")
+# What turns a literal into a pattern the fast path must refuse (a `|` inside an alternative only
+# splits it in two, and one at either end is the empty-alternative case below).
+NEAR = ["$", "^", ".", "\\", "*", "+", "?", "(", ")", "[", "]", "{", "}"]
+NEAR_FLAGS = ["i", "x", "n", "l", "s", "m", "p", "gi", "gx", "q"]
+LIT_OPS = ["test", "match", "matchg", "capture", "caps", "scan", "sub", "gsub", "split", "splits"]
+
+
+def generate_literal(nrows, seed, first_id):
+    """`nrows` literal rows with ids from `first_id`: each pattern on four of `LIT_OPS`."""
+    r = random.Random("literal-%d" % seed)
+
+    def ch():
+        return r.choice(LIT_CHARS) if r.random() < 0.2 else r.choice(LIT_COMMON)
+
+    def word(n):
+        return "".join(ch() for _ in range(n))
+
+    rows = []
+    rid = first_id
+    while len(rows) < nrows:
+        alts = [word(1 + r.randrange(3)) for _ in range(1 + r.randrange(4))]
+        gen, fl = "literal", r.choice([None, None, "", "g"])
+        x = r.random()
+        if x < 0.15:
+            gen = "near-literal"
+            i = r.randrange(len(alts))
+            at = r.randrange(len(alts[i]) + 1)
+            alts[i] = alts[i][:at] + r.choice(NEAR) + alts[i][at:]
+        elif x < 0.22:
+            gen = "near-literal"
+            alts.insert(r.randrange(len(alts) + 1), "")
+        elif x < 0.30:
+            gen = "near-literal"
+            fl = r.choice(NEAR_FLAGS)
+        p = "|".join(alts)
+        subj = [word(r.randrange(5)) + r.choice(alts) + word(r.randrange(5)) + r.choice(alts),
+                word(r.randrange(30)), word(r.randrange(30))]
+        for op in r.sample(LIT_OPS, 4):
+            if len(rows) == nrows:
+                break
+            rows.append([rid, gen, op, p, fl, subj])
+            rid += 1
+    return rows
+
+
 def cmd_gen(args, opt):
     out = args[0]
     npat, seed, chunk = int(opt.get("--patterns", 330000)), int(opt.get("--seed", 2026)), int(opt.get("--chunk", 5000))
+    nlit = int(opt.get("--literal", 40000))
     os.makedirs(out, exist_ok=True)
     rows, npatterns = generate(npat, seed)
+    literal = generate_literal(nlit, seed, len(rows))
     with open(out + "/MANIFEST", "w") as mf:
         n = 0
-        for i in range(0, len(rows), chunk):
-            fn = "chunk-%04d.jsonl" % n
-            with open(out + "/" + fn, "w", encoding="utf-8") as f:
-                for row in rows[i:i + chunk]:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            mf.write("%s %d\n" % (fn, len(rows[i:i + chunk])))
-            n += 1
-    print(json.dumps({"patterns": npatterns, "rows": len(rows), "chunks": n}))
+        # The literal rows start a chunk of their own, so the chunks before them are as they were.
+        for part in (rows, literal):
+            for i in range(0, len(part), chunk):
+                fn = "chunk-%04d.jsonl" % n
+                with open(out + "/" + fn, "w", encoding="utf-8") as f:
+                    for row in part[i:i + chunk]:
+                        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                mf.write("%s %d\n" % (fn, len(part[i:i + chunk])))
+                n += 1
+    print(json.dumps({"patterns": npatterns, "rows": len(rows) + len(literal), "literal rows": len(literal), "chunks": n}))
     return 0
 
 
