@@ -558,20 +558,27 @@ fn reserve<T>(items: &mut Vec<T>) -> Result<(), ()> {
     move_to_capacity(items, want)
 }
 
-/// Give `v` room for `want` elements in a new block, its elements moved over, fallibly.
+/// Give `v` room for `want` elements, fallibly.
 ///
-/// Not `realloc`: on macOS a large `realloc` remaps the old pages into the new block lazily, and
-/// the process's footprint does not count them until they are next read, so the memory bound
-/// read too little while the machine's own stacks and accumulators grew, and the run passed its
-/// limit by up to a fifth when the refusal's unwinding read them (#8064). Moving the elements
-/// writes them, so the footprint counts what the vector holds as soon as it holds it. The copy is
-/// the one a `realloc` that moves makes, once per doubling.
+/// On macOS not by `realloc`: a large `realloc` there maps the old pages into the new block
+/// lazily, and the process's footprint does not count them until they are next read, so the
+/// memory bound read too little while the machine's own stacks and accumulators grew, and the run
+/// passed its limit by up to a fifth when the refusal's unwinding read them (#8064). Moving the
+/// elements into a new block writes them, so the footprint counts what the vector holds as soon as
+/// it holds it; the copy costs a page fault per page the old block held, once per doubling. On
+/// Linux a large `realloc` moves the pages (`mremap`), and the resident set counts them as it
+/// moves them, so the vector is grown in place.
 fn move_to_capacity<T>(v: &mut Vec<T>, want: usize) -> Result<(), ()> {
-    let mut grown = Vec::new();
-    grown.try_reserve_exact(want).map_err(|_| ())?;
-    grown.append(v);
-    *v = grown;
-    Ok(())
+    if cfg!(target_vendor = "apple") {
+        let mut grown = Vec::new();
+        grown.try_reserve_exact(want).map_err(|_| ())?;
+        grown.append(v);
+        *v = grown;
+        Ok(())
+    } else {
+        v.try_reserve_exact(want.saturating_sub(v.len()))
+            .map_err(|_| ())
+    }
 }
 
 /// The refusal past [`BUDGET`] or [`Limits::rounds`]: succinctly's own recursion-limit wording
