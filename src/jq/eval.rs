@@ -44783,6 +44783,32 @@ fn member_name(path: &Expr) -> Option<String> {
     }
 }
 
+/// The concrete path `path` with every integer index that stands on a mapping of `doc` spelled as
+/// the member it names (#8070): in yq mode `.m[1]` reads the member keyed `1` (#4079), and a
+/// rename renames that member's key (`(.m[1] | key) = "q"` over `'1': six` is `'q': six` in yq
+/// v4.53.3), where [`member_name`] and [`rename_members`] take only a `Field` step for a member.
+fn mapping_indexes_as_fields(path: &Expr, doc: &OwnedValue) -> Expr {
+    let mut steps = Vec::new();
+    push_path_components(&mut steps, path);
+    let mut at = Some(doc);
+    for step in &mut steps {
+        let Some(value) = at else {
+            break;
+        };
+        if let (Expr::Index { idx, key: None }, OwnedValue::Object(_)) = (&*step, value) {
+            *step = Expr::Field(idx.to_string());
+        }
+        at = match (unwrap_path_component(step).0, value) {
+            (Expr::Field(name), OwnedValue::Object(map)) => map.get(name.as_str()),
+            (Expr::Index { idx, .. }, OwnedValue::Array(items)) => {
+                array_slot(items.len(), *idx).and_then(|at| items.get(at))
+            }
+            _ => None,
+        };
+    }
+    flatten_components(steps)
+}
+
 /// The mapping the concrete components `parents` lead to from `root`, or `None` where they lead to
 /// anything else or nowhere (#6089).
 fn mapping_at_mut<'v>(
@@ -44910,6 +44936,9 @@ fn eval_key_rename<'a, W: Clone + AsRef<[u64]>, S: EvalSemantics>(
             "(PATH | key) names members that cannot be resolved to paths (#6089)",
         ));
     };
+    for path in &mut paths {
+        *path = mapping_indexes_as_fields(path, &pristine);
+    }
     paths.sort_by_cached_key(|path| {
         let mut components = Vec::new();
         push_path_components(&mut components, path);

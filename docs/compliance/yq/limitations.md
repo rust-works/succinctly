@@ -2618,6 +2618,7 @@ The new name keeps the key's quoting, anchor and comments, and the value under i
 `=` evaluates its right side against the document and every target takes its last output; `|=` binds `.` to each key's text and takes the first.
 A target that is a sequence item or the document root renames nothing, as in yq.
 A target that does not exist is created as `null` and renamed (`(.a.zz | key) = "q"` adds `q: null`), as in yq.
+An integer bracket on a mapping names the member its read takes, so `(.m[1] | key) = "q"` renames the key `'1'` or `1`, and `(.m[0x1] | key) = "q"` the key `"0x1"`, as in yq (#8070).
 
 Not reproduced:
 
@@ -6281,6 +6282,8 @@ its text (`numeric_display_string`, so `==` and `tostring` agree about a compute
   A hex literal past `i64` is refused with yq's `strconv.ParseInt: parsing "FFFFFFFFFFFFFFFF": value out of range`, behind the `parse error at position N:` prefix every parse error has here.
   A spelled integer is still an index by value for `has` on a sequence, from a document or a literal: `[1,2] | has(0x1)` is `true` here, and in yq the error `strconv.ParseInt: parsing "0x1": invalid syntax`.
   A spelled bracket key indexes a mapping by its text since #7999, as in yq: `.m[0x1] = 9` and `del(.m[01])` reach the keys `0x1` and `01`, not `1`, and a sequence is still indexed by the value (`.s[0x1]` is its second element).
+  `key` and `path` after it name that key since #8070 (`.m[0x1] | key` is `"0x1"`, its path `["m","0x1"]`, and a typed `0x1:` key prints `0x1` with the path `["m",1]`), as in yq.
+  On a mapping that lacks the key, `path` is the value as in yq (`.m[0x2] | path` is `["m",2]`), but `key` prints the value too (`2`), where yq prints the bracket as written (`0x2`).
   An underscored integer (`1_000`) is a string here, the recorded input-spec divergence.
 - **`split`'s separator literals** ([#4374](https://github.com/rust-works/succinctly/issues/4374)):
   the `{}` literal splits on the text `{}` as in yq (`"a{}b" | split({})` is `["a","b"]`), recognised

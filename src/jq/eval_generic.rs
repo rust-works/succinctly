@@ -37330,6 +37330,14 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
             (t, stepped)
         });
         for tpos in targets.iter() {
+            if let Some(stepped) =
+                path_context_step_spelled_key::<S, V>(&component, bracket_optional, tpos, out)
+            {
+                match stepped {
+                    Ok(()) => continue,
+                    Err(control) => return walk_error.stop(control),
+                }
+            }
             match path_component_step_expr(&component) {
                 Some(step) => {
                     let step = if bracket_optional {
@@ -37479,6 +37487,79 @@ fn path_context_component_values<S: EvalSemantics, V: DocumentValue>(
         Demand::Continue
     });
     (values, control)
+}
+
+/// A computed bracket's step when its component is an integer spelled other than as its decimal
+/// value (`0x1`, `01`, `-0`) and the target is a yq mapping (#8070), or `None` to leave the
+/// component to [`path_component_step_expr`].
+///
+/// yq names a mapping's member by the key's text and a sequence's slot by the value, and the
+/// value route reads `.m[0x1]` that way since #7999. The `Index` the component would otherwise
+/// become keeps only the value, so `.m[0x1] | key` on `"0x1": a` / `"1": b` stood on `"1":`. A
+/// member whose key is the spelling is taken by the `Field` step that names it, so the component
+/// is the one `.m["0x1"]` reports: the key's text, or its value for a typed key (`0x1: a` is
+/// `["m",1]` in yq v4.53.3, #2801). A miss is the absent position an index misses into, whose
+/// component is the value (`.m[0x2] | path` is `["m",2]`), not the decimal key a canonical
+/// index would read.
+fn path_context_step_spelled_key<S: EvalSemantics, V: DocumentValue>(
+    component: &OwnedValue,
+    bracket_optional: bool,
+    tpos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Option<Result<(), Control>> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    let OwnedValue::NumberLiteral(NumberRepr::Int(idx), text) = component else {
+        return None;
+    };
+    let text: &str = text;
+    if is_decimal_spelling(text, *idx) {
+        return None;
+    }
+    let present = match &tpos.node {
+        PathNode::At(c) => {
+            let fields = c.value().as_object()?;
+            // A malformed member is the `Field` step's to raise.
+            !matches!(
+                crate::jq::key_index::find_cursor_memoized(&fields, text),
+                Ok(None)
+            )
+        }
+        PathNode::Owned(v) => match &**v {
+            OwnedValue::Object(map) => map.contains_key(text),
+            _ => return None,
+        },
+        PathNode::Absent => return None,
+    };
+    if !present {
+        out.push(PathContextPos {
+            node: PathNode::Absent,
+            trail: tpos.trail.extend_from(OwnedValue::Int(*idx), &tpos.node),
+            at_key: false,
+        });
+        return Some(Ok(()));
+    }
+    let step = Expr::Field(text.to_owned());
+    let step = if bracket_optional {
+        Expr::Optional(Box::new(step))
+    } else {
+        step
+    };
+    Some(path_context_step_generic::<S, V>(&step, tpos, out))
+}
+
+/// Whether `text` is `idx` written in decimal (`idx.to_string()`), decided without allocating:
+/// an optional `-`, then digits with no leading zero, and not `-0`.
+fn is_decimal_spelling(text: &str, idx: i64) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    let canonical = match digits.as_bytes() {
+        [] => false,
+        [b'0'] => digits.len() == text.len(),
+        [b'0', ..] => false,
+        bytes => bytes.iter().all(u8::is_ascii_digit),
+    };
+    canonical && text.parse::<i64>() == Ok(idx)
 }
 
 /// The literal navigation step that takes `component`, or `None` for a value
@@ -48885,6 +48966,31 @@ mod tests {
     use super::super::expr::{CompareOp, FormatType, Literal};
     use super::super::value::NumberRepr;
     use super::*;
+
+    /// #8070: `is_decimal_spelling` is `text == idx.to_string()` without the allocation.
+    #[test]
+    fn decimal_spelling_is_the_integer_rendering_8070() {
+        for (text, idx) in [("0", 0), ("1", 1), ("-1", -1), ("42", 42), ("-907", -907)] {
+            assert!(is_decimal_spelling(text, idx), "{text}");
+            assert_eq!(text, idx.to_string());
+        }
+        for (text, idx) in [
+            ("-0", 0),
+            ("01", 1),
+            ("00", 0),
+            ("-01", -1),
+            ("0x1", 1),
+            ("0X1", 1),
+            ("+1", 1),
+            ("", 0),
+            ("-", 0),
+            ("2", 1),
+            ("1_0", 10),
+        ] {
+            assert!(!is_decimal_spelling(text, idx), "{text}");
+            assert_ne!(text, idx.to_string());
+        }
+    }
 
     /// #2661: the public value-only entry point has no cursor, so `..`
     /// reaches the full-evaluator bridge rather than the native cursor walk.
