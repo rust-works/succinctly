@@ -21966,6 +21966,7 @@ fn bind_origin_of_identity<V: DocumentValue>(id: &OwnedIdentity<V>, navigated: b
         exact: id.exact,
         root: id.root,
         navigated,
+        unplaced: id.is_unplaced(),
     }
 }
 
@@ -22033,6 +22034,7 @@ fn identity_from_origin<V: DocumentValue>(
             key_node,
             exact,
             root,
+            unplaced,
             ..
         } => Some(OwnedIdentity {
             base: None,
@@ -22040,7 +22042,7 @@ fn identity_from_origin<V: DocumentValue>(
             key_node: *key_node,
             exact: *exact,
             root: *root,
-            meta: 0,
+            meta: if *unplaced { META_UNPLACED } else { 0 },
         }),
         BindOrigin::Owned {
             base: Some((node, document)),
@@ -22048,6 +22050,7 @@ fn identity_from_origin<V: DocumentValue>(
             key_node,
             exact,
             root,
+            unplaced,
             ..
         } => {
             let anchor = anchor?;
@@ -22060,7 +22063,7 @@ fn identity_from_origin<V: DocumentValue>(
                 key_node: *key_node,
                 exact: *exact,
                 root: *root,
-                meta: 0,
+                meta: if *unplaced { META_UNPLACED } else { 0 },
             })
         }
     }
@@ -73191,6 +73194,7 @@ mod deferred_bind_tests_3856 {
             exact: false,
             root: 0,
             navigated: false,
+            unplaced: false,
         }));
         assert_eq!(
             message(eval_with_cursor_using::<JqSemantics, _>(

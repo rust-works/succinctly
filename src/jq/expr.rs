@@ -310,6 +310,12 @@ pub enum BindOrigin {
         /// places a value the pipe *computed* at that position, which is
         /// not the node there, and `chain` alone cannot tell the two apart.
         navigated: bool,
+        /// The value stands at no position at all (#8039, the identity pipe's
+        /// `META_UNPLACED`): it is, or is inside, one yq builds with no
+        /// position (`{"a":1} | .a as $v | $v | . |= path` is `["a"]`), so
+        /// an update reached through the variable does not stand under the
+        /// prefix an enclosing update installed.
+        unplaced: bool,
     },
 }
 

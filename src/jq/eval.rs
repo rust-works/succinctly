@@ -184693,6 +184693,7 @@ mod tests {
                 exact,
                 root: 11,
                 navigated: false,
+                unplaced: false,
             }),
             fold_share: false,
         };
@@ -184859,6 +184860,7 @@ mod tests {
                 exact: false,
                 root: 1,
                 navigated,
+                unplaced: false,
             }),
             fold_share: false,
         };
@@ -185700,6 +185702,7 @@ mod tests {
             exact: false,
             root,
             navigated: false,
+            unplaced: false,
         };
         let marker = |origin: Origin, node: Option<BindOrigin>| {
             Expr::TrackedVar(Rc::new(Tracked {
@@ -185744,6 +185747,7 @@ mod tests {
                 exact: true,
                 root: 5,
                 navigated: false,
+                unplaced: false,
             }),
             fold_share: false,
         });
