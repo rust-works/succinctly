@@ -160,7 +160,7 @@ impl Meter {
     /// Start counting this thread's allocations for a run whose budget is `budget` bytes.
     pub(super) fn begin(budget: usize) -> Self {
         RUNS.fetch_add(1, Ordering::Relaxed);
-        let live: *const Cell<isize> = LIVE.with(core::ptr::from_ref);
+        let live: *const Cell<isize> = LIVE.with(|live| live as *const Cell<isize>);
         // SAFETY: `live` is this thread's `LIVE`, which lives as long as the thread.
         let now = unsafe { (*live).get() };
         let base = OUTER.with(|outer| {

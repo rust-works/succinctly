@@ -1407,8 +1407,8 @@ fn a_growth_is_held_to_the_heap_room_8064() {
     // A kept vector with room allocates nothing, so its growth needs no heap room.
     let mut kept: Vec<u64> = Vec::with_capacity(64);
     assert_eq!(grow(&mut kept, &mut 0, 0, usize::MAX, 0), Ok(32));
-    let mut items: Vec<u64> = Vec::with_capacity(100);
-    items.resize(100, 0);
+    let mut items: Vec<u64> = vec![0; 100];
+    assert_eq!(items.capacity(), 100);
     // Doubling needs 800 bytes; 400 fit, so it grows by 50.
     assert_eq!(reserve(&mut items, 400), Ok(()));
     assert_eq!(items.capacity(), 150);
@@ -1426,7 +1426,7 @@ fn the_meter_counts_what_a_run_holds_once_8064() {
     let before = meter.held();
     let block = alloc::rc::Rc::new(vec![0u8; 1 << 20]);
     let grew = meter.held() - before;
-    assert!(grew >= 1 << 20 && grew < (1 << 20) + 4096, "{grew}");
+    assert!(((1 << 20)..(1 << 20) + 4096).contains(&grew), "{grew}");
     let shared: Vec<_> = (0..1000).map(|_| block.clone()).collect();
     let with_shares = meter.held() - before;
     assert!(
