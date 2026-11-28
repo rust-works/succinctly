@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use anyhow::Result;
 use tempfile::NamedTempFile;
 
-use crate::{run_jq_stdin, run_jq_stdin_with_stderr, run_yq_stdin};
+use crate::{run_jq_stdin, run_jq_stdin_with_stderr, run_yq_stdin, run_yq_stdin_with_stderr};
 
 const FLAT: &str = "{\"a\":1,\"b\":5}";
 const NESTED: &str = "{\"a\":{\"b\":{\"c\":1},\"d\":2}}";
@@ -76,6 +76,17 @@ const ROWS: &[(&str, &str, &str)] = &[
         "with(.zz; . |= key)",
         "{\"a\":1,\"b\":5,\"zz\":\"zz\"}\n",
     ),
+    // A missing target several levels deep is created with its key and path.
+    (
+        FLAT,
+        "with(.zz.q; . |= key)",
+        "{\"a\":1,\"b\":5,\"zz\":{\"q\":\"q\"}}\n",
+    ),
+    (
+        FLAT,
+        "with(.zz.q.r; . |= path)",
+        "{\"a\":1,\"b\":5,\"zz\":{\"q\":{\"r\":[\"zz\",\"q\",\"r\"]}}}\n",
+    ),
     // A node built in the body has no position: its `key` answers nothing, its `path` is `[]`.
     (FLAT, "with(.b; 5 | . |= key)", "{\"a\":1,\"b\":5}\n"),
     (FLAT, ".b |= (5 | . |= key)", "{\"a\":1,\"b\":5}\n"),
@@ -118,6 +129,17 @@ const ROWS: &[(&str, &str, &str)] = &[
     (
         NESTED,
         "with(.a.b; . |= (parent(2) | keys))",
+        "{\"a\":{\"b\":[\"a\"],\"d\":2}}\n",
+    ),
+    // A climb past the enclosing update's input reaches the update around that one.
+    (
+        NESTED,
+        "with(.a; with(.b; . |= (parent(2) | keys)))",
+        "{\"a\":{\"b\":[\"a\"],\"d\":2}}\n",
+    ),
+    (
+        NESTED,
+        ".a |= (.b |= (. |= (parent(2) | keys)))",
         "{\"a\":{\"b\":[\"a\"],\"d\":2}}\n",
     ),
     (
@@ -200,6 +222,19 @@ fn a_nested_update_reads_key_and_parent_at_its_own_input_8039() -> Result<()> {
         let (stdout, code) = run_yq_stdin(filter, input, &["-p=json", "-o=json", "-I0"])?;
         assert_eq!(code, 0, "{filter}");
         assert_eq!(&stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// An error the positioned filter raises ends the run, reading the target's key as yq does.
+#[test]
+fn an_error_in_a_positioned_filter_reads_the_key_8039() -> Result<()> {
+    for filter in [".b |= error(key)", "with(.b; . |= error(key))"] {
+        let (stdout, stderr, code) =
+            run_yq_stdin_with_stderr(filter, FLAT, &["-p=json", "-o=json", "-I0"])?;
+        assert_eq!(code, 1, "{filter}");
+        assert_eq!(stdout, "", "{filter}");
+        assert_eq!(stderr, "Error: b\n", "{filter}");
     }
     Ok(())
 }
