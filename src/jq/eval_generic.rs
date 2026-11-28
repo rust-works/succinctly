@@ -12364,11 +12364,6 @@ mod path_base {
         f()
     }
 
-    /// Whether a prefix is installed: [`current`] without the clone.
-    pub(crate) fn is_installed() -> bool {
-        CURRENT.with(|c| c.borrow().is_some())
-    }
-
     /// Removes the prefix and the ancestry for `f`'s dynamic extent, restoring both on the way out.
     pub(crate) fn cleared<R>(f: impl FnOnce() -> R) -> R {
         struct Restore(Option<Rc<Vec<OwnedValue>>>);
@@ -12421,10 +12416,6 @@ mod path_base {
         f()
     }
 
-    pub(crate) fn is_installed() -> bool {
-        false
-    }
-
     pub(crate) fn cleared<R>(f: impl FnOnce() -> R) -> R {
         f()
     }
@@ -12453,19 +12444,12 @@ pub(crate) struct UpdateAncestry {
     pub(crate) outer: Option<Rc<Self>>,
 }
 
-/// Run `f` with no ambient prefix and no [`UpdateAncestry`] (#8039): the filter of an update that
-/// names no position for it (one whose path-context reads cannot all be resolved at its target,
-/// such as `5 | . |= key`). The prefix an enclosing update installed describes that update's
-/// target, which this filter's nested updates are not known to stand at; with none they stand
-/// nowhere, as a node yq builds (the `5`) does, so `.a |= (.b |= (5 | . |= key))` leaves `5`.
-/// The caller asks [`update_base_installed`] first, so the top level of every program pays nothing.
+/// Run `f` with no ambient prefix and no [`UpdateAncestry`] (#8039): an update whose input is a
+/// value yq builds with no position ([`OwnedIdentity::is_unplaced`]), such as the `5` of
+/// `.a |= (.b |= (5 | . |= key))`, stands nowhere, and the prefix an enclosing update installed
+/// describes that update's target, not it.
 pub(crate) fn without_update_base<R>(f: impl FnOnce() -> R) -> R {
     path_base::cleared(f)
-}
-
-/// Whether an ambient prefix is installed, which [`without_update_base`] would remove.
-pub(crate) fn update_base_installed() -> bool {
-    path_base::is_installed()
 }
 
 /// The ambient [`UpdateAncestry`], if an enclosing update installed one (#8039).
@@ -22121,7 +22105,7 @@ fn bound_var_identity<S: EvalSemantics, V: DocumentValue>(
                 // against.
                 id.clone().rebuilt()
             } else {
-                OwnedIdentity::detached()
+                OwnedIdentity::unplaced()
             }
         })
 }
@@ -44064,6 +44048,13 @@ const META_HEAD_FOOT: u8 = 1 << 4;
 /// The children of the value are still the document's own nodes (#3641): a write, `del` or a
 /// reordering of keys hands yq's node on, so a field read from it answers from the field's node.
 const META_CHILD: u8 = 1 << 5;
+/// Not metadata of the node but its absence (#8039): the value is one yq builds with no position
+/// of its own (a literal, `map`, `keys`, a constructor, `now`), which an owned identity rule
+/// detached, and every value derived from it. A `|=` it reaches stands at no position, so the
+/// prefix an enclosing update installed must not reach it ([`OwnedIdentity::is_unplaced`]); a
+/// plain [`OwnedIdentity::detached`] root of an owned pipe, which stands where that prefix says,
+/// does not carry it. Outside [`META_ALL`], so no reader of the node's metadata sees it.
+const META_UNPLACED: u8 = 1 << 6;
 /// Every bit of [`OwnedIdentity::meta`]: the value is the node itself.
 const META_ALL: u8 =
     META_POS | META_STYLE | META_ANCHOR | META_LINE_COMMENT | META_HEAD_FOOT | META_CHILD;
@@ -44101,6 +44092,20 @@ impl<V: DocumentValue> OwnedIdentity<V> {
         }
     }
 
+    /// A value an owned identity rule detached: [`OwnedIdentity::detached`], flagged as one yq
+    /// gives no position ([`META_UNPLACED`], #8039).
+    fn unplaced() -> Self {
+        let mut id = Self::detached();
+        id.meta = META_UNPLACED;
+        id
+    }
+
+    /// Whether the value stands at no position at all, not even the ambient one an enclosing
+    /// update installed ([`META_UNPLACED`]).
+    fn is_unplaced(&self) -> bool {
+        self.meta & META_UNPLACED != 0
+    }
+
     /// An owned root with no position at all.
     fn detached() -> Self {
         Self {
@@ -44125,7 +44130,7 @@ impl<V: DocumentValue> OwnedIdentity<V> {
     /// The same position holding a fresh scalar or array the pipe built (`path`, `file_index`,
     /// `filename`): no longer the node, so no source line or column of its own (#4696).
     fn without_meta(mut self) -> Self {
-        self.meta = 0;
+        self.meta &= META_UNPLACED;
         self
     }
 
@@ -44145,7 +44150,7 @@ impl<V: DocumentValue> OwnedIdentity<V> {
             keeps &= !META_ANCHOR;
         }
         let mut rebuilt = self.rebuilt();
-        rebuilt.meta &= keeps;
+        rebuilt.meta &= keeps | META_UNPLACED;
         rebuilt
     }
 
@@ -44195,11 +44200,12 @@ impl<V: DocumentValue> OwnedIdentity<V> {
             // node (its position, anchor and comments); style is a presentation of the container it
             // was read from, and a child of a child (`.d.e` after `.d = {...}`) may come from what a
             // write put there, so neither is carried.
-            meta: if self.ancestors.is_empty() && self.meta & META_CHILD != 0 {
-                self.meta & !(META_STYLE | META_CHILD)
-            } else {
-                0
-            },
+            meta: (self.meta & META_UNPLACED)
+                | if self.ancestors.is_empty() && self.meta & META_CHILD != 0 {
+                    self.meta & !(META_STYLE | META_CHILD)
+                } else {
+                    0
+                },
         }
     }
 
@@ -45309,7 +45315,7 @@ fn owned_identity_emits_position(stage: &Expr) -> bool {
 /// has no position of its own, so it is always detached, regardless of
 /// which of the two call sites reaches it.
 fn owned_literal_identity<V: DocumentValue>(lit: &Literal) -> (OwnedValue, OwnedIdentity<V>) {
-    (literal_to_owned(lit), OwnedIdentity::detached())
+    (literal_to_owned(lit), OwnedIdentity::unplaced())
 }
 
 /// Whether a slice's own component is trackable into `path`/`key`/`parent`
@@ -46325,13 +46331,13 @@ fn owned_identity_placed_by<S: EvalSemantics, V: DocumentValue>(
                 id.clone()
             })
         }
-        OwnedIdentityRule::Detaches => Some(OwnedIdentity::detached()),
+        OwnedIdentityRule::Detaches => Some(OwnedIdentity::unplaced()),
         OwnedIdentityRule::DetachesContainer => {
             // #3450: an empty container keeps its position, like a scalar.
             if value.as_array().is_some_and(|items| !items.is_empty())
                 || value.as_object().is_some_and(|fields| !fields.is_empty())
             {
-                Some(OwnedIdentity::detached())
+                Some(OwnedIdentity::unplaced())
             } else {
                 Some(id.clone())
             }
@@ -47961,7 +47967,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                 // yq v4.53.3). And a fresh scalar: its own `line` is `0`
                 // (#4696).
                 let mut next = id.clone().with_key_node(false);
-                next.meta = 0;
+                next.meta &= META_UNPLACED;
                 match eval_owned_identity_stages::<S, V>(
                     rest,
                     Cow::Owned(output),
@@ -48600,7 +48606,7 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                     Ok(None) => eval_owned_identity_stages::<S, V>(
                         rest,
                         Cow::Owned(output),
-                        OwnedIdentity::detached(),
+                        OwnedIdentity::unplaced(),
                         optional,
                         tail.reborrow(),
                     ),
@@ -48639,17 +48645,24 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                         | Expr::AlternativeAssign { .. }
                 ) =>
                 {
-                    match id.path() {
-                        Ok(path) => with_path_base(&path, || {
-                            eval_each_owned::<S>(
-                                stage_expr,
-                                &value,
-                                optional,
-                                Reentry::Against(id.root_witness()),
-                                &mut emit,
-                            )
-                        }),
-                        Err(e) => Flow::Escaped(Control::Error(e)),
+                    let run = |emit: &mut dyn FnMut(OwnedValue) -> Demand| {
+                        eval_each_owned::<S>(
+                            stage_expr,
+                            &value,
+                            optional,
+                            Reentry::Against(id.root_witness()),
+                            emit,
+                        )
+                    };
+                    // #8039: a value yq builds with no position (`5 | . |= path` is `[]`) gives the
+                    // update none, rather than the ambient prefix an enclosing update installed.
+                    if S::TAG == EvalTag::Yq && id.is_unplaced() {
+                        without_update_base(|| run(&mut emit))
+                    } else {
+                        match id.path() {
+                            Ok(path) => with_path_base(&path, || run(&mut emit)),
+                            Err(e) => Flow::Escaped(Control::Error(e)),
+                        }
                     }
                 }
                 None => eval_each_owned::<S>(
@@ -48736,7 +48749,7 @@ fn owned_identity_leaving_cursor<S: EvalSemantics, V: DocumentValue>(
         // #2471: `key` at the cursor boundary -- the emitted key stands
         // where the node stood, flagged so a second `key` emits nothing.
         OwnedIdentityRule::KeyNode => Ok(Some(id.rebuilt().with_key_node(true))),
-        OwnedIdentityRule::Detaches => Ok(Some(OwnedIdentity::detached())),
+        OwnedIdentityRule::Detaches => Ok(Some(OwnedIdentity::unplaced())),
         // #3450: "has members", not `is_container` (which is "has a subtree" for JSON and "is a
         // mapping or sequence" for YAML): an empty container keeps its position, like a scalar.
         // #4690: and by what the node *presents*, not by its subtree: an alias has a position of its
@@ -48748,7 +48761,7 @@ fn owned_identity_leaving_cursor<S: EvalSemantics, V: DocumentValue>(
                 node.as_array().is_some_and(|items| !items.is_empty())
                     || node.as_object().is_some_and(|fields| !fields.is_empty())
             } {
-                OwnedIdentity::detached()
+                OwnedIdentity::unplaced()
             } else {
                 id.rebuilt()
             },
