@@ -4559,7 +4559,7 @@ Every row of the issue is pinned against yq v4.53.3 in `tests/yq_cli/i5863.rs`, 
 - A missing key as the layout, format or zone argument (`with_dtf(.nope; f)`, `format_datetime(.nope)`) reads as `null` here, so it is the layout `null`; yq navigates it read-only, finds no node and raises `could not find layout for format_time`.
   An empty layout, or a container's, is RFC 3339 in both tools.
 - A stage after `with_dtf` that reads path context (`with_dtf(f; .a) | path`) reads the position of `with_dtf`'s input (`[]` where yq has `["a"]`).
-- `with_dtf`'s result is a value with no comments, anchors, aliases or style: over `# head` / `a: &x 1 # line` / `b: *x`, `with_dtf("2006"; .)` prints `a: 1` / `b: 1`, where yq prints the document as it was read, as `.` does in both.
+- `with_dtf`'s result is a value with no comments, anchors, aliases or style: over `# head` / `a: &x 1 # line` / `b: *x`, `with_dtf("2006"; .)` prints `a: 1` / `b: 1`, where yq prints the document as it was read, as `.` does in both ([#8078](https://github.com/rust-works/succinctly/issues/8078)).
   A write through it (`with_dtf(f; .a) = 5`, `|=`, `del`) lands where yq's does.
 - `tz` with an IANA name needs the `local-zone` feature (on in `cli`, not on Windows); without it only `UTC`, the empty name and `Local` load, and every other name is `unknown time zone`.
 - A `no_std` build has no thread-local layout, so `with_dtf` raises `with_dtf requires the std feature` there.
