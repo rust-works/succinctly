@@ -1058,10 +1058,12 @@ fn the_move_programs_reach_loadlast_and_kill_7977() {
     );
 }
 
-/// Limits small enough for a unit test: `rounds` rounds, `outputs` outputs and `bytes` bytes.
+/// Limits small enough for a unit test: `rounds` rounds, `outputs` outputs and `bytes` bytes of
+/// control state, with the shipped heap budget.
 fn small(bytes: usize, rounds: u32, outputs: u32) -> Limits {
     Limits {
         bytes,
+        heap: HEAP_BUDGET,
         rounds,
         outputs,
         range: MAX_RANGE_TOTAL,
@@ -1079,6 +1081,7 @@ fn refused(outputs: usize, error: &str) -> Answer {
 #[test]
 fn the_machine_keeps_the_shipped_bounds_7977() {
     assert_eq!(SHIPPED.bytes, 1 << 30);
+    assert_eq!(SHIPPED.heap, 5 << 28);
     assert_eq!(SHIPPED.rounds as usize, MAX_LOOP_ROUNDS);
     assert_eq!(SHIPPED.outputs as usize, MAX_LOOP_OUTPUTS);
     assert_eq!(SHIPPED.range, MAX_RANGE_TOTAL);
@@ -1181,21 +1184,36 @@ fn the_rounds_are_counted_per_loop_7977() {
     );
 }
 
-/// A zero-argument `def`'s tail loop is refused after its outputs once it has run
-/// `OUTPUT_BUDGET_AFTER_ROUNDS` rounds, as the shipped tail loop is (#5379), after the same number
-/// of outputs: the shipped binary prints 2^20 + 1 lines of `def f: ., (. + 1 | f); 0 | f` before
-/// `f/0: maximum outputs exceeded`. A consumer that stops is not charged for what it never asks
-/// for, and a loop with arguments is bounded by its rounds alone.
+/// No loop is refused for its outputs (#8064): a zero-argument `def`'s tail generator runs to its
+/// rounds, as every loop does, where the shipped tail loop refuses it after 2^20 outputs
+/// (`f/0: maximum outputs exceeded`, #5379), and jq runs until memory runs out. What a collector
+/// of its outputs holds is the heap budget's. A consumer that stops is not charged for what it
+/// never asks for, and a loop with arguments is bounded by its rounds alone.
 #[test]
-fn a_tail_generator_is_refused_after_its_outputs_7977() {
-    let limits = small(BUDGET, 1 << 20, 100);
+fn a_tail_generator_is_bounded_by_its_rounds_not_its_outputs_8064() {
+    let limits = small(BUDGET, 1000, 100);
     assert_eq!(
         machine_within(limits, "def f: ., (. + 1 | f); 0 | f"),
-        refused(101, "f/0: maximum outputs exceeded")
+        refused(1001, "f/0 exceeded maximum recursion depth")
     );
     assert_eq!(
         machine_within(limits, "[def f: ., (. + 1 | f); 0 | f] | length"),
-        refused(0, "f/0: maximum outputs exceeded")
+        refused(0, "f/0 exceeded maximum recursion depth")
+    );
+    // Within the rounds, past the old output bound: answered, as jq answers.
+    assert_eq!(
+        machine_within(
+            limits,
+            "[def f: if . < 900 then ., (. + 1 | f) else empty end; 0 | f] | length"
+        ),
+        ok(&["900"])
+    );
+    assert_eq!(
+        machine_within(
+            limits,
+            "def f: if . < 70 then range(20), (. + 1 | f) else empty end; [0 | f] | length"
+        ),
+        ok(&["1400"])
     );
     assert_eq!(
         machine_within(
@@ -1204,25 +1222,27 @@ fn a_tail_generator_is_refused_after_its_outputs_7977() {
         ),
         ok(&["51"])
     );
-    // A helper's outputs in front of the call are the loop's, as the shipped loop counts them,
-    // and a loop of the helper's own is not one of the caller's rounds.
+    // A helper's outputs in front of the call are not bounded either, and a loop of the
+    // helper's own is not one of the caller's rounds.
     assert_eq!(
-        machine_within(limits, "def g: .; def f: g, (. + 1 | f); [0 | f] | length"),
-        refused(0, "f/0: maximum outputs exceeded")
+        machine_within(
+            limits,
+            "def g: range(3); def f: if . < 500 then g, (. + 1 | f) else empty end; [0 | f] | length"
+        ),
+        ok(&["1500"])
     );
     assert_eq!(
         machine_within(
-            small(BUDGET, 1000, 1 << 20),
+            limits,
             "def g: if . < 900 then . + 1 | g else . end; def f($n): if $n < 900 then (0 | g) as $x | f($n + 1) else $n end; f(0)"
         ),
         ok(&["900"])
     );
-    let limits = small(BUDGET, 1000, 100);
     assert_eq!(
         machine_within(limits, "def f($n): $n, f($n + 1); [f(0)] | length"),
         refused(0, "f/1 exceeded maximum recursion depth")
     );
-    // The prelude's loops keep their own wording.
+    // The prelude's loops keep their own bounds and wording.
     assert_eq!(
         machine_within(limits, "[0 | repeat(. + 1)] | length"),
         refused(0, "repeat: maximum iterations exceeded")
@@ -1341,14 +1361,14 @@ fn a_call_or_a_fork_point_past_the_budget_is_refused_7977() {
 fn a_growth_past_the_budget_or_the_allocator_is_refused_7977() {
     let mut v: Vec<u64> = Vec::new();
     let mut cap = 0;
-    assert_eq!(grow(&mut v, &mut cap, 0, 31), Err(()));
-    assert_eq!(grow(&mut v, &mut cap, 0, 32), Ok(32));
+    assert_eq!(grow(&mut v, &mut cap, 0, 31, isize::MAX), Err(()));
+    assert_eq!(grow(&mut v, &mut cap, 0, 32, isize::MAX), Ok(32));
     assert_eq!((v.capacity(), cap), (4, 4));
     // From 4 to 8: the old block (32 bytes, in `used`) and the new one (64) are held at once.
-    assert_eq!(grow(&mut v, &mut cap, 32, 95), Err(()));
-    assert_eq!(grow(&mut v, &mut cap, 32, 96), Ok(32));
+    assert_eq!(grow(&mut v, &mut cap, 32, 95, isize::MAX), Err(()));
+    assert_eq!(grow(&mut v, &mut cap, 32, 96, isize::MAX), Ok(32));
     assert_eq!(
-        grow(&mut v, &mut cap, 64 + 8, 64 + 128),
+        grow(&mut v, &mut cap, 64 + 8, 64 + 128, isize::MAX),
         Err(()),
         "the bytes held already count"
     );
@@ -1356,19 +1376,156 @@ fn a_growth_past_the_budget_or_the_allocator_is_refused_7977() {
     // charge passes its capacity.
     let mut kept: Vec<u64> = Vec::with_capacity(64);
     let mut cap = 0;
-    assert_eq!(grow(&mut kept, &mut cap, 0, 31), Err(()), "charged from 0");
-    assert_eq!(grow(&mut kept, &mut cap, 0, 32), Ok(32));
+    assert_eq!(
+        grow(&mut kept, &mut cap, 0, 31, isize::MAX),
+        Err(()),
+        "charged from 0"
+    );
+    assert_eq!(grow(&mut kept, &mut cap, 0, 32, isize::MAX), Ok(32));
     assert_eq!((kept.capacity(), cap), (64, 4));
     // One element of 2^47 bytes, and four: past any address space, so the allocator refuses.
     #[cfg(target_pointer_width = "64")]
     {
         let mut huge: Vec<[u64; 1 << 44]> = Vec::new();
-        assert_eq!(grow(&mut huge, &mut 0, 0, usize::MAX), Err(()));
-        assert_eq!(reserve(&mut huge), Err(()));
+        assert_eq!(grow(&mut huge, &mut 0, 0, usize::MAX, isize::MAX), Err(()));
+        assert_eq!(reserve(&mut huge, isize::MAX), Err(()));
     }
     let mut items: Vec<OwnedValue> = Vec::new();
-    assert_eq!(reserve(&mut items), Ok(()));
+    assert_eq!(reserve(&mut items, isize::MAX), Ok(()));
     assert!(items.capacity() >= 1);
+}
+
+/// A growth that does not fit in what the heap budget has left is refused before it is made, a
+/// stack's whole; an accumulator's or a buffer's grows by what fits instead of doubling, so a
+/// collector can fill the budget rather than half of it (#8064).
+#[test]
+fn a_growth_is_held_to_the_heap_room_8064() {
+    let mut v: Vec<u64> = Vec::new();
+    let mut cap = 0;
+    assert_eq!(grow(&mut v, &mut cap, 0, usize::MAX, 31), Err(()));
+    assert_eq!(grow(&mut v, &mut cap, 0, usize::MAX, 32), Ok(32));
+    // A kept vector with room allocates nothing, so its growth needs no heap room.
+    let mut kept: Vec<u64> = Vec::with_capacity(64);
+    assert_eq!(grow(&mut kept, &mut 0, 0, usize::MAX, 0), Ok(32));
+    let mut items: Vec<u64> = Vec::with_capacity(100);
+    items.resize(100, 0);
+    // Doubling needs 800 bytes; 400 fit, so it grows by 50.
+    assert_eq!(reserve(&mut items, 400), Ok(()));
+    assert_eq!(items.capacity(), 150);
+    assert_eq!(reserve(&mut items, 7), Err(()), "not one more fits");
+    assert_eq!(reserve(&mut items, -1), Err(()), "past the budget");
+}
+
+/// The allocator counts what a run holds once, however many handles share it, and gives it back
+/// as it is freed; a run nested in another is charged from the outer one's start (#8064). Needs
+/// the library's test allocator (`MeteredAlloc`), which `std` builds install.
+#[cfg(feature = "std")]
+#[test]
+fn the_meter_counts_what_a_run_holds_once_8064() {
+    let meter = Meter::begin();
+    let before = meter.held();
+    let block = alloc::rc::Rc::new(vec![0u8; 1 << 20]);
+    let grew = meter.held() - before;
+    assert!(grew >= 1 << 20 && grew < (1 << 20) + 4096, "{grew}");
+    let shared: Vec<_> = (0..1000).map(|_| block.clone()).collect();
+    let with_shares = meter.held() - before;
+    assert!(
+        with_shares - grew < 64 * 1024,
+        "a thousand handles on one block: {with_shares}"
+    );
+    let inner = Meter::begin();
+    assert_eq!(
+        inner.held(),
+        meter.held(),
+        "a nested run shares the outer one's start"
+    );
+    drop(inner);
+    drop(shared);
+    drop(block);
+    assert!(meter.held() - before < 4096, "{}", meter.held() - before);
+}
+
+/// The repros of #8064, each refused at a small heap budget with the recursion wording, where
+/// the shipped output bound stopped them before and step 3's budget, which charged a slot per
+/// collected value, let them grow past 3 GB: what each value holds is charged, nested
+/// containers, strings and objects, and a `reduce`'s and a `foreach`'s state, and so are
+/// collectors the old bound could not see (a loop through a local `def`, a stage that does not
+/// settle). jq grows on each until memory runs out.
+#[cfg(feature = "std")]
+#[test]
+fn past_the_heap_budget_what_a_run_holds_is_refused_8064() {
+    let limits = Limits {
+        heap: 8 << 20,
+        ..SHIPPED
+    };
+    for filter in [
+        "[def f: def m: .+1 | f; (range(100)|-1), m; 0|f] | length",
+        "[def f: (.?) as $x | (range(100)|-1), ($x+1|f); 0|f] | length",
+        "[def f: def g: (range(100)|-1), (.+1|f); g; 0|f] | length",
+        "[def f: ., (. + 1 | f); 0 | f]",
+        "[def f: {a:.}, (.+1|f); 0|f] | length",
+        "[def f: [.,.,.,.,.,.,.,.], (.+1|f); 0|f] | length",
+        "reduce (def f: (range(100)|-1), (.+1|f); 0|f) as $x (null; [$x, .]) | length",
+        "foreach (def f: ., (.+1|f); 0|f) as $x (null; [$x, .]; empty)",
+        "[def f: tostring, (.+1|f); 0|f] | length",
+        "[def f: \"\\(.)-0123456789012345678901234567890123456789\", (.+1|f); 0|f] | length",
+        // A recursion whose frames keep what each built, uncollected: stopped at the call.
+        "def f: [range(1000)] as $a | f, ($a | length); f | empty",
+        // A loop whose argument a leaf builds, doubling each round.
+        "def f($s): f($s + $s); f(\"0123456789\")",
+    ] {
+        let answer = machine_within(limits, filter);
+        assert!(
+            answer.outputs.is_empty()
+                && answer
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.ends_with("exceeded maximum recursion depth")),
+            "{filter}: {answer:?}"
+        );
+    }
+}
+
+/// What is shared with a value already held is not charged again: `$big`, about 8 MB, collected
+/// a thousand times, bare, in an array and in an object, and folded a thousand times, answers
+/// within a 16 MiB heap budget, as jq answers it (#8064).
+#[cfg(feature = "std")]
+#[test]
+fn a_shared_value_collected_many_times_is_charged_once_8064() {
+    let limits = Limits {
+        heap: 16 << 20,
+        ..SHIPPED
+    };
+    let big =
+        "[range(200000)] as $big | def f($n): if $n < 1000 then $big, f($n + 1) else empty end;";
+    for (filter, want) in [
+        (format!("{big} [f(0)] | length"), "1000"),
+        (format!("{big} [f(0) | [.]] | length"), "1000"),
+        (
+            format!("{big} [f(0) | {{a: .}}] | map(.a | length) | add"),
+            "200000000",
+        ),
+        (
+            format!("{big} reduce f(0) as $x ([]; . + [$x]) | length"),
+            "1000",
+        ),
+        (
+            format!("{big} [foreach f(0) as $x (0; . + 1; [$x])] | length"),
+            "1000",
+        ),
+    ] {
+        assert_eq!(machine_within(limits, &filter), ok(&[want]), "{filter}");
+    }
+}
+
+/// The budget under a cap on the address space is half the room the cap leaves, and the
+/// shipped budget without one.
+#[test]
+fn the_heap_budget_is_held_to_half_the_room_a_cap_leaves_8064() {
+    assert_eq!(room_budget(HEAP_BUDGET, None), HEAP_BUDGET);
+    assert_eq!(room_budget(HEAP_BUDGET, Some(100 << 20)), 50 << 20);
+    assert_eq!(room_budget(HEAP_BUDGET, Some(usize::MAX)), HEAP_BUDGET);
+    assert_eq!(room_budget(HEAP_BUDGET, Some(0)), 0);
 }
 
 /// `range` keeps the shipped cap (#5292), `range/2` on the machine's own `RANGE` and `range/3` on
@@ -1632,26 +1789,25 @@ fn a_loop_through_a_nested_def_runs_in_linear_work_7977() {
     );
 }
 
-/// Where the machine and the shipped evaluators bound a program differently, a different bound
-/// is met first: `h`'s loop is the machine's, whose outputs count against `f`'s, where the
-/// shipped evaluators nest `h`'s calls and meet their native-stack floor (`h/1 exceeded`).
+/// Where the shipped evaluators nest a helper's calls and meet their native-stack floor
+/// (`h/1 exceeded maximum recursion depth`), the machine runs `h` as a loop, and with no bound on
+/// a loop's outputs (#8064) it answers, as jq 1.7.1 answers `1048580`.
 #[test]
-fn a_different_bound_can_be_met_first_7977() {
+fn a_loop_of_loops_past_the_old_output_bound_answers_8064() {
     assert_eq!(
         machine(
             "def h($m): if $m < 16132 then $m, h($m + 1) else empty end; \
              def f: if . < 65 then h(0), (. + 1 | f) else empty end; [0 | f] | length"
         ),
-        refused(0, "f/0: maximum outputs exceeded")
+        ok(&["1048580"])
     );
 }
 
-/// The output bound starts after `OUTPUT_BUDGET_AFTER_ROUNDS` tail rounds counted one each,
-/// whatever a round costs against the round cap (`BOUND_ROUND_WEIGHT` for a definition that
-/// declares one): the shipped tail loop answers 64 rounds of `range(17000)` with or without a
-/// nested `def`, and refuses 65.
+/// A round that declares a definition costs `BOUND_ROUND_WEIGHT` rounds against the round cap,
+/// and nothing against any bound on outputs, which the machine no longer has (#8064): past the
+/// old bound's 64 rounds, with or without a nested `def`, the loop answers.
 #[test]
-fn the_output_bound_starts_after_unweighted_rounds_7977() {
+fn no_round_starts_an_output_bound_8064() {
     let limits = small(BUDGET, 1 << 24, 100);
     for nested in ["", "def g: .; "] {
         let at = |n: u32| {
@@ -1660,11 +1816,8 @@ fn the_output_bound_starts_after_unweighted_rounds_7977() {
             )
         };
         assert_eq!(machine_within(limits, &at(64)), ok(&["128"]), "{nested}");
-        assert_eq!(
-            machine_within(limits, &at(65)),
-            refused(0, "f/0: maximum outputs exceeded"),
-            "{nested}"
-        );
+        assert_eq!(machine_within(limits, &at(65)), ok(&["130"]), "{nested}");
+        assert_eq!(machine_within(limits, &at(1000)), ok(&["2000"]), "{nested}");
     }
 }
 
@@ -1711,7 +1864,7 @@ fn a_helper_given_a_closure_keeps_its_own_count_7977() {
             "def g: range(15); \
              def f: if . < 100 then (g | select(true)), (. + 1 | f) else empty end; [0 | f] | length"
         ),
-        refused(0, "f/0: maximum outputs exceeded")
+        ok(&["1500"])
     );
 }
 
@@ -1811,8 +1964,7 @@ fn a_zero_argument_self_tail_call_compiles_to_a_jump_7977() {
 }
 
 /// The tail jump keeps every bound of the call it replaces: the loop cap refuses at the same
-/// round with the same wording, the output bound starts after the same unweighted rounds, and
-/// the dead fork points a round leaves are dropped as the call drops them. Each row answers the
+/// round with the same wording, and the dead fork points a round leaves are dropped as the call drops them. Each row answers the
 /// same compiled with jumps and without, around each bound.
 #[test]
 fn a_tail_jump_meets_each_bound_where_the_call_does_7977() {
@@ -1854,7 +2006,6 @@ fn a_tail_jump_meets_each_bound_where_the_call_does_7977() {
         refusals,
         [
             "f/0 exceeded maximum recursion depth",
-            "f/0: maximum outputs exceeded",
             // The nested loop is named for the definition it started at, as the shipped loop
             // names it.
             "g/0 exceeded maximum recursion depth",

@@ -191,6 +191,12 @@ impl Default for Config {
     }
 }
 
+/// The library's own tests count the heap as the binary does, so that the jq call machine's heap
+/// budget is under test (#8064).
+#[cfg(all(test, feature = "std"))]
+#[global_allocator]
+static TEST_ALLOCATOR: jq::path_mode::MeteredAlloc = jq::path_mode::MeteredAlloc;
+
 #[cfg(test)]
 mod tests {
     use super::RankSelect;

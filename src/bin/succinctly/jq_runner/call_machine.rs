@@ -36,6 +36,10 @@ fn switch_value_on(value: Option<&OsStr>) -> bool {
 pub(super) fn configure() {
     let on = switch_value_on(std::env::var_os(SWITCH_ENV).as_deref());
     path_mode::set_call_machine(on);
+    if on {
+        // Under `ulimit -v`, the machine's heap budget is held to the room the cap leaves (#8064).
+        path_mode::set_call_machine_room(crate::cli::address_space::room);
+    }
     if let Some(path) = std::env::var_os(DECISION_LOG_ENV).filter(|_| on) {
         let _ = DECISION_LOG.set(PathBuf::from(path));
         path_mode::observe_call_machine(Some(note_decision));

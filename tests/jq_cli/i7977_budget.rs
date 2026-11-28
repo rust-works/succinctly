@@ -1,12 +1,12 @@
 //! #7977 step 2: the call machine's bounds, with `SUCCINCTLY_CALL_MACHINE=1`.
 //!
-//! A loop that never deepens is refused after the shipped `MAX_LOOP_ROUNDS` rounds, a zero-argument
-//! `def`'s tail generator after `MAX_LOOP_OUTPUTS` outputs, and a run whose control state passes its
-//! byte budget, or whose allocation of it fails, with the shipped recursion wording. Each refusal
-//! is the one the shipped evaluators give with the switch off, so every row is checked against
-//! that run too, and against the decision log, so a row the machine declined cannot pass. jq spins
-//! or runs out of memory on every row (an ADR-0018 rule 4(c) divergence recorded in
-//! `docs/compliance/jq/limitations.md`).
+//! A loop that never deepens is refused after the shipped `MAX_LOOP_ROUNDS` rounds, and a run whose
+//! control state or heap passes its byte budget, or whose allocation of it fails, with the shipped
+//! recursion wording. Each loop refusal is the one the shipped evaluators give with the switch off,
+//! so those rows are checked against that run too, and against the decision log, so a row the
+//! machine declined cannot pass. jq spins or runs out of memory on every row (an ADR-0018 rule
+//! 4(c) divergence recorded in `docs/compliance/jq/limitations.md`). The machine has no bound on a
+//! loop's outputs (#8064, `i8064.rs`).
 
 use std::path::Path;
 use std::process::Command;
@@ -127,10 +127,6 @@ fn a_loop_that_never_deepens_is_refused_as_the_shipped_evaluators_refuse_it_7977
             "def f: select(true) | (. + 1 | f); 0 | f",
             "f/0 exceeded maximum recursion depth",
         ),
-        (
-            "[def f: ., (. + 1 | f); 0 | f] | length",
-            "f/0: maximum outputs exceeded",
-        ),
         // The prelude's loops, in a program the machine takes.
         (
             "def f: f; [0 | until(false; . + 1)]",
@@ -158,11 +154,6 @@ fn a_loop_that_never_deepens_is_refused_as_the_shipped_evaluators_refuse_it_7977
             "def f: f; [repeat(1)] | length",
             "repeat: maximum iterations exceeded",
         ),
-        // A helper's outputs in front of the call are the loop's.
-        (
-            "def g: .; def f: g, (. + 1 | f); [0 | f] | length",
-            "f/0: maximum outputs exceeded",
-        ),
     ] {
         assert_refused_as_shipped(filter, error, dir.path())?;
     }
@@ -177,9 +168,10 @@ fn a_loop_that_never_deepens_is_refused_as_the_shipped_evaluators_refuse_it_7977
     Ok(())
 }
 
-/// What the shipped evaluators answer, the machine answers, though it bounds its control state
-/// and its loops: what `[...]` holds is not control state, a `repeat` a consumer can stop is not
-/// bounded, and recursion through a closure that does not compose is not a closure chain.
+/// What the shipped evaluators answer, the machine answers, though it bounds its control state,
+/// its heap and its loops: what `[...]` holds here is within the heap budget (2^25 slots of
+/// `[range(1e7), range(1e7)]`, which jq 1.7.1 answers in 1.18 GB), a `repeat` a consumer can stop
+/// is not bounded, and recursion through a closure that does not compose is not a closure chain.
 #[test]
 fn the_machine_answers_what_the_shipped_evaluators_answer_7977() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -239,25 +231,6 @@ fn the_machine_answers_what_the_shipped_evaluators_answer_7977() -> Result<()> {
     Ok(())
 }
 
-/// A tail generator not under a collector prints the outputs the shipped loop prints, 2^20 + 1,
-/// before the same refusal.
-#[test]
-fn a_tail_generator_prints_what_the_shipped_loop_prints_before_its_refusal_7977() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let filter = "def f: ., (. + 1 | f); 0 | f";
-    let (stdout, stderr, exit, _) = run(filter, true, None, dir.path())?;
-    assert_eq!(exit, 5, "{stderr}");
-    assert_eq!(
-        stderr,
-        "jq: error (at <unknown>): f/0: maximum outputs exceeded\n"
-    );
-    assert_eq!(stdout.lines().count(), (1 << 20) + 1);
-    assert_eq!(stdout.lines().last(), Some("1048576"));
-    let (off, _, _, _) = run(filter, false, None, dir.path())?;
-    assert_eq!(off, stdout);
-    Ok(())
-}
-
 /// A recursion that deepens is refused at the byte budget, or at the closure depth when its
 /// argument composes (`n + 1`), naming the innermost definition, where jq grows until its
 /// allocation fails.
@@ -285,10 +258,13 @@ fn a_recursion_past_the_byte_budget_is_refused_7977() -> Result<()> {
 }
 
 /// #5634 and #7733 with the switch on: under a cap on the address space, and on the main thread
-/// at the process limit, a runaway recursion is still refused, because the machine's stacks grow
-/// fallibly (a failed allocation is a refusal, not an abort). The 1.5 GiB cap also holds every
-/// budget refusal above within the acceptance bound of #7977 step 2. Linux only: macOS refuses
-/// `ulimit -v` and does not count threads against `RLIMIT_NPROC`.
+/// at the process limit, a runaway recursion and a runaway collector are still refused, because
+/// the machine's stacks and collectors grow fallibly and its heap budget is held to half the room
+/// the cap leaves (#8064), so the refusal is made while there is room to make it, not an abort
+/// (`memory allocation of 2 bytes failed`) when an allocation the machine does not make fallibly
+/// fails first. The 1.5 GiB cap also holds every budget refusal above within the acceptance bound
+/// of #7977 step 2. Linux only: macOS refuses `ulimit -v` and does not count threads against
+/// `RLIMIT_NPROC`.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_machine_refuses_under_a_capped_address_space_and_at_the_thread_limit_7977() -> Result<()> {
@@ -308,7 +284,10 @@ fn the_machine_refuses_under_a_capped_address_space_and_at_the_thread_limit_7977
         for filter in [
             "def f: [f]; f",
             "def f(n): f(n + 1) + 1; f(0)",
-            "[def f: ., (. + 1 | f); 0 | f] | length",
+            // Collectors whose values hold heap of their own, and a `reduce`'s state (#8064).
+            "[def f: [range(1000)], (. + 1 | f); 0 | f] | length",
+            "[def f: {a: ([range(100)] | tostring)}, (. + 1 | f); 0 | f] | length",
+            "reduce (def f: ., (. + 1 | f); 0 | f) as $x (null; [$x, [range(100)], .]) | length",
         ] {
             let (stdout, stderr, exit, decisions) = run(filter, true, Some(&limit), dir.path())?;
             assert_eq!(
@@ -317,8 +296,7 @@ fn the_machine_refuses_under_a_capped_address_space_and_at_the_thread_limit_7977
                 "{limit}: {filter}: {stderr}"
             );
             assert!(
-                stderr.contains("exceeded maximum recursion depth")
-                    || stderr.contains("maximum outputs exceeded"),
+                stderr.contains("exceeded maximum recursion depth"),
                 "{limit}: {filter}: {stderr}"
             );
             assert!(decisions.lines().all(|l| l == "taken"), "{decisions:?}");

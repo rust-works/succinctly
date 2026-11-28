@@ -1604,6 +1604,16 @@ pub fn set_call_machine(on: bool) {
     vm::set_switched_on(on);
 }
 
+/// Have `room` asked, as each run of the call machine starts, for the bytes of address space a
+/// cap (`ulimit -v`) leaves unmapped, `None` when there is no cap (#8064). The machine then holds
+/// its heap budget to half of that, so it refuses while there is room to report the refusal. The
+/// library reads no limit of the process itself; the CLI sets this.
+#[doc(hidden)]
+#[cfg(feature = "std")]
+pub fn set_call_machine_room(room: fn() -> Option<usize>) {
+    vm::set_room(room);
+}
+
 /// What [`observe_call_machine`]'s observer is told of (#7977).
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5916,6 +5926,14 @@ fn variant_name(expr: &Expr) -> String {
 }
 
 mod vm;
+
+#[cfg(feature = "std")]
+mod heap_meter;
+
+/// The global allocator the call machine's heap budget counts with (#8064).
+#[cfg(feature = "std")]
+#[doc(hidden)]
+pub use heap_meter::MeteredAlloc;
 
 #[cfg(test)]
 mod reference;

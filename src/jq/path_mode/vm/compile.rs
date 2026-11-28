@@ -243,14 +243,6 @@ pub(super) struct Func {
     lends: bool,
 }
 
-impl Func {
-    /// Whether its tail loop's outputs are bounded (`MAX_LOOP_OUTPUTS`): a user's `def` with
-    /// no parameters, the loops the shipped tail loop bounds (#5379).
-    pub fn bounds_outputs(&self) -> bool {
-        self.arity == 0 && !self.prelude && !self.name.is_empty()
-    }
-}
-
 /// The loop a definition nested in the prelude's `name` runs: the shipped loops' own names. The
 /// `while` that `range/3` runs is compiled apart and named `range` (#7977).
 fn prelude_loop(name: &str) -> Option<&'static str> {
@@ -405,10 +397,6 @@ fn compile_moving<'e>(
     c.pending.push((main, Body::Main(program), Vec::new()));
     while let Some((f, body, scope)) = c.pending.pop() {
         c.func(f, body, scope)?;
-    }
-    if c.code.funcs.len() >= 1 << super::ENTRY_BITS {
-        // A frame names its loop's entry in that many bits.
-        return Err(String::from("too many functions"));
     }
     if c.code.insns.len() >= u32::MAX as usize {
         // A frame holds its return address in a `u32`.

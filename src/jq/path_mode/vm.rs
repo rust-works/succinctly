@@ -51,6 +51,8 @@ use super::*;
 
 mod compile;
 
+#[cfg(feature = "std")]
+use super::heap_meter::Meter;
 use compile::{ArgSpec, Callee, Code, Insn, Tail, NO_LEVEL};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,11 +61,20 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// is charged as it is grown into, [`Spare`]). Past it a call, a fork point or a growth refuses with the shipped
 /// evaluators' recursion wording ([`refusal`]), and so does a failed allocation of any of them.
 /// jq itself has no such bound: it runs until memory runs out, an ADR-0018 rule 4(c) divergence
-/// recorded in `docs/compliance/jq/limitations.md`. It bounds the machine's own state, not
-/// memory: what the values hold is not counted, nor are `[...]` accumulators and buffered leaf
-/// outputs, which hold values the program builds (they grow fallibly, so a failed allocation is
-/// a refusal too).
+/// recorded in `docs/compliance/jq/limitations.md`. What the values hold is bounded by
+/// [`HEAP_BUDGET`].
 const BUDGET: usize = 1 << 30;
+
+/// The byte budget of what a run holds on the heap (#8064): its control state and every value it
+/// keeps, a `[...]` accumulator's, a `reduce`'s or `foreach`'s state, a leaf's buffered outputs
+/// and a binding's included, as the allocator counts them ([`Meter`]), so a value shared with one
+/// already held is counted once and a count costs nothing per byte. Checked wherever the run
+/// grows what it holds ([`Vm::check_heap`]): a stack's or an accumulator's growth, and a value a
+/// leaf, an operator or `setpath` builds. Past it the run is refused with the recursion wording,
+/// as past [`BUDGET`]. Under a cap on the address space it is half the room the cap leaves
+/// ([`room_budget`]), so the refusal has room to be made. 1.25 GiB holds the 2^25 slots
+/// `[range(1e7), range(1e7)]` grows to, which jq 1.7.1 answers in 1.18 GB.
+const HEAP_BUDGET: usize = 5 << 28;
 
 /// A frame's `rounds` in a `repeat` loop a consumer can stop (`limit`, `first`), which the
 /// shipped evaluators do not bound ([`Vm::repeat_is_eager`]): its rounds are not counted, and
@@ -90,12 +101,15 @@ const _: () = assert!(REPEAT_WIDTH_BUDGET < MAX_LOOP_OUTPUTS);
 /// The bounds one run keeps: [`SHIPPED`] for every run, smaller ones in the unit tests.
 #[derive(Clone, Copy)]
 struct Limits {
-    /// The byte budget ([`BUDGET`]).
+    /// The byte budget of the control state ([`BUDGET`]).
     bytes: usize,
+    /// The byte budget of what the run holds on the heap ([`HEAP_BUDGET`]).
+    heap: usize,
     /// The rounds a tail loop may run: the shipped `MAX_LOOP_ROUNDS` (#5379, #5292).
     rounds: u32,
-    /// The outputs a zero-argument `def`'s tail loop may emit once it has run
-    /// `OUTPUT_BUDGET_AFTER_ROUNDS` rounds: the shipped `MAX_LOOP_OUTPUTS` (#5379).
+    /// The outputs a loop counts before each further one takes [`Vm::charge_output`]'s path:
+    /// an eager `repeat`'s width (`REPEAT_WIDTH_BUDGET`) is counted up to it. No loop is refused
+    /// for its outputs (#8064): what a collector holds is [`Limits::heap`]'s.
     outputs: u32,
     /// The numbers one `range` may produce: the shipped `MAX_RANGE_TOTAL` (#5292).
     range: usize,
@@ -104,10 +118,58 @@ struct Limits {
 /// The bounds of every run, the shipped evaluators' own.
 const SHIPPED: Limits = Limits {
     bytes: BUDGET,
+    heap: HEAP_BUDGET,
     rounds: MAX_LOOP_ROUNDS as u32,
     outputs: MAX_LOOP_OUTPUTS as u32,
     range: MAX_RANGE_TOTAL,
 };
+
+/// The heap budget under a cap on the address space that leaves `room` bytes unmapped when a run
+/// starts: half of it, so that what the run allocates outside its count (the allocator's own
+/// slack, a block freed but still mapped) and the refusal itself still fit (#8064). Under the cap
+/// an allocation that fails aborts the process wherever it is not a fallible one of the machine's.
+fn room_budget(heap: usize, room: Option<usize>) -> usize {
+    room.map_or(heap, |room| heap.min(room / 2))
+}
+
+/// The function that answers the address space left under a cap ([`set_room`]), if one was set.
+#[cfg(feature = "std")]
+static ROOM: std::sync::OnceLock<fn() -> Option<usize>> = std::sync::OnceLock::new();
+
+/// Have `room` asked, as each run starts, for the address space a cap leaves unmapped
+/// ([`super::set_call_machine_room`]).
+#[cfg(feature = "std")]
+pub(super) fn set_room(room: fn() -> Option<usize>) {
+    let _ = ROOM.set(room);
+}
+
+/// The address space left under a cap, if a cap was reported.
+fn room() -> Option<usize> {
+    #[cfg(feature = "std")]
+    {
+        ROOM.get().and_then(|room| room())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        None
+    }
+}
+
+/// Without `std` there is no allocator to count with: what a run holds is never past its budget.
+#[cfg(not(feature = "std"))]
+struct Meter;
+
+#[cfg(not(feature = "std"))]
+impl Meter {
+    fn begin() -> Self {
+        Self
+    }
+
+    #[inline(always)]
+    fn held(&self) -> isize {
+        0
+    }
+}
 
 /// No return address: the main program's frame, whose `RET` is an output.
 const NO_RET: u32 = u32::MAX;
@@ -276,20 +338,9 @@ struct Counts {
     /// call that entered the loop).
     owner: i32,
     /// The definition the loop started at, which a refusal is named for, as the shipped tail
-    /// loop names it (the low [`ENTRY_BITS`]), and the loop's rounds unweighted, saturating at
-    /// `OUTPUT_BUDGET_AFTER_ROUNDS` (the bits above): the shipped output bound starts after that
-    /// many tail rounds, however much each one costs.
+    /// loop names it.
     entry: u32,
 }
-
-/// The bits of [`Counts::entry`] that name the definition; the compiler declines a program of
-/// more functions.
-pub(super) const ENTRY_BITS: u32 = 25;
-
-const ENTRY_MASK: u32 = (1 << ENTRY_BITS) - 1;
-
-// The unweighted round count fits above the function index.
-const _: () = assert!(OUTPUT_BUDGET_AFTER_ROUNDS < (1 << (32 - ENTRY_BITS)));
 
 impl Counts {
     /// The counts of a loop that starts at `func`.
@@ -304,28 +355,13 @@ impl Counts {
 
     /// The definition the loop started at.
     fn entry(self) -> u32 {
-        self.entry & ENTRY_MASK
-    }
-
-    /// The loop's tail rounds, unweighted, up to `OUTPUT_BUDGET_AFTER_ROUNDS`.
-    fn taken(self) -> u32 {
-        self.entry >> ENTRY_BITS
+        self.entry
     }
 
     /// The counts of the loop's next round, its weighted rounds now `rounds`.
     #[inline(always)]
     fn next_round(self, rounds: u32) -> Self {
-        let taken = self.taken();
-        let taken = if taken < OUTPUT_BUDGET_AFTER_ROUNDS as u32 {
-            taken + 1
-        } else {
-            taken
-        };
-        Self {
-            rounds,
-            entry: self.entry() | (taken << ENTRY_BITS),
-            ..self
-        }
+        Self { rounds, ..self }
     }
 }
 
@@ -417,6 +453,8 @@ struct Vm<'c, 'e> {
     /// A call's arguments on their way into the callee's slots, kept between calls.
     scratch: Vec<Slot>,
     limits: Limits,
+    /// What the run holds on the heap, against [`Limits::heap`].
+    meter: Meter,
     /// The instructions run, for the tests that pin how work scales.
     #[cfg(test)]
     steps: u64,
@@ -428,21 +466,32 @@ struct Vm<'c, 'e> {
 
 /// Make room for one more element in `v` by doubling its charged capacity `cap`, or say it
 /// cannot: when the bytes the control state holds while it grows (`used` now, plus the new
-/// block, the old one still held until it is copied) pass `budget`, or the allocation fails.
-/// Answers the bytes the charge grew by.
+/// block, the old one still held until it is copied) pass `budget`, when what the allocation
+/// adds to the heap does not fit in `room` (what [`HEAP_BUDGET`] has left), or when the
+/// allocation fails. Answers the bytes the charge grew by.
 ///
 /// The charge is what a fresh vector would have grown to, so a run's bounds do not depend on
 /// what an earlier document left in a kept vector ([`Spare`]): one kept with room allocates
 /// nothing until the charge passes its capacity.
 #[cold]
 #[inline(never)]
-fn grow<T>(v: &mut Vec<T>, cap: &mut usize, used: usize, budget: usize) -> Result<usize, ()> {
+fn grow<T>(
+    v: &mut Vec<T>,
+    cap: &mut usize,
+    used: usize,
+    budget: usize,
+    room: isize,
+) -> Result<usize, ()> {
     let want = cap.saturating_mul(2).max(4);
     let size = core::mem::size_of::<T>();
     if used.saturating_add(want.saturating_mul(size)) > budget {
         return Err(());
     }
     if v.capacity() < want {
+        let adds = (want - v.capacity()).saturating_mul(size);
+        if isize::try_from(adds).map_or(true, |adds| adds > room) {
+            return Err(());
+        }
         v.try_reserve_exact(want - v.len()).map_err(|_| ())?;
     }
     let grew = (want - *cap) * size;
@@ -450,29 +499,29 @@ fn grow<T>(v: &mut Vec<T>, cap: &mut usize, used: usize, budget: usize) -> Resul
     Ok(grew)
 }
 
-/// Make room for one more value in an accumulator, fallibly: values the program builds are not
-/// the budget's, but a failed allocation is still a refusal, not an abort.
+/// Make room for one more value in an accumulator or a leaf's buffer, fallibly and within `room`,
+/// the heap bytes [`HEAP_BUDGET`] has left: by doubling, or, where that does not fit, by what
+/// does, so a collector can fill the budget rather than half of it; past it, or when the
+/// allocation fails, a refusal rather than an abort.
 #[cold]
 #[inline(never)]
-fn reserve<T>(items: &mut Vec<T>) -> Result<(), ()> {
-    items.try_reserve(1).map_err(|_| ())
+fn reserve<T>(items: &mut Vec<T>, room: isize) -> Result<(), ()> {
+    let size = core::mem::size_of::<T>().max(1);
+    let fits = usize::try_from(room).unwrap_or(0) / size;
+    let more = items.capacity().max(4).min(fits);
+    if more == 0 {
+        return Err(());
+    }
+    items.try_reserve_exact(more).map_err(|_| ())
 }
 
-/// The refusal past [`BUDGET`] or [`Limits::rounds`]: succinctly's own recursion-limit wording
-/// (ADR-0025), naming the definition (`f/1 exceeded maximum recursion depth`).
+/// The refusal past [`BUDGET`], [`HEAP_BUDGET`] or [`Limits::rounds`]: succinctly's own
+/// recursion-limit wording (ADR-0025), naming the definition (`f/1 exceeded maximum recursion
+/// depth`).
 fn refusal(name: &str, arity: usize) -> Raise {
     Raise::Fatal(named_depth_refusal(
         name.strip_prefix("_sp_").unwrap_or(name),
         arity,
-    ))
-}
-
-/// The refusal of a zero-argument `def`'s tail loop past [`Limits::outputs`]: the shipped tail
-/// loop's (`f/0: maximum outputs exceeded`, #5379).
-fn loop_outputs_refusal(name: &str) -> Raise {
-    Raise::Fatal(outputs_refusal(
-        name.strip_prefix("_sp_").unwrap_or(name),
-        0,
     ))
 }
 
@@ -587,7 +636,11 @@ pub(super) fn run<'e>(
     input: OwnedValue,
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
 ) -> R {
-    run_within(SHIPPED, it, program, input, on_value)
+    let limits = Limits {
+        heap: room_budget(HEAP_BUDGET, room()),
+        ..SHIPPED
+    };
+    run_within(limits, it, program, input, on_value)
 }
 
 /// [`run`] within `limits`.
@@ -644,6 +697,8 @@ impl<'c, 'e> Vm<'c, 'e> {
     /// A machine for one document, over the empty vectors `spare` (kept from an earlier
     /// document, or new).
     fn with_spare(it: &'c Interp<'e>, code: &'e Code, limits: Limits, spare: Spare) -> Self {
+        // Counting starts before the machine allocates anything of its own.
+        let meter = Meter::begin();
         Self {
             it,
             code,
@@ -655,6 +710,7 @@ impl<'c, 'e> Vm<'c, 'e> {
             forks_cap: 0,
             scratch: spare.scratch,
             limits,
+            meter,
             #[cfg(test)]
             steps: 0,
             #[cfg(test)]
@@ -683,6 +739,35 @@ impl<'c, 'e> Vm<'c, 'e> {
             + self.forks_cap * core::mem::size_of::<Fork>()
     }
 
+    /// The heap bytes [`Limits::heap`] has left, below zero past it.
+    #[inline(always)]
+    fn heap_room(&self) -> isize {
+        (self.limits.heap as isize).saturating_sub(self.meter.held())
+    }
+
+    /// The heap budget's check: a refusal naming the innermost definition once what the run holds
+    /// is past [`Limits::heap`] (#8064). Asked wherever the run keeps more: at every call, append
+    /// and store, and where a value was just built (a leaf's outputs, an operator's or
+    /// `setpath`'s), besides every growth of a stack, an accumulator or a leaf's buffer.
+    #[inline(always)]
+    fn check_heap(&self) -> Result<(), Raise> {
+        if self.heap_room() < 0 {
+            return Err(self.current_def());
+        }
+        Ok(())
+    }
+
+    /// [`Vm::check_heap`] for `v`, a value just built, when it can hold heap of its own.
+    #[inline(always)]
+    fn check_built(&self, v: &OwnedValue) -> Result<(), Raise> {
+        match v {
+            OwnedValue::Array(_) | OwnedValue::Object(_) | OwnedValue::String(_) => {
+                self.check_heap()
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Push onto the data stack, growing it within the budget.
     #[inline(always)]
     fn push(&mut self, value: OwnedValue) -> Result<(), Raise> {
@@ -697,11 +782,13 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[inline(never)]
     fn grow_data(&mut self) -> Result<(), Raise> {
         let used = self.bytes();
+        let room = self.heap_room();
         grow(
             &mut self.data.data,
             &mut self.data.cap,
             used,
             self.limits.bytes,
+            room,
         )
         .map_err(|()| self.current_def())?;
         Ok(())
@@ -711,11 +798,13 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[inline(never)]
     fn grow_frames(&mut self) -> Result<(), ()> {
         let used = self.bytes();
+        let room = self.heap_room();
         grow(
             &mut self.frames.data,
             &mut self.frames.cap,
             used,
             self.limits.bytes,
+            room,
         )
         .map(|_| ())
     }
@@ -725,21 +814,26 @@ impl<'c, 'e> Vm<'c, 'e> {
     fn grow_slots(&mut self, room: usize) -> Result<(), ()> {
         while self.slots_cap - self.slots.len() < room {
             let used = self.bytes();
+            let room = self.heap_room();
             grow(
                 &mut self.slots,
                 &mut self.slots_cap,
                 used,
                 self.limits.bytes,
+                room,
             )?;
         }
         Ok(())
     }
 
     /// Grow the frame stack and the slots, within the budget, so that a call's frame and its
-    /// `nslots` slots fit without growing either: the budget check of a call. Whether they fit.
+    /// `nslots` slots fit without growing either: the budget check of a call, which also asks
+    /// whether what the run holds is within [`Limits::heap`] (a round that keeps what it built
+    /// is stopped here). Whether they fit.
     #[inline(always)]
     fn room_for_call(&mut self, nslots: usize) -> bool {
-        (self.frames.has_room() || self.grow_frames().is_ok())
+        self.heap_room() >= 0
+            && (self.frames.has_room() || self.grow_frames().is_ok())
             && (self.slots_cap - self.slots.len() >= nslots || self.grow_slots(nslots).is_ok())
     }
 
@@ -753,9 +847,14 @@ impl<'c, 'e> Vm<'c, 'e> {
         Ok(())
     }
 
-    /// `APPEND` into the accumulator in slot `at`, growing it fallibly.
+    /// `APPEND` into the accumulator in slot `at`, growing it fallibly within the heap budget,
+    /// which every append checks: what the value holds was allocated as it was built.
     #[inline(always)]
     fn append(&mut self, at: usize, value: OwnedValue) -> Result<(), Raise> {
+        let room = self.heap_room();
+        if room < 0 {
+            return Err(self.current_def());
+        }
         let Slot::Acc(items) = &mut self.slots[at] else {
             return Ok(());
         };
@@ -763,7 +862,7 @@ impl<'c, 'e> Vm<'c, 'e> {
             items.push(value);
             return Ok(());
         }
-        if reserve(items).is_err() {
+        if reserve(items, room).is_err() {
             return Err(self.current_def());
         }
         items.push(value);
@@ -774,11 +873,13 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[inline(never)]
     fn grow_forks(&mut self) -> Result<(), Raise> {
         let used = self.bytes();
+        let room = self.heap_room();
         grow(
             &mut self.forks,
             &mut self.forks_cap,
             used,
             self.limits.bytes,
+            room,
         )
         .map_err(|()| self.current_def())?;
         Ok(())
@@ -1116,6 +1217,8 @@ impl<'c, 'e> Vm<'c, 'e> {
             Insn::Store(s) => {
                 let v = self.data.pop();
                 *self.slot(0, *s) = Slot::Val(v);
+                // A binding, or a `reduce`'s or `foreach`'s state, is held from here on.
+                self.check_heap()?;
             }
             Insn::Load(level, idx) => {
                 self.data.pop();
@@ -1168,7 +1271,9 @@ impl<'c, 'e> Vm<'c, 'e> {
             Insn::Bin(op) => {
                 let l = self.data.pop();
                 let r = self.data.pop();
-                self.push(combine(*op, &l, &r).map_err(raise_eval)?)?;
+                let v = combine(*op, &l, &r).map_err(raise_eval)?;
+                self.check_built(&v)?;
+                self.push(v)?;
             }
             Insn::Cmp(op) => {
                 let l = self.data.pop();
@@ -1180,7 +1285,9 @@ impl<'c, 'e> Vm<'c, 'e> {
             Insn::BinK(op, k) => {
                 let l = self.data.pop();
                 let r = &code.consts[*k as usize];
-                self.push(combine(*op, &l, r).map_err(raise_eval)?)?;
+                let v = combine(*op, &l, r).map_err(raise_eval)?;
+                self.check_built(&v)?;
+                self.push(v)?;
             }
             Insn::CmpK(op, k) => {
                 let l = self.data.pop();
@@ -1247,13 +1354,15 @@ impl<'c, 'e> Vm<'c, 'e> {
                         out.ok_or_else(|| unsupported("setpath answered nothing"))?
                     }
                 };
+                self.check_built(&written)?;
                 self.push(written)?;
             }
             Insn::Call { callee, args, tail } => return self.call(pc, *callee, args, *tail),
             Insn::TailJump { func, level } => return self.tail_jump(pc, *func, *level),
             Insn::Ret => {
                 // Outputs are counted in a loop's frames (and charged to an owner's), where a
-                // bound can apply; a frame of an ordinary call that is not yet a loop counts none.
+                // prelude loop's bound can apply; a frame of an ordinary call that is not yet a
+                // loop counts none.
                 let top = self.frames.index as usize;
                 let counts = self.frames.data[top].value.counts;
                 if counts.rounds != 0 || counts.owner != -1 {
@@ -1285,10 +1394,10 @@ impl<'c, 'e> Vm<'c, 'e> {
 
     /// An output charged to the loop of the frame at `owner`, once its count has reached
     /// [`Limits::outputs`] (or the loop is an uncounted `repeat`, whose `emitted` is above it):
-    /// the shipped tail loop's output bound (#5379), checked before this output as the shipped
-    /// loop checks after the one before; an eager `repeat`'s width (`REPEAT_WIDTH_BUDGET`, its
-    /// count started that far below the bound); or an uncounted `repeat`'s round marked
-    /// [`HEARD`].
+    /// an eager `repeat`'s width (`REPEAT_WIDTH_BUDGET`, its count started that far below the
+    /// bound), `range/3`'s `MAX_RANGE_TOTAL`, or an uncounted `repeat`'s round marked [`HEARD`].
+    /// The shipped tail loop's output bound (`MAX_LOOP_OUTPUTS`, #5379) is not the machine's
+    /// (#8064): the heap budget bounds what a collector of a loop's outputs holds.
     #[cold]
     #[inline(never)]
     fn charge_output(&mut self, owner: usize) -> Result<(), Raise> {
@@ -1311,9 +1420,11 @@ impl<'c, 'e> Vm<'c, 'e> {
             if entry.loop_name == Some("repeat") {
                 return Err(Raise::Fatal(iterations_refusal("repeat")));
             }
-            if counts.taken() >= OUTPUT_BUDGET_AFTER_ROUNDS as u32 && entry.bounds_outputs() {
-                return Err(loop_outputs_refusal(&entry.name));
-            }
+            // Any other loop is not bounded by its outputs (#8064): what a collector holds is the
+            // heap budget's. Its count starts again, so this path is taken once per
+            // `Limits::outputs` outputs.
+            counts.emitted = 0;
+            return Ok(());
         }
         counts.emitted = counts.emitted.saturating_add(1);
         Ok(())
@@ -1334,6 +1445,8 @@ impl<'c, 'e> Vm<'c, 'e> {
             slots: &self.slots,
         };
         let env = Env::over_slots(&view);
+        let meter = &self.meter;
+        let heap = self.limits.heap as isize;
         let mut first = None;
         let mut rest = Vec::new();
         let mut full = false;
@@ -1343,8 +1456,10 @@ impl<'c, 'e> Vm<'c, 'e> {
                 if first.is_none() {
                     first = Some(v);
                 } else {
-                    // Uncounted, as an accumulator is, but grown fallibly.
-                    if rest.len() == rest.capacity() && reserve(&mut rest).is_err() {
+                    // Grown fallibly within the heap budget, as an accumulator is.
+                    if rest.len() == rest.capacity()
+                        && reserve(&mut rest, heap.saturating_sub(meter.held())).is_err()
+                    {
                         full = true;
                         return Err(Raise::Stop);
                     }
@@ -1361,6 +1476,8 @@ impl<'c, 'e> Vm<'c, 'e> {
                 Err(raise) => Err(raise),
             };
         };
+        // What the leaf built is held from here on: its outputs, and the heap they hold.
+        self.check_heap()?;
         if !rest.is_empty() || end.is_err() {
             self.fork(Kind::Values {
                 vals: rest.into_iter(),
