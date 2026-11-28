@@ -45,9 +45,11 @@ mod eof_location;
 // ADR-0033's reader model (#7987): the routes' read arithmetic is its `Fgets` and `LineReads`
 // (step 4), the materializing route of `read_inputs` enters its `ReaderState` on a trigger
 // (step 5, `model_read`), and the default route enters it and hands back at the next sync point
-// (step 6, `model_default`).
+// (step 6, `model_default`), and the routes that read a window at a time feed it the windows they
+// hold (step 7, `model_window`).
 mod model_default;
 mod model_read;
+mod model_window;
 pub(crate) mod reader_model;
 mod window;
 
@@ -6197,6 +6199,12 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
         } else {
             None
         };
+        // #7987 step 7: the windowed route feeds jq's reader model the windows it holds.
+        let window_model_on = windowed.is_some()
+            && reader_model::enabled()
+            && !args.slurp
+            && !args.seq
+            && !args.validate;
         // #5291: jq skips a BOM at the start of its input, `--validate` included.
         let bom_cuts = strip_leading_json_bom(raw_inputs.iter_mut());
         // #4305: see [`stitch_json_file_seams`]. Not under `--validate`, which is strict per file.
@@ -6345,6 +6353,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 window_place,
                 notes,
                 window_edits,
+                window_model,
             ) = match windowed.as_mut() {
                 Some(reader) => match reader.next_window_noting(&mut |at, failure| {
                     noted.push((at, failure));
@@ -6358,6 +6367,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         Some((next.seam, next.origin)),
                         next.notes,
                         next.edits,
+                        Some(next.model),
                     ),
                     Ok(None) => break,
                     // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
@@ -6376,6 +6386,7 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                         None,
                         Vec::new(),
                         Vec::new(),
+                        None,
                     ),
                     None => break,
                 },
@@ -6477,6 +6488,28 @@ fn run_jq_on_stack_floor(mut args: JqCommand) -> Result<i32> {
                 }
                 _ => None,
             };
+            // #7987 step 7: a window's substituted lines read by jq's reader model, as the whole-file
+            // route reads a file's ([`model_window`]).
+            if let (Some(facts), Some((seam, origin)), true, false) = (
+                &window_model,
+                &window_place,
+                window_model_on,
+                window_edits.is_empty(),
+            ) {
+                if noted.is_empty() && failures.is_empty() {
+                    let window = model_window::Window {
+                        raw,
+                        edits: &window_edits,
+                        facts,
+                        file: idx,
+                        files: files.len().max(1),
+                        lines_before,
+                        line: origin.0,
+                        base: seam.base,
+                    };
+                    model_window::plan_window(&window, &mut values, &mut split_error);
+                }
+            }
             // jq's main loop ends the run once an open has failed, after the one value it was
             // fetching when it met the failure: the first the files past it hold. It reads
             // nothing beyond that value, so a fault further on is never reached (#5472).
@@ -8337,6 +8370,11 @@ fn read_inputs(
                 return Ok(Ok(inputs));
             }
             Ok(LoneStart::Read(bytes)) => read_whole = Some(bytes),
+            Ok(LoneStart::BrokenMark(front)) => {
+                opened.clone_from(&files);
+                let tag = (!files.is_empty()).then_some(0);
+                return Ok(Ok(model_read::read_whole_as_read(&[(tag, front)], &files)));
+            }
             Ok(LoneStart::Declined) => {}
             // patchcov: coverage tolerate-line reason="untestable: stdin failing part-way"
             Err(e) => return Ok(Err(e)),
@@ -9748,6 +9786,8 @@ fn read_inputs(
         // ADR-0033 step 5: what the loop read of each source, for the model to be entered after it
         // should it meet a trigger.
         let mut model_files: Vec<model_read::EagerFile> = Vec::new();
+        // #8082: a source of `model_files` met a trigger.
+        let mut model_triggered = false;
         let counts_files = !args.stream && args.input_dsv.is_none();
         let mut next_file = StreamOrigin::ALONE.file;
         // #5857: a clean stream of several files converts each document when the program reads
@@ -9858,6 +9898,16 @@ fn read_inputs(
             // #4316: the bytes a stitched file starts with came from the previous file, so
             // its lines start after them.
             let seam = seams.get(pos).cloned().unwrap_or_default();
+            // #8082: past a trigger jq's reader model reads the rest of the input, so the loop reads
+            // none of it as JSON; a later source only gives the model its text.
+            if model_triggered {
+                model_files.push(model_read::EagerFile::unread(
+                    std::rc::Rc::new(raw),
+                    seam.base,
+                    values.len(),
+                ));
+                continue;
+            }
 
             if let Some(delimiter) = args.input_dsv {
                 // DSV input: each row becomes a JSON array of strings
@@ -9999,6 +10049,7 @@ fn read_inputs(
                         lossy,
                         ends_stream: pos == last && !unopened_tail,
                         lines_before: 0,
+                        stop_at_fault: model_route,
                     };
                     let mut first_fault = None;
                     if let Err(error) = read_json_tail(
@@ -10029,14 +10080,16 @@ fn read_inputs(
                         } else {
                             model_ends.append(&mut ends);
                         }
-                        model_files.push(model_read::EagerFile {
+                        let file = model_read::EagerFile {
                             text: std::rc::Rc::clone(&raw),
                             base: seam.base,
                             ends: model_ends,
                             lazy,
                             values_before: documents_before,
                             trigger: model_read::EagerFile::trigger_of(first_fault, lossy),
-                        });
+                        };
+                        model_triggered |= file.trigger.is_some();
+                        model_files.push(file);
                     }
                     continue;
                 }
@@ -15625,6 +15678,10 @@ struct TailContext<'a> {
     /// How many line breaks came before the text, which a lone source read in windows has dropped
     /// the front of (#7023); `file_start` is then where the text starts, not the file.
     lines_before: usize,
+    /// The read stops at the first fault (#8082): jq's reader model reads the rest of the input
+    /// from the last sync point before it ([`model_read::enter_after_trigger`]), so what the reader
+    /// would resume to read is read again there, and was all thrown away.
+    stop_at_fault: bool,
 }
 
 /// The eager reader of a JSON text from byte `offset` on (#4311): the documents it holds, each ending
@@ -15774,6 +15831,9 @@ fn read_json_tail(
                 as_parse_error: false,
             },
         ));
+        if cx.stop_at_fault {
+            break;
+        }
         past_fault = true;
         let mut next = resume;
         // #5990: the read this one's end leaves starts inside a replacement when
@@ -16304,6 +16364,9 @@ enum LoneStart {
     Read(Vec<u8>),
     /// Nothing kept: the file is read as it always was (and a failure reported there).
     Declined,
+    /// The front of a source whose mark breaks off in it, for jq's reader model, which is stuck on
+    /// `Malformed BOM` within the front's first read (#7987, step 7): the rest is never read.
+    BrokenMark(Vec<u8>),
 }
 
 /// The front of a lone source, for a run [`lone_lazy_read`] admits (#6451). When the lazy route's
@@ -16462,6 +16525,12 @@ fn lone_lazy_start(files: &[PathBuf]) -> Result<LoneStart> {
         // #7863: a mark that breaks off in the front is jq's fault for good, which the substituted
         // text the route reads would hide (`EF 31` is `U+FFFD` and `1` there).
         if crate::cli::front_matter::StreamBomMatch::default().breaks_in(&bytes) {
+            // #7987 step 7: jq's reader model reads it, and is stuck on `Malformed BOM` in its first
+            // read, which the front holds: nothing past the front is ever read (#5804 retired on a
+            // long pipe's lazy route).
+            if reader_model::enabled() {
+                return Ok(LoneStart::BrokenMark(bytes));
+            }
             BROKEN_MARK_STREAM.with(|flag| flag.set(true));
         }
         let utf8 = succinctly::text::utf8::is_utf8(&bytes[bom..]);
@@ -17604,6 +17673,7 @@ fn fault_tail(
         lossy: lazy.lossy.as_ref(),
         ends_stream: lazy.ends_stream,
         lines_before: lazy.dropped.newlines,
+        stop_at_fault: false,
     };
     let (mut values, mut ends, mut errors) = (Vec::new(), Vec::new(), Vec::new());
     match read_json_tail(
@@ -17837,6 +17907,7 @@ fn hand_off_later_sources(
             lossy: None,
             ends_stream: pos == last && ends_stream,
             lines_before,
+            stop_at_fault: false,
         };
         let before = values.len();
         let mut ends = Vec::new();

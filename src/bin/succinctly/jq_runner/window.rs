@@ -317,6 +317,26 @@ pub(super) struct Window<'a> {
     /// records (#7322), in order, each with the offset in `raw` it was met at: it is printed before
     /// the first of `values` that starts after that offset. Empty for any other window.
     pub notes: Vec<(usize, String)>,
+    /// #7987 step 7: what jq's reader model is entered in the window with ([`super::model_window`]).
+    pub model: ModelFacts<'a>,
+}
+
+/// What a window tells jq's reader model of where its text is in the file as read (#7987, step 7):
+/// enough to give the bytes of the window back as they were read and to name the reader's state at
+/// a line start of it ([`super::reader_model::ReaderState::at_line_start`]).
+pub(super) struct ModelFacts<'a> {
+    /// Where `raw` starts in the file, as read (its mark and every substitution before it
+    /// counted): negative while `raw` starts in the bytes moved onto the file from the one before.
+    pub file_front: i64,
+    /// The bytes each of [`Window::edits`] replaced, in order.
+    pub edit_bytes: &'a [Vec<u8>],
+    /// Where the window's first document can start in `raw`: the text before it is the end of a
+    /// document an earlier window ran.
+    pub run_from: usize,
+    /// `raw` runs to the end of the file, with nothing moved off it onto the next.
+    pub ends_file: bool,
+    /// `raw` starts at the front of the stream: the mark skipped there (#7569), else `None`.
+    pub front: Option<usize>,
 }
 
 /// Where a file stands among the ones the run reads as one stream, and what it takes from the files
@@ -509,6 +529,10 @@ pub(super) struct WindowedFile {
     /// before the first of them: what a window hands the document loop ([`Window::edits`]).
     edits: Vec<SubstitutionEdit>,
     edits_delta_dropped: i64,
+    /// The bytes each of [`Self::edits`] replaced (#7987, step 7), which jq's reader model reads.
+    edit_bytes: Vec<Vec<u8>>,
+    /// Only empty files came before this one: its front is the stream's, where a mark is skipped.
+    at_stream_front: bool,
     /// Where `buf` starts in jq's input.
     origin: (usize, usize),
     /// Where the end of the text handed out is, once the last window is.
@@ -612,6 +636,8 @@ impl WindowedFile {
             track_raw,
             edits: Vec::new(),
             edits_delta_dropped: 0,
+            edit_bytes: Vec::new(),
+            at_stream_front: place.strip_bom,
             origin: place.origin,
             end_origin: place.origin,
             certifier: None,
@@ -852,6 +878,15 @@ impl WindowedFile {
                     seam,
                     origin: self.origin,
                     notes,
+                    model: ModelFacts {
+                        file_front: self.offset as i64 + self.edits_delta_dropped
+                            - self.carry_raw_len as i64,
+                        edit_bytes: &self.edit_bytes,
+                        run_from: from,
+                        ends_file: last && tail_start.is_none(),
+                        front: (self.at_stream_front && self.offset == self.seam.lead)
+                            .then_some(self.seam.lead),
+                    },
                 }));
             }
             // Nothing to run, and the file goes on: white space is dropped, and a document that did
@@ -1049,6 +1084,7 @@ impl WindowedFile {
                 let last = &self.edits[keep - 1];
                 self.edits_delta_dropped = last.raw.end as i64 - last.text.end as i64;
                 self.edits.drain(..keep);
+                self.edit_bytes.drain(..keep);
             }
         }
     }
@@ -1351,6 +1387,8 @@ impl WindowedFile {
             raw: raw_start + edit.raw.start..raw_start + edit.raw.end,
             text: text_start + edit.text.start..text_start + edit.text.end,
         }));
+        self.edit_bytes
+            .extend(edits.iter().map(|edit| region[edit.raw.clone()].to_vec()));
         if self.track_raw {
             // The first region is the front of the file, where the carry is: its seam is moved by
             // the substitution as the whole-file route's is (`utf8_lossy_document`).
@@ -1645,6 +1683,12 @@ struct Job<'a> {
     /// The stream ends with the window.
     eof: bool,
     raw_map: Cow<'a, RawMap>,
+    /// The window starts at the stream's front: the mark it skipped, which jq's first read holds
+    /// (#7569), else `None`.
+    front: Option<usize>,
+    /// jq's reader model certifies it (#7987, step 7), as the run asked on its own thread
+    /// ([`super::reader_model::enabled`]).
+    model: bool,
     #[cfg(test)]
     exact_reads: Arc<AtomicUsize>,
 }
@@ -2355,6 +2399,8 @@ impl WindowedFile {
     /// be started, is certified here, over the buffer itself. The last window is certified only if a
     /// fault is asked for, over the buffer, which it then shares ([`SeenFault::defer_last`], #7294).
     fn certify(&mut self, values: &[Span], fault_at_end: bool) {
+        let front = self.stream_front();
+        let model = super::reader_model::enabled();
         let Some(certifier) = self.certifier.as_mut() else {
             return;
         };
@@ -2373,6 +2419,8 @@ impl WindowedFile {
                 eof: self.eof,
                 // Nothing reads the map once the last window is out.
                 raw_map: Cow::Owned(std::mem::take(&mut self.raw_map)),
+                front,
+                model,
                 #[cfg(test)]
                 exact_reads: Arc::clone(&certifier.exact_reads),
             });
@@ -2401,6 +2449,8 @@ impl WindowedFile {
                 origin: self.origin,
                 eof: self.eof,
                 raw_map: Cow::Borrowed(&self.raw_map),
+                front,
+                model,
                 #[cfg(test)]
                 exact_reads: Arc::clone(&certifier.exact_reads),
             };
@@ -2423,6 +2473,8 @@ impl WindowedFile {
             origin: self.origin,
             eof: self.eof,
             raw_map: Cow::Owned(self.raw_map.clone()),
+            front,
+            model,
             #[cfg(test)]
             exact_reads: Arc::clone(&certifier.exact_reads),
         };
@@ -2431,6 +2483,13 @@ impl WindowedFile {
             // have the next reader of the fault say so.
             certifier.seen.finish(None, None, true); // patchcov: coverage tolerate-line reason="defensive: the thread ends only when its sender is dropped, and a panic inside it is caught"
         }
+    }
+
+    /// The mark skipped before the text when the text starts at the stream's front, else `None`: the
+    /// front is the one place whose bytes before the text are the mark's (#7569), and a drop moves
+    /// the text off it.
+    fn stream_front(&self) -> Option<usize> {
+        (self.at_stream_front && self.offset == self.seam.lead).then_some(self.seam.lead)
     }
 
     /// The room of the buffer the windows are read into, the last window's once it is shared (#7294).
@@ -2450,12 +2509,35 @@ impl WindowedFile {
     }
 }
 
+/// What jq's reader model made of a window it certified ([`Job::certify_by_model`]).
+enum ModelCertified {
+    /// The stream's first fault, in jq's words.
+    Fault(String),
+    /// No fault in the window.
+    Clean,
+    /// No sync point to enter the model at: the parser imitation certifies the window.
+    Declined,
+}
+
 impl Job<'_> {
     /// Certifies the documents of the window, from where jq's parser stood at the end of the last:
     /// the fault it meets, if it is the stream's first.
     fn certify(&self, resume: &mut usize) -> Option<String> {
         // Only white space has been dropped past the boundary: the parser stands at the text's start.
         let mut at = (*resume).max(self.offset) - self.offset;
+        if self.model {
+            match self.certify_by_model(&mut at) {
+                ModelCertified::Fault(fault) => {
+                    *resume = self.offset + at;
+                    return Some(fault);
+                }
+                ModelCertified::Clean => {
+                    *resume = self.offset + at;
+                    return None;
+                }
+                ModelCertified::Declined => {}
+            }
+        }
         let mut fault = None;
         // `JobText`'s `Deref` is a match and, for a held buffer, a bounds check: take it once, not per document (#7313).
         let text: &[u8] = &self.text;
@@ -2486,6 +2568,110 @@ impl Job<'_> {
         }
         *resume = self.offset + at;
         fault
+    }
+
+    /// [`Self::certify`] by jq's reader model (#7987, step 7), from `at`, where the last window left
+    /// the parser: the documents the validator certifies are plain, and the model reads from the last
+    /// sync point before the first one it does not (or before the window's fault at its end) to the
+    /// end of the window: the line start after the last newline that no document holds, where
+    /// [`ReaderState::at_line_start`] is the reader from the window's line count and its bytes as read,
+    /// or the stream's front. The fault it meets, or none, with `at` moved to where the parser stands
+    /// after the window; declined when there is no such line start, which keeps the parser
+    /// imitation's reading of the window.
+    ///
+    /// [`ReaderState::at_line_start`]: super::reader_model::ReaderState::at_line_start
+    #[inline(never)]
+    // `reads` is drained, not consumed: the buffer is the next step's.
+    #[allow(clippy::iter_with_drain)]
+    fn certify_by_model(&self, at: &mut usize) -> ModelCertified {
+        use super::reader_model::{Item, ReadMode, ReaderState, Session, Stop};
+        const NON_SEQ: ReadMode = ReadMode { seq: false };
+        let text: &[u8] = &self.text;
+        let mut from = *at;
+        let mut trigger = None;
+        for &(start, end) in &self.values {
+            let certified = succinctly::json::validate::Validator::new(&text[start..end])
+                .with_max_depth(CERTIFIED_DEPTH)
+                .validate()
+                .is_ok();
+            if !certified {
+                trigger = Some(start);
+                break;
+            }
+            from = Self::boundary_after(text, start, end);
+        }
+        let last_boundary = self
+            .values
+            .last()
+            .map_or(from, |&(start, end)| Self::boundary_after(text, start, end));
+        // A document the validator turned down costs a read by jq's parser (the test counts them);
+        // the fault at the end of the stream is read for its own wording.
+        #[cfg(test)]
+        let turned_down = trigger.is_some();
+        let Some(trigger) = trigger.or_else(|| self.fault_at_end.then_some(from)) else {
+            *at = from;
+            return ModelCertified::Clean;
+        };
+        // The last sync point before the trigger: a line start after `at` that no document holds.
+        let entry = super::model_window::newline_between_values(text, *at, trigger, &self.values)
+            .map(|newline| newline + 1);
+        let (state, entry, lead) = match (entry, self.front) {
+            (Some(entry), _) => {
+                let as_read = self.raw_map.raw_of(self.offset + entry);
+                let lines = self.origin.0 - 1 + super::count_newlines(&text[..entry]);
+                (
+                    ReaderState::at_line_start(0, as_read, lines, lines),
+                    entry,
+                    0,
+                )
+            }
+            (None, Some(lead)) if *at == 0 => (ReaderState::start(NON_SEQ), 0, lead),
+            (None, _) => return ModelCertified::Declined,
+        };
+        #[cfg(test)]
+        if turned_down {
+            self.exact_reads.fetch_add(1, Ordering::Relaxed);
+        }
+        // The window from the entry as read: the text itself where nothing was substituted, and at
+        // the stream's front behind the mark the route skipped.
+        let read = self.as_read(entry, text.len());
+        let bytes: Cow<'_, [u8]> = if lead == 0 {
+            read
+        } else {
+            Cow::Owned([&succinctly::jq::jv_parse::UTF8_BOM[..lead], &read[..]].concat())
+        };
+        let base = match state.input {
+            Some(open) => open.offset,
+            None => 0,
+        };
+        let mut source = super::model_window::HeldBytes {
+            bytes: &bytes,
+            file: 0,
+            base,
+            to_end: self.eof,
+            files: 1,
+        };
+        let profile = &crate::cli::jq_reader_profile::JQ_READER;
+        let mut session = Session::resume(state, &source, profile, NON_SEQ);
+        let mut reads = Vec::new();
+        loop {
+            let stop = session.step(&mut source, &mut reads);
+            for read in reads.drain(..) {
+                match read.item {
+                    Item::Value(_) => {}
+                    Item::Fault(fault) => return ModelCertified::Fault(fault.message()),
+                    Item::End => {
+                        *at = last_boundary;
+                        return ModelCertified::Clean;
+                    }
+                }
+            }
+            if stop != Stop::Synced {
+                // The window ends inside a value the next one goes on with.
+                *at = last_boundary;
+                return ModelCertified::Clean;
+            }
+        }
     }
 
     /// Where jq's parser stands at a boundary once the document at `start..end` is read: after it for a
@@ -3618,6 +3804,98 @@ const TAIL_PROBE: u64 = 256 << 10;
 #[cfg(unix)]
 const PREPASS_CHUNK: usize = 64 << 10;
 
+/// The files of a [`Reread`] read again by position for jq's reader model (#7987, step 7): one chunk
+/// of one file at a time, read from where the model stands, to the end each file has now, as the
+/// run reads each file on to the end it has when its reads get there (#7446).
+#[cfg(unix)]
+struct RereadModelSource<'r> {
+    reread: &'r Reread,
+    /// The named file the read is in, opened when it is reached, with its position.
+    opened: Option<(usize, File)>,
+    /// The chunk held: its file, where it starts in the file's stream, its bytes, and whether the
+    /// file ends with it.
+    chunk: Option<(usize, usize, Vec<u8>, bool)>,
+    /// A file could not be read again: the run keeps its own wording.
+    failed: bool,
+}
+
+#[cfg(unix)]
+impl super::reader_model::Source for RereadModelSource<'_> {
+    fn files(&self) -> usize {
+        self.reread.sources.len()
+    }
+
+    /// Only a session at the stream's start reads it, so every offset counts from there.
+    fn start_of(&self, _file: usize) -> usize {
+        0
+    }
+
+    fn held(&mut self, file: usize, offset: usize, want: usize) -> super::reader_model::Held<'_> {
+        use std::os::unix::fs::FileExt;
+        let holds = |chunk: &Option<(usize, usize, Vec<u8>, bool)>| {
+            chunk.as_ref().is_some_and(|(at, start, bytes, end)| {
+                *at == file
+                    && *start <= offset
+                    && offset <= start + bytes.len()
+                    && (*end || offset + want <= start + bytes.len())
+            })
+        };
+        if !holds(&self.chunk) && !self.failed {
+            let current = &self.reread.sources[file];
+            let handle: Option<&File> = match &current.file {
+                RereadFile::Held(handle) => Some(handle),
+                RereadFile::Named(named) => {
+                    if !matches!(&self.opened, Some((at, _)) if *at == file) {
+                        self.opened = None;
+                        match named.reopen_as_read() {
+                            Ok(Some((handle, _))) => self.opened = Some((file, handle)),
+                            // Read as no bytes by the run.
+                            Ok(None) => {}
+                            Err(_) => self.failed = true,
+                        }
+                    }
+                    self.opened.as_ref().map(|(_, handle)| handle)
+                }
+            };
+            let want = want.max(REREAD_CHUNK as usize);
+            let mut bytes = vec![0u8; want];
+            let mut filled = 0;
+            if let Some(handle) = handle {
+                while filled < want {
+                    match handle.read_at(
+                        &mut bytes[filled..],
+                        current.start + (offset + filled) as u64,
+                    ) {
+                        Ok(0) => break,
+                        Ok(read) => filled += read,
+                        // patchcov: coverage tolerate reason="untestable: a read that fails after the file opened"
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(_) => {
+                            self.failed = true;
+                            break;
+                        } // patchcov: coverage end
+                    }
+                }
+            }
+            bytes.truncate(filled);
+            let end = filled < want;
+            self.chunk = Some((file, offset, bytes, end));
+        }
+        match &self.chunk {
+            Some((at, start, bytes, end)) if *at == file && !self.failed => {
+                super::reader_model::Held {
+                    bytes: &bytes[offset - start..],
+                    to_end: *end,
+                }
+            }
+            _ => super::reader_model::Held {
+                bytes: &[],
+                to_end: true,
+            },
+        }
+    }
+}
+
 impl Reread {
     pub(super) fn new(file: &File, start: u64, len: u64, path: PathBuf) -> io::Result<Self> {
         Ok(Self {
@@ -3714,6 +3992,71 @@ impl Reread {
     /// jq's parse error for the stream, and the file it lies in ([`Self::fault_source`]).
     #[cfg(unix)]
     fn read_fault(&self) -> (Option<String>, Option<usize>) {
+        // #7987 step 7: jq's reader model reads the files again, a read at a time, from the stream's
+        // start to its first fault, in place of the parser imitation below. `--seq` is step 8's.
+        if super::reader_model::enabled() && !self.blank_rs.get() {
+            return self.read_fault_by_model();
+        }
+        self.read_fault_by_imitation()
+    }
+
+    /// [`Self::read_fault`] by jq's reader model (ADR-0033): a [`Session`] from the stream's start
+    /// over the files read again by position ([`RereadSource`]), which holds one chunk of one file at
+    /// a time, so the memory is a chunk whatever the stream's length. The model reads the mark
+    /// itself, so a mark that is not whole is jq's `Malformed BOM` (#5804 retired on the windowed
+    /// routes), and it counts every position over the bytes as read.
+    ///
+    /// [`Session`]: super::reader_model::Session
+    #[cfg(unix)]
+    #[inline(never)]
+    // `reads` is drained, not consumed: the buffer is the next step's.
+    #[allow(clippy::iter_with_drain)]
+    fn read_fault_by_model(&self) -> (Option<String>, Option<usize>) {
+        use super::reader_model::{Item, ReadMode, ReaderState, Session, Stop};
+        use succinctly::jq::jv_parse::FaultPlace;
+        const NON_SEQ: ReadMode = ReadMode { seq: false };
+        let profile = &crate::cli::jq_reader_profile::JQ_READER;
+        let mut source = RereadModelSource {
+            reread: self,
+            opened: None,
+            chunk: None,
+            failed: false,
+        };
+        let mut session = Session::resume(ReaderState::start(NON_SEQ), &source, profile, NON_SEQ);
+        let mut reads = Vec::new();
+        loop {
+            let stop = session.step(&mut source, &mut reads);
+            if source.failed {
+                return (None, None);
+            }
+            for read in reads.drain(..) {
+                match read.item {
+                    Item::Value(_) => {}
+                    Item::Fault(fault) => {
+                        // A fault at the end of the stream is past every file, as the imitation
+                        // placed it: jq's reader has opened them all.
+                        let file = match (fault.place, read.at.file) {
+                            (FaultPlace::Eof, _) | (_, None) => self.sources.len(),
+                            (_, Some(file)) => file,
+                        };
+                        return (Some(fault.message()), Some(file));
+                    }
+                    Item::End => return (None, None),
+                }
+            }
+            if stop != Stop::Synced {
+                // patchcov: coverage tolerate reason="unreachable: a stuck reader ends on its fault, returned above, and the files read again hold every read"
+                return (None, None);
+                // patchcov: coverage end
+            }
+        }
+    }
+
+    /// [`Self::read_fault`] by the parser imitation (`jq_stream_fault`), the decider the model
+    /// replaces, kept for `SUCCINCTLY_READER_MODEL=0` and `--seq` (ADR-0033: two readers until step
+    /// 10).
+    #[cfg(unix)]
+    fn read_fault_by_imitation(&self) -> (Option<String>, Option<usize>) {
         use std::os::unix::fs::FileExt;
         // The file of the last chunk handed to the parser, and whether the files ran out.
         let last_source = std::cell::Cell::new(0usize);
