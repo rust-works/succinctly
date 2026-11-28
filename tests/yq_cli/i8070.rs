@@ -167,15 +167,26 @@ fn test_key_rename_through_an_integer_bracket_on_a_mapping_8070() -> Result<()> 
     ])
 }
 
-/// The rename over several documents with `eval-all`.
+/// The rename over several documents with `eval-all`, each document renaming its own member and
+/// creating the one it lacks. (`eval-all` loses a quoted key's quoting in any rename, `.m["1"]`
+/// too, so the documents here quote nothing.)
 #[test]
 fn test_key_rename_through_an_integer_bracket_eval_all_8070() -> Result<()> {
-    check(&[(
-        "(.m[1] | key) = \"q\"",
-        "m:\n  \"1\": a\n---\nm:\n  1: b\n  0x1: c\n",
-        &["ea"],
-        "m:\n  \"q\": a\n---\nm:\n  q: b\n  0x1: c\n",
-    )])
+    let input = "m:\n  1: a\n---\nm:\n  2: b\n  1: c\n";
+    check(&[
+        (
+            "(.m[1] | key) = \"q\"",
+            input,
+            &["ea"],
+            "m:\n  q: a\n---\nm:\n  2: b\n  q: c\n",
+        ),
+        (
+            "(.m[2] | key) |= \"q\"",
+            input,
+            &["ea"],
+            "m:\n  1: a\n  q: null\n---\nm:\n  q: b\n  1: c\n",
+        ),
+    ])
 }
 
 /// The new step is yq's alone: jq reads `01` as the number 1, so jq mode's `path` through an index

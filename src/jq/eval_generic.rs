@@ -37514,7 +37514,7 @@ fn path_context_step_spelled_key<S: EvalSemantics, V: DocumentValue>(
         return None;
     };
     let text: &str = text;
-    if text == idx.to_string() {
+    if is_decimal_spelling(text, *idx) {
         return None;
     }
     let present = match &tpos.node {
@@ -37547,6 +37547,19 @@ fn path_context_step_spelled_key<S: EvalSemantics, V: DocumentValue>(
         step
     };
     Some(path_context_step_generic::<S, V>(&step, tpos, out))
+}
+
+/// Whether `text` is `idx` written in decimal (`idx.to_string()`), decided without allocating:
+/// an optional `-`, then digits with no leading zero, and not `-0`.
+fn is_decimal_spelling(text: &str, idx: i64) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    let canonical = match digits.as_bytes() {
+        [] => false,
+        [b'0'] => digits.len() == text.len(),
+        [b'0', ..] => false,
+        bytes => bytes.iter().all(u8::is_ascii_digit),
+    };
+    canonical && text.parse::<i64>() == Ok(idx)
 }
 
 /// The literal navigation step that takes `component`, or `None` for a value
@@ -48953,6 +48966,31 @@ mod tests {
     use super::super::expr::{CompareOp, FormatType, Literal};
     use super::super::value::NumberRepr;
     use super::*;
+
+    /// #8070: `is_decimal_spelling` is `text == idx.to_string()` without the allocation.
+    #[test]
+    fn decimal_spelling_is_the_integer_rendering_8070() {
+        for (text, idx) in [("0", 0), ("1", 1), ("-1", -1), ("42", 42), ("-907", -907)] {
+            assert!(is_decimal_spelling(text, idx), "{text}");
+            assert_eq!(text, idx.to_string());
+        }
+        for (text, idx) in [
+            ("-0", 0),
+            ("01", 1),
+            ("00", 0),
+            ("-01", -1),
+            ("0x1", 1),
+            ("0X1", 1),
+            ("+1", 1),
+            ("", 0),
+            ("-", 0),
+            ("2", 1),
+            ("1_0", 10),
+        ] {
+            assert!(!is_decimal_spelling(text, idx), "{text}");
+            assert_ne!(text, idx.to_string());
+        }
+    }
 
     /// #2661: the public value-only entry point has no cursor, so `..`
     /// reaches the full-evaluator bridge rather than the native cursor walk.
