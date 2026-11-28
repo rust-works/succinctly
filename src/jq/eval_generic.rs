@@ -12364,18 +12364,6 @@ mod path_base {
         f()
     }
 
-    /// Removes the prefix and the ancestry for `f`'s dynamic extent, restoring both on the way out.
-    pub(crate) fn cleared<R>(f: impl FnOnce() -> R) -> R {
-        struct Restore(Option<Rc<Vec<OwnedValue>>>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                CURRENT.with(|c| *c.borrow_mut() = self.0.take());
-            }
-        }
-        let _restore = Restore(CURRENT.with(|c| c.borrow_mut().take()));
-        with_ancestry(None, f)
-    }
-
     thread_local! {
         static ANCESTRY: RefCell<Option<Rc<UpdateAncestry>>> = const { RefCell::new(None) };
     }
@@ -12416,10 +12404,6 @@ mod path_base {
         f()
     }
 
-    pub(crate) fn cleared<R>(f: impl FnOnce() -> R) -> R {
-        f()
-    }
-
     pub(crate) fn ancestry() -> Option<Rc<UpdateAncestry>> {
         None
     }
@@ -12444,12 +12428,13 @@ pub(crate) struct UpdateAncestry {
     pub(crate) outer: Option<Rc<Self>>,
 }
 
-/// Run `f` with no ambient prefix and no [`UpdateAncestry`] (#8039): an update whose input is a
-/// value yq builds with no position ([`OwnedIdentity::is_unplaced`]), such as the `5` of
-/// `.a |= (.b |= (5 | . |= key))`, stands nowhere, and the prefix an enclosing update installed
-/// describes that update's target, not it.
-pub(crate) fn without_update_base<R>(f: impl FnOnce() -> R) -> R {
-    path_base::cleared(f)
+/// Install `path` as the absolute prefix for `f`, with no [`UpdateAncestry`] (#8039): an update
+/// whose input is a value yq builds with no position, or a node inside one
+/// ([`OwnedIdentity::is_unplaced`]), stands at that value's own path and nowhere in the document.
+/// `.a |= (.b |= (5 | . |= path))` is `[]` and `{} | .k | . |= path` is `["k"]`, where composing
+/// the prefix an enclosing update installed would have put the document's target in front.
+pub(crate) fn with_unplaced_update_base<R>(path: Vec<OwnedValue>, f: impl FnOnce() -> R) -> R {
+    path_base::with(Rc::new(path), || path_base::with_ancestry(None, f))
 }
 
 /// The ambient [`UpdateAncestry`], if an enclosing update installed one (#8039).
@@ -44050,8 +44035,9 @@ const META_HEAD_FOOT: u8 = 1 << 4;
 const META_CHILD: u8 = 1 << 5;
 /// Not metadata of the node but its absence (#8039): the value is one yq builds with no position
 /// of its own (a literal, `map`, `keys`, a constructor, `now`), which an owned identity rule
-/// detached, and every value derived from it. A `|=` it reaches stands at no position, so the
-/// prefix an enclosing update installed must not reach it ([`OwnedIdentity::is_unplaced`]); a
+/// detached, and every value derived from it. A `|=` it reaches stands at that value's own path
+/// (`{} | .k | . |= path` is `["k"]`), so the prefix an enclosing update installed must not reach
+/// it ([`OwnedIdentity::is_unplaced`]); a
 /// plain [`OwnedIdentity::detached`] root of an owned pipe, which stands where that prefix says,
 /// does not carry it. Outside [`META_ALL`], so no reader of the node's metadata sees it.
 const META_UNPLACED: u8 = 1 << 6;
@@ -48654,15 +48640,15 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
                             emit,
                         )
                     };
-                    // #8039: a value yq builds with no position (`5 | . |= path` is `[]`) gives the
-                    // update none, rather than the ambient prefix an enclosing update installed.
-                    if S::TAG == EvalTag::Yq && id.is_unplaced() {
-                        without_update_base(|| run(&mut emit))
-                    } else {
-                        match id.path() {
-                            Ok(path) => with_path_base(&path, || run(&mut emit)),
-                            Err(e) => Flow::Escaped(Control::Error(e)),
+                    // #8039: a value yq builds with no position (`5 | . |= path` is `[]`), or a
+                    // node inside one, stands at its own path, not under the ambient prefix an
+                    // enclosing update installed.
+                    match id.path() {
+                        Ok(path) if S::TAG == EvalTag::Yq && id.is_unplaced() => {
+                            with_unplaced_update_base(path, || run(&mut emit))
                         }
+                        Ok(path) => with_path_base(&path, || run(&mut emit)),
+                        Err(e) => Flow::Escaped(Control::Error(e)),
                     }
                 }
                 None => eval_each_owned::<S>(
