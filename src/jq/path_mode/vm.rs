@@ -161,13 +161,13 @@ struct Meter;
 
 #[cfg(not(feature = "std"))]
 impl Meter {
-    fn begin() -> Self {
+    fn begin(_budget: usize) -> Self {
         Self
     }
 
     #[inline(always)]
-    fn held(&self) -> isize {
-        0
+    fn room(&self) -> isize {
+        isize::MAX
     }
 }
 
@@ -698,7 +698,7 @@ impl<'c, 'e> Vm<'c, 'e> {
     /// document, or new).
     fn with_spare(it: &'c Interp<'e>, code: &'e Code, limits: Limits, spare: Spare) -> Self {
         // Counting starts before the machine allocates anything of its own.
-        let meter = Meter::begin();
+        let meter = Meter::begin(limits.heap);
         Self {
             it,
             code,
@@ -742,7 +742,7 @@ impl<'c, 'e> Vm<'c, 'e> {
     /// The heap bytes [`Limits::heap`] has left, below zero past it.
     #[inline(always)]
     fn heap_room(&self) -> isize {
-        (self.limits.heap as isize).saturating_sub(self.meter.held())
+        self.meter.room()
     }
 
     /// The heap budget's check: a refusal naming the innermost definition once what the run holds
@@ -1446,7 +1446,6 @@ impl<'c, 'e> Vm<'c, 'e> {
         };
         let env = Env::over_slots(&view);
         let meter = &self.meter;
-        let heap = self.limits.heap as isize;
         let mut first = None;
         let mut rest = Vec::new();
         let mut full = false;
@@ -1457,9 +1456,7 @@ impl<'c, 'e> Vm<'c, 'e> {
                     first = Some(v);
                 } else {
                     // Grown fallibly within the heap budget, as an accumulator is.
-                    if rest.len() == rest.capacity()
-                        && reserve(&mut rest, heap.saturating_sub(meter.held())).is_err()
-                    {
+                    if rest.len() == rest.capacity() && reserve(&mut rest, meter.room()).is_err() {
                         full = true;
                         return Err(Raise::Stop);
                     }

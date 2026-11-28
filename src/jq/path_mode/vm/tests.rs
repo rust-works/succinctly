@@ -1422,7 +1422,7 @@ fn a_growth_is_held_to_the_heap_room_8064() {
 #[cfg(feature = "std")]
 #[test]
 fn the_meter_counts_what_a_run_holds_once_8064() {
-    let meter = Meter::begin();
+    let meter = Meter::begin(usize::MAX);
     let before = meter.held();
     let block = alloc::rc::Rc::new(vec![0u8; 1 << 20]);
     let grew = meter.held() - before;
@@ -1433,7 +1433,7 @@ fn the_meter_counts_what_a_run_holds_once_8064() {
         with_shares - grew < 64 * 1024,
         "a thousand handles on one block: {with_shares}"
     );
-    let inner = Meter::begin();
+    let inner = Meter::begin(usize::MAX);
     assert_eq!(
         inner.held(),
         meter.held(),

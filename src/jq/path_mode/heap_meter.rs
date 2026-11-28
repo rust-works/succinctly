@@ -150,12 +150,15 @@ pub(super) struct Meter {
     /// This thread's [`LIVE`].
     live: *const Cell<isize>,
     /// [`LIVE`] when the thread's outermost run started.
+    #[cfg(test)]
     base: isize,
+    /// The [`LIVE`] past which the run is over its budget: `base` plus the budget.
+    top: isize,
 }
 
 impl Meter {
-    /// Start counting this thread's allocations for a run.
-    pub(super) fn begin() -> Self {
+    /// Start counting this thread's allocations for a run whose budget is `budget` bytes.
+    pub(super) fn begin(budget: usize) -> Self {
         RUNS.fetch_add(1, Ordering::Relaxed);
         let live: *const Cell<isize> = LIVE.with(core::ptr::from_ref);
         // SAFETY: `live` is this thread's `LIVE`, which lives as long as the thread.
@@ -166,17 +169,36 @@ impl Meter {
             outer.set((base, depth + 1));
             base
         });
-        Self { live, base }
+        let top = base.saturating_add(isize::try_from(budget).unwrap_or(isize::MAX));
+        Self {
+            live,
+            #[cfg(test)]
+            base,
+            top,
+        }
+    }
+
+    /// This thread's count now.
+    #[inline(always)]
+    fn live(&self) -> isize {
+        // SAFETY: `live` is the `LIVE` of the thread that made this `Meter`, which is the thread
+        // reading it (`Meter` is not `Send`) and which outlives it; a `Cell` read while no
+        // reference into it is live (the allocator's writes are not reentrant with this one).
+        unsafe { (*self.live).get() }
+    }
+
+    /// The bytes the budget has left, below zero past it: one load and a subtraction, so the
+    /// machine can ask at every call, append and store.
+    #[inline(always)]
+    pub(super) fn room(&self) -> isize {
+        self.top.wrapping_sub(self.live())
     }
 
     /// The bytes this thread has allocated and not freed since its outermost run started: what
     /// the run holds. Below zero when the run freed more than it allocated (its input, say).
-    #[inline(always)]
+    #[cfg(test)]
     pub(super) fn held(&self) -> isize {
-        // SAFETY: `live` is the `LIVE` of the thread that made this `Meter`, which is the thread
-        // reading it (`Meter` is not `Send`) and which outlives it; a `Cell` read while no
-        // reference into it is live (the allocator's writes are not reentrant with this one).
-        unsafe { (*self.live).get() }.wrapping_sub(self.base)
+        self.live().wrapping_sub(self.base)
     }
 }
 
