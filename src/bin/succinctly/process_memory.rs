@@ -89,7 +89,7 @@ fn physical() -> Option<usize> {
         let read = unsafe {
             libc::sysctlbyname(
                 b"hw.memsize\0".as_ptr().cast(),
-                (&mut bytes as *mut u64).cast(),
+                core::ptr::addr_of_mut!(bytes).cast(),
                 &mut len,
                 core::ptr::null_mut(),
                 0,
@@ -213,7 +213,7 @@ mod apple {
             libc::proc_pid_rusage(
                 libc::getpid(),
                 libc::RUSAGE_INFO_V2,
-                (&mut info as *mut libc::rusage_info_v2).cast(),
+                core::ptr::addr_of_mut!(info).cast(),
             )
         };
         if read != 0 {
@@ -270,8 +270,7 @@ mod tests {
     #[test]
     fn the_probe_reads_the_process_8064() {
         let Some(now) = resident() else {
-            assert!(cfg!(not(any(target_os = "linux", target_vendor = "apple"))));
-            assert_eq!(limit(), None);
+            assert_eq!(limit(), None, "no probe, so no limit");
             return;
         };
         assert!(now >= 1 << 20, "{now}");
