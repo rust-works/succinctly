@@ -14,6 +14,8 @@ use std::sync::OnceLock;
 
 use succinctly::jq::path_mode::{self, CallMachineEvent};
 
+use crate::cli::process_memory;
+
 /// Turns the machine on for any non-empty value but `0`, as the `SUCCINCTLY_DEBUG_JQ_*` switches
 /// read theirs ([`super::window::WHOLE_FILE_ENV`]).
 const SWITCH_ENV: &str = "SUCCINCTLY_CALL_MACHINE";
@@ -36,9 +38,39 @@ fn switch_value_on(value: Option<&OsStr>) -> bool {
 pub(super) fn configure() {
     let on = switch_value_on(std::env::var_os(SWITCH_ENV).as_deref());
     path_mode::set_call_machine(on);
+    if on {
+        install_memory_bound();
+    }
     if let Some(path) = std::env::var_os(DECISION_LOG_ENV).filter(|_| on) {
         let _ = DECISION_LOG.set(PathBuf::from(path));
         path_mode::observe_call_machine(Some(note_decision));
+    }
+}
+
+/// Overrides the memory limit the machine's bound computes ([`process_memory::limit`]), in
+/// bytes, for the tests that drive the bound without filling the machine's memory.
+const MEMORY_LIMIT_ENV: &str = "SUCCINCTLY_DEBUG_CALL_MACHINE_MEMORY_LIMIT";
+
+/// Bound the machine by the memory the process holds (#8064), where it can be read: against
+/// [`MEMORY_LIMIT_ENV`] when it is set, else against [`process_memory::limit`]. Where it cannot be
+/// read nothing is installed, and the machine keeps the shipped bound on a loop's outputs.
+fn install_memory_bound() {
+    let Some(limit) = memory_limit(std::env::var_os(MEMORY_LIMIT_ENV).as_deref()) else {
+        return;
+    };
+    path_mode::set_call_machine_memory(process_memory::resident, limit);
+}
+
+/// The limit [`install_memory_bound`] installs, given [`MEMORY_LIMIT_ENV`]'s value: a number of
+/// bytes there, else the computed one; `None` where the process's memory cannot be read.
+fn memory_limit(value: Option<&OsStr>) -> Option<usize> {
+    process_memory::resident()?;
+    match value
+        .and_then(OsStr::to_str)
+        .and_then(|v| v.trim().parse().ok())
+    {
+        Some(bytes) => Some(bytes),
+        None => process_memory::limit(),
     }
 }
 

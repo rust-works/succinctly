@@ -62,7 +62,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// recorded in `docs/compliance/jq/limitations.md`. It bounds the machine's own state, not
 /// memory: what the values hold is not counted, nor are `[...]` accumulators and buffered leaf
 /// outputs, which hold values the program builds (they grow fallibly, so a failed allocation is
-/// a refusal too).
+/// a refusal too). What a run holds in all is bounded by the memory limit ([`Limits::memory`],
+/// #8064) where a caller installed a probe.
 const BUDGET: usize = 1 << 30;
 
 /// A frame's `rounds` in a `repeat` loop a consumer can stop (`limit`, `first`), which the
@@ -99,6 +100,11 @@ struct Limits {
     outputs: u32,
     /// The numbers one `range` may produce: the shipped `MAX_RANGE_TOTAL` (#5292).
     range: usize,
+    /// The process's memory and its limit, when a caller installed a probe
+    /// ([`super::set_call_machine_memory`], #8064). With one, the run is refused once the
+    /// process holds more than the limit, and no loop is refused for its outputs; without one,
+    /// the output bound above stands, so a run is never unbounded.
+    memory: Option<MemoryProbe>,
 }
 
 /// The bounds of every run, the shipped evaluators' own.
@@ -107,7 +113,90 @@ const SHIPPED: Limits = Limits {
     rounds: MAX_LOOP_ROUNDS as u32,
     outputs: MAX_LOOP_OUTPUTS as u32,
     range: MAX_RANGE_TOTAL,
+    memory: None,
 };
+
+/// How a run reads the memory the process holds, and the most it may (#8064).
+///
+/// The library reads no figure of the process itself: the CLI installs one, sampling its resident
+/// memory (`/proc/self/statm` on Linux, the physical footprint on macOS) against a limit it
+/// computes once per process from the memory available to it.
+#[derive(Clone, Copy)]
+pub(super) struct MemoryProbe {
+    /// The bytes the process holds now, `None` when they cannot be read.
+    pub(super) sample: fn() -> Option<usize>,
+    /// The most it may hold before a run is refused.
+    pub(super) limit: usize,
+}
+
+/// The probe installed for the process ([`set_memory_probe`]).
+#[cfg(feature = "std")]
+static PROBE: std::sync::OnceLock<MemoryProbe> = std::sync::OnceLock::new();
+
+/// Install `probe` for every later run of the process (the first one installed stays).
+#[cfg(feature = "std")]
+pub(super) fn set_memory_probe(probe: MemoryProbe) {
+    let _ = PROBE.set(probe);
+}
+
+/// The probe installed for the process, if any.
+fn memory_probe() -> Option<MemoryProbe> {
+    #[cfg(feature = "std")]
+    {
+        PROBE.get().copied()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        None
+    }
+}
+
+/// The fewest and the most check points between two samples of the process's memory.
+const MIN_INTERVAL: u32 = 16;
+const MAX_INTERVAL: u32 = 1 << 16;
+
+/// When a run next samples the process's memory (#8064): every `interval` check points (a call,
+/// an append, a store, a leaf, an operator that builds a container or a string), the
+/// interval set at each sample so that, at the growth per check point seen since the last one,
+/// the next sample comes when at most half the room left is spent. A fast-growing run is so
+/// sampled more often as it nears the limit, and a run far from it rarely. Kept between the
+/// documents of a run ([`Spare`]), as the process's memory is one figure across them.
+#[derive(Clone, Copy)]
+struct Sampler {
+    /// Check points left before the next sample.
+    left: u32,
+    /// Check points between the last sample and the next.
+    interval: u32,
+    /// The bytes the last sample read, 0 before the first.
+    last: usize,
+}
+
+impl Default for Sampler {
+    fn default() -> Self {
+        Self {
+            left: MIN_INTERVAL,
+            interval: MIN_INTERVAL,
+            last: 0,
+        }
+    }
+}
+
+impl Sampler {
+    /// The check points until the next sample after reading `now` bytes against `limit`, with
+    /// `interval` check points since the reading `last` (0: none).
+    fn next_interval(last: usize, now: usize, interval: u32, limit: usize) -> u32 {
+        let room = limit.saturating_sub(now);
+        if last == 0 {
+            return MIN_INTERVAL;
+        }
+        let per_check = now.saturating_sub(last) / interval.max(1) as usize;
+        if per_check == 0 {
+            return MAX_INTERVAL;
+        }
+        let checks = room / 2 / per_check;
+        checks.clamp(MIN_INTERVAL as usize, MAX_INTERVAL as usize) as u32
+    }
+}
 
 /// No return address: the main program's frame, whose `RET` is an output.
 const NO_RET: u32 = u32::MAX;
@@ -417,6 +506,11 @@ struct Vm<'c, 'e> {
     /// A call's arguments on their way into the callee's slots, kept between calls.
     scratch: Vec<Slot>,
     limits: Limits,
+    /// When the run next samples the process's memory ([`Limits::memory`]).
+    sampler: Sampler,
+    /// Whether a growth was refused for want of memory ([`Vm::growth_fits`]): the refusal is then
+    /// the memory bound's, not the budget's.
+    memory_over: bool,
     /// The instructions run, for the tests that pin how work scales.
     #[cfg(test)]
     steps: u64,
@@ -443,11 +537,16 @@ fn grow<T>(v: &mut Vec<T>, cap: &mut usize, used: usize, budget: usize) -> Resul
         return Err(());
     }
     if v.capacity() < want {
-        v.try_reserve_exact(want - v.len()).map_err(|_| ())?;
+        move_to_capacity(v, want)?;
     }
     let grew = (want - *cap) * size;
     *cap = want;
     Ok(grew)
+}
+
+/// The bytes `v`'s allocation holds.
+fn bytes_of<T>(v: &Vec<T>) -> usize {
+    v.capacity().saturating_mul(core::mem::size_of::<T>())
 }
 
 /// Make room for one more value in an accumulator, fallibly: values the program builds are not
@@ -455,7 +554,31 @@ fn grow<T>(v: &mut Vec<T>, cap: &mut usize, used: usize, budget: usize) -> Resul
 #[cold]
 #[inline(never)]
 fn reserve<T>(items: &mut Vec<T>) -> Result<(), ()> {
-    items.try_reserve(1).map_err(|_| ())
+    let want = items.capacity().saturating_mul(2).max(4);
+    move_to_capacity(items, want)
+}
+
+/// Give `v` room for `want` elements, fallibly.
+///
+/// On macOS not by `realloc`: a large `realloc` there maps the old pages into the new block
+/// lazily, and the process's footprint does not count them until they are next read, so the
+/// memory bound read too little while the machine's own stacks and accumulators grew, and the run
+/// passed its limit by up to a fifth when the refusal's unwinding read them (#8064). Moving the
+/// elements into a new block writes them, so the footprint counts what the vector holds as soon as
+/// it holds it; the copy costs a page fault per page the old block held, once per doubling. On
+/// Linux a large `realloc` moves the pages (`mremap`), and the resident set counts them as it
+/// moves them, so the vector is grown in place.
+fn move_to_capacity<T>(v: &mut Vec<T>, want: usize) -> Result<(), ()> {
+    if cfg!(target_vendor = "apple") {
+        let mut grown = Vec::new();
+        grown.try_reserve_exact(want).map_err(|_| ())?;
+        grown.append(v);
+        *v = grown;
+        Ok(())
+    } else {
+        v.try_reserve_exact(want.saturating_sub(v.len()))
+            .map_err(|_| ())
+    }
 }
 
 /// The refusal past [`BUDGET`] or [`Limits::rounds`]: succinctly's own recursion-limit wording
@@ -465,6 +588,16 @@ fn refusal(name: &str, arity: usize) -> Raise {
         name.strip_prefix("_sp_").unwrap_or(name),
         arity,
     ))
+}
+
+/// The refusal of a run whose process holds more than its memory limit (#8064): its own wording,
+/// naming the definition (`f/0: memory limit exceeded`), as nothing need recurse to reach it.
+fn memory_refusal(name: &str, arity: usize) -> Raise {
+    let name = name.strip_prefix("_sp_").unwrap_or(name);
+    Raise::Fatal(EvalError::resource_limit(format!(
+        "{}/{arity}: memory limit exceeded",
+        super::super::resolve::ModuleRun::display_name(name),
+    )))
 }
 
 /// The refusal of a zero-argument `def`'s tail loop past [`Limits::outputs`]: the shipped tail
@@ -587,7 +720,11 @@ pub(super) fn run<'e>(
     input: OwnedValue,
     on_value: &mut dyn FnMut(OwnedValue) -> bool,
 ) -> R {
-    run_within(SHIPPED, it, program, input, on_value)
+    let limits = Limits {
+        memory: memory_probe(),
+        ..SHIPPED
+    };
+    run_within(limits, it, program, input, on_value)
 }
 
 /// [`run`] within `limits`.
@@ -619,6 +756,8 @@ pub(super) struct Spare {
     slots: Vec<Slot>,
     forks: Vec<Fork>,
     scratch: Vec<Slot>,
+    /// When the next document's run samples the process's memory.
+    sampler: Sampler,
 }
 
 /// The most a kept vector holds on to between documents, so that a document that grew its
@@ -655,6 +794,8 @@ impl<'c, 'e> Vm<'c, 'e> {
             forks_cap: 0,
             scratch: spare.scratch,
             limits,
+            sampler: spare.sampler,
+            memory_over: false,
             #[cfg(test)]
             steps: 0,
             #[cfg(test)]
@@ -671,7 +812,76 @@ impl<'c, 'e> Vm<'c, 'e> {
             slots: keep(self.slots),
             forks: keep(self.forks),
             scratch: keep(self.scratch),
+            sampler: self.sampler,
         }
+    }
+
+    /// A check point of the memory bound (#8064): one in every [`Sampler::interval`] samples the
+    /// process's memory against [`Limits::memory`]'s limit. Asked at every call (a tail jump
+    /// included), append and store, after every leaf, and after an operator or `setpath` that
+    /// builds a container or a string: wherever the run can come to hold more.
+    #[inline(always)]
+    fn check_memory(&mut self) -> Result<(), Raise> {
+        self.sampler.left -= 1;
+        if self.sampler.left == 0 {
+            return self.sample_memory();
+        }
+        Ok(())
+    }
+
+    /// [`Vm::check_memory`] for `v`, a value just built, when it can hold heap of its own.
+    #[inline(always)]
+    fn check_built(&mut self, v: &OwnedValue) -> Result<(), Raise> {
+        match v {
+            OwnedValue::Array(_) | OwnedValue::Object(_) | OwnedValue::String(_) => {
+                self.check_memory()
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Read the process's memory, refuse past the limit, and set when to read it next. Without
+    /// a probe no check point samples at all: the count is set as far off as it goes.
+    #[cold]
+    #[inline(never)]
+    fn sample_memory(&mut self) -> Result<(), Raise> {
+        let Some(probe) = self.limits.memory else {
+            self.sampler.left = u32::MAX;
+            return Ok(());
+        };
+        let Some(now) = (probe.sample)() else {
+            self.sampler.left = MAX_INTERVAL;
+            return Ok(());
+        };
+        if now > probe.limit {
+            return Err(self.memory_refusal());
+        }
+        let s = &mut self.sampler;
+        let next = Sampler::next_interval(s.last, now, s.interval, probe.limit);
+        *s = Sampler {
+            left: next,
+            interval: next,
+            last: now,
+        };
+        Ok(())
+    }
+
+    /// [`memory_refusal`] naming the innermost user definition on the call chain, or none.
+    #[cold]
+    #[inline(never)]
+    fn memory_refusal(&self) -> Raise {
+        let mut f = self.frames.index;
+        while f >= 0 {
+            let fr = self.frames.data[f as usize].value;
+            let func = &self.code.funcs[fr.func as usize];
+            if !func.name.is_empty() && !func.prelude {
+                return memory_refusal(&func.name, func.arity);
+            }
+            f = self.frames.data[f as usize].next as isize;
+        }
+        Raise::Fatal(EvalError::resource_limit(String::from(
+            "memory limit exceeded",
+        )))
     }
 
     /// The bytes the control state holds, for [`BUDGET`]: the stacks, slots and fork points by
@@ -696,6 +906,9 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[cold]
     #[inline(never)]
     fn grow_data(&mut self) -> Result<(), Raise> {
+        if !self.growth_fits(bytes_of(&self.data.data), false) {
+            return Err(self.current_def());
+        }
         let used = self.bytes();
         grow(
             &mut self.data.data,
@@ -710,6 +923,9 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[cold]
     #[inline(never)]
     fn grow_frames(&mut self) -> Result<(), ()> {
+        if !self.growth_fits(bytes_of(&self.frames.data), false) {
+            return Err(());
+        }
         let used = self.bytes();
         grow(
             &mut self.frames.data,
@@ -724,6 +940,9 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[inline(never)]
     fn grow_slots(&mut self, room: usize) -> Result<(), ()> {
         while self.slots_cap - self.slots.len() < room {
+            if !self.growth_fits(bytes_of(&self.slots), false) {
+                return Err(());
+            }
             let used = self.bytes();
             grow(
                 &mut self.slots,
@@ -756,6 +975,7 @@ impl<'c, 'e> Vm<'c, 'e> {
     /// `APPEND` into the accumulator in slot `at`, growing it fallibly.
     #[inline(always)]
     fn append(&mut self, at: usize, value: OwnedValue) -> Result<(), Raise> {
+        self.check_memory()?;
         let Slot::Acc(items) = &mut self.slots[at] else {
             return Ok(());
         };
@@ -763,6 +983,13 @@ impl<'c, 'e> Vm<'c, 'e> {
             items.push(value);
             return Ok(());
         }
+        let old = bytes_of(items);
+        if !self.growth_fits(old, true) {
+            return Err(self.current_def());
+        }
+        let Slot::Acc(items) = &mut self.slots[at] else {
+            return Ok(());
+        };
         if reserve(items).is_err() {
             return Err(self.current_def());
         }
@@ -770,9 +997,37 @@ impl<'c, 'e> Vm<'c, 'e> {
         Ok(())
     }
 
+    /// Whether the process has room, under [`Limits::memory`]'s limit, for a vector of `old`
+    /// bytes to grow: its elements are moved into the new block while the old one is still held,
+    /// so for that moment the process holds `old` bytes more (#8064). Asked of every growth of a
+    /// stack or an accumulator, which is rare and moves the process's memory by more than any one
+    /// check point does. An accumulator's refusal is the memory bound's (`memory`), with its
+    /// wording; a control stack's is a deep recursion's, with the recursion wording, as past the
+    /// control-state budget, unless the process was past the limit before the stack grew.
+    #[cold]
+    #[inline(never)]
+    fn growth_fits(&mut self, old: usize, memory: bool) -> bool {
+        let Some(probe) = self.limits.memory else {
+            return true;
+        };
+        let Some(now) = (probe.sample)() else {
+            return true;
+        };
+        if now.saturating_add(old) <= probe.limit {
+            return true;
+        }
+        // A stack's growth is a deep recursion's only when its own old block is what does not
+        // fit; a process already past the limit (a large input, say) is the memory bound's.
+        self.memory_over = memory || now > probe.limit;
+        false
+    }
+
     #[cold]
     #[inline(never)]
     fn grow_forks(&mut self) -> Result<(), Raise> {
+        if !self.growth_fits(bytes_of(&self.forks), false) {
+            return Err(self.current_def());
+        }
         let used = self.bytes();
         grow(
             &mut self.forks,
@@ -828,6 +1083,9 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[cold]
     #[inline(never)]
     fn current_def(&self) -> Raise {
+        if self.memory_over {
+            return self.memory_refusal();
+        }
         let mut f = self.frames.index;
         while f >= 0 {
             let fr = self.frames.data[f as usize].value;
@@ -1116,6 +1374,8 @@ impl<'c, 'e> Vm<'c, 'e> {
             Insn::Store(s) => {
                 let v = self.data.pop();
                 *self.slot(0, *s) = Slot::Val(v);
+                // A binding, or a `reduce`'s or `foreach`'s state, is held from here on.
+                self.check_memory()?;
             }
             Insn::Load(level, idx) => {
                 self.data.pop();
@@ -1168,7 +1428,9 @@ impl<'c, 'e> Vm<'c, 'e> {
             Insn::Bin(op) => {
                 let l = self.data.pop();
                 let r = self.data.pop();
-                self.push(combine(*op, &l, &r).map_err(raise_eval)?)?;
+                let v = combine(*op, &l, &r).map_err(raise_eval)?;
+                self.check_built(&v)?;
+                self.push(v)?;
             }
             Insn::Cmp(op) => {
                 let l = self.data.pop();
@@ -1180,7 +1442,9 @@ impl<'c, 'e> Vm<'c, 'e> {
             Insn::BinK(op, k) => {
                 let l = self.data.pop();
                 let r = &code.consts[*k as usize];
-                self.push(combine(*op, &l, r).map_err(raise_eval)?)?;
+                let v = combine(*op, &l, r).map_err(raise_eval)?;
+                self.check_built(&v)?;
+                self.push(v)?;
             }
             Insn::CmpK(op, k) => {
                 let l = self.data.pop();
@@ -1247,6 +1511,7 @@ impl<'c, 'e> Vm<'c, 'e> {
                         out.ok_or_else(|| unsupported("setpath answered nothing"))?
                     }
                 };
+                self.check_built(&written)?;
                 self.push(written)?;
             }
             Insn::Call { callee, args, tail } => return self.call(pc, *callee, args, *tail),
@@ -1311,6 +1576,13 @@ impl<'c, 'e> Vm<'c, 'e> {
             if entry.loop_name == Some("repeat") {
                 return Err(Raise::Fatal(iterations_refusal("repeat")));
             }
+            if self.limits.memory.is_some() {
+                // With a memory probe no loop is refused for its outputs (#8064): what a
+                // collector holds is the memory bound's. The count starts again, so this path is
+                // taken once per `Limits::outputs` outputs.
+                counts.emitted = 0;
+                return Ok(());
+            }
             if counts.taken() >= OUTPUT_BUDGET_AFTER_ROUNDS as u32 && entry.bounds_outputs() {
                 return Err(loop_outputs_refusal(&entry.name));
             }
@@ -1361,6 +1633,8 @@ impl<'c, 'e> Vm<'c, 'e> {
                 Err(raise) => Err(raise),
             };
         };
+        // What the leaf built is held from here on.
+        self.check_memory()?;
         if !rest.is_empty() || end.is_err() {
             self.fork(Kind::Values {
                 vals: rest.into_iter(),
@@ -1407,6 +1681,7 @@ impl<'c, 'e> Vm<'c, 'e> {
         if !self.room_for_call(f.nslots as usize) {
             return Err(self.call_refusal(func));
         }
+        self.check_memory()?;
         let caller = self.frames.data[cur as usize].value;
         let counts = if tail == Tail::No && f.loop_name.is_none() {
             Counts::fresh(func)
@@ -1509,6 +1784,7 @@ impl<'c, 'e> Vm<'c, 'e> {
         if !self.room_for_call(nslots) {
             return Err(self.call_refusal(func));
         }
+        self.check_memory()?;
         let top = self.frames.index as usize;
         let fr = self.frames.data[top].value;
         debug_assert_eq!(
@@ -1649,6 +1925,9 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[cold]
     #[inline(never)]
     fn call_refusal(&self, func: u32) -> Raise {
+        if self.memory_over {
+            return self.memory_refusal();
+        }
         let f = &self.code.funcs[func as usize];
         if f.name.is_empty() || f.prelude {
             self.current_def()

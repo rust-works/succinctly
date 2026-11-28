@@ -1604,6 +1604,19 @@ pub fn set_call_machine(on: bool) {
     vm::set_switched_on(on);
 }
 
+/// Bound the call machine (#8064) by the memory the process holds: `sample` answers the bytes it
+/// holds now (`None` when they cannot be read), and a run is refused once they pass `limit`. The
+/// first probe installed stays for the process. The library reads no figure of the process
+/// itself; `succinctly jq` installs one sampling its resident memory, against a limit computed
+/// once from the memory available to it. Without a probe the machine keeps the shipped tail
+/// loop's bound on a loop's outputs (`MAX_LOOP_OUTPUTS`), so it is never unbounded; with one, no
+/// loop is refused for its outputs.
+#[doc(hidden)]
+#[cfg(feature = "std")]
+pub fn set_call_machine_memory(sample: fn() -> Option<usize>, limit: usize) {
+    vm::set_memory_probe(vm::MemoryProbe { sample, limit });
+}
+
 /// What [`observe_call_machine`]'s observer is told of (#7977).
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

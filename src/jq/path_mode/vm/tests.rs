@@ -1065,6 +1065,7 @@ fn small(bytes: usize, rounds: u32, outputs: u32) -> Limits {
         rounds,
         outputs,
         range: MAX_RANGE_TOTAL,
+        memory: None,
     }
 }
 
@@ -2164,6 +2165,160 @@ fn leaf_program() -> impl Strategy<Value = String> {
             let body = w.replace('G', g);
             format!("def f($n): if $n <= 0 then . else [{input} | {body}] end; [{input} | f(2)]")
         })
+}
+
+std::thread_local! {
+    /// What [`fake_memory`] answers on this thread, and how many times it was asked.
+    static FAKE_MEMORY: core::cell::Cell<(usize, usize, u32)> = const { core::cell::Cell::new((0, 0, 0)) };
+}
+
+/// A memory probe for the tests (#8064): answers the bytes set for this thread, growing by the
+/// step set with them at each sample, and counts how often it is asked.
+fn fake_memory() -> Option<usize> {
+    FAKE_MEMORY.with(|cell| {
+        let (bytes, step, asked) = cell.get();
+        cell.set((bytes + step, step, asked + 1));
+        Some(bytes)
+    })
+}
+
+/// `limits` with [`fake_memory`] as the probe against `limit`, starting at `bytes` and growing
+/// by `step` a sample.
+fn probed(limits: Limits, limit: usize, bytes: usize, step: usize) -> Limits {
+    FAKE_MEMORY.with(|cell| cell.set((bytes, step, 0)));
+    Limits {
+        memory: Some(MemoryProbe {
+            sample: fake_memory,
+            limit,
+        }),
+        ..limits
+    }
+}
+
+/// How many times [`fake_memory`] was asked since [`probed`].
+fn samples() -> u32 {
+    FAKE_MEMORY.with(|cell| cell.get().2)
+}
+
+/// A run whose process holds more than the limit is refused, uncatchably, whatever the program
+/// does: a collector, a fold's state, a recursion that collects nothing (#8064). It is refused
+/// with the memory bound's own wording at a check point or an accumulator's growth, and with the
+/// recursion wording at a control stack's growth, which can come first: a run that cannot grow
+/// its stacks is too deep for its memory. A run too short to reach a sample (fewer check points
+/// than the first interval) holds too little to matter and is not sampled.
+#[test]
+fn past_the_memory_limit_a_run_is_refused_8064() {
+    for filter in [
+        "[def f: ., (. + 1 | f); 0 | f] | length",
+        "reduce (def f: ., (. + 1 | f); 0 | f) as $x (null; [$x, .]) | length",
+        "def f: [range(10)] as $a | f, ($a | length); f | empty",
+        r#"[try (def f: ., (. + 1 | f); 0 | f) catch "caught"]"#,
+    ] {
+        let answer = machine_within(probed(SHIPPED, 1 << 20, 2 << 20, 0), filter);
+        assert!(answer.outputs.is_empty(), "{filter}: {answer:?}");
+        let error = answer.error.unwrap_or_default();
+        assert!(
+            [
+                "f/0: memory limit exceeded",
+                "memory limit exceeded",
+                "f/0 exceeded maximum recursion depth",
+                "exceeded maximum recursion depth",
+            ]
+            .contains(&error.as_str()),
+            "{filter}: {error}"
+        );
+    }
+    // A collector whose stacks need not grow is refused at a check point, with the memory
+    // wording: one round's frames fit in the stacks a first call grows to.
+    let answer = machine_within(
+        probed(SHIPPED, 1 << 20, 2 << 20, 0),
+        "def f($n): if $n < 100 then [range(20)] as $a | f($n + 1) else $n end; f(0)",
+    );
+    assert!(
+        answer
+            .error
+            .as_deref()
+            .is_some_and(|e| e.ends_with("memory limit exceeded")),
+        "{answer:?}"
+    );
+}
+
+/// With a probe no loop is refused for its outputs: past the shipped output bound a loop answers
+/// as jq 1.7.1 answers it, and one that never ends meets its rounds; without one (a library
+/// caller that installs none), the shipped bound stands, so no run is unbounded (#8064).
+#[test]
+fn a_probe_lifts_the_output_bound_8064() {
+    let limits = small(BUDGET, 1000, 100);
+    let filter = "[def f: if . < 900 then ., (. + 1 | f) else empty end; 0 | f] | length";
+    assert_eq!(
+        machine_within(probed(limits, usize::MAX, 1 << 20, 0), filter),
+        ok(&["900"])
+    );
+    assert_eq!(
+        machine_within(limits, filter),
+        refused(0, "f/0: maximum outputs exceeded")
+    );
+    assert_eq!(
+        machine_within(
+            probed(limits, usize::MAX, 1 << 20, 0),
+            "def f: ., (. + 1 | f); 0 | f"
+        ),
+        refused(1001, "f/0 exceeded maximum recursion depth")
+    );
+    assert_eq!(
+        machine_within(
+            probed(small(BUDGET, 1 << 24, 1 << 20), usize::MAX, 1 << 20, 0),
+            "def h($m): if $m < 16132 then $m, h($m + 1) else empty end; \
+             def f: if . < 65 then h(0), (. + 1 | f) else empty end; [0 | f] | length"
+        ),
+        ok(&["1048580"])
+    );
+}
+
+/// The probe is asked rarely while memory stands still, so a run far from the limit pays nearly
+/// nothing (200,000 rounds in constant memory sample a handful of times), and a run is refused at
+/// the first sample that reads past the limit.
+#[test]
+fn the_memory_is_sampled_rarely_while_it_stands_still_8064() {
+    let filter = "def f: if . < 200000 then . + 1 | f else . end; 0 | f";
+    assert_eq!(
+        machine_within(probed(SHIPPED, 1 << 30, 1 << 20, 0), filter),
+        ok(&["200000"])
+    );
+    assert!(samples() < 20, "{} samples", samples());
+    // From 1 MiB, 16 MiB more at each sample (a check point's or a growth's), towards 64 MiB:
+    // the fifth reads 65 MiB, or a growth's sample before it finds no room for the old block.
+    let answer = machine_within(
+        probed(SHIPPED, 64 << 20, 1 << 20, 16 << 20),
+        "[def f: ., (. + 1 | f); 0 | f] | length",
+    );
+    assert!(
+        answer
+            .error
+            .as_deref()
+            .is_some_and(|e| e.ends_with("memory limit exceeded")),
+        "{answer:?}"
+    );
+    assert!(samples() <= 5, "{} samples", samples());
+}
+
+/// The interval to the next sample: the least at the first reading, the most while nothing grows,
+/// and otherwise the check points that, at the growth per check point since the last sample,
+/// spend half the room left, within the least and the most.
+#[test]
+fn the_next_sample_comes_when_half_the_room_could_be_spent_8064() {
+    assert_eq!(Sampler::next_interval(0, 100, 16, 1000), MIN_INTERVAL);
+    assert_eq!(Sampler::next_interval(100, 100, 16, 1000), MAX_INTERVAL);
+    assert_eq!(Sampler::next_interval(100, 50, 16, 1000), MAX_INTERVAL);
+    // 1,600 bytes over 16 check points is 100 a check point; 4,000 room, half is 20 check points.
+    assert_eq!(Sampler::next_interval(1000, 2600, 16, 6600), 20);
+    assert_eq!(Sampler::next_interval(1000, 2600, 16, 2700), MIN_INTERVAL);
+    assert_eq!(
+        Sampler::next_interval(1000, 1016, 16, usize::MAX),
+        MAX_INTERVAL
+    );
+    // Past the limit there is no room.
+    assert_eq!(Sampler::next_interval(1000, 3000, 16, 2000), MIN_INTERVAL);
 }
 
 proptest! {

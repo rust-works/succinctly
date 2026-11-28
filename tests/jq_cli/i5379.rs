@@ -456,10 +456,20 @@ fn test_a_program_that_reads_a_path_loops_too_5379() -> Result<()> {
 /// A generator that tail-calls itself holds every output it emitted while a consumer that
 /// collects (`[...]`) is waiting for its end, and jq's loop runs until its heap is gone. The
 /// outputs a loop emits ahead of its calls are bounded (2^20), apart from its rounds, so the
-/// collecting consumer is refused in a few hundred MB, not gigabytes.
+/// collecting consumer is refused in a few hundred MB, not gigabytes. The shipped route's bound:
+/// the call machine (`SUCCINCTLY_CALL_MACHINE=1`) bounds what it holds by bytes instead and has
+/// no bound on outputs (#8064, `i8064.rs`), so this row runs with the machine off.
 #[test]
 fn test_a_tail_generator_under_a_collector_is_bounded_5379() -> Result<()> {
-    let (stdout, stderr, code) = run("[def f: ., (. + 1 | f); 0 | f] | length")?;
+    let output = std::process::Command::new(crate::succinctly_bin())
+        .args(["jq", "-nc", "[def f: ., (. + 1 | f); 0 | f] | length"])
+        .env("SUCCINCTLY_CALL_MACHINE", "0")
+        .output()?;
+    let (stdout, stderr, code) = (
+        String::from_utf8(output.stdout)?,
+        String::from_utf8(output.stderr)?,
+        output.status.code().unwrap_or(-1),
+    );
     assert_eq!((stdout.as_str(), code), ("", 5), "{stderr:?}");
     assert!(
         stderr.contains("f/0: maximum outputs exceeded"),
