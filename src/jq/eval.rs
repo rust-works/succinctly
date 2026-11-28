@@ -83819,9 +83819,11 @@ fn yq_condition_is_value_only(cond: &Expr) -> bool {
     }
 }
 
-/// What a yq document holds that the owned value reads differently than yq does (#8020), so a
-/// values-only `select` over it can keep a node yq leaves. The document route measures it once per
-/// document ([`yq_owned_document::enter`]); without a document to measure, every part is assumed.
+/// What a yq document holds that the owned value reads differently than yq does (#8020).
+///
+/// A values-only `select` over such a document can keep a node yq leaves. The document route
+/// measures it once per document ([`yq_owned_document::enter`]); without a document to measure,
+/// every part is assumed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedDocumentShape {
     /// An alias or a merge key: the owned value expanded both, where yq's `has`, `length`, `keys`,
@@ -83841,9 +83843,10 @@ impl OwnedDocumentShape {
     };
 }
 
-/// The [`OwnedDocumentShape`] of the document a yq evaluation runs over (#8020), ambient for the
-/// reason [`yq_delete_context`] is: the `del()` rewrite that asks sits many levels below the runner
-/// that knows. `std` only; without it every part is assumed.
+/// The [`OwnedDocumentShape`] of the document a yq evaluation runs over (#8020).
+///
+/// Ambient for the reason [`yq_delete_context`] is: the `del()` rewrite that asks sits many levels
+/// below the runner that knows. `std` only; without it every part is assumed.
 #[cfg(feature = "std")]
 pub mod yq_owned_document {
     use super::OwnedDocumentShape;

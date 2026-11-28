@@ -6624,20 +6624,23 @@ fn for_each_merge_source<'a, W: AsRef<[u64]>>(
     }
 }
 
-/// Whether `cursor`'s document may hold a merge key (`<<`), which the owned value expands into
-/// the mapping that holds it (#8020): the same proof [`collect_merged_members`] and the mapping
-/// reads take, so `false` means none and `true` only that one might.
+/// Whether `cursor`'s document may hold a merge key (`<<`) (#8020).
+///
+/// The owned value expands one into the mapping that holds it. This is the same proof
+/// [`collect_merged_members`] and the mapping reads take, so `false` means none and `true` only
+/// that one might.
 #[must_use]
 pub fn may_hold_merge_keys<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> bool {
     cursor.index.may_have_merge_keys(cursor.text)
 }
 
-/// Whether `cursor`'s document holds a `null` or a boolean that yq reads by a text other than the
-/// canonical `null`/`true`/`false` (#8020): `~`, `Null`, `NULL`, an empty value, `True`, `TRUE`,
-/// `False`, `FALSE`. yq compares such a scalar by its text (`True == true` is false there, and `~
-/// | tostring` is `"~"`), where the owned value and the cursor read the value it resolved to. A
-/// document with an explicit tag answers `true` as well: a tag can force either kind. The walk
-/// visits every value once, without recursion.
+/// Whether `cursor`'s document holds a `null` or a boolean spelled non-canonically (#8020).
+///
+/// That is, one yq reads by a text other than `null`/`true`/`false`: `~`, `Null`, `NULL`, an empty
+/// value, `True`, `TRUE`, `False`, `FALSE`. yq compares such a scalar by its text (`True == true`
+/// is false there, and `~ | tostring` is `"~"`), where the owned value and the cursor read the
+/// value it resolved to. A document with an explicit tag answers `true` as well: a tag can force
+/// either kind. The walk visits every value once, without recursion.
 #[must_use]
 pub fn holds_spelled_bool_or_null<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> bool {
     if cursor.index.has_explicit_tags() {
