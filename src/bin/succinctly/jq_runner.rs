@@ -9974,7 +9974,13 @@ fn read_inputs(
                     );
                     if model_route {
                         let lazy = model_ends.len();
-                        model_ends.extend_from_slice(&ends);
+                        // Moved, not copied, where no lazy prefix comes first: the loop is done
+                        // with them.
+                        if lazy == 0 {
+                            model_ends = ends;
+                        } else {
+                            model_ends.append(&mut ends);
+                        }
                         model_files.push(model_read::EagerFile {
                             text: std::rc::Rc::clone(&raw),
                             base: seam.base,
