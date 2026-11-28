@@ -13,9 +13,12 @@ The builtins are `test`, `match`, `match` with `g`, a capture summary, `capture`
 The generators cover look-behind bodies, references and calls (defined and undefined), malformed pieces, classes, intervals, escapes, option runs, comments and blanks, a general mix, ordinary patterns (`plain`), and 133 probe patterns taken from a reading of the old text passes.
 12% of the generated patterns are run four ways (no flags, `x`, `i`, `g`).
 
-The default corpus (seed 2026) has 330,133 distinct patterns in 459,678 rows, 45 MB in 92 chunks.
-It is regenerated in about five seconds, not committed.
-`scripts/test_jq_regex_corpus.py` pins its digest: stored answers are comparable only while the rows stay the same.
+Those 459,678 rows (seed 2026, 330,133 distinct patterns, 45 MB in chunks 0 to 91) are the corpus ADR-0031's measurements used.
+After them, in chunks 92 to 99 of their own, come 40,000 literal rows: literals and alternations of literals, which jq mode searches without Oniguruma (ADR-0031 step 5), and near-literals one metacharacter, empty alternative or flag away from one, which must still reach Oniguruma.
+Only 155 of the 459,678 rows reached that path, so a change to it was not otherwise checked.
+The literal rows have their own random stream, so the chunks before them, and every answer stored for those chunks, stay valid; `gen --literal 0` leaves them out.
+The corpus is regenerated in about five seconds, not committed.
+`scripts/test_jq_regex_corpus.py` pins both digests: stored answers are comparable only while the rows stay the same.
 
 ## Running it
 
