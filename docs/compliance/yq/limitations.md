@@ -4149,6 +4149,7 @@ The first such stage whose input list is empty is the one that emits, and the st
 A union is evaluated over the empty list branch by branch (`.a[] | (1, 2)` is `1`, `2`), and `map(f)` is `[.[] | f]` to the rule, so `map(select(false) | 1)` is `[1]`.
 Since [#8075](https://github.com/rust-works/succinctly/issues/8075) `now`, `env(NAME)` and `strenv(NAME)`, which yq builds once whatever the context holds, count as literals inside an operator, an object, a binding, a fold or an `error`: `select(false) | (now + "1h")`, `select(false) | {"t": strenv(X)}` and `select(false) | (. as $t | now)` are one value each in both.
 A `with_dtf(L; E)` counts when its layout and its body do (`select(false) | with_dtf("2006"; "x")` is `"x"`).
+An object or a collection emitted after an empty stage is printed with a `---` between the documents here, where yq prints none: `.x[] | select(false) | {"t": 1}` over `x: [1]` / `---` / `x: [2]` is `t: 1` twice without one in yq, which predates #8075 and holds for `{"t": strenv(X)}` and `with_dtf("2006"; {"a": 1})` too.
 `succinctly jq` is unchanged: jq's pipe loops zero times over an empty stage.
 
 It is answered where the pipe is evaluated: the sink route counts what the pipe emitted and, when that is nothing, asks which stage's input was empty (the stages before it run once more, only then).

@@ -256,7 +256,7 @@ fn with_dtf_raises_what_its_body_raises_over_an_empty_context_8075() -> Result<(
     Ok(())
 }
 
-/// The body of a write, a `map` or `with_entries` is a pipe of its own (#8002).
+/// The body of a write or a `map` is a pipe of its own (#8002).
 const BODY_ROWS: &[(&str, &str)] = &[
     (
         ".x[] |= (select(false) | (strenv(X) + \"a\"))",
@@ -270,20 +270,29 @@ const BODY_ROWS: &[(&str, &str)] = &[
         ".x[] |= (select(false) | with_dtf(\"2006\"; \"x\"))",
         "x: [x, x, x]\n",
     ),
-    (".x | map(select(false) | (strenv(X) + \"a\"))", "[hia]\n"),
+];
+
+/// A `map` body, printed as JSON: yq keeps the input's flow style on the sequence `map` builds,
+/// which is #6801's recorded difference.
+const MAP_ROWS: &[(&str, &str)] = &[
+    (
+        ".x | map(select(false) | (strenv(X) + \"a\"))",
+        "[\"hia\"]\n",
+    ),
     (
         ".x | map(select(false) | {\"t\": strenv(X)})",
-        "[{t: hi}]\n",
+        "[{\"t\":\"hi\"}]\n",
     ),
     (
         ".x | map(select(false) | with_dtf(\"2006\"; \"x\"))",
-        "[x]\n",
+        "[\"x\"]\n",
     ),
 ];
 
 #[test]
 fn a_body_a_write_or_map_runs_answers_once_8075() -> Result<()> {
-    assert_rows(&[], XS, BODY_ROWS)
+    assert_rows(&[], XS, BODY_ROWS)?;
+    assert_rows(JSON, XS, MAP_ROWS)
 }
 
 /// Over a context with nodes each node answers, as before.
@@ -316,10 +325,6 @@ fn several_documents_answer_once_each_8075() -> Result<()> {
         "x: [1]\n---\nx: [2]\n",
         &[
             (".x[] | select(false) | (strenv(X) + \"a\")", "hia\nhia\n"),
-            (
-                ".x[] | select(false) | {\"t\": strenv(X)}",
-                "t: hi\nt: hi\n",
-            ),
             (".x[] | select(false) | with_dtf(\"2006\"; \"x\")", "x\nx\n"),
         ],
     )
