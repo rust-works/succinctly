@@ -4198,6 +4198,16 @@ pub(crate) fn needs_path_context(expr: &Expr) -> bool {
         Expr::CompoundAssign { value, .. } | Expr::AlternativeAssign { value, .. } => {
             needs_path_context(value)
         }
+        // `error(msg)` (#8080): the message is evaluated against the stage's
+        // own input, so a `key`/`path`/`parent` inside it reads that input's
+        // position, exactly as `key as $k | error($k)` does. Without this arm
+        // a pipe whose only read is inside the message was never routed with
+        // position: `.b | error(key)` raised `aborted` (the message produced
+        // nothing) and `.b | error(path | join("."))` raised `""`, where yq
+        // v4.53.3 raises `b` for both. The routes already had `Expr::Error`
+        // arms (`path_context_resolvable`, the rewriter, the walk step, the
+        // owned identity pipe); none was ever asked.
+        Expr::Error(Some(message)) => needs_path_context(message),
         // Remembered on the pipe (#3886): a pipe nested in another stage is
         // walked once, not on every ask of the stage holding it.
         Expr::Pipe(exprs) => pipe_needs_path_context(exprs),

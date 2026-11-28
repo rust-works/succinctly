@@ -18635,6 +18635,12 @@ fn eval_single<S: EvalSemantics, V: DocumentValue>(
             finish_fork_generic(values, control, optional)
         }
 
+        // #8080: a message that reads the input's position, evaluated with the
+        // cursor (see [`error_at_position`]).
+        Expr::Error(Some(message)) if cursor.is_some() && error_message_reads_position(message) => {
+            error_at_position_single::<S, V>(message, value, optional, cursor)
+        }
+
         // Spine 2416 (the exit): unary minus over a path-context operand.
         // The eager evaluator carried this as `eval_negate_with_path_context`
         // (#1100) so `-file_index` mid-pipe read at the node; with that
@@ -20225,6 +20231,10 @@ fn eval_each_generic<S: EvalSemantics, V: DocumentValue>(
         // `?//`-retry rows that arm pins are the same definition here.
         Expr::Negate(operand) => {
             each_negate_generic::<S, V>(operand, value, optional, cursor, sink)
+        }
+        // #8080: the sink route's twin of `eval_single`'s arm.
+        Expr::Error(Some(message)) if cursor.is_some() && error_message_reads_position(message) => {
+            error_at_position_each::<S, V>(message, value, optional, cursor, sink)
         }
         // jq mode only -- yq mode's string interpolation isn't a fan-out
         // generator at all (`eval::eval_string_interpolation`'s own doc
@@ -27641,6 +27651,69 @@ fn each_range_generic<S: EvalSemantics, V: DocumentValue>(
         Some(Flow::Stopped { .. }) => Flow::Stopped { pending: None },
         Some(Flow::Exhausted) | None => from_flow,
     }
+}
+
+/// Whether an `error` message reads the position of the input it is evaluated
+/// against (#8080): a path-context read (`key`, `path`, `parent`,
+/// `file_index`, ...) or a cursor metadata read (`line`, `column`, `anchor`,
+/// ...). Only such a message takes [`error_at_position`]; every other one
+/// keeps the bridge it always took.
+fn error_message_reads_position(message: &Expr) -> bool {
+    needs_path_context(message) || crate::jq::walk::uses_cursor_metadata_builtins(message)
+}
+
+/// `error(msg)` as `(msg as $m | error($m)), error(empty)` (#8080), for a
+/// message that reads its input's position.
+///
+/// `Expr::Error` has no native arm of its own on either generic route, so it
+/// reached `eval::eval` through the wildcard bridge, over a value copy with no
+/// position: `.b | error(key)` raised `aborted` (the message produced nothing)
+/// and `.b | error(line)` raised `0`, where yq v4.53.3 raises `b` and `2`. The
+/// `as` binding is native on both routes and evaluates its source against the
+/// cursor, which is why `key as $k | error($k)` was already right; spelling
+/// the call as one keeps the rest of `error`'s rules where they are. Only the
+/// message's first output is raised, and the binding stops at that raise, so
+/// a later output is never evaluated (#3636). A message that produces nothing
+/// falls through to `error(empty)`, which raises yq's `aborted` and yields
+/// nothing in jq mode, as the bridge always did.
+///
+/// The bound name is never visible to the message: it is in scope only in the
+/// body, which reads nothing else.
+fn error_at_position(message: &Expr) -> Expr {
+    const MESSAGE: &str = "__error_message_8080";
+    Expr::Comma(vec![
+        Expr::As {
+            expr: Box::new(message.clone()),
+            var: MESSAGE.into(),
+            body: Box::new(Expr::Error(Some(Box::new(Expr::Var(MESSAGE.into()))))),
+        },
+        Expr::Error(Some(Box::new(Expr::Builtin(Builtin::Empty)))),
+    ])
+}
+
+/// `eval_single`'s arm for [`error_at_position`], out of line so the rewritten
+/// expression does not widen `eval_single`'s own frame.
+#[inline(never)]
+fn error_at_position_single<S: EvalSemantics, V: DocumentValue>(
+    message: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+) -> GenericResult<V> {
+    eval_single::<S, V>(&error_at_position(message), value, optional, cursor)
+}
+
+/// `eval_each_generic`'s arm for [`error_at_position`], out of line for the
+/// same reason as [`error_at_position_single`].
+#[inline(never)]
+fn error_at_position_each<S: EvalSemantics, V: DocumentValue>(
+    message: &Expr,
+    value: V,
+    optional: bool,
+    cursor: Option<V::Cursor>,
+    sink: &mut dyn Sink<V>,
+) -> Flow {
+    eval_each_generic::<S, V>(&error_at_position(message), value, optional, cursor, sink)
 }
 
 /// `eval_single`'s `-E` for an operand holding a `?//` (#3410): collect
@@ -37974,11 +38047,31 @@ fn path_context_walk_split(exprs: &[Expr]) -> Option<(&[Expr], &[Expr])> {
         (exprs, &[])
     } else if path_context_is_cursor_walkable(first) && !exprs[1..].iter().any(needs_path_context) {
         (&exprs[..1], &exprs[1..])
+    } else if let Some(len) = path_context_walked_error_prefix_len(exprs) {
+        (&exprs[..len], &exprs[len..])
     } else {
         let len = path_context_walked_emitting_prefix_len(exprs)?;
         (&exprs[..len], &exprs[len..])
     };
     Some((walked, rest))
+}
+
+/// (#8080) The length of a navigational prefix ending on an `error` whose
+/// message reads the position (`.zz | error(key) | tostring`). The walk steps
+/// such a stage by evaluating its message at each position, and `error` emits
+/// nothing, so the stages after it never receive a value: `rest` is handed
+/// nothing and what it would read does not matter. Without this the pipe had
+/// no route -- the absent route declines a `rest` that reads nothing, the
+/// read being in the head -- and the staged fold evaluated the message over
+/// the absent node's `null`, raising `aborted` where yq raises `zz`.
+fn path_context_walked_error_prefix_len(exprs: &[Expr]) -> Option<usize> {
+    let idx = exprs.iter().position(|stage| {
+        matches!(strip_parens(stage), Expr::Error(Some(message)) if needs_path_context(message))
+    })?;
+    exprs[..=idx]
+        .iter()
+        .all(path_context_is_navigational)
+        .then_some(idx + 1)
 }
 
 /// (#2149) The length of a walkable prefix ending on an emitting stage
@@ -48599,6 +48692,30 @@ fn eval_owned_identity_stages<S: EvalSemantics, V: DocumentValue>(
             eval_owned_identity_spliced::<S, V>(stage, rest, value, id, optional, tail)
         }
         Expr::Break(name) => Flow::Escaped(Control::Break(name.clone())),
+        // #8080: a message that reads this position (`error(key)`,
+        // `error(parent | keys)`) is resolved here first, as the `_` arm
+        // below resolves any other stage, so it reads the node this position
+        // holds; the ordinary evaluator then raises it as it raises any
+        // other message. Without it, `[.[] | error(key)]` (yq's `map(error(key))`)
+        // and `.b | . as $v | error(key)` raised `aborted`.
+        Expr::Error(Some(message)) if needs_path_context(message) => {
+            let escaped = core::cell::RefCell::new(None);
+            let resolved =
+                match owned_identity_resolve_at::<S, V>(stage, &value, &id, optional, &escaped) {
+                    Ok(e) => e,
+                    Err(e) => return Flow::Escaped(Control::Error(e)),
+                };
+            match eval_each_owned::<S>(
+                &resolved,
+                &value,
+                optional,
+                Reentry::Against(id.root_witness()),
+                &mut |_| Demand::Continue,
+            ) {
+                Flow::Escaped(control) => Flow::Escaped(control),
+                flow => escaped.into_inner().map_or(flow, Flow::Escaped),
+            }
+        }
         // Nothing to place: the ordinary evaluator raises what these raise.
         // #3036: `Expr::Error`'s own message expression can embed a
         // `Snapshot` marker, checked against this position's own node
