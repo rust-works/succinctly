@@ -332,6 +332,14 @@ fn builtin_node(builtin: &Builtin, input: Node) -> Option<Node> {
         | Builtin::DocumentIndex
         | Builtin::Filename
         | Builtin::PathNoArg => Some(replacement(input)),
+        // The datetime operators build a replacement of the timestamp they read
+        // (`operator_datetime.go`, v4.53.3): `tzOp`, `toUnixOp` and `fromUnixOp` through
+        // `CreateReplacement`, and `formatDateTime` by giving the snippet it parses the input's
+        // parent. So `now | format_datetime("2006")` has no document, and `.t | tz("UTC")` keeps
+        // `.t`'s (#8077).
+        Builtin::FormatDatetime(_) | Builtin::Tz(_) | Builtin::ToUnix | Builtin::FromUnix => {
+            Some(replacement(input))
+        }
         Builtin::Select(_) => Some(input),
         // `map` copies an empty input and builds a fresh sequence from any other, so its result
         // has no document whatever the input when the input has none.
@@ -405,6 +413,16 @@ mod tests {
             "now",
             ".a | now",
             "now | tostring",
+            "now | format_datetime(\"2006\")",
+            "now | format_datetime(\"2006\") | length",
+            "with_dtf(\"2006\"; now | format_datetime(\"06\"))",
+            "now | tz(\"UTC\")",
+            "now | to_unix",
+            "now | to_unix | from_unix",
+            "format_datetime(\"2006\")",
+            "tz(\"UTC\")",
+            "to_unix",
+            "from_unix",
         ] {
             assert!(fresh(filter), "{filter}");
         }
@@ -445,6 +463,11 @@ mod tests {
             ".a = env(X)",
             ".a, now",
             ".a = now",
+            ".a | format_datetime(\"2006\")",
+            ".t | tz(\"UTC\")",
+            ".t | to_unix",
+            ".n | from_unix",
+            "now | format_datetime(\"2006\"), .",
         ] {
             assert!(!fresh(filter), "{filter}");
         }
