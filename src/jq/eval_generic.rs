@@ -37330,6 +37330,14 @@ fn path_context_step_computed_index<S: EvalSemantics, V: DocumentValue>(
             (t, stepped)
         });
         for tpos in targets.iter() {
+            if let Some(stepped) =
+                path_context_step_spelled_key::<S, V>(&component, bracket_optional, tpos, out)
+            {
+                match stepped {
+                    Ok(()) => continue,
+                    Err(control) => return walk_error.stop(control),
+                }
+            }
             match path_component_step_expr(&component) {
                 Some(step) => {
                     let step = if bracket_optional {
@@ -37479,6 +37487,66 @@ fn path_context_component_values<S: EvalSemantics, V: DocumentValue>(
         Demand::Continue
     });
     (values, control)
+}
+
+/// A computed bracket's step when its component is an integer spelled other than as its decimal
+/// value (`0x1`, `01`, `-0`) and the target is a yq mapping (#8070), or `None` to leave the
+/// component to [`path_component_step_expr`].
+///
+/// yq names a mapping's member by the key's text and a sequence's slot by the value, and the
+/// value route reads `.m[0x1]` that way since #7999. The `Index` the component would otherwise
+/// become keeps only the value, so `.m[0x1] | key` on `"0x1": a` / `"1": b` stood on `"1":`. A
+/// member whose key is the spelling is taken by the `Field` step that names it, so the component
+/// is the one `.m["0x1"]` reports: the key's text, or its value for a typed key (`0x1: a` is
+/// `["m",1]` in yq v4.53.3, #2801). A miss is the absent position an index misses into, whose
+/// component is the value (`.m[0x2] | path` is `["m",2]`), not the decimal key a canonical
+/// index would read.
+fn path_context_step_spelled_key<S: EvalSemantics, V: DocumentValue>(
+    component: &OwnedValue,
+    bracket_optional: bool,
+    tpos: &PathContextPos<V>,
+    out: &mut Vec<PathContextPos<V>>,
+) -> Option<Result<(), Control>> {
+    if S::TAG != EvalTag::Yq {
+        return None;
+    }
+    let OwnedValue::NumberLiteral(NumberRepr::Int(idx), text) = component else {
+        return None;
+    };
+    let text: &str = text;
+    if text == idx.to_string() {
+        return None;
+    }
+    let present = match &tpos.node {
+        PathNode::At(c) => {
+            let fields = c.value().as_object()?;
+            // A malformed member is the `Field` step's to raise.
+            !matches!(
+                crate::jq::key_index::find_cursor_memoized(&fields, text),
+                Ok(None)
+            )
+        }
+        PathNode::Owned(v) => match &**v {
+            OwnedValue::Object(map) => map.contains_key(text),
+            _ => return None,
+        },
+        PathNode::Absent => return None,
+    };
+    if !present {
+        out.push(PathContextPos {
+            node: PathNode::Absent,
+            trail: tpos.trail.extend_from(OwnedValue::Int(*idx), &tpos.node),
+            at_key: false,
+        });
+        return Some(Ok(()));
+    }
+    let step = Expr::Field(text.to_owned());
+    let step = if bracket_optional {
+        Expr::Optional(Box::new(step))
+    } else {
+        step
+    };
+    Some(path_context_step_generic::<S, V>(&step, tpos, out))
 }
 
 /// The literal navigation step that takes `component`, or `None` for a value
