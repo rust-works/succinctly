@@ -4347,11 +4347,16 @@ from no position at all).
 An update whose target is its own input (`. |= f`, which `with(PATH; . |= f)` is) reads `key` and `parent` at that input since [#8039](https://github.com/rust-works/succinctly/issues/8039): `with(.b; . |= key)` writes `"b"`, and `with(.a.b; . |= (parent | keys))` writes the keys of `.a`, as in yq (pinned in `tests/yq_cli/i8039.rs`).
 Before it `key` answered nothing there and the target was left as it was.
 An update whose own reads cannot all be resolved at its target still names the target for the updates nested in its filter, so `with(.x; . |= (.d = 1 | .b |= path))` and `.x |= (.b |= (.c | . |= path))` write `["x","b"]` and `["x","b","c"]`.
-A nested update that follows a value yq builds with no position (a scalar literal, an object constructor, a string interpolation, `keys` or `with_entries`) gets none: `.x |= (.b |= (5 | . |= path))` writes `[]`, as in yq.
+Whether a value a stage builds has a position is the owned identity rule's answer, the one a read gets (`.x | (map(.) | path)` is `[]`): an update that value reaches stands at the value's own path and not under the enclosing update's, so `.x |= (.b |= (5 | . |= path))` and `.x |= (map(.) | (. |= path))` write `[]`, `.x |= ({} | .k | (. |= path))` writes `["k"]`, and `.x |= (.zz // 3 | (. |= path))` writes `[]` where `.x |= (.d // 3 | (. |= path))` writes `["x","d"]`, as in yq.
+Where that rule places a value differently from yq, the update follows the rule, and two rows that answered as yq does before #8039 (from no position at all) now answer as the read does.
+`.b.c + 1` over an absent `.b.c` has no position in yq and stands at its left operand here: `.x | .b | (.b.c + 1 | key)` is `"c"` here and nothing in yq, and `.x |= (.b |= (.b.c + 1 | . |= key))` on `{"x":{"b":{"c":1},"d":2}}` now writes `"c"` where yq leaves `1`.
+`splitDoc`'s value has no parent in yq and keeps its input's here: `.x | splitDoc | (parent | keys)` is `["x"]` here and nothing in yq, and `.x |= (splitDoc | (. |= (parent | keys)))` now writes `["x"]` where yq leaves `.x` as it was.
+Both are pinned in `tests/yq_cli/i8039.rs` with the read rows, so a fix to the rule changes them together.
 Three shapes still differ.
 A read of the update's own filter after a write in it is not positioned, because the write is taken to move the position: `.b |= (.x = 1 | key)` leaves `5` where yq writes `"b"`.
 A nested update reached through a pipe stage rather than an update's body climbs no `parent` above its own input: `.a.b | . |= (parent | keys)` leaves `.a.b` as it was, where yq writes `["b","d"]`.
 A `parent` above a node the filter navigated into but that does not exist lacks that node's key, the #2435 divergence above: `.x |= (.b |= (.b | . |= (parent | keys)))` writes `["c"]` where yq, which creates `.b.b` on the way, writes `["c","b"]`.
+A target the enclosing update created is the `null` it was created as, where yq has made it a mapping on the way: `.zz |= (.q | . |= (parent | kind))` writes `null` where yq writes `"map"`.
 
 `line`/`column` inside an update filter are **not** covered: they are answered from a
 cursor, not from a path, and no cursor reaches the filter. `.a | .b |= line` is `2` in real

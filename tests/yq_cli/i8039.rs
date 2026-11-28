@@ -203,6 +203,37 @@ const ROWS: &[(&str, &str, &str)] = &[
         "with(.x.b; .d = 1 | .c |= key)",
         "{\"x\":{\"b\":{\"c\":\"c\",\"d\":1},\"d\":2}}\n",
     ),
+    // Whether a stage leaves its value a position is the owned identity rule's answer, as for a
+    // read (`.x | (map(.) | path)` is `[]`): a literal, `now`, arithmetic on a literal, a bound
+    // literal, `map` and `keys` leave none; `//` leaves the one of the side it took; a collect and
+    // `to_entries` keep the input's; a node inside a positionless value stands at its own path.
+    // Each update decides for itself, so a sibling after an unplaced one keeps the prefix.
+    (SPINE, ".x |= (now | (. |= path))", "{\"x\":[]}\n"),
+    (SPINE, ".x |= (1 + 2 | (. |= path))", "{\"x\":[]}\n"),
+    (SPINE, ".x |= (\"a\" + .d | (. |= path))", "{\"x\":[]}\n"),
+    (SPINE, ".x |= (5 as $v | $v | (. |= path))", "{\"x\":[]}\n"),
+    (SPINE, ".x |= ((5 | .) | (. |= path))", "{\"x\":[]}\n"),
+    (SPINE, ".x |= (.zz // \"q\" | (. |= path))", "{\"x\":[]}\n"),
+    (SPINE, ".x |= (.zz // 3 | (. |= path))", "{\"x\":[]}\n"),
+    (
+        SPINE,
+        ".x |= (.d // 3 | (. |= path))",
+        "{\"x\":[\"x\",\"d\"]}\n",
+    ),
+    (SPINE, ".x |= (map(.) | (. |= path))", "{\"x\":[]}\n"),
+    (SPINE, ".x |= (keys | (. |= path))", "{\"x\":[]}\n"),
+    (SPINE, ".x |= ([.[]] | (. |= path))", "{\"x\":[\"x\"]}\n"),
+    (
+        SPINE,
+        ".x |= (to_entries | (. |= path))",
+        "{\"x\":[\"x\"]}\n",
+    ),
+    (SPINE, ".x |= ({} | .k | (. |= path))", "{\"x\":[\"k\"]}\n"),
+    (
+        SPINE,
+        ".x |= (.b |= (5 | . |= path) | .d |= path)",
+        "{\"x\":{\"b\":[],\"d\":[\"x\",\"d\"]}}\n",
+    ),
     // A scalar the body builds still has no position under such an update.
     (
         SPINE,
@@ -222,6 +253,48 @@ fn a_nested_update_reads_key_and_parent_at_its_own_input_8039() -> Result<()> {
         let (stdout, code) = run_yq_stdin(filter, input, &["-p=json", "-o=json", "-I0"])?;
         assert_eq!(code, 0, "{filter}");
         assert_eq!(&stdout, expected, "{filter}");
+    }
+    Ok(())
+}
+
+/// Where the owned identity rule places a value differently from yq, an update reads that place as
+/// a read does (#8039, recorded in `docs/compliance/yq/limitations.md`). Main answered these as yq
+/// does by accident, from no position at all; a fix to the rule changes them together with the
+/// read rows below.
+#[test]
+fn an_update_reads_the_identity_rules_position_where_it_differs_from_yq_8039() -> Result<()> {
+    for (filter, expected, yq) in [
+        // `.b.c + 1` over an absent `.b.c`: yq gives the sum no position (`key` answers nothing,
+        // `path` is `[]`); the rule places it at its left operand.
+        (
+            ".x |= (.b |= (.b.c + 1 | . |= key))",
+            "{\"x\":{\"b\":\"c\",\"d\":2}}\n",
+            "{\"x\":{\"b\":1,\"d\":2}}",
+        ),
+        (".x | .b | (.b.c + 1 | key)", "\"c\"\n", "(nothing)"),
+        // `splitDoc`'s value has no parent in yq; the rule keeps the input's position.
+        (
+            ".x |= (splitDoc | (. |= (parent | keys)))",
+            "{\"x\":[\"x\"]}\n",
+            "{\"x\":{\"b\":{\"c\":1},\"d\":2}}",
+        ),
+        (
+            ".x |= (.b |= (splitDoc | . |= (parent | keys)))",
+            "{\"x\":{\"b\":[\"b\",\"d\"],\"d\":2}}\n",
+            "{\"x\":{\"b\":{\"c\":1},\"d\":2}}",
+        ),
+        (".x | splitDoc | (parent | keys)", "[\"x\"]\n", "(nothing)"),
+        // #2435: yq creates `.zz.q` on the way, so its parent is a map; the snapshot holds `zz` as
+        // the `null` it was created as.
+        (
+            ".zz |= (.q | . |= (parent | kind))",
+            "{\"x\":{\"b\":{\"c\":1},\"d\":2},\"zz\":null}\n",
+            "{\"x\":{\"b\":{\"c\":1},\"d\":2},\"zz\":\"map\"}",
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, SPINE, &["-p=json", "-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, expected, "{filter} (yq v4.53.3: {yq})");
     }
     Ok(())
 }
