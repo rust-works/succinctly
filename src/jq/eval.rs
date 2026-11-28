@@ -5331,6 +5331,7 @@ fn reemit_with_budget(expr: &Expr, input_empty: bool, budget: usize) -> Option<E
             bound: &[],
             input_empty,
             budget: &budget,
+            nested: false,
         },
     );
     rewrite.filter(|_| !budget.exhausted.get())
@@ -5352,9 +5353,25 @@ struct ReemitScope<'s> {
     input_empty: bool,
     /// The nodes the rewrite may still copy; once spent, the whole rewrite declines.
     budget: &'s ReemitBudget,
+    /// Whether the expression is inside a part of the stage that is not itself a stage of it: an
+    /// operand, an object's key or value, a binding, a fold or a `with_dtf` (#8075). Only there
+    /// is a stage yq builds once over its context ([`yq_stage_built_once`]) an answer of the
+    /// rewrite's: as a stage of its own (`select(false) | now`, through parentheses, pipes and
+    /// commas) it is the context-list walk's and the parser's, which answer it once already.
+    ///
+    /// [`yq_stage_built_once`]: super::eval_generic::yq_stage_built_once
+    nested: bool,
 }
 
 impl ReemitScope<'_> {
+    /// This scope for a part of the expression that is not a stage of it ([`Self::nested`]).
+    fn nest(self) -> Self {
+        Self {
+            nested: true,
+            ..self
+        }
+    }
+
     /// Charge `nodes` copied nodes, `false` (and the rewrite declines) when the budget has not got
     /// them. A rewrite that spends it exactly still answers.
     fn charge(&self, nodes: usize) -> bool {
@@ -5415,6 +5432,8 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
             var,
             body,
         } => {
+            // #8075: neither the source nor the body is a stage of the pipe that holds the binding.
+            let scope = scope.nest();
             let Some(source) = yq_empty_context_reemit_in(source, scope) else {
                 return yq_empty_context_reemit_in(body, scope);
             };
@@ -5507,6 +5526,7 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
             if !scope.input_empty {
                 return None;
             }
+            let scope = scope.nest();
             let (source, tuple) = match (unwrap_paren(input), patterns.as_slice()) {
                 (_, [Pattern::Var(_)]) => (&**input, None),
                 (Expr::Pipe(stages), [Pattern::Array(vars)]) if node_read_tuple(vars) => {
@@ -5538,6 +5558,7 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
         // when its own body loops zero times over the empty context.
         Expr::Array(_) => Some(Expr::Array(Box::new(Expr::Comma(Vec::new())))),
         Expr::Object(entries) => {
+            let scope = scope.nest();
             let mut rewritten = Vec::new();
             for entry in entries {
                 let key = match &entry.key {
@@ -5573,6 +5594,11 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
                             // stringifies when it is built, as it does over a context with nodes
                             // (`select(false) | ("x" as $y | {$y: 1})` is `{"x": 1}`).
                             var @ Expr::Var(_) => ObjectKey::Expr(Box::new(var)),
+                            // #8075: and so is a stage yq builds once (`{(strenv(X)): 1}` is
+                            // `{"hi": 1}` there with `X=hi`).
+                            once if super::eval_generic::yq_stage_built_once(&once) => {
+                                ObjectKey::Expr(Box::new(once))
+                            }
                             _ => return None,
                         }
                     }
@@ -5592,7 +5618,8 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
             (!kept.is_empty()).then(|| Expr::comma(kept))
         }
         Expr::Negate(operand) => Some(Expr::Negate(Box::new(yq_empty_context_reemit_in(
-            operand, scope,
+            operand,
+            scope.nest(),
         )?))),
         // #5261: `errorOperator` raises whatever its context holds, so
         // `select(false) | error("x")` and `.a.zz | error("x")` raise in yq. The
@@ -5601,7 +5628,7 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
         // reads its input (`error(.q)`, yq's "aborted") and the bare `error`
         // decline and stay empty.
         Expr::Error(Some(message)) => Some(Expr::Error(Some(Box::new(
-            yq_empty_context_reemit_in(message, scope)?,
+            yq_empty_context_reemit_in(message, scope.nest())?,
         )))),
         // An operator needs every operand to re-emit, see `reemit_operands`.
         Expr::Arithmetic {
@@ -5642,6 +5669,7 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
         // two branches are the operator: no answer is no branch. Not as a pipe stage before the
         // operator, which the pipe's own rule would re-emit after that stage emptied, forever.
         Expr::Alternative(left, right) => {
+            let scope = scope.nest();
             let left = yq_empty_context_reemit_in(left, scope)?;
             let right =
                 yq_empty_context_reemit_in(right, scope).unwrap_or(Expr::Builtin(Builtin::Empty));
@@ -5676,6 +5704,31 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
             rewritten.extend(stages[at + 1..].iter().cloned());
             Some(Expr::pipe(rewritten))
         }
+        // #8075: yq's `withDateTimeFormat` (`operator_datetime.go`, v4.53.3) reads the layout over
+        // the context it is handed, then evaluates the body over that same context, so over an
+        // empty one the call answers what its body does there, under the layout's first answer:
+        // `select(false) | with_dtf("2006"; "x")` is `"x"`. A layout that answers nothing there
+        // (`.fmt`) raises in yq; the call then declines, as an operator with an operand that reads
+        // its input does. A call that is itself a stage yq builds once is the walk's (`nested`).
+        Expr::Builtin(Builtin::WithDtf(layout, body)) => {
+            if !scope.nested && super::eval_generic::yq_stage_built_once(expr) {
+                return None;
+            }
+            let scope = scope.nest();
+            let layout = yq_empty_context_reemit_in(layout, scope)?;
+            let body = yq_empty_context_reemit_in(body, scope)?;
+            Some(Expr::Builtin(Builtin::WithDtf(
+                Box::new(layout),
+                Box::new(body),
+            )))
+        }
+        // #8075: `now`, `env(NAME)` and `strenv(NAME)` answer one node of their own whatever the
+        // context holds, so inside an operand or an object value they answer over an empty one as
+        // a literal does: `select(false) | (now + "1h")` and `select(false) | {"t": now}` are one
+        // value each in yq.
+        once if scope.nested && super::eval_generic::yq_stage_built_once(once) => {
+            Some(once.clone())
+        }
         _ => None,
     }
 }
@@ -5695,50 +5748,50 @@ pub(crate) fn yq_stage_can_reemit(expr: &Expr) -> bool {
 /// head (`.users | [.[]]`), so a caller that must not disturb the routes that build those lazily
 /// asks without it and handles an empty answer afterwards.
 pub(crate) fn yq_stage_can_reemit_in(expr: &Expr, arrays: bool) -> bool {
-    stage_can_reemit_in(expr, arrays, false)
+    stage_can_reemit_in(expr, arrays, false, false)
 }
 
 /// [`yq_stage_can_reemit_in`], where `vars` says whether an `as` around `expr` has a source that
-/// may re-emit, and so may bind a variable that re-emits (#8044).
-fn stage_can_reemit_in(expr: &Expr, arrays: bool, vars: bool) -> bool {
+/// may re-emit, and so may bind a variable that re-emits (#8044), and `nested` whether `expr` is
+/// inside a part of the stage that is not a stage of it, where a stage yq builds once counts
+/// ([`ReemitScope::nested`], #8075).
+fn stage_can_reemit_in(expr: &Expr, arrays: bool, vars: bool, nested: bool) -> bool {
+    let inner = |expr: &Expr| stage_can_reemit_in(expr, arrays, vars, true);
     match super::eval_generic::strip_parens(expr) {
         Expr::Literal(_) => true,
         Expr::Array(_) => arrays,
         Expr::Object(entries) => entries.iter().all(|entry| {
             !matches!(entry.key, ObjectKey::Bare)
                 && match &entry.key {
-                    ObjectKey::Expr(key) => stage_can_reemit_in(key, arrays, vars),
+                    ObjectKey::Expr(key) => inner(key),
                     _ => true,
                 }
-                && stage_can_reemit_in(&entry.value, arrays, vars)
+                && inner(&entry.value)
         }),
         Expr::Comma(branches) => branches
             .iter()
-            .any(|branch| stage_can_reemit_in(branch, arrays, vars)),
-        Expr::Negate(operand) => stage_can_reemit_in(operand, arrays, vars),
-        Expr::Error(Some(message)) => stage_can_reemit_in(message, arrays, vars),
+            .any(|branch| stage_can_reemit_in(branch, arrays, vars, nested)),
+        Expr::Negate(operand) => inner(operand),
+        Expr::Error(Some(message)) => inner(message),
         Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
-            stage_can_reemit_in(left, arrays, vars) && stage_can_reemit_in(right, arrays, vars)
+            inner(left) && inner(right)
         }
-        Expr::And(left, right) | Expr::Or(left, right) => {
-            stage_can_reemit_in(left, arrays, vars) && stage_can_reemit_in(right, arrays, vars)
-        }
-        Expr::Alternative(left, _) => stage_can_reemit_in(left, arrays, vars),
+        Expr::And(left, right) | Expr::Or(left, right) => inner(left) && inner(right),
+        Expr::Alternative(left, _) => inner(left),
         Expr::Pipe(stages) => stages
             .iter()
-            .any(|stage| stage_can_reemit_in(stage, arrays, vars)),
+            .any(|stage| stage_can_reemit_in(stage, arrays, vars, nested)),
         // #8044: a binding re-emits when its body does, and a variable in it only where its source
         // may (`"x" as $y | .a` does not).
         Expr::Var(_) => vars,
-        Expr::As { expr, body, .. } => stage_can_reemit_in(
-            body,
-            arrays,
-            vars || stage_can_reemit_in(expr, arrays, vars),
-        ),
-        Expr::Reduce { input, init, .. } => {
-            stage_can_reemit_in(input, arrays, vars) || stage_can_reemit_in(init, arrays, vars)
+        Expr::As { expr, body, .. } => stage_can_reemit_in(body, arrays, vars || inner(expr), true),
+        Expr::Reduce { input, init, .. } => inner(input) || inner(init),
+        Expr::Builtin(Builtin::WithDtf(layout, body)) => {
+            (nested || !super::eval_generic::yq_stage_built_once(expr))
+                && inner(layout)
+                && inner(body)
         }
-        _ => false,
+        once => nested && super::eval_generic::yq_stage_built_once(once),
     }
 }
 
@@ -5967,7 +6020,9 @@ fn reemit_always_answers(expr: &Expr) -> bool {
             reemit_always_answers(left) && reemit_always_answers(right)
         }
         Expr::Alternative(left, _) => reemit_always_answers(left),
-        _ => false,
+        // #8075: a layout that answers nothing raises, so the call answers when its body does.
+        Expr::Builtin(Builtin::WithDtf(_, body)) => reemit_always_answers(body),
+        once => super::eval_generic::yq_stage_built_once(once),
     }
 }
 
@@ -5977,6 +6032,7 @@ fn reemit_always_answers(expr: &Expr) -> bool {
 /// while `.b == 2` and `1 + .b` are nothing -- so the operator declines and
 /// the ordinary evaluator answers it (the empty-operand table, #2460).
 fn reemit_operands(left: &Expr, right: &Expr, scope: ReemitScope<'_>) -> Option<(Expr, Expr)> {
+    let scope = scope.nest();
     Some((
         yq_empty_context_reemit_in(left, scope)?,
         yq_empty_context_reemit_in(right, scope)?,
@@ -128820,6 +128876,65 @@ mod tests {
             reemit_always_answers(&yq_empty_input_reemit(&expr).expect(src))
         };
         assert!(!input_answers("1 as $x ireduce (0; .)"));
+        // #8075: a stage yq builds once answers, and a `with_dtf` when its body does.
+        for src in [
+            "now + \"1h\"",
+            "{\"t\": strenv(X)}",
+            "with_dtf(\"2006\"; \"x\")",
+            "with_dtf(strenv(X); \"x\")",
+        ] {
+            assert!(answers(src), "`{src}`");
+        }
+        assert!(!answers("with_dtf(\"2006\"; \"x\" | select(false))"));
+    }
+
+    /// #8075: inside an operand, an object, a binding, a fold or a `with_dtf`, a stage yq builds
+    /// once over its context (`now`, `env(NAME)`, `strenv(NAME)`) answers over an empty one as a
+    /// literal does, and a `with_dtf` re-emits what its layout and body do. As a stage of its own,
+    /// through parentheses, pipes and commas, it is left to the walk, which answers it already.
+    #[test]
+    fn test_yq_empty_context_reemit_once_stages_8075() {
+        let yq = |src: &str| crate::jq::parse_with_mode(src, ParserMode::Yq).unwrap();
+        let reemit = |src: &str| yq_empty_context_reemit(&yq(src));
+        let is = |src: &str, want: &str| assert_eq!(reemit(src), Some(yq(want)), "`{src}`");
+        is("now + \"1h\"", "now + \"1h\"");
+        is("{\"t\": now}", "{\"t\": now}");
+        is("{\"t\": {\"u\": env(X)}}", "{\"t\": {\"u\": env(X)}}");
+        is("strenv(X) == \"hi\"", "strenv(X) == \"hi\"");
+        is("strenv(X) // 1", "strenv(X) // 1");
+        is("error(strenv(X))", "error(strenv(X))");
+        is("\"a\" + (.b | strenv(X))", "\"a\" + strenv(X)");
+        is(". as $t | now", "now");
+        is("with_dtf(\"2006\"; \"x\")", "with_dtf(\"2006\"; \"x\")");
+        is("with_dtf(\"2006\"; [now])", "with_dtf(\"2006\"; [])");
+        is("with_dtf(\"2006\"; .a, \"x\")", "with_dtf(\"2006\"; \"x\")");
+        is(
+            "with_dtf(strenv(X); now + \"1h\")",
+            "with_dtf(strenv(X); now + \"1h\")",
+        );
+        is(
+            "{\"t\": with_dtf(\"2006\"; now)}",
+            "{\"t\": with_dtf(\"2006\"; now)}",
+        );
+        assert!(reemit("{(strenv(X)): 1}").is_some());
+        assert!(reemit("{\"a\": (strenv(X), 1)}").is_some());
+        // The walk's own stages, and what reads the empty context.
+        for src in [
+            "now",
+            "strenv(X)",
+            "(env(X))",
+            ".a | now",
+            "now, .a",
+            "with_dtf(\"2006\"; now)",
+            "with_dtf(\"2006\"; now | tostring)",
+            "with_dtf(\"2006\"; .)",
+            "with_dtf(.fmt; \"x\")",
+            "now + .a",
+            "{\"t\": now, \"u\": .}",
+        ] {
+            assert_eq!(reemit(src), None, "`{src}`");
+            assert!(!yq_stage_can_reemit(&yq(src)), "`{src}`");
+        }
     }
 
     /// #8044: over an empty context yq evaluates a binding's body once per output of its source
@@ -129009,6 +129124,19 @@ mod tests {
             ".[] as $x ireduce (0; . + 1)",
             "1 as $x ireduce (.; 1)",
             ".[] as $x ireduce (0; . + ($x | key))",
+            // #8075: stages yq builds once, inside a stage and as one.
+            "now",
+            "now + \"1h\"",
+            "{\"t\": now}",
+            "{(strenv(X)): 1}",
+            "(.b | env(X)) + 1",
+            ". as $t | now",
+            "now as $t | $t",
+            ".[] as $x ireduce (now; .)",
+            "with_dtf(\"2006\"; \"x\")",
+            "with_dtf(\"2006\"; now)",
+            "with_dtf(.fmt; \"x\")",
+            "{\"t\": with_dtf(\"2006\"; now)}",
         ];
         for src in corpus {
             let expr = crate::jq::parse_with_mode(src, ParserMode::Yq).unwrap();
