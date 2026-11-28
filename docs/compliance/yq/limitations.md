@@ -4398,6 +4398,20 @@ succinctly until spine 2416's identity pass ran map-family bodies at each member
 position (before it, a `parent` inside such a body was refused by every route and answered
 from no position at all).
 
+An update whose target is its own input (`. |= f`, which `with(PATH; . |= f)` is) reads `key` and `parent` at that input since [#8039](https://github.com/rust-works/succinctly/issues/8039): `with(.b; . |= key)` writes `"b"`, and `with(.a.b; . |= (parent | keys))` writes the keys of `.a`, as in yq (pinned in `tests/yq_cli/i8039.rs`).
+Before it `key` answered nothing there and the target was left as it was.
+Whether a value a stage builds has a position is the owned identity rule's answer, the one a read gets (`.x | (map(.) | path)` is `[]`): an update that value reaches stands at the value's own path and not under the enclosing update's, so `.x |= (.b |= (5 | . |= path))` and `.x |= (map(.) | (. |= path))` write `[]` and `.x |= ({} | .k | (. |= path))` writes `["k"]`, as in yq, a variable bound from such a value included (`.x |= (keys | .[0] as $v | $v | . |= path)` writes `[0]`).
+An update whose own reads cannot all be resolved at its target still names no position for its filter, as before #8039: the updates nested in it read the enclosing update's prefix, plus what a stage that hands the position on adds, and take no `key` or `parent` from that prefix itself.
+So `.x |= (.b |= (.c | . |= path))` writes `["x","c"]` where yq writes `["x","b","c"]`, `.x |= (.d // 3 | (. |= path))` writes `["d"]` where yq writes `["x","d"]`, `.x |= (to_entries | (. |= path))` writes `[]` where yq writes `["x"]`, and `.x |= (.b |= (5 | . |= path) | .d |= path)` writes `d: ["d"]` where yq writes `["x","d"]`; those rows are pinned with yq's answer in `tests/yq_cli/i8039.rs`.
+Where the owned identity rule places a value differently from yq, the update follows the rule, and two shapes that answered as yq does before #8039 (from no position at all) now answer as the read does.
+`.b.c + 1` over an absent `.b.c` has no position in yq and stands at its left operand here: `.x | .b | (.b.c + 1 | key)` is `"c"` here and nothing in yq, and `.x |= (.b |= (.b.c + 1 | . |= key))` on `{"x":{"b":{"c":1},"d":2}}` now writes `"c"` where yq leaves `1`.
+An `ireduce` over a source that yields nothing answers INIT, which has no position in yq, and keeps the source's here: `.x | (.d // 3 | .[]? as $v ireduce (0; $v) | key)` is `"d"` here and nothing in yq, and `.x |= (.d // 3 | .[]? as $v ireduce (0; $v) | . |= key)` now writes `"d"` where yq writes `0`.
+Both are pinned in `tests/yq_cli/i8039.rs` with the read rows, so a fix to the rule changes them together.
+Other shapes still differ, as before #8039.
+A read of the update's own filter after a write in it is not positioned, because the write is taken to move the position: `.b |= (.x = 1 | key)` leaves `5` where yq writes `"b"`.
+A nested update reached through a pipe stage rather than an update's body climbs no `parent` above its own input: `.a.b | . |= (parent | keys)` leaves `.a.b` as it was, where yq writes `["b","d"]`.
+A `parent` read by an update nested in one that names no position for its filter climbs nothing: `.x |= (.b |= (.b | . |= (parent | keys)))` writes `null` where yq, which creates `.b.b` on the way, writes `["c","b"]`, and `.zz |= (.q | . |= (parent | kind))` writes `null` where yq writes `"map"`.
+
 `line`/`column` inside an update filter are **not** covered: they are answered from a
 cursor, not from a path, and no cursor reaches the filter. `.a | .b |= line` is `2` in real
 yq and `0` in succinctly — a separate, pre-existing gap, not one #2522 touches.

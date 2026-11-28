@@ -46706,14 +46706,15 @@ fn test_owned_identity_rules_match_yq_2416() -> Result<()> {
     // 2026-09-07 (`cap/yq1.txt`..`yq3.txt` in the pass's capture set); the
     // eager evaluator answered 29 of them differently, all of them now
     // matching. Ten captured rows are deliberately absent because the
-    // difference is a divergence recorded elsewhere, not this route's:
+    // difference was a divergence recorded elsewhere, not this route's:
     // `.a.b | first(key)` (#2377), `[.. | key]` (#2428), `.a.x | parent +
     // {}` / `.a.x | (key, parent)` / `.a.x | {"k": parent}` / `.a.x | (parent
     // | length) == 2` (#2435 vivification), `"k=\\(key)-\\(path)"` and
     // `"\\(parent)"` (yq renders a container inside a string as YAML, a
     // formatting divergence with no position in it), `.a | .b |= parent`
     // (yq's in-place-rewrite artefact, `docs/compliance/yq/limitations.md`)
-    // and `.a.b | . |= key` (`update_path`'s own input position, #2522).
+    // and `.a.b | . |= key` (`update_path`'s own input position, #2522; it
+    // agrees since #8039, pinned in `tests/yq_cli/i8039.rs`).
     for (filter, expected) in IDENTITY_PASS_ROWS_2416 {
         let (output, code) = run_yq_stdin(filter, IDENTITY_PASS_DOC_2416, args)?;
         assert_eq!(code, 0, "{filter}");
