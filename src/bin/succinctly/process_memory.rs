@@ -111,9 +111,8 @@ fn physical() -> Option<usize> {
 fn cgroup() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
-        let v2 = std::fs::read_to_string("/proc/self/cgroup")
-            .ok()
-            .and_then(|groups| cgroup_v2_path(&groups))
+        let groups = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        let v2 = cgroup_v2_path(&groups)
             .and_then(|path| {
                 std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.max")).ok()
             })
