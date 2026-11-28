@@ -593,9 +593,10 @@ fn refusal(name: &str, arity: usize) -> Raise {
 /// The refusal of a run whose process holds more than its memory limit (#8064): its own wording,
 /// naming the definition (`f/0: memory limit exceeded`), as nothing need recurse to reach it.
 fn memory_refusal(name: &str, arity: usize) -> Raise {
+    let name = name.strip_prefix("_sp_").unwrap_or(name);
     Raise::Fatal(EvalError::resource_limit(format!(
         "{}/{arity}: memory limit exceeded",
-        name.strip_prefix("_sp_").unwrap_or(name),
+        super::super::resolve::ModuleRun::display_name(name),
     )))
 }
 
@@ -905,7 +906,7 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[cold]
     #[inline(never)]
     fn grow_data(&mut self) -> Result<(), Raise> {
-        if !self.growth_fits(bytes_of(&self.data.data)) {
+        if !self.growth_fits(bytes_of(&self.data.data), false) {
             return Err(self.current_def());
         }
         let used = self.bytes();
@@ -922,7 +923,7 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[cold]
     #[inline(never)]
     fn grow_frames(&mut self) -> Result<(), ()> {
-        if !self.growth_fits(bytes_of(&self.frames.data)) {
+        if !self.growth_fits(bytes_of(&self.frames.data), false) {
             return Err(());
         }
         let used = self.bytes();
@@ -939,7 +940,7 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[inline(never)]
     fn grow_slots(&mut self, room: usize) -> Result<(), ()> {
         while self.slots_cap - self.slots.len() < room {
-            if !self.growth_fits(bytes_of(&self.slots)) {
+            if !self.growth_fits(bytes_of(&self.slots), false) {
                 return Err(());
             }
             let used = self.bytes();
@@ -983,7 +984,7 @@ impl<'c, 'e> Vm<'c, 'e> {
             return Ok(());
         }
         let old = bytes_of(items);
-        if !self.growth_fits(old) {
+        if !self.growth_fits(old, true) {
             return Err(self.current_def());
         }
         let Slot::Acc(items) = &mut self.slots[at] else {
@@ -1000,10 +1001,12 @@ impl<'c, 'e> Vm<'c, 'e> {
     /// bytes to grow: its elements are moved into the new block while the old one is still held,
     /// so for that moment the process holds `old` bytes more (#8064). Asked of every growth of a
     /// stack or an accumulator, which is rare and moves the process's memory by more than any one
-    /// check point does; past it the run is refused with the memory wording.
+    /// check point does. An accumulator's refusal is the memory bound's (`memory`), with its
+    /// wording; a control stack's is a deep recursion's, with the recursion wording, as past the
+    /// control-state budget.
     #[cold]
     #[inline(never)]
-    fn growth_fits(&mut self, old: usize) -> bool {
+    fn growth_fits(&mut self, old: usize, memory: bool) -> bool {
         let Some(probe) = self.limits.memory else {
             return true;
         };
@@ -1013,14 +1016,14 @@ impl<'c, 'e> Vm<'c, 'e> {
         if now.saturating_add(old) <= probe.limit {
             return true;
         }
-        self.memory_over = true;
+        self.memory_over = memory;
         false
     }
 
     #[cold]
     #[inline(never)]
     fn grow_forks(&mut self) -> Result<(), Raise> {
-        if !self.growth_fits(bytes_of(&self.forks)) {
+        if !self.growth_fits(bytes_of(&self.forks), false) {
             return Err(self.current_def());
         }
         let used = self.bytes();
