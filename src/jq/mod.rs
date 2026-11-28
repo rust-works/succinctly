@@ -177,7 +177,7 @@ pub use eval::{go_query_unescape, go_quote_bytes};
 pub use eval::yq_parse_int64;
 // #8020: whether a yq `select` condition can read a node differently on the owned value.
 #[doc(hidden)]
-pub use eval::yq_condition_reads_differently_on_owned;
+pub use eval::{yq_condition_reads_differently_on_owned, yq_owned_document, OwnedDocumentShape};
 #[doc(hidden)]
 pub use glob::yq_match_key;
 // #6560: the CLI's switch for reading `$ENV` once; `std` only, like the `thread_local!` behind it.

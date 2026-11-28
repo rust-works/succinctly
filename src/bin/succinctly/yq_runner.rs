@@ -7888,7 +7888,7 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
                 inexact |= detached
                     || jq::yq_condition_reads_differently_on_owned(
                         cond,
-                        cursor.index().has_aliases(),
+                        jq::yq_owned_document::current(),
                     );
                 detached
                     || jq::walk::any_subexpr(cond, &mut |e| {
@@ -7921,21 +7921,25 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
     });
     let tail_needs_cursor = !tail.is_empty()
         && descends
-        && cursor.index().has_aliases()
+        && jq::yq_owned_document::current().aliases_or_merge_keys
         && navigation.iter().all(|stage| is_pure_navigation(stage));
     if !(filters || tail_needs_cursor) || fresh_start {
         return None;
     }
     let navigation_expr = Expr::pipe(navigation.iter().map(|stage| (*stage).clone()).collect());
-    let refusal = || {
+    let refusal = |why: &str| {
         Some(Expr::Error(Some(Box::new(Expr::Literal(Literal::String(
-            "Invalid path expression: a target that selects by node metadata must only navigate \
-             and filter here"
-                .into(),
+            format!("Invalid path expression: {why}").into(),
         ))))))
     };
-    if inexact || !navigates_and_filters_only(&navigation_expr) {
-        return refusal();
+    if inexact {
+        return refusal(
+            "this document holds what yq reads differently in that selection (an alias, a merge \
+             key, a spelled true/false/null, or eval)",
+        );
+    }
+    if !navigates_and_filters_only(&navigation_expr) {
+        return refusal("a target that selects by node metadata must navigate and filter only");
     }
     let query = Expr::Pipe(vec![navigation_expr, Expr::Builtin(Builtin::PathNoArg)].into());
     let mut scratch = ErrorSink::default();
@@ -7951,16 +7955,17 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
     // A selection the cursor cannot finish (`select(style == "" or (. - 1) > 0)` over a string, an
     // error in yq too) is not run as written instead: the owned value would answer its metadata
     // reads with their defaults and keep nodes yq leaves, which a write then overwrites.
+    let unresolved = "the selection could not be resolved on the document";
     let Ok(results) = results else {
-        return refusal();
+        return refusal(unresolved);
     };
     if scratch.hit() {
-        return refusal();
+        return refusal(unresolved);
     }
     let mut matched = Vec::with_capacity(results.len());
     for (path, _) in &results {
         let Some(at) = navigation_for(path) else {
-            return refusal();
+            return refusal(unresolved);
         };
         let at_root = matches!(at, Expr::Identity);
         // The root has no key, and a reader's answer at the root has none either: a tail with
@@ -9766,7 +9771,43 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
                 .and_then(jq::enter_document_index_scope)
         })
         .flatten();
+    // #8020: what this document holds that the owned value reads differently than yq, for a write
+    // or `del()` whose target selects or descends: the evaluator's reader-tail rewrite and the
+    // cursor resolution below both decline a condition, or a `..`, only where the document can
+    // make it answer differently. Measured only for such a program, since finding spelled
+    // scalars reads every value.
+    let _owned_shape = writes_through_a_filter_or_descent(expr).then(|| {
+        jq::yq_owned_document::enter(jq::OwnedDocumentShape {
+            aliases_or_merge_keys: cursor.index().has_aliases()
+                || succinctly::yaml::may_hold_merge_keys(cursor),
+            spelled_bool_or_null: succinctly::yaml::holds_spelled_bool_or_null(cursor),
+        })
+    });
     evaluate_yaml_cursor_in_document(cursor, expr, sink, need_comments, strip_style, sort_keys)
+}
+
+/// Whether `expr` writes or deletes, and holds a `select` (or yq's `first(f)`/`last(f)`) or a `..`
+/// (#8020).
+fn writes_through_a_filter_or_descent(expr: &Expr) -> bool {
+    let mut selects = false;
+    let mut writes = false;
+    jq::walk::any_subexpr(expr, &mut |e| {
+        match e {
+            Expr::Builtin(Builtin::Select(_))
+            | Expr::FirstExpr(_)
+            | Expr::LastExpr(_)
+            | Expr::RecursiveDescent
+            | Expr::RecursiveDescentWithKeys => selects = true,
+            Expr::Builtin(Builtin::Del(_))
+            | Expr::Assign { .. }
+            | Expr::Update { .. }
+            | Expr::CompoundAssign { .. }
+            | Expr::AlternativeAssign { .. }
+            | Expr::MetaAssign { .. } => writes = true,
+            _ => {}
+        }
+        selects && writes
+    })
 }
 
 /// [`evaluate_yaml_cursor`] inside the document scope it installs.

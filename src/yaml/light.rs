@@ -6624,6 +6624,57 @@ fn for_each_merge_source<'a, W: AsRef<[u64]>>(
     }
 }
 
+/// Whether `cursor`'s document may hold a merge key (`<<`), which the owned value expands into
+/// the mapping that holds it (#8020): the same proof [`collect_merged_members`] and the mapping
+/// reads take, so `false` means none and `true` only that one might.
+#[must_use]
+pub fn may_hold_merge_keys<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> bool {
+    cursor.index.may_have_merge_keys(cursor.text)
+}
+
+/// Whether `cursor`'s document holds a `null` or a boolean that yq reads by a text other than the
+/// canonical `null`/`true`/`false` (#8020): `~`, `Null`, `NULL`, an empty value, `True`, `TRUE`,
+/// `False`, `FALSE`. yq compares such a scalar by its text (`True == true` is false there, and `~
+/// | tostring` is `"~"`), where the owned value and the cursor read the value it resolved to. A
+/// document with an explicit tag answers `true` as well: a tag can force either kind. The walk
+/// visits every value once, without recursion.
+#[must_use]
+pub fn holds_spelled_bool_or_null<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> bool {
+    if cursor.index.has_explicit_tags() {
+        return true;
+    }
+    let mut pending = vec![cursor];
+    while let Some(node) = pending.pop() {
+        match node.value() {
+            YamlValue::Null => return true,
+            YamlValue::String(text) => {
+                if text.is_unquoted()
+                    && text.as_str().is_ok_and(|t| {
+                        matches!(
+                            &*t,
+                            "True" | "TRUE" | "False" | "FALSE" | "~" | "Null" | "NULL"
+                        )
+                    })
+                {
+                    return true;
+                }
+            }
+            YamlValue::Mapping(_) => {
+                pending.extend(YamlFields::raw(node.first_child()).map(|f| f.value_cursor()));
+            }
+            YamlValue::Sequence(elements) => {
+                let mut rest = elements;
+                while let Some((element, next)) = rest.uncons_cursor() {
+                    pending.push(element);
+                    rest = next;
+                }
+            }
+            YamlValue::Alias { .. } | YamlValue::Error(_) => {}
+        }
+    }
+    false
+}
+
 /// The members `<<` merges bring into the mappings of the document `cursor` roots, each with the
 /// position of the node a write through it lands on and the node its value is copied from (#6785).
 ///

@@ -83760,7 +83760,8 @@ fn yq_slot_rewrite_is_sound(navigation: &[Expr], tail: &[Expr]) -> bool {
     let key_after_key = tail
         .windows(2)
         .any(|pair| is_key(&pair[0]) && is_key(&pair[1]));
-    let walks_through_aliases = alias_identity::active()
+    let walks_through_aliases = (alias_identity::active()
+        || yq_owned_document::current().aliases_or_merge_keys)
         && navigation.iter().any(|stage| {
             any_subexpr(stage, &mut |e| {
                 matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys)
@@ -83818,17 +83819,88 @@ fn yq_condition_is_value_only(cond: &Expr) -> bool {
     }
 }
 
+/// What a yq document holds that the owned value reads differently than yq does (#8020), so a
+/// values-only `select` over it can keep a node yq leaves. The document route measures it once per
+/// document ([`yq_owned_document::enter`]); without a document to measure, every part is assumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedDocumentShape {
+    /// An alias or a merge key: the owned value expanded both, where yq's `has`, `length`, `keys`,
+    /// `contains`, `test` and the string predicates see the alias node, and a merge key's
+    /// members are not the mapping's own.
+    pub aliases_or_merge_keys: bool,
+    /// A `null` or boolean spelled other than `null`/`true`/`false` (`~`, `True`, an empty value):
+    /// yq compares a scalar by its text, the owned value by what it resolved to.
+    pub spelled_bool_or_null: bool,
+}
+
+impl OwnedDocumentShape {
+    /// Every part assumed: the shape of a document nothing measured.
+    pub const UNKNOWN: Self = Self {
+        aliases_or_merge_keys: true,
+        spelled_bool_or_null: true,
+    };
+}
+
+/// The [`OwnedDocumentShape`] of the document a yq evaluation runs over (#8020), ambient for the
+/// reason [`yq_delete_context`] is: the `del()` rewrite that asks sits many levels below the runner
+/// that knows. `std` only; without it every part is assumed.
+#[cfg(feature = "std")]
+pub mod yq_owned_document {
+    use super::OwnedDocumentShape;
+    use std::cell::Cell;
+
+    thread_local! {
+        static SHAPE: Cell<Option<OwnedDocumentShape>> = const { Cell::new(None) };
+    }
+
+    /// The shape of the document being evaluated, or [`OwnedDocumentShape::UNKNOWN`].
+    pub fn current() -> OwnedDocumentShape {
+        SHAPE.with(Cell::get).unwrap_or(OwnedDocumentShape::UNKNOWN)
+    }
+
+    /// Restores the previous shape on drop.
+    #[must_use]
+    pub struct Guard(Option<OwnedDocumentShape>);
+
+    /// Record `shape` for the evaluation the guard lives for.
+    pub fn enter(shape: OwnedDocumentShape) -> Guard {
+        Guard(SHAPE.with(|c| c.replace(Some(shape))))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SHAPE.with(|c| c.set(self.0));
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub mod yq_owned_document {
+    use super::OwnedDocumentShape;
+
+    pub fn current() -> OwnedDocumentShape {
+        OwnedDocumentShape::UNKNOWN
+    }
+
+    pub struct Guard;
+
+    pub fn enter(_shape: OwnedDocumentShape) -> Guard {
+        Guard
+    }
+}
+
 /// Whether a values-only `select` condition can still answer differently on the owned value than on
-/// yq's document (#8020), which keeps a node yq leaves:
+/// yq's document of the given `shape` (#8020), which keeps a node yq leaves:
 ///
-/// - The owned value lost scalar spellings: yq compares a scalar's text, so `True == true` and
-///   `True != "True"` are both false there, and `~ | tostring` is `"~"`. So `tostring`, and a `!=`
-///   or an `==` against `true`, `false` or `null` over a node's own value, count.
-/// - With `aliased`, the owned value expanded aliases and merge keys: yq's `has`, `length`, `keys`,
-///   `tostring`, `contains`, `test` and the string predicates see an alias node itself
-///   (`*x | has("p")` is false in yq). Those count too.
+/// - With [`OwnedDocumentShape::spelled_bool_or_null`]: yq compares a scalar's text, so `True ==
+///   true`, `True == "true"` and `True != "True"` are all false there, and `~ | tostring` is
+///   `"~"`. So `tostring`, and an `==` or `!=` between a node's own value and a literal `null`,
+///   boolean or string, count.
+/// - With [`OwnedDocumentShape::aliases_or_merge_keys`]: yq's `has`, `length`, `keys`, `tostring`,
+///   `contains`, `test` and the string predicates see an alias node itself (`*x | has("p")` is
+///   false in yq), and a merge key's members are not the mapping's own. Those count.
 #[doc(hidden)]
-pub fn yq_condition_reads_differently_on_owned(cond: &Expr, aliased: bool) -> bool {
+pub fn yq_condition_reads_differently_on_owned(cond: &Expr, shape: OwnedDocumentShape) -> bool {
     use Builtin as B;
     // An operand that reads a node's own value, which is what yq compares by its text; a
     // metadata reader's answer (`style != ""`) is a fresh string, the same in both.
@@ -83845,18 +83917,20 @@ pub fn yq_condition_reads_differently_on_owned(cond: &Expr, aliased: bool) -> bo
             _ => false,
         }
     }
-    let nullish = |e: &Expr| {
+    let textual = |e: &Expr| {
         matches!(
             unwrap_paren(e),
-            Expr::Literal(Literal::Null | Literal::Bool(_))
+            Expr::Literal(Literal::Null | Literal::Bool(_) | Literal::String(_))
         )
     };
+    let spelled = shape.spelled_bool_or_null;
+    let aliased = shape.aliases_or_merge_keys;
     any_subexpr(cond, &mut |e| match e {
-        Expr::Builtin(B::ToString) => true,
+        Expr::Builtin(B::ToString) => spelled || aliased,
         Expr::Compare { op, left, right } => {
-            (node_value(left) || node_value(right))
-                && (matches!(op, CompareOp::Ne)
-                    || (matches!(op, CompareOp::Eq) && (nullish(left) || nullish(right))))
+            spelled
+                && matches!(op, CompareOp::Eq | CompareOp::Ne)
+                && ((node_value(left) && textual(right)) || (node_value(right) && textual(left)))
         }
         Expr::Builtin(
             B::Has(_)
@@ -83894,7 +83968,7 @@ fn yq_owned_navigation_is_exact(stage: &Expr) -> bool {
         | Expr::RecursiveDescentWithKeys => true,
         Expr::Builtin(Builtin::Select(cond)) => {
             yq_condition_is_value_only(cond)
-                && !yq_condition_reads_differently_on_owned(cond, alias_identity::active())
+                && !yq_condition_reads_differently_on_owned(cond, yq_owned_document::current())
         }
         Expr::Optional(inner) | Expr::Paren(inner) => yq_owned_navigation_is_exact(inner),
         Expr::Pipe(stages) => stages.iter().all(yq_owned_navigation_is_exact),
@@ -185472,39 +185546,62 @@ mod del_reader_rewrite_allowlist_8020 {
 
     #[test]
     fn a_value_the_owned_document_holds_differently_is_flagged() {
-        // Scalar spellings: yq compares a scalar's text.
+        let plain = OwnedDocumentShape {
+            aliases_or_merge_keys: false,
+            spelled_bool_or_null: false,
+        };
+        let spelled = OwnedDocumentShape {
+            spelled_bool_or_null: true,
+            ..plain
+        };
+        let aliased = OwnedDocumentShape {
+            aliases_or_merge_keys: true,
+            ..plain
+        };
+        // Scalar spellings: yq compares a scalar's text, on a document that spells one.
         for cond in [
             ". == true",
             "null == .",
             "(.a)? == false",
             ".a | . != \"x\"",
+            ". == \"true\"",
+            ".[0] == \"false\"",
             "tostring == \"null\"",
         ] {
             assert!(
-                yq_condition_reads_differently_on_owned(&condition(cond), false),
+                yq_condition_reads_differently_on_owned(&condition(cond), spelled),
+                "{cond}"
+            );
+            assert!(
+                !yq_condition_reads_differently_on_owned(&condition(cond), plain),
                 "{cond}"
             );
         }
-        // An alias node itself, on a document with aliases only.
+        // An alias node itself, or a merge key's members, on a document with one.
         for cond in [
             "has(\"p\")",
             "length == 1",
             "test(\"p\")",
             "keys | length > 0",
+            "tostring | test(\"p\")",
         ] {
             assert!(
-                !yq_condition_reads_differently_on_owned(&condition(cond), false),
+                !yq_condition_reads_differently_on_owned(&condition(cond), plain),
                 "{cond}"
             );
             assert!(
-                yq_condition_reads_differently_on_owned(&condition(cond), true),
+                yq_condition_reads_differently_on_owned(&condition(cond), aliased),
                 "{cond}"
             );
         }
-        // A metadata reader's answer is a fresh string, and ordering compares read the value.
+        // A metadata reader's answer is a fresh string, and ordering compares and numbers read the
+        // value as yq does.
         for cond in ["style != \"\"", ". > 1", ".a == 1", "1 == 2"] {
             assert!(
-                !yq_condition_reads_differently_on_owned(&condition(cond), true),
+                !yq_condition_reads_differently_on_owned(
+                    &condition(cond),
+                    OwnedDocumentShape::UNKNOWN
+                ),
                 "{cond}"
             );
         }
