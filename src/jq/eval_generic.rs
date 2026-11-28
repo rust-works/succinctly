@@ -24870,11 +24870,27 @@ fn yq_head_built_once(expr: &Expr) -> bool {
 /// argument the whole context and returns what it answers (`(E)` is a parenthesis, which both
 /// predicates already look through). [`yq_stage_built_once`] (the context-list walk) and the
 /// parser's `yq_stage_head_once` and `yq_once_wrapper_split` (its once-stage rewrite) all ask it.
+///
+/// Only a layout that reads no node counts (a literal, a `$name`, `env(NAME)` or `strenv(NAME)`):
+/// yq reads the layout once over the whole context and uses its first answer, which a once-stage
+/// evaluated over a stand-in cannot reproduce for `with_dtf(.fmt; now)`, so such a call stays per
+/// node, as it was before #8028.
 pub(super) fn yq_once_wrapper_body(stage: &Expr) -> Option<&Expr> {
     match stage {
-        Expr::Builtin(Builtin::WithDtf(_, body)) => Some(body),
+        Expr::Builtin(Builtin::WithDtf(layout, body)) if yq_layout_reads_no_node(layout) => {
+            Some(body)
+        }
         _ => None,
     }
+}
+
+/// Whether a `with_dtf` layout reads nothing of the node it is evaluated over
+/// ([`yq_once_wrapper_body`]).
+fn yq_layout_reads_no_node(layout: &Expr) -> bool {
+    matches!(
+        unwrap_paren(layout),
+        Expr::Literal(_) | Expr::Var(_) | Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_))
+    )
 }
 
 /// Whether `expr` is, or is a stage of, a stage yq builds once however many nodes reach it

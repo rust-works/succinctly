@@ -2933,7 +2933,8 @@ fn yq_stage_head_once(stage: &Expr, env_args_pseudo: bool) -> bool {
 /// flat stage list, which [`yq_splice_stage`] collects and [`yq_once_wrapper_splits`] scans.
 fn yq_visit_flat_stages(stage: &Expr, visit: &mut dyn FnMut(&Expr) -> bool) -> bool {
     match stage {
-        Expr::Paren(inner) if matches!(**inner, Expr::Pipe(_)) => {
+        // `((A | B))` is `A | B` too, however many parentheses stand around it.
+        Expr::Paren(inner) if matches!(super::eval::unwrap_paren(inner), Expr::Pipe(_)) => {
             yq_visit_flat_stages(inner, visit)
         }
         Expr::Pipe(inner) => inner.iter().any(|stage| yq_visit_flat_stages(stage, visit)),
@@ -15020,6 +15021,14 @@ mod tests {
             (l("."), None),
             (l("[now]"), None),
             (l("now, now"), None),
+            // A layout that reads the node keeps the call per node.
+            (
+                Expr::Builtin(Builtin::WithDtf(
+                    Box::new(jq(".fmt")),
+                    Box::new(jq("test(\"A\") | now")),
+                )),
+                None,
+            ),
             (l("test(\"A\") | now"), Some((l("test(\"A\")"), l("now")))),
             (
                 l("ascii_downcase | (strenv(X) | tostring) | length"),

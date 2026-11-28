@@ -1546,17 +1546,19 @@ yq also tags the node `!!timestamp`, which an owned value cannot carry ([#2802](
 ### `with_dtf(layout; f)` over a once-stage is answered once ([#8028](https://github.com/rust-works/succinctly/issues/8028))
 
 yq's `withDateTimeFormat` sets the layout and evaluates `f` over the whole context it was given, not once per node.
-So a `with_dtf` whose `f` holds a stage yq answers once for its whole context (`now`, `env(NAME)`, `strenv(NAME)`, `{}`, a `$name`) is answered once too: `[.x[] | with_dtf("2006"; now)] | length` is `1`, and so is `with_dtf("2006"; select(true) | now)`.
+So a `with_dtf` whose `f` holds a stage yq answers once for its whole context, under a layout that reads no node, (`now`, `env(NAME)`, `strenv(NAME)`, `{}`, a `$name`) is answered once too: `[.x[] | with_dtf("2006"; now)] | length` is `1`, and so is `with_dtf("2006"; select(true) | now)`.
 `succinctly yq` follows that through the walk and the parser rewrite above, which look through `with_dtf` to its body (`yq_once_wrapper_body`).
 Stages of the body before its once-stage still run over every node, as in yq: the rewrite cuts `with_dtf(L; P | now)` into `with_dtf(L; P)`, run over each node for its errors, and `with_dtf(L; now)`, answered once, so `[.s[] | with_dtf("2006"; test("A") | now)]` is one value and `[.x[] | with_dtf("2006"; split("x") | now)]` over integers raises `cannot split` in both.
 The three differences recorded for `env(NAME)` hold for such a call too: `limit(1; repeat(1) | with_dtf("2006"; now))` under `--jq-extensions` runs `repeat` to its limit, and `with_dtf("2006"; now) | document_index` over three documents is `0 1 2` here and `0 0 0` in yq.
 Any other body is still read once per node, which differs from yq wherever the body's answer depends on the whole list.
-- **A union in the body.**
+- **A union in the body** ([#8076](https://github.com/rust-works/succinctly/issues/8076)).
   `[.x[] | with_dtf("2006"; ., 0)]` over `x: [1, 2, 3]` is `[1,2,3,0,0,0]` in yq, branch-major over the list, and `[1,0,2,0,3,0]` here.
   `[.x[] | with_dtf("2006"; now, now)]` holds two values in yq and six here.
-- **A body that answers over an empty context.**
+- **A body that answers over an empty context** ([#8075](https://github.com/rust-works/succinctly/issues/8075)).
   `[.x[] | select(false) | with_dtf("2006"; "x")]` is `["x"]` in yq, as `[.x[] | select(false) | "x"]` is in both, and `[]` here; `with_dtf("2006"; [now])` there is `[[]]` in yq and `[]` here.
-- **The layout of a call answered once** is read over `null` here, where yq reads it from the first node of the context, so a layout that reads the node (`with_dtf(.f; now)`) is the layout `null` here.
+- **A layout that reads the node.**
+  yq reads the layout once over the whole context and uses its first answer, so `[.x[] | with_dtf(.fmt; now)]` is one value in yq.
+  Here only a layout that reads no node (a literal, a `$name`, `env(NAME)` or `strenv(NAME)`) makes the call a once-stage, and `with_dtf(.fmt; now)` is still answered per node, each under its own node's layout: two values over two members.
 - A `{}` body in a write's right side is read per node, as a bare `{}` stage there is: `.y = [.x[] | with_dtf("2006"; {})]` writes three `{}` here and one in yq.
 
 ### Duplicate mapping keys — an owned value keeps every entry (#1344); a few narrower gaps remain

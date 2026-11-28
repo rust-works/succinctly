@@ -291,8 +291,6 @@ fn a_write_reads_with_dtf_over_a_once_stage_once_8028() -> Result<()> {
     Ok(())
 }
 
-/// `succinctly jq` keeps jq's per-value pipe for its `with_dtf` extension (jq 1.7.1 has no
-/// `with_dtf`): the body runs once per input.
 const PREFIX_INPUT: &str = "s: [A, B]\nm: [{a: 1}, {b: 2}]\nx: [1, 2, 3]\n";
 
 /// The stages of a body before its once-stage run over every node of the context, not over a
@@ -377,6 +375,54 @@ fn stages_before_the_once_stage_read_every_node_8028() -> Result<()> {
     Ok(())
 }
 
+const LAYOUT_INPUT: &str = "x: [{fmt: \"2006\", a: 1}, {fmt: \"2006\", a: 2}]\n";
+
+/// A layout that reads the node (`.fmt`) is read over the context's nodes, not over a stand-in: yq
+/// reads it once over the whole context, and here each call reads its own node, which agrees on
+/// every value (the count is recorded in `docs/compliance/yq/limitations.md`). A `$name` layout is
+/// answered once. (filter, yq's `-o json -I0` stdout) over [`LAYOUT_INPUT`].
+const LAYOUT_ROWS: &[(&str, &str)] = &[
+    (
+        "[.x[] | with_dtf(.fmt; .a | now | \"2001\" | format_datetime(\"Jan 2006\"))] | unique",
+        "[\"Jan 2001\"]\n",
+    ),
+    (
+        "[.x[] | with_dtf(.fmt | downcase; .a | now) | length] | unique",
+        "[20]\n",
+    ),
+    (
+        "\"2006\" as $f | [.x[] | with_dtf($f; .a | now)] | length",
+        "1\n",
+    ),
+    (
+        "\"2006\" as $f | [.x[] | with_dtf($f; .a | now | \"2001\" | format_datetime(\"Jan 2006\"))]",
+        "[\"Jan 2001\"]\n",
+    ),
+    // Parentheses around the body's pipe, however many, are the pipe.
+    ("[.x[] | with_dtf(\"2006\"; ((.a | now)))] | length", "1\n"),
+    ("[.x[] | with_dtf(\"2006\"; ((now)))] | length", "1\n"),
+    ("[.x[] | ((.a | strenv(X)))] | length", "1\n"),
+    (
+        ".y = [.x[] | with_dtf(\"2006\"; ((.a | strenv(X))))] | .y",
+        "[\"hi\"]\n",
+    ),
+];
+
+#[test]
+fn a_layout_that_reads_the_node_reads_the_nodes_8028() -> Result<()> {
+    for (filter, want) in LAYOUT_ROWS {
+        let got = run(&["-o", "json", "-I0"], filter, LAYOUT_INPUT)?;
+        assert_eq!(
+            (got.0.as_str(), got.1.as_str(), got.2),
+            (*want, "", 0),
+            "{filter}"
+        );
+    }
+    Ok(())
+}
+
+/// `succinctly jq` keeps jq's per-value pipe for its `with_dtf` extension (jq 1.7.1 has no
+/// `with_dtf`): the body runs once per input.
 #[test]
 fn jq_mode_reads_with_dtf_per_value_8028() -> Result<()> {
     for (filter, want) in [
