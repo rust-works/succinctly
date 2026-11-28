@@ -5594,11 +5594,12 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
                             // stringifies when it is built, as it does over a context with nodes
                             // (`select(false) | ("x" as $y | {$y: 1})` is `{"x": 1}`).
                             var @ Expr::Var(_) => ObjectKey::Expr(Box::new(var)),
-                            // #8075: and so is a stage yq builds once (`{(strenv(X)): 1}` is
-                            // `{"hi": 1}` there with `X=hi`).
-                            once if super::eval_generic::yq_stage_built_once(&once) => {
-                                ObjectKey::Expr(Box::new(once))
-                            }
+                            // #8075: and so is a builtin yq builds once (`{(strenv(X)): 1}` is
+                            // `{"hi": 1}` there with `X=hi`). Not a `{}`, which is not a key here
+                            // (`{({}): 1}`), nor a `with_dtf` around one.
+                            once @ Expr::Builtin(
+                                Builtin::Now | Builtin::EnvObject(_) | Builtin::StrEnv(_),
+                            ) => ObjectKey::Expr(Box::new(once)),
                             _ => return None,
                         }
                     }
@@ -128917,6 +128918,8 @@ mod tests {
             "{\"t\": with_dtf(\"2006\"; now)}",
         );
         assert!(reemit("{(strenv(X)): 1}").is_some());
+        assert_eq!(reemit("{({}): 1}"), None);
+        assert_eq!(reemit("{(with_dtf(\"2006\"; {})): 1}"), None);
         assert!(reemit("{\"a\": (strenv(X), 1)}").is_some());
         // The walk's own stages, and what reads the empty context.
         for src in [

@@ -4150,6 +4150,8 @@ A union is evaluated over the empty list branch by branch (`.a[] | (1, 2)` is `1
 Since [#8075](https://github.com/rust-works/succinctly/issues/8075) `now`, `env(NAME)` and `strenv(NAME)`, which yq builds once whatever the context holds, count as literals inside an operator, an object, a binding, a fold or an `error`: `select(false) | (now + "1h")`, `select(false) | {"t": strenv(X)}` and `select(false) | (. as $t | now)` are one value each in both.
 A `with_dtf(L; E)` counts when its layout and its body do (`select(false) | with_dtf("2006"; "x")` is `"x"`).
 An object or a collection emitted after an empty stage is printed with a `---` between the documents here, where yq prints none: `.x[] | select(false) | {"t": 1}` over `x: [1]` / `---` / `x: [2]` is `t: 1` twice without one in yq, which predates #8075 and holds for `{"t": strenv(X)}` and `with_dtf("2006"; {"a": 1})` too.
+So does a once-built stage behind `//` or as a fold's INIT, over a context with nodes too: `.x[0] | (now // .)` and `.x[0] | (.[] as $i ireduce (now; .))` print a `---` between the documents here and none in yq.
+`now` is a string here, not yq's `!!timestamp` ([#2802](https://github.com/rust-works/succinctly/issues/2802)), so the date arithmetic and comparisons yq refuses on it answer here after an empty stage as they do over a node: `select(false) | (now + "x")` raises `unable to parse duration` in yq and is a string here, as `.x[0] | (now + "x")` is.
 `succinctly jq` is unchanged: jq's pipe loops zero times over an empty stage.
 
 It is answered where the pipe is evaluated: the sink route counts what the pipe emitted and, when that is nothing, asks which stage's input was empty (the stages before it run once more, only then).
