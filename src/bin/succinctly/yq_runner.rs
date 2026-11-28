@@ -9774,30 +9774,39 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // #8020: what this document holds that the owned value reads differently than yq, for a write
     // or `del()` whose target selects or descends: the evaluator's reader-tail rewrite and the
     // cursor resolution below both decline a condition, or a `..`, only where the document can
-    // make it answer differently. Measured only for such a program, since finding spelled
-    // scalars reads every value.
-    let _owned_shape = writes_through_a_filter_or_descent(expr).then(|| {
+    // make it answer differently. Only the parts some condition consults are measured, and the
+    // spelled-scalar walk reads every value, so a `select(.score < 100)` pays for neither.
+    let _owned_shape = owned_shape_needs(expr).map(|needs| {
         jq::yq_owned_document::enter(jq::OwnedDocumentShape {
-            aliases_or_merge_keys: cursor.index().has_aliases()
-                || succinctly::yaml::may_hold_merge_keys(cursor),
-            spelled_bool_or_null: succinctly::yaml::holds_spelled_bool_or_null(cursor),
+            aliases_or_merge_keys: needs.aliases_or_merge_keys
+                && (cursor.index().has_aliases() || succinctly::yaml::may_hold_merge_keys(cursor)),
+            spelled_bool_or_null: needs.spelled_bool_or_null
+                && succinctly::yaml::holds_spelled_bool_or_null(cursor),
         })
     });
     evaluate_yaml_cursor_in_document(cursor, expr, sink, need_comments, strip_style, sort_keys)
 }
 
-/// Whether `expr` writes or deletes, and holds a `select` (or yq's `first(f)`/`last(f)`) or a `..`
-/// (#8020).
-fn writes_through_a_filter_or_descent(expr: &Expr) -> bool {
-    let mut selects = false;
+/// Which parts of the document's [`jq::OwnedDocumentShape`] a write or `del()` in `expr` can
+/// consult (#8020): the parts the `select` and `if` conditions read
+/// ([`jq::yq_condition_shape_needs`]), and the alias half for a `..`. `None` for a program that
+/// writes nothing or consults neither part, which then measures nothing.
+fn owned_shape_needs(expr: &Expr) -> Option<jq::OwnedDocumentShape> {
     let mut writes = false;
+    let mut needs = jq::OwnedDocumentShape {
+        aliases_or_merge_keys: false,
+        spelled_bool_or_null: false,
+    };
     jq::walk::any_subexpr(expr, &mut |e| {
         match e {
-            Expr::Builtin(Builtin::Select(_))
-            | Expr::FirstExpr(_)
-            | Expr::LastExpr(_)
-            | Expr::RecursiveDescent
-            | Expr::RecursiveDescentWithKeys => selects = true,
+            Expr::Builtin(Builtin::Select(cond)) | Expr::If { cond, .. } => {
+                let more = jq::yq_condition_shape_needs(cond);
+                needs.aliases_or_merge_keys |= more.aliases_or_merge_keys;
+                needs.spelled_bool_or_null |= more.spelled_bool_or_null;
+            }
+            Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys => {
+                needs.aliases_or_merge_keys = true;
+            }
             Expr::Builtin(Builtin::Del(_))
             | Expr::Assign { .. }
             | Expr::Update { .. }
@@ -9806,8 +9815,9 @@ fn writes_through_a_filter_or_descent(expr: &Expr) -> bool {
             | Expr::MetaAssign { .. } => writes = true,
             _ => {}
         }
-        selects && writes
-    })
+        false
+    });
+    (writes && (needs.aliases_or_merge_keys || needs.spelled_bool_or_null)).then_some(needs)
 }
 
 /// [`evaluate_yaml_cursor`] inside the document scope it installs.

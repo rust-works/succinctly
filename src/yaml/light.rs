@@ -6646,7 +6646,7 @@ pub fn holds_spelled_bool_or_null<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_
     if cursor.index.has_explicit_tags() {
         return true;
     }
-    let mut pending = vec![cursor];
+    let mut pending = alloc::vec![cursor];
     while let Some(node) = pending.pop() {
         match node.value() {
             YamlValue::Null => return true,

@@ -83845,7 +83845,7 @@ impl OwnedDocumentShape {
 
 /// The [`OwnedDocumentShape`] of the document a yq evaluation runs over (#8020).
 ///
-/// Ambient for the reason [`yq_delete_context`] is: the `del()` rewrite that asks sits many levels
+/// Ambient for the reason `yq_delete_context` is: the `del()` rewrite that asks sits many levels
 /// below the runner that knows. `std` only; without it every part is assumed.
 #[cfg(feature = "std")]
 pub mod yq_owned_document {
@@ -83904,6 +83904,17 @@ pub mod yq_owned_document {
 ///   false in yq), and a merge key's members are not the mapping's own. Those count.
 #[doc(hidden)]
 pub fn yq_condition_reads_differently_on_owned(cond: &Expr, shape: OwnedDocumentShape) -> bool {
+    let needs = yq_condition_shape_needs(cond);
+    (needs.spelled_bool_or_null && shape.spelled_bool_or_null)
+        || (needs.aliases_or_merge_keys && shape.aliases_or_merge_keys)
+}
+
+/// Which parts of an [`OwnedDocumentShape`] a values-only `select` condition consults (#8020):
+/// each field is `true` when the condition holds an operator
+/// [`yq_condition_reads_differently_on_owned`] reads that part for. The document route measures
+/// only those parts, so a condition with neither (`.score < 100`) costs no walk of the document.
+#[doc(hidden)]
+pub fn yq_condition_shape_needs(cond: &Expr) -> OwnedDocumentShape {
     use Builtin as B;
     // An operand that reads a node's own value, which is what yq compares by its text; a
     // metadata reader's answer (`style != ""`) is a fresh string, the same in both.
@@ -83926,32 +83937,43 @@ pub fn yq_condition_reads_differently_on_owned(cond: &Expr, shape: OwnedDocument
             Expr::Literal(Literal::Null | Literal::Bool(_) | Literal::String(_))
         )
     };
-    let spelled = shape.spelled_bool_or_null;
-    let aliased = shape.aliases_or_merge_keys;
-    any_subexpr(cond, &mut |e| match e {
-        Expr::Builtin(B::ToString) => spelled || aliased,
-        Expr::Compare { op, left, right } => {
-            spelled
-                && matches!(op, CompareOp::Eq | CompareOp::Ne)
-                && ((node_value(left) && textual(right)) || (node_value(right) && textual(left)))
+    let mut needs = OwnedDocumentShape {
+        aliases_or_merge_keys: false,
+        spelled_bool_or_null: false,
+    };
+    any_subexpr(cond, &mut |e| {
+        match e {
+            Expr::Builtin(B::ToString) => {
+                needs.spelled_bool_or_null = true;
+                needs.aliases_or_merge_keys = true;
+            }
+            Expr::Compare { op, left, right }
+                if matches!(op, CompareOp::Eq | CompareOp::Ne)
+                    && ((node_value(left) && textual(right))
+                        || (node_value(right) && textual(left))) =>
+            {
+                needs.spelled_bool_or_null = true;
+            }
+            Expr::Builtin(
+                B::Has(_)
+                | B::Length
+                | B::Keys
+                | B::KeysUnsorted
+                | B::Contains(_)
+                | B::Test(_)
+                | B::TestFlags(..)
+                | B::Startswith(_)
+                | B::Endswith(_)
+                | B::AsciiDowncase
+                | B::AsciiUpcase
+                | B::Downcase
+                | B::Upcase,
+            ) => needs.aliases_or_merge_keys = true,
+            _ => {}
         }
-        Expr::Builtin(
-            B::Has(_)
-            | B::Length
-            | B::Keys
-            | B::KeysUnsorted
-            | B::Contains(_)
-            | B::Test(_)
-            | B::TestFlags(..)
-            | B::Startswith(_)
-            | B::Endswith(_)
-            | B::AsciiDowncase
-            | B::AsciiUpcase
-            | B::Downcase
-            | B::Upcase,
-        ) => aliased,
-        _ => false,
-    })
+        false
+    });
+    needs
 }
 
 /// Whether a `del()` navigation stage reaches on the owned value exactly the nodes yq reaches on the
@@ -185496,7 +185518,7 @@ mod del_reader_rewrite_allowlist_8020 {
     fn a_condition_over_values_alone_is_on_the_allowlist() {
         for cond in [
             ". > 1",
-            "-(.a) < 0",
+            "(0 - .a) < 0",
             "(.a)? > 1",
             "(.a, .b) > 1",
             ".a and .b",
