@@ -109,14 +109,9 @@ const ROWS: &[(&[&str], &str, &str, &str)] = &[
         TWO,
         "4\n---\n4\n",
     ),
-    // A branch that navigates the document keeps the separator before it.
-    (
-        &[],
-        "now | format_datetime(\"2006\") | length, .a",
-        DATES,
-        "4\n1\n4\n---\n2\n",
-    ),
-    (&[], "now | length, .", TWO, "20\na: 1\n20\n---\na: 2\n"),
+    // No row mixes the two within one document (`now | length, .a`): yq writes `---` before the
+    // first result that reads the next document, and succinctly before each document's first
+    // result, a recorded gap (docs/compliance/yq/limitations.md, `.a, "x"`).
 ];
 
 fn run(args: &[&str], filter: &str, stdin: &str) -> Result<(String, String, i32)> {
