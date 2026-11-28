@@ -33408,6 +33408,293 @@ enum RegexEngine {
     Std(regex::Regex),
     /// jq mode: Oniguruma itself, at jq 1.7.1's pin, called as jq's `f_match` calls it.
     Onig(OnigEngine),
+    /// jq mode: a pattern Oniguruma reads as literal text alone, searched without it (ADR-0031
+    /// step 5).
+    Literal(LiteralEngine),
+}
+
+/// A jq pattern that is one literal or an alternation of literals, with no flag but `g`
+/// ([`literal_alternatives`]), searched as Oniguruma searches it: the leftmost position where an
+/// alternative matches, and at that position the first alternative in the pattern's order, which
+/// is where Oniguruma's backtracking stops. That is Aho-Corasick's leftmost-first match.
+///
+/// An alternation is searched with the crate's SIMD literal-set searcher (Teddy), and one literal,
+/// or an alternation it cannot take, with its automaton. On `test` with three alternatives over
+/// long strings the automaton was 2-6% slower than Oniguruma and Teddy 7-9% faster (ADR-0031
+/// step 5, measured on a Ryzen 9 7950X and an Apple M4 Pro).
+///
+/// Every alternative is non-empty, so no match is empty and jq's byte step after an empty match
+/// never runs; and an alternative is valid UTF-8 starting at a lead byte, so a match starts and
+/// ends on character boundaries. Its answers are [`OnigEngine`]'s, which
+/// `literal_engine_tests_7965` checks against the pinned library.
+#[cfg(feature = "regex")]
+struct LiteralEngine {
+    searcher: LiteralSearcher,
+}
+
+/// A [`LiteralEngine`]'s searcher, both with leftmost-first semantics.
+#[cfg(feature = "regex")]
+enum LiteralSearcher {
+    /// One literal, or an alternation [`Packed`](Self::Packed) cannot take.
+    Automaton(aho_corasick::AhoCorasick),
+    /// An alternation of at most 128 literals on a CPU with Teddy's SIMD (x86_64 SSSE3, aarch64).
+    Packed(aho_corasick::packed::Searcher),
+}
+
+/// The bytes that make a jq pattern something other than literal text to Oniguruma's
+/// `ONIG_SYNTAX_PERL_NG` without `x`: escapes, groups, classes, repeats, anchors, `.` and `|`.
+/// `|` is read by [`literal_alternatives`] as the separator between alternatives.
+#[cfg(feature = "regex")]
+const ONIG_META: &[u8] = b"\\^$.|?*+()[]{}";
+
+/// The alternatives of `pattern` when [`LiteralEngine`] can search it: `flags` holds nothing but
+/// `g` (which sets no option), no byte of the pattern is in [`ONIG_META`] but `|`, and every
+/// alternative `|` separates is non-empty. `i` cannot join (Oniguruma's multi-character case
+/// folds), nor `x` (whitespace and `#`), nor `l` (the longest alternative instead of the first);
+/// `$` is excluded with the other anchors (Perl_NG's `ONIG_OPTION_SINGLELINE` matches it before a
+/// final newline).
+#[cfg(feature = "regex")]
+fn literal_alternatives<'p>(pattern: &'p str, flags: Option<&str>) -> Option<Vec<&'p str>> {
+    if !flags.unwrap_or_default().bytes().all(|b| b == b'g') {
+        return None;
+    }
+    if pattern.bytes().any(|b| b != b'|' && ONIG_META.contains(&b)) {
+        return None;
+    }
+    let alternatives: Vec<&str> = pattern.split('|').collect();
+    alternatives
+        .iter()
+        .all(|a| !a.is_empty())
+        .then_some(alternatives)
+}
+
+#[cfg(feature = "regex")]
+impl LiteralEngine {
+    /// The engine for `pattern`, or `None` when [`literal_alternatives`] refuses it or the searcher
+    /// cannot be built (then Oniguruma compiles it, and its answers stand).
+    fn new(pattern: &str, flags: Option<&str>) -> Option<Self> {
+        Self::build(literal_alternatives(pattern, flags)?, true)
+    }
+
+    /// The searcher for `alternatives`: Teddy for more than one when `packed` and it can be built,
+    /// the automaton otherwise.
+    fn build(alternatives: Vec<&str>, packed: bool) -> Option<Self> {
+        if packed && alternatives.len() > 1 {
+            if let Some(searcher) = aho_corasick::packed::Config::new()
+                .match_kind(aho_corasick::packed::MatchKind::LeftmostFirst)
+                .builder()
+                .extend(&alternatives)
+                .build()
+            {
+                return Some(Self {
+                    searcher: LiteralSearcher::Packed(searcher),
+                });
+            }
+        }
+        let searcher = aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+            .build(alternatives)
+            .ok()?;
+        Some(Self {
+            searcher: LiteralSearcher::Automaton(searcher),
+        })
+    }
+
+    fn find_at(&self, input: &str, start: usize) -> Option<(usize, usize)> {
+        match &self.searcher {
+            LiteralSearcher::Automaton(ac) => ac
+                .find(aho_corasick::Input::new(input).range(start..))
+                .map(|m| (m.start(), m.end())),
+            LiteralSearcher::Packed(packed) => packed
+                .find_in(input, aho_corasick::Span::from(start..input.len()))
+                .map(|m| (m.start(), m.end())),
+        }
+    }
+
+    fn is_match(&self, input: &str) -> bool {
+        match &self.searcher {
+            LiteralSearcher::Automaton(ac) => ac.is_match(input),
+            LiteralSearcher::Packed(_) => self.find_at(input, 0).is_some(),
+        }
+    }
+
+    /// The match a search of `input` from byte `start` finds, as [`OnigEngine::captures_at`]
+    /// reports a pattern with no group.
+    fn captures_at<'h>(&self, input: &'h str, start: usize) -> Option<RegexCaptures<'h>> {
+        let (beg, end) = self.find_at(input, start)?;
+        Some(RegexCaptures::OnigWhole {
+            whole: RegexMatch::at(&input[beg..end], beg),
+            raw: (beg, end),
+        })
+    }
+}
+
+/// A [`LiteralEngine`] pattern's group names: the whole match alone, which has none.
+#[cfg(feature = "regex")]
+static LITERAL_GROUP_NAMES: [Option<Box<str>>; 1] = [None];
+
+/// [`LiteralEngine`] against the pinned Oniguruma it stands in for: every pattern
+/// [`literal_alternatives`] accepts has to give `f_match`'s answers (ADR-0031 step 5, #7965).
+#[cfg(all(test, feature = "regex"))]
+mod literal_engine_tests_7965 {
+    use super::*;
+
+    fn onig(pattern: &str, flags: Option<&str>) -> JqRegex {
+        JqRegex {
+            engine: RegexEngine::Onig(OnigEngine::compile(pattern, flags).expect("compiles")),
+            suppress_empty: false,
+        }
+    }
+
+    fn literal(pattern: &str, flags: Option<&str>, packed: bool) -> JqRegex {
+        let alternatives = literal_alternatives(pattern, flags).expect("a literal pattern");
+        JqRegex {
+            engine: RegexEngine::Literal(
+                LiteralEngine::build(alternatives, packed).expect("a searcher"),
+            ),
+            suppress_empty: false,
+        }
+    }
+
+    /// What jq reads of a pattern over `input`: test mode, then every match of the `g` loop as its
+    /// raw span, its string and its group count.
+    fn answers(re: &JqRegex, input: &str) -> (bool, Vec<(usize, usize, String)>, usize) {
+        let matches = global_captures::<JqSemantics>(re, input)
+            .expect("no search error")
+            .iter()
+            .map(|caps| {
+                let m = caps.get(0).expect("group 0");
+                (m.start(), m.end(), m.as_str().to_string())
+            })
+            .collect();
+        (
+            re.is_match(input).expect("no search error"),
+            matches,
+            re.captures_len(),
+        )
+    }
+
+    fn assert_agrees(pattern: &str, flags: Option<&str>, input: &str) {
+        let expected = answers(&onig(pattern, flags), input);
+        // Both searchers: Teddy, and the automaton it falls back to.
+        for packed in [true, false] {
+            assert_eq!(
+                answers(&literal(pattern, flags, packed), input),
+                expected,
+                "packed {packed} pattern {pattern:?} flags {flags:?} input {input:?}"
+            );
+        }
+    }
+
+    /// Every character the fast path treats as literal: each ASCII byte outside [`ONIG_META`] (NUL
+    /// and the controls included) and characters of two, three and four bytes.
+    fn literal_chars() -> Vec<char> {
+        let mut chars: Vec<char> = (0u8..=0x7f)
+            .filter(|b| !ONIG_META.contains(b))
+            .map(char::from)
+            .collect();
+        chars.extend(['é', 'ö', 'ß', '\u{301}', '日', '本', '\u{2028}', '🎉']);
+        chars
+    }
+
+    #[test]
+    fn refuses_what_oniguruma_reads_as_more_than_text() {
+        for pattern in [
+            "", "|", "a|", "|a", "a||b", "a.b", "a$", "^a", "a\\b", "\\d", "(a)", "a{2}", "a}",
+            "]", "a*", "a+", "a?", "[a]",
+        ] {
+            assert!(literal_alternatives(pattern, None).is_none(), "{pattern:?}");
+        }
+        for flags in ["i", "x", "l", "n", "s", "m", "p", "gi", "z"] {
+            assert!(
+                literal_alternatives("ab", Some(flags)).is_none(),
+                "{flags:?}"
+            );
+        }
+        for flags in [None, Some(""), Some("g"), Some("gg")] {
+            assert_eq!(literal_alternatives("ab|c", flags), Some(vec!["ab", "c"]));
+        }
+    }
+
+    #[test]
+    fn each_literal_character_and_pair_matches_as_oniguruma_reads_it() {
+        let chars = literal_chars();
+        for &c in &chars {
+            let p = c.to_string();
+            assert_agrees(&p, None, &format!("x{c}y{c}{c}z"));
+        }
+        // Two-character sequences, so that no pair of literal characters is special to
+        // Oniguruma either (an ASCII pair covers every sequence an escape-free syntax could read).
+        for &a in chars.iter().filter(|c| c.is_ascii()) {
+            for &b in chars.iter().filter(|c| c.is_ascii()) {
+                let p: String = [a, b].iter().collect();
+                assert_agrees(&p, Some("g"), &format!("{a}{p}{b}{p}"));
+            }
+        }
+    }
+
+    #[test]
+    fn random_alternations_match_as_oniguruma_finds_them() {
+        let chars = literal_chars();
+        // A few characters drawn often, so that alternatives overlap and the input matches.
+        let common = ['a', 'b', 'é', '日', ' '];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let word = |next: &mut dyn FnMut(usize) -> usize, len: usize| -> String {
+            (0..len)
+                .map(|_| {
+                    if next(5) == 0 {
+                        chars[next(chars.len())]
+                    } else {
+                        common[next(common.len())]
+                    }
+                })
+                .collect()
+        };
+        for _ in 0..20_000 {
+            let alternatives: Vec<String> = (0..=next(4))
+                .map(|_| {
+                    let len = 1 + next(3);
+                    word(&mut next, len)
+                })
+                .collect();
+            let pattern = alternatives.join("|");
+            let len = next(40);
+            let input = word(&mut next, len);
+            assert_agrees(&pattern, Some("g"), &input);
+        }
+    }
+
+    /// The searcher each shape gets, so that the tests above reach both: Teddy for an
+    /// alternation, the automaton for one literal and for more alternatives than Teddy takes.
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn an_alternation_gets_teddy_and_one_literal_the_automaton() {
+        let searcher = |p: &str| LiteralEngine::new(p, None).expect("literal").searcher;
+        assert!(matches!(
+            searcher("lorem|dolor|amet"),
+            LiteralSearcher::Packed(_)
+        ));
+        assert!(matches!(searcher("lorem"), LiteralSearcher::Automaton(_)));
+        let many: Vec<String> = (0..500).map(|i| format!("w{i}x")).collect();
+        assert!(matches!(
+            searcher(&many.join("|")),
+            LiteralSearcher::Automaton(_)
+        ));
+    }
+
+    #[test]
+    fn many_alternatives_match_as_oniguruma_finds_them() {
+        let words: Vec<String> = (0..500).map(|i| format!("w{i}x")).collect();
+        let pattern = words.join("|");
+        let input: String = (0..2000).map(|i| format!("w{}x ", (i * 7) % 900)).collect();
+        assert_agrees(&pattern, None, &input);
+    }
 }
 
 /// A jq-mode pattern compiled by Oniguruma as jq 1.7.1's `f_match` (`src/builtin.c`) compiles it:
@@ -33563,7 +33850,8 @@ enum RegexCaptures<'h> {
         groups: Vec<Option<RegexMatch<'h>>>,
         raw: (usize, usize),
     },
-    /// [`Onig`](Self::Onig) for a pattern with no capture group: the whole match alone.
+    /// [`Onig`](Self::Onig) for a pattern with no capture group: the whole match alone. A
+    /// [`RegexEngine::Literal`] match is one too.
     OnigWhole {
         whole: RegexMatch<'h>,
         raw: (usize, usize),
@@ -33677,6 +33965,7 @@ impl JqRegex {
         match &self.engine {
             // jq's test mode: the first search's answer.
             RegexEngine::Onig(engine) => engine.is_match(input),
+            RegexEngine::Literal(engine) => Ok(engine.is_match(input)),
             RegexEngine::Std(re) => Ok(re.is_match(input)),
         }
     }
@@ -33699,6 +33988,7 @@ impl JqRegex {
     ) -> Result<Option<RegexCaptures<'h>>, EvalError> {
         match &self.engine {
             RegexEngine::Onig(engine) => engine.captures_at(input, start),
+            RegexEngine::Literal(engine) => Ok(engine.captures_at(input, start)),
             RegexEngine::Std(re) => Ok(re.captures_at(input, start).map(RegexCaptures::Std)),
         }
     }
@@ -33706,6 +33996,7 @@ impl JqRegex {
     fn capture_names(&self) -> RegexCaptureNames<'_> {
         match &self.engine {
             RegexEngine::Onig(engine) => RegexCaptureNames::Mapped(engine.names.iter()),
+            RegexEngine::Literal(_) => RegexCaptureNames::Mapped(LITERAL_GROUP_NAMES.iter()),
             RegexEngine::Std(re) => RegexCaptureNames::Std(re.capture_names()),
         }
     }
@@ -33713,6 +34004,7 @@ impl JqRegex {
     fn captures_len(&self) -> usize {
         match &self.engine {
             RegexEngine::Onig(engine) => engine.names.len(),
+            RegexEngine::Literal(_) => LITERAL_GROUP_NAMES.len(),
             RegexEngine::Std(re) => re.captures_len(),
         }
     }
@@ -33944,8 +34236,15 @@ fn build_regex_uncached<S: EvalSemantics>(
     flags: Option<&str>,
 ) -> Result<JqRegex, EvalError> {
     // ADR-0031: jq's patterns compile with Oniguruma at jq 1.7.1's pin, as jq's `f_match`
-    // compiles them, flags check and error text included.
+    // compiles them, flags check and error text included. A literal or an alternation of
+    // literals is searched without it, with the same answers (step 5).
     if S::TAG != EvalTag::Yq {
+        if let Some(engine) = LiteralEngine::new(pattern, flags) {
+            return Ok(JqRegex {
+                engine: RegexEngine::Literal(engine),
+                suppress_empty: false,
+            });
+        }
         return Ok(JqRegex {
             engine: RegexEngine::Onig(OnigEngine::compile(pattern, flags)?),
             suppress_empty: false,
