@@ -216,6 +216,9 @@ pub(crate) enum Stop {
     /// On `Malformed BOM` outside `--seq`: the parser never leaves that state and consumes
     /// nothing in it, so every later call is the same fault, read with no new read.
     Stuck,
+    /// Before a read whose bytes the [`Source`] does not hold ([`Session::step`]); never over
+    /// [`Whole`] sources.
+    Short,
 }
 
 /// What a route knows about one file's share of a plain stretch.
@@ -256,75 +259,155 @@ pub(crate) struct PlainStretch<'r> {
     pub value_in_final_buffer: bool,
 }
 
-/// The offset in the inputs read as one stream at which `file` starts.
-fn file_start(sources: &[&[u8]], file: usize) -> usize {
-    sources[..file.min(sources.len())]
-        .iter()
-        .map(|source| source.len())
-        .sum()
+/// What a [`Session`] reads its input through: every input file whole ([`Whole`]), or the part of
+/// them a route holds, which may be a window of one file (#7987, step 7). The session asks for one
+/// `fgets` read at a time, so a source holds a read's worth of bytes past where the reader stands,
+/// not the input.
+pub(crate) trait Source {
+    /// How many input files the run has.
+    fn files(&self) -> usize;
+    /// The offset in the stream the spans and faults are offsets of at which file `file` starts. A
+    /// source that holds one file's bytes may say 0 for it: a session started in that file names
+    /// the file's own offsets.
+    fn start_of(&self, file: usize) -> usize;
+    /// The bytes of file `file` the source holds from `offset` on: at least `want` of them where
+    /// the file has that many and the source can hold them, and whether they run to the file's end.
+    fn held(&mut self, file: usize, offset: usize, want: usize) -> Held<'_>;
 }
 
-/// `jq_util_input_state` and its parser, between two sync points.
-struct Reader<'s, 'b> {
-    profile: &'s ReaderProfile,
-    mode: ReadMode,
+/// What a [`Source`] holds of a file from where the reader stands.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Held<'a> {
+    pub bytes: &'a [u8],
+    /// The bytes run to the end of the file.
+    pub to_end: bool,
+}
+
+/// Every input file, whole, in command-line order.
+pub(crate) struct Whole<'s, 'b> {
     sources: &'s [&'b [u8]],
+    starts: Vec<usize>,
+}
+
+impl<'s, 'b> Whole<'s, 'b> {
+    pub(crate) fn new(sources: &'s [&'b [u8]]) -> Self {
+        let starts = sources
+            .iter()
+            .scan(0usize, |at, source| {
+                let start = *at;
+                *at += source.len();
+                Some(start)
+            })
+            .collect();
+        Self { sources, starts }
+    }
+}
+
+impl Source for Whole<'_, '_> {
+    fn files(&self) -> usize {
+        self.sources.len()
+    }
+
+    fn start_of(&self, file: usize) -> usize {
+        match self.starts.get(file) {
+            Some(&start) => start,
+            None => self.sources.iter().map(|source| source.len()).sum(),
+        }
+    }
+
+    fn held(&mut self, file: usize, offset: usize, _want: usize) -> Held<'_> {
+        Held {
+            bytes: &self.sources[file][offset..],
+            to_end: true,
+        }
+    }
+}
+
+/// `jq_util_input_state` and its parser, from a sync point on (ADR-0033). A [`Session`] reads from
+/// a [`Source`] one `fgets` read at a time and keeps its place between reads, a value in progress
+/// included, so the bytes of each read can come from a different window: a route that holds only
+/// some of its input runs the model over what it holds, and goes on with it when it holds more.
+pub(crate) struct Session {
+    profile: ReaderProfile,
+    mode: ReadMode,
     next_file: usize,
     input: Option<OpenFile>,
     current_line: usize,
-    parser: JvParser<'b>,
+    /// Between reads it holds no buffer ([`JvParser::rebind`]), so it outlives each one.
+    parser: Option<JvParser<'static>>,
+    /// The reads since the session last stopped at a sync point.
+    reads: usize,
 }
 
-impl<'s, 'b> Reader<'s, 'b> {
-    fn resume(
+/// The read a [`Source`] did not hold the bytes of: the session is where it was before it.
+struct Short;
+
+impl Session {
+    /// The reader of `state`, reading `source`.
+    pub(crate) fn resume(
         state: ReaderState,
-        sources: &'s [&'b [u8]],
-        profile: &'s ReaderProfile,
+        source: &impl Source,
+        profile: &ReaderProfile,
         mode: ReadMode,
     ) -> Self {
         let offset = match state.input {
-            Some(file) => file_start(sources, state.next_file - 1) + file.offset,
-            None => file_start(sources, state.next_file),
+            Some(file) => source.start_of(state.next_file - 1) + file.offset,
+            None => source.start_of(state.next_file),
         };
         Self {
-            profile,
+            profile: *profile,
             mode,
-            sources,
             next_file: state.next_file,
             input: state.input,
             current_line: state.current_line,
-            parser: JvParser::resume(state.parser, mode.seq, profile.max_depth, offset),
+            parser: Some(JvParser::resume(
+                state.parser,
+                mode.seq,
+                profile.max_depth,
+                offset,
+            )),
+            reads: 0,
         }
     }
 
-    fn state(&self) -> ReaderState {
-        ReaderState {
+    /// The reader as [`ReaderState`], at a sync point; `None` in the middle of a value, which a
+    /// [`Stop::Short`] can leave it in.
+    pub(crate) fn state(&self) -> Option<ReaderState> {
+        Some(ReaderState {
             next_file: self.next_file,
             input: self.input,
             current_line: self.current_line,
-            parser: self
-                .parser
-                .sync()
-                .expect("the reader stops at a sync point"),
-        }
+            parser: self.parser.as_ref()?.sync()?,
+        })
     }
 
-    fn position(&self) -> Position {
+    /// What `input_filename` and `input_line_number` answer here.
+    pub(crate) fn position(&self) -> Position {
         Position {
             file: self.input.map(|_| self.next_file - 1),
             line: self.current_line,
         }
     }
 
-    /// `jq_util_input_read_more`: the next buffer, and whether it is the last (`is_last`).
-    fn read_more(&mut self) -> (&'b [u8], bool) {
+    /// Where the reader stands: the open file and how far it has read it, or the next file's front.
+    pub(crate) fn stands(&self) -> (usize, usize) {
+        match self.input {
+            Some(file) => (self.next_file - 1, file.offset),
+            None => (self.next_file, 0),
+        }
+    }
+
+    /// `jq_util_input_read_more`: the next buffer, and whether it is the last (`is_last`); `Short`
+    /// when `source` does not hold the bytes `fgets` would return.
+    fn read_more<'x>(&mut self, source: &'x mut impl Source) -> Result<(&'x [u8], bool), Short> {
+        let files = source.files();
         // `map_or(true, ..)`, not `is_none_or`: clippy's `msrv` is 1.73 (clippy.toml).
         if self.input.map_or(true, |file| file.eof) {
             if self.input.take().is_some() {
                 // `fclose`; jq 1.7.1 clears `current_filename` and `current_line` here.
                 self.current_line = 0;
             }
-            if self.next_file < self.sources.len() {
+            if self.next_file < files {
                 self.next_file += 1;
                 self.input = Some(OpenFile {
                     offset: 0,
@@ -333,14 +416,18 @@ impl<'s, 'b> Reader<'s, 'b> {
                 self.current_line = 0;
             }
         }
-        let mut chunk: &'b [u8] = &[];
+        let mut chunk: &'x [u8] = &[];
         if let Some(file) = self.input.as_mut() {
-            let source: &'b [u8] = self.sources[self.next_file - 1];
-            let rest = &source[file.offset..];
             let read_len = self.profile.read_len;
-            match Fgets::of(rest, read_len) {
+            let held = source.held(self.next_file - 1, file.offset, read_len);
+            match Fgets::of(held.bytes, read_len) {
                 // `fgets` returns NULL at the end of the file.
-                None => file.eof = true,
+                None if held.to_end => file.eof = true,
+                None => return Err(Short),
+                // A read the bytes held end before: not a newline, a full buffer or the file's end.
+                Some(read) if !(read.newline || read.fills(read_len) || held.to_end) => {
+                    return Err(Short)
+                }
                 Some(read) => {
                     file.offset += read.len;
                     // `fgets` met the end of the file before a newline or a full buffer.
@@ -352,61 +439,83 @@ impl<'s, 'b> Reader<'s, 'b> {
                     }
                     // jq 1.7.1 measures a newline-less read with `strlen` and loses it from its
                     // first NUL; under E2 the NUL reaches the parser, which refuses it (#7966).
-                    chunk = &rest[..read.len];
+                    chunk = &held.bytes[..read.len];
                 }
             }
         }
-        let is_last =
-            self.next_file == self.sources.len() && self.input.map_or(true, |file| file.eof);
-        (chunk, is_last)
+        let is_last = self.next_file == files && self.input.map_or(true, |file| file.eof);
+        Ok((chunk, is_last))
     }
 
-    /// `jq_util_input_next_input`'s loop, from the reader's sync point to the next one.
-    fn run(&mut self, out: &mut Vec<Read>) -> Stop {
-        if !self.mode.seq && self.parser.malformed_bom() {
+    /// `jq_util_input_next_input`'s loop (parser mode, without `--slurp`), from where the session
+    /// stands to the next sync point, at least one read on: what each `input` call returned on the
+    /// way is appended to `out`, with the position it was returned at. Outside `--seq` a `Malformed
+    /// BOM` stops it on the fault ([`Stop::Stuck`]), and a call from that state answers the fault
+    /// again without reading. [`Stop::Short`] is a read `source` does not hold the bytes of: the
+    /// session stays where it was before that read, and a later call with more bytes goes on.
+    pub(crate) fn step(&mut self, source: &mut impl Source, out: &mut Vec<Read>) -> Stop {
+        let mut parser = self.parser.take().expect("a session holds its parser");
+        if !self.mode.seq && parser.malformed_bom() {
             // The bytes after the broken mark are still in jq's buffer, so it reads nothing more.
-            let fault = self.bom_fault();
+            // A parser rebuilt in the stuck state has no buffer; any will do, as it consumes nothing.
+            let mut stuck: JvParser<'_> = parser.rebind();
+            stuck.set_buf(&[], true);
+            let fault = match stuck.next() {
+                Next::Fault(fault) => fault,
+                _ => unreachable!("a malformed mark is a fault outside --seq"),
+            };
+            self.parser = Some(stuck.rebind());
             self.emit(Item::Fault(fault), out);
             return Stop::Stuck;
         }
-        // `is_last` is local to one call: a call that returns starts the next one afresh.
-        let mut is_last = false;
-        let mut reads = 0usize;
         loop {
-            if self.parser.remaining() == 0 {
-                if reads > 0 && self.parser.sync().is_some() {
-                    return Stop::Synced;
-                }
-                let (chunk, last) = self.read_more();
-                is_last = last;
-                reads += 1;
-                self.parser.set_buf(chunk, !is_last);
+            // Between reads, the parser's buffer is read through.
+            if self.reads > 0 && parser.sync().is_some() {
+                self.reads = 0;
+                self.parser = Some(parser);
+                return Stop::Synced;
             }
-            let next = self.parser.next();
-            // jq 1.7.1 reads on past an empty record only while slurping (`has_more`); the profile
-            // reads every record under `--seq`, as jq 1.8.2 does (#7718).
-            let has_more = self.mode.seq
-                && self.profile.seq_reads_every_record
-                && self.parser.remaining() != 0;
-            match next {
-                Next::Value(span) => {
-                    self.emit(Item::Value(span), out);
-                    is_last = false;
-                }
-                Next::Fault(fault) => {
-                    self.emit(Item::Fault(fault), out);
-                    is_last = false;
-                    if fault.place == FaultPlace::Bom {
-                        return Stop::Stuck;
-                    }
-                }
-                Next::None => {
-                    if is_last && !has_more {
-                        self.emit(Item::End, out);
+            let Ok((chunk, last)) = self.read_more(source) else {
+                self.parser = Some(parser);
+                return Stop::Short;
+            };
+            // `is_last` is local to one call: a call that returns starts the next one afresh.
+            let mut is_last = last;
+            self.reads += 1;
+            let mut reading: JvParser<'_> = parser.rebind();
+            reading.set_buf(chunk, !is_last);
+            loop {
+                let next = reading.next();
+                // jq 1.7.1 reads on past an empty record only while slurping (`has_more`); the
+                // profile reads every record under `--seq`, as jq 1.8.2 does (#7718).
+                let has_more = self.mode.seq
+                    && self.profile.seq_reads_every_record
+                    && reading.remaining() != 0;
+                match next {
+                    Next::Value(span) => {
+                        self.emit(Item::Value(span), out);
                         is_last = false;
                     }
+                    Next::Fault(fault) => {
+                        self.emit(Item::Fault(fault), out);
+                        is_last = false;
+                        if fault.place == FaultPlace::Bom {
+                            self.parser = Some(reading.rebind());
+                            return Stop::Stuck;
+                        }
+                    }
+                    Next::None => {
+                        if is_last && !has_more {
+                            self.emit(Item::End, out);
+                            is_last = false;
+                        }
+                    }
+                }
+                if reading.remaining() == 0 {
+                    break;
                 }
             }
+            parser = reading.rebind();
         }
     }
 
@@ -415,16 +524,6 @@ impl<'s, 'b> Reader<'s, 'b> {
             item,
             at: self.position(),
         });
-    }
-
-    /// The `Malformed BOM` a stuck parser answers every call with.
-    fn bom_fault(&mut self) -> Fault {
-        // A parser rebuilt in the stuck state has no buffer; any will do, as it consumes nothing.
-        self.parser.set_buf(&[], true);
-        match self.parser.next() {
-            Next::Fault(fault) => fault,
-            _ => unreachable!("a malformed mark is a fault outside --seq"),
-        }
     }
 }
 
@@ -480,10 +579,41 @@ impl ReaderState {
         mode: ReadMode,
         out: &mut Vec<Read>,
     ) -> Stop {
-        let mut reader = Reader::resume(*self, sources, profile, mode);
-        let stop = reader.run(out);
-        *self = reader.state();
+        let mut whole = Whole::new(sources);
+        let mut session = Session::resume(*self, &whole, profile, mode);
+        let stop = session.step(&mut whole, out);
+        *self = session
+            .state()
+            .expect("over whole sources the reader stops at a sync point");
         stop
+    }
+
+    /// The reader at the byte after a newline of file `file`'s own bytes that no top-level value
+    /// holds (#7987, step 7): `offset` is where that byte is in the file, as read, `file_lines` the
+    /// newlines of the file before it and `stream_lines` those of every file before it, its own
+    /// included. A newline ends a `fgets` read and decides the mark, so the point is a sync point,
+    /// and the state there is a closed form of those counts: what [`step`](Self::step) reaches over
+    /// any input, plain or not, that has them (`tests.rs` holds the two to each other). It is how a
+    /// route that holds a window of its input, and so not the bytes before it, enters the model at
+    /// the last sync point before a trigger: the window's line and offset counters are the facts.
+    /// Outside `--seq` only, whose parser waits for a record separator (step 8).
+    pub(crate) const fn at_line_start(
+        file: usize,
+        offset: usize,
+        file_lines: usize,
+        stream_lines: usize,
+    ) -> Self {
+        Self {
+            next_file: file + 1,
+            input: Some(OpenFile { offset, eof: false }),
+            current_line: file_lines,
+            parser: ParserSync {
+                line: stream_lines + 1,
+                column: 0,
+                bom: BOM_DONE,
+                ..ParserSync::start(false)
+            },
+        }
     }
 
     /// [`step`](Self::step) from this sync point on until the input is over: each answer goes to
@@ -494,15 +624,17 @@ impl ReaderState {
     // `reads` is drained, not consumed: the buffer is the next step's.
     #[allow(clippy::iter_with_drain)]
     pub(crate) fn read_to_end(
-        mut self,
+        self,
         sources: &[&[u8]],
         profile: &ReaderProfile,
         mode: ReadMode,
         mut on_read: impl FnMut(Read),
     ) -> bool {
+        let mut whole = Whole::new(sources);
+        let mut session = Session::resume(self, &whole, profile, mode);
         let mut reads = Vec::new();
         loop {
-            let stop = self.step(sources, profile, mode, &mut reads);
+            let stop = session.step(&mut whole, &mut reads);
             for read in reads.drain(..) {
                 let end = read.item == Item::End;
                 on_read(read);
