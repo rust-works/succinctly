@@ -9,6 +9,7 @@ link and `relink.py` (#7960).
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -145,12 +146,37 @@ class Resolve(unittest.TestCase):
         finally:
             os.unlink(f.name)
 
-    def test_only_object_files_are_read(self):
+    def test_objects_and_archives_are_read(self):
         with tempfile.TemporaryDirectory() as d:
-            o, rlib = os.path.join(d, "a.o"), os.path.join(d, "libb.rlib")
-            for p in (o, rlib):
+            o, rlib, a, so = (os.path.join(d, n) for n in ("a.o", "libb.rlib", "libc.a", "libd.so"))
+            for p in (o, rlib, a, so):
                 open(p, "w").close()
-            self.assertEqual(link.objects(["-o", "out", o, rlib, os.path.join(d, "absent.o")]), [o])
+            args = ["-o", "out", o, rlib, os.path.join(d, "absent.o"), a, so, "-lm"]
+            self.assertEqual(link.objects(args), [o, rlib, a])
+
+    def test_an_archive_nm_cannot_wholly_read_still_gives_its_symbols(self):
+        # An rlib's metadata members are not objects: nm reports them and may exit non-zero, but the
+        # bundled C objects' symbols (Oniguruma's, #8073) must still be found. An object it cannot
+        # read stays an error, so a broken link does not silently lose its order.
+        with tempfile.TemporaryDirectory() as d:
+            nm = os.path.join(d, "nm")
+            write(nm, "#!/bin/sh\n"
+                      "case \"$2\" in\n"
+                      "  bad.o) echo 'nm: bad.o: file format not recognized' >&2; exit 1;;\n"
+                      "  *.rlib) echo 'libb.rlib:'; echo '0000000000000000 T onig_search'; echo 'nm: lib.rmeta: bad' >&2; exit 1;;\n"
+                      "  *.o) echo '0000000000000000 T _ZN1a1f17h0123456789abcdefE'; echo '0000000000000010 U memcpy';;\n"
+                      "  *) exit 1;;\n"
+                      "esac\n")
+            os.chmod(nm, 0o755)
+            path = os.environ["PATH"]
+            os.environ["PATH"] = d + os.pathsep + path
+            try:
+                self.assertEqual(link.text_symbols(["x.o", "libb.rlib"]),
+                                 ["_ZN1a1f17h0123456789abcdefE", "onig_search"])
+                with self.assertRaises(subprocess.CalledProcessError):
+                    link.text_symbols(["x.o", "bad.o"])
+            finally:
+                os.environ["PATH"] = path
 
 
 def write(path, text):

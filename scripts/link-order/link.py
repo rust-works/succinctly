@@ -19,8 +19,9 @@ had 4.5-5 MB of its own text resident against 0.3 MB for jq 1.7.1. Ordering brin
 
 `symbols.txt` holds demangled names, which carry no crate hash: the mangled names change with the
 crate version, the target triple and the toolchain, so the list is resolved here, at link time,
-against the symbols of the objects being linked (`nm`, then `c++filt`). A name the objects do not
-define is skipped. `generate.py` regenerates the list.
+against the symbols of the objects and archives being linked (`nm`, then `c++filt`; an archive holds
+the vendored Oniguruma's C code, #8073). A name they do not define is skipped. `generate.py`
+regenerates the list.
 
 It steps aside (plain link) when: the output is not the `succinctly` executable (cargo's
 `deps/succinctly-<hash>` or, from cargo 1.100, `build/succinctly/<hash>/out/succinctly`) of a
@@ -137,14 +138,30 @@ def wants_order(args, platform=sys.platform, env=os.environ):
     return None, [], "no lld: GNU ld has no --symbol-ordering-file"
 
 
+ARCHIVES = (".rlib", ".a")
+
+
 def objects(args):
-    # With fat LTO every Rust function of the executable is in the one object rustc made.
-    return [a for a in args if a.endswith(".o") and os.path.isfile(a)]
+    """The link's objects and archives, whose text symbols the list is resolved against.
+
+    With fat LTO every Rust function of the executable is in the one object rustc made, but C code
+    comes in archives: the `libsuccinctly` rlib bundles the vendored Oniguruma's objects (#7965).
+    Read from the object alone, the 57 Oniguruma functions a regex run executes were never ordered,
+    and counted as no longer resolving in every freshly generated list (59 of 1462, #8073).
+    """
+    return [a for a in args if a.endswith((".o",) + ARCHIVES) and os.path.isfile(a)]
 
 
 def text_symbols(files):
-    """Names of the text symbols `files` define (`nm -p`, in file order)."""
-    out = subprocess.run(["nm", "-p"] + files, capture_output=True, text=True, check=True).stdout
+    """Names of the text symbols `files` define (`nm -p`, in file order).
+
+    An archive is read on its own and its exit status ignored: an rlib's metadata members are no
+    object `nm` can read (GNU nm says `no symbols`; another nm may fail), and its other members are
+    still listed. An object `nm` cannot read is an error, as before."""
+    out = ""
+    for f in files:
+        archive = f.endswith(ARCHIVES)
+        out += subprocess.run(["nm", "-p", f], capture_output=True, text=True, check=not archive).stdout
     names = []
     for line in out.splitlines():
         p = line.split(" ", 2)
