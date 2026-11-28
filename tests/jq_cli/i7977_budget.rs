@@ -17,6 +17,7 @@ use crate::{spawn_with_signal_retry, succinctly_bin};
 
 const SWITCH: &str = "SUCCINCTLY_CALL_MACHINE";
 const LOG: &str = "SUCCINCTLY_DEBUG_CALL_MACHINE_LOG";
+const MEMORY: &str = "SUCCINCTLY_DEBUG_CALL_MACHINE_MEMORY_LIMIT";
 
 /// `(stdout, stderr, exit, decisions)` of `succinctly jq -nc <filter>`, with the switch on when
 /// `on`, under the shell prefix `limit` (`ulimit ...`) when there is one. `decisions` holds the
@@ -51,6 +52,12 @@ fn run(
                 command.env(SWITCH, "1");
             } else {
                 command.env_remove(SWITCH);
+            }
+            // These rows pin the round cap and the control-state budget, so the memory limit
+            // (#8064, `i8064.rs`), which a collector can meet first on one platform and not on
+            // another, is lifted out of their way; under a shell cap it is the computed one.
+            if limit.is_none() {
+                command.env(MEMORY, "1099511627776");
             }
             command
         },
