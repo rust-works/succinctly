@@ -84,7 +84,7 @@ locale-time = ["std", "dep:libc"]
 # Oniguruma (`vendor/oniguruma`, the commit jq 1.7.1 bundles) through its FFI
 # (`src/jq/onig_ffi.rs`), which needs a C compiler (#7965, ADR-0031); yq mode
 # runs Go's dialect on the `regex` crate.
-regex = ["std", "dep:regex", "dep:cc"]
+regex = ["std", "dep:regex", "dep:aho-corasick", "dep:cc"]
 
 # Test features (not for production)
 large-tests = []    # 1G bitvector tests (~125MB RAM)
@@ -129,6 +129,9 @@ serde = { version = "1.0", default-features = false, features = ["alloc", "deriv
 # in each branch of an alternation (rust-lang/regex#1400); yq's leftmost-first match depends on it
 # (#6149).
 regex = { version = "1.13.2", optional = true }
+# jq mode's literal fast path (ADR-0031 step 5): a pattern that is a literal or an alternation of
+# literals is searched leftmost-first, as Oniguruma backtracks it. Already in Cargo.lock through regex.
+aho-corasick = { version = "1.1.4", optional = true }
 
 # CLI dependencies (optional, only for binary)
 clap = { version = "4.5", features = ["derive"], optional = true }

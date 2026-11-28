@@ -134,3 +134,38 @@ fn the_earlier_engine_switch_is_gone_7965() -> Result<()> {
     assert_eq!(String::from_utf8(off.stdout)?.trim_end(), jq);
     Ok(())
 }
+
+/// ADR-0031 step 5: a literal or an alternation of literals is searched without Oniguruma, with its
+/// answers: the leftmost match, the first alternative there, offsets in characters. Each expected
+/// value is captured from `/usr/bin/jq` 1.7.1.
+#[test]
+fn literal_patterns_answer_as_oniguruma_does_7965() -> Result<()> {
+    let input = r#""abc ab a 日本語本 é, x;y""#;
+    for (filter, expected) in [
+        (
+            r#"[match("a|ab|abc";"g") | [.offset, .length, .string]]"#,
+            r#"[[0,1,"a"],[4,1,"a"],[7,1,"a"]]"#,
+        ),
+        (
+            r#"[match("abc|ab|a";"g") | .string]"#,
+            r#"["abc","ab","a"]"#,
+        ),
+        (
+            r#"[match("本|語本";"g") | [.offset, .length]]"#,
+            "[[10,1],[11,2]]",
+        ),
+        (
+            r#"gsub("é|日"; "<\(.)>")"#,
+            r#""abc ab a <{}>本語本 <{}>, x;y""#,
+        ),
+        (r#"[splits(", |;")]"#, r#"["abc ab a 日本語本 é","x","y"]"#),
+        (r#"test("ab|zz")"#, "true"),
+    ] {
+        assert_eq!(
+            run(filter, input)?,
+            (expected.to_string(), 0),
+            "{input} | {filter}"
+        );
+    }
+    Ok(())
+}
