@@ -1003,7 +1003,7 @@ impl<'c, 'e> Vm<'c, 'e> {
     /// stack or an accumulator, which is rare and moves the process's memory by more than any one
     /// check point does. An accumulator's refusal is the memory bound's (`memory`), with its
     /// wording; a control stack's is a deep recursion's, with the recursion wording, as past the
-    /// control-state budget.
+    /// control-state budget, unless the process was past the limit before the stack grew.
     #[cold]
     #[inline(never)]
     fn growth_fits(&mut self, old: usize, memory: bool) -> bool {
@@ -1016,7 +1016,9 @@ impl<'c, 'e> Vm<'c, 'e> {
         if now.saturating_add(old) <= probe.limit {
             return true;
         }
-        self.memory_over = memory;
+        // A stack's growth is a deep recursion's only when its own old block is what does not
+        // fit; a process already past the limit (a large input, say) is the memory bound's.
+        self.memory_over = memory || now > probe.limit;
         false
     }
 

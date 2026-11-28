@@ -2200,10 +2200,12 @@ fn samples() -> u32 {
     FAKE_MEMORY.with(|cell| cell.get().2)
 }
 
-/// A run whose process holds more than the limit is refused with the memory bound's own wording
-/// (#8064), naming the innermost definition, uncatchably, whatever the program does: a collector,
-/// a fold's state, a recursion that collects nothing. A run too short to reach a sample (fewer
-/// check points than the first interval) holds too little to matter and is not sampled.
+/// A run whose process holds more than the limit is refused, uncatchably, whatever the program
+/// does: a collector, a fold's state, a recursion that collects nothing (#8064). It is refused
+/// with the memory bound's own wording at a check point or an accumulator's growth, and with the
+/// recursion wording at a control stack's growth, which can come first: a run that cannot grow
+/// its stacks is too deep for its memory. A run too short to reach a sample (fewer check points
+/// than the first interval) holds too little to matter and is not sampled.
 #[test]
 fn past_the_memory_limit_a_run_is_refused_8064() {
     for filter in [
@@ -2216,10 +2218,29 @@ fn past_the_memory_limit_a_run_is_refused_8064() {
         assert!(answer.outputs.is_empty(), "{filter}: {answer:?}");
         let error = answer.error.unwrap_or_default();
         assert!(
-            error == "f/0: memory limit exceeded" || error == "memory limit exceeded",
+            [
+                "f/0: memory limit exceeded",
+                "memory limit exceeded",
+                "f/0 exceeded maximum recursion depth",
+                "exceeded maximum recursion depth",
+            ]
+            .contains(&error.as_str()),
             "{filter}: {error}"
         );
     }
+    // A collector whose stacks need not grow is refused at a check point, with the memory
+    // wording: one round's frames fit in the stacks a first call grows to.
+    let answer = machine_within(
+        probed(SHIPPED, 1 << 20, 2 << 20, 0),
+        "def f($n): if $n < 100 then [range(20)] as $a | f($n + 1) else $n end; f(0)",
+    );
+    assert!(
+        answer
+            .error
+            .as_deref()
+            .is_some_and(|e| e.ends_with("memory limit exceeded")),
+        "{answer:?}"
+    );
 }
 
 /// With a probe no loop is refused for its outputs: past the shipped output bound a loop answers
