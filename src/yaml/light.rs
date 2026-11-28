@@ -6634,32 +6634,41 @@ pub fn may_hold_merge_keys<W: AsRef<[u64]>>(cursor: YamlCursor<'_, W>) -> bool {
     cursor.index.may_have_merge_keys(cursor.text)
 }
 
-/// Whether `cursor`'s document holds a `null` or a boolean spelled non-canonically (#8020).
+/// Which scalars spelled non-canonically `cursor`'s document holds, of the kinds asked for (#8020):
+/// `(bools, nulls)`.
 ///
-/// That is, one yq reads by a text other than `null`/`true`/`false`: `~`, `Null`, `NULL`, an empty
-/// value, `True`, `TRUE`, `False`, `FALSE`. yq compares such a scalar by its text (`True == true`
-/// is false there, and `~ | tostring` is `"~"`), where the owned value and the cursor read the
-/// value it resolved to. A document with an explicit tag answers `true` as well: a tag can force
-/// either kind. The walk visits every value once, without recursion.
+/// A boolean spelled `True`, `TRUE`, `False` or `FALSE`, plain or under any explicit tag (`!Foo
+/// True`), or a `null` spelled `~`, `Null`, `NULL` or left empty. yq reads such a scalar by its
+/// text (`True == true` is false there, and `~ | tostring` is `"~"`, an empty value's `""`), where
+/// the owned value and the cursor read the value it resolved to. A kind not asked for answers `false`; the walk visits
+/// every value at most once, without recursion, and stops when every kind asked for is found.
+#[doc(hidden)]
 #[must_use]
-pub fn holds_spelled_bool_or_null<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_, W>) -> bool {
-    if cursor.index.has_explicit_tags() {
-        return true;
-    }
+pub fn holds_spelled_scalars<W: AsRef<[u64]> + Clone>(
+    cursor: YamlCursor<'_, W>,
+    want_bools: bool,
+    want_nulls: bool,
+) -> (bool, bool) {
+    let (mut bools, mut nulls) = (false, false);
     let mut pending = alloc::vec![cursor];
-    while let Some(node) = pending.pop() {
+    while (want_bools && !bools) || (want_nulls && !nulls) {
+        let Some(node) = pending.pop() else { break };
         match node.value() {
-            YamlValue::Null => return true,
+            YamlValue::Null => nulls |= want_nulls,
             YamlValue::String(text) => {
-                if text.is_unquoted()
-                    && text.as_str().is_ok_and(|t| {
-                        matches!(
-                            &*t,
-                            "True" | "TRUE" | "False" | "FALSE" | "~" | "Null" | "NULL"
-                        )
-                    })
+                let spelled = text.as_str().ok();
+                let spelled = spelled.as_deref();
+                if want_bools
+                    && matches!(spelled, Some("True" | "TRUE" | "False" | "FALSE"))
+                    && (text.is_unquoted() || node.explicit_tag().is_some())
                 {
-                    return true;
+                    bools = true;
+                }
+                if want_nulls
+                    && text.is_unquoted()
+                    && matches!(spelled, Some("" | "~" | "Null" | "NULL"))
+                {
+                    nulls = true;
                 }
             }
             YamlValue::Mapping(_) => {
@@ -6675,7 +6684,7 @@ pub fn holds_spelled_bool_or_null<W: AsRef<[u64]> + Clone>(cursor: YamlCursor<'_
             YamlValue::Alias { .. } | YamlValue::Error(_) => {}
         }
     }
-    false
+    (bools, nulls)
 }
 
 /// The members `<<` merges bring into the mappings of the document `cursor` roots, each with the

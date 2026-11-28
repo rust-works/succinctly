@@ -565,6 +565,95 @@ const CANONICAL_ROWS: &[(&str, &str)] = &[
     ),
 ];
 
+/// A double-quoted `keep`, a plain one, and an empty value (#8020 fifth review).
+const KEEP: &str = "a: \"keep\"\nb: \"x\"\nc: keep\nd:\n";
+/// [`KEEP`] with a custom-tagged node beside it.
+const KEEP_TAGGED: &str = "a: \"keep\"\nb: \"x\"\nc: keep\nd:\ne: !Ref y\n";
+/// Spelled nulls beside the strings.
+const KEEP_NULLS: &str = "a: \"keep\"\nb: ~\nc: keep\nd: Null\n";
+/// Two nodes compared with each other, one pair spelling the same boolean two ways.
+const NODE_PAIRS: &str = "a: {x: True, y: true}\nb: {x: 1, y: 2}\nc: {x: 3, y: 3}\n";
+/// Tagged scalars: yq compares `!Foo True` by its text, the owned value as `true`.
+const TAGGED_SCALARS: &str =
+    "a: !!bool true\nb: !!str true\nc: !Ref x\nd: !!null ~\ne: !!str 5\nf: !!int \"5\"\ng: !Foo True\n";
+
+/// Only what a condition reads by its text gates it (#8020 fifth review): a spelled boolean gates
+/// `==` and `!=` against a string, a boolean or another node, a spelled `null` or an empty value
+/// only `tostring`, and an explicit tag nothing of its own. Each matches yq v4.53.3. (document,
+/// filter, yq's stdout.)
+const SPLIT_GATE_ROWS: &[(&str, &str, &str)] = &[
+    (
+        KEEP,
+        "(.[] | select(style == \"double\" and . == \"keep\")) = \"Z\"",
+        "a: \"Z\"\nb: \"x\"\nc: keep\nd:\n",
+    ),
+    (
+        KEEP_TAGGED,
+        "(.[] | select(style == \"double\" and . == \"keep\")) = \"Z\"",
+        "a: \"Z\"\nb: \"x\"\nc: keep\nd:\ne: !Ref y\n",
+    ),
+    (
+        KEEP,
+        "del(.[] | select(. == \"keep\") | line)",
+        "b: \"x\"\nd:\n",
+    ),
+    (
+        KEEP_TAGGED,
+        "del(.[] | select(. == \"keep\") | line)",
+        "b: \"x\"\nd:\ne: !Ref y\n",
+    ),
+    (
+        KEEP,
+        "del(.[] | select(. == \"keep\") | key)",
+        "b: \"x\"\nd:\n",
+    ),
+    (KEEP, "del(.[] | select(. != null) | line)", "d:\n"),
+    (KEEP, "del(.[] | select(tostring == \"null\") | line)", KEEP),
+    (
+        KEEP,
+        "(.[] | select(style == \"\" and . == null)) = \"Z\"",
+        "a: \"keep\"\nb: \"x\"\nc: keep\nd: Z\n",
+    ),
+    (
+        KEEP_NULLS,
+        "del(.[] | select(. == null) | line)",
+        "a: \"keep\"\nc: keep\n",
+    ),
+    (
+        KEEP_NULLS,
+        "(.[] | select(style == \"\" and . == null)) = \"Z\"",
+        "a: \"keep\"\nb: Z\nc: keep\nd: Z\n",
+    ),
+    (
+        TAGGED_SCALARS,
+        "del(.[] | select(. == 5) | line)",
+        "a: !!bool true\nb: !!str true\nc: !Ref x\nd: !!null ~\ng: !Foo True\n",
+    ),
+    (
+        TAGGED_SCALARS,
+        "del(.[] | select(. == null) | line)",
+        "a: !!bool true\nb: !!str true\nc: !Ref x\ne: !!str 5\nf: !!int \"5\"\ng: !Foo True\n",
+    ),
+];
+
+/// A spelled boolean still gates: compared with another node (`.x == .y`, where yq deletes `c`)
+/// or under a tag of its own (`!Foo True`, where yq deletes `a` and `b`), the reader stays
+/// parentless and nothing goes (the safe direction, recorded). (document, filter, stdout.)
+const SPLIT_LESS_ROWS: &[(&str, &str, &str)] = &[
+    (NODE_PAIRS, "del(.[] | select(.x == .y) | line)", NODE_PAIRS),
+    (NODE_PAIRS, "del(.[] | select(.x != .y) | line)", NODE_PAIRS),
+    (
+        TAGGED_SCALARS,
+        "del(.[] | select(. == true) | line)",
+        TAGGED_SCALARS,
+    ),
+    (
+        TAGGED_SCALARS,
+        "del(.[] | select(. == \"true\") | line)",
+        TAGGED_SCALARS,
+    ),
+];
+
 fn run(args: &[&str], stdin: &str) -> Result<(String, String, i32)> {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_succinctly"))
@@ -795,6 +884,26 @@ fn a_metadata_selection_over_canonical_scalars_resolves_as_before_8020() -> Resu
     Ok(())
 }
 
+#[test]
+fn a_spelled_null_or_a_tag_gates_only_the_reads_it_changes_8020() -> Result<()> {
+    for (doc, filter, want) in SPLIT_GATE_ROWS.iter().chain(SPLIT_LESS_ROWS) {
+        assert_row(&[filter], doc, want)?;
+    }
+    // On the cursor route a node-to-node compare over a spelled boolean refuses, where yq writes
+    // `c.z`.
+    let got = run(
+        &["(.[] | select(kind == \"map\" and .x == .y)).z = 1"],
+        NODE_PAIRS,
+    )?;
+    assert_eq!((got.0.as_str(), got.2), ("", 1), "{}", got.1);
+    assert!(
+        got.1.starts_with("Error: Invalid path expression"),
+        "{}",
+        got.1
+    );
+    Ok(())
+}
+
 /// One `-i` row per review finding: the file holds yq's result, or is left as it was.
 #[test]
 fn inplace_review_rows_keep_the_file_8020() -> Result<()> {
@@ -831,6 +940,24 @@ fn inplace_review_rows_keep_the_file_8020() -> Result<()> {
             0,
         ),
         (SPELLED, "del(.[] | select(. == true) | line)", SPELLED, 0),
+        (
+            KEEP_TAGGED,
+            "(.[] | select(style == \"double\" and . == \"keep\")) = \"Z\"",
+            "a: \"Z\"\nb: \"x\"\nc: keep\nd:\ne: !Ref y\n",
+            0,
+        ),
+        (
+            KEEP,
+            "del(.[] | select(. == \"keep\") | line)",
+            "b: \"x\"\nd:\n",
+            0,
+        ),
+        (
+            NODE_PAIRS,
+            "del(.[] | select(.x == .y) | line)",
+            NODE_PAIRS,
+            0,
+        ),
         (
             TAGGED,
             "del(.[] | select(type == \"!!str\") | line)",

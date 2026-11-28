@@ -9777,47 +9777,93 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // make it answer differently. Only the parts some condition consults are measured, and the
     // spelled-scalar walk reads every value, so a `select(.score < 100)` pays for neither.
     let _owned_shape = owned_shape_needs(expr).map(|needs| {
+        let (spelled_bools, spelled_nulls) = if needs.spelled_bools || needs.spelled_nulls {
+            succinctly::yaml::holds_spelled_scalars(
+                cursor,
+                needs.spelled_bools,
+                needs.spelled_nulls,
+            )
+        } else {
+            (false, false)
+        };
         jq::yq_owned_document::enter(jq::OwnedDocumentShape {
             aliases_or_merge_keys: needs.aliases_or_merge_keys
                 && (cursor.index().has_aliases() || succinctly::yaml::may_hold_merge_keys(cursor)),
-            spelled_bool_or_null: needs.spelled_bool_or_null
-                && succinctly::yaml::holds_spelled_bool_or_null(cursor),
+            spelled_bools,
+            spelled_nulls,
         })
     });
     evaluate_yaml_cursor_in_document(cursor, expr, sink, need_comments, strip_style, sort_keys)
 }
 
 /// Which parts of the document's [`jq::OwnedDocumentShape`] a write or `del()` in `expr` can
-/// consult (#8020): the parts the `select` and `if` conditions read
-/// ([`jq::yq_condition_shape_needs`]), and the alias half for a `..`. `None` for a program that
-/// writes nothing or consults neither part, which then measures nothing.
+/// consult (#8020): the parts the `select` and `if` conditions of its target read
+/// ([`jq::yq_condition_shape_needs`]), and the alias half for a `..` there. Only a target the shape
+/// is asked about counts: one with a node reader or a deriving stage (`.[] | select(. == "x") |
+/// line`, `tostring`), or one that selects by node metadata, `eval` or a `def` call, which the
+/// cursor resolution takes. `None` for a program with none, or whose such targets consult neither
+/// part, which then measures nothing: `(.[] | select(.x > 1)).y = 1` pays for no walk.
 fn owned_shape_needs(expr: &Expr) -> Option<jq::OwnedDocumentShape> {
-    let mut writes = false;
+    fn asks_about_shape(target: &Expr) -> bool {
+        jq::walk::uses_cursor_metadata_builtins(target)
+            || jq::walk::any_subexpr(target, &mut |e| {
+                matches!(
+                    e,
+                    Expr::Builtin(
+                        Builtin::Tag
+                            | Builtin::Type
+                            | Builtin::PathNoArg
+                            | Builtin::Key
+                            | Builtin::ToString
+                            | Builtin::Length
+                            | Builtin::ToJson
+                            | Builtin::EvalExpr(..)
+                            | Builtin::Load(..)
+                    ) | Expr::Not
+                        | Expr::Format(_)
+                        | Expr::FuncCall { .. }
+                        | Expr::DefCall { .. }
+                ) || matches!(e, Expr::Builtin(b) if is_node_metadata_slot(b))
+            })
+    }
     let mut needs = jq::OwnedDocumentShape {
         aliases_or_merge_keys: false,
-        spelled_bool_or_null: false,
+        spelled_bools: false,
+        spelled_nulls: false,
+    };
+    let mut add = |target: &Expr| {
+        if !asks_about_shape(target) {
+            return;
+        }
+        jq::walk::any_subexpr(target, &mut |e| {
+            match e {
+                Expr::Builtin(Builtin::Select(cond)) | Expr::If { cond, .. } => {
+                    let more = jq::yq_condition_shape_needs(cond);
+                    needs.aliases_or_merge_keys |= more.aliases_or_merge_keys;
+                    needs.spelled_bools |= more.spelled_bools;
+                    needs.spelled_nulls |= more.spelled_nulls;
+                }
+                Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys => {
+                    needs.aliases_or_merge_keys = true;
+                }
+                _ => {}
+            }
+            false
+        });
     };
     jq::walk::any_subexpr(expr, &mut |e| {
         match e {
-            Expr::Builtin(Builtin::Select(cond)) | Expr::If { cond, .. } => {
-                let more = jq::yq_condition_shape_needs(cond);
-                needs.aliases_or_merge_keys |= more.aliases_or_merge_keys;
-                needs.spelled_bool_or_null |= more.spelled_bool_or_null;
-            }
-            Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys => {
-                needs.aliases_or_merge_keys = true;
-            }
-            Expr::Builtin(Builtin::Del(_))
-            | Expr::Assign { .. }
-            | Expr::Update { .. }
-            | Expr::CompoundAssign { .. }
-            | Expr::AlternativeAssign { .. }
-            | Expr::MetaAssign { .. } => writes = true,
+            Expr::Builtin(Builtin::Del(target))
+            | Expr::Assign { path: target, .. }
+            | Expr::Update { path: target, .. }
+            | Expr::CompoundAssign { path: target, .. }
+            | Expr::AlternativeAssign { path: target, .. }
+            | Expr::MetaAssign { target, .. } => add(target),
             _ => {}
         }
         false
     });
-    (writes && (needs.aliases_or_merge_keys || needs.spelled_bool_or_null)).then_some(needs)
+    (needs.aliases_or_merge_keys || needs.spelled_bools || needs.spelled_nulls).then_some(needs)
 }
 
 /// [`evaluate_yaml_cursor`] inside the document scope it installs.

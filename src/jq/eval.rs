@@ -83830,16 +83830,20 @@ pub struct OwnedDocumentShape {
     /// `contains`, `test` and the string predicates see the alias node, and a merge key's
     /// members are not the mapping's own.
     pub aliases_or_merge_keys: bool,
-    /// A `null` or boolean spelled other than `null`/`true`/`false` (`~`, `True`, an empty value):
-    /// yq compares a scalar by its text, the owned value by what it resolved to.
-    pub spelled_bool_or_null: bool,
+    /// A boolean spelled other than `true`/`false` (`True`, `FALSE`, `!Foo True`): yq compares a
+    /// scalar by its text, the owned value by what it resolved to, so `==` and `!=` differ.
+    pub spelled_bools: bool,
+    /// A `null` spelled other than `null` (`~`, `Null`, an empty value): yq's `tostring` gives its
+    /// text, the owned value's `"null"`. Its comparisons agree.
+    pub spelled_nulls: bool,
 }
 
 impl OwnedDocumentShape {
     /// Every part assumed: the shape of a document nothing measured.
     pub const UNKNOWN: Self = Self {
         aliases_or_merge_keys: true,
-        spelled_bool_or_null: true,
+        spelled_bools: true,
+        spelled_nulls: true,
     };
 }
 
@@ -83895,17 +83899,20 @@ pub mod yq_owned_document {
 /// Whether a values-only `select` condition can still answer differently on the owned value than on
 /// yq's document of the given `shape` (#8020), which keeps a node yq leaves:
 ///
-/// - With [`OwnedDocumentShape::spelled_bool_or_null`]: yq compares a scalar's text, so `True ==
-///   true`, `True == "true"` and `True != "True"` are all false there, and `~ | tostring` is
-///   `"~"`. So `tostring`, and an `==` or `!=` between a node's own value and a literal `null`,
-///   boolean or string, count.
+/// - With [`OwnedDocumentShape::spelled_bools`]: yq compares a scalar's text, so `True == true`,
+///   `True == "true"` and `True != "True"` are all false there, and `{x: True, y: true} | .x == .y`
+///   is too. So `tostring`, an `==` or `!=` between a node's own value and a literal boolean or
+///   string, and one between two node values, count.
+/// - With [`OwnedDocumentShape::spelled_nulls`]: `~ | tostring` is `"~"` in yq, so `tostring`
+///   counts. `~ == null` holds in both.
 /// - With [`OwnedDocumentShape::aliases_or_merge_keys`]: yq's `has`, `length`, `keys`, `tostring`,
 ///   `contains`, `test` and the string predicates see an alias node itself (`*x | has("p")` is
 ///   false in yq), and a merge key's members are not the mapping's own. Those count.
 #[doc(hidden)]
 pub fn yq_condition_reads_differently_on_owned(cond: &Expr, shape: OwnedDocumentShape) -> bool {
     let needs = yq_condition_shape_needs(cond);
-    (needs.spelled_bool_or_null && shape.spelled_bool_or_null)
+    (needs.spelled_bools && shape.spelled_bools)
+        || (needs.spelled_nulls && shape.spelled_nulls)
         || (needs.aliases_or_merge_keys && shape.aliases_or_merge_keys)
 }
 
@@ -83931,28 +83938,34 @@ pub fn yq_condition_shape_needs(cond: &Expr) -> OwnedDocumentShape {
             _ => false,
         }
     }
-    let textual = |e: &Expr| {
-        matches!(
+    // What a node value is compared with where yq's reading of a spelled boolean by its text can
+    // change the answer: anything but a number or `null` (`True == 1` and `~ == null` agree).
+    let may_be_text = |e: &Expr| {
+        !matches!(
             unwrap_paren(e),
-            Expr::Literal(Literal::Null | Literal::Bool(_) | Literal::String(_))
+            Expr::Literal(
+                Literal::NumberLiteral(..) | Literal::Int(_) | Literal::Float(_) | Literal::Null
+            )
         )
     };
     let mut needs = OwnedDocumentShape {
         aliases_or_merge_keys: false,
-        spelled_bool_or_null: false,
+        spelled_bools: false,
+        spelled_nulls: false,
     };
     any_subexpr(cond, &mut |e| {
         match e {
             Expr::Builtin(B::ToString) => {
-                needs.spelled_bool_or_null = true;
+                needs.spelled_bools = true;
+                needs.spelled_nulls = true;
                 needs.aliases_or_merge_keys = true;
             }
             Expr::Compare { op, left, right }
                 if matches!(op, CompareOp::Eq | CompareOp::Ne)
-                    && ((node_value(left) && textual(right))
-                        || (node_value(right) && textual(left))) =>
+                    && ((node_value(left) && may_be_text(right))
+                        || (node_value(right) && may_be_text(left))) =>
             {
-                needs.spelled_bool_or_null = true;
+                needs.spelled_bools = true;
             }
             Expr::Builtin(
                 B::Has(_)
@@ -185573,32 +185586,51 @@ mod del_reader_rewrite_allowlist_8020 {
     fn a_value_the_owned_document_holds_differently_is_flagged() {
         let plain = OwnedDocumentShape {
             aliases_or_merge_keys: false,
-            spelled_bool_or_null: false,
+            spelled_bools: false,
+            spelled_nulls: false,
         };
-        let spelled = OwnedDocumentShape {
-            spelled_bool_or_null: true,
+        let bools = OwnedDocumentShape {
+            spelled_bools: true,
+            ..plain
+        };
+        let nulls = OwnedDocumentShape {
+            spelled_nulls: true,
             ..plain
         };
         let aliased = OwnedDocumentShape {
             aliases_or_merge_keys: true,
             ..plain
         };
-        // Scalar spellings: yq compares a scalar's text, on a document that spells one.
+        // Spelled booleans: yq compares a scalar's text, with a literal or with another node.
         for cond in [
             ". == true",
-            "null == .",
             "(.a)? == false",
             ".a | . != \"x\"",
             ". == \"true\"",
             ".[0] == \"false\"",
+            ".x == .y",
             "tostring == \"null\"",
         ] {
+            let cond = condition(cond);
+            assert!(yq_condition_reads_differently_on_owned(&cond, bools));
+            assert!(!yq_condition_reads_differently_on_owned(&cond, plain));
+        }
+        // Spelled nulls: only `tostring` reads one by its text; `~ == null` holds in yq too.
+        for cond in ["tostring == \"null\"", "tostring | length > 1"] {
             assert!(
-                yq_condition_reads_differently_on_owned(&condition(cond), spelled),
+                yq_condition_reads_differently_on_owned(&condition(cond), nulls),
                 "{cond}"
             );
+        }
+        for cond in [
+            ". == null",
+            "null == .",
+            ".a != null",
+            ". == true",
+            ".x == .y",
+        ] {
             assert!(
-                !yq_condition_reads_differently_on_owned(&condition(cond), plain),
+                !yq_condition_reads_differently_on_owned(&condition(cond), nulls),
                 "{cond}"
             );
         }
@@ -185621,7 +185653,14 @@ mod del_reader_rewrite_allowlist_8020 {
         }
         // A metadata reader's answer is a fresh string, and ordering compares and numbers read the
         // value as yq does.
-        for cond in ["style != \"\"", ". > 1", ".a == 1", "1 == 2"] {
+        for cond in [
+            "style != \"\"",
+            ". > 1",
+            ".a == 1",
+            "1 == 2",
+            ". == null",
+            "\"a\" == \"b\"",
+        ] {
             assert!(
                 !yq_condition_reads_differently_on_owned(
                     &condition(cond),
