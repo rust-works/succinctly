@@ -404,6 +404,23 @@ const ALLOWLIST_ROWS: &[(&str, &str, &str)] = &[
         "del(.[] | select(style == \"\") | tostring)",
         "a: \"x\"\n",
     ),
+    // `..` from the root on documents without aliases, rewritten on the owned value.
+    (NESTED, "del(.. | line)", "{}\n"),
+    (NESTED, "del(.. | key)", "{}\n"),
+    (STYLED, "del(.. | line)", "{}\n"),
+    (STYLED, "del(.. | kind)", "{}\n"),
+    // Pure navigation into a `..` on a document with aliases, resolved on the cursor.
+    (
+        ALIASED,
+        "del(.e? | .. | line)",
+        "d: &x {p: 1, q: 2}\nf: 3\n",
+    ),
+    (ALIASED, "del((.e, .f) | .. | line)", "d: &x {p: 1, q: 2}\n"),
+    (
+        ALIASED,
+        "del((.e | .p, .f) | .. | line)",
+        "d: &x {q: 2}\ne: *x\n",
+    ),
     (INNER, "del(.x | first(style == \"\"))", "x: {a: \"q\"}\n"),
     (
         INNER,
@@ -631,6 +648,41 @@ fn a_def_that_reads_metadata_deletes_nothing_through_a_reader_8020() -> Result<(
     let got = run(&["--jq-extensions", "-i", filter, path], "")?;
     assert_eq!((got.0.as_str(), got.1.as_str(), got.2), ("", "", 0));
     assert_eq!(std::fs::read_to_string(file.path())?, STYLED);
+    Ok(())
+}
+
+/// A metadata selection the cursor cannot finish refuses, as yq errors there too: run on the owned
+/// value it would read every metadata reader's default, and the write would reach every node.
+#[test]
+fn a_metadata_selection_the_cursor_cannot_finish_refuses_8020() -> Result<()> {
+    for filter in [
+        "del(.[] | select(style == \"\" or (. - 1) > 0) | line)",
+        "(.[] | select(style == \"\" or (. - 1) > 0)) = 9",
+    ] {
+        let got = run(&[filter], STYLED)?;
+        assert_eq!((got.0.as_str(), got.2), ("", 1), "{filter}: {}", got.1);
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(file.path(), STYLED)?;
+        let path = file.path().to_str().expect("utf-8 temp path");
+        let got = run(&["-i", filter, path], "")?;
+        assert_eq!(got.2, 1, "{filter}: {}", got.1);
+        assert_eq!(std::fs::read_to_string(file.path())?, STYLED, "{filter}");
+    }
+    Ok(())
+}
+
+/// A metadata selection with an effect of its own (`debug`, `--jq-extensions`) is not run a second
+/// time on the cursor: it runs as written, where the reader stays parentless and nothing goes.
+#[test]
+fn a_metadata_selection_with_an_effect_runs_as_written_8020() -> Result<()> {
+    let got = run(
+        &[
+            "--jq-extensions",
+            "del(.[] | select(style == \"\" | debug) | line)",
+        ],
+        STYLED,
+    )?;
+    assert_eq!((got.0.as_str(), got.2), (STYLED, 0), "{}", got.1);
     Ok(())
 }
 

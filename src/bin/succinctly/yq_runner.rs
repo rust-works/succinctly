@@ -7783,7 +7783,7 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
 /// alias and the owned walk would reach the anchor through it.
 ///
 /// A target whose paths cannot be resolved (an error, or a key that is not a string or an
-/// integer) runs as written, as it always did.
+/// integer) refuses too: run as written, its selection would keep nodes yq leaves.
 fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
     cursor: YamlCursor<'_, W>,
     target: &Expr,
@@ -7927,12 +7927,15 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         return None;
     }
     let navigation_expr = Expr::pipe(navigation.iter().map(|stage| (*stage).clone()).collect());
-    if inexact || !navigates_and_filters_only(&navigation_expr) {
-        return Some(Expr::Error(Some(Box::new(Expr::Literal(Literal::String(
+    let refusal = || {
+        Some(Expr::Error(Some(Box::new(Expr::Literal(Literal::String(
             "Invalid path expression: a target that selects by node metadata must only navigate \
              and filter here"
                 .into(),
-        ))))));
+        ))))))
+    };
+    if inexact || !navigates_and_filters_only(&navigation_expr) {
+        return refusal();
     }
     let query = Expr::Pipe(vec![navigation_expr, Expr::Builtin(Builtin::PathNoArg)].into());
     let mut scratch = ErrorSink::default();
@@ -7944,14 +7947,21 @@ fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
         false,
         false,
         CoreRoute::inner(None),
-    )
-    .ok()?;
+    );
+    // A selection the cursor cannot finish (`select(style == "" or (. - 1) > 0)` over a string, an
+    // error in yq too) is not run as written instead: the owned value would answer its metadata
+    // reads with their defaults and keep nodes yq leaves, which a write then overwrites.
+    let Ok(results) = results else {
+        return refusal();
+    };
     if scratch.hit() {
-        return None;
+        return refusal();
     }
     let mut matched = Vec::with_capacity(results.len());
     for (path, _) in &results {
-        let at = navigation_for(path)?;
+        let Some(at) = navigation_for(path) else {
+            return refusal();
+        };
         let at_root = matches!(at, Expr::Identity);
         // The root has no key, and a reader's answer at the root has none either: a tail with
         // `key` answers nothing there.
