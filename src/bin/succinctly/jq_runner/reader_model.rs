@@ -489,6 +489,8 @@ impl ReaderState {
     /// ends it instead, as the last answer, and it returns `true`: every `input` after it is that
     /// fault again ([`Stop::Stuck`]). Each step's answers are handed on and dropped before the next
     /// step, so what it holds is one read's worth, not the input's.
+    // `reads` is drained, not consumed: the buffer is the next step's.
+    #[allow(clippy::iter_with_drain)]
     pub(crate) fn read_to_end(
         mut self,
         sources: &[&[u8]],

@@ -220,7 +220,7 @@ fn read_rest(
                 }
             }
             Item::Fault(found) => {
-                errors.push((values.len(), fault(EvalError::new(found.message()))))
+                errors.push((values.len(), fault(EvalError::new(found.message()))));
             }
             Item::End => {
                 locations.eof_tail = Some(EofTail {
