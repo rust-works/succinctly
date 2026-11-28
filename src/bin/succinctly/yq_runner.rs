@@ -7637,13 +7637,17 @@ fn selects_by_tag(target: &Expr) -> bool {
     let mut scalar_compares = 0usize;
     jq::walk::any_subexpr(target, &mut |e| {
         match e {
-            Expr::Builtin(Builtin::Tag) => tag_reads += 1,
+            Expr::Builtin(Builtin::Tag | Builtin::Type) => tag_reads += 1,
             Expr::Compare { left, right, .. } => {
                 let literal = match (left.as_ref(), right.as_ref()) {
-                    (Expr::Builtin(Builtin::Tag), Expr::Literal(Literal::String(tag)))
-                    | (Expr::Literal(Literal::String(tag)), Expr::Builtin(Builtin::Tag)) => {
-                        Some(tag.as_ref())
-                    }
+                    (
+                        Expr::Builtin(Builtin::Tag | Builtin::Type),
+                        Expr::Literal(Literal::String(tag)),
+                    )
+                    | (
+                        Expr::Literal(Literal::String(tag)),
+                        Expr::Builtin(Builtin::Tag | Builtin::Type),
+                    ) => Some(tag.as_ref()),
                     _ => None,
                 };
                 if literal.is_some_and(|tag: &str| !matches!(tag, "!!map" | "!!seq")) {
@@ -7748,36 +7752,7 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
         Expr::Pipe(pipe) => (pipe.first()?, Some(pipe)),
         other => (other, None),
     };
-    let rewritten = retarget_write(write, &mut |target| {
-        let by_tag = || selects_by_tag(target) && cursor.index().has_explicit_tags();
-        if !(selects_by_node_metadata(target) || by_tag()) {
-            return None;
-        }
-        let query = Expr::Pipe(vec![target.clone(), Expr::Builtin(Builtin::PathNoArg)].into());
-        let mut scratch = ErrorSink::default();
-        let results = evaluate_yaml_cursor_core(
-            cursor,
-            &query,
-            &mut scratch,
-            false,
-            false,
-            false,
-            CoreRoute::inner(None),
-        )
-        .ok()?;
-        if scratch.hit() {
-            return None;
-        }
-        let mut matched = results
-            .iter()
-            .map(|(path, _)| navigation_for(path))
-            .collect::<Option<Vec<_>>>()?;
-        Some(match matched.len() {
-            0 => Expr::Builtin(Builtin::Empty),
-            1 => matched.remove(0),
-            _ => Expr::Paren(Box::new(Expr::Comma(matched))),
-        })
-    })?;
+    let rewritten = retarget_write(write, &mut |target| cursor_metadata_target(cursor, target))?;
     Some(match pipe {
         None => rewritten,
         Some(pipe) => {
@@ -7786,6 +7761,306 @@ fn resolve_metadata_write_targets<W: AsRef<[u64]> + Clone>(
             Expr::Pipe(stages.into())
         }
     })
+}
+
+/// One write target that selects nodes by node metadata, resolved on the cursor (#5479, #8020,
+/// #8037): `None` when it selects by none, which runs as written.
+///
+/// The target is split into its navigation and a tail of node readers (`line`, `kind`, `tag`,
+/// `path`, the comment readers, ..., and `key`). The navigation is resolved to the path of each
+/// node it selects, and each becomes that path with the tail after it (`.b | line`, or the tail
+/// alone at the root), which the evaluator then takes as yq does: a reader's answer keeps the slot
+/// of the node it read for a `del()` and is a fresh node for a write, and `key` renames.
+///
+/// A `path` names a document node only for an output that is one: a fresh node has a path too --
+/// `[]` for a literal or a reader's answer at the root, the path of the node it was copied from for
+/// a constructor (`{"a": 1} | .a` answers `["a"]`) -- and rewriting that into navigation wrote or
+/// deleted a document node yq never touches (`del(.a, line)` deleted the document, `(.b |
+/// select(kind == "map") | {"a": 1} | .a) = 9` set the top-level `a`). So only a navigation that
+/// navigates and filters is resolved. Any other one refuses rather than running as written: the
+/// owned value answers every metadata reader's default, so its `select` would keep nodes yq
+/// leaves. So does a `..` below a step down on a document with aliases, as yq's `..` stops at an
+/// alias and the owned walk would reach the anchor through it.
+///
+/// A target whose paths cannot be resolved (an error, or a key that is not a string or an
+/// integer) refuses too: run as written, its selection would keep nodes yq leaves.
+fn cursor_metadata_target<W: AsRef<[u64]> + Clone>(
+    cursor: YamlCursor<'_, W>,
+    target: &Expr,
+) -> Option<Expr> {
+    fn flatten<'e>(expr: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match strip_parens(expr) {
+            Expr::Pipe(stages) => stages.iter().for_each(|stage| flatten(stage, out)),
+            other => out.push(other),
+        }
+    }
+    // A comma is resolved member by member, so a member that selects by metadata is resolved on
+    // the cursor while a reader or a literal beside it is left to the evaluator, which applies
+    // yq's rule to it: `del(1, (.. | select(style == "x")))` keeps the document.
+    if let Expr::Comma(members) = strip_parens(target) {
+        let mut changed = false;
+        let members = members
+            .iter()
+            .map(|member| {
+                let resolved = cursor_metadata_target(cursor, member);
+                changed |= resolved.is_some();
+                resolved.unwrap_or_else(|| member.clone())
+            })
+            .collect();
+        return changed.then(|| Expr::Paren(Box::new(Expr::Comma(members))));
+    }
+    let mut stages = Vec::new();
+    flatten(target, &mut stages);
+    let is_reader = |stage: &Expr| match strip_parens(stage) {
+        Expr::Builtin(b) => {
+            is_node_metadata_slot(b)
+                || matches!(b, Builtin::Tag | Builtin::PathNoArg | Builtin::Key)
+        }
+        _ => false,
+    };
+    // A value derived from a node keeps that node's slot as a `del()` target in yq (#4476):
+    // `tostring`, `length`, `tojson`, `type`, `not`, `@json`.
+    let is_deriving = |stage: &Expr| {
+        matches!(
+            strip_parens(stage),
+            Expr::Builtin(Builtin::ToString | Builtin::Length | Builtin::ToJson | Builtin::Type)
+                | Expr::Not
+                | Expr::Format(FormatType::Json | FormatType::YqJson(_) | FormatType::YqYaml(_))
+        )
+    };
+    let opens_tail = |stage: &Expr| is_reader(stage) || is_deriving(stage);
+    // The tail starts at a reader or a deriving stage and holds those and the `select`s that test
+    // their answer without reading metadata (`line | select(. > 1)`), which keep its fresh node.
+    let in_tail = |stage: &Expr| {
+        opens_tail(stage)
+            || matches!(strip_parens(stage), Expr::Builtin(Builtin::Select(cond))
+                if !selects_by_node_metadata(cond) && !jq::walk::uses_cursor_metadata_builtins(cond))
+    };
+    let mut split = stages
+        .iter()
+        .rposition(|stage| !in_tail(stage))
+        .map_or(0, |at| at + 1);
+    while split < stages.len() && !opens_tail(stages[split]) {
+        split += 1;
+    }
+    let (navigation, tail) = stages.split_at(split);
+    if navigation.is_empty() {
+        return None;
+    }
+    // A selection the owned value cannot run exactly: one that reads node metadata
+    // (`select(style == "")`, `tag`/`type` by `selects_by_tag`'s rule), or one that can read it
+    // through `eval(..)` or a `def` call. A reader that only answers a node -- a stage of its own, or a member of a comma or a
+    // `first(..)` of navigation and readers (`first(.a, line)`, `.b | (style, .)`) -- selects
+    // nothing, and the evaluator takes its fresh node as yq does. A condition with an effect of its
+    // own (`input`, `debug`, `halt`) is not run twice: the target runs as written.
+    let explicit_tags = cursor.index().has_explicit_tags();
+    let mut effectful = false;
+    // `eval(..)` runs its program detached from the document, so even the cursor answers
+    // `eval("style")` with `""`: a target whose selection holds one refuses.
+    let mut inexact = false;
+    let filters = navigation.iter().any(|stage| {
+        if answers_without_selecting(stage, &is_reader) {
+            return false;
+        }
+        let beyond_values = jq::walk::any_subexpr(stage, &mut |e| match e {
+            Expr::Builtin(Builtin::Select(cond)) | Expr::If { cond, .. } => {
+                effectful |= jq::walk::uses_input_builtins(cond)
+                    || jq::walk::can_halt(cond)
+                    || jq::walk::contains_builtin(cond, |b| {
+                        matches!(
+                            b,
+                            Builtin::Debug
+                                | Builtin::DebugMsg(_)
+                                | Builtin::Stderr
+                                | Builtin::System(..)
+                        )
+                    });
+                // Beyond the direct metadata reads (`selects_by_node_metadata`, and `tag`/`type`
+                // by `selects_by_tag`'s rule, #6895), a condition can read metadata the owned value
+                // does not hold through `eval(..)` or a call of a `def`; `eval` runs detached from
+                // the document even on the cursor, so a target with one refuses.
+                let detached = jq::walk::contains_builtin(cond, |b| {
+                    matches!(b, Builtin::EvalExpr(..) | Builtin::Load(..))
+                });
+                // The cursor reads a scalar's value and through an alias as the owned value does,
+                // so a condition that yq answers from the text or the alias node itself
+                // (`. == true` on `True`, `has("p")` on `*x`) is not resolved there either.
+                inexact |= detached
+                    || jq::yq_condition_reads_differently_on_owned(
+                        cond,
+                        jq::yq_owned_document::current(),
+                    );
+                detached
+                    || jq::walk::any_subexpr(cond, &mut |e| {
+                        matches!(e, Expr::FuncCall { .. } | Expr::DefCall { .. })
+                    })
+            }
+            _ => false,
+        });
+        beyond_values || selects_by_node_metadata(stage) || (explicit_tags && selects_by_tag(stage))
+    });
+    if effectful {
+        return None;
+    }
+    // A navigation that starts at a fresh node (`1 | select(kind == "scalar")`, `line |
+    // select(true)`) selects among nodes of its own, whose metadata the owned value answers as yq
+    // does, and has no document node to resolve: it runs as written.
+    let fresh_start = matches!(
+        strip_parens(navigation[0]),
+        Expr::Literal(_) | Expr::Array(_) | Expr::Object(_)
+    ) || is_reader(navigation[0]);
+    // A tail of readers or deriving stages after a `..` on a document with aliases: the evaluator
+    // does not rewrite it to its navigation there, as the owned walk goes on through an alias where
+    // yq's `..` stops, and the cursor's `..` stops as yq's does (`[.e | .. | path]` is `[["e"]]` in
+    // both). Only pure navigation: a value condition (`has("p")`, `. == true`) is not answered as
+    // yq does on such a document even on the cursor, which reads through an alias.
+    let descends = navigation.iter().any(|stage| {
+        jq::walk::any_subexpr(stage, &mut |e| {
+            matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys)
+        })
+    });
+    let tail_needs_cursor = !tail.is_empty()
+        && descends
+        && jq::yq_owned_document::current().aliases_or_merge_keys
+        && navigation.iter().all(|stage| is_pure_navigation(stage));
+    if !(filters || tail_needs_cursor) || fresh_start {
+        return None;
+    }
+    let navigation_expr = Expr::pipe(navigation.iter().map(|stage| (*stage).clone()).collect());
+    let refusal = |why: &str| {
+        Some(Expr::Error(Some(Box::new(Expr::Literal(Literal::String(
+            format!("Invalid path expression: {why}").into(),
+        ))))))
+    };
+    if inexact {
+        return refusal(
+            "this document holds what yq reads differently in that selection (an alias, a merge \
+             key, a spelled true/false/null, or eval)",
+        );
+    }
+    if !navigates_and_filters_only(&navigation_expr) {
+        return refusal("a target that selects by node metadata must navigate and filter only");
+    }
+    let query = Expr::Pipe(vec![navigation_expr, Expr::Builtin(Builtin::PathNoArg)].into());
+    let mut scratch = ErrorSink::default();
+    let results = evaluate_yaml_cursor_core(
+        cursor,
+        &query,
+        &mut scratch,
+        false,
+        false,
+        false,
+        CoreRoute::inner(None),
+    );
+    // A selection the cursor cannot finish (`select(style == "" or (. - 1) > 0)` over a string, an
+    // error in yq too) is not run as written instead: the owned value would answer its metadata
+    // reads with their defaults and keep nodes yq leaves, which a write then overwrites.
+    let unresolved = "the selection could not be resolved on the document";
+    let Ok(results) = results else {
+        return refusal(unresolved);
+    };
+    if scratch.hit() {
+        return refusal(unresolved);
+    }
+    let mut matched = Vec::with_capacity(results.len());
+    for (path, _) in &results {
+        let Some(at) = navigation_for(path) else {
+            return refusal(unresolved);
+        };
+        let at_root = matches!(at, Expr::Identity);
+        // The root has no key, and a reader's answer at the root has none either: a tail with
+        // `key` answers nothing there.
+        if at_root
+            && tail
+                .iter()
+                .any(|stage| matches!(strip_parens(stage), Expr::Builtin(Builtin::Key)))
+        {
+            continue;
+        }
+        let mut member: Vec<Expr> = Vec::with_capacity(tail.len() + 1);
+        if !at_root || tail.is_empty() {
+            member.push(at);
+        }
+        member.extend(tail.iter().map(|stage| (*stage).clone()));
+        matched.push(Expr::pipe(member));
+    }
+    Some(match matched.len() {
+        // Nothing selected: `empty` with the tail kept, so a key rename stays spelled `PATH | key`.
+        0 => Expr::pipe(
+            core::iter::once(Expr::Builtin(Builtin::Empty))
+                .chain(tail.iter().map(|stage| (*stage).clone()))
+                .collect(),
+        ),
+        1 => matched.remove(0),
+        _ => Expr::Paren(Box::new(Expr::Comma(matched))),
+    })
+}
+
+/// Whether `stage` only answers nodes, without choosing among them by a condition: navigation,
+/// node readers (`is_reader`), and commas, pipes and `first`/`last` of them (#8020).
+fn answers_without_selecting(stage: &Expr, is_reader: &dyn Fn(&Expr) -> bool) -> bool {
+    match strip_parens(stage) {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Iterate
+        | Expr::RecursiveDescent => true,
+        Expr::Optional(inner)
+        | Expr::FirstExpr(inner)
+        | Expr::LastExpr(inner)
+        | Expr::Builtin(Builtin::FirstStream(inner) | Builtin::LastStream(inner)) => {
+            answers_without_selecting(inner, is_reader)
+        }
+        Expr::Pipe(stages) => stages
+            .iter()
+            .all(|s| answers_without_selecting(s, is_reader)),
+        Expr::Comma(items) => items
+            .iter()
+            .all(|s| answers_without_selecting(s, is_reader)),
+        other => is_reader(other),
+    }
+}
+
+/// Whether `stage` only navigates, without a condition: keys, indexes, slices, `.[]`, `..`, through
+/// pipes, commas, `?` and parentheses (#8020). The evaluator rewrites a reader tail after such a
+/// navigation on the owned value; any other navigation is resolved on the cursor first.
+fn is_pure_navigation(stage: &Expr) -> bool {
+    match strip_parens(stage) {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate
+        | Expr::RecursiveDescent
+        | Expr::RecursiveDescentWithKeys => true,
+        Expr::Optional(inner) => is_pure_navigation(inner),
+        Expr::Pipe(stages) => stages.iter().all(is_pure_navigation),
+        Expr::Comma(items) => items.iter().all(is_pure_navigation),
+        _ => false,
+    }
+}
+
+/// Whether every output of a write target is a node of the document it navigated to: `.`, `..`,
+/// keys, indexes, `.[]`, slices and `select`, through pipes, commas, `?` and parentheses (#8020).
+fn navigates_and_filters_only(target: &Expr) -> bool {
+    match strip_parens(target) {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::Iterate
+        | Expr::RecursiveDescent
+        | Expr::Builtin(Builtin::Select(_)) => true,
+        // yq's `first(f)`/`last(f)` pick a child of the context (`first(.[]? | select(f))`).
+        Expr::Optional(inner) | Expr::FirstExpr(inner) | Expr::LastExpr(inner) => {
+            navigates_and_filters_only(inner)
+        }
+        Expr::Pipe(stages) => stages.iter().all(navigates_and_filters_only),
+        Expr::Comma(items) => items.iter().all(navigates_and_filters_only),
+        _ => false,
+    }
 }
 
 /// Whether `expr` contains a `tag` metadata write anywhere (#2796): the one slot that changes
@@ -9496,7 +9771,90 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
                 .and_then(jq::enter_document_index_scope)
         })
         .flatten();
+    // #8020: what this document holds that the owned value reads differently than yq, for a write
+    // or `del()` whose target selects or descends: the evaluator's reader-tail rewrite and the
+    // cursor resolution below both decline a condition, or a `..`, only where the document can
+    // make it answer differently. Only the parts some condition consults are measured, and the
+    // spelled-scalar walk reads every value, so a `select(.score < 100)` pays for neither; a part
+    // not measured stays assumed present, so a read the count missed refuses rather than deletes.
+    let _owned_shape = owned_shape_needs(expr).map(|needs| {
+        jq::yq_owned_document::enter(jq::OwnedDocumentShape::measured(
+            needs,
+            || cursor.index().has_aliases() || succinctly::yaml::may_hold_merge_keys(cursor),
+            |bools, nulls| succinctly::yaml::holds_spelled_scalars(cursor, bools, nulls),
+        ))
+    });
     evaluate_yaml_cursor_in_document(cursor, expr, sink, need_comments, strip_style, sort_keys)
+}
+
+/// Which parts of the document's [`jq::OwnedDocumentShape`] a write or `del()` in `expr` can
+/// consult (#8020): the parts the `select` and `if` conditions of its target read
+/// ([`jq::yq_condition_shape_needs`]), and the alias half for a `..` there. Only a target the shape
+/// is asked about counts: one with a node reader or a deriving stage (`.[] | select(. == "x") |
+/// line`, `tostring`), or one that selects by node metadata, `eval` or a `def` call, which the
+/// cursor resolution takes. `None` for a program with none, or whose such targets consult neither
+/// part, which then measures nothing: `(.[] | select(.x > 1)).y = 1` pays for no walk.
+fn owned_shape_needs(expr: &Expr) -> Option<jq::OwnedDocumentShape> {
+    fn asks_about_shape(target: &Expr) -> bool {
+        jq::walk::uses_cursor_metadata_builtins(target)
+            || jq::walk::any_subexpr(target, &mut |e| {
+                matches!(
+                    e,
+                    Expr::Builtin(
+                        Builtin::Tag
+                            | Builtin::Type
+                            | Builtin::PathNoArg
+                            | Builtin::Key
+                            | Builtin::ToString
+                            | Builtin::Length
+                            | Builtin::ToJson
+                            | Builtin::EvalExpr(..)
+                            | Builtin::Load(..)
+                    ) | Expr::Not
+                        | Expr::Format(_)
+                        | Expr::FuncCall { .. }
+                        | Expr::DefCall { .. }
+                ) || matches!(e, Expr::Builtin(b) if is_node_metadata_slot(b))
+            })
+    }
+    let mut needs = jq::OwnedDocumentShape {
+        aliases_or_merge_keys: false,
+        spelled_bools: false,
+        spelled_nulls: false,
+    };
+    let mut add = |target: &Expr| {
+        if !asks_about_shape(target) {
+            return;
+        }
+        jq::walk::any_subexpr(target, &mut |e| {
+            match e {
+                Expr::Builtin(Builtin::Select(cond)) | Expr::If { cond, .. } => {
+                    let more = jq::yq_condition_shape_needs(cond);
+                    needs.aliases_or_merge_keys |= more.aliases_or_merge_keys;
+                    needs.spelled_bools |= more.spelled_bools;
+                    needs.spelled_nulls |= more.spelled_nulls;
+                }
+                Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys => {
+                    needs.aliases_or_merge_keys = true;
+                }
+                _ => {}
+            }
+            false
+        });
+    };
+    jq::walk::any_subexpr(expr, &mut |e| {
+        match e {
+            Expr::Builtin(Builtin::Del(target))
+            | Expr::Assign { path: target, .. }
+            | Expr::Update { path: target, .. }
+            | Expr::CompoundAssign { path: target, .. }
+            | Expr::AlternativeAssign { path: target, .. }
+            | Expr::MetaAssign { target, .. } => add(target),
+            _ => {}
+        }
+        false
+    });
+    (needs.aliases_or_merge_keys || needs.spelled_bools || needs.spelled_nulls).then_some(needs)
 }
 
 /// [`evaluate_yaml_cursor`] inside the document scope it installs.

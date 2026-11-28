@@ -83687,12 +83687,16 @@ fn resolve_del_path_branches<'a, S: EvalSemantics>(
 /// `map`, arithmetic) is left to the general rule. `None` when nothing in `expr` has that shape.
 fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
     let deriving_stage = |stage: &Expr| {
-        matches!(
-            unwrap_paren(stage),
-            Expr::Builtin(Builtin::ToString | Builtin::Length | Builtin::ToJson | Builtin::Type)
-                | Expr::Not
-                | Expr::Format(FormatType::Json | FormatType::YqJson(_) | FormatType::YqYaml(_))
-        )
+        is_yq_slot_reader(stage)
+            || matches!(
+                unwrap_paren(stage),
+                Expr::Builtin(
+                    Builtin::ToString | Builtin::Length | Builtin::ToJson | Builtin::Type
+                ) | Expr::Not
+                    | Expr::Format(
+                        FormatType::Json | FormatType::YqJson(_) | FormatType::YqYaml(_)
+                    )
+            )
     };
     match expr {
         Expr::Paren(inner) => yq_slot_keeping_del_target(inner).map(|r| Expr::Paren(Box::new(r))),
@@ -83719,15 +83723,400 @@ fn yq_slot_keeping_del_target(expr: &Expr) -> Option<Expr> {
             if split == 0 || !stages[split..].iter().all(deriving_stage) {
                 return None;
             }
+            if !yq_slot_rewrite_is_sound(&stages[..split], &stages[split..]) {
+                return None;
+            }
             // Without a step down from the root the derived value can be the document itself
             // (`. | tostring`, `.. | tostring`), which has no parent in yq: it stops the delete
             // instead of going, and the rewrite would delete the document.
             let steps_down = stages[..split].iter().any(del_target_steps_down);
             if !steps_down {
-                return None;
+                return yq_reader_del_target_from_root(stages, split);
             }
             Some(Expr::pipe(stages[..split].to_vec()))
         }
+        _ => None,
+    }
+}
+
+/// Whether [`yq_slot_keeping_del_target`] may replace `navigation | tail` by the navigation's own
+/// nodes (#8020). Each case it declines leaves the target to the general rule, under which the tail
+/// is parentless or refused, so it deletes no more than yq:
+///
+/// - A navigation that is not pure navigation ([`yq_owned_navigation_is_exact`]): any `select`
+///   (`.[] | select(style == "") | line`, `.[] | select(has("p")) | line`) can keep nodes on the
+///   owned value that yq leaves, through a metadata reader answering its default or an alias,
+///   merge key or scalar spelling the owned value no longer holds. The document route resolves
+///   such a navigation on the cursor before it gets here.
+/// - `key` straight after `key` in the tail: yq's key node has no key of its own, so `.b | key |
+///   key` answers nothing and deletes nothing (`.b | key | line | key` deletes `.b`: the answer of
+///   `line` on a key node keeps that node as its key).
+/// - `..` on a document with aliases (`.e | .. | line`): yq's `..` stops at an alias, where the
+///   owned walk goes on through the anchor's copy and the alias redirect deletes from the anchor's
+///   node. The document route resolves it on the cursor, whose `..` stops as yq's does.
+fn yq_slot_rewrite_is_sound(navigation: &[Expr], tail: &[Expr]) -> bool {
+    let reads_metadata = !navigation.iter().all(yq_owned_navigation_is_exact);
+    let is_key = |stage: &Expr| matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key));
+    let key_after_key = tail
+        .windows(2)
+        .any(|pair| is_key(&pair[0]) && is_key(&pair[1]));
+    let walks_through_aliases = (alias_identity::active()
+        || yq_owned_document::current().aliases_or_merge_keys)
+        && navigation.iter().any(|stage| {
+            any_subexpr(stage, &mut |e| {
+                matches!(e, Expr::RecursiveDescent | Expr::RecursiveDescentWithKeys)
+            })
+        });
+    !(reads_metadata || key_after_key || walks_through_aliases)
+}
+
+/// Whether a yq `select` condition reads values alone, so the owned value answers it exactly as the
+/// document does (#8020): navigation, literals, comparisons, arithmetic, `and`/`or`/`not`, `//`,
+/// and a short list of builtins over values (`length`, `has`, `contains`, `test`, ...). An
+/// allowlist: every metadata read (`style`, `line_comment`, `tag`, `type`, `kind`, `anchor`, ...),
+/// `eval`, a call of a `def`, a variable and any builtin not listed answers `false`.
+fn yq_condition_is_value_only(cond: &Expr) -> bool {
+    use Builtin as B;
+    let within = yq_condition_is_value_only;
+    match cond {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate
+        | Expr::Literal(_)
+        | Expr::Not => true,
+        Expr::Optional(inner) | Expr::Paren(inner) | Expr::Negate(inner) => within(inner),
+        Expr::Pipe(stages) => stages.iter().all(within),
+        Expr::Comma(items) => items.iter().all(within),
+        Expr::Compare { left, right, .. } | Expr::Arithmetic { left, right, .. } => {
+            within(left) && within(right)
+        }
+        Expr::And(left, right) | Expr::Or(left, right) | Expr::Alternative(left, right) => {
+            within(left) && within(right)
+        }
+        Expr::Builtin(builtin) => match builtin {
+            B::Length
+            | B::Keys
+            | B::KeysUnsorted
+            | B::ToString
+            | B::ToNumber
+            | B::AsciiDowncase
+            | B::AsciiUpcase
+            | B::Downcase
+            | B::Upcase => true,
+            B::Select(arg)
+            | B::Has(arg)
+            | B::Contains(arg)
+            | B::Startswith(arg)
+            | B::Endswith(arg)
+            | B::Test(arg) => within(arg),
+            B::TestFlags(re, flags) => within(re) && within(flags),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// What a yq document holds that the owned value reads differently than yq does (#8020).
+///
+/// A values-only `select` over such a document can keep a node yq leaves. The document route
+/// measures it once per document ([`yq_owned_document::enter`]); without a document to measure,
+/// every part is assumed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedDocumentShape {
+    /// An alias or a merge key: the owned value expanded both, where yq's `has`, `length`, `keys`,
+    /// `contains`, `test` and the string predicates see the alias node, and a merge key's
+    /// members are not the mapping's own.
+    pub aliases_or_merge_keys: bool,
+    /// A boolean spelled other than `true`/`false` (`True`, `FALSE`, `!Foo True`): yq compares a
+    /// scalar by its text, the owned value by what it resolved to, so `==` and `!=` differ.
+    pub spelled_bools: bool,
+    /// A `null` spelled other than `null` (`~`, `Null`, an empty value): yq's `tostring` gives its
+    /// text, the owned value's `"null"`. Its comparisons agree.
+    pub spelled_nulls: bool,
+}
+
+impl OwnedDocumentShape {
+    /// Every part assumed: the shape of a document nothing measured.
+    pub const UNKNOWN: Self = Self {
+        aliases_or_merge_keys: true,
+        spelled_bools: true,
+        spelled_nulls: true,
+    };
+
+    /// The shape of a document measured only for the parts `needs` names (#8020): each of those
+    /// is what its measure answers, and every other part stays assumed (`true`), as in
+    /// [`Self::UNKNOWN`]. A part no condition was counted as consulting is then read, if anything
+    /// does read it, as present: a refusal or a smaller delete, never a delete yq would not make.
+    /// `aliases_or_merge_keys` is asked only when needed, and `spelled` (asked whether to look for
+    /// bools, for nulls) only when either is.
+    pub fn measured(
+        needs: Self,
+        aliases_or_merge_keys: impl FnOnce() -> bool,
+        spelled: impl FnOnce(bool, bool) -> (bool, bool),
+    ) -> Self {
+        let (bools, nulls) = if needs.spelled_bools || needs.spelled_nulls {
+            spelled(needs.spelled_bools, needs.spelled_nulls)
+        } else {
+            (true, true)
+        };
+        Self {
+            aliases_or_merge_keys: !needs.aliases_or_merge_keys || aliases_or_merge_keys(),
+            spelled_bools: !needs.spelled_bools || bools,
+            spelled_nulls: !needs.spelled_nulls || nulls,
+        }
+    }
+}
+
+/// The [`OwnedDocumentShape`] of the document a yq evaluation runs over (#8020).
+///
+/// Ambient for the reason `yq_delete_context` is: the `del()` rewrite that asks sits many levels
+/// below the runner that knows. `std` only; without it every part is assumed.
+#[cfg(feature = "std")]
+pub mod yq_owned_document {
+    use super::OwnedDocumentShape;
+    use std::cell::Cell;
+
+    thread_local! {
+        static SHAPE: Cell<Option<OwnedDocumentShape>> = const { Cell::new(None) };
+    }
+
+    /// The shape of the document being evaluated, or [`OwnedDocumentShape::UNKNOWN`].
+    pub fn current() -> OwnedDocumentShape {
+        SHAPE.with(Cell::get).unwrap_or(OwnedDocumentShape::UNKNOWN)
+    }
+
+    /// Restores the previous shape on drop.
+    #[must_use]
+    pub struct Guard(Option<OwnedDocumentShape>);
+
+    /// Record `shape` for the evaluation the guard lives for.
+    pub fn enter(shape: OwnedDocumentShape) -> Guard {
+        Guard(SHAPE.with(|c| c.replace(Some(shape))))
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            SHAPE.with(|c| c.set(self.0));
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub mod yq_owned_document {
+    use super::OwnedDocumentShape;
+
+    pub fn current() -> OwnedDocumentShape {
+        OwnedDocumentShape::UNKNOWN
+    }
+
+    pub struct Guard;
+
+    pub fn enter(_shape: OwnedDocumentShape) -> Guard {
+        Guard
+    }
+}
+
+/// Whether a values-only `select` condition can still answer differently on the owned value than on
+/// yq's document of the given `shape` (#8020), which keeps a node yq leaves:
+///
+/// - With [`OwnedDocumentShape::spelled_bools`]: yq compares a scalar's text, so `True == true`,
+///   `True == "true"` and `True != "True"` are all false there, and `{x: True, y: true} | .x == .y`
+///   is too. So `tostring`, an `==` or `!=` between a node's own value and a literal boolean or
+///   string, and one between two node values, count.
+/// - With [`OwnedDocumentShape::spelled_nulls`]: `~ | tostring` is `"~"` in yq, so `tostring`
+///   counts. `~ == null` holds in both.
+/// - With [`OwnedDocumentShape::aliases_or_merge_keys`]: yq's `has`, `length`, `keys`, `tostring`,
+///   `contains`, `test` and the string predicates see an alias node itself (`*x | has("p")` is
+///   false in yq), and a merge key's members are not the mapping's own. Those count.
+#[doc(hidden)]
+pub fn yq_condition_reads_differently_on_owned(cond: &Expr, shape: OwnedDocumentShape) -> bool {
+    let needs = yq_condition_shape_needs(cond);
+    (needs.spelled_bools && shape.spelled_bools)
+        || (needs.spelled_nulls && shape.spelled_nulls)
+        || (needs.aliases_or_merge_keys && shape.aliases_or_merge_keys)
+}
+
+/// Which parts of an [`OwnedDocumentShape`] a values-only `select` condition consults (#8020):
+/// each field is `true` when the condition holds an operator
+/// [`yq_condition_reads_differently_on_owned`] reads that part for. The document route measures
+/// only those parts, so a condition with neither (`.score < 100`) costs no walk of the document.
+#[doc(hidden)]
+pub fn yq_condition_shape_needs(cond: &Expr) -> OwnedDocumentShape {
+    use Builtin as B;
+    // An operand that reads a node's own value, which is what yq compares by its text; a
+    // metadata reader's answer (`style != ""`) is a fresh string, the same in both.
+    fn node_value(e: &Expr) -> bool {
+        match unwrap_paren(e) {
+            Expr::Identity
+            | Expr::Field(_)
+            | Expr::Index { .. }
+            | Expr::Slice { .. }
+            | Expr::ArrayKey(_)
+            | Expr::Iterate => true,
+            Expr::Optional(inner) => node_value(inner),
+            Expr::Pipe(stages) => stages.iter().all(node_value),
+            _ => false,
+        }
+    }
+    // What a node value is compared with where yq's reading of a spelled boolean by its text can
+    // change the answer: anything but a number or `null` (`True == 1` and `~ == null` agree).
+    let may_be_text = |e: &Expr| {
+        !matches!(
+            unwrap_paren(e),
+            Expr::Literal(
+                Literal::NumberLiteral(..) | Literal::Int(_) | Literal::Float(_) | Literal::Null
+            )
+        )
+    };
+    let mut needs = OwnedDocumentShape {
+        aliases_or_merge_keys: false,
+        spelled_bools: false,
+        spelled_nulls: false,
+    };
+    any_subexpr(cond, &mut |e| {
+        match e {
+            Expr::Builtin(B::ToString) => {
+                needs.spelled_bools = true;
+                needs.spelled_nulls = true;
+                needs.aliases_or_merge_keys = true;
+            }
+            Expr::Compare { op, left, right }
+                if matches!(op, CompareOp::Eq | CompareOp::Ne)
+                    && ((node_value(left) && may_be_text(right))
+                        || (node_value(right) && may_be_text(left))) =>
+            {
+                needs.spelled_bools = true;
+            }
+            Expr::Builtin(
+                B::Has(_)
+                | B::Length
+                | B::Keys
+                | B::KeysUnsorted
+                | B::Contains(_)
+                | B::Test(_)
+                | B::TestFlags(..)
+                | B::Startswith(_)
+                | B::Endswith(_)
+                | B::AsciiDowncase
+                | B::AsciiUpcase
+                | B::Downcase
+                | B::Upcase,
+            ) => needs.aliases_or_merge_keys = true,
+            _ => {}
+        }
+        false
+    });
+    needs
+}
+
+/// Whether a `del()` navigation stage reaches on the owned value exactly the nodes yq reaches on the
+/// document (#8020): an allowlist. Keys, indexes, slices, `.[]` and `..` pass (the caller guards
+/// `..` on a document with aliases), and so does a `select` over a condition of values alone
+/// ([`yq_condition_is_value_only`]) unless it reads one of the values the owned value holds
+/// differently ([`yq_condition_reads_differently_on_owned`]).
+fn yq_owned_navigation_is_exact(stage: &Expr) -> bool {
+    match stage {
+        Expr::Identity
+        | Expr::Field(_)
+        | Expr::Index { .. }
+        | Expr::Slice { .. }
+        | Expr::ArrayKey(_)
+        | Expr::Iterate
+        | Expr::RecursiveDescent
+        | Expr::RecursiveDescentWithKeys => true,
+        Expr::Builtin(Builtin::Select(cond)) => {
+            yq_condition_is_value_only(cond)
+                && !yq_condition_reads_differently_on_owned(cond, yq_owned_document::current())
+        }
+        Expr::Optional(inner) | Expr::Paren(inner) => yq_owned_navigation_is_exact(inner),
+        Expr::Pipe(stages) => stages.iter().all(yq_owned_navigation_is_exact),
+        Expr::Comma(items) => items.iter().all(yq_owned_navigation_is_exact),
+        _ => false,
+    }
+}
+
+/// Whether `stage` is one of yq's node metadata readers (#8020): `line`, `column`, `kind`, `style`,
+/// `tag`, `anchor`, `alias`, the three comment readers, `path`, `document_index`, `file_index` and
+/// `filename`. Each answers a fresh scalar built with `CreateReplacement`, which keeps its input's
+/// parent and key, so as a `del()` target it is its input's slot, and at the root (which has no
+/// parent) it is a node of its own: not the document, which only `del(.)` deletes.
+fn is_yq_metadata_reader(stage: &Expr) -> bool {
+    matches!(unwrap_paren(stage), Expr::Builtin(b) if is_yq_metadata_reader_builtin(b))
+}
+
+/// [`is_yq_metadata_reader`] of the builtin itself.
+fn is_yq_metadata_reader_builtin(builtin: &Builtin) -> bool {
+    matches!(
+        builtin,
+        Builtin::Line
+            | Builtin::Column
+            | Builtin::Kind
+            | Builtin::Style
+            | Builtin::Tag
+            | Builtin::Anchor
+            | Builtin::Alias
+            | Builtin::HeadComment
+            | Builtin::LineComment
+            | Builtin::FootComment
+            | Builtin::PathNoArg
+            | Builtin::DocumentIndex
+            | Builtin::FileIndex
+            | Builtin::Filename
+    )
+}
+
+/// [`is_yq_metadata_reader`], or `key`: yq's `key` answers its input's key node, whose parent and
+/// key are its input's too, so as a `del()` target after a step down it is its input's slot
+/// (`del(.b | key)` deletes `.b`, `del(.c[0] | key)` the element). At the root it answers nothing,
+/// as the root has no key, which the resolver already does.
+fn is_yq_slot_reader(stage: &Expr) -> bool {
+    is_yq_metadata_reader(stage) || matches!(unwrap_paren(stage), Expr::Builtin(Builtin::Key))
+}
+
+/// [`yq_slot_keeping_del_target`] for a pipe of navigation that ends in metadata readers
+/// ([`is_yq_slot_reader`]) and may yield the root (#8020): `stages[..split]` is the navigation,
+/// none of it stepping down. A reader's answer at the root is a parentless node of its own, which
+/// stops yq's back-to-front loop, and a bare reader resolves to such a parentless target here. So
+/// the navigation is split where it can still reach a node below the root: `(A, B) | R` is
+/// `(A | R), (B | R)`, and `.. | R` is `R, (.[]? | ..)`, the root's answer first, as `..` emits it
+/// (`del(.. | line)` leaves `{}`, `del((.b, .) | line)` deletes nothing and `del((., .b) | line)`
+/// deletes `.b`, all as in yq v4.53.3). `None` for any other shape, which the general rule takes:
+/// a reader there is parentless, so it can only stop the loop early, never delete the document.
+fn yq_reader_del_target_from_root(stages: &[Expr], split: usize) -> Option<Expr> {
+    if !stages[split..].iter().all(is_yq_slot_reader) {
+        return None;
+    }
+    let rest = &stages[1..];
+    match unwrap_paren(&stages[0]) {
+        Expr::RecursiveDescent => {
+            let below = [
+                Expr::Optional(Box::new(Expr::Iterate)),
+                Expr::RecursiveDescent,
+            ]
+            .into_iter()
+            .chain(stages[1..split].iter().cloned())
+            .collect();
+            Some(Expr::Comma(vec![
+                Expr::pipe(rest.to_vec()),
+                Expr::pipe(below),
+            ]))
+        }
+        Expr::Comma(items) => Some(Expr::Comma(
+            items
+                .iter()
+                .map(|item| {
+                    let member = Expr::pipe(
+                        core::iter::once(item.clone())
+                            .chain(rest.iter().cloned())
+                            .collect(),
+                    );
+                    yq_slot_keeping_del_target(&member).unwrap_or(member)
+                })
+                .collect(),
+        )),
         _ => None,
     }
 }
@@ -83785,11 +84174,20 @@ fn del_target_shape(expr: &Expr) -> DelTargetShape {
         // `del(env(X), .a)` deletes `.a`.
         Expr::Builtin(Builtin::EnvObject(_) | Builtin::StrEnv(_) | Builtin::Now) => Parentless,
         Expr::Optional(inner) | Expr::Paren(inner) => del_target_shape(inner),
-        Expr::Pipe(stages) => match stages.last().map(del_target_shape) {
-            Some(Parentless) => Parentless,
-            _ if stages.iter().all(|s| del_target_shape(s) == Navigation) => Navigation,
-            _ => Other,
-        },
+        Expr::Pipe(stages) => {
+            // A trailing `select` hands its input on (#8020): `1 | select(true)` and
+            // `line | select(true)` are still that parentless node, so `del(.a, (1 | select(true)))`
+            // deletes nothing and `del((1 | select(true)), .a)` deletes `.a`, as in yq.
+            let judged = stages
+                .iter()
+                .rposition(|s| !matches!(s, Expr::Builtin(Builtin::Select(_))))
+                .map_or(stages.len(), |at| at + 1);
+            match stages[..judged].last().map(del_target_shape) {
+                Some(Parentless) => Parentless,
+                _ if stages.iter().all(|s| del_target_shape(s) == Navigation) => Navigation,
+                _ => Other,
+            }
+        }
         Expr::Comma(branches) => {
             let mut shape = Navigation;
             for branch in branches {
@@ -83801,6 +84199,13 @@ fn del_target_shape(expr: &Expr) -> DelTargetShape {
             }
             shape
         }
+        // A metadata reader at the root answers a node of its own with no parent (#8020):
+        // `del(.a, line)` deletes nothing and `del(line, .a)` deletes `.a`. After a step down it
+        // is its input's slot, which `yq_slot_keeping_del_target` rewrote it to.
+        stage if is_yq_metadata_reader(stage) => Parentless,
+        // No target at all: what the document route writes for a comma member that selects by
+        // metadata and matched nothing (`del(1, (.. | select(style == "x")))`, #8020).
+        Expr::Builtin(Builtin::Empty) => Navigation,
         _ => Other,
     }
 }
@@ -185122,6 +185527,247 @@ mod del_path_memory_tests_7789 {
                     );
                 }
             }
+        }
+    }
+}
+
+/// The `del()` reader-tail rewrite's allowlist (#8020), pinned at the predicates themselves: a CLI
+/// row reaches only the shapes a reviewer thought of, and these decide every other one.
+#[cfg(test)]
+mod del_reader_rewrite_allowlist_8020 {
+    use super::*;
+    use crate::jq::{parse_with_mode_and_extensions, ParserMode};
+
+    fn yq(src: &str) -> Expr {
+        parse_with_mode_and_extensions(src, ParserMode::Yq, true).expect("parses")
+    }
+
+    /// The `select` condition of `.[] | select(COND)`.
+    fn condition(cond: &str) -> Expr {
+        match yq(&format!("select({cond})")) {
+            Expr::Builtin(Builtin::Select(cond)) => *cond,
+            other => panic!("not a select: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_condition_over_values_alone_is_on_the_allowlist() {
+        for cond in [
+            ". > 1",
+            "(0 - .a) < 0",
+            "(.a)? > 1",
+            "(.a, .b) > 1",
+            ".a and .b",
+            ".a or .b",
+            ".a // .b",
+            "has(\"a\")",
+            "length > 1",
+            "keys | length > 1",
+            "test(\"a\")",
+            "test(\"a\"; \"i\")",
+            "startswith(\"a\")",
+            "ascii_downcase == \"a\"",
+            "not",
+        ] {
+            assert!(yq_condition_is_value_only(&condition(cond)), "{cond}");
+        }
+    }
+
+    #[test]
+    fn a_condition_beyond_values_is_not() {
+        for cond in [
+            "style == \"\"",
+            "type == \"!!str\"",
+            "tag == \"!!str\"",
+            "kind == \"map\"",
+            "key == \"a\"",
+            "line > 1",
+            "eval(\"style\") == \"\"",
+            "$x == 1",
+            "env(HOME) == \"x\"",
+            "now > 1",
+            "split(\",\") | length > 1",
+            "[.[]] | length > 1",
+        ] {
+            let parsed = parse_with_mode_and_extensions(
+                &format!(".x as $x | select({cond})"),
+                ParserMode::Yq,
+                true,
+            );
+            let cond_expr = match parsed {
+                Ok(Expr::As { body, .. }) => match *body {
+                    Expr::Builtin(Builtin::Select(cond)) => *cond,
+                    other => panic!("not a select: {other:?}"),
+                },
+                other => panic!("{cond}: {other:?}"),
+            };
+            assert!(!yq_condition_is_value_only(&cond_expr), "{cond}");
+        }
+    }
+
+    #[test]
+    fn a_shape_measured_for_one_part_assumes_the_others() {
+        let needs = OwnedDocumentShape {
+            aliases_or_merge_keys: false,
+            spelled_bools: true,
+            spelled_nulls: false,
+        };
+        let shape = OwnedDocumentShape::measured(
+            needs,
+            || panic!("aliases were not needed"),
+            |bools, nulls| {
+                assert!(bools && !nulls);
+                (false, false)
+            },
+        );
+        assert_eq!(
+            shape,
+            OwnedDocumentShape {
+                aliases_or_merge_keys: true,
+                spelled_bools: false,
+                spelled_nulls: true,
+            }
+        );
+        let aliases_only = OwnedDocumentShape {
+            aliases_or_merge_keys: true,
+            spelled_bools: false,
+            spelled_nulls: false,
+        };
+        let shape = OwnedDocumentShape::measured(
+            aliases_only,
+            || false,
+            |_, _| panic!("spellings were not needed"),
+        );
+        assert_eq!(
+            shape,
+            OwnedDocumentShape {
+                aliases_or_merge_keys: false,
+                ..OwnedDocumentShape::UNKNOWN
+            }
+        );
+    }
+
+    #[test]
+    fn a_value_the_owned_document_holds_differently_is_flagged() {
+        let plain = OwnedDocumentShape {
+            aliases_or_merge_keys: false,
+            spelled_bools: false,
+            spelled_nulls: false,
+        };
+        let bools = OwnedDocumentShape {
+            spelled_bools: true,
+            ..plain
+        };
+        let nulls = OwnedDocumentShape {
+            spelled_nulls: true,
+            ..plain
+        };
+        let aliased = OwnedDocumentShape {
+            aliases_or_merge_keys: true,
+            ..plain
+        };
+        // Spelled booleans: yq compares a scalar's text, with a literal or with another node.
+        for cond in [
+            ". == true",
+            "(.a)? == false",
+            ".a | . != \"x\"",
+            ". == \"true\"",
+            ".[0] == \"false\"",
+            ".x == .y",
+            "tostring == \"null\"",
+        ] {
+            let cond = condition(cond);
+            assert!(yq_condition_reads_differently_on_owned(&cond, bools));
+            assert!(!yq_condition_reads_differently_on_owned(&cond, plain));
+        }
+        // Spelled nulls: only `tostring` reads one by its text; `~ == null` holds in yq too.
+        for cond in ["tostring == \"null\"", "tostring | length > 1"] {
+            assert!(
+                yq_condition_reads_differently_on_owned(&condition(cond), nulls),
+                "{cond}"
+            );
+        }
+        for cond in [
+            ". == null",
+            "null == .",
+            ".a != null",
+            ". == true",
+            ".x == .y",
+        ] {
+            assert!(
+                !yq_condition_reads_differently_on_owned(&condition(cond), nulls),
+                "{cond}"
+            );
+        }
+        // An alias node itself, or a merge key's members, on a document with one.
+        for cond in [
+            "has(\"p\")",
+            "length == 1",
+            "test(\"p\")",
+            "keys | length > 0",
+            "tostring | test(\"p\")",
+        ] {
+            assert!(
+                !yq_condition_reads_differently_on_owned(&condition(cond), plain),
+                "{cond}"
+            );
+            assert!(
+                yq_condition_reads_differently_on_owned(&condition(cond), aliased),
+                "{cond}"
+            );
+        }
+        // A metadata reader's answer is a fresh string, and ordering compares and numbers read the
+        // value as yq does.
+        for cond in [
+            "style != \"\"",
+            ". > 1",
+            ".a == 1",
+            "1 == 2",
+            ". == null",
+            "\"a\" == \"b\"",
+        ] {
+            assert!(
+                !yq_condition_reads_differently_on_owned(
+                    &condition(cond),
+                    OwnedDocumentShape::UNKNOWN
+                ),
+                "{cond}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_owned_rewrite_admits_pure_navigation_and_values_only_selects() {
+        for stage in [
+            ".a",
+            ".[]",
+            ".[0]",
+            ".[1:2]",
+            "..",
+            ".a?",
+            "(.a, .b)",
+            "(.a | .b)",
+            "select(. > 1)",
+        ] {
+            assert!(yq_owned_navigation_is_exact(&yq(stage)), "{stage}");
+        }
+        for stage in [
+            "select(style == \"\")",
+            "select(. == true)",
+            "first(.a)",
+            "map(.)",
+            "$x",
+        ] {
+            let parsed = parse_with_mode_and_extensions(
+                &format!(".x as $x | {stage}"),
+                ParserMode::Yq,
+                true,
+            );
+            let stage_expr = match parsed {
+                Ok(Expr::As { body, .. }) => *body,
+                other => panic!("{stage}: {other:?}"),
+            };
+            assert!(!yq_owned_navigation_is_exact(&stage_expr), "{stage}");
         }
     }
 }

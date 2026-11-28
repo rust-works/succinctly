@@ -311,6 +311,8 @@ pub use light::{
     stream_json_sequence, stream_yaml_sequence, yq_float_is_scientific, ChompingIndicator,
     YamlCursor, YamlElements, YamlField, YamlFields, YamlNumber, YamlString, YamlValue,
 };
+#[doc(hidden)]
+pub use light::{holds_spelled_scalars, may_hold_merge_keys};
 pub use locate::{locate_offset, locate_offset_detailed, LocateResult};
 #[doc(hidden)]
 pub use scalar::overflowed_int_json_text;
