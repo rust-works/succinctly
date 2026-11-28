@@ -110,6 +110,36 @@ fn a_binding_after_an_empty_stage_runs_its_body_8044() -> Result<()> {
     assert_rows(INPUT, BINDING_ROWS)
 }
 
+/// A body that reads its variables is written twice per binding, bound and not, and a level whose
+/// rewrite drops its reads (a collect) is written once. yq answers each row below.
+#[test]
+fn a_nest_whose_body_reads_its_variables_answers_8044() -> Result<()> {
+    let nest = |n: usize, body: &str| {
+        let bindings: String = (1..=n)
+            .map(|i| format!("(1 | select(false)) as $a{i} | "))
+            .collect();
+        format!("select(false) | ({bindings}{body})")
+    };
+    let vars = |n: usize| -> String {
+        (1..=n)
+            .map(|i| format!("$a{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let seven = nest(7, &format!("({}, 9)", vars(7)));
+    let collected = format!(
+        "select(false) | ({}(1 | select(false)) as $b | ([{}], $b, 9))",
+        (1..=6)
+            .map(|i| format!("(1 | select(false)) as $a{i} | "))
+            .collect::<String>(),
+        vars(6)
+    );
+    assert_rows(
+        INPUT,
+        &[(seven.as_str(), "9\n"), (collected.as_str(), "[]\n9\n")],
+    )
+}
+
 /// A fold after a stage that matched nothing.
 const FOLD_ROWS: &[(&str, &str)] = &[
     // The source yields nothing, so the fold is INIT's answer over the empty context.
@@ -199,6 +229,14 @@ fn a_fold_that_dropped_its_accumulators_stays_empty_8044() -> Result<()> {
 /// Bodies a write, a builtin or a fold evaluates itself (#8002, #8035).
 #[test]
 fn a_binding_in_a_body_over_an_empty_context_8044() -> Result<()> {
+    // `map` runs its body once over the whole list of members, so a member whose `.a` yields
+    // nothing (a scalar) leaves the binding an empty context: one `[]` for the list, not one per
+    // member. This is why such a body takes the list walk.
+    assert_rows("[5, 6]\n", &[("map(.a | . as $x | [$x])", "[[]]\n")])?;
+    assert_rows(
+        "[{\"a\": 1}, 5]\n",
+        &[("map(.a | . as $x | [$x])", "[[1]]\n")],
+    )?;
     assert_rows(
         INPUT,
         &[

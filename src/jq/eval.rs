@@ -5300,7 +5300,7 @@ pub(crate) fn literal_to_owned(lit: &Literal) -> OwnedValue {
 /// exercised by any known query shape yet, so it is left for whoever hits it
 /// live rather than guessed at.
 pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
-    yq_empty_context_reemit_in(expr, ReemitScope::new(false))
+    reemit_within_budget(expr, false)
 }
 
 /// [`yq_empty_context_reemit`] for a stage whose input list is known to be empty: the caller asked
@@ -5309,7 +5309,23 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
 /// its source may have yielded them and UPDATE dropped every accumulator
 /// (`(.[] as $x ireduce (0; select(false))) as $q | [$q]` over `[1, 2]` is `[]` in yq).
 pub(crate) fn yq_empty_input_reemit(expr: &Expr) -> Option<Expr> {
-    yq_empty_context_reemit_in(expr, ReemitScope::new(true))
+    reemit_within_budget(expr, true)
+}
+
+/// [`yq_empty_context_reemit_in`] of `expr` from the top, within [`REEMIT_MAX_STEPS`]: a rewrite
+/// that ran out of steps declines whole, never a part of it, since a part could answer what the
+/// whole would not (a comma that lost a branch).
+fn reemit_within_budget(expr: &Expr, input_empty: bool) -> Option<Expr> {
+    let steps = core::cell::Cell::new(REEMIT_MAX_STEPS);
+    let rewrite = yq_empty_context_reemit_in(
+        expr,
+        ReemitScope {
+            bound: &[],
+            input_empty,
+            steps: &steps,
+        },
+    );
+    rewrite.filter(|_| steps.get() > 0)
 }
 
 /// Where [`yq_empty_context_reemit_in`] rewrites an expression (#8044).
@@ -5320,24 +5336,24 @@ struct ReemitScope<'s> {
     bound: &'s [&'s str],
     /// Whether the context is known to be empty ([`yq_empty_input_reemit`]) or only came up empty.
     input_empty: bool,
-    /// How many bindings around the expression rewrote their body twice, once bound and once not.
-    splits: u8,
+    /// The rewrite steps left; at zero the whole rewrite declines ([`reemit_within_budget`]).
+    steps: &'s core::cell::Cell<u32>,
 }
 
 impl ReemitScope<'_> {
-    fn new(input_empty: bool) -> Self {
-        Self {
-            bound: &[],
-            input_empty,
-            splits: 0,
-        }
+    /// Spend one step, `false` once none is left.
+    fn spend(&self) -> bool {
+        let left = self.steps.get();
+        self.steps.set(left.saturating_sub(1));
+        left > 0
     }
 }
 
-/// How many bindings around an expression may each rewrite their body twice
-/// ([`yq_empty_context_reemit_in`]'s `as` arm): every one doubles the rewrite, so a deeper nest
-/// declines instead.
-const REEMIT_MAX_SPLITS: u8 = 6;
+/// How many expressions one rewrite may visit. A binding whose body's rewrite reads its variable,
+/// over a source that may answer nothing, writes that body twice (bound and not), so a nest of them
+/// doubles per level; ten thousand steps answer some dozen such levels of an ordinary body and
+/// decline a deeper nest.
+const REEMIT_MAX_STEPS: u32 = 10_000;
 
 /// The variable the rewrite of an `as` whose source may answer nothing binds that source's
 /// outputs to, collected (#8044). Its `\u{1}` keeps it out of any name a program can spell.
@@ -5349,6 +5365,9 @@ const REEMIT_SOURCE_VAR: &str = "\u{1}reemit-source";
 /// the context), so `select(false) | (1 as $y | $y)` is `1`; any other reference is one yq finds
 /// unbound over the empty context, which answers nothing.
 fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Expr> {
+    if !scope.spend() {
+        return None;
+    }
     match super::eval_generic::strip_parens(expr) {
         lit @ Expr::Literal(_) => Some(lit.clone()),
         Expr::Var(name) if scope.bound.contains(&name.as_str()) => Some(Expr::Var(name.clone())),
@@ -5386,7 +5405,7 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
             // `select(false) | ((1 | select(false)) as $y | 3)` is `3`. The source runs once, into a
             // list. A body whose rewrite never reads the variable is written once, bound to `null`
             // for an empty list, so a nest of such bindings stays linear; one that reads it is
-            // written twice, bound and not, a few levels deep at most.
+            // written twice, bound and not, within the rewrite's step budget.
             let collected = Expr::Var(REEMIT_SOURCE_VAR.into());
             let no_outputs = Expr::Compare {
                 op: CompareOp::Eq,
@@ -5403,20 +5422,7 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
                     &mut |e| matches!(e, Expr::Var(name) if name == var),
                 )
             };
-            // Each binding whose body reads its variable counts toward the cap, so the rewrites
-            // below it are at most `2^REEMIT_MAX_SPLITS` per level.
-            let splits = if reads(body) {
-                (scope.splits + 1).min(REEMIT_MAX_SPLITS)
-            } else {
-                scope.splits
-            };
-            let bound_body = yq_empty_context_reemit_in(
-                body,
-                ReemitScope {
-                    splits,
-                    ..inner_scope
-                },
-            )?;
+            let bound_body = yq_empty_context_reemit_in(body, inner_scope)?;
             // A rewrite that does not read the variable is what the body rewrites to unbound too.
             let over_list = if !reads(&bound_body) {
                 Expr::As {
@@ -5429,10 +5435,7 @@ fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Exp
                     body: Box::new(bound_body),
                 }
             } else {
-                if scope.splits >= REEMIT_MAX_SPLITS {
-                    return None;
-                }
-                let unbound = yq_empty_context_reemit_in(body, ReemitScope { splits, ..scope });
+                let unbound = yq_empty_context_reemit_in(body, scope);
                 Expr::If {
                     cond: Box::new(no_outputs),
                     then_branch: Box::new(unbound.unwrap_or(Expr::Builtin(Builtin::Empty))),
