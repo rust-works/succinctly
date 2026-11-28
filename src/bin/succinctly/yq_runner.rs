@@ -9775,23 +9775,14 @@ fn evaluate_yaml_cursor<W: AsRef<[u64]> + Clone>(
     // or `del()` whose target selects or descends: the evaluator's reader-tail rewrite and the
     // cursor resolution below both decline a condition, or a `..`, only where the document can
     // make it answer differently. Only the parts some condition consults are measured, and the
-    // spelled-scalar walk reads every value, so a `select(.score < 100)` pays for neither.
+    // spelled-scalar walk reads every value, so a `select(.score < 100)` pays for neither; a part
+    // not measured stays assumed present, so a read the count missed refuses rather than deletes.
     let _owned_shape = owned_shape_needs(expr).map(|needs| {
-        let (spelled_bools, spelled_nulls) = if needs.spelled_bools || needs.spelled_nulls {
-            succinctly::yaml::holds_spelled_scalars(
-                cursor,
-                needs.spelled_bools,
-                needs.spelled_nulls,
-            )
-        } else {
-            (false, false)
-        };
-        jq::yq_owned_document::enter(jq::OwnedDocumentShape {
-            aliases_or_merge_keys: needs.aliases_or_merge_keys
-                && (cursor.index().has_aliases() || succinctly::yaml::may_hold_merge_keys(cursor)),
-            spelled_bools,
-            spelled_nulls,
-        })
+        jq::yq_owned_document::enter(jq::OwnedDocumentShape::measured(
+            needs,
+            || cursor.index().has_aliases() || succinctly::yaml::may_hold_merge_keys(cursor),
+            |bools, nulls| succinctly::yaml::holds_spelled_scalars(cursor, bools, nulls),
+        ))
     });
     evaluate_yaml_cursor_in_document(cursor, expr, sink, need_comments, strip_style, sort_keys)
 }

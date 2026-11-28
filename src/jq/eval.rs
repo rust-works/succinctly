@@ -83845,6 +83845,29 @@ impl OwnedDocumentShape {
         spelled_bools: true,
         spelled_nulls: true,
     };
+
+    /// The shape of a document measured only for the parts `needs` names (#8020): each of those
+    /// is what its measure answers, and every other part stays assumed (`true`), as in
+    /// [`Self::UNKNOWN`]. A part no condition was counted as consulting is then read, if anything
+    /// does read it, as present: a refusal or a smaller delete, never a delete yq would not make.
+    /// `aliases_or_merge_keys` is asked only when needed, and `spelled` (asked whether to look for
+    /// bools, for nulls) only when either is.
+    pub fn measured(
+        needs: Self,
+        aliases_or_merge_keys: impl FnOnce() -> bool,
+        spelled: impl FnOnce(bool, bool) -> (bool, bool),
+    ) -> Self {
+        let (bools, nulls) = if needs.spelled_bools || needs.spelled_nulls {
+            spelled(needs.spelled_bools, needs.spelled_nulls)
+        } else {
+            (true, true)
+        };
+        Self {
+            aliases_or_merge_keys: !needs.aliases_or_merge_keys || aliases_or_merge_keys(),
+            spelled_bools: !needs.spelled_bools || bools,
+            spelled_nulls: !needs.spelled_nulls || nulls,
+        }
+    }
 }
 
 /// The [`OwnedDocumentShape`] of the document a yq evaluation runs over (#8020).
@@ -185580,6 +185603,48 @@ mod del_reader_rewrite_allowlist_8020 {
             };
             assert!(!yq_condition_is_value_only(&cond_expr), "{cond}");
         }
+    }
+
+    #[test]
+    fn a_shape_measured_for_one_part_assumes_the_others() {
+        let needs = OwnedDocumentShape {
+            aliases_or_merge_keys: false,
+            spelled_bools: true,
+            spelled_nulls: false,
+        };
+        let shape = OwnedDocumentShape::measured(
+            needs,
+            || panic!("aliases were not needed"),
+            |bools, nulls| {
+                assert!(bools && !nulls);
+                (false, false)
+            },
+        );
+        assert_eq!(
+            shape,
+            OwnedDocumentShape {
+                aliases_or_merge_keys: true,
+                spelled_bools: false,
+                spelled_nulls: true,
+            }
+        );
+        let aliases_only = OwnedDocumentShape {
+            aliases_or_merge_keys: true,
+            spelled_bools: false,
+            spelled_nulls: false,
+        };
+        let shape = OwnedDocumentShape::measured(
+            aliases_only,
+            || false,
+            |_, _| panic!("spellings were not needed"),
+        );
+        assert_eq!(
+            shape,
+            OwnedDocumentShape {
+                aliases_or_merge_keys: false,
+                ..OwnedDocumentShape::UNKNOWN
+            }
+        );
     }
 
     #[test]
