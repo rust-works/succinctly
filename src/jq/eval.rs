@@ -185395,3 +185395,153 @@ mod del_path_memory_tests_7789 {
         }
     }
 }
+
+/// The `del()` reader-tail rewrite's allowlist (#8020), pinned at the predicates themselves: a CLI
+/// row reaches only the shapes a reviewer thought of, and these decide every other one.
+#[cfg(test)]
+mod del_reader_rewrite_allowlist_8020 {
+    use super::*;
+    use crate::jq::{parse_with_mode_and_extensions, ParserMode};
+
+    fn yq(src: &str) -> Expr {
+        parse_with_mode_and_extensions(src, ParserMode::Yq, true).expect("parses")
+    }
+
+    /// The `select` condition of `.[] | select(COND)`.
+    fn condition(cond: &str) -> Expr {
+        match yq(&format!("select({cond})")) {
+            Expr::Builtin(Builtin::Select(cond)) => *cond,
+            other => panic!("not a select: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_condition_over_values_alone_is_on_the_allowlist() {
+        for cond in [
+            ". > 1",
+            "-(.a) < 0",
+            "(.a)? > 1",
+            "(.a, .b) > 1",
+            ".a and .b",
+            ".a or .b",
+            ".a // .b",
+            "has(\"a\")",
+            "length > 1",
+            "keys | length > 1",
+            "test(\"a\")",
+            "test(\"a\"; \"i\")",
+            "startswith(\"a\")",
+            "ascii_downcase == \"a\"",
+            "not",
+        ] {
+            assert!(yq_condition_is_value_only(&condition(cond)), "{cond}");
+        }
+    }
+
+    #[test]
+    fn a_condition_beyond_values_is_not() {
+        for cond in [
+            "style == \"\"",
+            "type == \"!!str\"",
+            "tag == \"!!str\"",
+            "kind == \"map\"",
+            "key == \"a\"",
+            "line > 1",
+            "eval(\"style\") == \"\"",
+            "$x == 1",
+            "env(HOME) == \"x\"",
+            "now > 1",
+            "split(\",\") | length > 1",
+            "[.[]] | length > 1",
+        ] {
+            let parsed = parse_with_mode_and_extensions(
+                &format!(".x as $x | select({cond})"),
+                ParserMode::Yq,
+                true,
+            );
+            let cond_expr = match parsed {
+                Ok(Expr::As { body, .. }) => match *body {
+                    Expr::Builtin(Builtin::Select(cond)) => *cond,
+                    other => panic!("not a select: {other:?}"),
+                },
+                other => panic!("{cond}: {other:?}"),
+            };
+            assert!(!yq_condition_is_value_only(&cond_expr), "{cond}");
+        }
+    }
+
+    #[test]
+    fn a_value_the_owned_document_holds_differently_is_flagged() {
+        // Scalar spellings: yq compares a scalar's text.
+        for cond in [
+            ". == true",
+            "null == .",
+            "(.a)? == false",
+            ".a | . != \"x\"",
+            "tostring == \"null\"",
+        ] {
+            assert!(
+                yq_condition_reads_differently_on_owned(&condition(cond), false),
+                "{cond}"
+            );
+        }
+        // An alias node itself, on a document with aliases only.
+        for cond in [
+            "has(\"p\")",
+            "length == 1",
+            "test(\"p\")",
+            "keys | length > 0",
+        ] {
+            assert!(
+                !yq_condition_reads_differently_on_owned(&condition(cond), false),
+                "{cond}"
+            );
+            assert!(
+                yq_condition_reads_differently_on_owned(&condition(cond), true),
+                "{cond}"
+            );
+        }
+        // A metadata reader's answer is a fresh string, and ordering compares read the value.
+        for cond in ["style != \"\"", ". > 1", ".a == 1", "1 == 2"] {
+            assert!(
+                !yq_condition_reads_differently_on_owned(&condition(cond), true),
+                "{cond}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_owned_rewrite_admits_pure_navigation_and_values_only_selects() {
+        for stage in [
+            ".a",
+            ".[]",
+            ".[0]",
+            ".[1:2]",
+            "..",
+            ".a?",
+            "(.a, .b)",
+            "(.a | .b)",
+            "select(. > 1)",
+        ] {
+            assert!(yq_owned_navigation_is_exact(&yq(stage)), "{stage}");
+        }
+        for stage in [
+            "select(style == \"\")",
+            "select(. == true)",
+            "first(.a)",
+            "map(.)",
+            "$x",
+        ] {
+            let parsed = parse_with_mode_and_extensions(
+                &format!(".x as $x | {stage}"),
+                ParserMode::Yq,
+                true,
+            );
+            let stage_expr = match parsed {
+                Ok(Expr::As { body, .. }) => *body,
+                other => panic!("{stage}: {other:?}"),
+            };
+            assert!(!yq_owned_navigation_is_exact(&stage_expr), "{stage}");
+        }
+    }
+}
