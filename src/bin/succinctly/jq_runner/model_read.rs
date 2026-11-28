@@ -373,14 +373,17 @@ fn entry_before(
     let first = files.iter().position(|file| file.trigger.is_some())?;
     // The lazy prefix of a lone source: the model's values through its end are its. Its end is an
     // offset in the text, the substitution of the bytes read for a source that is not UTF-8.
-    let drop_through = files.first().filter(|file| file.lazy > 0).map_or(0, |file| {
-        let end = file.ends[file.lazy - 1];
-        let end = lossy
-            .first()
-            .and_then(Option::as_ref)
-            .map_or(end, |lossy| lossy.original_offset(end));
-        cuts.first().copied().unwrap_or(0) + end
-    });
+    let drop_through = files
+        .first()
+        .filter(|file| file.lazy > 0)
+        .map_or(0, |file| {
+            let end = file.ends[file.lazy - 1];
+            let end = lossy
+                .first()
+                .and_then(Option::as_ref)
+                .map_or(end, |lossy| lossy.original_offset(end));
+            cuts.first().copied().unwrap_or(0) + end
+        });
     let mut at = None;
     for j in (0..=first).rev() {
         let file = &files[j];
@@ -504,7 +507,10 @@ pub(super) fn transcript_alone(files: &[&[u8]]) -> Vec<String> {
         .collect();
     let mut seen = Vec::new();
     ReaderState::start(NON_SEQ).read_to_end(files, &JQ_READER, NON_SEQ, |read| {
-        let at = read.at.file.map(|file| (file as u32, read.at.line as u64 + seed));
+        let at = read
+            .at
+            .file
+            .map(|file| (file as u32, read.at.line as u64 + seed));
         let what = match read.item {
             Item::Value(span) => match decode(&span_bytes(files, &starts, span.start, span.end)) {
                 Ok(value) => format!("doc {value:?}"),
