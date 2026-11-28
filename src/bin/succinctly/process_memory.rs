@@ -255,17 +255,21 @@ mod tests {
         assert_eq!(vm_size("Name:\tx\n"), None);
     }
 
-    /// Where a probe exists, it reads the process: a block it touches is seen.
+    /// Where a probe exists, it reads the process: some MiB at least, no more than the machine
+    /// has, and a limit within the ceiling. Whether it follows what the process holds is
+    /// `tests/jq_cli/i8064.rs`'s to show, in a process of its own: in this one other tests
+    /// allocate and free concurrently, and freed pages the allocator keeps are reused unseen.
     #[test]
-    fn the_probe_reads_what_the_process_holds_8064() {
-        let Some(before) = resident() else {
+    fn the_probe_reads_the_process_8064() {
+        let Some(now) = resident() else {
             assert!(cfg!(not(any(target_os = "linux", target_vendor = "apple"))));
+            assert_eq!(limit(), None);
             return;
         };
-        let block = vec![1u8; 64 << 20];
-        let after = resident().expect("read once, read again");
-        assert!(after >= before + (32 << 20), "{before} -> {after}");
-        drop(block);
+        assert!(now >= 1 << 20, "{now}");
+        if let Some(physical) = physical() {
+            assert!(now <= physical, "{now} of {physical}");
+        }
         let limit = limit().expect("a probe, so a limit");
         assert!(limit > 0 && limit <= CEILING, "{limit}");
     }
