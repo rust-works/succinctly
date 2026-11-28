@@ -5300,8 +5300,240 @@ pub(crate) fn literal_to_owned(lit: &Literal) -> OwnedValue {
 /// exercised by any known query shape yet, so it is left for whoever hits it
 /// live rather than guessed at.
 pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
+    reemit_within_budget(expr, false)
+}
+
+/// [`yq_empty_context_reemit`] for a stage whose input list is known to be empty: the caller asked
+/// the stages before it (#6943, #8002), where an operand that came up empty may have had nodes.
+/// Only here is a fold whose source re-emits nothing its INIT (#8044): over a context with nodes
+/// its source may have yielded them and UPDATE dropped every accumulator
+/// (`(.[] as $x ireduce (0; select(false))) as $q | [$q]` over `[1, 2]` is `[]` in yq).
+pub(crate) fn yq_empty_input_reemit(expr: &Expr) -> Option<Expr> {
+    reemit_within_budget(expr, true)
+}
+
+/// [`yq_empty_context_reemit_in`] of `expr` from the top, within [`REEMIT_MAX_COPIED_NODES`].
+fn reemit_within_budget(expr: &Expr, input_empty: bool) -> Option<Expr> {
+    reemit_with_budget(expr, input_empty, REEMIT_MAX_COPIED_NODES)
+}
+
+/// [`reemit_within_budget`] with `budget` nodes for the copies: a rewrite whose copies would pass it
+/// declines whole, never a part of it, since a part could answer what the whole would not (a comma
+/// that lost a branch).
+fn reemit_with_budget(expr: &Expr, input_empty: bool, budget: usize) -> Option<Expr> {
+    let budget = ReemitBudget {
+        left: core::cell::Cell::new(budget),
+        exhausted: core::cell::Cell::new(false),
+    };
+    let rewrite = yq_empty_context_reemit_in(
+        expr,
+        ReemitScope {
+            bound: &[],
+            input_empty,
+            budget: &budget,
+        },
+    );
+    rewrite.filter(|_| !budget.exhausted.get())
+}
+
+/// What the rewrite of one expression may still copy ([`ReemitScope::charge`]).
+struct ReemitBudget {
+    left: core::cell::Cell<usize>,
+    exhausted: core::cell::Cell<bool>,
+}
+
+/// Where [`yq_empty_context_reemit_in`] rewrites an expression (#8044).
+#[derive(Clone, Copy)]
+struct ReemitScope<'s> {
+    /// The variables an `as` of the rewrite binds around the expression, because that binding's
+    /// source re-emits.
+    bound: &'s [&'s str],
+    /// Whether the context is known to be empty ([`yq_empty_input_reemit`]) or only came up empty.
+    input_empty: bool,
+    /// The nodes the rewrite may still copy; once spent, the whole rewrite declines.
+    budget: &'s ReemitBudget,
+}
+
+impl ReemitScope<'_> {
+    /// Charge `nodes` copied nodes, `false` (and the rewrite declines) when the budget has not got
+    /// them. A rewrite that spends it exactly still answers.
+    fn charge(&self, nodes: usize) -> bool {
+        let left = self.budget.left.get();
+        if nodes > left {
+            self.budget.exhausted.set(true);
+            return false;
+        }
+        self.budget.left.set(left - nodes);
+        true
+    }
+}
+
+/// The number of nodes in `expr`, for [`ReemitScope::charge`].
+fn reemit_nodes(expr: &Expr) -> usize {
+    let mut nodes = 0;
+    super::walk::any_subexpr(expr, &mut |_| {
+        nodes += 1;
+        false
+    });
+    nodes
+}
+
+/// How many nodes one rewrite may write beyond its input's own size. Only a copy is charged: a
+/// binding whose body's rewrite reads its variable, over a source that may answer nothing, writes
+/// that body a second time (unbound), and a `//` whose left side may answer nothing writes that side
+/// three times, so a nest of either multiplies per level. A rewrite that copies nothing (a comma or
+/// an object of any size) is never refused.
+const REEMIT_MAX_COPIED_NODES: usize = 1_000_000;
+
+/// The variable the rewrite of an `as` whose source may answer nothing binds that source's
+/// outputs to, collected (#8044). Its `\u{1}` keeps it out of any name a program can spell.
+const REEMIT_SOURCE_VAR: &str = "\u{1}reemit-source";
+
+/// [`yq_empty_context_reemit`] of `expr` inside the bindings `bound` names: the variables an `as`
+/// of the rewrite binds around it, because that binding's source re-emits (#8044). A reference to
+/// one is a value whatever the context holds (yq's `getVariableOperator` reads the variable, not
+/// the context), so `select(false) | (1 as $y | $y)` is `1`; any other reference is one yq finds
+/// unbound over the empty context, which answers nothing.
+fn yq_empty_context_reemit_in(expr: &Expr, scope: ReemitScope<'_>) -> Option<Expr> {
+    if scope.budget.exhausted.get() {
+        return None;
+    }
     match super::eval_generic::strip_parens(expr) {
         lit @ Expr::Literal(_) => Some(lit.clone()),
+        Expr::Var(name) if scope.bound.contains(&name.as_str()) => Some(Expr::Var(name.clone())),
+        // #8044: yq's `variableLoopSingleChild` (`operator_variables.go`, v4.53.3) evaluates the
+        // source over the context, then the body over that same context once per source output
+        // with the variable bound to it, or once with nothing bound when the source yields nothing.
+        // Over an empty context the body is therefore asked as a stage of its own:
+        // `select(false) | (. as $y | 3)` is `3`, `(. as $y | [.])` is `[]` and
+        // `((1, 2) as $y | $y)` is `1`, `2`, where `(. as $y | $y)` is nothing. A body evaluated
+        // with nothing bound sees an enclosing binding of the same name, as yq's does
+        // (`1 as $y | select(false) | (. as $y | $y)` is `1`), and the rewrite, which drops the
+        // inner binding, does too.
+        Expr::As {
+            expr: source,
+            var,
+            body,
+        } => {
+            let Some(source) = yq_empty_context_reemit_in(source, scope) else {
+                return yq_empty_context_reemit_in(body, scope);
+            };
+            let mut inner: Vec<&str> = scope.bound.to_vec();
+            inner.push(var);
+            let inner_scope = ReemitScope {
+                bound: &inner,
+                ..scope
+            };
+            if reemit_always_answers(&source) {
+                return Some(Expr::As {
+                    expr: Box::new(source),
+                    var: var.clone(),
+                    body: Box::new(yq_empty_context_reemit_in(body, inner_scope)?),
+                });
+            }
+            // A source that may answer nothing leaves the body to run once with nothing bound then:
+            // `select(false) | ((1 | select(false)) as $y | 3)` is `3`. The source runs once, into a
+            // list. A body whose rewrite never reads the variable is written once, bound to `null`
+            // for an empty list, so a nest of such bindings stays linear; one that reads it is
+            // written twice, bound and not, within the rewrite's budget for copies.
+            let collected = Expr::Var(REEMIT_SOURCE_VAR.into());
+            let no_outputs = Expr::Compare {
+                op: CompareOp::Eq,
+                left: Box::new(Expr::pipe(vec![
+                    collected.clone(),
+                    Expr::Builtin(Builtin::Length),
+                ])),
+                right: Box::new(Expr::Literal(Literal::Int(0))),
+            };
+            let each = Expr::pipe(vec![collected, Expr::Iterate]);
+            let reads = |rewrite: &Expr| {
+                super::walk::any_subexpr(
+                    rewrite,
+                    &mut |e| matches!(e, Expr::Var(name) if name == var),
+                )
+            };
+            let bound_body = yq_empty_context_reemit_in(body, inner_scope)?;
+            // A rewrite that does not read the variable is what the body rewrites to unbound too.
+            let over_list = if !reads(&bound_body) {
+                Expr::As {
+                    expr: Box::new(Expr::If {
+                        cond: Box::new(no_outputs),
+                        then_branch: Box::new(Expr::Literal(Literal::Null)),
+                        else_branch: Box::new(each),
+                    }),
+                    var: var.clone(),
+                    body: Box::new(bound_body),
+                }
+            } else {
+                let unbound = yq_empty_context_reemit_in(body, scope);
+                // The second copy of the body is what a nest of such bindings multiplies.
+                if !scope.charge(unbound.as_ref().map_or(0, reemit_nodes)) {
+                    return None;
+                }
+                Expr::If {
+                    cond: Box::new(no_outputs),
+                    then_branch: Box::new(unbound.unwrap_or(Expr::Builtin(Builtin::Empty))),
+                    else_branch: Box::new(Expr::As {
+                        expr: Box::new(each),
+                        var: var.clone(),
+                        body: Box::new(bound_body),
+                    }),
+                }
+            };
+            Some(Expr::As {
+                expr: Box::new(Expr::Array(Box::new(source))),
+                var: REEMIT_SOURCE_VAR.into(),
+                body: Box::new(over_list),
+            })
+        }
+        // #8044: yq's `reduceOperator` (`operator_reduce.go`) evaluates the source and INIT over
+        // the context and folds UPDATE over INIT's list for each source output, so over an empty
+        // context a fold whose source yields nothing is INIT's answer there
+        // (`select(false) | (.[] as $x ireduce (0; . + 1))` is `0`), and one whose source re-emits
+        // folds it from that answer, an empty list included (#8035): `((1, 2) as $x ireduce (0;
+        // . + $x))` is `3`. UPDATE runs on the accumulators as written. Only where the context is
+        // known to be empty ([`yq_empty_input_reemit`]): an operand that only came up empty may
+        // have had nodes its source folded and UPDATE dropped, and a rewrite keeps only the source
+        // branches that re-emit (`((.[], 1) as $x ireduce (0; select($x == 1) | . + 1)) as $q |
+        // [$q]` over `[5]` is `[]` in yq). A fold whose UPDATE reads its node's position
+        // (`$x | key`) has the source the parser piped into a tuple (`bind_ireduce_node_reads`):
+        // the source as written decides, and the tuple is built on what it re-emits.
+        Expr::Reduce {
+            input,
+            patterns,
+            init,
+            update,
+        } => {
+            if !scope.input_empty {
+                return None;
+            }
+            let (source, tuple) = match (unwrap_paren(input), patterns.as_slice()) {
+                (_, [Pattern::Var(_)]) => (&**input, None),
+                (Expr::Pipe(stages), [Pattern::Array(vars)]) if node_read_tuple(vars) => {
+                    match stages.as_slice() {
+                        [written @ Expr::Paren(_), tuple @ Expr::Array(_)] => {
+                            (written, Some(tuple))
+                        }
+                        _ => return None, // patchcov: coverage tolerate-line reason="defensive: `bind_ireduce_node_reads` builds this two-stage pipe for every tuple pattern it makes"
+                    }
+                }
+                _ => return None,
+            };
+            let init = yq_empty_context_reemit_in(init, scope);
+            let Some(source) = yq_empty_context_reemit_in(source, scope) else {
+                return init;
+            };
+            let input = match tuple {
+                Some(tuple) => Expr::pipe(vec![source, tuple.clone()]),
+                None => source,
+            };
+            Some(Expr::Reduce {
+                input: Box::new(input),
+                patterns: patterns.clone(),
+                init: Box::new(init.unwrap_or(Expr::Builtin(Builtin::Empty))),
+                update: update.clone(),
+            })
+        }
         // Regardless of `body`: the collected array is emitted once even
         // when its own body loops zero times over the empty context.
         Expr::Array(_) => Some(Expr::Array(Box::new(Expr::Comma(Vec::new())))),
@@ -5309,7 +5541,7 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
             let mut rewritten = Vec::new();
             for entry in entries {
                 let key = match &entry.key {
-                    ObjectKey::Literal(s) => s.clone(),
+                    ObjectKey::Literal(s) => ObjectKey::Literal(s.clone()),
                     // A bare entry (#2783) is `COLLECT_OBJECT`'s, not a pair, so
                     // there is no key to rebuild an object around.
                     ObjectKey::Bare => return None,
@@ -5329,17 +5561,25 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
                     // which is yq-only by construction (see this function's
                     // own doc comment), so there is no jq-mode call to get
                     // this wrong for.
-                    ObjectKey::Expr(k) => match yq_empty_context_reemit(k)? {
-                        Expr::Literal(lit) => match literal_to_owned(&lit) {
-                            OwnedValue::String(s) => String::clone(&s),
-                            v => yq_object_key_stringify::<YqSemantics>(&v)?,
-                        },
-                        _ => return None,
-                    },
+                    ObjectKey::Expr(k) => {
+                        match yq_empty_context_reemit_in(k, scope)? {
+                            Expr::Literal(lit) => {
+                                ObjectKey::Literal(match literal_to_owned(&lit) {
+                                    OwnedValue::String(s) => String::clone(&s),
+                                    v => yq_object_key_stringify::<YqSemantics>(&v)?,
+                                })
+                            }
+                            // #8044: a variable an `as` of the rewrite binds is a key the object
+                            // stringifies when it is built, as it does over a context with nodes
+                            // (`select(false) | ("x" as $y | {$y: 1})` is `{"x": 1}`).
+                            var @ Expr::Var(_) => ObjectKey::Expr(Box::new(var)),
+                            _ => return None,
+                        }
+                    }
                 };
                 rewritten.push(ObjectEntry {
-                    key: ObjectKey::Literal(key),
-                    value: yq_empty_context_reemit(&entry.value)?,
+                    key,
+                    value: yq_empty_context_reemit_in(&entry.value, scope)?,
                 });
             }
             Some(Expr::Object(rewritten))
@@ -5347,25 +5587,27 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
         Expr::Comma(branches) => {
             let kept: Vec<Expr> = branches
                 .iter()
-                .filter_map(yq_empty_context_reemit)
+                .filter_map(|branch| yq_empty_context_reemit_in(branch, scope))
                 .collect();
             (!kept.is_empty()).then(|| Expr::comma(kept))
         }
-        Expr::Negate(operand) => Some(Expr::Negate(Box::new(yq_empty_context_reemit(operand)?))),
+        Expr::Negate(operand) => Some(Expr::Negate(Box::new(yq_empty_context_reemit_in(
+            operand, scope,
+        )?))),
         // #5261: `errorOperator` raises whatever its context holds, so
         // `select(false) | error("x")` and `.a.zz | error("x")` raise in yq. The
         // message is itself an operand evaluated against the empty context
         // (`error("x" + "y")` is `xy`), so it has to re-emit too; a message that
         // reads its input (`error(.q)`, yq's "aborted") and the bare `error`
         // decline and stay empty.
-        Expr::Error(Some(message)) => Some(Expr::Error(Some(Box::new(yq_empty_context_reemit(
-            message,
-        )?)))),
+        Expr::Error(Some(message)) => Some(Expr::Error(Some(Box::new(
+            yq_empty_context_reemit_in(message, scope)?,
+        )))),
         // An operator needs every operand to re-emit, see `reemit_operands`.
         Expr::Arithmetic {
             op, left, right, ..
         } => {
-            let (left, right) = reemit_operands(left, right)?;
+            let (left, right) = reemit_operands(left, right, scope)?;
             Some(Expr::Arithmetic {
                 op: *op,
                 left: Box::new(left),
@@ -5374,7 +5616,7 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
             })
         }
         Expr::Compare { op, left, right } => {
-            let (left, right) = reemit_operands(left, right)?;
+            let (left, right) = reemit_operands(left, right, scope)?;
             Some(Expr::Compare {
                 op: *op,
                 left: Box::new(left),
@@ -5382,11 +5624,11 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
             })
         }
         Expr::And(left, right) => {
-            let (left, right) = reemit_operands(left, right)?;
+            let (left, right) = reemit_operands(left, right, scope)?;
             Some(Expr::And(Box::new(left), Box::new(right)))
         }
         Expr::Or(left, right) => {
-            let (left, right) = reemit_operands(left, right)?;
+            let (left, right) = reemit_operands(left, right, scope)?;
             Some(Expr::Or(Box::new(left), Box::new(right)))
         }
         // Only the left operand has to re-emit: `1 // .b` is `1` (the right
@@ -5400,10 +5642,16 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
         // two branches are the operator: no answer is no branch. Not as a pipe stage before the
         // operator, which the pipe's own rule would re-emit after that stage emptied, forever.
         Expr::Alternative(left, right) => {
-            let left = yq_empty_context_reemit(left)?;
-            let right = yq_empty_context_reemit(right).unwrap_or(Expr::Builtin(Builtin::Empty));
+            let left = yq_empty_context_reemit_in(left, scope)?;
+            let right =
+                yq_empty_context_reemit_in(right, scope).unwrap_or(Expr::Builtin(Builtin::Empty));
             if reemit_always_answers(&left) {
                 return Some(Expr::Alternative(Box::new(left), Box::new(right)));
+            }
+            // The left side is written three times and the right side twice, which a nest of `//`
+            // multiplies per level (#8044).
+            if !scope.charge(2 * reemit_nodes(&left) + reemit_nodes(&right)) {
+                return None;
             }
             let operator = Expr::Alternative(Box::new(left.clone()), Box::new(right));
             Some(Expr::If {
@@ -5416,7 +5664,14 @@ pub(crate) fn yq_empty_context_reemit(expr: &Expr) -> Option<Expr> {
             let (at, head) = stages
                 .iter()
                 .enumerate()
-                .find_map(|(i, stage)| Some((i, yq_empty_context_reemit(stage)?)))?;
+                .find_map(|(i, stage)| Some((i, yq_empty_context_reemit_in(stage, scope)?)))?;
+            // #8034's postfix rule inside a rewrite: a postfix index is part of the term in yq, so
+            // a candidate that reads path context declines when a navigation follows it
+            // (`select(false) | (. as $y | [key][0])` is nothing in yq), as
+            // [`yq_reemit_after_empty_stage_as`] declines it among a body's own stages.
+            if needs_path_context(&stages[at]) && stages[at + 1..].iter().any(yq_stage_navigates) {
+                return None;
+            }
             let mut rewritten = vec![head];
             rewritten.extend(stages[at + 1..].iter().cloned());
             Some(Expr::pipe(rewritten))
@@ -5440,32 +5695,49 @@ pub(crate) fn yq_stage_can_reemit(expr: &Expr) -> bool {
 /// head (`.users | [.[]]`), so a caller that must not disturb the routes that build those lazily
 /// asks without it and handles an empty answer afterwards.
 pub(crate) fn yq_stage_can_reemit_in(expr: &Expr, arrays: bool) -> bool {
+    stage_can_reemit_in(expr, arrays, false)
+}
+
+/// [`yq_stage_can_reemit_in`], where `vars` says whether an `as` around `expr` has a source that
+/// may re-emit, and so may bind a variable that re-emits (#8044).
+fn stage_can_reemit_in(expr: &Expr, arrays: bool, vars: bool) -> bool {
     match super::eval_generic::strip_parens(expr) {
         Expr::Literal(_) => true,
         Expr::Array(_) => arrays,
         Expr::Object(entries) => entries.iter().all(|entry| {
             !matches!(entry.key, ObjectKey::Bare)
                 && match &entry.key {
-                    ObjectKey::Expr(key) => yq_stage_can_reemit_in(key, arrays),
+                    ObjectKey::Expr(key) => stage_can_reemit_in(key, arrays, vars),
                     _ => true,
                 }
-                && yq_stage_can_reemit_in(&entry.value, arrays)
+                && stage_can_reemit_in(&entry.value, arrays, vars)
         }),
         Expr::Comma(branches) => branches
             .iter()
-            .any(|branch| yq_stage_can_reemit_in(branch, arrays)),
-        Expr::Negate(operand) => yq_stage_can_reemit_in(operand, arrays),
-        Expr::Error(Some(message)) => yq_stage_can_reemit_in(message, arrays),
+            .any(|branch| stage_can_reemit_in(branch, arrays, vars)),
+        Expr::Negate(operand) => stage_can_reemit_in(operand, arrays, vars),
+        Expr::Error(Some(message)) => stage_can_reemit_in(message, arrays, vars),
         Expr::Arithmetic { left, right, .. } | Expr::Compare { left, right, .. } => {
-            yq_stage_can_reemit_in(left, arrays) && yq_stage_can_reemit_in(right, arrays)
+            stage_can_reemit_in(left, arrays, vars) && stage_can_reemit_in(right, arrays, vars)
         }
         Expr::And(left, right) | Expr::Or(left, right) => {
-            yq_stage_can_reemit_in(left, arrays) && yq_stage_can_reemit_in(right, arrays)
+            stage_can_reemit_in(left, arrays, vars) && stage_can_reemit_in(right, arrays, vars)
         }
-        Expr::Alternative(left, _) => yq_stage_can_reemit_in(left, arrays),
+        Expr::Alternative(left, _) => stage_can_reemit_in(left, arrays, vars),
         Expr::Pipe(stages) => stages
             .iter()
-            .any(|stage| yq_stage_can_reemit_in(stage, arrays)),
+            .any(|stage| stage_can_reemit_in(stage, arrays, vars)),
+        // #8044: a binding re-emits when its body does, and a variable in it only where its source
+        // may (`"x" as $y | .a` does not).
+        Expr::Var(_) => vars,
+        Expr::As { expr, body, .. } => stage_can_reemit_in(
+            body,
+            arrays,
+            vars || stage_can_reemit_in(expr, arrays, vars),
+        ),
+        Expr::Reduce { input, init, .. } => {
+            stage_can_reemit_in(input, arrays, vars) || stage_can_reemit_in(init, arrays, vars)
+        }
         _ => false,
     }
 }
@@ -5526,7 +5798,7 @@ fn yq_reemit_after_empty_stage_as(
         if written_flat[at + 1..].iter().any(needs_path_context) {
             return None;
         }
-        let Some(head) = yq_empty_context_reemit(&written_flat[at]) else {
+        let Some(head) = yq_empty_input_reemit(&written_flat[at]) else {
             continue; // patchcov: coverage tolerate-line reason="an object with a computed key (`{(\"a\" + \"b\"): 1}`) may re-emit and then declines; the plain pipe declines it the same way (#6943), so no row of yq's answer can pin it"
         };
         // The candidate's own reads are of the empty context, which the rewrite drops (#8034):
@@ -5679,8 +5951,10 @@ pub(crate) fn eval_each_owned_reemitting<S: EvalSemantics>(
 /// empty in a later stage (`1 | select(false)`), so it and anything holding one answers `false`.
 fn reemit_always_answers(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(_) | Expr::Array(_) => true,
+        // A variable is one only where an `as` of the rewrite binds it (#8044).
+        Expr::Literal(_) | Expr::Array(_) | Expr::Var(_) => true,
         Expr::Error(message) => message.as_deref().map_or(true, reemit_always_answers),
+        Expr::As { expr, body, .. } => reemit_always_answers(expr) && reemit_always_answers(body),
         Expr::Object(entries) => entries
             .iter()
             .all(|entry| reemit_always_answers(&entry.value)),
@@ -5702,11 +5976,19 @@ fn reemit_always_answers(expr: &Expr) -> bool {
 /// context, but what yq then does is not one rule -- `1 == .b` is `false`
 /// while `.b == 2` and `1 + .b` are nothing -- so the operator declines and
 /// the ordinary evaluator answers it (the empty-operand table, #2460).
-fn reemit_operands(left: &Expr, right: &Expr) -> Option<(Expr, Expr)> {
+fn reemit_operands(left: &Expr, right: &Expr, scope: ReemitScope<'_>) -> Option<(Expr, Expr)> {
     Some((
-        yq_empty_context_reemit(left)?,
-        yq_empty_context_reemit(right)?,
+        yq_empty_context_reemit_in(left, scope)?,
+        yq_empty_context_reemit_in(right, scope)?,
     ))
+}
+
+/// Whether a fold's array pattern is the tuple `bind_ireduce_node_reads` builds for an UPDATE that
+/// reads its node (`$x | key`): the loop variable, then one variable per read, each named with a
+/// `\u{1}` no program can spell.
+fn node_read_tuple(vars: &[Pattern]) -> bool {
+    matches!(vars, [Pattern::Var(_), reads @ ..] if !reads.is_empty()
+        && reads.iter().all(|read| matches!(read, Pattern::Var(name) if name.contains('\u{1}'))))
 }
 
 /// Evaluate a comma expression (multiple outputs).
@@ -127736,6 +128018,150 @@ mod tests {
         };
         assert!(negated_answers("1"));
         assert!(!negated_answers("1 | select(false)"));
+        // #8044: a binding answers when its source and its body do, a variable it binds always.
+        for src in ["1 as $y | $y", "1 as $y | [.]", "1 as $y | {\"k\": $y}"] {
+            assert!(answers(src), "`{src}`");
+        }
+        for src in [
+            "1 as $y | ($y | select(false))",
+            "(1 | select(false)) as $y | 3",
+        ] {
+            assert!(!answers(src), "`{src}`");
+        }
+        let input_answers = |src: &str| {
+            let expr = parse_with_mode_and_extensions(src, ParserMode::Yq, true).unwrap();
+            reemit_always_answers(&yq_empty_input_reemit(&expr).expect(src))
+        };
+        assert!(!input_answers("1 as $x ireduce (0; .)"));
+    }
+
+    /// #8044: over an empty context yq evaluates a binding's body once per output of its source
+    /// with the variable bound, or once with nothing bound when the source yields nothing, and a
+    /// fold is its INIT there unless its source yields something to fold.
+    #[test]
+    fn test_yq_empty_context_reemit_binding_and_fold_8044() {
+        let yq = |src: &str| parse_with_mode_and_extensions(src, ParserMode::Yq, true).unwrap();
+        let reemit = |src: &str| yq_empty_context_reemit(&yq(src));
+        let is = |src: &str, want: &str| assert_eq!(reemit(src), Some(yq(want)), "`{src}`");
+        // A source that yields nothing leaves the body, unbound.
+        is(". as $y | 3", "3");
+        is(". as $y | [.]", "[]");
+        is(". as $a | . as $b | 3", "3");
+        is(". as $y | select(false) | 3", "3");
+        is("{\"a\": .} as $y | 3", "3");
+        // A source that re-emits binds it, and the variable is a value.
+        is("1 as $y | $y", "1 as $y | $y");
+        is("1 as $y | [$y]", "1 as $y | []");
+        is("1 as $y | $y + 1", "1 as $y | $y + 1");
+        is("1 as $y | . as $z | $y", "1 as $y | $y");
+        is("[.] as $y | $y", "[] as $y | $y");
+        // A source that may answer nothing is collected once; a body that does not read the
+        // variable is written once, bound to `null` for an empty list.
+        assert!(matches!(
+            reemit("(1 | select(false)) as $y | 3"),
+            Some(Expr::As { var, body, .. })
+                if var == REEMIT_SOURCE_VAR && matches!(&*body, Expr::As { .. })
+        ));
+        assert!(matches!(
+            reemit("(1 | select(false)) as $y | $y"),
+            Some(Expr::As { body, .. }) if matches!(&*body, Expr::If { .. })
+        ));
+        // #8034's postfix rule holds inside a binding's body.
+        assert_eq!(reemit(". as $y | [key][0]"), None);
+        assert!(reemit(". as $y | [key][1:]").is_some());
+        // A key bound by the rewrite is kept for the object to stringify.
+        assert!(reemit("\"x\" as $y | {$y: 1}").is_some());
+        for src in [
+            ". as $y | $y",
+            ". as $y | .",
+            ". as $y | $y + 1",
+            "{\"a\": .} as $y | $y",
+            "3 as $y | .",
+            "$y",
+            "{$y: 1}",
+        ] {
+            assert_eq!(reemit(src), None, "`{src}`");
+        }
+        // A fold over a source that yields nothing is its INIT where the context is known to be
+        // empty; one over a source that re-emits folds it, from `empty` for an INIT that yields
+        // nothing.
+        let input_reemit = |src: &str| yq_empty_input_reemit(&yq(src));
+        let input_is =
+            |src: &str, want: &str| assert_eq!(input_reemit(src), Some(yq(want)), "`{src}`");
+        input_is(".[] as $x ireduce (0; . + 1)", "0");
+        input_is(".[] as $x ireduce ([]; . + [$x])", "[]");
+        input_is(". as $y | .[] as $x ireduce (0; . + 1)", "0");
+        input_is("1 as $x ireduce (0; . + $x)", "1 as $x ireduce (0; . + $x)");
+        input_is("1 as $x ireduce (.; 1)", "1 as $x ireduce (empty; 1)");
+        // An operand that only came up empty may have had nodes its source folded and UPDATE
+        // dropped, so no fold is rewritten there.
+        for src in [
+            ".[] as $x ireduce (0; select(false))",
+            ". as $y | .[] as $x ireduce (0; . + 1)",
+            "(.[], 1) as $x ireduce (0; select($x == 1) | . + 1)",
+        ] {
+            assert_eq!(reemit(src), None, "`{src}`");
+        }
+        // UPDATE reads the node: the source as written decides, and the tuple is built on what it
+        // re-emits.
+        input_is(".[] as $x ireduce (0; . + ($x | key))", "0");
+        assert!(matches!(
+            input_reemit("1 as $x ireduce (0; . + ($x | key))"),
+            Some(Expr::Reduce { .. })
+        ));
+        // A user-written array pattern is no tuple of the parser's.
+        assert_eq!(input_reemit("reduce ((1) | [.]) as [$a] (0; . + $a)"), None);
+        for src in [
+            ".[] as $x ireduce (.; 1)",
+            ".[] as $x ireduce (select(false); [.])",
+        ] {
+            assert_eq!(input_reemit(src), None, "`{src}`");
+        }
+    }
+
+    /// #8044: a nest of bindings whose sources may answer nothing is rewritten in linear time: a body
+    /// that does not read its variable is written once, and one that does is written twice only a
+    /// few levels deep. Each doubling would make these 30-deep nests some billion nodes.
+    #[test]
+    fn test_reemit_of_nested_empty_sources_stays_linear_8044() {
+        let yq = |src: &str| parse_with_mode_and_extensions(src, ParserMode::Yq, true).unwrap();
+        let nest = |body: &str| {
+            let bindings: String = (1..=30)
+                .map(|i| format!("(1 | select(false)) as $a{i} | "))
+                .collect();
+            yq(&format!("{bindings}{body}"))
+        };
+        assert!(yq_empty_context_reemit(&nest("3")).is_some());
+        let reads: Vec<String> = (1..=30).map(|i| format!("$a{i}")).collect();
+        // A collect drops the reads, so every level is written once.
+        assert!(yq_empty_context_reemit(&nest(&format!("[{}]", reads.join(", ")))).is_some());
+        // A union keeps them, so the copies pass the budget and the rewrite declines (yq answers
+        // nothing: every variable is unbound).
+        assert_eq!(
+            yq_empty_context_reemit(&nest(&format!("({})", reads.join(", ")))),
+            None
+        );
+    }
+
+    /// #8044: only a copy is charged, so a rewrite that copies nothing is never refused, and one
+    /// that spends the budget exactly still answers.
+    #[test]
+    fn test_reemit_budget_charges_only_copies_8044() {
+        let yq = |src: &str| parse_with_mode_and_extensions(src, ParserMode::Yq, true).unwrap();
+        let ones = vec!["1"; 20_000].join(", ");
+        assert!(reemit_with_budget(&yq(&format!("({ones})")), true, 0).is_some());
+        let object: Vec<String> = (0..20_000).map(|i| format!("\"k{i}\": {i}")).collect();
+        assert!(reemit_with_budget(&yq(&format!("{{{}}}", object.join(", "))), true, 0).is_some());
+        // The unbound copy of `($y, 1)` is `1`, one node.
+        let split = yq("(1 | select(false)) as $y | ($y, 1)");
+        assert!(reemit_with_budget(&split, true, 1).is_some());
+        assert_eq!(reemit_with_budget(&split, true, 0), None);
+        // A `//` whose left side may answer nothing writes it three times and its right side twice.
+        let alternative = yq("(1 | select(false)) // 2");
+        let left = reemit_nodes(&yq("1 | select(false)"));
+        let exact = 2 * left + 1;
+        assert!(reemit_with_budget(&alternative, true, exact).is_some());
+        assert_eq!(reemit_with_budget(&alternative, true, exact - 1), None);
     }
 
     /// #6943: the allocation-free test the pipe entry asks never says `false` where the rewrite
@@ -127785,10 +128211,21 @@ mod tests {
             "(1 | . + 1)",
             "map(1)",
             "[.[] | 1]",
+            // #8044: bindings and folds.
+            ". as $y | 3",
+            ". as $y | [.]",
+            ". as $y | $y",
+            "1 as $y | $y",
+            "1 as $y | . as $z | $y",
+            "\"x\" as $y | {$y: 1}",
+            "(1 | select(false)) as $y | 3",
+            ".[] as $x ireduce (0; . + 1)",
+            "1 as $x ireduce (.; 1)",
+            ".[] as $x ireduce (0; . + ($x | key))",
         ];
         for src in corpus {
             let expr = crate::jq::parse_with_mode(src, ParserMode::Yq).unwrap();
-            if yq_empty_context_reemit(&expr).is_some() {
+            if yq_empty_context_reemit(&expr).is_some() || yq_empty_input_reemit(&expr).is_some() {
                 assert!(yq_stage_can_reemit(&expr), "`{src}` re-emits");
             }
         }
