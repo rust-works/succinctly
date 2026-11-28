@@ -33,21 +33,67 @@ std::thread_local! {
     static OUTER: Cell<(isize, u32)> = const { Cell::new((0, 0)) };
 }
 
-/// Out of line, as are the allocator's methods, so an allocation site holds one call as it did
-/// with the default allocator, not the count's code as well.
+/// Whether a run is under way on any thread, so allocations are counted.
 #[inline(always)]
-fn count(delta: isize) {
-    if RUNS.load(Ordering::Relaxed) != 0 {
-        // A thread being torn down has no count to keep; nothing it frees then is a run's.
-        let _ = LIVE.try_with(|live| live.set(live.get().wrapping_add(delta)));
-    }
+fn counting() -> bool {
+    RUNS.load(Ordering::Relaxed) != 0
+}
+
+/// Count `delta` bytes for this thread.
+#[inline(always)]
+fn add(delta: isize) {
+    // A thread being torn down has no count to keep; nothing it frees then is a run's.
+    let _ = LIVE.try_with(|live| live.set(live.get().wrapping_add(delta)));
 }
 
 /// The system allocator, counting what a thread holds while a run of the call machine is under
 /// way ([`Meter`]). The `succinctly` binary installs it with `#[global_allocator]`.
+///
+/// Each method is out of line, so an allocation site holds one call, as with the default
+/// allocator, and asks whether to count before it allocates: when not, it is the system
+/// allocator's call in tail position, one load and a branch more than the default; when so, the
+/// counting arm, out of line again.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MeteredAlloc;
+
+impl MeteredAlloc {
+    #[cold]
+    #[inline(never)]
+    unsafe fn counted_alloc(layout: Layout, zeroed: bool) -> *mut u8 {
+        // SAFETY: the caller's `layout`, as `GlobalAlloc::alloc` requires of it.
+        let ptr = unsafe {
+            if zeroed {
+                System.alloc_zeroed(layout)
+            } else {
+                System.alloc(layout)
+            }
+        };
+        if !ptr.is_null() {
+            add(layout.size() as isize);
+        }
+        ptr
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn counted_dealloc(ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from this allocator, which is `System`'s, with `layout`.
+        unsafe { System.dealloc(ptr, layout) };
+        add(-(layout.size() as isize));
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn counted_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: as `GlobalAlloc::realloc` requires of its caller.
+        let new = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new.is_null() {
+            add(new_size as isize - layout.size() as isize);
+        }
+        new
+    }
+}
 
 // SAFETY: every method forwards to `System` with the arguments it was given and returns what
 // `System` returns, so `System`'s contract is this one's; the count is a thread-local `Cell` that
@@ -55,40 +101,42 @@ pub struct MeteredAlloc;
 unsafe impl GlobalAlloc for MeteredAlloc {
     #[inline(never)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller's `layout`, as `GlobalAlloc::alloc` requires of it.
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            count(layout.size() as isize);
+        if counting() {
+            // SAFETY: the caller's `layout`, as `GlobalAlloc::alloc` requires of it.
+            return unsafe { Self::counted_alloc(layout, false) };
         }
-        ptr
+        // SAFETY: as above.
+        unsafe { System.alloc(layout) }
     }
 
     #[inline(never)]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: as `alloc`.
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        if !ptr.is_null() {
-            count(layout.size() as isize);
+        if counting() {
+            // SAFETY: as `alloc`.
+            return unsafe { Self::counted_alloc(layout, true) };
         }
-        ptr
+        // SAFETY: as `alloc`.
+        unsafe { System.alloc_zeroed(layout) }
     }
 
     #[inline(never)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr` came from this allocator, which is `System`'s, with `layout`.
-        unsafe { System.dealloc(ptr, layout) };
-        count(-(layout.size() as isize));
+        if counting() {
+            // SAFETY: `ptr` came from this allocator, which is `System`'s, with `layout`.
+            return unsafe { Self::counted_dealloc(ptr, layout) };
+        }
+        // SAFETY: as above.
+        unsafe { System.dealloc(ptr, layout) }
     }
 
     #[inline(never)]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: as `dealloc`, and `new_size` is the caller's, as `GlobalAlloc::realloc`
-        // requires of it.
-        let new = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new.is_null() {
-            count(new_size as isize - layout.size() as isize);
+        if counting() {
+            // SAFETY: as `GlobalAlloc::realloc` requires of its caller.
+            return unsafe { Self::counted_realloc(ptr, layout, new_size) };
         }
-        new
+        // SAFETY: as above.
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 
