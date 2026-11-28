@@ -2265,13 +2265,20 @@ fn the_memory_is_sampled_rarely_while_it_stands_still_8064() {
         ok(&["200000"])
     );
     assert!(samples() < 20, "{} samples", samples());
-    // From 1 MiB, 16 MiB more at each sample, towards 64 MiB: the fifth reads 65 MiB.
+    // From 1 MiB, 16 MiB more at each sample (a check point's or a growth's), towards 64 MiB:
+    // the fifth reads 65 MiB, or a growth's sample before it finds no room for the old block.
     let answer = machine_within(
         probed(SHIPPED, 64 << 20, 1 << 20, 16 << 20),
         "[def f: ., (. + 1 | f); 0 | f] | length",
     );
-    assert_eq!(answer.error.as_deref(), Some("f/0: memory limit exceeded"));
-    assert_eq!(samples(), 5);
+    assert!(
+        answer
+            .error
+            .as_deref()
+            .is_some_and(|e| e.ends_with("memory limit exceeded")),
+        "{answer:?}"
+    );
+    assert!(samples() <= 5, "{} samples", samples());
 }
 
 /// The interval to the next sample: the least at the first reading, the most while nothing grows,

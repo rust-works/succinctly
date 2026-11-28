@@ -508,6 +508,9 @@ struct Vm<'c, 'e> {
     limits: Limits,
     /// When the run next samples the process's memory ([`Limits::memory`]).
     sampler: Sampler,
+    /// Whether a growth was refused for want of memory ([`Vm::growth_fits`]): the refusal is then
+    /// the memory bound's, not the budget's.
+    memory_over: bool,
     /// The instructions run, for the tests that pin how work scales.
     #[cfg(test)]
     steps: u64,
@@ -534,11 +537,16 @@ fn grow<T>(v: &mut Vec<T>, cap: &mut usize, used: usize, budget: usize) -> Resul
         return Err(());
     }
     if v.capacity() < want {
-        v.try_reserve_exact(want - v.len()).map_err(|_| ())?;
+        move_to_capacity(v, want)?;
     }
     let grew = (want - *cap) * size;
     *cap = want;
     Ok(grew)
+}
+
+/// The bytes `v`'s allocation holds.
+fn bytes_of<T>(v: &Vec<T>) -> usize {
+    v.capacity().saturating_mul(core::mem::size_of::<T>())
 }
 
 /// Make room for one more value in an accumulator, fallibly: values the program builds are not
@@ -546,7 +554,24 @@ fn grow<T>(v: &mut Vec<T>, cap: &mut usize, used: usize, budget: usize) -> Resul
 #[cold]
 #[inline(never)]
 fn reserve<T>(items: &mut Vec<T>) -> Result<(), ()> {
-    items.try_reserve(1).map_err(|_| ())
+    let want = items.capacity().saturating_mul(2).max(4);
+    move_to_capacity(items, want)
+}
+
+/// Give `v` room for `want` elements in a new block, its elements moved over, fallibly.
+///
+/// Not `realloc`: on macOS a large `realloc` remaps the old pages into the new block lazily, and
+/// the process's footprint does not count them until they are next read, so the memory bound
+/// read too little while the machine's own stacks and accumulators grew, and the run passed its
+/// limit by up to a fifth when the refusal's unwinding read them (#8064). Moving the elements
+/// writes them, so the footprint counts what the vector holds as soon as it holds it. The copy is
+/// the one a `realloc` that moves makes, once per doubling.
+fn move_to_capacity<T>(v: &mut Vec<T>, want: usize) -> Result<(), ()> {
+    let mut grown = Vec::new();
+    grown.try_reserve_exact(want).map_err(|_| ())?;
+    grown.append(v);
+    *v = grown;
+    Ok(())
 }
 
 /// The refusal past [`BUDGET`] or [`Limits::rounds`]: succinctly's own recursion-limit wording
@@ -762,6 +787,7 @@ impl<'c, 'e> Vm<'c, 'e> {
             scratch: spare.scratch,
             limits,
             sampler: spare.sampler,
+            memory_over: false,
             #[cfg(test)]
             steps: 0,
             #[cfg(test)]
@@ -872,6 +898,9 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[cold]
     #[inline(never)]
     fn grow_data(&mut self) -> Result<(), Raise> {
+        if !self.growth_fits(bytes_of(&self.data.data)) {
+            return Err(self.current_def());
+        }
         let used = self.bytes();
         grow(
             &mut self.data.data,
@@ -886,6 +915,9 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[cold]
     #[inline(never)]
     fn grow_frames(&mut self) -> Result<(), ()> {
+        if !self.growth_fits(bytes_of(&self.frames.data)) {
+            return Err(());
+        }
         let used = self.bytes();
         grow(
             &mut self.frames.data,
@@ -900,6 +932,9 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[inline(never)]
     fn grow_slots(&mut self, room: usize) -> Result<(), ()> {
         while self.slots_cap - self.slots.len() < room {
+            if !self.growth_fits(bytes_of(&self.slots)) {
+                return Err(());
+            }
             let used = self.bytes();
             grow(
                 &mut self.slots,
@@ -940,6 +975,13 @@ impl<'c, 'e> Vm<'c, 'e> {
             items.push(value);
             return Ok(());
         }
+        let old = bytes_of(items);
+        if !self.growth_fits(old) {
+            return Err(self.current_def());
+        }
+        let Slot::Acc(items) = &mut self.slots[at] else {
+            return Ok(());
+        };
         if reserve(items).is_err() {
             return Err(self.current_def());
         }
@@ -947,9 +989,33 @@ impl<'c, 'e> Vm<'c, 'e> {
         Ok(())
     }
 
+    /// Whether the process has room, under [`Limits::memory`]'s limit, for a vector of `old`
+    /// bytes to grow: its elements are moved into the new block while the old one is still held,
+    /// so for that moment the process holds `old` bytes more (#8064). Asked of every growth of a
+    /// stack or an accumulator, which is rare and moves the process's memory by more than any one
+    /// check point does; past it the run is refused with the memory wording.
+    #[cold]
+    #[inline(never)]
+    fn growth_fits(&mut self, old: usize) -> bool {
+        let Some(probe) = self.limits.memory else {
+            return true;
+        };
+        let Some(now) = (probe.sample)() else {
+            return true;
+        };
+        if now.saturating_add(old) <= probe.limit {
+            return true;
+        }
+        self.memory_over = true;
+        false
+    }
+
     #[cold]
     #[inline(never)]
     fn grow_forks(&mut self) -> Result<(), Raise> {
+        if !self.growth_fits(bytes_of(&self.forks)) {
+            return Err(self.current_def());
+        }
         let used = self.bytes();
         grow(
             &mut self.forks,
@@ -1005,6 +1071,9 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[cold]
     #[inline(never)]
     fn current_def(&self) -> Raise {
+        if self.memory_over {
+            return self.memory_refusal();
+        }
         let mut f = self.frames.index;
         while f >= 0 {
             let fr = self.frames.data[f as usize].value;
@@ -1844,6 +1913,9 @@ impl<'c, 'e> Vm<'c, 'e> {
     #[cold]
     #[inline(never)]
     fn call_refusal(&self, func: u32) -> Raise {
+        if self.memory_over {
+            return self.memory_refusal();
+        }
         let f = &self.code.funcs[func as usize];
         if f.name.is_empty() || f.prelude {
             self.current_def()
