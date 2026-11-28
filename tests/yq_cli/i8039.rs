@@ -3,9 +3,9 @@
 //! does for `.b |= key`, but the nested update answered no `key` (nor `parent`) at its own input,
 //! so the value was left unchanged. `path` already read the position the enclosing update
 //! installed; `key` is now its last component, and `parent` climbs the enclosing update's input.
-//! An update whose own reads cannot be resolved at its target still names that target for the
-//! updates nested in its filter, unless a value yq builds with no position comes first
-//! (`5 | . |= key`, whose `5` has no key).
+//! A value yq builds with no position (`5 | . |= key`, whose `5` has no key) gives the updates it
+//! reaches none, as a read of it gets none. An update whose own reads cannot be resolved at its
+//! target names no position for its filter, as before.
 //!
 //! Every row was captured from yq v4.53.3. `with` is not a jq builtin, and `succinctly jq` still
 //! refuses it as jq 1.7.1 does; a nested update there climbs no `parent` either.
@@ -156,8 +156,8 @@ const ROWS: &[(&str, &str, &str)] = &[
         "{\"a\":[[\"a\",0],[\"a\",1],[\"a\",2]]}\n",
     ),
     (LIST, ".a[] |= (. |= key)", "{\"a\":[0,1,2]}\n"),
-    // An update whose own reads cannot all be resolved at its target still names it for the
-    // updates nested in its filter: after a write, through navigation, `to_entries` and a binding.
+    // An update nested in one whose own reads cannot all be resolved at its target: its walk, or
+    // the navigation that reaches it, names its position below the enclosing one's.
     (
         SPINE,
         "with(.x; . |= (.d = 1 | .b |= path))",
@@ -185,16 +185,6 @@ const ROWS: &[(&str, &str, &str)] = &[
     ),
     (
         SPINE,
-        ".x |= (.b |= (.c | . |= path))",
-        "{\"x\":{\"b\":[\"x\",\"b\",\"c\"],\"d\":2}}\n",
-    ),
-    (
-        SPINE,
-        ".x |= (.b |= (.d = 1 | .c |= path))",
-        "{\"x\":{\"b\":{\"c\":[\"x\",\"b\",\"c\"],\"d\":1},\"d\":2}}\n",
-    ),
-    (
-        SPINE,
         ".x |= (.b |= (.c |= path, (5 | key)))",
         "{\"x\":{\"b\":{\"c\":[\"x\",\"b\",\"c\"]},\"d\":2}}\n",
     ),
@@ -205,9 +195,8 @@ const ROWS: &[(&str, &str, &str)] = &[
     ),
     // Whether a stage leaves its value a position is the owned identity rule's answer, as for a
     // read (`.x | (map(.) | path)` is `[]`): a literal, `now`, arithmetic on a literal, a bound
-    // literal, `map` and `keys` leave none; `//` leaves the one of the side it took; a collect and
-    // `to_entries` keep the input's; a node inside a positionless value stands at its own path.
-    // Each update decides for itself, so a sibling after an unplaced one keeps the prefix.
+    // literal, `map` and `keys` leave none, and a node inside a positionless value stands at its
+    // own path, a variable bound from one included.
     (SPINE, ".x |= (now | (. |= path))", "{\"x\":[]}\n"),
     (SPINE, ".x |= (1 + 2 | (. |= path))", "{\"x\":[]}\n"),
     (SPINE, ".x |= (\"a\" + .d | (. |= path))", "{\"x\":[]}\n"),
@@ -215,24 +204,34 @@ const ROWS: &[(&str, &str, &str)] = &[
     (SPINE, ".x |= ((5 | .) | (. |= path))", "{\"x\":[]}\n"),
     (SPINE, ".x |= (.zz // \"q\" | (. |= path))", "{\"x\":[]}\n"),
     (SPINE, ".x |= (.zz // 3 | (. |= path))", "{\"x\":[]}\n"),
-    (
-        SPINE,
-        ".x |= (.d // 3 | (. |= path))",
-        "{\"x\":[\"x\",\"d\"]}\n",
-    ),
     (SPINE, ".x |= (map(.) | (. |= path))", "{\"x\":[]}\n"),
     (SPINE, ".x |= (keys | (. |= path))", "{\"x\":[]}\n"),
-    (SPINE, ".x |= ([.[]] | (. |= path))", "{\"x\":[\"x\"]}\n"),
-    (
-        SPINE,
-        ".x |= (to_entries | (. |= path))",
-        "{\"x\":[\"x\"]}\n",
-    ),
     (SPINE, ".x |= ({} | .k | (. |= path))", "{\"x\":[\"k\"]}\n"),
     (
         SPINE,
-        ".x |= (.b |= (5 | . |= path) | .d |= path)",
-        "{\"x\":{\"b\":[],\"d\":[\"x\",\"d\"]}}\n",
+        ".x |= ({\"a\":1} | .a as $v | $v | . |= path)",
+        "{\"x\":[\"a\"]}\n",
+    ),
+    (
+        SPINE,
+        ".x |= (keys | .[0] as $v | $v | . |= path)",
+        "{\"x\":[0]}\n",
+    ),
+    (
+        SPINE,
+        ".x |= (map(.) | .[0] as $v | $v | . |= path)",
+        "{\"x\":[0]}\n",
+    ),
+    (
+        SPINE,
+        ".x |= ({\"a\":{\"q\":1}} as $v | $v | .a |= path)",
+        "{\"x\":{\"a\":[\"a\"]}}\n",
+    ),
+    (SPINE, ".x |= (keys as $v | $v | . |= path)", "{\"x\":[]}\n"),
+    (
+        SPINE,
+        ".x |= (splitDoc | (. |= (parent | keys)))",
+        "{\"x\":{\"b\":{\"c\":1},\"d\":2}}\n",
     ),
     // A scalar the body builds still has no position under such an update.
     (
@@ -257,10 +256,10 @@ fn a_nested_update_reads_key_and_parent_at_its_own_input_8039() -> Result<()> {
     Ok(())
 }
 
-/// Where the owned identity rule places a value differently from yq, an update reads that place as
-/// a read does (#8039, recorded in `docs/compliance/yq/limitations.md`). Main answered these as yq
-/// does by accident, from no position at all; a fix to the rule changes them together with the
-/// read rows below.
+/// Where the owned identity rule places a value differently from yq (`.b.c + 1` over an absent
+/// operand, an `ireduce` that answers INIT), an update reads that place as a read does (#8039,
+/// recorded in `docs/compliance/yq/limitations.md`). Main answered these as yq does by accident,
+/// from no position at all; a fix to the rule changes them together with the read rows below.
 #[test]
 fn an_update_reads_the_identity_rules_position_where_it_differs_from_yq_8039() -> Result<()> {
     for (filter, expected, yq) in [
@@ -272,24 +271,65 @@ fn an_update_reads_the_identity_rules_position_where_it_differs_from_yq_8039() -
             "{\"x\":{\"b\":1,\"d\":2}}",
         ),
         (".x | .b | (.b.c + 1 | key)", "\"c\"\n", "(nothing)"),
-        // `splitDoc`'s value has no parent in yq; the rule keeps the input's position.
+        // An `ireduce` over a source that yields nothing answers INIT, which has no position in yq;
+        // the rule keeps the source's.
         (
-            ".x |= (splitDoc | (. |= (parent | keys)))",
-            "{\"x\":[\"x\"]}\n",
-            "{\"x\":{\"b\":{\"c\":1},\"d\":2}}",
+            ".x |= (.d // 3 | .[]? as $v ireduce (0; $v) | . |= key)",
+            "{\"x\":\"d\"}\n",
+            "{\"x\":0}",
         ),
         (
-            ".x |= (.b |= (splitDoc | . |= (parent | keys)))",
-            "{\"x\":{\"b\":[\"b\",\"d\"],\"d\":2}}\n",
-            "{\"x\":{\"b\":{\"c\":1},\"d\":2}}",
+            ".x | (.d // 3 | .[]? as $v ireduce (0; $v) | key)",
+            "\"d\"\n",
+            "(nothing)",
         ),
-        (".x | splitDoc | (parent | keys)", "[\"x\"]\n", "(nothing)"),
         // #2435: yq creates `.zz.q` on the way, so its parent is a map; the snapshot holds `zz` as
         // the `null` it was created as.
         (
             ".zz |= (.q | . |= (parent | kind))",
             "{\"x\":{\"b\":{\"c\":1},\"d\":2},\"zz\":null}\n",
             "{\"x\":{\"b\":{\"c\":1},\"d\":2},\"zz\":\"map\"}",
+        ),
+    ] {
+        let (stdout, code) = run_yq_stdin(filter, SPINE, &["-p=json", "-o=json", "-I0"])?;
+        assert_eq!(code, 0, "{filter}");
+        assert_eq!(stdout, expected, "{filter} (yq v4.53.3: {yq})");
+    }
+    Ok(())
+}
+
+/// An update whose own reads cannot all be resolved at its target names no position for its
+/// filter, as before #8039 (`docs/compliance/yq/limitations.md`): the prefix the updates nested in
+/// it read stays the enclosing update's, and a stage that hands the position on gives them only the
+/// part it adds. Each row's yq answer is in the assert message.
+#[test]
+fn an_unpositioned_update_names_no_position_for_its_filter_8039() -> Result<()> {
+    for (filter, expected, yq) in [
+        (
+            ".x |= (.b |= (.c | . |= path))",
+            "{\"x\":{\"b\":[\"x\",\"c\"],\"d\":2}}\n",
+            "[\"x\",\"b\",\"c\"]",
+        ),
+        (
+            ".x |= (.b |= (.d = 1 | .c |= path))",
+            "{\"x\":{\"b\":{\"c\":[\"x\",\"c\"],\"d\":1},\"d\":2}}\n",
+            "[\"x\",\"b\",\"c\"]",
+        ),
+        (
+            ".x |= (.d // 3 | (. |= path))",
+            "{\"x\":[\"d\"]}\n",
+            "[\"x\",\"d\"]",
+        ),
+        (".x |= ([.[]] | (. |= path))", "{\"x\":[]}\n", "[\"x\"]"),
+        (
+            ".x |= (to_entries | (. |= path))",
+            "{\"x\":[]}\n",
+            "[\"x\"]",
+        ),
+        (
+            ".x |= (.b |= (5 | . |= path) | .d |= path)",
+            "{\"x\":{\"b\":[],\"d\":[\"d\"]}}\n",
+            "d: [\"x\",\"d\"]",
         ),
     ] {
         let (stdout, code) = run_yq_stdin(filter, SPINE, &["-p=json", "-o=json", "-I0"])?;
